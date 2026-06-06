@@ -160,7 +160,7 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                   AND claims.priority = ready.priority \
                   AND claims.enqueue_shard = ready.enqueue_shard \
                  WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= claims.claim_seq \
+                   AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name) \
                  UNION ALL \
                  SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
                  UNION ALL \
@@ -234,7 +234,7 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                   AND claims.priority = ready.priority \
                   AND claims.enqueue_shard = ready.enqueue_shard \
                  WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= claims.claim_seq \
+                   AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name) \
                  UNION ALL \
                  SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
                  UNION ALL \

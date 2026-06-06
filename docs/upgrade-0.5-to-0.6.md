@@ -285,12 +285,15 @@ The only operator-visible caveat is the per-runtime `enqueue_shards_cache`: a ru
 3. Optionally watch per-shard lag drain to zero:
 
    ```sql
-   SELECT priority, enqueue_shard,
-          enqueues.next_seq, claims.claim_seq,
-          enqueues.next_seq - claims.claim_seq AS lag
+   SELECT priority, enqueue_shard, enqueue_cursor, claim_cursor,
+          enqueue_cursor - claim_cursor AS lag
    FROM <queue_storage_schema>.queue_claim_heads AS claims
    JOIN <queue_storage_schema>.queue_enqueue_heads AS enqueues
      USING (queue, priority, enqueue_shard)
+   CROSS JOIN LATERAL (
+     SELECT <queue_storage_schema>.sequence_next_value(enqueues.seq_name) AS enqueue_cursor,
+            <queue_storage_schema>.sequence_next_value(claims.seq_name) AS claim_cursor
+   ) AS cursor_values
    WHERE queue = 'my_hot_queue'
    ORDER BY priority, enqueue_shard;
    ```

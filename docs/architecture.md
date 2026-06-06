@@ -271,7 +271,7 @@ maintenance leader:
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 |---|---|---:|---|---|
 | Queue | `ready_entries_*`, `done_entries_*` | `1000ms` | incoming ready/done slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows in that ready segment are reclaimed with their retained ready bodies |
-| Lease | `leases_*` | `50ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
+| Lease | `leases_*` | `250ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure |
 
 The maintenance tick for each ring is deliberately small: attempt one rotate,

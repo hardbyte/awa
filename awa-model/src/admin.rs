@@ -285,7 +285,7 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
               ON claims.queue = ready.queue
              AND claims.priority = ready.priority
              AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= claims.claim_seq
+            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
         ),
         current_jobs AS (
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
@@ -560,7 +560,7 @@ pub async fn cancel_by_unique_key(
                   ON claims.queue = ready.queue
                  AND claims.priority = ready.priority
                  AND claims.enqueue_shard = ready.enqueue_shard
-                WHERE ready.lane_seq >= claims.claim_seq
+                WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
             ),
             candidates AS (
                 SELECT job_id
@@ -2299,7 +2299,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                       ON claims.queue = ready.queue
                      AND claims.priority = ready.priority
                      AND claims.enqueue_shard = ready.enqueue_shard
-                    WHERE ready.lane_seq >= claims.claim_seq
+                    WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
                 ), 0) AS available,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'), 0) AS completed,

@@ -112,6 +112,7 @@ What is intentionally not modeled:
 - `storage/AwaSegmentedStorageTrace.tla` /
   `storage/AwaSegmentedStorageTrace.cfg` /
   `storage/AwaSegmentedStorageTraceReceiptRescue.cfg` /
+  `storage/AwaSegmentedStorageTraceLostClaimAdvance.cfg` /
   `storage/AwaSegmentedStorageTraceRunningCancel.cfg` /
   `storage/AwaSegmentedStorageTraceReceiptOnlyCancel.cfg` /
   `storage/AwaSegmentedStorageTraceCallbackWait.cfg` /
@@ -192,6 +193,7 @@ Expected counterexample or positive-witness configs:
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptRescue.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceLostClaimAdvance.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceRunningCancel.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptOnlyCancel.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceCallbackWait.cfg

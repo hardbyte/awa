@@ -52,6 +52,17 @@ ReceiptRescueTrace == <<
     [action |-> "RescueStaleReceipt",       job |-> "j1", run_lease |-> 1]
 >>
 
+\* Post-commit claim-cursor advance loss trace. This models the v0.6
+\* sequence-cursor shape where the receipt claim commits but the separate
+\* sequence advance does not run. The committed receipt makes the ready head
+\* a spent attempt, so AdvanceClaimCursor may move over it without opening a
+\* second receipt.
+LostClaimAdvanceTrace == <<
+    [action |-> "EnqueueReady",                        job |-> "j1"],
+    [action |-> "SeedOpenReceiptOnlyClaimLostAdvance", worker |-> "w1", job |-> "j1"],
+    [action |-> "AdvanceClaimCursor"]
+>>
+
 \* Running admin-cancel trace: enqueue, claim a lease-backed running job,
 \* admin-cancel it into terminal_entries, and close the matching receipt.
 RunningCancelTrace == <<
@@ -164,6 +175,41 @@ SeedOpenReceiptOnlyClaim(w, j) ==
                    terminalSegmentOf>>
     /\ UnchangedSegmentState
 
+\* Same receipt-only seed, but deliberately leaves laneState.claimSeq at the
+\* old head to model a process dying between claim commit and the
+\* post-commit sequence advance. CurrentReady excludes the open receipt, so
+\* the base AdvanceClaimCursor action can self-heal by moving over the spent
+\* committed attempt.
+SeedOpenReceiptOnlyClaimLostAdvance(w, j) ==
+    LET newKey == <<j, runLease[j] + 1>>
+    IN
+    /\ w \in Workers
+    /\ j \in CurrentReady
+    /\ laneSeq[j] = laneState.claimSeq
+    /\ runLease[j] < MaxRunLease
+    /\ claimSegments[claimSegmentCursor] = "open"
+    /\ runLease' = [runLease EXCEPT ![j] = runLease[j] + 1]
+    /\ claimSegmentOf' = [claimSegmentOf EXCEPT ![newKey] = claimSegmentCursor]
+    /\ claimOpen' = claimOpen \cup {newKey}
+    /\ UNCHANGED claimClosed
+    /\ laneState' = [laneState EXCEPT !.readyCount = laneState.readyCount - 1]
+    /\ UNCHANGED <<deferredEntries,
+                   waitingLeases,
+                   terminalEntries,
+                   dlqEntries,
+                   activeLeases,
+                   leaseOwner,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   readyEntries,
+                   laneSeq,
+                   readySegmentOf,
+                   leaseSegmentOf,
+                   terminalSegmentOf>>
+    /\ UnchangedSegmentState
+
 \* Fire the base spec action matching trace[n]. Events that take a
 \* (worker, job) pair read both ev.worker and ev.job. Events that take
 \* only a job read ev.job.
@@ -173,6 +219,9 @@ TraceStep(trace, n) ==
     /\ \/ (ev.action = "EnqueueReady" /\ EnqueueReady(ev.job))
        \/ (ev.action = "SeedOpenReceiptOnlyClaim" /\
               SeedOpenReceiptOnlyClaim(ev.worker, ev.job))
+       \/ (ev.action = "SeedOpenReceiptOnlyClaimLostAdvance" /\
+              SeedOpenReceiptOnlyClaimLostAdvance(ev.worker, ev.job))
+       \/ (ev.action = "AdvanceClaimCursor" /\ AdvanceClaimCursor)
        \/ (ev.action = "Claim" /\ Claim(ev.worker, ev.job))
        \/ (ev.action = "RetryToDeferred" /\ RetryToDeferred(ev.worker, ev.job))
        \/ (ev.action = "PromoteDeferred" /\ PromoteDeferred(ev.job))
@@ -212,6 +261,7 @@ TraceNextFor(trace) ==
 \* `SPECIFICATION SpecSnooze`, etc.
 SpecSnooze == TraceInit /\ [][TraceNextFor(SnoozeTrace)]_<<vars, traceIdx>>
 SpecReceiptRescue == TraceInit /\ [][TraceNextFor(ReceiptRescueTrace)]_<<vars, traceIdx>>
+SpecLostClaimAdvance == TraceInit /\ [][TraceNextFor(LostClaimAdvanceTrace)]_<<vars, traceIdx>>
 SpecRunningCancel == TraceInit /\ [][TraceNextFor(RunningCancelTrace)]_<<vars, traceIdx>>
 SpecDlqRetry == TraceInit /\ [][TraceNextFor(DlqRetryTrace)]_<<vars, traceIdx>>
 SpecReceiptOnlyCancel == TraceInit /\ [][TraceNextFor(ReceiptOnlyCancelTrace)]_<<vars, traceIdx>>
@@ -227,6 +277,7 @@ SpecBroken == TraceInit /\ [][TraceNextFor(BrokenTrace)]_<<vars, traceIdx>>
 \* end — the deadlock at traceIdx < Len proves the rejection.
 SnoozeTraceIncomplete == traceIdx < Len(SnoozeTrace)
 ReceiptRescueTraceIncomplete == traceIdx < Len(ReceiptRescueTrace)
+LostClaimAdvanceTraceIncomplete == traceIdx < Len(LostClaimAdvanceTrace)
 RunningCancelTraceIncomplete == traceIdx < Len(RunningCancelTrace)
 DlqRetryTraceIncomplete == traceIdx < Len(DlqRetryTrace)
 ReceiptOnlyCancelTraceIncomplete == traceIdx < Len(ReceiptOnlyCancelTrace)
