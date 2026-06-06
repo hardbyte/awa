@@ -130,8 +130,9 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
 /// function and its exact signature) originate from the v023 SQL helper,
 /// called either by `awa migrate` for the default schema or by
 /// [`QueueStorage::prepare_schema`](crate::QueueStorage::prepare_schema)
-/// for custom schemas. If you change a name or the `claim_ready_runtime`
-/// signature there, update this check at the same time.
+/// for custom schemas. If you change a required substrate object or the
+/// `claim_ready_runtime` signature there, update this check at the same
+/// time.
 pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<bool, AwaError> {
     sqlx::query_scalar::<_, bool>(
         r#"
@@ -139,6 +140,7 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
             to_regclass(format('%I.%I', $1, 'job_id_seq')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'queue_ring_state')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_entries')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'ready_tombstones')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'done_entries')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'leases')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'deferred_jobs')) IS NOT NULL

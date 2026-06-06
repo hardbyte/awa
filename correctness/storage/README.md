@@ -6,6 +6,7 @@ runtime storage layout.
 It uses the storage naming set:
 
 - `ready_entries`
+- `ready_tombstones`
 - `deferred_jobs`
 - `leases`, including `waiting_external` rows
 - `attempt_state`
@@ -30,6 +31,7 @@ What it models:
 - callback-timeout rescue on exhausted attempts landing directly in `dlq_entries`
 - claim into `leases`
 - explicit `lane_state` append/claim cursors with gap-skipping claim advancement
+- ready tombstones for unclaimed ready cancellation and priority aging
 - lazy materialization of `attempt_state`
 - short-job completion without `attempt_state`
 - stateful completion after heartbeat/progress/callback activity
@@ -37,10 +39,12 @@ What it models:
 - rescue flow that re-enqueues at the tail of `ready_entries`
 - executor-side terminal failure routed directly into `dlq_entries`
 - admin-initiated move from `terminal_entries` to `dlq_entries`
-- `retry_from_dlq` round trip back to `ready_entries` with `run_lease` reset to 0
+- `retry_from_dlq` round trip back to `ready_entries`
 - admin purge of DLQ rows
 - stale completion rejection via per-worker lease snapshots
-- segment rotation and prune safety for ready, lease, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
+- segment rotation and prune safety for ready, tombstone, lease, terminal,
+  **and claim** segment families (retention by partition rotation rather than
+  row-by-row cleanup, per ADR-019 and ADR-023)
 - unpartitioned backlog row-vacuum handling for `deferred_jobs` and `dlq_entries`
 - receipt-plane append-only receipts and closures matched into the same
   `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A
@@ -55,7 +59,8 @@ lease on the same `run_lease`.
 Key safety checks include:
 
 - waiting jobs are live lease rows
-- deferred and DLQ jobs have no runnable `laneSeq`
+- deferred and DLQ jobs are not current-ready, even when an immutable
+  `ready_entries` body is retained for hydration until queue prune
 - `attempt_state` only exists for live leases
 - claim cursors never move behind live runnable rows
 - DLQ rows hold no live runtime (no lease, attempt_state, etc.)
@@ -91,30 +96,25 @@ Run it with:
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
 ```
 
-The checked-in configs are intentionally small so TLC completes quickly in CI-like
-environments:
-
-- `AwaSegmentedStorage.cfg`: 1 job, 1 worker — ~33k distinct states
-- `AwaSegmentedStorageInterleavings.cfg`: 1 job, 2 workers — ~74k distinct states
-
-That is enough to exercise waiting/resume, stale completion rejection, retry,
-rescue (including short-job rescue), DLQ round-trip, terminal-family rotation
-and prune, and queue-family prune safety, but not multi-job fairness or
-priority-aging liveness.
+The checked-in configs are intentionally small so TLC completes quickly in
+CI-like environments. They exercise waiting/resume, stale completion rejection,
+retry, rescue (including short-job rescue), DLQ round-trip, ready tombstones,
+terminal-family rotation and prune, and queue-family prune safety, but not
+multi-job fairness or priority-aging liveness.
 
 ## DLQ coverage
 
-Action coverage from a `-coverage 1` run of the base config confirms each
-new DLQ transition is reached:
+Action coverage from a `-coverage 1` run of the base config confirms each DLQ
+transition is reachable:
 
-| Action | States |
-|---|---:|
-| `FailToDlq` | 41,472 |
-| `TimeoutWaitingToDlq` | 9,216 |
-| `RescueToReady` | 6,912 |
-| `PurgeDlq` | 4,608 |
-| `MoveFailedToDlq` | 3,072 |
-| `RetryFromDlq` | 1,536 |
+| Action |
+|---|
+| `FailToDlq` |
+| `TimeoutWaitingToDlq` |
+| `RescueToReady` |
+| `PurgeDlq` |
+| `MoveFailedToDlq` |
+| `RetryFromDlq` |
 
 `RescueToReady` firing in a single-worker config confirms the heartbeat-fix
 path (short jobs, no `attempt_state`) is reachable — the previous spec's
@@ -123,17 +123,17 @@ that path from exploration.
 
 ## Terminal family coverage
 
-The terminal family mirrors the DLQ family's segment lifecycle. From the
-same `-coverage 1` run:
+The terminal family mirrors the DLQ family's segment lifecycle. A coverage run
+checks these actions are reachable:
 
-| Action | States |
-|---|---:|
-| `FastComplete` (now tags `terminalSegmentOf`) | 55,296 |
-| `StatefulComplete` (now tags `terminalSegmentOf`) | 110,592 |
-| `CancelWaitingToTerminal` (now tags `terminalSegmentOf`) | 36,864 |
-| `MoveFailedToDlq` (now clears `terminalSegmentOf`) | 18,432 |
-| `RotateTerminalSegments` | 158,720 |
-| `PruneTerminalSegment` | 158,720 |
+| Action |
+|---|
+| `FastComplete` (tags `terminalSegmentOf`) |
+| `StatefulComplete` (tags `terminalSegmentOf`) |
+| `CancelWaitingToTerminal` (tags `terminalSegmentOf`) |
+| `MoveFailedToDlq` (clears `terminalSegmentOf`) |
+| `RotateTerminalSegments` |
+| `PruneTerminalSegment` |
 
 This removes the previous gap where `terminal_entries` was the only
 "monotonic-growing" set in the spec — it now shares the rotate/prune
@@ -142,10 +142,12 @@ model.
 
 ADR-026 adds the retained-body shape for ready-backed terminal rows.
 `TerminalHasRetainedReadyBody` asserts that every modelled terminal fact keeps
-its ready row and lane key until a terminal delete path or queue prune removes
-both. `MoveFailedToDlq` now clears that ready backing row after hydrating the
-DLQ row, and `PruneReadySegment` removes terminal facts in the pruned ready
-segment so the model matches queue-ring reclamation.
+its ready row and lane key until queue prune removes the ready segment. Moving
+a failed terminal row into the DLQ removes the terminal fact but keeps the
+retained ready body; DLQ liveness is defined by `CurrentReady`, not by physical
+absence from `ready_entries`. `PruneReadySegment` removes terminal facts and
+tombstones in the pruned ready segment so the model matches queue-ring
+reclamation.
 
 ## Mapping to Rust code
 
@@ -415,10 +417,11 @@ Specific to this spec:
 
 - **Public SQL projections are not modelled as separate views.**
   `AwaSegmentedStorage` models the storage state and invariants underneath
-  `ready_entries`, `leases`, `done_entries`, `dlq_entries`, and receipt
-  partitions. It does not separately derive `awa.jobs`, `terminal_jobs`,
-  admin state counts, or health-check availability. Those projection paths
-  are covered by Rust regression tests and the correspondence notes in
+  `ready_entries`, `ready_tombstones`, `leases`, `done_entries`,
+  `dlq_entries`, and receipt partitions. It does not separately derive
+  `awa.jobs`, `terminal_jobs`, admin state counts, or health-check
+  availability. Those projection paths are covered by Rust regression tests
+  and the correspondence notes in
   [`MAPPING.md`](./MAPPING.md#public-read-and-compatibility-surfaces).
 - **Enqueue-shard routing is split across specs.** The base storage model
   uses one `(queue, priority, enqueue_shard)` lane. Cross-shard `lane_seq`

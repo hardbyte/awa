@@ -55,9 +55,10 @@ What is intentionally not modeled:
   stale completion protection
 - `storage/AwaSegmentedStorage.tla` / `storage/AwaSegmentedStorage.cfg`: focused
   segmented-storage model covering `ready_entries`, `deferred_jobs`,
-  live `leases` including `waiting_external`, optional `attempt_state`,
-  `done_entries`, `dlq_entries`, queue-local append/claim cursors, and
-  segment rotation/prune safety for ready, lease, terminal, and claim
+  `ready_tombstones`, live `leases` including `waiting_external`, optional
+  `attempt_state`, `done_entries`, `dlq_entries`, queue-local append/claim
+  cursors, and segment rotation/prune safety for ready, tombstone, lease,
+  terminal, and claim
   families. Heartbeat freshness lives on non-waiting leases, matching the
   Rust implementation. DLQ modelling covers both executor-side `FailToDlq`
   and admin-side `MoveFailedToDlq`, plus `RetryFromDlq` (with `run_lease`

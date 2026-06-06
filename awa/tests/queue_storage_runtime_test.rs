@@ -495,6 +495,57 @@ async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) ->
         .expect("Failed to count lease_claim_closures")
 }
 
+async fn ready_tombstone_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.ready_tombstones",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count ready_tombstones")
+}
+
+async fn tombstone_ready_job(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) {
+    let schema = store.schema();
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.ready_tombstones (
+            ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+        )
+        SELECT ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+        FROM {schema}.ready_entries
+        WHERE job_id = $1
+        ON CONFLICT DO NOTHING
+        "#
+    ))
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("Failed to tombstone ready job");
+}
+
+async fn claim_cursor_for(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    enqueue_shard: i16,
+) -> i64 {
+    let schema = store.schema();
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT {schema}.sequence_next_value(seq_name)
+         FROM {schema}.queue_claim_heads
+         WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
+    ))
+    .bind(queue)
+    .bind(priority)
+    .bind(enqueue_shard)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to read claim cursor")
+}
+
 fn queue_storage_client<W: Worker + 'static>(
     pool: &sqlx::PgPool,
     queue: &str,
@@ -1121,7 +1172,7 @@ async fn test_queue_storage_failed_narrow_done_row_can_retry_from_ready_hydratio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_queue_storage_cancel_available_done_row_is_wide_without_ready_backing() {
+async fn test_queue_storage_cancel_available_tombstones_and_retains_ready_backing() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(6).await;
     let queue = "qs_wide_available_cancel";
@@ -1144,6 +1195,22 @@ async fn test_queue_storage_cancel_available_done_row_is_wide_without_ready_back
         .expect("Failed to cancel available job")
         .expect("available job should cancel");
     assert_eq!(cancelled.state, JobState::Cancelled);
+    assert_eq!(
+        ready_tombstone_count(&pool, &store).await,
+        1,
+        "available cancel should tombstone the ready lane"
+    );
+    let retained_ready_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count retained ready row");
+    assert_eq!(
+        retained_ready_rows, 1,
+        "available cancel should retain the ready backing row until queue prune"
+    );
 
     let (args, max_attempts, run_at, created_at, _payload) =
         done_body_columns(&pool, &store, job_id).await;
@@ -1153,15 +1220,15 @@ async fn test_queue_storage_cancel_available_done_row_is_wide_without_ready_back
     );
     assert!(
         max_attempts.is_some(),
-        "available-cancel terminal row cannot rely on a deleted ready backing row"
+        "available-cancel terminal row should remain wide for direct done_entries readers"
     );
     assert!(
         run_at.is_some(),
-        "available-cancel terminal row cannot rely on a deleted ready backing row"
+        "available-cancel terminal row should remain wide for direct done_entries readers"
     );
     assert!(
         created_at.is_some(),
-        "available-cancel terminal row cannot rely on a deleted ready backing row"
+        "available-cancel terminal row should remain wide for direct done_entries readers"
     );
 
     let loaded = store
@@ -1171,6 +1238,128 @@ async fn test_queue_storage_cancel_available_done_row_is_wide_without_ready_back
         .expect("cancelled available job should be loadable");
     assert_eq!(loaded.state, JobState::Cancelled);
     assert_eq!(loaded.args["id"], serde_json::json!(88));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_ready_tombstone_head_advances_claim_cursor() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let queue = "qs_tombstone_head";
+    let schema = "awa_qs_tombstone_head";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 901 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    tombstone_ready_job(&pool, &store, job_id).await;
+    assert_eq!(ready_tombstone_count(&pool, &store).await, 1);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("queue counts")
+            .available,
+        0,
+        "exact counts must not report tombstoned ready rows as available"
+    );
+
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(1_i64)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("raw claim over tombstoned head");
+
+    assert!(
+        claimed.is_empty(),
+        "claim allocator must not emit a tombstoned ready row"
+    );
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, 2, 0).await,
+        2,
+        "a tombstoned head lane is committed spent evidence and should advance the cursor"
+    );
+    assert_eq!(lease_count(&pool, &store).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_ready_tombstone_non_head_does_not_skip_live_prefix() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let queue = "qs_tombstone_non_head";
+    let schema = "awa_qs_tombstone_non_head";
+    let store = create_store(&pool, schema).await;
+    let first_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 911 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    let second_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 912 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    tombstone_ready_job(&pool, &store, second_id).await;
+    assert_eq!(ready_tombstone_count(&pool, &store).await, 1);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("queue counts")
+            .available,
+        1,
+        "only the non-tombstoned prefix row should be available"
+    );
+
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(2_i64)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("raw claim with non-head tombstone");
+
+    assert_eq!(
+        claimed.iter().map(|row| row.job_id).collect::<Vec<_>>(),
+        vec![first_id],
+        "later tombstones must not be claimed and must not suppress an earlier live row"
+    );
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, 2, 0).await,
+        1,
+        "a later tombstone must not move the non-transactional cursor past an earlier live row"
+    );
+    assert_eq!(lease_count(&pool, &store).await, 1);
 }
 
 struct ReceiptRescueWorker {
@@ -4721,10 +4910,10 @@ async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() 
 /// Drift-detection guard for the head-table-derived available count.
 ///
 /// `queue_counts_exact` (admin API) scans `ready_entries` with
-/// `lane_seq >= claim_cursor`; the dispatcher hot path reads the cheaper
-/// `sum(enqueue_cursor - claim_cursor)` from the two head tables. The two are
-/// only equivalent when every lifecycle path that adds or removes a
-/// live ready row keeps the head tables honest:
+/// `lane_seq >= claim_cursor` and no matching ready tombstone; the dispatcher
+/// hot path reads the cheaper `sum(enqueue_cursor - claim_cursor)` from the
+/// two head tables. The two are only equivalent when every lifecycle path
+/// that adds or removes a live ready row keeps the head tables honest:
 ///
 ///   * enqueue → bumps the lane's enqueue sequence
 ///   * claim   → bumps the lane's claim sequence past the lane_seq
@@ -4743,6 +4932,7 @@ async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() 
 /// At every checkpoint:
 ///   - `store.queue_counts(...).available` (public API) ==
 ///     `count(*) FROM ready_entries WHERE lane_seq >= claim_cursor`
+///     anti-joined with `ready_tombstones`
 ///   - `sum(enqueue_cursor - claim_cursor)` (hot-path approximation)
 ///     `>= scan` (never under-counts)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4760,7 +4950,7 @@ async fn test_available_count_matches_ready_entries_scan() {
         checkpoint: &str,
     ) {
         let schema = store.schema();
-        // Ground-truth scan — the predicate the original CTE used.
+        // Ground-truth scan — same available-row predicate as the exact API.
         let scan: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*)::bigint
              FROM {schema}.ready_entries AS ready
@@ -4769,7 +4959,17 @@ async fn test_available_count_matches_ready_entries_scan() {
               AND claims.priority = ready.priority
               AND claims.enqueue_shard = ready.enqueue_shard
              WHERE ready.queue = $1
-               AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)"
+               AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM {schema}.ready_tombstones AS tomb
+                   WHERE tomb.ready_slot = ready.ready_slot
+                     AND tomb.ready_generation = ready.ready_generation
+                     AND tomb.queue = ready.queue
+                     AND tomb.priority = ready.priority
+                     AND tomb.enqueue_shard = ready.enqueue_shard
+                     AND tomb.lane_seq = ready.lane_seq
+               )"
         ))
         .bind(queue)
         .fetch_one(pool)
@@ -7233,7 +7433,7 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
             .fetch_one(&pool)
             .await
             .expect("Failed to count remaining awa.jobs rows");
-    let ready_after_delete: i64 = sqlx::query_scalar(&format!(
+    let retained_ready_after_delete: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
         store.schema()
     ))
@@ -7241,6 +7441,14 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
     .fetch_one(&pool)
     .await
     .expect("Failed to recount ready entries");
+    let tombstones_after_delete: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.ready_tombstones WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count ready tombstones");
     let deferred_after_delete: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
         store.schema()
@@ -7250,7 +7458,14 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
     .await
     .expect("Failed to recount deferred rows");
     assert_eq!(remaining, 0);
-    assert_eq!(ready_after_delete, 0);
+    assert_eq!(
+        retained_ready_after_delete, 1,
+        "compat DELETE should retain the ready backing row until queue prune"
+    );
+    assert_eq!(
+        tombstones_after_delete, 1,
+        "compat DELETE should tombstone the retained ready row"
+    );
     assert_eq!(deferred_after_delete, 0);
     assert_eq!(
         deleted, 2,

@@ -97,6 +97,7 @@ TableSpec == [
     \* All partitioned by their respective ring slot, reclaimed by
     \* TRUNCATE on partition prune.
     ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    ready_tombstones       |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
@@ -264,6 +265,25 @@ CancelRunningTx == <<
     Mut("Insert", "lease_claim_closures")
 >>
 
+\* cancel_job_tx ready branch (append-only ready segments)
+CancelReadyTx == <<
+    Mut("Insert", "ready_tombstones"),
+    Mut("Insert", "done_entries")
+>>
+
+\* age_ready_jobs_tx (reprioritize)
+ReprioritizeReadyTx == <<
+    Mut("Insert", "ready_tombstones"),
+    Mut("Insert", "ready_entries")
+>>
+
+\* delete_job_compat ready branch. SQL DELETE from the public awa.jobs view
+\* hides the ready row by tombstoning the lane; the retained ready row remains
+\* append-only until queue prune.
+DeleteReadyCompatTx == <<
+    Mut("Insert", "ready_tombstones")
+>>
+
 \* fail_to_dlq / fail_terminal — queue_storage.rs:8055, 8088
 FailToDlqTx == <<
     Mut("Delete", "leases"),
@@ -350,7 +370,8 @@ RotateReadyTx == << Mut("Update", "queue_ring_state") >>
 PruneReadyTx  == <<
     Mut("Update", "queue_ring_slots"),
     Mut("Truncate", "ready_entries"),
-    Mut("Truncate", "done_entries")
+    Mut("Truncate", "done_entries"),
+    Mut("Truncate", "ready_tombstones")
 >>
 
 RotateClaimsTx == << Mut("Update", "claim_ring_state") >>
@@ -364,7 +385,8 @@ Transactions == {
     ClaimReceiptsTx, ClaimLegacyTx,
     CompleteReceiptsTx, CompleteLegacyTx,
     CloseReceiptTx, RescueReceiptsTx, EnsureRunningTx,
-    CancelReceiptOnlyTx, CancelRunningTx,
+    CancelReceiptOnlyTx, CancelRunningTx, CancelReadyTx, DeleteReadyCompatTx,
+    ReprioritizeReadyTx,
     FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,
     EnterCallbackWaitTx, ResumeWaitingTx, ResolveExternalTerminalTx,
     RetryExternalTx, MoveFailedToDlqTx, RetryFromDlqTx, PurgeDlqTx,

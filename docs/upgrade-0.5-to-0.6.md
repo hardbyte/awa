@@ -193,8 +193,8 @@ awa --database-url "$DATABASE_URL" storage status
 
 | After step | Watch for |
 |------------|-----------|
-| migrate | `SELECT MAX(version) FROM awa.schema_version` advances; `\dt awa.ready_entries` exists for the default schema |
-| prepare custom queue-storage schema | `\dt <custom_schema>.ready_entries` (and other queue-storage tables) exist when using a custom schema |
+| migrate | `SELECT MAX(version) FROM awa.schema_version` advances; `\dt awa.ready_entries` and `\dt awa.ready_tombstones` exist for the default schema |
+| prepare custom queue-storage schema | `\dt <custom_schema>.ready_entries` and `\dt <custom_schema>.ready_tombstones` exist when using a custom schema |
 | prepare | `awa storage status` reports `state=prepared` |
 | start queue-storage target | `awa.runtime_instances` shows `transition_role='queue_storage_target'` and `storage_capability='queue_storage'` for the new instance; `awa storage status` lists no `enter_mixed_transition_blockers` |
 | enter-mixed-transition | `awa_maintenance_rotate_attempts_total{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
