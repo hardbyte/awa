@@ -4709,6 +4709,61 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_prune_treats_ready_tombstone_as_spent() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let queue = "qs_prune_tombstone";
+    let schema = "awa_qs_prune_tombstone";
+    let store = create_store(&pool, schema).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 77 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    tombstone_ready_job(&pool, &store, job_id).await;
+    assert_eq!(ready_tombstone_count(&pool, &store).await, 1);
+
+    let rotated = store
+        .rotate(&pool)
+        .await
+        .expect("Failed to rotate queue ring");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let prune = store
+        .prune_oldest(&pool)
+        .await
+        .expect("Failed to prune tombstoned ready slot");
+    assert!(
+        matches!(prune, PruneOutcome::Pruned { slot: 0 }),
+        "tombstoned ready rows should not keep the old queue slot active: {prune:?}"
+    );
+
+    assert_eq!(
+        ready_tombstone_count(&pool, &store).await,
+        0,
+        "queue prune should truncate tombstones with the matching ready slot"
+    );
+    let ready_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count retained ready rows after prune");
+    assert_eq!(ready_rows, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;

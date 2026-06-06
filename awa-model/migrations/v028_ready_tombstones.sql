@@ -67,6 +67,37 @@ BEGIN
             v_lease_claim_receipts
         );
 
+        -- `install_queue_storage_substrate()` intentionally marks terminal
+        -- counters untrusted when it sees live terminal rows that may have
+        -- come from the pre-v027 unbucketed counter shape. This migration
+        -- refreshes the substrate after v027 has already rebucketed those
+        -- counters, so rebuild and trust the counter again before leaving the
+        -- schema at version 28.
+        EXECUTE format('TRUNCATE TABLE %I.queue_terminal_live_counts', v_schema);
+        EXECUTE format(
+            $sql$
+            INSERT INTO %1$I.queue_terminal_live_counts AS counts (
+                ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
+            )
+            SELECT
+                ready_slot,
+                queue,
+                priority,
+                enqueue_shard,
+                mod(mod(job_id, 256::bigint) + 256::bigint, 256::bigint)::smallint AS counter_bucket,
+                count(*)::bigint
+            FROM %1$I.done_entries
+            GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+            ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
+            SET live_terminal_count = EXCLUDED.live_terminal_count
+            $sql$,
+            v_schema
+        );
+        EXECUTE format(
+            'UPDATE %I.queue_ring_state SET terminal_counter_trusted_at = now() WHERE singleton = TRUE',
+            v_schema
+        );
+
     END LOOP;
 END
 $$;

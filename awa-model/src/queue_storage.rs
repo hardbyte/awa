@@ -287,7 +287,7 @@ pub enum PruneOutcome {
 pub enum SkipReason {
     /// Queue prune: leases on the prior generation persist.
     QueueActiveLeases,
-    /// Queue prune: ready rows without a matching done row.
+    /// Queue prune: ready rows without matching done or tombstone evidence.
     QueuePendingReady,
     /// Lease prune: target slot equals the current slot (rotator race).
     LeaseCurrent,
@@ -10661,6 +10661,7 @@ impl QueueStorage {
             });
         }
 
+        let tomb_child = format!("{schema}.ready_tombstones_{slot}");
         let pending: i64 = sqlx::query_scalar(&format!(
             r#"
             SELECT count(*)::bigint
@@ -10671,7 +10672,14 @@ impl QueueStorage {
              AND done.priority = ready.priority
              AND done.enqueue_shard = ready.enqueue_shard
              AND done.lane_seq = ready.lane_seq
+            LEFT JOIN {tomb_child} AS tomb
+              ON tomb.ready_generation = ready.ready_generation
+             AND tomb.queue = ready.queue
+             AND tomb.priority = ready.priority
+             AND tomb.enqueue_shard = ready.enqueue_shard
+             AND tomb.lane_seq = ready.lane_seq
             WHERE done.lane_seq IS NULL
+              AND tomb.lane_seq IS NULL
             "#
         ))
         .fetch_one(tx.as_mut())
@@ -10711,7 +10719,6 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let tomb_child = format!("{schema}.ready_tombstones_{slot}");
         let truncate = sqlx::query(&format!(
             "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}"
         ))
