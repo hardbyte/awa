@@ -23,17 +23,13 @@ Use PyO3 with `pyo3-async-runtimes` for in-process Python integration.
 
 A proof-of-concept spike (`spike/pyo3-async/`) validated four critical requirements before committing to this approach:
 
-1. **Rust tokio can call a Python `async def` and await its result.**
-   `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. `pyo3_async_runtimes::into_future_with_locals` converts Python coroutines to Rust futures when the worker is executing on a Rust background task. Round-trip latency is sub-microsecond.
+1. **Rust tokio can call a Python `async def` and await its result.** `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. `pyo3_async_runtimes::into_future_with_locals` converts Python coroutines to Rust futures when the worker is executing on a Rust background task. Round-trip latency is sub-microsecond.
 
-2. **A Rust background task can heartbeat while a Python handler runs.**
-   The heartbeat task runs as a separate tokio task that never acquires the GIL. The spike proved that heartbeat increments continue accumulating while a Python handler is blocked in `asyncio.sleep`.
+2. **A Rust background task can heartbeat while a Python handler runs.** The heartbeat task runs as a separate tokio task that never acquires the GIL. The spike proved that heartbeat increments continue accumulating while a Python handler is blocked in `asyncio.sleep`.
 
-3. **Python exceptions propagate to Rust as structured errors.**
-   PyO3 converts Python exceptions to `PyErr`, which carries the exception type, message, and traceback. The spike confirmed that type name, message, and traceback are all accessible from Rust.
+3. **Python exceptions propagate to Rust as structured errors.** PyO3 converts Python exceptions to `PyErr`, which carries the exception type, message, and traceback. The spike confirmed that type name, message, and traceback are all accessible from Rust.
 
-4. **`ctx.is_cancelled()` works from Python when Rust signals shutdown.**
-   A shared `AtomicBool` (wrapped in a `#[pyclass]`) is checked by Python and set by Rust. The spike confirmed that cancellation signalled from a Rust background task is visible to the Python handler within milliseconds.
+4. **`ctx.is_cancelled()` works from Python when Rust signals shutdown.** A shared `AtomicBool` (wrapped in a `#[pyclass]`) is checked by Python and set by Rust. The spike confirmed that cancellation signalled from a Rust background task is visible to the Python handler within milliseconds.
 
 ### How Heartbeats Survive GIL Blocks
 

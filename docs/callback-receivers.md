@@ -2,37 +2,21 @@
 
 Awa supports three ways to host the HTTP callback ingress surface:
 
-1. **Bundled with the admin UI** — the default. `awa serve` exposes the
-   admin UI plus the three callback routes from the same router.
-2. **Standalone receiver** — `awa callbacks serve` runs a router that
-   mounts only the callback ingress endpoints. Use this when callbacks
-   must be reachable from outside the operator network but the admin
-   surface must remain private. See [`docs/http-callbacks.md`](./http-callbacks.md).
-3. **User-owned API layer** — mount the callback ingress routes inside
-   your own application (FastAPI / Starlette / Flask / Django / axum /
-   actix). This page covers option 3.
+1. **Bundled with the admin UI** — the default. `awa serve` exposes the admin UI plus the three callback routes from the same router.
+2. **Standalone receiver** — `awa callbacks serve` runs a router that mounts only the callback ingress endpoints. Use this when callbacks must be reachable from outside the operator network but the admin surface must remain private. See [`docs/http-callbacks.md`](./http-callbacks.md).
+3. **User-owned API layer** — mount the callback ingress routes inside your own application (FastAPI / Starlette / Flask / Django / axum / actix). This page covers option 3.
 
 The on-wire contract is identical across all three options:
 
 - Routes: `POST {prefix}/{callback_id}/{complete,fail,heartbeat}`.
-- Signature: BLAKE3 keyed-hash of the callback id, lowercase hex, in the
-  `X-Awa-Signature` header.
+- Signature: BLAKE3 keyed-hash of the callback id, lowercase hex, in the `X-Awa-Signature` header.
 - Payloads: see [`docs/http-callbacks.md`](./http-callbacks.md#callback-receiver-contract).
 
-When you host the routes yourself, **reuse the shared signing and URL
-helpers** from `awa::callback_contract` (Rust) or `awa.callback_contract`
-(Python) so your implementation cannot drift from the worker's. The
-helpers are exported specifically so this is a one-line dependency, not
-a copy-paste of the algorithm.
+When you host the routes yourself, **reuse the shared signing and URL helpers** from `awa::callback_contract` (Rust) or `awa.callback_contract` (Python) so your implementation cannot drift from the worker's. The helpers are exported specifically so this is a one-line dependency, not a copy-paste of the algorithm.
 
 ## Security
 
-The callback receiver routes mutate job state. Specifically, `complete`
-and `fail` are terminal — once they succeed, the job leaves
-`waiting_external`. A receiver that does not verify `X-Awa-Signature`
-must be protected another way (mTLS at the load balancer, IP allow-list,
-private VPC). See [ADR-027](./adr/027-callback-ingress-surface.md) for the
-deployable-role model.
+The callback receiver routes mutate job state. Specifically, `complete` and `fail` are terminal — once they succeed, the job leaves `waiting_external`. A receiver that does not verify `X-Awa-Signature` must be protected another way (mTLS at the load balancer, IP allow-list, private VPC). See [ADR-027](./adr/027-callback-ingress-surface.md) for the deployable-role model.
 
 ## Custom axum receiver (Rust)
 
@@ -106,9 +90,7 @@ pub fn callback_routes(state: Arc<CallbackState>) -> Router {
 }
 ```
 
-For most users the built-in receiver in `awa::callback_router` (PR #279)
-covers this case. Mount the routes yourself only when you need them
-*inside* an existing axum application.
+For most users the built-in receiver in `awa::callback_router` (PR #279) covers this case. Mount the routes yourself only when you need them _inside_ an existing axum application.
 
 ## Custom FastAPI receiver (Python)
 
@@ -200,19 +182,11 @@ app = FastAPI()
 app.include_router(router)
 ```
 
-The `awa.callback_contract` module wraps the same Rust signing
-implementation the worker uses, so a signature this verifier accepts is
-bit-for-bit identical to a signature `awa serve` would accept. There is
-a parity test (`awa-python/tests/test_callback_contract.py`) that pins
-a known BLAKE3 vector across both languages.
+The `awa.callback_contract` module wraps the same Rust signing implementation the worker uses, so a signature this verifier accepts is bit-for-bit identical to a signature `awa serve` would accept. There is a parity test (`awa-python/tests/test_callback_contract.py`) that pins a known BLAKE3 vector across both languages.
 
 ## Configuring the worker to point at your receiver
 
-Whichever option you pick, the worker side needs to know the full
-callback URL. Set [`HttpWorkerConfig::callback_base_url`](./http-callbacks.md)
-to your receiver's externally-reachable base URL, and override
-`callback_path_prefix` if your routes are mounted somewhere other than
-`/api/callbacks`:
+Whichever option you pick, the worker side needs to know the full callback URL. Set [`HttpWorkerConfig::callback_base_url`](./http-callbacks.md) to your receiver's externally-reachable base URL, and override `callback_path_prefix` if your routes are mounted somewhere other than `/api/callbacks`:
 
 ```rust
 HttpWorkerConfig {
@@ -223,6 +197,4 @@ HttpWorkerConfig {
 }
 ```
 
-The worker uses `awa::callback_contract::callback_url` internally to
-build the URL — the same helper your receiver can use to compute
-URLs for outbound retries or diagnostics.
+The worker uses `awa::callback_contract::callback_url` internally to build the URL — the same helper your receiver can use to compute URLs for outbound retries or diagnostics.

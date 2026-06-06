@@ -1,7 +1,6 @@
 # Segmented Storage Model
 
-`AwaSegmentedStorage` is a focused TLA+ model for the 0.6 segmented
-runtime storage layout.
+`AwaSegmentedStorage` is a focused TLA+ model for the 0.6 segmented runtime storage layout.
 
 It uses the storage naming set:
 
@@ -16,10 +15,7 @@ It uses the storage naming set:
 - `ready_segments` / `ready_segment_cursor`
 - `lease_segments` / `lease_segment_cursor`
 - `terminal_segments` / `terminal_segment_cursor`
-- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims` and
-  `lease_claim_closures` partitioned by `claim_slot`, reclaimed by
-  rotation and `TRUNCATE` instead of the earlier `open_receipt_claims`
-  INSERT+DELETE frontier)
+- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims` and `lease_claim_closures` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier)
 
 What it models:
 
@@ -42,37 +38,23 @@ What it models:
 - `retry_from_dlq` round trip back to `ready_entries`
 - admin purge of DLQ rows
 - stale completion rejection via per-worker lease snapshots
-- segment rotation and prune safety for ready, tombstone, lease, terminal,
-  **and claim** segment families (retention by partition rotation rather than
-  row-by-row cleanup, per ADR-019 and ADR-023)
+- segment rotation and prune safety for ready, tombstone, lease, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
 - unpartitioned backlog row-vacuum handling for `deferred_jobs` and `dlq_entries`
-- receipt-plane append-only receipts and closures matched into the same
-  `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A
-  rescue-before-truncate
+- receipt-plane append-only receipts and closures matched into the same `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A rescue-before-truncate
 - a second config with two workers to exercise interleavings on the same storage invariants
 
-Heartbeat freshness is tracked at the lease level (not `attempt_state`) to
-match the Rust implementation. `ParkToWaiting` clears heartbeat freshness
-while keeping the lease row live; `ResumeWaitingToRunning` restores a running
-lease on the same `run_lease`.
+Heartbeat freshness is tracked at the lease level (not `attempt_state`) to match the Rust implementation. `ParkToWaiting` clears heartbeat freshness while keeping the lease row live; `ResumeWaitingToRunning` restores a running lease on the same `run_lease`.
 
 Key safety checks include:
 
 - waiting jobs are live lease rows
-- deferred and DLQ jobs are not current-ready, even when an immutable
-  `ready_entries` body is retained for hydration until queue prune
+- deferred and DLQ jobs are not current-ready, even when an immutable `ready_entries` body is retained for hydration until queue prune
 - `attempt_state` only exists for live leases
 - claim cursors never move behind live runnable rows
 - DLQ rows hold no live runtime (no lease, attempt_state, etc.)
-- `dlq_entries` and `terminal_entries` are disjoint (a job is in exactly one
-  terminal family at a time)
-- pruned terminal segments hold no live terminal rows; terminal rotation
-  is deadlock-free and respects the same open/sealed/pruned lifecycle as
-  the other families
-- pruned claim segments hold no open receipts (`NoLostClaim`,
-  `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment`
-  requires every claim in the partition to have a matching closure
-  before `TRUNCATE` fires
+- `dlq_entries` and `terminal_entries` are disjoint (a job is in exactly one terminal family at a time)
+- pruned terminal segments hold no live terminal rows; terminal rotation is deadlock-free and respects the same open/sealed/pruned lifecycle as the other families
+- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have a matching closure before `TRUNCATE` fires
 
 What it intentionally does not model:
 
@@ -80,13 +62,8 @@ What it intentionally does not model:
 - MVCC horizons or autovacuum timing
 - queue priorities and fairness
 - local worker-capacity accounting and completion-batcher scheduling
-- `queue_counts()` caching details such as the cold
-  `{schema}.queue_terminal_rollups` table and the transitional
-  `queue_lanes.pruned_completed_count` fallback; Rust keeps those as
-  post-prune rollups rather than as part of the completion hot path
-- unique-claim key semantics; the Rust `retry_from_dlq` unique-conflict
-  contract (see `awa-model/src/dlq.rs::retry_from_dlq`) is enforced at the
-  SQL layer via `release_queue_storage_unique_claim` and is out of scope here
+- `queue_counts()` caching details such as the cold `{schema}.queue_terminal_rollups` table and the transitional `queue_lanes.pruned_completed_count` fallback; Rust keeps those as post-prune rollups rather than as part of the completion hot path
+- unique-claim key semantics; the Rust `retry_from_dlq` unique-conflict contract (see `awa-model/src/dlq.rs::retry_from_dlq`) is enforced at the SQL layer via `release_queue_storage_unique_claim` and is out of scope here
 - liveness/fairness properties; this spec is still safety-oriented
 
 Run it with:
@@ -96,91 +73,57 @@ Run it with:
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
 ```
 
-The checked-in configs are intentionally small so TLC completes quickly in
-CI-like environments. They exercise waiting/resume, stale completion rejection,
-retry, rescue (including short-job rescue), DLQ round-trip, ready tombstones,
-terminal-family rotation and prune, and queue-family prune safety, but not
-multi-job fairness or priority-aging liveness.
+The checked-in configs are intentionally small so TLC completes quickly in CI-like environments. They exercise waiting/resume, stale completion rejection, retry, rescue (including short-job rescue), DLQ round-trip, ready tombstones, terminal-family rotation and prune, and queue-family prune safety, but not multi-job fairness or priority-aging liveness.
 
 ## DLQ coverage
 
-Action coverage from a `-coverage 1` run of the base config confirms each DLQ
-transition is reachable:
+Action coverage from a `-coverage 1` run of the base config confirms each DLQ transition is reachable:
 
-| Action |
-|---|
-| `FailToDlq` |
+| Action                |
+| --------------------- |
+| `FailToDlq`           |
 | `TimeoutWaitingToDlq` |
-| `RescueToReady` |
-| `PurgeDlq` |
-| `MoveFailedToDlq` |
-| `RetryFromDlq` |
+| `RescueToReady`       |
+| `PurgeDlq`            |
+| `MoveFailedToDlq`     |
+| `RetryFromDlq`        |
 
-`RescueToReady` firing in a single-worker config confirms the heartbeat-fix
-path (short jobs, no `attempt_state`) is reachable — the previous spec's
-`FreshHeartbeatRequiresAttemptState` subset constraint had silently excluded
-that path from exploration.
+`RescueToReady` firing in a single-worker config confirms the heartbeat-fix path (short jobs, no `attempt_state`) is reachable — the previous spec's `FreshHeartbeatRequiresAttemptState` subset constraint had silently excluded that path from exploration.
 
 ## Terminal family coverage
 
-The terminal family mirrors the DLQ family's segment lifecycle. A coverage run
-checks these actions are reachable:
+The terminal family mirrors the DLQ family's segment lifecycle. A coverage run checks these actions are reachable:
 
-| Action |
-|---|
-| `FastComplete` (tags `terminalSegmentOf`) |
-| `StatefulComplete` (tags `terminalSegmentOf`) |
+| Action                                               |
+| ---------------------------------------------------- |
+| `FastComplete` (tags `terminalSegmentOf`)            |
+| `StatefulComplete` (tags `terminalSegmentOf`)        |
 | `CancelWaitingToTerminal` (tags `terminalSegmentOf`) |
-| `MoveFailedToDlq` (clears `terminalSegmentOf`) |
-| `RotateTerminalSegments` |
-| `PruneTerminalSegment` |
+| `MoveFailedToDlq` (clears `terminalSegmentOf`)       |
+| `RotateTerminalSegments`                             |
+| `PruneTerminalSegment`                               |
 
-This removes the previous gap where `terminal_entries` was the only
-"monotonic-growing" set in the spec — it now shares the rotate/prune
-reclaim story with the other families, matching the ADR-019 retention
-model.
+This removes the previous gap where `terminal_entries` was the only "monotonic-growing" set in the spec — it now shares the rotate/prune reclaim story with the other families, matching the ADR-019 retention model.
 
-ADR-026 adds the retained-body shape for ready-backed terminal rows.
-`TerminalHasRetainedReadyBody` asserts that every modelled terminal fact keeps
-its ready row and lane key until queue prune removes the ready segment. Moving
-a failed terminal row into the DLQ removes the terminal fact but keeps the
-retained ready body; DLQ liveness is defined by `CurrentReady`, not by physical
-absence from `ready_entries`. `PruneReadySegment` removes terminal facts and
-tombstones in the pruned ready segment so the model matches queue-ring
-reclamation.
+ADR-026 adds the retained-body shape for ready-backed terminal rows. `TerminalHasRetainedReadyBody` asserts that every modelled terminal fact keeps its ready row and lane key until queue prune removes the ready segment. Moving a failed terminal row into the DLQ removes the terminal fact but keeps the retained ready body; DLQ liveness is defined by `CurrentReady`, not by physical absence from `ready_entries`. `PruneReadySegment` removes terminal facts and tombstones in the pruned ready segment so the model matches queue-ring reclamation.
 
 ## Mapping to Rust code
 
-See [`MAPPING.md`](./MAPPING.md) for the action-by-action correspondence
-between TLA+ transitions and the Rust implementation, including the SQL
-statements that enforce each guard.
+See [`MAPPING.md`](./MAPPING.md) for the action-by-action correspondence between TLA+ transitions and the Rust implementation, including the SQL statements that enforce each guard.
 
 ## Lock-order companion spec
 
-[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each
-storage-engine transaction (claim, rotate-leases, prune-leases,
-rotate-ready, prune-ready) as an ordered sequence of Postgres lock
-acquisitions, with a simplified shared/exclusive compatibility matrix
-that captures the cases relevant to deadlock analysis. Invariants:
+[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each storage-engine transaction (claim, rotate-leases, prune-leases, rotate-ready, prune-ready) as an ordered sequence of Postgres lock acquisitions, with a simplified shared/exclusive compatibility matrix that captures the cases relevant to deadlock analysis. Invariants:
 
 - `NoDeadlock`: the waits-for graph is acyclic
 - `LockCompatibility`: no two incompatible locks on the same resource
 - `HeldOnlyByRunningTxs`: committed transactions hold no locks
-- `NoGlobalStall`: there is always some running transaction that can
-  make progress (a stall-free-safety-check stand-in for liveness)
+- `NoGlobalStall`: there is always some running transaction that can make progress (a stall-free-safety-check stand-in for liveness)
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run
-  against the real Rust lock plans — **39,040 distinct states, clean**.
-  Models claim (receipts and legacy modes), complete, close-receipt,
-  rescue-receipts, ensure-running, the two cancel branches, plus
-  rotate / prune for the queue, lease, and claim rings. This is the
-  positive artifact saying the current SQL lock ordering is
-  deadlock-free and the lock compatibility contract holds.
-- [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg):
-  sanity harness using a deliberately cycle-creating pair of plans —
-  **NoDeadlock tripped in 5 steps** (confirms the checker works).
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans — **39,040 distinct states, clean**. Models claim (receipts and legacy modes), complete, close-receipt, rescue-receipts, ensure-running, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
 
 Run:
 
@@ -189,82 +132,34 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ```
 
-Coverage note: the plans model the lock steps that actually appear in
-the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS
-EXCLUSIVE` / the implicit AccessShare of SELECT on partition
-children). They do NOT model implicit table-level locks beyond what
-is named, or Postgres's lock-timeout / deadlock-detector abort choice.
-The spec treats a waits-for cycle as a safety violation, which is
-conservative — Postgres would abort one transaction and let the other
-proceed. For our purposes "this sequence of lock requests could
-produce a cycle" is the thing we want to catch, regardless of how
-the runtime resolves it.
+Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
 
 ## Race-exposure companion spec
 
-[`AwaSegmentedStorageRaces.tla`](./AwaSegmentedStorageRaces.tla) refines the
-Claim action into a two-step `BeginClaim(w, j)` / `CommitClaim(w)` with a
-per-worker `claimIntent` snapshot, and enables `RotateLeaseSegments` /
-`PruneLeaseSegment` to fire between the steps. The checked-in configs both
-run with two workers so the race is exercised under real contention rather
-than a single-worker self-interleaving. Two configs:
+[`AwaSegmentedStorageRaces.tla`](./AwaSegmentedStorageRaces.tla) refines the Claim action into a two-step `BeginClaim(w, j)` / `CommitClaim(w)` with a per-worker `claimIntent` snapshot, and enables `RotateLeaseSegments` / `PruneLeaseSegment` to fire between the steps. The checked-in configs both run with two workers so the race is exercised under real contention rather than a single-worker self-interleaving. Two configs:
 
-- [`AwaSegmentedStorageRaces.cfg`](./AwaSegmentedStorageRaces.cfg):
-  naive `CommitClaim` (uses the snapshotted segment without re-check).
-  **TLC finds `PrunedLeaseSegmentsAreEmpty` violated in 6 steps** — the
-  trace shows Init → EnqueueReady → BeginClaim (snapshot seg 1) →
-  RotateLeaseSegments (seg 1 → sealed) → PruneLeaseSegment(1) (seg 1 →
-  pruned, precondition passes because the pending claim isn't committed
-  yet so `activeLeases = {}`) → CommitClaim lands a lease in segment 1,
-  now pruned. This is simultaneously the claim-vs-rotate race and the
-  prune check-then-act race.
-- [`AwaSegmentedStorageRacesSafe.cfg`](./AwaSegmentedStorageRacesSafe.cfg):
-  `CommitClaimChecked` re-reads `leaseSegments[leaseSeg] = "open"` at
-  commit time. TLC completes cleanly with no invariant violations.
-- [`AwaSegmentedStorageRacesMultiWorker.cfg`](./AwaSegmentedStorageRacesMultiWorker.cfg):
-  same safe refinement, but with three workers to exercise the checked
-  claim path under higher claimant contention. TLC completes cleanly.
+- [`AwaSegmentedStorageRaces.cfg`](./AwaSegmentedStorageRaces.cfg): naive `CommitClaim` (uses the snapshotted segment without re-check). **TLC finds `PrunedLeaseSegmentsAreEmpty` violated in 6 steps** — the trace shows Init → EnqueueReady → BeginClaim (snapshot seg 1) → RotateLeaseSegments (seg 1 → sealed) → PruneLeaseSegment(1) (seg 1 → pruned, precondition passes because the pending claim isn't committed yet so `activeLeases = {}`) → CommitClaim lands a lease in segment 1, now pruned. This is simultaneously the claim-vs-rotate race and the prune check-then-act race.
+- [`AwaSegmentedStorageRacesSafe.cfg`](./AwaSegmentedStorageRacesSafe.cfg): `CommitClaimChecked` re-reads `leaseSegments[leaseSeg] = "open"` at commit time. TLC completes cleanly with no invariant violations.
+- [`AwaSegmentedStorageRacesMultiWorker.cfg`](./AwaSegmentedStorageRacesMultiWorker.cfg): same safe refinement, but with three workers to exercise the checked claim path under higher claimant contention. TLC completes cleanly.
 
-Run either with `./correctness/run-tlc.sh`. The race-exposing config is
-expected to produce a counterexample; the safe config is expected to pass.
+Run either with `./correctness/run-tlc.sh`. The race-exposing config is expected to produce a counterexample; the safe config is expected to pass.
 
-What this proves: the race is real at the data-spec abstraction level. The
-safe config models a checked-commit discipline; the Rust implementation does
-not use `FOR SHARE` on `lease_ring_state`. Production instead relies on the
-rotator's compare-and-swap on `(current_slot, generation)`, child-partition
-locking, and the busy-check before rotation/prune. The lock-order companion
-spec documents that actual SQL lock shape. See [`MAPPING.md`](./MAPPING.md)
-for the full lock-interaction analysis.
+What this proves: the race is real at the data-spec abstraction level. The safe config models a checked-commit discipline; the Rust implementation does not use `FOR SHARE` on `lease_ring_state`. Production instead relies on the rotator's compare-and-swap on `(current_slot, generation)`, child-partition locking, and the busy-check before rotation/prune. The lock-order companion spec documents that actual SQL lock shape. See [`MAPPING.md`](./MAPPING.md) for the full lock-interaction analysis.
 
 ## Storage-transition companion spec
 
-[`AwaStorageTransition.tla`](./AwaStorageTransition.tla) models the
-`0.5.x canonical -> 0.6 queue_storage` control plane from #180. It is
-deliberately smaller than the segmented-storage data model: it tracks the
-transition singleton, prepared schema readiness, runtime capability reports,
-effective queue executors, canonical backlog count, queue-storage row count,
-producer routing, finalize, and abort interlocks.
+[`AwaStorageTransition.tla`](./AwaStorageTransition.tla) models the `0.5.x canonical -> 0.6 queue_storage` control plane from #180. It is deliberately smaller than the segmented-storage data model: it tracks the transition singleton, prepared schema readiness, runtime capability reports, effective queue executors, canonical backlog count, queue-storage row count, producer routing, finalize, and abort interlocks.
 
-The model separates three runtime populations that collapse to similar
-database rows in parts of the implementation:
+The model separates three runtime populations that collapse to similar database rows in parts of the implementation:
 
 - old canonical-only runtimes (`storage_capability = 'canonical'`)
-- auto 0.6 runtimes started before mixed transition, which report
-  `queue_storage` while prepared but become `canonical_drain_only` after
-  routing flips
-- explicit queue-storage targets, which can actually execute queue-storage
-  work immediately after mixed transition starts
+- auto 0.6 runtimes started before mixed transition, which report `queue_storage` while prepared but become `canonical_drain_only` after routing flips
+- explicit queue-storage targets, which can actually execute queue-storage work immediately after mixed transition starts
 
 Configs:
 
-- [`AwaStorageTransition.cfg`](./AwaStorageTransition.cfg): desired gate,
-  requiring a live queue-storage executor at `EnterMixedTransition`. TLC
-  completes cleanly with **222 distinct states**.
-- [`AwaStorageTransitionCurrentGate.cfg`](./AwaStorageTransitionCurrentGate.cfg):
-  historical pre-v014 failing witness for the old SQL-level capability-only gate.
-  TLC trips `MixedHasQueueExecutor` in 5 steps: prepare queue storage,
-  prepare schema, start an auto pre-mixed runtime, enter mixed transition,
-  and end up with queue-storage routing but no queue executor.
+- [`AwaStorageTransition.cfg`](./AwaStorageTransition.cfg): desired gate, requiring a live queue-storage executor at `EnterMixedTransition`. TLC completes cleanly with **222 distinct states**.
+- [`AwaStorageTransitionCurrentGate.cfg`](./AwaStorageTransitionCurrentGate.cfg): historical pre-v014 failing witness for the old SQL-level capability-only gate. TLC trips `MixedHasQueueExecutor` in 5 steps: prepare queue storage, prepare schema, start an auto pre-mixed runtime, enter mixed transition, and end up with queue-storage routing but no queue executor.
 
 Run:
 
@@ -273,78 +168,34 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageTransition.tla storage/AwaStorageTransitionCurrentGate.cfg
 ```
 
-What this proves: the finalize and abort gates are captured at the same
-abstraction level as the migration SQL, and the mixed-transition gate needs
-to prove executor liveness rather than only queue-storage capability. The
-current implementation can require explicit operator discipline, but the SQL
-gate itself cannot distinguish a pre-mixed auto runtime from an explicit
-queue-storage target.
+What this proves: the finalize and abort gates are captured at the same abstraction level as the migration SQL, and the mixed-transition gate needs to prove executor liveness rather than only queue-storage capability. The current implementation can require explicit operator discipline, but the SQL gate itself cannot distinguish a pre-mixed auto runtime from an explicit queue-storage target.
 
 ## Dead-tuple architectural contract
 
-[`AwaDeadTupleContract.tla`](./AwaDeadTupleContract.tla) is the
-companion to ADR-023 that catches dead-tuple regressions at design
-time, before they show up as autovacuum running behind in production.
-Each table declares a `kind` and a `hot` flag; each transaction
-declares the `Insert` / `Update` / `Delete` / `Truncate` operations
-it performs.
+[`AwaDeadTupleContract.tla`](./AwaDeadTupleContract.tla) is the companion to ADR-023 that catches dead-tuple regressions at design time, before they show up as autovacuum running behind in production. Each table declares a `kind` and a `hot` flag; each transaction declares the `Insert` / `Update` / `Delete` / `Truncate` operations it performs.
 
 Reclaim kinds:
 
-- `PartitionTruncate`: partition rotation + `TRUNCATE` reclaims an
-  entire child child at a time. Suitable for hot tables whose row
-  count grows with traffic.
-- `Warm`: row count is high-mutation but **bounded** by something
-  that does not scale with traffic (worker fleet size, queue lane
-  count, etc.). Autovacuum scans a small heap and keeps up cheaply.
-  Requires a non-empty `bounded_by` field naming the bound — that
-  bound is the operator's commitment, and breaking it (e.g. letting
-  `attempt_state` retain terminated rows) graduates the table to
-  `PartitionTruncate`.
-- `RowVacuum`: low mutation rate; cold metadata. Autovacuum trivially
-  keeps up.
+- `PartitionTruncate`: partition rotation + `TRUNCATE` reclaims an entire child child at a time. Suitable for hot tables whose row count grows with traffic.
+- `Warm`: row count is high-mutation but **bounded** by something that does not scale with traffic (worker fleet size, queue lane count, etc.). Autovacuum scans a small heap and keeps up cheaply. Requires a non-empty `bounded_by` field naming the bound — that bound is the operator's commitment, and breaking it (e.g. letting `attempt_state` retain terminated rows) graduates the table to `PartitionTruncate`.
+- `RowVacuum`: low mutation rate; cold metadata. Autovacuum trivially keeps up.
 - `AppendOnly`: never reclaimed; archive shape.
 
 The static checks:
 
-- `HotTablesAreNotRowVacuum`: a hot-mutation table must be
-  `PartitionTruncate` or `Warm`. This is the rule the original
-  `open_receipt_claims` design violated. A new entry like
-  `open_receipt_claims |-> [kind |-> "RowVacuum", hot |-> "hot"]`
-  fires this assumption.
-- `PartitionTruncateTablesAreReclaimed`: every partitioned hot table
-  must have at least one transaction in the model that performs
-  `Truncate` on it (i.e. a `prune_*` maintenance path is wired).
-  Without this, partitions never get reclaimed and the table grows
-  monotonically.
-- `WarmTablesDocumentTheirBound`: every `Warm` table must declare a
-  non-empty `bounded_by` and be marked `hot`. Forces the operator
-  to name the bound rather than wave it through with a comment.
-- `BacklogRowVacuumTablesDocumentTheirBound`: unpartitioned backlog
-  tables such as `deferred_jobs` and `dlq_entries` must name the
-  backlog or retention policy that bounds live rows. This is a release
-  validation hook, not a structural truncate proof.
-- `OnlyBoundedKindsHaveBoundedBy`: only `Warm` and
-  `BacklogRowVacuum` tables may set `bounded_by`; on every other kind
-  the field is dead weight.
-- `AppendOnlyAcceptsOnlyInsert`: archive / never-reclaimed tables
-  forbid `Update` and `Delete`.
-- `VacuumKindTablesNotTruncated`: `TRUNCATE` is the
-  `PartitionTruncate` reclaim mechanism; using it on a `RowVacuum`
-  `Warm`, or `BacklogRowVacuum` table either contradicts the kind or
-  means the kind is wrong.
+- `HotTablesAreNotRowVacuum`: a hot-mutation table must be `PartitionTruncate` or `Warm`. This is the rule the original `open_receipt_claims` design violated. A new entry like `open_receipt_claims |-> [kind |-> "RowVacuum", hot |-> "hot"]` fires this assumption.
+- `PartitionTruncateTablesAreReclaimed`: every partitioned hot table must have at least one transaction in the model that performs `Truncate` on it (i.e. a `prune_*` maintenance path is wired). Without this, partitions never get reclaimed and the table grows monotonically.
+- `WarmTablesDocumentTheirBound`: every `Warm` table must declare a non-empty `bounded_by` and be marked `hot`. Forces the operator to name the bound rather than wave it through with a comment.
+- `BacklogRowVacuumTablesDocumentTheirBound`: unpartitioned backlog tables such as `deferred_jobs` and `dlq_entries` must name the backlog or retention policy that bounds live rows. This is a release validation hook, not a structural truncate proof.
+- `OnlyBoundedKindsHaveBoundedBy`: only `Warm` and `BacklogRowVacuum` tables may set `bounded_by`; on every other kind the field is dead weight.
+- `AppendOnlyAcceptsOnlyInsert`: archive / never-reclaimed tables forbid `Update` and `Delete`.
+- `VacuumKindTablesNotTruncated`: `TRUNCATE` is the `PartitionTruncate` reclaim mechanism; using it on a `RowVacuum` `Warm`, or `BacklogRowVacuum` table either contradicts the kind or means the kind is wrong.
 
-The checks are TLA+ `ASSUME` declarations evaluated during
-semantic analysis, so a violation surfaces as a parse-time error
-rather than a model-checker counterexample. Workflow when adding a
-new SQL site or a new table:
+The checks are TLA+ `ASSUME` declarations evaluated during semantic analysis, so a violation surfaces as a parse-time error rather than a model-checker counterexample. Workflow when adding a new SQL site or a new table:
 
-1. Add the table to `TableSpec` in the spec with the right `kind`
-   and honest `hot/cold` label.
-2. Add (or update) the matching `Tx` definition with the mutation
-   list of its `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE`s.
-3. Re-run the TLC check. If anything is wrong, an `ASSUME` fires
-   with the line number of the broken invariant.
+1. Add the table to `TableSpec` in the spec with the right `kind` and honest `hot/cold` label.
+2. Add (or update) the matching `Tx` definition with the mutation list of its `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE`s.
+3. Re-run the TLC check. If anything is wrong, an `ASSUME` fires with the line number of the broken invariant.
 
 Run:
 
@@ -352,40 +203,19 @@ Run:
 ./correctness/run-tlc.sh storage/AwaDeadTupleContract.tla
 ```
 
-Expected outcome: clean run, no assumption violation. The whole
-check is a single TLC initial state and finishes in well under a
-second.
+Expected outcome: clean run, no assumption violation. The whole check is a single TLC initial state and finishes in well under a second.
 
-This spec models the **architectural contract** for dead tuples.
-For partitioned hot tables it checks that a real truncate path exists.
-For `BacklogRowVacuum` tables it deliberately does not claim a static
-proof: the complementary numerical check (how many dead tuples does the
-system actually accumulate under load X?) lives in the external
-`hardbyte/postgresql-job-queue-benchmarking` harness; see the long-horizon
-runner and the per-table dead-tuple columns in the `summary.json` it produces.
+This spec models the **architectural contract** for dead tuples. For partitioned hot tables it checks that a real truncate path exists. For `BacklogRowVacuum` tables it deliberately does not claim a static proof: the complementary numerical check (how many dead tuples does the system actually accumulate under load X?) lives in the external `hardbyte/postgresql-job-queue-benchmarking` harness; see the long-horizon runner and the per-table dead-tuple columns in the `summary.json` it produces.
 
 ## Trace-validation harness
 
-[`AwaSegmentedStorageTrace.tla`](./AwaSegmentedStorageTrace.tla)
-extends the base spec with a replay harness that verifies a concrete
-sequence of events transcribed from a real queue-storage runtime
-test is accepted by the spec. The current checked-in traces:
+[`AwaSegmentedStorageTrace.tla`](./AwaSegmentedStorageTrace.tla) extends the base spec with a replay harness that verifies a concrete sequence of events transcribed from a real queue-storage runtime test is accepted by the spec. The current checked-in traces:
 
-- `SnoozeTrace` (6 events: enqueue → claim → retry-to-deferred →
-  promote → claim → fast-complete) — accepted cleanly, 7 states.
-  Transcribed from `test_queue_storage_runtime_snooze`.
-- `ReceiptRescueTrace` (3 events: enqueue → seed receipt-only claim →
-  rescue stale receipt) — accepted cleanly, 4 states. The seed action
-  is trace-only scaffolding because the base spec's `Claim` action
-  materializes a lease immediately while the implementation has a short
-  receipt-only window before materialization.
-- `RunningCancelTrace` (3 events: enqueue → claim → running admin
-  cancel) — accepted cleanly, 4 states.
-- `DlqRetryTrace` (6 events: enqueue → claim → fail-to-DLQ →
-  retry-from-DLQ → claim → fast-complete) — accepted cleanly, 7 states.
-- `BrokenTrace` (same events with steps 3 and 4 swapped) —
-  rejected with a deadlock at traceIdx = 2, proving the harness
-  catches invalid sequences.
+- `SnoozeTrace` (6 events: enqueue → claim → retry-to-deferred → promote → claim → fast-complete) — accepted cleanly, 7 states. Transcribed from `test_queue_storage_runtime_snooze`.
+- `ReceiptRescueTrace` (3 events: enqueue → seed receipt-only claim → rescue stale receipt) — accepted cleanly, 4 states. The seed action is trace-only scaffolding because the base spec's `Claim` action materializes a lease immediately while the implementation has a short receipt-only window before materialization.
+- `RunningCancelTrace` (3 events: enqueue → claim → running admin cancel) — accepted cleanly, 4 states.
+- `DlqRetryTrace` (6 events: enqueue → claim → fail-to-DLQ → retry-from-DLQ → claim → fast-complete) — accepted cleanly, 7 states.
+- `BrokenTrace` (same events with steps 3 and 4 swapped) — rejected with a deadlock at traceIdx = 2, proving the harness catches invalid sequences.
 
 Run:
 
@@ -400,43 +230,16 @@ Run:
 
 Expected outcomes:
 
-- Positive trace configs: TLC reports the matching `*TraceIncomplete`
-  invariant violation — this is the **positive witness** that the trace
-  was fully consumed.
-- Broken config: TLC reports `Deadlock reached` at traceIdx = 2 —
-  the third event (`PromoteDeferred`) has no matching enabled spec
-  action.
+- Positive trace configs: TLC reports the matching `*TraceIncomplete` invariant violation — this is the **positive witness** that the trace was fully consumed.
+- Broken config: TLC reports `Deadlock reached` at traceIdx = 2 — the third event (`PromoteDeferred`) has no matching enabled spec action.
 
-See [`MAPPING.md`](./MAPPING.md#trace-validation) for the full
-description of how to transcribe and add a new trace.
+See [`MAPPING.md`](./MAPPING.md#trace-validation) for the full description of how to transcribe and add a new trace.
 
 ## Known modelling gaps
 
-See [`../README.md`](../README.md) for the full Known Divergences list.
-Specific to this spec:
+See [`../README.md`](../README.md) for the full Known Divergences list. Specific to this spec:
 
-- **Public SQL projections are not modelled as separate views.**
-  `AwaSegmentedStorage` models the storage state and invariants underneath
-  `ready_entries`, `ready_tombstones`, `leases`, `done_entries`,
-  `dlq_entries`, and receipt partitions. It does not separately derive
-  `awa.jobs`, `terminal_jobs`, admin state counts, or health-check
-  availability. Those projection paths are covered by Rust regression tests
-  and the correspondence notes in
-  [`MAPPING.md`](./MAPPING.md#public-read-and-compatibility-surfaces).
-- **Enqueue-shard routing is split across specs.** The base storage model
-  uses one `(queue, priority, enqueue_shard)` lane. Cross-shard `lane_seq`
-  collisions are checked by `AwaShardedPrune`, but the producer shard chooser,
-  per-queue `enqueue_shards` changes, and projection exactness across shards
-  remain code-tested rather than represented in a single unified TLA+ state.
-- **DLQ bulk ops are modelled as quantified single-row actions.** The Rust
-  `bulk_retry_from_dlq` / `purge_dlq` paths are transactionally atomic across
-  the matching rows; the spec explores arbitrary interleavings of individual
-  `RetryFromDlq(j)` / `PurgeDlq(j)` which is a strictly weaker claim. Safety
-  invariants hold under both framings; a refinement with a `BulkScope` set
-  variable could tighten this.
-- **Unique-claim conflicts on `retry_from_dlq`.** The Rust contract says
-  retry-from-dlq returns `UniqueConflict` and leaves the DLQ row intact when
-  a replacement owns the unique slot. The model doesn't have unique keys, so
-  TLC simply explores `RetryFromDlq(j)` whenever the precondition holds.
-  Preserving-the-DLQ-row-on-conflict is enforced in SQL
-  (`awa-model/src/queue_storage.rs::sync_unique_claim`).
+- **Public SQL projections are not modelled as separate views.** `AwaSegmentedStorage` models the storage state and invariants underneath `ready_entries`, `ready_tombstones`, `leases`, `done_entries`, `dlq_entries`, and receipt partitions. It does not separately derive `awa.jobs`, `terminal_jobs`, admin state counts, or health-check availability. Those projection paths are covered by Rust regression tests and the correspondence notes in [`MAPPING.md`](./MAPPING.md#public-read-and-compatibility-surfaces).
+- **Enqueue-shard routing is split across specs.** The base storage model uses one `(queue, priority, enqueue_shard)` lane. Cross-shard `lane_seq` collisions are checked by `AwaShardedPrune`, but the producer shard chooser, per-queue `enqueue_shards` changes, and projection exactness across shards remain code-tested rather than represented in a single unified TLA+ state.
+- **DLQ bulk ops are modelled as quantified single-row actions.** The Rust `bulk_retry_from_dlq` / `purge_dlq` paths are transactionally atomic across the matching rows; the spec explores arbitrary interleavings of individual `RetryFromDlq(j)` / `PurgeDlq(j)` which is a strictly weaker claim. Safety invariants hold under both framings; a refinement with a `BulkScope` set variable could tighten this.
+- **Unique-claim conflicts on `retry_from_dlq`.** The Rust contract says retry-from-dlq returns `UniqueConflict` and leaves the DLQ row intact when a replacement owns the unique slot. The model doesn't have unique keys, so TLC simply explores `RetryFromDlq(j)` whenever the precondition holds. Preserving-the-DLQ-row-on-conflict is enforced in SQL (`awa-model/src/queue_storage.rs::sync_unique_claim`).

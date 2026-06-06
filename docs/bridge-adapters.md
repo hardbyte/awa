@@ -6,9 +6,7 @@ The core `awa::insert` and `awa::insert_with` functions require sqlx's `PgExecut
 
 ## Rust: external adapter API
 
-External Rust integration crates can reuse Awa's canonical insert preparation
-without depending on sqlx executors. The stable surface is
-`awa::adapter::postgres`:
+External Rust integration crates can reuse Awa's canonical insert preparation without depending on sqlx executors. The stable surface is `awa::adapter::postgres`:
 
 ```rust
 use awa::adapter::postgres::{
@@ -34,25 +32,11 @@ let prepared = prepare_job_insert(&args, InsertOpts::default())?;
 // 12. prepared.ordering_key()
 ```
 
-`prepare_job_insert` and `prepare_raw_job_insert` apply the same validation,
-scheduled-state selection, unique-key computation, unique-state bitmask
-formatting, and sharded enqueue ordering-key propagation as Awa's built-in
-sqlx insert path. Adapters should map Postgres SQLSTATE
-`UNIQUE_VIOLATION_SQLSTATE` to `AwaError::UniqueConflict`.
+`prepare_job_insert` and `prepare_raw_job_insert` apply the same validation, scheduled-state selection, unique-key computation, unique-state bitmask formatting, and sharded enqueue ordering-key propagation as Awa's built-in sqlx insert path. Adapters should map Postgres SQLSTATE `UNIQUE_VIOLATION_SQLSTATE` to `AwaError::UniqueConflict`.
 
-This API is intentionally single-row. High-throughput bulk ingestion remains
-on Awa's native SQLx-backed APIs (`insert_many_copy_from_pool`) and the
-queue-storage-native COPY path (`QueueStorage::enqueue_params_copy`), because
-COPY support, row return semantics, and uniqueness handling are
-driver-specific.
+This API is intentionally single-row. High-throughput bulk ingestion remains on Awa's native SQLx-backed APIs (`insert_many_copy_from_pool`) and the queue-storage-native COPY path (`QueueStorage::enqueue_params_copy`), because COPY support, row return semantics, and uniqueness handling are driver-specific.
 
-Worker polling, heartbeating, claiming, and completion remain on the Awa
-runtime. That does not prevent applications from using their existing
-database stack inside job handlers: pass a SeaORM connection, Diesel pool, or
-other app dependency through `Client::builder(...).state(...)` and extract it
-from `JobContext`. Integration crates can provide ergonomic helpers for this
-handler dependency wiring, but should not reimplement Awa's lease/runtime
-storage engine.
+Worker polling, heartbeating, claiming, and completion remain on the Awa runtime. That does not prevent applications from using their existing database stack inside job handlers: pass a SeaORM connection, Diesel pool, or other app dependency through `Client::builder(...).state(...)` and extract it from `JobContext`. Integration crates can provide ergonomic helpers for this handler dependency wiring, but should not reimplement Awa's lease/runtime storage engine.
 
 ## Rust: tokio-postgres
 
@@ -165,19 +149,9 @@ All functions return `awa::JobRow` with the full row from `RETURNING *` — same
 
 ## Rust: SeaORM
 
-SeaORM already sits on top of SQLx, so the integration is deliberately thin.
-A `sea_orm::DatabaseConnection` wraps a `sqlx::PgPool`, so for building a
-client, running migrations, or reading job state you can reach the pool
-directly (`awa_seaorm::pool(&db)` / `db.awa_pool()`) and use Awa's existing
-APIs unchanged.
+SeaORM already sits on top of SQLx, so the integration is deliberately thin. A `sea_orm::DatabaseConnection` wraps a `sqlx::PgPool`, so for building a client, running migrations, or reading job state you can reach the pool directly (`awa_seaorm::pool(&db)` / `db.awa_pool()`) and use Awa's existing APIs unchanged.
 
-The part that needs a real adapter is **transactional enqueue**.
-`get_postgres_connection_pool()` hands back a *separate* pooled connection, so
-a job inserted through it commits independently of your ORM writes. The
-`insert` / `insert_with` / `insert_raw` helpers instead run Awa's canonical
-insert SQL through SeaORM's `ConnectionTrait`, so they bind to whatever you
-pass — a `DatabaseConnection` *or* a `DatabaseTransaction` — letting a job
-commit atomically with the rest of a transaction.
+The part that needs a real adapter is **transactional enqueue**. `get_postgres_connection_pool()` hands back a _separate_ pooled connection, so a job inserted through it commits independently of your ORM writes. The `insert` / `insert_with` / `insert_raw` helpers instead run Awa's canonical insert SQL through SeaORM's `ConnectionTrait`, so they bind to whatever you pass — a `DatabaseConnection` _or_ a `DatabaseTransaction` — letting a job commit atomically with the rest of a transaction.
 
 The adapter lives in the optional `awa-seaorm` crate:
 
@@ -217,28 +191,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Without a transaction, pass the connection directly (`insert(&db, &job)`) to
-enqueue immediately, or use `client_builder(&db)` to build a worker client.
+Without a transaction, pass the connection directly (`insert(&db, &job)`) to enqueue immediately, or use `client_builder(&db)` to build a worker client.
 
 ### Why the adapter runs SQL rather than reusing `awa::insert_with`
 
-Awa's native `insert_with` is a *pull* API: hand it a `&mut sqlx::PgConnection`
-and it runs on it. A SeaORM `DatabaseTransaction` can't satisfy that. It owns
-the connection inside an `Arc<Mutex<…>>` and must keep it so a later
-`commit()`/`rollback()` runs on that same connection — so it never lends out a
-`&mut PgConnection`, and exposes no `Into`/`AsMut`/accessor for one. The only
-way it lets you use that connection is its `ConnectionTrait`, a *push* API:
-you give it a `Statement` and it runs it for you.
+Awa's native `insert_with` is a _pull_ API: hand it a `&mut sqlx::PgConnection` and it runs on it. A SeaORM `DatabaseTransaction` can't satisfy that. It owns the connection inside an `Arc<Mutex<…>>` and must keep it so a later `commit()`/`rollback()` runs on that same connection — so it never lends out a `&mut PgConnection`, and exposes no `Into`/`AsMut`/accessor for one. The only way it lets you use that connection is its `ConnectionTrait`, a _push_ API: you give it a `Statement` and it runs it for you.
 
-So the adapter inverts the direction — it pushes Awa's canonical insert SQL
-(`awa::adapter::postgres::INSERT_JOB_SQL`, the same statement and bind order
-the native path and the tokio-postgres bridge use) through `ConnectionTrait`.
-The result row, however, *is* surrendered: `QueryResult::try_as_pg_row` yields
-the underlying `sqlx::PgRow`, which Awa's own `JobRow: FromRow` decodes — so
-the returned job is identical to one from `awa::insert`, with no parallel
-decoder to drift. This is also why the workspace enables SeaORM's `with-chrono`
-and `with-json` features: only so the timestamp and JSONB bind values can
-become `sea_orm::Value`.
+So the adapter inverts the direction — it pushes Awa's canonical insert SQL (`awa::adapter::postgres::INSERT_JOB_SQL`, the same statement and bind order the native path and the tokio-postgres bridge use) through `ConnectionTrait`. The result row, however, _is_ surrendered: `QueryResult::try_as_pg_row` yields the underlying `sqlx::PgRow`, which Awa's own `JobRow: FromRow` decodes — so the returned job is identical to one from `awa::insert`, with no parallel decoder to drift. This is also why the workspace enables SeaORM's `with-chrono` and `with-json` features: only so the timestamp and JSONB bind values can become `sea_orm::Value`.
 
 ## Python: psycopg3, asyncpg, SQLAlchemy, Django
 
@@ -247,7 +206,7 @@ See [Python getting started — ORM Transaction Bridging](getting-started-python
 ## Rust feature flags
 
 | Feature | Crate | What it enables |
-|---------|-------|-----------------|
+| --- | --- | --- |
 | `tokio-postgres` | `awa` or `awa-model` | `awa::bridge::tokio_pg` adapter |
 | `cel` | `awa` or `awa-model` | CEL expression evaluation for callback filtering |
 | `anyhow` | `awa` | `From<anyhow::Error>` for `JobError` |

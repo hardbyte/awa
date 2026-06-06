@@ -2,39 +2,25 @@
 
 **Postgres-native job queue for Rust and Python.**
 
-Awa (Māori: river) fills the gap between Postgres event queues that are too
-narrow for real job-queue behavior and language-specific job frameworks (River,
-Oban, Sidekiq) that couple you to one ecosystem. If you run Rust or Python (or
-both) on Postgres and want priorities, cron, DLQ, and transactional enqueue
-without Redis or RabbitMQ, Awa is built for you.
+Awa (Māori: river) fills the gap between Postgres event queues that are too narrow for real job-queue behavior and language-specific job frameworks (River, Oban, Sidekiq) that couple you to one ecosystem. If you run Rust or Python (or both) on Postgres and want priorities, cron, DLQ, and transactional enqueue without Redis or RabbitMQ, Awa is built for you.
 
 ![AWA Web UI — Jobs (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
 
 ## Core Concepts
 
 - A **job** is a typed payload stored in Postgres until a worker handles it.
-- A **queue** is the operational boundary workers subscribe to; use separate
-  queues when workloads need different capacity, ownership, or failure policy.
-- A **scheduled job** has a future `run_at`. Awa stores scheduled jobs outside
-  the ready claim path and promotes them when due. Retry backoff and snooze use
-  the same deferred backlog.
-- A worker **claims** a job before running it. The claim increments
-  `run_lease`, which guards completion so stale workers cannot finish a newer
-  attempt.
-- A **lease** is the durable execution record for a live attempt. Short jobs
-  usually stay on the receipt path; jobs that need heartbeat, progress,
-  callbacks, or mutable attempt state materialize a lease row.
-- A **lane** is the ordered stream for one `(queue, priority, enqueue_shard)`.
-  FIFO is strict inside a lane; raising shard count creates partitioned FIFO.
-- A **segment** is a ring partition Awa can rotate and later truncate.
-  Segments keep high-churn queue history off long-lived row-vacuum paths.
-- A **ready tombstone** is a small marker saying an immutable ready row should
-  no longer be claimed, for example after cancelling or reprioritizing an
-  unclaimed job. The ready row itself stays append-only until segment prune.
+- A **queue** is the operational boundary workers subscribe to; use separate queues when workloads need different capacity, ownership, or failure policy.
+- A **scheduled job** has a future `run_at`. Awa stores scheduled jobs outside the ready claim path and promotes them when due. Retry backoff and snooze use the same deferred backlog.
+- A worker **claims** a job before running it. The claim increments `run_lease`, which guards completion so stale workers cannot finish a newer attempt.
+- A **lease** is the durable execution record for a live attempt. Short jobs usually stay on the receipt path; jobs that need heartbeat, progress, callbacks, or mutable attempt state materialize a lease row.
+- A **lane** is the ordered stream for one `(queue, priority, enqueue_shard)`. FIFO is strict inside a lane; raising shard count creates partitioned FIFO.
+- A **segment** is a ring partition Awa can rotate and later truncate. Segments keep high-churn queue history off long-lived row-vacuum paths.
+- A **ready tombstone** is a small marker saying an immutable ready row should no longer be claimed, for example after cancelling or reprioritizing an unclaimed job. The ready row itself stays append-only until segment prune.
 
 ## Features
 
 ### Core queue
+
 - **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone.
 - **Unique jobs** — declare uniqueness by kind/queue/args; cancel by unique key without storing job IDs.
 - **Priorities, retries, snoozes** — exponential backoff with jitter; priority aging for fairness.
@@ -44,6 +30,7 @@ without Redis or RabbitMQ, Awa is built for you.
 - **Webhook callbacks** — park jobs for external completion with optional CEL-expression filtering.
 
 ### Runtime
+
 - **Rust and Python workers** — same queues, same storage engine, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
 - **Runtime-owned maintenance** — dispatch, rescue, queue/lease/claim ring rotation, pruning, and cleanup run in the worker fleet; no `pg_cron` ticker required.
@@ -53,6 +40,7 @@ without Redis or RabbitMQ, Awa is built for you.
 - **Weighted concurrency + rate limiting** — global worker pool with per-queue guarantees; per-queue token bucket.
 
 ### Operations
+
 - **Web UI** — dashboard, job inspector, queue management, cron controls, DLQ retry/purge.
 - **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
 - **OpenTelemetry metrics** — 20+ built-in counters, histograms, and gauges for Prometheus/Grafana. Python workers enable export with `awa.init_telemetry(endpoint, service)`; Rust workers install their own provider.
@@ -63,78 +51,35 @@ without Redis or RabbitMQ, Awa is built for you.
 
 ## Correctness
 
-Core concurrency invariants — no duplicate processing after rescue, stale
-completions rejected, no claim/rotate/prune deadlock, DLQ round-trip safety,
-prune-segment emptiness, heartbeat-driven short-job rescue — are checked by
-[TLA+ models](https://github.com/hardbyte/awa/blob/main/correctness/README.md)
-covering the segmented storage engine, the lock-ordering protocol, and the
-single/multi-instance worker runtime. The storage model has a trace-replay
-harness that verifies concrete runtime-test event sequences against the spec.
+Core concurrency invariants — no duplicate processing after rescue, stale completions rejected, no claim/rotate/prune deadlock, DLQ round-trip safety, prune-segment emptiness, heartbeat-driven short-job rescue — are checked by [TLA+ models](https://github.com/hardbyte/awa/blob/main/correctness/README.md) covering the segmented storage engine, the lock-ordering protocol, and the single/multi-instance worker runtime. The storage model has a trace-replay harness that verifies concrete runtime-test event sequences against the spec.
 
 ## Delivery Contract
 
-- **Transactional enqueue** is a core Postgres-native feature: enqueue inside
-  the same transaction as application data, and the job commits or rolls back
-  with that data.
-- **At-least-once delivery** is the contract. Awa rejects stale completions
-  and rescues stuck work, but it does not promise “exactly once”.
-- **Idempotency is recommended** for handlers, because retries and recovery are
-  part of the honest failure model.
-- **No lost work under failure** takes priority over clever fast paths. If a
-  design weakens crash/restart safety, it loses even if the benchmark looks
-  better.
-- **Strict FIFO per `(queue, priority)` by default.** Operators can opt a
-  contended queue into **partitioned FIFO** by raising
-  `awa.queue_meta.enqueue_shards` — the same kind of trade as choosing SQS
-  Standard over SQS FIFO, or raising Kafka partition count. Producers pin
-  related jobs to one shard with `ordering_key`. See
-  [ADR-025](docs/adr/025-sharded-enqueue-heads.md).
+- **Transactional enqueue** is a core Postgres-native feature: enqueue inside the same transaction as application data, and the job commits or rolls back with that data.
+- **At-least-once delivery** is the contract. Awa rejects stale completions and rescues stuck work, but it does not promise “exactly once”.
+- **Idempotency is recommended** for handlers, because retries and recovery are part of the honest failure model.
+- **No lost work under failure** takes priority over clever fast paths. If a design weakens crash/restart safety, it loses even if the benchmark looks better.
+- **Strict FIFO per `(queue, priority)` by default.** Operators can opt a contended queue into **partitioned FIFO** by raising `awa.queue_meta.enqueue_shards` — the same kind of trade as choosing SQS Standard over SQS FIFO, or raising Kafka partition count. Producers pin related jobs to one shard with `ordering_key`. See [ADR-025](docs/adr/025-sharded-enqueue-heads.md).
 
 ## Benchmarks
 
-The north-star benchmark is not enqueue-only speed. Awa is judged by
-end-to-end completion throughput, p99 end-to-end latency, queue depth under
-oversupply, WAL bytes per completed job, transaction commits per completed job,
-and dead tuples / prune lag. Enqueue-only rates are reported separately for
-producer-path regressions.
+The north-star benchmark is not enqueue-only speed. Awa is judged by end-to-end completion throughput, p99 end-to-end latency, queue depth under oversupply, WAL bytes per completed job, transaction commits per completed job, and dead tuples / prune lag. Enqueue-only rates are reported separately for producer-path regressions.
 
-Queue-storage soak reference, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95
-pickup**, **417 exact final dead tuples**. Enqueue reference: ~30k/s
-single-producer, ~100k/s multi-producer.
+Queue-storage soak reference, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95 pickup**, **417 exact final dead tuples**. Enqueue reference: ~30k/s single-producer, ~100k/s multi-producer.
 
-For high-volume queue-storage producers, use the direct queue-storage COPY
-path: Python `enqueue_many_copy()` or Rust
-`QueueStorage::enqueue_params_copy()`. Configure direct-copy producers with the
-same queue-storage routing knobs as the worker fleet, especially
-`queue_stripe_count` / `queue_storage_queue_stripe_count`. The older
-`insert_many_copy()` API is the compatibility insert surface; it remains useful
-for canonical-storage compatibility and adapters, but it is not the
-queue-storage producer fast path.
+For high-volume queue-storage producers, use the direct queue-storage COPY path: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Configure direct-copy producers with the same queue-storage routing knobs as the worker fleet, especially `queue_stripe_count` / `queue_storage_queue_stripe_count`. The older `insert_many_copy()` API is the compatibility insert surface; it remains useful for canonical-storage compatibility and adapters, but it is not the queue-storage producer fast path.
 
-A phase-driven portable benchmark harness comparing Awa against pgque,
-procrastinate, pg-boss, river, oban, and pgmq on a shared Postgres
-instance lives in its own repository:
-[hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
-It records producer, subscriber, and end-to-end delivery latency
-alongside throughput, queue depth, dead tuples, WAL pressure, and transaction
-pressure over time.
+A phase-driven portable benchmark harness comparing Awa against pgque, procrastinate, pg-boss, river, oban, and pgmq on a shared Postgres instance lives in its own repository: [hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking). It records producer, subscriber, and end-to-end delivery latency alongside throughput, queue depth, dead tuples, WAL pressure, and transaction pressure over time.
 
-Methodology and caveats live in
-[benchmarking notes](docs/benchmarking.md). Validation artifacts:
-[ADR-019 (queue storage)](docs/adr/bench/019-queue-storage-validation-2026-04-19.md)
-and [ADR-023 (receipt-plane ring partitioning)](docs/adr/bench/023-receipt-ring-validation-2026-04-26.md).
+Methodology and caveats live in [benchmarking notes](docs/benchmarking.md). Validation artifacts: [ADR-019 (queue storage)](docs/adr/bench/019-queue-storage-validation-2026-04-19.md) and [ADR-023 (receipt-plane ring partitioning)](docs/adr/bench/023-receipt-ring-validation-2026-04-26.md).
 
 ## Where Awa Fits
 
-Awa is for teams that already trust Postgres and want a real job queue, not
-just a stream or a framework tied to one host language.
+Awa is for teams that already trust Postgres and want a real job queue, not just a stream or a framework tied to one host language.
 
-- Choose Awa when you want priorities, unique jobs, retries, cron, callbacks,
-  DLQ, and operator tooling on one Postgres-backed runtime.
-- Choose PgQue-style systems when you want an event queue with independent
-  consumer cursors and event-log semantics first.
-- Choose River or Oban Pro when you want a job framework tightly shaped around
-  one surrounding language ecosystem.
+- Choose Awa when you want priorities, unique jobs, retries, cron, callbacks, DLQ, and operator tooling on one Postgres-backed runtime.
+- Choose PgQue-style systems when you want an event queue with independent consumer cursors and event-log semantics first.
+- Choose River or Oban Pro when you want a job framework tightly shaped around one surrounding language ecosystem.
 
 See [docs/positioning.md](docs/positioning.md) for the category map and messaging guidance.
 
@@ -158,14 +103,7 @@ awa --database-url $DATABASE_URL job dump 123
 awa --database-url $DATABASE_URL job dump-run 123
 ```
 
-The Awa mental model: your app inserts durable queue entries inside Postgres,
-often in the same transaction as business data. Immediate jobs become ready for
-workers; scheduled jobs, retry backoff, and snoozes wait in the deferred backlog
-until maintenance promotes them. Workers claim runnable entries through guarded
-attempt identity and rescue stale work after crashes; long-running attempts
-touch `attempt_state` only when they need mutable data like progress or callback
-state. Operators inspect scheduled, live, terminal, and DLQ state through the
-CLI or the built-in UI.
+The Awa mental model: your app inserts durable queue entries inside Postgres, often in the same transaction as business data. Immediate jobs become ready for workers; scheduled jobs, retry backoff, and snoozes wait in the deferred backlog until maintenance promotes them. Workers claim runnable entries through guarded attempt identity and rescue stale work after crashes; long-running attempts touch `attempt_state` only when they need mutable data like progress or callback state. Operators inspect scheduled, live, terminal, and DLQ state through the CLI or the built-in UI.
 
 Language-specific guides:
 
@@ -180,10 +118,7 @@ Configuring real workloads:
 - [Dead Letter Queue](docs/configuration.md#dead-letter-queue) — when to enable, per-queue overrides, operator workflow
 - [Deploying on managed Postgres](docs/deploying-on-managed-postgres.md) — Cloud SQL / AlloyDB sizing data, IAM grants, auth-proxy sidecar, gotchas
 
-Already running 0.5? Read the [0.5 → 0.6 upgrade guide](docs/upgrade-0.5-to-0.6.md)
-before you bump — 0.6 introduces a staged storage transition (canonical →
-prepared → mixed_transition → active) with a refused-by-default gate that
-expects the operator to roll out queue-storage-capable workers first.
+Already running 0.5? Read the [0.5 → 0.6 upgrade guide](docs/upgrade-0.5-to-0.6.md) before you bump — 0.6 introduces a staged storage transition (canonical → prepared → mixed_transition → active) with a refused-by-default gate that expects the operator to roll out queue-storage-capable workers first.
 
 ## Python Example
 
@@ -253,9 +188,7 @@ async def create_order(session: AsyncSession, order_id: str) -> int:
     return job["id"]
 ```
 
-`AsyncClient` is the worker/admin/direct-producer handle. In web handlers,
-keep using SQLAlchemy, asyncpg, psycopg, Django, or your existing database
-stack, and call `awa.bridge.insert_job(...)` inside that transaction.
+`AsyncClient` is the worker/admin/direct-producer handle. In web handlers, keep using SQLAlchemy, asyncpg, psycopg, Django, or your existing database stack, and call `awa.bridge.insert_job(...)` inside that transaction.
 
 **Sync API** for synchronous workers/admin code:
 
@@ -265,9 +198,7 @@ client.migrate()
 job = client.insert(SendEmail(to="bob@example.com", subject="Hello"))
 ```
 
-For Django/Flask request transactions, use `awa.bridge.insert_job_sync(...)`
-with the framework's existing connection/session instead of routing app SQL
-through Awa.
+For Django/Flask request transactions, use `awa.bridge.insert_job_sync(...)` with the framework's existing connection/session instead of routing app SQL through Awa.
 
 **Sequential callbacks** — suspend a handler, wait for an external system, then resume:
 
@@ -358,21 +289,15 @@ tx.commit().await?;
 awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;
 ```
 
-Lifecycle hooks receive `Started` after a claim commits as the worker handler
-is about to run, plus outcome events (`Completed`, `Retried`, `Exhausted`,
-`Cancelled`) after the corresponding state transition commits. Hooks run in
-detached tasks, so they do not block job execution.
+Lifecycle hooks receive `Started` after a claim commits as the worker handler is about to run, plus outcome events (`Completed`, `Retried`, `Exhausted`, `Cancelled`) after the corresponding state transition commits. Hooks run in detached tasks, so they do not block job execution.
 
 Cancellation is cooperative for running handlers:
 
 - Rust handlers can poll `ctx.is_cancelled()`.
 - Python handlers can poll `job.is_cancelled()`.
 - Shutdown and runtime rescue paths flip that flag.
-- Admin cancel (`awa::admin::cancel`, `client.cancel`) updates job state in
-  storage and signals the matching in-flight handler, when that exact running
-  attempt is still alive on a worker process.
-- If a handler ignores the signal or returns too late, stale completion/retry
-  results remain no-ops because the job is already cancelled in storage.
+- Admin cancel (`awa::admin::cancel`, `client.cancel`) updates job state in storage and signals the matching in-flight handler, when that exact running attempt is still alive on a worker process.
+- If a handler ignores the signal or returns too late, stale completion/retry results remain no-ops because the job is already cancelled in storage.
 
 ## Installation
 
@@ -385,10 +310,7 @@ pip install 'awa-pg[ui]'    # SDK + bundled `awa` binary for the dashboard
 pip install awa-cli         # CLI on its own: migrations, queue admin, web UI
 ```
 
-`pip install awa-pg` stays small for workers and producers. The `[ui]` extra
-pulls in [`awa-cli`](https://pypi.org/project/awa-cli/), which ships the
-`awa` binary plus the embedded React dashboard; afterwards `python -m awa
-serve` (or `awa serve` directly) launches it.
+`pip install awa-pg` stays small for workers and producers. The `[ui]` extra pulls in [`awa-cli`](https://pypi.org/project/awa-cli/), which ships the `awa` binary plus the embedded React dashboard; afterwards `python -m awa serve` (or `awa serve` directly) launches it.
 
 ### Rust
 
@@ -436,28 +358,25 @@ awa --database-url $DATABASE_URL job dump-run 123
    └────────┘└────────┘└────────┘
 ```
 
-All coordination through Postgres. The Rust runtime owns dispatch, leases,
-heartbeats, rescue, rotation, prune, and shutdown for both languages. Mixed
-Rust and Python workers coexist on the same queues. See
-[architecture overview](docs/architecture.md) for full details.
+All coordination through Postgres. The Rust runtime owns dispatch, leases, heartbeats, rescue, rotation, prune, and shutdown for both languages. Mixed Rust and Python workers coexist on the same queues. See [architecture overview](docs/architecture.md) for full details.
 
 ## Workspace
 
-| Crate | Purpose |
-|---|---|
-| `awa` | Main crate — re-exports `awa-model` + `awa-worker` |
-| `awa-model` | Types, queries, migrations, admin ops |
-| `awa-macros` | `#[derive(JobArgs)]` proc macro |
-| `awa-worker` | Runtime: dispatch, heartbeat, maintenance |
-| `awa-ui` | Web UI (axum API + embedded React frontend) |
-| `awa-cli` | CLI binary (migrations, admin, serve) |
-| `awa-python` | PyO3 extension module (`pip install awa-pg`) |
-| `awa-testing` | Test helpers (`TestClient`) |
+| Crate         | Purpose                                            |
+| ------------- | -------------------------------------------------- |
+| `awa`         | Main crate — re-exports `awa-model` + `awa-worker` |
+| `awa-model`   | Types, queries, migrations, admin ops              |
+| `awa-macros`  | `#[derive(JobArgs)]` proc macro                    |
+| `awa-worker`  | Runtime: dispatch, heartbeat, maintenance          |
+| `awa-ui`      | Web UI (axum API + embedded React frontend)        |
+| `awa-cli`     | CLI binary (migrations, admin, serve)              |
+| `awa-python`  | PyO3 extension module (`pip install awa-pg`)       |
+| `awa-testing` | Test helpers (`TestClient`)                        |
 
 ## Documentation
 
 | Doc | Description |
-|---|---|
+| --- | --- |
 | [Rust getting started](docs/getting-started-rust.md) | From `cargo add` to a job reaching `completed` |
 | [Python getting started](docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
 | [Deployment guide](docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |

@@ -1,18 +1,13 @@
 # Architecture Decision Records
 
-Each file in this directory captures a single architectural decision —
-its context, the decision itself, the alternatives considered, and the
-consequences. ADRs are written when a decision has a non-obvious
-rationale, trades off across concerns, or will be hard to change later.
+Each file in this directory captures a single architectural decision — its context, the decision itself, the alternatives considered, and the consequences. ADRs are written when a decision has a non-obvious rationale, trades off across concerns, or will be hard to change later.
 
-Template: `Status / Context / Decision / Consequences (positive, negative) /
-Alternatives Considered / Relationship to other ADRs`. Superseded ADRs stay
-in-place as historical context.
+Template: `Status / Context / Decision / Consequences (positive, negative) / Alternatives Considered / Relationship to other ADRs`. Superseded ADRs stay in-place as historical context.
 
 ## Index
 
 | # | Title | Status | Summary | Relationship |
-|---:|---|---|---|---|
+| --: | --- | --- | --- | --- |
 | 001 | [Postgres-only](001-postgres-only.md) | Accepted | Single storage backend, no pluggable adapter layer | Current layout per ADR-019 |
 | 002 | [BLAKE3 uniqueness](002-blake3-uniqueness.md) | Accepted | Uniqueness keys hashed with BLAKE3, claims in `awa.job_unique_claims` | — |
 | 003 | [Heartbeat + deadline hybrid](003-heartbeat-deadline-hybrid.md) | Accepted | Two independent rescue paths cover crash and runaway failure modes | Fields moved to `active_leases` per ADR-019 |
@@ -45,34 +40,15 @@ in-place as historical context.
 
 ## Validation artifacts
 
-Runtime validation for ADR-019 is recorded in
-[`bench/019-queue-storage-validation-2026-04-19.md`](bench/019-queue-storage-validation-2026-04-19.md)
-(exact commands, raw output, measured numbers).
+Runtime validation for ADR-019 is recorded in [`bench/019-queue-storage-validation-2026-04-19.md`](bench/019-queue-storage-validation-2026-04-19.md) (exact commands, raw output, measured numbers).
 
-Runtime validation for ADR-023 is recorded in
-[`bench/023-receipt-ring-validation-2026-04-26.md`](bench/023-receipt-ring-validation-2026-04-26.md)
-(receipt-ring long-horizon and overnight evidence).
+Runtime validation for ADR-023 is recorded in [`bench/023-receipt-ring-validation-2026-04-26.md`](bench/023-receipt-ring-validation-2026-04-26.md) (receipt-ring long-horizon and overnight evidence).
 
-TLA+ correctness models that pin spec-level invariants are under
-[`../../correctness/`](../../correctness/) — the segmented-storage family
-(`AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,
-`AwaSegmentedStorageTrace`) maps to ADR-019 and ADR-020; the
-worker-runtime family (`AwaCore`, `AwaExtended`, `AwaBatcher`, `AwaCbk`,
-`AwaDispatchClaim`, `AwaViewTrigger`, `AwaCron`) covers rescue, batcher,
-callback race, dispatcher claim, view-trigger concurrency, and cron
-double-fire.
+TLA+ correctness models that pin spec-level invariants are under [`../../correctness/`](../../correctness/) — the segmented-storage family (`AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`, `AwaSegmentedStorageTrace`) maps to ADR-019 and ADR-020; the worker-runtime family (`AwaCore`, `AwaExtended`, `AwaBatcher`, `AwaCbk`, `AwaDispatchClaim`, `AwaViewTrigger`, `AwaCron`) covers rescue, batcher, callback race, dispatcher claim, view-trigger concurrency, and cron double-fire.
 
 ## Conventions
 
-- Status is one of: **Accepted**, **Proposed**, **Superseded by ADR-XXX**,
-  **Deprecated**, **Rejected**. Superseded ADRs stay in the directory as
-  historical context.
-- Relationships to later ADRs that change implementation but not
-  decision are recorded in a bottom-of-doc `## Relationship to ADR-XXX`
-  section rather than a top-of-doc `## Note`.
-- ADRs should be narrative: context, rationale, what-was-considered.
-  Deep implementation detail belongs in
-  [`../architecture.md`](../architecture.md) or a companion design
-  doc, with the ADR holding the decision and its alternatives.
-- New ADRs claim the next number in a small placeholder PR before
-  writing to avoid collisions.
+- Status is one of: **Accepted**, **Proposed**, **Superseded by ADR-XXX**, **Deprecated**, **Rejected**. Superseded ADRs stay in the directory as historical context.
+- Relationships to later ADRs that change implementation but not decision are recorded in a bottom-of-doc `## Relationship to ADR-XXX` section rather than a top-of-doc `## Note`.
+- ADRs should be narrative: context, rationale, what-was-considered. Deep implementation detail belongs in [`../architecture.md`](../architecture.md) or a companion design doc, with the ADR holding the decision and its alternatives.
+- New ADRs claim the next number in a small placeholder PR before writing to avoid collisions.

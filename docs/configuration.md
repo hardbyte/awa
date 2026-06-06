@@ -6,15 +6,11 @@ Terms used throughout this guide:
 
 - A **queue** is the worker subscription and capacity boundary.
 - A **claim** is the act of reserving a ready job for one attempt.
-- A **claim lease** (`run_lease`) is the monotonically increasing attempt guard
-  on a job; stale completions with an old value are rejected.
-- A **scheduled job** has a future `run_at` and waits outside the ready claim
-  path. Retry backoff and snooze use the same deferred backlog until their
-  `run_at` is due.
+- A **claim lease** (`run_lease`) is the monotonically increasing attempt guard on a job; stale completions with an old value are rejected.
+- A **scheduled job** has a future `run_at` and waits outside the ready claim path. Retry backoff and snooze use the same deferred backlog until their `run_at` is due.
 - A **lane** is one ordered `(queue, priority, enqueue_shard)` stream.
 - A **segment** is a rotating partition that Awa eventually truncates.
-- A **receipt** is the lightweight short-attempt claim record; a **lease row**
-  is materialized when an attempt needs mutable execution state.
+- A **receipt** is the lightweight short-attempt claim record; a **lease row** is materialized when an attempt needs mutable execution state.
 
 ## How configuration flows
 
@@ -39,16 +35,11 @@ Workers and the UI server are separate processes. Workers own all queue machiner
 
 ## Worker scope: which queues and which kinds
 
-A single worker process handles work for the **set of queues it was
-configured with** and the **set of job kinds it registered handlers
-for**. There is no implicit fan-out across queues, and no implicit
-filter on kinds within a queue — these are two separate concerns.
+A single worker process handles work for the **set of queues it was configured with** and the **set of job kinds it registered handlers for**. There is no implicit fan-out across queues, and no implicit filter on kinds within a queue — these are two separate concerns.
 
 ### Targeting specific queues
 
-A worker only claims jobs from queues passed to its builder; everything
-else on the database is invisible to it. To run a worker dedicated to
-one queue, only declare that queue:
+A worker only claims jobs from queues passed to its builder; everything else on the database is invisible to it. To run a worker dedicated to one queue, only declare that queue:
 
 ```rust
 // Rust: this worker only ever processes the "email" queue.
@@ -67,42 +58,19 @@ async def handle(job): ...
 await client.start([("email", 8)])
 ```
 
-Run separate worker processes (or separate fleets) per queue when you
-want **isolation**: a stuck `etl` queue can't starve `email`,
-deployment of a slow handler doesn't pause unrelated queues, and per-
-queue scaling is just a deployment knob. Run **one worker process
-across multiple queues** with `global_max_workers` and weighted mode
-when you want elastic capacity sharing — see [Weighted
-mode](#weighted-mode).
+Run separate worker processes (or separate fleets) per queue when you want **isolation**: a stuck `etl` queue can't starve `email`, deployment of a slow handler doesn't pause unrelated queues, and per- queue scaling is just a deployment knob. Run **one worker process across multiple queues** with `global_max_workers` and weighted mode when you want elastic capacity sharing — see [Weighted mode](#weighted-mode).
 
 ### Targeting specific job kinds within a queue
 
-`register::<SomeJob, _, _>` (Rust) or `@client.task(SomeJob, ...)`
-(Python) tells the worker how to execute one specific job kind. At
-execute time the worker looks up the kind on the claimed job and runs
-the matching handler.
+`register::<SomeJob, _, _>` (Rust) or `@client.task(SomeJob, ...)` (Python) tells the worker how to execute one specific job kind. At execute time the worker looks up the kind on the claimed job and runs the matching handler.
 
-**Sharp edge:** the claim path is per-queue, not per-kind. If a queue
-holds jobs of kinds the worker didn't register, the worker still
-claims those jobs (it can't tell ahead of time) and then **fails them
-terminally** with `unknown job kind: <name>`. There is no soft re-
-enqueue. So the supported patterns for "this worker only handles a
-subset of kinds" are:
+**Sharp edge:** the claim path is per-queue, not per-kind. If a queue holds jobs of kinds the worker didn't register, the worker still claims those jobs (it can't tell ahead of time) and then **fails them terminally** with `unknown job kind: <name>`. There is no soft re- enqueue. So the supported patterns for "this worker only handles a subset of kinds" are:
 
-1. **Recommended: put each kind set on its own queue.** Queues are
-   cheap; this is the operator-shaped boundary. Workers with
-   different kind responsibilities subscribe to different queues, and
-   the queue boundary becomes the routing decision.
-2. **Acceptable: every worker on the queue registers handlers for
-   every kind that lands there.** Heterogeneous workloads on a single
-   queue work fine as long as no worker is missing a registration.
-3. **Not supported: have some workers on a queue claim jobs and
-   silently leave kinds they don't know for someone else.** This will
-   terminal-fail or DLQ jobs.
+1. **Recommended: put each kind set on its own queue.** Queues are cheap; this is the operator-shaped boundary. Workers with different kind responsibilities subscribe to different queues, and the queue boundary becomes the routing decision.
+2. **Acceptable: every worker on the queue registers handlers for every kind that lands there.** Heterogeneous workloads on a single queue work fine as long as no worker is missing a registration.
+3. **Not supported: have some workers on a queue claim jobs and silently leave kinds they don't know for someone else.** This will terminal-fail or DLQ jobs.
 
-If kinds drift out of sync (e.g. a deploy lags), the descriptor
-catalog in the admin UI flags missing handlers; see [Queue and
-job-kind descriptors](#queue-and-job-kind-descriptors) below.
+If kinds drift out of sync (e.g. a deploy lags), the descriptor catalog in the admin UI flags missing handlers; see [Queue and job-kind descriptors](#queue-and-job-kind-descriptors) below.
 
 ## Queue configuration
 
@@ -133,7 +101,7 @@ let client = Client::builder(pool.clone())
 The key `QueueConfig` fields:
 
 | Field | Default | When you'd change it |
-|---|---|---|
+| --- | --- | --- |
 | `max_workers` | `50` | Always — this is your concurrency cap per queue |
 | `rate_limit` | `None` | External API rate limits, backpressure |
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims. |
@@ -142,13 +110,7 @@ The key `QueueConfig` fields:
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
 | `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |
 
-Defaults intentionally favor the smallest blast radius:
-`enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise
-`enqueue_shards` only when the queue can accept partitioned FIFO semantics.
-For a single hot queue, a larger claim batch usually helps before extra
-claimers: it reduces claim round-trips without adding more concurrent head
-coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot
-keep worker permits full.
+Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
 ### Python
 
@@ -187,12 +149,10 @@ Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Ea
 
 ### What can be tuned per queue vs per job
 
-Queue configuration is the normal way to express operational policy. Job
-kinds are primarily handler registrations and descriptor/catalog entries; if
-two kinds need different runtime policy, put them on different queues.
+Queue configuration is the normal way to express operational policy. Job kinds are primarily handler registrations and descriptor/catalog entries; if two kinds need different runtime policy, put them on different queues.
 
 | Scope | Knobs | Notes |
-|---|---|---|
+| --- | --- | --- |
 | Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
 | Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
 | Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, and extra metadata. They do not set dispatch limits or timeouts. |
@@ -200,41 +160,30 @@ two kinds need different runtime policy, put them on different queues.
 | Per queue / global retention and DLQ policy | `completed_retention`, `failed_retention`, `queue_retention(...)`, `dlq_enabled_by_default`, `queue_dlq_enabled`, `dlq_retention` | Retention has global defaults with per-queue overrides. DLQ enablement is queue-scoped. Split job kinds across queues if only some kinds should DLQ. |
 | Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` currently applies to the queue-storage engine rather than to one named queue. |
 
-There is no active per-job-kind hard timeout today. The hard timeout is the
-queue's `deadline_duration`; moving long-running kinds onto their own queue is
-the intended way to give them a different timeout without making every job on a
-busy queue slower to rescue.
+There is no active per-job-kind hard timeout today. The hard timeout is the queue's `deadline_duration`; moving long-running kinds onto their own queue is the intended way to give them a different timeout without making every job on a busy queue slower to rescue.
 
 ## Scheduled jobs and deferred promotion
 
-Set `run_at` when enqueueing a job that should not be claimable yet. Awa stores
-that row in the deferred backlog and the maintenance leader promotes it to the
-ready ring once `run_at <= now()`.
+Set `run_at` when enqueueing a job that should not be claimable yet. Awa stores that row in the deferred backlog and the maintenance leader promotes it to the ready ring once `run_at <= now()`.
 
-Retry backoff and `Snooze` use the same mechanism: the current attempt closes,
-a retryable row is written with its next `run_at`, and promotion makes it ready
-again later. Cron schedules are producers on top of the same enqueue path; a
-cron fire atomically records the schedule fire and inserts the resulting job.
+Retry backoff and `Snooze` use the same mechanism: the current attempt closes, a retryable row is written with its next `run_at`, and promotion makes it ready again later. Cron schedules are producers on top of the same enqueue path; a cron fire atomically records the schedule fire and inserts the resulting job.
 
 Operational knobs:
 
-- `promote_interval` controls how often maintenance checks for due deferred
-  rows.
+- `promote_interval` controls how often maintenance checks for due deferred rows.
 - Per-job `run_at` controls the due time.
-- Periodic schedules are declared in worker code with `periodic()` and managed
-  through the CLI/UI `cron` surface.
+- Periodic schedules are declared in worker code with `periodic()` and managed through the CLI/UI `cron` surface.
 
 ## Job priority and aging
 
-Every job carries a **priority** (`i16`, lower number = higher
-priority). The default is `2`. Conventional usage:
+Every job carries a **priority** (`i16`, lower number = higher priority). The default is `2`. Conventional usage:
 
-| Priority | Typical meaning |
-|---|---|
-| `1` | Urgent / customer-facing / SLA-critical |
-| `2` | Default |
-| `3` | Background work |
-| `4` | Batch / catch-up / bulk reprocess |
+| Priority | Typical meaning                         |
+| -------- | --------------------------------------- |
+| `1`      | Urgent / customer-facing / SLA-critical |
+| `2`      | Default                                 |
+| `3`      | Background work                         |
+| `4`      | Batch / catch-up / bulk reprocess       |
 
 Values outside `1..=4` are rejected by the insert path.
 
@@ -264,15 +213,9 @@ await client.insert(
 
 ### Priority aging (escalation for fairness)
 
-Without aging, a steady stream of priority-1 work can starve every
-priority-2 job behind it. AWA escalates priority over time — the
-longer a job has been waiting, the higher (numerically lower) its
-**effective priority** becomes at claim time. A priority-4 job that
-has waited `3 × aging_interval` ages all the way down to priority 1
-and is no longer starvable.
+Without aging, a steady stream of priority-1 work can starve every priority-2 job behind it. AWA escalates priority over time — the longer a job has been waiting, the higher (numerically lower) its **effective priority** becomes at claim time. A priority-4 job that has waited `3 × aging_interval` ages all the way down to priority 1 and is no longer starvable.
 
-The cadence is per-queue via `QueueConfig.priority_aging_interval`
-(default `60s`):
+The cadence is per-queue via `QueueConfig.priority_aging_interval` (default `60s`):
 
 ```rust
 // Rust
@@ -295,49 +238,24 @@ await client.start([
 ])
 ```
 
-Aging is computed at claim time on queue-storage runtimes: ready rows keep
-their stored lane priority, and the claim SQL compares candidate lanes by
-effective priority. When a job is claimed, the live attempt records the
-effective priority used for that claim. In canonical storage, the maintenance
-leader physically rewrites waiting rows from priority N to N-1 and preserves
-the enqueue priority in `metadata._awa_original_priority`.
+Aging is computed at claim time on queue-storage runtimes: ready rows keep their stored lane priority, and the claim SQL compares candidate lanes by effective priority. When a job is claimed, the live attempt records the effective priority used for that claim. In canonical storage, the maintenance leader physically rewrites waiting rows from priority N to N-1 and preserves the enqueue priority in `metadata._awa_original_priority`.
 
-The admin UI shows the priority on the current job snapshot and, when
-`_awa_original_priority` is present, the original enqueue priority as
-`(enqueued as N)`. Set the value to `Duration::ZERO` (Rust) or
-`priority_aging_interval_ms: 0` (Python) to disable escalation
-entirely (strict static priority).
+The admin UI shows the priority on the current job snapshot and, when `_awa_original_priority` is present, the original enqueue priority as `(enqueued as N)`. Set the value to `Duration::ZERO` (Rust) or `priority_aging_interval_ms: 0` (Python) to disable escalation entirely (strict static priority).
 
-There is a separate top-level `ClientBuilder::priority_aging_interval`
-that controls the legacy canonical-storage maintenance pass that
-physically rewrites stored priorities. With queue storage (the 0.6
-default) it is a no-op; the per-queue setting above is the one to
-tune.
+There is a separate top-level `ClientBuilder::priority_aging_interval` that controls the legacy canonical-storage maintenance pass that physically rewrites stored priorities. With queue storage (the 0.6 default) it is a no-op; the per-queue setting above is the one to tune.
 
 ### Changing priority after enqueue
 
-The ordinary job retry/cancel/admin path does **not** currently expose a
-general "reprioritize this queued job" operation. In queue storage, priority is
-part of the physical lane key (`queue`, `priority`, `enqueue_shard`,
-`lane_seq`), so changing an already-queued job's priority means moving it to a
-different lane and assigning a new lane sequence. That is a semantic operation,
-not a metadata update.
+The ordinary job retry/cancel/admin path does **not** currently expose a general "reprioritize this queued job" operation. In queue storage, priority is part of the physical lane key (`queue`, `priority`, `enqueue_shard`, `lane_seq`), so changing an already-queued job's priority means moving it to a different lane and assigning a new lane sequence. That is a semantic operation, not a metadata update.
 
 Use one of these patterns instead:
 
-- Choose the priority when inserting the job, periodic schedule, or direct-COPY
-  batch.
-- Tune `priority_aging_interval` when the goal is fairness under sustained
-  high-priority load.
-- For DLQ recovery, use `retry_from_dlq(..., priority=...)` (Python) or
-  `RetryFromDlqOpts { priority: Some(...) }` (Rust/model API) to revive a DLQ
-  row at a different priority.
-- For a pending job that truly must move priority, cancel it and enqueue a
-  replacement with the new priority, after checking any uniqueness or
-  idempotency contract that applies to that job kind.
+- Choose the priority when inserting the job, periodic schedule, or direct-COPY batch.
+- Tune `priority_aging_interval` when the goal is fairness under sustained high-priority load.
+- For DLQ recovery, use `retry_from_dlq(..., priority=...)` (Python) or `RetryFromDlqOpts { priority: Some(...) }` (Rust/model API) to revive a DLQ row at a different priority.
+- For a pending job that truly must move priority, cancel it and enqueue a replacement with the new priority, after checking any uniqueness or idempotency contract that applies to that job kind.
 
-Plain `retry` of a failed/cancelled/waiting job keeps the job's existing
-priority.
+Plain `retry` of a failed/cancelled/waiting job keeps the job's existing priority.
 
 ## Queue and job-kind descriptors
 
@@ -398,105 +316,59 @@ Both surfaces must be called before `start()` / `build()`. Declaring a descripto
 
 ## Reliability timings: heartbeat, deadline, rescue
 
-These knobs control **how fast a stuck or crashed handler is noticed
-and rescued**. They live on `ClientBuilder` (Rust) and `client.start()`
-kwargs (Python). All of them have `_ms`-suffixed kwargs on the Python
-side (e.g. `heartbeat_interval_ms=15000`).
+These knobs control **how fast a stuck or crashed handler is noticed and rescued**. They live on `ClientBuilder` (Rust) and `client.start()` kwargs (Python). All of them have `_ms`-suffixed kwargs on the Python side (e.g. `heartbeat_interval_ms=15000`).
 
 ### Heartbeat — detecting crashed workers
 
-A running job updates a heartbeat row periodically while its handler
-is alive. If the heartbeat goes stale, the maintenance leader rescues
-the job (re-enqueues it for another attempt). Three knobs participate:
+A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:
 
 | Knob | Default | What it does |
-|---|---|---|
+| --- | --- | --- |
 | `heartbeat_interval` | `30s` | How often each running handler refreshes its heartbeat row. |
 | `heartbeat_staleness` | `90s` | How long the row may go un-refreshed before the maintenance leader treats the job as crashed. |
 | `heartbeat_rescue_interval` | `30s` | How often the maintenance leader scans for stale heartbeats. |
 
 Pick them in this order:
 
-1. **Decide your detection target.** "Crashes should be noticed within
-   X seconds." That target is roughly `heartbeat_staleness +
-   heartbeat_rescue_interval` in the worst case.
-2. **Set `heartbeat_staleness` to at least `3× heartbeat_interval`.**
-   The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue
-   scan's own jitter; tighter ratios produce false rescues. The
-   builder logs a warning if you violate it.
-3. **`heartbeat_rescue_interval`** can match `heartbeat_interval` for
-   low-latency rescue, or be higher to reduce maintenance load on big
-   fleets.
+1. **Decide your detection target.** "Crashes should be noticed within X seconds." That target is roughly `heartbeat_staleness + heartbeat_rescue_interval` in the worst case.
+2. **Set `heartbeat_staleness` to at least `3× heartbeat_interval`.** The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it.
+3. **`heartbeat_rescue_interval`** can match `heartbeat_interval` for low-latency rescue, or be higher to reduce maintenance load on big fleets.
 
-For a 5-second crash detection target: `heartbeat_interval=1s`,
-`heartbeat_staleness=4s`, `heartbeat_rescue_interval=1s`. For a
-1-minute target with the cheapest possible maintenance: keep all the
-defaults.
+For a 5-second crash detection target: `heartbeat_interval=1s`, `heartbeat_staleness=4s`, `heartbeat_rescue_interval=1s`. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.
 
 ### Deadline — bounding a single attempt
 
-Each queue has a `deadline_duration` (default `5m` on
-`QueueConfig`). At claim time the runtime stamps
-`now() + deadline_duration` onto the claim, and a maintenance scan
-force-closes attempts that pass it without completing. This bounds a
-single attempt's wall-clock time independently of heartbeats — if a
-handler is hanging, looping forever, or wedged in a sync wait,
-the deadline rescues it even if its heartbeat is fresh.
+Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
 
 | Knob | Default | What it does |
-|---|---|---|
+| --- | --- | --- |
 | `QueueConfig.deadline_duration` (Rust) / `deadline_duration_ms` (Python dict form) | `5m` | Per-queue hard upper bound on one attempt. `Duration::ZERO` / `0` skips deadline rescue for that queue. |
 | `ClientBuilder::deadline_rescue_interval` (Rust) / `deadline_rescue_interval_ms` (Python kwarg) | `30s` | How often the maintenance leader scans for expired deadlines. |
 
-Receipts mode (the 0.6 default storage) supports both shapes: the
-deadline lands on `lease_claims.deadline_at` and is rescued there for
-short claims, or carried onto `leases.deadline_at` if the claim
-materializes for a long-running attempt. See [Queue storage
-tuning](#queue-storage-tuning) and ADR-023.
+Receipts mode (the 0.6 default storage) supports both shapes: the deadline lands on `lease_claims.deadline_at` and is rescued there for short claims, or carried onto `leases.deadline_at` if the claim materializes for a long-running attempt. See [Queue storage tuning](#queue-storage-tuning) and ADR-023.
 
 ### Callback timeout — bounding `wait_for_callback`
 
-If you suspend a handler with `wait_for_callback()` and the external
-system never resumes, a callback-timeout rescue brings the job back to
-ready (or DLQ if attempts are exhausted).
+If you suspend a handler with `wait_for_callback()` and the external system never resumes, a callback-timeout rescue brings the job back to ready (or DLQ if attempts are exhausted).
 
 | Knob | Default | What it does |
-|---|---|---|
+| --- | --- | --- |
 | `ClientBuilder::callback_rescue_interval` | `30s` | How often the maintenance leader scans for `callback_timeout_at < now()`. The per-callback timeout itself is set when registering the callback in the handler. |
 
 ### Retention and cleanup
 
 Retention depends on the storage path.
 
-Queue storage is the worker engine in `0.6`: ordinary terminal snapshots
-(`completed`, non-DLQ `failed`, and `cancelled`) live in the rotating
-`done_entries_*` partitions and are reclaimed by queue-ring prune after the
-matching ready segment is no longer live. Most terminal rows are narrow:
-the durable terminal fact lives in `done_entries_*`, while immutable job-body
-fields are hydrated from the retained `ready_entries_*` row until queue prune
-reclaims both together. Direct SQL against `done_entries` should therefore
-expect nullable body columns and join to `ready_entries` when it needs the full
-job body. Public Awa APIs perform that hydration, and
-`{schema}.terminal_jobs` exposes the same hydrated terminal shape for
-read-only SQL inspection.
+Queue storage is the worker engine in `0.6`: ordinary terminal snapshots (`completed`, non-DLQ `failed`, and `cancelled`) live in the rotating `done_entries_*` partitions and are reclaimed by queue-ring prune after the matching ready segment is no longer live. Most terminal rows are narrow: the durable terminal fact lives in `done_entries_*`, while immutable job-body fields are hydrated from the retained `ready_entries_*` row until queue prune reclaims both together. Direct SQL against `done_entries` should therefore expect nullable body columns and join to `ready_entries` when it needs the full job body. Public Awa APIs perform that hydration, and `{schema}.terminal_jobs` exposes the same hydrated terminal shape for read-only SQL inspection.
 
-Ready rows are not deleted for unclaimed cancellation, priority aging, or SQL
-compatibility deletes through `awa.jobs`. Those paths append to
-`{schema}.ready_tombstones_*`; claim and exact-count queries anti-join the
-tombstone ledger, and queue prune truncates it with the matching ready/done
-segment.
+Ready rows are not deleted for unclaimed cancellation, priority aging, or SQL compatibility deletes through `awa.jobs`. Those paths append to `{schema}.ready_tombstones_*`; claim and exact-count queries anti-join the tombstone ledger, and queue prune truncates it with the matching ready/done segment.
 
-The `completed_retention` and `failed_retention` knobs apply to the canonical
-compatibility path, not to queue-storage terminal history. In queue storage,
-use the queue-ring sizing and rotation knobs below to control how much
-ordinary terminal history remains queryable.
+The `completed_retention` and `failed_retention` knobs apply to the canonical compatibility path, not to queue-storage terminal history. In queue storage, use the queue-ring sizing and rotation knobs below to control how much ordinary terminal history remains queryable.
 
-DLQ rows are different: `dlq_entries` is a separate hold table and the
-maintenance leader deletes rows older than `dlq_retention` in bounded cleanup
-passes.
+DLQ rows are different: `dlq_entries` is a separate hold table and the maintenance leader deletes rows older than `dlq_retention` in bounded cleanup passes.
 
 | Knob | Default | What it does |
-|---|---|---|
+| --- | --- | --- |
 | `completed_retention` | `24h` | Canonical compatibility path only: how long completed jobs stay queryable before row cleanup deletes them. Queue storage uses queue-ring prune instead. |
 | `failed_retention` | `72h` | Canonical compatibility path only: same for failed/cancelled jobs excluding DLQ. Queue storage uses queue-ring prune instead. |
 | `dlq_retention` | `30d` | How long DLQ rows stay in `dlq_entries` before bounded cleanup deletes them. |
@@ -507,31 +379,15 @@ passes.
 
 ## Queue storage tuning
 
-Queue storage is the runtime engine in `0.6`, and most deployments can keep
-the defaults. Queue-storage tables live in the canonical `awa` schema; the
-main knobs are there for large fleets, very bursty queues, or operators who
-want to trade off the partition-reclaim window against rotation churn.
+Queue storage is the runtime engine in `0.6`, and most deployments can keep the defaults. Queue-storage tables live in the canonical `awa` schema; the main knobs are there for large fleets, very bursty queues, or operators who want to trade off the partition-reclaim window against rotation churn.
 
 ### Producer path choice
 
-For bulk producers on queue storage, prefer direct queue-storage COPY:
-Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`.
-Those paths stream rows straight into `ready_entries` / `deferred_jobs` and use
-the queue-storage enqueue heads directly.
+For bulk producers on queue storage, prefer direct queue-storage COPY: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Those paths stream rows straight into `ready_entries` / `deferred_jobs` and use the queue-storage enqueue heads directly.
 
-Direct-copy producers must use the same queue-storage routing config as the
-worker fleet. This matters most for `queue_stripe_count` /
-`queue_storage_queue_stripe_count`: a producer using the default unstriped
-config can write to `queue` while striped workers claim from `queue#0`,
-`queue#1`, etc. Rust producers should construct `QueueStorage` with the same
-`QueueStorageConfig` used by workers. Python producers should pass the same
-`queue_storage_queue_stripe_count` to `enqueue_many_copy()` when the fleet uses
-non-default striping.
+Direct-copy producers must use the same queue-storage routing config as the worker fleet. This matters most for `queue_stripe_count` / `queue_storage_queue_stripe_count`: a producer using the default unstriped config can write to `queue` while striped workers claim from `queue#0`, `queue#1`, etc. Rust producers should construct `QueueStorage` with the same `QueueStorageConfig` used by workers. Python producers should pass the same `queue_storage_queue_stripe_count` to `enqueue_many_copy()` when the fleet uses non-default striping.
 
-`insert_many_copy()` is the compatibility insert API. It is still useful when a
-caller needs the canonical insert surface, but in queue-storage mode it routes
-through the compatibility function rather than being the primary producer fast
-path.
+`insert_many_copy()` is the compatibility insert API. It is still useful when a caller needs the canonical insert surface, but in queue-storage mode it routes through the compatibility function rather than being the primary producer fast path.
 
 ### Rust
 
@@ -572,7 +428,7 @@ await client.start(
 ### What the knobs mean
 
 | Knob | Default | What it controls |
-|---|---|---|
+| --- | --- | --- |
 | `queue_slot_count` | `16` | Number of rotating ready/tombstone/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. Ready-backed terminal rows rely on the matching ready partition until queue prune reclaims both. |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
@@ -582,12 +438,7 @@ await client.start(
 | `lease_rotate_interval` | `250ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions. |
 
-The benchmark harness in
-[postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking)
-reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`,
-`QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment.
-Those env vars are benchmark configuration, not general worker-runtime
-configuration.
+The benchmark harness in [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking) reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.
 
 Use the defaults unless you have a reason not to:
 
@@ -612,15 +463,9 @@ ON CONFLICT (queue)
 DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 ```
 
-Use an upsert rather than a plain `UPDATE`: the first enqueue can create
-queue-storage lane rows before an operator-owned `queue_meta` row exists, so a
-plain `UPDATE` may quietly affect zero rows.
+Use an upsert rather than a plain `UPDATE`: the first enqueue can create queue-storage lane rows before an operator-owned `queue_meta` row exists, so a plain `UPDATE` may quietly affect zero rows.
 
-A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× /
-3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1
-(per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust)
-or `ordering_key=...` (Python) on insert — jobs sharing the key always land on
-the same shard regardless of which producer batch emitted them.
+A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× / 3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1 (per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust) or `ordering_key=...` (Python) on insert — jobs sharing the key always land on the same shard regardless of which producer batch emitted them.
 
 Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard` attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.
 
@@ -628,67 +473,27 @@ Lowering the value is safe at any time — see [`docs/upgrade-0.5-to-0.6.md`](up
 
 ### Hot-Queue Claim Control
 
-Queue storage also uses a bounded-claimer control plane
-(`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a
-hot queue's claim path at once. For a single hot queue, raising
-`QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops
-while still sharing the queue's `max_workers` / `min_workers` permits.
+Queue storage also uses a bounded-claimer control plane (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a hot queue's claim path at once. For a single hot queue, raising `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's `max_workers` / `min_workers` permits.
 
-Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4`
-is the change that turns overload into bounded end-to-end throughput; raising
-`claimers` to `4` increases transaction pressure and worsens tail latency in
-that shape. For extreme single-queue workloads, raise `enqueue_shards` first
-when the ordering contract allows partitioned FIFO. Benchmark `claimers = 2`
-or `4` only for a workload-specific reason, and judge the result by durable
-completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed
-job, transaction commits per completed job, and dead tuples. Lower
-`claim_batch_size` from `512` for small or latency-sensitive queues; raise
-claimers only with workload-specific evidence.
+Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4` is the change that turns overload into bounded end-to-end throughput; raising `claimers` to `4` increases transaction pressure and worsens tail latency in that shape. For extreme single-queue workloads, raise `enqueue_shards` first when the ordering contract allows partitioned FIFO. Benchmark `claimers = 2` or `4` only for a workload-specific reason, and judge the result by durable completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed job, transaction commits per completed job, and dead tuples. Lower `claim_batch_size` from `512` for small or latency-sensitive queues; raise claimers only with workload-specific evidence.
 
-Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` (`8` on canonical
-storage). Extra completion flushers can improve some single-process shapes, but
-they also multiply terminal-write contention across a worker fleet. Raise this
-only after measuring the same north-star metrics for the target topology.
+Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` (`8` on canonical storage). Extra completion flushers can improve some single-process shapes, but they also multiply terminal-write contention across a worker fleet. Raise this only after measuring the same north-star metrics for the target topology.
 
-`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS`
-defaults to `1`. The queue-storage short-job path fuses receipt closure and
-terminal insertion into one statement, so the lower flush interval reduces the
-worker capacity tied up waiting for durable completion while the batch size
-still amortises the claim/complete path under load. That pairing is what moves
-the lower WAL budget into durable throughput.
+`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS` defaults to `1`. The queue-storage short-job path fuses receipt closure and terminal insertion into one statement, so the lower flush interval reduces the worker capacity tied up waiting for durable completion while the batch size still amortises the claim/complete path under load. That pairing is what moves the lower WAL budget into durable throughput.
 
-For very high-throughput no-op queues, size `max_workers` for durable
-completion latency, not handler CPU alone. The `10k/s` offered-rate reference
-shape needs 1,024 in-flight worker permits to absorb the load consistently;
-real jobs with non-trivial handler time need workload-specific sizing.
+For very high-throughput no-op queues, size `max_workers` for durable completion latency, not handler CPU alone. The `10k/s` offered-rate reference shape needs 1,024 in-flight worker permits to absorb the load consistently; real jobs with non-trivial handler time need workload-specific sizing.
 
-The terminal write path is already narrow for running/waiting jobs: it stores
-the terminal fact in `done_entries_*` and avoids duplicating immutable ready
-body fields. That keeps the default completion settings conservative without
-giving up durable terminal history.
+The terminal write path is already narrow for running/waiting jobs: it stores the terminal fact in `done_entries_*` and avoids duplicating immutable ready body fields. That keeps the default completion settings conservative without giving up durable terminal history.
 
 ## Dead Letter Queue
 
-The DLQ is the **separate, durable hold-table for jobs that exhausted
-retries or hit a non-retryable terminal failure**. Without it,
-terminal failures live in ordinary queue-storage `done_entries_*` partitions
-and are reclaimed when queue-ring prune can safely truncate their segment.
-With DLQ enabled, those rows land in
-`dlq_entries`, are visible to the admin UI / API as a discrete
-backlog, and can be retried or purged by an operator.
+The DLQ is the **separate, durable hold-table for jobs that exhausted retries or hit a non-retryable terminal failure**. Without it, terminal failures live in ordinary queue-storage `done_entries_*` partitions and are reclaimed when queue-ring prune can safely truncate their segment. With DLQ enabled, those rows land in `dlq_entries`, are visible to the admin UI / API as a discrete backlog, and can be retried or purged by an operator.
 
 ### When to enable
 
-- **Enable DLQ for queues whose terminal failures need an operator
-  decision.** Payment, notification, billing — anything where you'd
-  rather a human triages a failure than have the job silently age out.
-- **Leave DLQ disabled for high-throughput queues whose failures are
-  fire-and-forget.** Logging, telemetry, ETL retries that get
-  re-driven from upstream — accumulating dead rows here is just
-  storage cost.
-- **Default to disabled** unless you've decided either way; the
-  builder's `dlq_enabled_by_default` is the global switch and
-  `queue_dlq_enabled` is the per-queue override.
+- **Enable DLQ for queues whose terminal failures need an operator decision.** Payment, notification, billing — anything where you'd rather a human triages a failure than have the job silently age out.
+- **Leave DLQ disabled for high-throughput queues whose failures are fire-and-forget.** Logging, telemetry, ETL retries that get re-driven from upstream — accumulating dead rows here is just storage cost.
+- **Default to disabled** unless you've decided either way; the builder's `dlq_enabled_by_default` is the global switch and `queue_dlq_enabled` is the per-queue override.
 
 ### Configuring
 
@@ -704,14 +509,9 @@ let client = Client::builder(pool.clone())
     .await?;
 ```
 
-DLQ policy is per-queue, not per-job-kind. If you need a single queue
-to handle some kinds with DLQ and some without, split them onto two
-queues (the same shape recommended for [worker scope by
-kind](#targeting-specific-job-kinds-within-a-queue)).
+DLQ policy is per-queue, not per-job-kind. If you need a single queue to handle some kinds with DLQ and some without, split them onto two queues (the same shape recommended for [worker scope by kind](#targeting-specific-job-kinds-within-a-queue)).
 
-Per-queue retention overrides go through `RetentionPolicy.dlq` on
-`queue_retention(queue, policy)` — handy if one queue's failures need
-to live longer than the global `dlq_retention`.
+Per-queue retention overrides go through `RetentionPolicy.dlq` on `queue_retention(queue, policy)` — handy if one queue's failures need to live longer than the global `dlq_retention`.
 
 ### Operator workflow
 
@@ -720,13 +520,9 @@ Once DLQ is on, operators interact with it through:
 - **Web UI** — DLQ tab with retry, purge, and per-row failure detail.
 - **CLI** — `awa dlq list`, `awa dlq retry <id>`, `awa dlq purge`.
 - **REST** — `/api/dlq/*` endpoints (same actions as the UI).
-- **Python / Rust** — `client.dlq_*` admin methods for programmatic
-  retry / purge.
+- **Python / Rust** — `client.dlq_*` admin methods for programmatic retry / purge.
 
-Queue-policy declaration is still a runtime-side concern; the UI /
-API report state but don't toggle DLQ on/off (that's a code-level
-decision so it doesn't drift between deployments). See
-[ADR-020](adr/020-dead-letter-queue.md).
+Queue-policy declaration is still a runtime-side concern; the UI / API report state but don't toggle DLQ on/off (that's a code-level decision so it doesn't drift between deployments). See [ADR-020](adr/020-dead-letter-queue.md).
 
 ## CLI and `awa serve`
 
@@ -741,7 +537,7 @@ awa serve --pool-max 10 --cache-ttl 5
 Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 
 | Flag | Env var | Default | Purpose |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--pool-max` | `AWA_POOL_MAX` | `10` | Max database connections |
 | `--pool-min` | `AWA_POOL_MIN` | `2` | Min idle connections |
 | `--pool-idle-timeout` | `AWA_POOL_IDLE_TIMEOUT` | `300` | Idle connection timeout (seconds) |
@@ -762,7 +558,7 @@ If you're connecting to a read replica, increase `--cache-ttl` to reduce load. T
 There are two ways to opt in:
 
 | Mode | Trigger | When to use |
-|---|---|---|
+| --- | --- | --- |
 | Auto-detect (default) | Server probes `current_setting('transaction_read_only')` on startup | Pointed at a read replica or a Postgres role without write grants |
 | Forced | `--read-only` flag or `AWA_READ_ONLY=1` env var | Writable DB but you want mutations off — incident read-outs, shared debugging instances, less-trusted public UI sessions |
 

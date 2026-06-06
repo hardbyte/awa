@@ -1,13 +1,8 @@
 # awa
 
-Postgres-native background job queue. Transactional enqueue, heartbeat
-crash recovery, priority aging, retries with backoff, cron, callbacks,
-unique jobs, dead-letter queue, and a vacuum-aware storage engine
-designed to keep dead-tuple pressure bounded under sustained load.
+Postgres-native background job queue. Transactional enqueue, heartbeat crash recovery, priority aging, retries with backoff, cron, callbacks, unique jobs, dead-letter queue, and a vacuum-aware storage engine designed to keep dead-tuple pressure bounded under sustained load.
 
-This crate is the user-facing facade. It re-exports the worker
-(`awa-worker`) and model (`awa-model`) crates and is what most Rust
-applications depend on directly.
+This crate is the user-facing facade. It re-exports the worker (`awa-worker`) and model (`awa-model`) crates and is what most Rust applications depend on directly.
 
 ```toml
 [dependencies]
@@ -58,31 +53,17 @@ async fn main() -> anyhow::Result<()> {
 
 ## What you get
 
-- **Transactional enqueue** — enqueueing a job is a normal `INSERT` you can
-  commit alongside your application's writes.
-- **Vacuum-aware storage** — append-only ready/terminal partitions plus
-  rotating lease and receipt rings keep the hot queue tables' dead-tuple
-  footprint bounded under sustained load. See [ADR-019](../docs/adr/019-queue-storage-redesign.md)
-  and [ADR-023](../docs/adr/023-receipt-plane-ring-partitioning.md).
-- **Crash-safe execution** — heartbeat-based lease tracking; jobs whose
-  workers vanish are rescued automatically.
-- **Per-queue policy** — priorities, priority aging, weighted concurrency,
-  rate limits, deadlines, retry/backoff, cron, dead-letter queue.
-- **Unique jobs** — content-keyed deduplication windowed across pending /
-  running / completed.
-- **Callbacks and external waits** — wait for an external event without
-  burning a worker slot.
-- **First-class Python bindings** — same engine, same SQL, same defaults;
-  see [awa-pg on PyPI](https://pypi.org/project/awa-pg/).
+- **Transactional enqueue** — enqueueing a job is a normal `INSERT` you can commit alongside your application's writes.
+- **Vacuum-aware storage** — append-only ready/terminal partitions plus rotating lease and receipt rings keep the hot queue tables' dead-tuple footprint bounded under sustained load. See [ADR-019](../docs/adr/019-queue-storage-redesign.md) and [ADR-023](../docs/adr/023-receipt-plane-ring-partitioning.md).
+- **Crash-safe execution** — heartbeat-based lease tracking; jobs whose workers vanish are rescued automatically.
+- **Per-queue policy** — priorities, priority aging, weighted concurrency, rate limits, deadlines, retry/backoff, cron, dead-letter queue.
+- **Unique jobs** — content-keyed deduplication windowed across pending / running / completed.
+- **Callbacks and external waits** — wait for an external event without burning a worker slot.
+- **First-class Python bindings** — same engine, same SQL, same defaults; see [awa-pg on PyPI](https://pypi.org/project/awa-pg/).
 
 ## Partitioned FIFO and ordering keys
 
-Queues default to strict FIFO per `(queue, priority)`. Operators
-can raise `awa.queue_meta.enqueue_shards` on a contended queue to
-trade strict FIFO for throughput; the contract then becomes
-**partitioned FIFO** — strict order within each shard, no ordering
-promised across shards. Producers can pin related jobs to the same
-shard with `InsertOpts::ordering_key`:
+Queues default to strict FIFO per `(queue, priority)`. Operators can raise `awa.queue_meta.enqueue_shards` on a contended queue to trade strict FIFO for throughput; the contract then becomes **partitioned FIFO** — strict order within each shard, no ordering promised across shards. Producers can pin related jobs to the same shard with `InsertOpts::ordering_key`:
 
 ```rust
 let opts = InsertOpts {
@@ -93,11 +74,7 @@ let opts = InsertOpts {
 awa::insert_with(&pool, &UpdateCustomer { ... }, opts).await?;
 ```
 
-Jobs sharing an `ordering_key` always pick the same shard, so the
-shard's strict FIFO carries over to per-key FIFO. At
-`enqueue_shards = 1` the key is ignored. See
-[ADR-025](../docs/adr/025-sharded-enqueue-heads.md) for the full
-contract.
+Jobs sharing an `ordering_key` always pick the same shard, so the shard's strict FIFO carries over to per-key FIFO. At `enqueue_shards = 1` the key is ignored. See [ADR-025](../docs/adr/025-sharded-enqueue-heads.md) for the full contract.
 
 ## Documentation
 

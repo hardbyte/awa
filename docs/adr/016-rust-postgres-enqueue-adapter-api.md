@@ -32,10 +32,7 @@ Expose the stable public preparation surface under `awa::adapter::postgres` and 
 
 External Rust crates can execute `INSERT_JOB_SQL` through their own connection or transaction type while binding values from `PreparedJobInsert`. Awa remains responsible for insert semantics; the adapter remains responsible for driver-specific execution and row decoding.
 
-The native sqlx path is not required to use this driver-friendly SQL. It may
-keep a typed `PgExecutor` query that binds `JobState` directly and returns
-`SELECT *`, while external adapters use `INSERT_JOB_SQL` with text casts and
-`state_str` for portable enum decoding.
+The native sqlx path is not required to use this driver-friendly SQL. It may keep a typed `PgExecutor` query that binds `JobState` directly and returns `SELECT *`, while external adapters use `INSERT_JOB_SQL` with text casts and `state_str` for portable enum decoding.
 
 ### tokio-postgres adapter
 
@@ -51,10 +48,7 @@ The tokio-postgres bridge uses the public adapter API internally, so it acts as 
 
 ### Scope boundaries
 
-- **Insert-only adapter contract.** Worker polling, heartbeating, claiming,
-  and completion remain Awa runtime responsibilities. Applications may still
-  use SeaORM, Diesel, or another stack inside handlers by passing those
-  dependencies through worker state.
+- **Insert-only adapter contract.** Worker polling, heartbeating, claiming, and completion remain Awa runtime responsibilities. Applications may still use SeaORM, Diesel, or another stack inside handlers by passing those dependencies through worker state.
 - **No connection sharing.** Each driver owns its own connection lifecycle.
 - **No batch/COPY bridging.** The COPY path requires `PgConnection::copy_in_raw()` and is sqlx-specific. Bridge adapters support single-row parameterized INSERT only.
 - **Native bulk paths remain native.** `insert_many_copy_from_pool` and `QueueStorage::enqueue_params_copy` stay on the SQLx/Awa runtime side. External adapters can add their own driver-specific bulk support later, but the public adapter contract does not promise a portable COPY abstraction.

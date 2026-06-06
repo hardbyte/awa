@@ -1,18 +1,8 @@
 # Upgrade Checklist: 0.5.x → 0.6
 
-This is the operator-facing rollout sheet for moving an existing 0.5.x
-cluster to 0.6 (queue-storage-by-default). The companion long-form
-explanation is in [migrations.md](migrations.md). This file is the
-short version: one-screen pre-flight, two phases, an explicit rollback
-boundary, and the health checks to run at each step.
+This is the operator-facing rollout sheet for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). The companion long-form explanation is in [migrations.md](migrations.md). This file is the short version: one-screen pre-flight, two phases, an explicit rollback boundary, and the health checks to run at each step.
 
-> **Fresh installs do not need this file.** A new cluster runs
-> `awa migrate` and starts workers; the first worker auto-finalizes
-> via `awa.storage_auto_finalize_if_fresh()`. See
-> migrations.md ["Fresh install"](migrations.md#fresh-install-no-prior-canonical-data).
-> This checklist is for **upgrading existing 0.5.x clusters**, where
-> canonical drain is unavoidable and auto-finalize correctly defers to
-> the staged path.
+> **Fresh installs do not need this file.** A new cluster runs `awa migrate` and starts workers; the first worker auto-finalizes via `awa.storage_auto_finalize_if_fresh()`. See migrations.md ["Fresh install"](migrations.md#fresh-install-no-prior-canonical-data). This checklist is for **upgrading existing 0.5.x clusters**, where canonical drain is unavoidable and auto-finalize correctly defers to the staged path.
 
 ## Pre-flight
 
@@ -43,18 +33,13 @@ psql "$DATABASE_URL" -c "
 "
 ```
 
-**Expected:** `current_engine=canonical`, `active_engine=canonical`,
-`prepared_engine=NULL`, `state=canonical`. Every live `runtime_instance`
-reports `storage_capability=canonical` (not `queue_storage`).
+**Expected:** `current_engine=canonical`, `active_engine=canonical`, `prepared_engine=NULL`, `state=canonical`. Every live `runtime_instance` reports `storage_capability=canonical` (not `queue_storage`).
 
-This is a **safe stopping point**. The queue is fully canonical and
-behavior is unchanged. You can sit here indefinitely.
+This is a **safe stopping point**. The queue is fully canonical and behavior is unchanged. You can sit here indefinitely.
 
 ## Rollback boundaries
 
-Read this before starting Phase 2. The rollout has one explicit one-way
-door — knowing exactly where it sits is the difference between "abort"
-and "restore from backup":
+Read this before starting Phase 2. The rollout has one explicit one-way door — knowing exactly where it sits is the difference between "abort" and "restore from backup":
 
 - **canonical → prepared**: `awa storage abort` returns to canonical. Trivial.
 - **prepared → canonical**: `awa storage abort` clears the prepared engine metadata. Trivial.
@@ -62,44 +47,22 @@ and "restore from backup":
 - **mixed_transition (queue-storage rows exist) — ONE-WAY**: `awa storage abort` is rejected. From this point onward you must either finish the transition (`finalize`) or restore from backup. A pure fleet downgrade to 0.5 is **not supported** because 0.5 workers don't know how to claim queue-storage work.
 - **active → anything**: not supported by `awa storage abort`. Use database restore.
 
-The `/api/storage` dashboard card surfaces the current boundary
-explicitly: "Rollback is still available" on `canonical` / `prepared`,
-"From here it's restore-only" once the cluster has crossed into
-`mixed_transition`, and "Finalized" once the transition has completed.
+The `/api/storage` dashboard card surfaces the current boundary explicitly: "Rollback is still available" on `canonical` / `prepared`, "From here it's restore-only" once the cluster has crossed into `mixed_transition`, and "Finalized" once the transition has completed.
 
 ### The Storage transition card
 
-When a transition is in flight the runtime page renders a "Storage
-transition" card with four panels operators reload during a cutover:
+When a transition is in flight the runtime page renders a "Storage transition" card with four panels operators reload during a cutover:
 
-1. **Header row** — current engine, prepared engine, state, and the
-   live canonical backlog. The state pill is paired with an
-   `in <state> for Nh Mm` time-in-state stamp that ticks once per
-   second, so a stuck transition is visually distinct from a slow one
-   without having to compare timestamps by hand.
-2. **Backlog sparkline** — appears next to the canonical-backlog number
-   once the cluster enters `mixed_transition`. The series is anchored
-   to the current `transition_epoch`, so it always shows the timeline
-   of *this* cutover (an `abort`/re-`prepare` resets the line).
-3. **Schema-readiness warning** — if `prepared_engine = queue_storage`
-   but the queue-storage tables are missing, a yellow alert spells out
-   the exact `awa storage prepare-queue-storage-schema --schema <name>`
-   command to run before the routing flip.
-4. **Rollback-boundary panel** — the wording above ("reversible via
-   abort", "from here it's restore-only", "finalized") rendered as a
-   coloured block so the operator never has to infer the boundary from
-   the state string alone.
+1. **Header row** — current engine, prepared engine, state, and the live canonical backlog. The state pill is paired with an `in <state> for Nh Mm` time-in-state stamp that ticks once per second, so a stuck transition is visually distinct from a slow one without having to compare timestamps by hand.
+2. **Backlog sparkline** — appears next to the canonical-backlog number once the cluster enters `mixed_transition`. The series is anchored to the current `transition_epoch`, so it always shows the timeline of _this_ cutover (an `abort`/re-`prepare` resets the line).
+3. **Schema-readiness warning** — if `prepared_engine = queue_storage` but the queue-storage tables are missing, a yellow alert spells out the exact `awa storage prepare-queue-storage-schema --schema <name>` command to run before the routing flip.
+4. **Rollback-boundary panel** — the wording above ("reversible via abort", "from here it's restore-only", "finalized") rendered as a coloured block so the operator never has to infer the boundary from the state string alone.
 
-Samples for the sparkline are accumulated client-side from the existing
-poll (no audit table, per the #180 decision); they're discarded on a
-tab reload and that's fine — the operator only needs the trend since
-they opened the page, not historical replay.
+Samples for the sparkline are accumulated client-side from the existing poll (no audit table, per the #180 decision); they're discarded on a tab reload and that's fine — the operator only needs the trend since they opened the page, not historical replay.
 
 ## Phase 2 — 0.6 rollout
 
-> **Crossing the line below is a one-way door once any queue-storage
-> work has been accepted.** Re-read [Rollback boundaries](#rollback-boundaries)
-> above before kicking off Phase 2.
+> **Crossing the line below is a one-way door once any queue-storage work has been accepted.** Re-read [Rollback boundaries](#rollback-boundaries) above before kicking off Phase 2.
 
 ```bash
 # 1. Roll out 0.6 binaries (rolling deploy). 0.5.x and 0.6 pods may
@@ -192,7 +155,7 @@ awa --database-url "$DATABASE_URL" storage status
 ## Health checks per step
 
 | After step | Watch for |
-|------------|-----------|
+| --- | --- |
 | migrate | `SELECT MAX(version) FROM awa.schema_version` advances; `\dt awa.ready_entries` and `\dt awa.ready_tombstones` exist for the default schema |
 | prepare custom queue-storage schema | `\dt <custom_schema>.ready_entries` and `\dt <custom_schema>.ready_tombstones` exist when using a custom schema |
 | prepare | `awa storage status` reports `state=prepared` |

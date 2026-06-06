@@ -1,51 +1,24 @@
 # awa-model
 
-Schema, types, and admin surface for the [Awa](https://crates.io/crates/awa)
-Postgres-native job queue. This is the foundation crate: every other
-`awa-*` crate depends on it, and it owns the SQL migrations, the row
-types, and the admin queries that back both the CLI and the web UI.
+Schema, types, and admin surface for the [Awa](https://crates.io/crates/awa) Postgres-native job queue. This is the foundation crate: every other `awa-*` crate depends on it, and it owns the SQL migrations, the row types, and the admin queries that back both the CLI and the web UI.
 
-Most Rust applications should depend on the [`awa`](https://crates.io/crates/awa)
-facade rather than `awa-model` directly. Reach for this crate when you
-need a smaller dependency footprint (e.g. an enqueue-only producer that
-does not link the worker runtime), or when you are building tooling
-against the admin API.
+Most Rust applications should depend on the [`awa`](https://crates.io/crates/awa) facade rather than `awa-model` directly. Reach for this crate when you need a smaller dependency footprint (e.g. an enqueue-only producer that does not link the worker runtime), or when you are building tooling against the admin API.
 
 ## What's in here
 
-- **Job model** — `JobRow`, `JobState`, `InsertOpts`, `UniqueOpts`,
-  `InsertParams`.
-- **Insertion** — `insert`, `insert_with`, `insert_many`,
-  `insert_many_copy` for the compatibility insert surface, and
-  `QueueStorage::enqueue_params_copy` for direct queue-storage COPY ingestion
-  with an explicitly configured queue-storage engine.
-- **Migrations** — `migrations::run` applies the schema; `migrations`,
-  `migration_sql`, `migration_sql_range`, and `current_version` expose the
-  catalog for tooling.
-- **Admin** (`admin`) — retry, cancel (single, by unique key, bulk),
-  pause/resume/drain queues, queue and job-kind overviews, runtime
-  instance snapshots, dirty-key recompute, and descriptor sync
-  (`sync_queue_descriptors`, `sync_job_kind_descriptors`,
-  `cleanup_stale_descriptors`).
-- **Dead Letter Queue** (`dlq`) — `DlqRow`, `DlqMetadata`,
-  `ListDlqFilter`, `RetryFromDlqOpts`, list / retry / move / purge
-  helpers backing the `awa dlq` CLI and the DLQ admin UI tab.
-- **Cron** (`cron`) — `PeriodicJob`, `PeriodicJobBuilder`, `CronJobRow`
-  plus `pause_cron_job` / `resume_cron_job` operating on the
-  `paused_at` / `paused_by` columns.
-- **Queue storage** (`queue_storage`) — `QueueStorage`,
-  `QueueStorageConfig`, `ClaimedRuntimeJob`, `RotateOutcome`,
-  `PruneOutcome`. The vacuum-aware engine introduced in 0.6.
-- **Storage status** (`storage`) — `StorageStatus` and the
-  transition-state primitives the `awa storage` CLI surfaces.
-- **Adapter API** (`adapter`) — stable Postgres insert preparation and SQL
-  contract for external enqueue bridges.
+- **Job model** — `JobRow`, `JobState`, `InsertOpts`, `UniqueOpts`, `InsertParams`.
+- **Insertion** — `insert`, `insert_with`, `insert_many`, `insert_many_copy` for the compatibility insert surface, and `QueueStorage::enqueue_params_copy` for direct queue-storage COPY ingestion with an explicitly configured queue-storage engine.
+- **Migrations** — `migrations::run` applies the schema; `migrations`, `migration_sql`, `migration_sql_range`, and `current_version` expose the catalog for tooling.
+- **Admin** (`admin`) — retry, cancel (single, by unique key, bulk), pause/resume/drain queues, queue and job-kind overviews, runtime instance snapshots, dirty-key recompute, and descriptor sync (`sync_queue_descriptors`, `sync_job_kind_descriptors`, `cleanup_stale_descriptors`).
+- **Dead Letter Queue** (`dlq`) — `DlqRow`, `DlqMetadata`, `ListDlqFilter`, `RetryFromDlqOpts`, list / retry / move / purge helpers backing the `awa dlq` CLI and the DLQ admin UI tab.
+- **Cron** (`cron`) — `PeriodicJob`, `PeriodicJobBuilder`, `CronJobRow` plus `pause_cron_job` / `resume_cron_job` operating on the `paused_at` / `paused_by` columns.
+- **Queue storage** (`queue_storage`) — `QueueStorage`, `QueueStorageConfig`, `ClaimedRuntimeJob`, `RotateOutcome`, `PruneOutcome`. The vacuum-aware engine introduced in 0.6.
+- **Storage status** (`storage`) — `StorageStatus` and the transition-state primitives the `awa storage` CLI surfaces.
+- **Adapter API** (`adapter`) — stable Postgres insert preparation and SQL contract for external enqueue bridges.
 - **Bridge adapters** (`bridge`) — built-in tokio-postgres enqueue bridge.
-- **Errors** — `AwaError`, the single error type shared across the
-  workspace.
+- **Errors** — `AwaError`, the single error type shared across the workspace.
 
-`#[derive(JobArgs)]` is re-exported from [`awa-macros`](https://crates.io/crates/awa-macros)
-so applications get the macro automatically.
+`#[derive(JobArgs)]` is re-exported from [`awa-macros`](https://crates.io/crates/awa-macros) so applications get the macro automatically.
 
 ## Example: enqueue-only producer
 
@@ -80,9 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Versioning
 
-`awa-model` is versioned in lockstep with the rest of the workspace.
-Pin to the same minor version as `awa` and `awa-worker` if you depend
-on multiple crates directly.
+`awa-model` is versioned in lockstep with the rest of the workspace. Pin to the same minor version as `awa` and `awa-worker` if you depend on multiple crates directly.
 
 ## See also
 

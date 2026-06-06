@@ -4,12 +4,8 @@ These are the smallest safety-oriented models.
 
 ## Files
 
-- `AwaCore.tla` / `AwaCore.cfg`
-  Covers lease-guarded finalization, rescue, admin cancel, and stale completion
-  rejection.
-- `AwaBatcher.tla` / `AwaBatcher.cfg` / `AwaBatcherLiveness.cfg`
-  Covers the async completion batching path, stale flush rejection, fallback
-  direct completion, and shutdown drain.
+- `AwaCore.tla` / `AwaCore.cfg` Covers lease-guarded finalization, rescue, admin cancel, and stale completion rejection.
+- `AwaBatcher.tla` / `AwaBatcher.cfg` / `AwaBatcherLiveness.cfg` Covers the async completion batching path, stale flush rejection, fallback direct completion, and shutdown drain.
 
 ## When To Use
 

@@ -2,9 +2,7 @@
 
 ## Status
 
-Accepted. This ADR records the user-facing callback semantics. ADR-019 moved
-the physical callback fields from canonical storage onto queue-storage lease /
-attempt state; see [Relationship to ADR-019](#relationship-to-adr-019).
+Accepted. This ADR records the user-facing callback semantics. ADR-019 moved the physical callback fields from canonical storage onto queue-storage lease / attempt state; see [Relationship to ADR-019](#relationship-to-adr-019).
 
 ## Context
 
@@ -27,6 +25,7 @@ Enhance the single-callback model with two backward-compatible additions:
 `complete_external` gains an optional `resume: bool` flag (default `false`). When `true`, instead of transitioning to `completed`, the job transitions back to `running` and the handler resumes execution with the callback payload.
 
 **Rust API:**
+
 ```rust
 // Handler registers first callback
 let token = ctx.register_callback(Duration::from_secs(3600)).await?;
@@ -47,6 +46,7 @@ Ok(JobResult::Completed)
 ```
 
 **Python API:**
+
 ```python
 @client.task(ProcessOrder, queue="orders")
 async def handle(job):
@@ -64,6 +64,7 @@ async def handle(job):
 ```
 
 **Implementation:** `wait_for_callback(token)` is a new method on `JobContext` / `Job` that:
+
 1. Transitions the job to `waiting_external` (same as today's `WaitForCallback` return)
 2. Suspends the handler's async task and polls the storage-backed job snapshot until the callback resolves
 3. `resume_external(callback_id, payload)` transitions the job back to `running` and stores the payload in `metadata._awa_callback_result`
@@ -76,6 +77,7 @@ The wait is token-specific: the handler only waits on the exact callback ID it r
 The job stays in `running` → `waiting_external` → `running` → `waiting_external` → ... → `completed` without being re-dispatched. The existing heartbeat keeps the job alive between waits. The run_lease stays valid throughout.
 
 **State transitions:**
+
 ```
 running → waiting_external (register_callback + wait)
 waiting_external → running (complete_external with resume=true)
@@ -88,6 +90,7 @@ waiting_external → completed (complete_external with resume=false, or handler 
 New `heartbeat_callback(callback_id)` function that resets `callback_timeout_at` without completing the job. External systems call this periodically for long-running operations.
 
 **API:**
+
 ```python
 # External system (e.g., ML training service)
 while training_in_progress:
@@ -99,12 +102,13 @@ await client.complete_external(callback_id, payload={"model_url": "s3://..."})
 ```
 
 **Rust:**
+
 ```rust
 awa::admin::heartbeat_callback(&pool, callback_id).await?;
 ```
 
-**Implementation:** Single SQL update against the active lease row (ADR-019
-moved `callback_timeout_at` onto `{schema}.active_leases`):
+**Implementation:** Single SQL update against the active lease row (ADR-019 moved `callback_timeout_at` onto `{schema}.active_leases`):
+
 ```sql
 UPDATE {schema}.active_leases
 SET callback_timeout_at = now() + make_interval(secs => $2)
@@ -151,7 +155,7 @@ No schema changes — reuses the existing `callback_timeout_at` column.
 ## Prior Art
 
 | System | Pattern | Awa equivalent |
-|--------|---------|----------------|
+| --- | --- | --- |
 | Temporal signals | Multiple `waitForSignal()` in sequence | `wait_for_callback()` in a loop |
 | Restate awakeables | `ctx.awakeable().promise` | `job.wait_for_callback(token)` |
 | Step Functions task tokens | `.waitForTaskToken` with heartbeat | `register_callback` + `heartbeat_callback` |
@@ -159,8 +163,4 @@ No schema changes — reuses the existing `callback_timeout_at` column.
 
 ## Relationship to ADR-019
 
-ADR-019 moved callback state from the canonical `awa.jobs` row onto
-queue-storage execution state: `leases_*` holds the dispatch / timeout fields
-and `attempt_state` holds mutable per-attempt payloads keyed by
-`(job_id, run_lease)`. User-facing semantics are unchanged — sequential waits,
-callback heartbeats, and timeout handling remain exactly as described here.
+ADR-019 moved callback state from the canonical `awa.jobs` row onto queue-storage execution state: `leases_*` holds the dispatch / timeout fields and `attempt_state` holds mutable per-attempt payloads keyed by `(job_id, run_lease)`. User-facing semantics are unchanged — sequential waits, callback heartbeats, and timeout handling remain exactly as described here.
