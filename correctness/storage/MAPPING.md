@@ -15,6 +15,7 @@ onto the current Rust / SQL implementation.
 | TLA+ variable | Rust / SQL equivalent |
 |---|---|
 | `readyEntries` | `{schema}.ready_entries` parent partitioned table |
+| `readyTombstones` | `{schema}.ready_tombstones`, keyed by ready segment/generation and lane identity. The TLA+ model stores lane records so reprioritizing a job can tombstone the old lane while the new lane remains claimable. |
 | `deferredEntries` | `{schema}.deferred_jobs` |
 | `waitingLeases` | subset of `{schema}.leases` rows with `state = 'waiting_external'`; there is no waiting table |
 | `terminalEntries` | `{schema}.done_entries` (ADR-019 target name: `terminal_entries`). ADR-026 makes ready-backed terminal rows narrow: duplicated immutable body fields hydrate from the retained `{schema}.ready_entries` row until queue prune reclaims both. |
@@ -45,8 +46,8 @@ for backfill / fallback reads during upgrades.
 | `EnqueueReady(j)` | `QueueStorage::insert_ready_rows_tx` and `QueueStorage::insert_ready_rows_copy_tx`; producer entry points include `enqueue_batch`, `enqueue_runtime_rows`, `enqueue_params_batch`, and `enqueue_params_copy` | reserve `{schema}.queue_enqueue_heads.next_seq`, sync enqueue-time uniqueness claims, append to `{schema}.ready_entries` via INSERT or COPY, and notify logical queues in one tx |
 | `EnqueueDeferred(j)` | `QueueStorage::insert_deferred_rows_tx` and `QueueStorage::insert_deferred_rows_copy_tx`; producer entry points include `enqueue_params_batch` and `enqueue_params_copy` | allocate job ids, sync enqueue-time uniqueness claims, append to `{schema}.deferred_jobs` via INSERT or COPY in one tx |
 | `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_state` | `DELETE FROM deferred_jobs ... INSERT INTO ready_entries ...` in one tx |
-| `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside the inline claim CTE; logical `UPDATE queue_claim_heads SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
-| `Claim(w, j)` | `QueueStorage::claim_runtime_batch` (`queue_storage.rs:4145`) → `claim_runtime_batch_with_aging_for_instance` (`:4504`) → dispatcher (`awa-worker/src/dispatcher.rs`) | inline claim CTE: lane selection via `FOR UPDATE OF queue_claim_heads SKIP LOCKED`; bare reads of `lease_ring_state` and `claim_ring_state` (no FOR SHARE/UPDATE — rotate's CAS UPDATE on `(current_slot, generation)` plus the partition busy-check provides the conflict detection); INSERT into `lease_claims_<claim_slot>` (receipts mode) or `leases_<lease_slot>` (legacy mode); UPDATE `queue_claim_heads` |
+| `AdvanceClaimCursor` | claim path spent-prefix advancement and post-commit `QueueStorage::advance_claim_cursors` | `claim_ready_runtime()` may advance the sequence-backed claim cursor only across a contiguous prefix of committed spent/tombstoned lanes; newly emitted claims advance the cursor after the claim transaction commits. |
+| `Claim(w, j)` | `QueueStorage::claim_runtime_batch` (`queue_storage.rs:4145`) → `claim_runtime_batch_with_aging_for_instance` (`:4504`) → dispatcher (`awa-worker/src/dispatcher.rs`) | inline claim CTE: lane selection via `FOR UPDATE OF queue_claim_heads SKIP LOCKED`; bare reads of `lease_ring_state` and `claim_ring_state` (no FOR SHARE/UPDATE — rotate's CAS UPDATE on `(current_slot, generation)` plus the partition busy-check provides the conflict detection); anti-join `ready_tombstones`; INSERT into `lease_claims_<claim_slot>` (receipts mode) or `leases_<lease_slot>` (legacy mode). |
 | `MaterializeAttemptState(j)` | `QueueStorage::upsert_attempt_state_from_receipts_tx` (`queue_storage.rs:6243`) and `upsert_attempt_state_progress_from_receipts_tx` (`:6307`) | `INSERT INTO attempt_state ... ON CONFLICT (job_id, run_lease) DO NOTHING` |
 | `Heartbeat(j)` | `heartbeat_tick` in `awa-worker/src/heartbeat.rs` | `UPDATE leases SET heartbeat_at = now() WHERE job_id = $1 AND run_lease = $2` |
 | `LoseHeartbeat(j)` | implicit — time passes without a heartbeat UPDATE; maintenance rescue sees a stale cutoff | (no action in real code; represents age) |
@@ -61,8 +62,10 @@ for backfill / fallback reads during upgrades.
 | `RetryToDeferred(w, j)` | `QueueStorage::retry_after` (`queue_storage.rs:7945`) / `snooze` (`:7981`) on `JobError::RetryAfter` / `Snooze` | `DELETE FROM leases`, `INSERT INTO deferred_jobs` |
 | `RescueToReady(j)` | `rescue_stale_heartbeats` (`queue_storage.rs:8575`) / `rescue_expired_deadlines` (`:8688`) in maintenance | `DELETE FROM leases ... RETURNING ...; INSERT INTO ready_entries ...` |
 | `CancelWaitingToTerminal(j)` | waiting branch in `cancel_job_tx` (`queue_storage.rs:5501`) | `DELETE FROM leases WHERE state IN ('running', 'waiting_external')`, hydrate from `ready_entries`, insert `done_entries`, close the matching receipt |
+| `CancelReadyToTerminal(j)` | available branch in `cancel_job_tx` | `SELECT ready_entries ... FOR UPDATE SKIP LOCKED`, append `ready_tombstones`, insert `done_entries(cancelled)`, and post-commit advance the claim cursor only if the cancelled lane was the current head. The ready row remains until queue prune. |
+| `ReprioritizeReady(j)` | `QueueStorage::age_waiting_priorities` | `SELECT ready_entries ... FOR UPDATE SKIP LOCKED`, append `ready_tombstones` for the old lane, append a new `ready_entries` row at the improved priority, and notify the queue. |
 | `StaleCompleteRejected(w, j)` | `complete_runtime_batch` returning `CompletionOutcome::IgnoredStale` | `UPDATE leases ... WHERE run_lease = $2` matching 0 rows |
-| `MoveFailedToDlq(j)` | `QueueStorage::move_failed_to_dlq` (`queue_storage.rs:8127`); admin entry in `awa-model/src/dlq.rs:170` | hydrate then `DELETE FROM done_entries`, delete the retained ready backing row, and `INSERT INTO dlq_entries` guarded by state=failed |
+| `MoveFailedToDlq(j)` | `QueueStorage::move_failed_to_dlq` (`queue_storage.rs:8127`); admin entry in `awa-model/src/dlq.rs:170` | hydrate from retained ready body, `DELETE FROM done_entries`, and `INSERT INTO dlq_entries` guarded by state=failed. The retained ready row remains until queue prune. |
 | `RetryFromDlq(j)` | `QueueStorage::retry_from_dlq` (`queue_storage.rs:8254`) | CTE: `DELETE FROM dlq_entries RETURNING ...` + `INSERT INTO ready_entries ...` (Rust resets `run_lease` to 0 because the new claim row will live in a different `claim_slot` partition; the spec keeps `run_lease` monotonic per-job since it abstracts away `claim_slot` from the receipt key); unique-conflict handled by `sync_unique_claim` |
 | `PurgeDlq(j)` | `purge_dlq_job` / `purge_dlq` in `awa-model/src/dlq.rs:382, 423` | `DELETE FROM dlq_entries WHERE ...` |
 | `RotateReadySegments` | maintenance `rotate_ready` (`awa-worker/src/maintenance.rs`) | `UPDATE queue_ring_state SET current_slot = next` + partition attach/detach |
@@ -84,13 +87,13 @@ for backfill / fallback reads during upgrades.
 | `AttemptStateRequiresLiveLease` | callback/progress attempt state is associated with a live lease row and is deleted on terminal/retry/rescue paths |
 | `FreshHeartbeatRequiresLease` | `heartbeat_at` is a column on `leases`; `enter_callback_wait` clears it for waiting leases |
 | `TerminalHasNoLiveRuntime` | `complete_runtime_batch` / terminal cancel/fail paths clear live runtime state before inserting terminal; a retained ready row is body storage, not live availability, because `CurrentReady` anti-joins terminal rows |
-| `TerminalHasRetainedReadyBody` | ADR-026 ready-backed terminal rows keep the ready row until terminal delete or queue prune; `load_job`, retry, DLQ move, and discard hydrate before removing the terminal fact |
+| `TerminalHasRetainedReadyBody` | ADR-026 ready-backed terminal rows keep the ready row until queue prune; `load_job`, retry, DLQ move, and discard hydrate before removing or moving the terminal fact |
 | `DlqHasNoLiveRuntime` | same, for dlq path |
 | `DlqAndTerminalDisjoint` | `move_failed_to_dlq` uses `DELETE FROM done_entries ... RETURNING` then `INSERT INTO dlq_entries` in one tx; no intermediate state where both hold the same job_id |
 | `StaleCompleteRejected` precondition | `WHERE run_lease = $2 AND state = 'running'` clauses on every completion UPDATE |
 | `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, enqueue_shard, lane_seq)` on `ready_entries` child partitions; `AwaSegmentedStorage` checks the per-shard uniqueness shape and `AwaShardedPrune` checks the cross-shard duplicate-`lane_seq` case |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
-| `PrunedXSegmentsAreEmpty` | ready, lease, terminal, and claim prune require no-live-row preconditions before TRUNCATE; queue-slot prune checks pending ready rows by `(queue, priority, enqueue_shard, lane_seq)` and reclaims matching terminal rows with their retained ready bodies; `deferred_jobs` and `dlq_entries` are unpartitioned backlog row-vacuum tables and are covered by `AwaDeadTupleContract` |
+| `PrunedXSegmentsAreEmpty` | ready, lease, terminal, tombstone, and claim prune require no-live-row preconditions before TRUNCATE; queue-slot prune checks pending ready rows by `(queue, priority, enqueue_shard, lane_seq)` anti-joined with `ready_tombstones`, then reclaims matching terminal rows, tombstones, and retained ready bodies together; `deferred_jobs` and `dlq_entries` are unpartitioned backlog row-vacuum tables and are covered by `AwaDeadTupleContract` |
 | `PrunedClaimSegmentsAreEmpty` (ADR-023) | `prune_oldest_claims` requires no open claim in the partition before TRUNCATE; rescue-before-truncate closes stragglers in the same transaction |
 | `NoLostClaim` (ADR-023) | receipts and their closures both live in `claim_slot`-partitioned tables; partitions only truncate once all their receipts are closed, so no open claim is physically dropped |
 | `ClaimOpenAndClosedDisjoint` (ADR-023) | closure insertion and receipt-clearing are a single transaction; a partition's receipt+closure pair is either both present or both dropped by `TRUNCATE` |
@@ -104,10 +107,10 @@ SQL implementation:
 
 - `awa.jobs` / `awa.jobs_compat()` is the compatibility view used by SQL
   adapters and operational queries. Migration
-  `awa-model/migrations/v019_queue_storage_jobs_compat_shard_joins.sql`
-  keeps queue-storage joins shard-aware: available rows join claim heads by
-  `(queue, priority, enqueue_shard)`, and lease-backed rows join ready bodies
-  by `(queue, priority, enqueue_shard, lane_seq)`.
+  `awa-model/migrations/v028_ready_tombstones.sql` keeps queue-storage
+  available rows shard-aware, uses the sequence-backed claim cursor, and
+  anti-joins `ready_tombstones`; lease-backed rows join ready bodies by
+  `(queue, priority, enqueue_shard, lane_seq)`.
 - `awa-model/src/admin.rs::queue_storage_current_jobs_cte`,
   `awa-model/src/admin.rs::state_counts`, and
   `awa-worker/src/client.rs::health_check` are the Rust read-side equivalents.
@@ -131,7 +134,7 @@ the worker role/effective-storage resolution in
 | TLA+ variable / action | Rust / SQL equivalent |
 |---|---|
 | `state`, `currentEngine`, `preparedEngine` | `awa.storage_transition_state.state`, `current_engine`, `prepared_engine` |
-| `preparedSchemaReady` | `queue_storage_schema_ready()` / SQL checks for the queue-storage substrate needed by producers and claimers: `{schema}.job_id_seq`, `queue_ring_state`, `ready_entries`, `done_entries`, `leases`, `deferred_jobs`, `lease_claims`, `lease_claim_closures`, and `claim_ready_runtime(...)` |
+| `preparedSchemaReady` | `queue_storage_schema_ready()` / SQL checks for the queue-storage substrate needed by producers and claimers: `{schema}.job_id_seq`, `queue_ring_state`, `ready_entries`, `ready_tombstones`, `done_entries`, `leases`, `deferred_jobs`, `lease_claims`, `lease_claim_closures`, and `claim_ready_runtime(...)` |
 | `oldCanonicalLive` | live `awa.runtime_instances` rows with `storage_capability = 'canonical'` |
 | `autoPreMixedLive` | a 0.6 `TransitionWorkerRole::Auto` runtime that resolved effective storage to canonical before mixed transition; it reports `queue_storage` while prepared and `canonical_drain_only` once routing flips |
 | `queueTargetLive` | `TransitionWorkerRole::QueueStorageTarget`; the only modeled runtime population that can execute queue-storage work immediately after mixed transition |

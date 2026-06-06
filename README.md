@@ -10,6 +10,28 @@ without Redis or RabbitMQ, Awa is built for you.
 
 ![AWA Web UI — Jobs (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
 
+## Core Concepts
+
+- A **job** is a typed payload stored in Postgres until a worker handles it.
+- A **queue** is the operational boundary workers subscribe to; use separate
+  queues when workloads need different capacity, ownership, or failure policy.
+- A **scheduled job** has a future `run_at`. Awa stores scheduled jobs outside
+  the ready claim path and promotes them when due. Retry backoff and snooze use
+  the same deferred backlog.
+- A worker **claims** a job before running it. The claim increments
+  `run_lease`, which guards completion so stale workers cannot finish a newer
+  attempt.
+- A **lease** is the durable execution record for a live attempt. Short jobs
+  usually stay on the receipt path; jobs that need heartbeat, progress,
+  callbacks, or mutable attempt state materialize a lease row.
+- A **lane** is the ordered stream for one `(queue, priority, enqueue_shard)`.
+  FIFO is strict inside a lane; raising shard count creates partitioned FIFO.
+- A **segment** is a ring partition Awa can rotate and later truncate.
+  Segments keep high-churn queue history off long-lived row-vacuum paths.
+- A **ready tombstone** is a small marker saying an immutable ready row should
+  no longer be claimed, for example after cancelling or reprioritizing an
+  unclaimed job. The ready row itself stays append-only until segment prune.
+
 ## Features
 
 ### Core queue
@@ -25,7 +47,7 @@ without Redis or RabbitMQ, Awa is built for you.
 - **Rust and Python workers** — same queues, same storage engine, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
 - **Runtime-owned maintenance** — dispatch, rescue, queue/lease/claim ring rotation, pruning, and cleanup run in the worker fleet; no `pg_cron` ticker required.
-- **Segmented queue storage** — append-only ready/terminal partitions, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
+- **Segmented queue storage** — append-only ready/terminal partitions, a small ready-tombstone ledger, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
 - **LISTEN/NOTIFY wakeup** — millisecond-scale pickup latency.
 - **HTTP Worker** — feature-gated worker that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with BLAKE3-signed callback auth.
 - **Weighted concurrency + rate limiting** — global worker pool with per-queue guarantees; per-queue token bucket.
@@ -137,11 +159,13 @@ awa --database-url $DATABASE_URL job dump-run 123
 ```
 
 The Awa mental model: your app inserts durable queue entries inside Postgres,
-often in the same transaction as business data; workers claim runnable entries
-through short-lived execution leases and rescue stale work after crashes;
-long-running attempts touch `attempt_state` only when they need mutable data
-like progress or callback state; operators inspect live, terminal, and DLQ
-state through the CLI or the built-in UI.
+often in the same transaction as business data. Immediate jobs become ready for
+workers; scheduled jobs, retry backoff, and snoozes wait in the deferred backlog
+until maintenance promotes them. Workers claim runnable entries through guarded
+attempt identity and rescue stale work after crashes; long-running attempts
+touch `attempt_state` only when they need mutable data like progress or callback
+state. Operators inspect scheduled, live, terminal, and DLQ state through the
+CLI or the built-in UI.
 
 Language-specific guides:
 
@@ -393,13 +417,13 @@ awa --database-url $DATABASE_URL job dump-run 123
 
 ```
  ┌────────────────┐  ┌────────────────┐
- │ Rust producer  │  │  Python (pip)  │
+ │ Rust producer  │  │  Python SDK    │
  └───────┬────────┘  └────────┬───────┘
          └────────┬───────────┘
                   ▼
        ┌──────────────────────────────┐
        │          PostgreSQL          │
-       │ ready / deferred entries     │
+       │ ready / tombstone / deferred │
        │ active leases / attempt_state│
        │ terminal / dlq entries       │
        └──────────────┬───────────────┘

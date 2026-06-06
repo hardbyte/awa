@@ -20,6 +20,26 @@ need answered first:
 For migration details see [migrations.md](migrations.md). For user-facing
 knobs see [configuration.md](configuration.md).
 
+## Terms
+
+- A **claim** is the storage transition that makes a ready job belong to one
+  attempt. It increments `run_lease`; later completion, retry, rescue, and
+  cancellation must match that lease number.
+- A **deferred** job is not claimable yet. Future `run_at` jobs are
+  `scheduled`; retry backoff and snooze rows are `retryable`. Maintenance
+  promotes due deferred rows into the ready ring.
+- A **lane** is one ordered `(queue, priority, enqueue_shard)` stream. Raising
+  the shard count creates more lanes for the same logical queue.
+- A **lease** is the durable live-attempt row used when an attempt needs mutable
+  execution state such as heartbeat, progress, callbacks, or deadlines.
+- A **receipt** is the lighter claim record used for short attempts. A closure
+  row records how the receipt ended; open receipts are derived by anti-joining
+  claims and closures.
+- A **segment** is a ring partition. Awa rotates segments and truncates whole
+  old segments instead of vacuuming hot history row by row.
+- A **ready tombstone** is an append-only marker that excludes an immutable
+  ready row from future claims.
+
 ## Runtime Shape
 
 The runtime is three cooperating layers:
@@ -56,7 +76,7 @@ right kind of churn.
 
 | Plane | Tables | Shape | Why it matters |
 |---|---|---|---|
-| Queue | `ready_entries_*`, `done_entries_*` | Ring partitions by `ready_slot` | Runnable and terminal rows stay append-first and are reclaimed by queue-ring prune. |
+| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*` | Ring partitions by `ready_slot` | Runnable and terminal rows stay append-first; rare ready mutations append tombstones instead of deleting ready rows; the whole segment is reclaimed by queue-ring prune. |
 | Queue backlog | `deferred_jobs` | Plain table | Scheduled and retryable work stays out of the hot claim path until promotion. |
 | Operator hold | `dlq_entries` | Plain table | DLQ rows are explicit operator backlog with retry, purge, and retention cleanup. |
 | Receipt execution | `lease_claims_*`, `lease_claim_closures_*` | Ring partitions by `claim_slot` | Short attempts avoid mutable lease rows; live receipts are claims anti-joined with closures. |
@@ -78,9 +98,10 @@ physical transition surfaces:
 
 | Surface | Role | Consumer contract |
 |---|---|---|
-| `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility surface used during the storage transition and by SQL adapters that need the public job shape. When queue storage is active, the runtime does not claim or complete from `awa.jobs`; compatibility inserts route into the active backend. | Public compatibility surface. Prefer Rust/Python/adapter APIs for ordinary writes. For high-volume queue-storage producers, prefer configured direct COPY through `QueueStorage::enqueue_params_copy()` or Python `enqueue_many_copy()` rather than the compat COPY path. |
+| `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility surface used during the storage transition and by SQL adapters that need the public job shape. When queue storage is active, the runtime does not claim or complete from `awa.jobs`; compatibility inserts route into the active backend, and SQL deletes of ready rows append ready tombstones. | Public compatibility surface. Prefer Rust/Python/adapter APIs for ordinary writes. For high-volume queue-storage producers, prefer configured direct COPY through `QueueStorage::enqueue_params_copy()` or Python `enqueue_many_copy()` rather than the compat COPY path. |
 | `{schema}.terminal_jobs` | Read-only hydrated view over queue-storage terminal history. It joins narrow `done_entries_*` rows back to retained `ready_entries_*` bodies. | Public read surface for SQL inspection and reporting of terminal queue-storage rows. It is not a write or transition surface. |
 | `ready_entries_*` | Physical runnable queue ring. | Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths. |
+| `ready_tombstones_*` | Physical ledger for ready lanes made unavailable by cancellation, priority aging, or similar out-of-band ready mutations. | Internal storage. Claim and exact-count paths anti-join it; maintenance truncates it with the matching ready segment. |
 | `done_entries_*` | Physical terminal fact ring. Ready-backed terminal rows can intentionally omit duplicated body columns. | Internal storage. Direct readers must tolerate nullable duplicated body fields; use `{schema}.terminal_jobs` for hydrated terminal rows. |
 | `deferred_jobs` | Physical scheduled/retryable backlog table. | Internal storage. Promotion, retry, snooze, and cancellation own its transitions. |
 | `dlq_entries` | Durable operator hold table for DLQ-enabled terminal failures. | Operator surface through CLI/UI/API; direct SQL inspection is reasonable, direct mutation is not. |
@@ -132,9 +153,9 @@ Terminal rows differ by storage backend:
   live in `done_entries_*` and are reclaimed by queue-ring prune. Ready-backed
   terminal rows are narrow: immutable job-body fields stay in the retained
   `ready_entries_*` row and public/admin reads hydrate through the storage
-  surfaces described above. If a transition deletes the ready row first, such
-  as cancelling an unclaimed available job, the terminal row is written wide
-  instead.
+  surfaces described above. Unclaimed ready cancellation and priority aging do
+  not delete ready rows; they append `ready_tombstones_*` rows so claim and
+  exact-count paths skip the old lane until queue prune reclaims the segment.
 - DLQ-enabled terminal failures are routed or moved into `dlq_entries`
   instead of ordinary terminal history; that table has explicit retention
   cleanup plus operator retry/purge.
@@ -175,6 +196,13 @@ sequenceDiagram
 Enqueue is transactional: if the producer's outer transaction rolls back, the
 job never becomes visible. Immediate jobs append to `ready_entries_*`; future
 scheduled or retryable jobs append to `deferred_jobs`.
+
+`deferred_jobs` is deliberately outside the claim path. The maintenance leader
+promotes due `scheduled` and `retryable` rows into `ready_entries_*` in batches
+and notifies the target queues. Cron schedules are just producers for ordinary
+jobs: when a schedule fires, the cron transaction records the fire and enqueues
+the job atomically, using `ready_entries_*` for immediate fires or
+`deferred_jobs` when the enqueue carries a future `run_at`.
 
 There are two COPY-shaped producer paths:
 
@@ -270,7 +298,7 @@ maintenance leader:
 
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 |---|---|---:|---|---|
-| Queue | `ready_entries_*`, `done_entries_*` | `1000ms` | incoming ready/done slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows in that ready segment are reclaimed with their retained ready bodies |
+| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*` | `1000ms` | incoming ready/done/tombstone slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows and tombstones in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `250ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure |
 

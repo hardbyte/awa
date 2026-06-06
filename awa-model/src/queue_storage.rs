@@ -287,7 +287,7 @@ pub enum PruneOutcome {
 pub enum SkipReason {
     /// Queue prune: leases on the prior generation persist.
     QueueActiveLeases,
-    /// Queue prune: ready rows without a matching done row.
+    /// Queue prune: ready rows without matching done or tombstone evidence.
     QueuePendingReady,
     /// Lease prune: target slot equals the current slot (rotator race).
     LeaseCurrent,
@@ -4008,52 +4008,6 @@ impl QueueStorage {
             .collect()
     }
 
-    async fn delete_ready_backing_rows_tx<'a>(
-        &self,
-        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        rows: &[DoneJobRow],
-    ) -> Result<u64, AwaError> {
-        let rows: Vec<&DoneJobRow> = rows.iter().filter(|row| row.lane_seq >= 0).collect();
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
-        let schema = self.schema();
-        let ready_slots: Vec<i32> = rows.iter().map(|row| row.ready_slot).collect();
-        let ready_generations: Vec<i64> = rows.iter().map(|row| row.ready_generation).collect();
-        let queues: Vec<&str> = rows.iter().map(|row| row.queue.as_str()).collect();
-        let priorities: Vec<i16> = rows.iter().map(|row| row.priority).collect();
-        let enqueue_shards: Vec<i16> = rows.iter().map(|row| row.enqueue_shard).collect();
-        let lane_seqs: Vec<i64> = rows.iter().map(|row| row.lane_seq).collect();
-
-        let result = sqlx::query(&format!(
-            r#"
-            WITH refs(ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq) AS (
-                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::smallint[], $6::bigint[])
-            )
-            DELETE FROM {schema}.ready_entries AS ready
-            USING refs
-            WHERE ready.ready_slot = refs.ready_slot
-              AND ready.ready_generation = refs.ready_generation
-              AND ready.queue = refs.queue
-              AND ready.priority = refs.priority
-              AND ready.enqueue_shard = refs.enqueue_shard
-              AND ready.lane_seq = refs.lane_seq
-            "#
-        ))
-        .bind(&ready_slots)
-        .bind(&ready_generations)
-        .bind(&queues)
-        .bind(&priorities)
-        .bind(&enqueue_shards)
-        .bind(&lane_seqs)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        Ok(result.rows_affected())
-    }
-
     async fn ready_payloads_for_done_rows_tx<'a, 'r>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5985,6 +5939,15 @@ impl QueueStorage {
                  AND claims.enqueue_shard = ready.enqueue_shard
                 WHERE ready.queue = ANY($1)
                   AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                        AND tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                  )
             ),
             pruned_terminal AS (
                 SELECT COALESCE(
@@ -6259,8 +6222,6 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if let Some(terminal) = terminal {
-            self.delete_ready_backing_rows_tx(tx, std::slice::from_ref(&terminal))
-                .await?;
             // #290: the DELETE FROM done_entries above removes one terminal
             // row; the counter must decrement in lockstep.
             self.decrement_live_terminal_counters_tx(
@@ -6412,14 +6373,8 @@ impl QueueStorage {
         let schema = self.schema();
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(&format!(
             r#"
-            DELETE FROM {schema}.ready_entries
-            WHERE (ready_slot, queue, priority, enqueue_shard, lane_seq) IN (
-                SELECT
-                    ready.ready_slot,
-                    ready.queue,
-                    ready.priority,
-                    ready.enqueue_shard,
-                    ready.lane_seq
+            WITH target AS (
+                SELECT ready.*
                 FROM {schema}.ready_entries AS ready
                 JOIN {schema}.queue_claim_heads AS claims
                   ON claims.queue = ready.queue
@@ -6427,11 +6382,28 @@ impl QueueStorage {
                  AND claims.enqueue_shard = ready.enqueue_shard
                 WHERE ready.job_id = $1
                   AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                        AND tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                  )
                 ORDER BY ready.lane_seq DESC
                 LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF ready SKIP LOCKED
+            ),
+            tombstone AS (
+                INSERT INTO {schema}.ready_tombstones (
+                    ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                )
+                SELECT ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                FROM target
+                ON CONFLICT DO NOTHING
             )
-            RETURNING
+            SELECT
                 ready_slot,
                 ready_generation,
                 job_id,
@@ -6450,6 +6422,7 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
+            FROM target
             "#
         ))
         .bind(job_id)
@@ -6849,14 +6822,8 @@ impl QueueStorage {
 
         let moved: Vec<ReadyTransitionRow> = sqlx::query_as(&format!(
             r#"
-            DELETE FROM {schema}.ready_entries
-            WHERE (ready_slot, queue, priority, enqueue_shard, lane_seq) IN (
-                SELECT
-                    ready.ready_slot,
-                    ready.queue,
-                    ready.priority,
-                    ready.enqueue_shard,
-                    ready.lane_seq
+            WITH target AS (
+                SELECT ready.*
                 FROM {schema}.ready_entries AS ready
                 JOIN {schema}.queue_claim_heads AS claims
                   ON claims.queue = ready.queue
@@ -6865,11 +6832,28 @@ impl QueueStorage {
                 WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
                   AND ready.priority > 1
                   AND ready.run_at <= $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                        AND tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                  )
                 ORDER BY ready.run_at ASC, ready.lane_seq ASC
                 LIMIT $2
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF ready SKIP LOCKED
+            ),
+            tombstones AS (
+                INSERT INTO {schema}.ready_tombstones (
+                    ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                )
+                SELECT ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                FROM target
+                ON CONFLICT DO NOTHING
             )
-            RETURNING
+            SELECT
                 ready_slot,
                 ready_generation,
                 job_id,
@@ -6888,6 +6872,7 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
+            FROM target
             "#
         ))
         .bind(cutoff)
@@ -6937,11 +6922,10 @@ impl QueueStorage {
             });
         }
 
-        // Aging deletes ready rows from the source lane without moving the
-        // source's claim cursor, then re-inserts on the target lane. The
-        // source lane can temporarily over-count by `moved`; later successful
-        // claims on that lane advance the cursor again. The drift is bounded
-        // by aging rate × poll interval.
+        // Aging tombstones the source lane without moving its claim cursor,
+        // then re-inserts on the target lane. The source lane can temporarily
+        // over-count by `moved`; later claims advance over the tombstones.
+        // The drift is bounded by aging rate × poll interval.
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
         self.notify_queues_tx(&mut tx, queues).await?;
@@ -9523,9 +9507,8 @@ impl QueueStorage {
             return Ok(None);
         };
 
-        self.delete_ready_backing_rows_tx(&mut tx, std::slice::from_ref(&moved))
-            .await?;
-        // #290: DLQ move deletes from done_entries — decrement counter.
+        // #290: dlq inserts do not increment the live terminal counter, so
+        // the source DELETE must decrement it.
         self.decrement_live_terminal_counters_tx(
             &mut tx,
             &Self::done_rows_to_counter_keys(std::slice::from_ref(&moved)),
@@ -9581,7 +9564,6 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        self.delete_ready_backing_rows_tx(&mut tx, &moved).await?;
         // #290: bulk DLQ move deletes from done_entries — decrement counter
         // by the per-group magnitudes of the moved rows.
         self.decrement_live_terminal_counters_tx(&mut tx, &Self::done_rows_to_counter_keys(&moved))
@@ -9825,8 +9807,6 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        self.delete_ready_backing_rows_tx(&mut tx, &deleted_done)
-            .await?;
         // #290: discard removes terminal `failed` rows from done_entries
         // (and `failed` DLQ rows from dlq_entries — counter is keyed on
         // done_entries only). Decrement the counter by the per-group
@@ -10681,6 +10661,7 @@ impl QueueStorage {
             });
         }
 
+        let tomb_child = format!("{schema}.ready_tombstones_{slot}");
         let pending: i64 = sqlx::query_scalar(&format!(
             r#"
             SELECT count(*)::bigint
@@ -10691,7 +10672,14 @@ impl QueueStorage {
              AND done.priority = ready.priority
              AND done.enqueue_shard = ready.enqueue_shard
              AND done.lane_seq = ready.lane_seq
+            LEFT JOIN {tomb_child} AS tomb
+              ON tomb.ready_generation = ready.ready_generation
+             AND tomb.queue = ready.queue
+             AND tomb.priority = ready.priority
+             AND tomb.enqueue_shard = ready.enqueue_shard
+             AND tomb.lane_seq = ready.lane_seq
             WHERE done.lane_seq IS NULL
+              AND tomb.lane_seq IS NULL
             "#
         ))
         .fetch_one(tx.as_mut())
@@ -10731,9 +10719,11 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let truncate = sqlx::query(&format!("TRUNCATE TABLE {ready_child}, {done_child}",))
-            .execute(tx.as_mut())
-            .await;
+        let truncate = sqlx::query(&format!(
+            "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}"
+        ))
+        .execute(tx.as_mut())
+        .await;
 
         match truncate {
             Ok(_) => {

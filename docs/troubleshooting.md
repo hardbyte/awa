@@ -361,6 +361,7 @@ WHERE schemaname = '<schema>'
       OR relname = 'deferred_jobs'
       OR relname = 'dlq_entries'
       OR relname LIKE 'ready_entries%'
+      OR relname LIKE 'ready_tombstones%'
       OR relname LIKE 'done_entries%'
       OR relname LIKE 'leases%'
   )
@@ -369,7 +370,7 @@ ORDER BY n_dead_tup DESC, relname;
 
 Interpretation:
 
-- `ready_entries%` should usually stay at or near zero dead tuples
+- `ready_entries%` and `ready_tombstones%` should usually stay at or near zero dead tuples
 - `leases%` can rise within the current rotation window, but should fall again
   after prune
 - `attempt_state` should roughly match live long-running attempts, not total

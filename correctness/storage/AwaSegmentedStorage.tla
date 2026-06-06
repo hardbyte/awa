@@ -134,7 +134,8 @@ VARIABLES readyEntries,
           leaseSegmentCursor,
           terminalSegmentCursor,
           claimSegmentCursor,
-          laneState
+          laneState,
+          readyTombstones
 
 vars == <<readyEntries,
           deferredEntries,
@@ -163,7 +164,8 @@ vars == <<readyEntries,
           leaseSegmentCursor,
           terminalSegmentCursor,
           claimSegmentCursor,
-          laneState>>
+          laneState,
+          readyTombstones>>
 
 NextReadySegment(s) == IF s = ReadySegmentCount THEN 1 ELSE s + 1
 NextLeaseSegment(s) == IF s = LeaseSegmentCount THEN 1 ELSE s + 1
@@ -172,6 +174,12 @@ NextClaimSegment(s) == IF s = ClaimSegmentCount THEN 1 ELSE s + 1
 
 ReceiptClaimJobs == {j \in Jobs : \E r \in RunLeaseValues : <<j, r>> \in claimOpen}
 
+ReadyTombstone(j) == [
+    job |-> j,
+    segment |-> readySegmentOf[j],
+    laneSeq |-> laneSeq[j]
+]
+
 CurrentReady ==
     {j \in readyEntries :
         /\ j \notin terminalEntries
@@ -179,6 +187,7 @@ CurrentReady ==
         /\ j \notin ReceiptClaimJobs
         /\ j \notin deferredEntries
         /\ j \notin dlqEntries
+        /\ ReadyTombstone(j) \notin readyTombstones
         /\ laneSeq[j] >= laneState.claimSeq}
 
 JobsInReadySegment(seg) == {j \in Jobs : readySegmentOf[j] = seg}
@@ -216,6 +225,7 @@ Init ==
     /\ terminalSegmentCursor = 1
     /\ claimSegmentCursor = 1
     /\ laneState = [appendSeq |-> 1, claimSeq |-> 1, readyCount |-> 0, leasedCount |-> 0]
+    /\ readyTombstones = {}
 
 \* Segment-state variables for every family that are never touched by a
 \* data-level action. Every data action unchanges this bundle.
@@ -263,7 +273,8 @@ EnqueueReady(j) ==
                    heartbeatFresh,
                    progressTouched,
                    leaseSegmentOf,
-                   terminalSegmentOf>>
+                   terminalSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -291,7 +302,8 @@ EnqueueDeferred(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -318,7 +330,8 @@ PromoteDeferred(j) ==
                    heartbeatFresh,
                    progressTouched,
                    leaseSegmentOf,
-                   terminalSegmentOf>>
+                   terminalSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -341,7 +354,8 @@ AdvanceClaimCursor ==
                    laneSeq,
                    readySegmentOf,
                    leaseSegmentOf,
-                   terminalSegmentOf>>
+                   terminalSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -387,7 +401,8 @@ Claim(w, j) ==
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
-                   terminalSegmentOf>>
+                   terminalSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 MaterializeAttemptState(j) ==
@@ -409,7 +424,8 @@ MaterializeAttemptState(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -432,7 +448,8 @@ Heartbeat(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -455,7 +472,8 @@ LoseHeartbeat(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -477,7 +495,8 @@ ProgressFlush(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -507,7 +526,8 @@ ParkToWaiting(w, j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    laneState,
-                   terminalSegmentOf>>
+                   terminalSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -532,7 +552,8 @@ ResumeWaitingToRunning(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -565,7 +586,8 @@ TimeoutWaitingToReady(j) ==
                    dlqEntries,
                    runLease,
                    terminalSegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 \* Callback-timeout rescue on exhausted attempts lands a waiting entry
@@ -575,24 +597,25 @@ TimeoutWaitingToDlq(j) ==
     /\ j \in attemptState
     /\ activeLeases' = activeLeases \ {j}
     /\ waitingLeases' = waitingLeases \ {j}
-    /\ readyEntries' = readyEntries \ {j}
     /\ dlqEntries' = dlqEntries \cup {j}
     /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
     /\ taskLease' = [w \in Workers |-> [taskLease[w] EXCEPT ![j] = 0]]
     /\ attemptState' = attemptState \ {j}
     /\ progressTouched' = progressTouched \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
     /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
-    /\ UNCHANGED <<deferredEntries,
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
                    terminalEntries,
                    runLease,
+                   laneSeq,
+                   readySegmentOf,
                    terminalSegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 FastComplete(w, j) ==
@@ -622,7 +645,8 @@ FastComplete(w, j) ==
                    readyEntries,
                    laneSeq,
                    readySegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 StatefulComplete(w, j) ==
@@ -652,7 +676,8 @@ StatefulComplete(w, j) ==
                    readyEntries,
                    laneSeq,
                    readySegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 \* Executor-side terminal failure with DLQ enabled. The attempt's lease
@@ -665,25 +690,26 @@ FailToDlq(w, j) ==
     /\ leaseOwner[j] = w
     /\ taskLease[w][j] = runLease[j]
     /\ activeLeases' = activeLeases \ {j}
-    /\ readyEntries' = readyEntries \ {j}
     /\ dlqEntries' = dlqEntries \cup {j}
     /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ progressTouched' = progressTouched \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
     /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
-    /\ UNCHANGED <<deferredEntries,
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
                    waitingLeases,
                    terminalEntries,
                    runLease,
+                   laneSeq,
+                   readySegmentOf,
                    terminalSegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 RetryToDeferred(w, j) ==
@@ -694,24 +720,25 @@ RetryToDeferred(w, j) ==
     /\ taskLease[w][j] = runLease[j]
     /\ activeLeases' = activeLeases \ {j}
     /\ deferredEntries' = deferredEntries \cup {j}
-    /\ readyEntries' = readyEntries \ {j}
     /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ progressTouched' = progressTouched \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
     /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
-    /\ UNCHANGED <<waitingLeases,
+    /\ UNCHANGED <<readyEntries,
+                   waitingLeases,
                    terminalEntries,
                    dlqEntries,
                    runLease,
+                   laneSeq,
+                   readySegmentOf,
                    terminalSegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 \* Heartbeat or deadline rescue. No longer requires attempt_state, so
@@ -747,7 +774,8 @@ RescueToReady(j) ==
                    taskLease,
                    heartbeatFresh,
                    terminalSegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 \* ADR-023 Tier-A rescue: force-close a straggling receipt whose
@@ -786,7 +814,8 @@ RescueStaleReceipt(j, r) ==
                    leaseSegmentOf,
                    terminalSegmentOf,
                    claimSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 CancelWaitingToTerminal(j) ==
@@ -811,7 +840,8 @@ CancelWaitingToTerminal(j) ==
                    readyEntries,
                    laneSeq,
                    readySegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 \* Admin cancel of a running (lease-backed) job. Mirrors
@@ -852,7 +882,8 @@ CancelRunningToTerminal(j) ==
                    readyEntries,
                    laneSeq,
                    readySegmentOf,
-                   claimSegmentOf>>
+                   claimSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
 
 \* Admin cancel of a job whose attempt is running on the receipt-only
@@ -888,7 +919,72 @@ CancelReceiptOnlyToTerminal(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    claimSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
+    /\ UnchangedSegmentState
+
+CancelReadyToTerminal(j) ==
+    /\ j \in CurrentReady
+    /\ j \notin activeLeases
+    /\ j \notin waitingLeases
+    /\ j \notin terminalEntries
+    /\ j \notin deferredEntries
+    /\ j \notin dlqEntries
+    /\ terminalSegments[terminalSegmentCursor] = "open"
+    /\ terminalEntries' = terminalEntries \cup {j}
+    /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = terminalSegmentCursor]
+    /\ readyTombstones' = readyTombstones \cup {ReadyTombstone(j)}
+    /\ laneState' = [laneState EXCEPT !.readyCount = laneState.readyCount - 1]
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingLeases,
+                   dlqEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   laneSeq,
+                   readySegmentOf,
+                   leaseSegmentOf,
+                   claimSegmentOf,
+                   claimOpen,
+                   claimClosed>>
+    /\ UnchangedSegmentState
+
+ReprioritizeReady(j) ==
+    /\ j \in CurrentReady
+    /\ j \notin activeLeases
+    /\ j \notin waitingLeases
+    /\ j \notin terminalEntries
+    /\ j \notin deferredEntries
+    /\ j \notin dlqEntries
+    /\ laneState.appendSeq <= MaxAppendSeq
+    /\ readySegments[readySegmentCursor] = "open"
+    /\ readyTombstones' = readyTombstones \cup {ReadyTombstone(j)}
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = laneState.appendSeq]
+    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = readySegmentCursor]
+    /\ laneState' = [laneState EXCEPT
+                        !.appendSeq = laneState.appendSeq + 1]
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingLeases,
+                   terminalEntries,
+                   dlqEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   leaseSegmentOf,
+                   terminalSegmentOf,
+                   claimSegmentOf,
+                   claimOpen,
+                   claimClosed>>
     /\ UnchangedSegmentState
 
 StaleCompleteRejected(w, j) ==
@@ -912,7 +1008,8 @@ StaleCompleteRejected(w, j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -925,10 +1022,8 @@ MoveFailedToDlq(j) ==
     /\ terminalEntries' = terminalEntries \ {j}
     /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = NoTerminalSegment]
     /\ dlqEntries' = dlqEntries \cup {j}
-    /\ readyEntries' = readyEntries \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
-    /\ UNCHANGED <<deferredEntries,
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
                    waitingLeases,
                    activeLeases,
                    leaseOwner,
@@ -937,19 +1032,19 @@ MoveFailedToDlq(j) ==
                    attemptState,
                    heartbeatFresh,
                    progressTouched,
+                   laneSeq,
+                   readySegmentOf,
                    leaseSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
-\* Retry a DLQ row back into live queue storage. Resets run_lease to 0
-\* to match the Rust contract (`retry_from_dlq` starts a fresh attempt).
-\* DLQ retry preserves the job's run_lease counter — `retry_from_dlq`
-\* reads the DLQ row's run_lease and reinserts it into ready_entries
-\* with that value preserved, so the next claim's `run_lease + 1` is
-\* monotonic across the job's entire lifetime. Resetting it here would
-\* let the next claim collide with an old (j, run_lease) key still
-\* tracked in claimClosed for an unpruned old partition.
+\* Retry a DLQ row back into live queue storage. Rust resets run_lease
+\* because the new claim row lands in a fresh claim partition. The model
+\* abstracts claim_slot away from the receipt key, so it preserves
+\* runLease[j] and lets the next claim use runLease[j] + 1 instead of
+\* colliding with an old (j, run_lease) key still tracked in claimClosed.
 RetryFromDlq(j) ==
     /\ j \in dlqEntries
     /\ laneState.appendSeq <= MaxAppendSeq
@@ -972,7 +1067,8 @@ RetryFromDlq(j) ==
                    heartbeatFresh,
                    progressTouched,
                    leaseSegmentOf,
-                   terminalSegmentOf>>
+                   terminalSegmentOf,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -996,7 +1092,8 @@ PurgeDlq(j) ==
                    readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedSegmentState
     /\ UnchangedClaimData
 
@@ -1030,7 +1127,8 @@ RotateReadySegments ==
                    leaseSegmentCursor,
                    terminalSegmentCursor,
                    claimSegmentCursor,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedClaimData
 
 RotateLeaseSegments ==
@@ -1063,7 +1161,8 @@ RotateLeaseSegments ==
                    readySegmentCursor,
                    terminalSegmentCursor,
                    claimSegmentCursor,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedClaimData
 
 RotateTerminalSegments ==
@@ -1096,7 +1195,8 @@ RotateTerminalSegments ==
                    readySegmentCursor,
                    leaseSegmentCursor,
                    claimSegmentCursor,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedClaimData
 
 \* ADR-023 rotation of the claim-ring control plane. Mirrors the
@@ -1132,7 +1232,8 @@ RotateClaimSegments ==
                    readySegmentCursor,
                    leaseSegmentCursor,
                    terminalSegmentCursor,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedClaimData
 
 PruneReadySegment(seg) ==
@@ -1141,6 +1242,7 @@ PruneReadySegment(seg) ==
     /\ \A j \in Jobs : readySegmentOf[j] = seg => j \notin CurrentReady /\ j \notin activeLeases /\ j \notin ReceiptClaimJobs
     /\ readyEntries' = readyEntries \ JobsInReadySegment(seg)
     /\ terminalEntries' = terminalEntries \ JobsInReadySegment(seg)
+    /\ readyTombstones' = {t \in readyTombstones : t.segment # seg}
     /\ laneSeq' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoLaneSeq ELSE laneSeq[j]]
     /\ readySegmentOf' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoReadySegment ELSE readySegmentOf[j]]
     /\ terminalSegmentOf' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoTerminalSegment ELSE terminalSegmentOf[j]]
@@ -1194,7 +1296,8 @@ PruneLeaseSegment(seg) ==
                    leaseSegmentCursor,
                    terminalSegmentCursor,
                    claimSegmentCursor,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedClaimData
 
 PruneTerminalSegment(seg) ==
@@ -1225,7 +1328,8 @@ PruneTerminalSegment(seg) ==
                    leaseSegmentCursor,
                    terminalSegmentCursor,
                    claimSegmentCursor,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
     /\ UnchangedClaimData
 
 \* ADR-023 prune of the claim ring. The precondition
@@ -1269,7 +1373,8 @@ PruneClaimSegment(seg) ==
                    leaseSegmentCursor,
                    terminalSegmentCursor,
                    claimSegmentCursor,
-                   laneState>>
+                   laneState,
+                   readyTombstones>>
 
 Stutter == /\ UNCHANGED vars
 
@@ -1296,6 +1401,8 @@ Next ==
     \/ \E j \in Jobs : CancelWaitingToTerminal(j)
     \/ \E j \in Jobs : CancelRunningToTerminal(j)
     \/ \E j \in Jobs : CancelReceiptOnlyToTerminal(j)
+    \/ \E j \in Jobs : CancelReadyToTerminal(j)
+    \/ \E j \in Jobs : ReprioritizeReady(j)
     \/ \E w \in Workers, j \in Jobs : StaleCompleteRejected(w, j)
     \/ \E j \in Jobs : MoveFailedToDlq(j)
     \/ \E j \in Jobs : RetryFromDlq(j)
@@ -1352,6 +1459,9 @@ TypeOK ==
     /\ laneState.claimSeq \in 1..(MaxAppendSeq + 1)
     /\ laneState.readyCount \in 0..Cardinality(Jobs)
     /\ laneState.leasedCount \in 0..Cardinality(Jobs)
+    /\ readyTombstones \subseteq [job: Jobs,
+                                  segment: ReadySegments \cup {NoReadySegment},
+                                  laneSeq: 0..MaxAppendSeq]
 
 OneOpenReadySegment == Cardinality({s \in ReadySegments : readySegments[s] = "open"}) = 1
 OneOpenLeaseSegment == Cardinality({s \in LeaseSegments : leaseSegments[s] = "open"}) = 1
@@ -1400,7 +1510,7 @@ DlqHasNoLiveRuntime ==
         /\ j \notin activeLeases
         /\ j \notin attemptState
         /\ j \notin waitingLeases
-        /\ j \notin readyEntries
+        /\ j \notin CurrentReady
         /\ j \notin deferredEntries
 
 DlqAndTerminalDisjoint == dlqEntries \cap terminalEntries = {}
@@ -1408,8 +1518,10 @@ DlqAndTerminalDisjoint == dlqEntries \cap terminalEntries = {}
 ReadyEntriesHaveLaneSeq ==
     \A j \in CurrentReady : laneSeq[j] # NoLaneSeq
 
-DeferredEntriesClearLaneSeq == \A j \in deferredEntries : laneSeq[j] = NoLaneSeq
-DlqEntriesClearLaneSeq == \A j \in dlqEntries : laneSeq[j] = NoLaneSeq
+DeferredEntriesClearLaneSeq ==
+    \A j \in deferredEntries : j \in readyEntries \/ laneSeq[j] = NoLaneSeq
+DlqEntriesClearLaneSeq ==
+    \A j \in dlqEntries : j \in readyEntries \/ laneSeq[j] = NoLaneSeq
 
 ReadyLaneSeqUnique ==
     \A j1, j2 \in CurrentReady : j1 # j2 => laneSeq[j1] # laneSeq[j2]

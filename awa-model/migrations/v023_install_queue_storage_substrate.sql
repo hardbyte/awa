@@ -930,7 +930,8 @@ BEGIN
     );
 
     --------------------------------------------------------------------
-    -- Attempt state, ready_entries, done_entries, deferred_jobs, dlq_entries.
+    -- Attempt state, ready_entries, ready_tombstones, done_entries,
+    -- deferred_jobs, dlq_entries.
     --------------------------------------------------------------------
 
     EXECUTE format(
@@ -995,6 +996,35 @@ BEGIN
         ) PARTITION BY LIST (ready_slot)
         $ddl$,
         p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.ready_tombstones (
+            ready_slot       INT NOT NULL,
+            ready_generation BIGINT NOT NULL,
+            queue            TEXT NOT NULL,
+            priority         SMALLINT NOT NULL,
+            enqueue_shard    SMALLINT NOT NULL DEFAULT 0,
+            lane_seq         BIGINT NOT NULL,
+            job_id           BIGINT NOT NULL,
+            tombstoned_at    TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq, ready_generation)
+        ) PARTITION BY LIST (ready_slot)
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'COMMENT ON TABLE %I.ready_tombstones IS %L',
+        p_schema,
+        'Append-only ledger of ready lanes that were made unavailable without deleting ready_entries; reclaimed with the matching ready-slot partition.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.ready_tombstones.ready_generation IS %L',
+        p_schema,
+        'Generation guard for reused ready_slot partitions; prevents a tombstone from applying to a later ring generation.'
     );
 
     EXECUTE format(
@@ -1181,7 +1211,8 @@ BEGIN
     );
 
     --------------------------------------------------------------------
-    -- ready_entries / done_entries partitions + lane indexes.
+    -- ready_entries / ready_tombstones / done_entries partitions + lane
+    -- indexes.
     --------------------------------------------------------------------
 
     FOR v_slot IN 0..(p_queue_slot_count - 1) LOOP
@@ -1200,6 +1231,21 @@ BEGIN
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%s_ready_%s_job ON %I.%I (job_id)',
             p_schema, v_slot, p_schema, format('ready_entries_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.ready_tombstones FOR VALUES IN (%s)',
+            p_schema, format('ready_tombstones_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_ready_tombstones_%s_lane_shard ON %I.%I (queue, priority, enqueue_shard, lane_seq)',
+            p_schema, v_slot, p_schema, format('ready_tombstones_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_ready_tombstones_%s_job ON %I.%I (job_id)',
+            p_schema, v_slot, p_schema, format('ready_tombstones_%s', v_slot)
         );
 
         EXECUTE format(
@@ -1611,6 +1657,15 @@ BEGIN
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
                   AND ready.lane_seq >= cursors.claim_seq
+                  AND NOT EXISTS (
+                      SELECT 1 FROM %1$I.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                        AND tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                  )
                 ORDER BY ready.lane_seq ASC
                 LIMIT 1
             ) AS candidate ON TRUE
@@ -1670,7 +1725,16 @@ BEGIN
                 SELECT
                     ready.job_id,
                     ready.run_lease,
-                    ready.lane_seq
+                    ready.lane_seq,
+                    EXISTS (
+                        SELECT 1 FROM %1$I.ready_tombstones AS tomb
+                        WHERE tomb.ready_slot = ready.ready_slot
+                          AND tomb.ready_generation = ready.ready_generation
+                          AND tomb.queue = ready.queue
+                          AND tomb.priority = ready.priority
+                          AND tomb.enqueue_shard = ready.enqueue_shard
+                          AND tomb.lane_seq = ready.lane_seq
+                    ) AS is_tombstone
                 FROM %1$I.ready_entries AS ready
                 WHERE ready.queue = p_queue
                   AND ready.priority = v_lane_priority
@@ -1685,7 +1749,8 @@ BEGIN
                 SELECT
                     selected.*,
                     (
-                        EXISTS (
+                        selected.is_tombstone
+                        OR EXISTS (
                             SELECT 1
                             FROM %1$I.lease_claims AS existing_claims
                             WHERE existing_claims.job_id = selected.job_id
@@ -1723,16 +1788,26 @@ BEGIN
                         )
                     ) AS attempt_spent
                 FROM selected
+            ),
+            spent_prefix AS (
+                SELECT
+                    selected_with_spent.lane_seq,
+                    selected_with_spent.lane_seq
+                        - row_number() OVER (ORDER BY selected_with_spent.lane_seq)::bigint AS prefix_group
+                FROM selected_with_spent
+                WHERE attempt_spent
             )
-            SELECT max(selected_with_spent.lane_seq) + 1
+            SELECT max(spent_prefix.lane_seq) + 1
             INTO v_spent_next_seq
-            FROM selected_with_spent
-            WHERE attempt_spent;
+            FROM spent_prefix
+            WHERE prefix_group = v_lane_claim_seq - 1;
 
             IF v_spent_next_seq IS NOT NULL THEN
-                -- Safe in-transaction sequence movement: this only skips
-                -- attempts with already-committed evidence. Newly emitted
-                -- claims still advance post-commit.
+                -- Safe in-transaction sequence movement: only skip a
+                -- contiguous prefix of attempts with already-committed
+                -- evidence. Later spent/tombstoned lanes cannot move the
+                -- cursor past an earlier live row, because the surrounding
+                -- claim transaction could still abort.
                 PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_spent_next_seq);
             END IF;
 
@@ -1768,7 +1843,16 @@ BEGIN
                     ready.created_at,
                     ready.unique_key,
                     ready.unique_states,
-                    COALESCE(ready.payload, '{}'::jsonb) AS payload
+                    COALESCE(ready.payload, '{}'::jsonb) AS payload,
+                    EXISTS (
+                        SELECT 1 FROM %1$I.ready_tombstones AS tomb
+                        WHERE tomb.ready_slot = ready.ready_slot
+                          AND tomb.ready_generation = ready.ready_generation
+                          AND tomb.queue = ready.queue
+                          AND tomb.priority = ready.priority
+                          AND tomb.enqueue_shard = ready.enqueue_shard
+                          AND tomb.lane_seq = ready.lane_seq
+                    ) AS is_tombstone
                 FROM %1$I.ready_entries AS ready
                 WHERE ready.queue = p_queue
                   AND ready.priority = v_lane_priority
@@ -1798,7 +1882,8 @@ BEGIN
                         -- Legitimate retries re-enter ready/deferred state
                         -- with selected.run_lease advanced, so they target a
                         -- new idempotency key.
-                        EXISTS (
+                        selected.is_tombstone
+                        OR EXISTS (
                             SELECT 1
                             FROM %1$I.lease_claims AS existing_claims
                             WHERE existing_claims.job_id = selected.job_id
@@ -1897,6 +1982,12 @@ BEGIN
         p_schema, v_claimed_cte
     );
 
+    EXECUTE format(
+        'COMMENT ON FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION) IS %L',
+        p_schema,
+        'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
+    );
+
     --------------------------------------------------------------------
     -- Seed ring-slot generation rows. Slot 0 starts at generation 0;
     -- the rest start at -1 (sentinel for "never rotated through").
@@ -1929,7 +2020,7 @@ END;
 $install$;
 
 COMMENT ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) IS
-    'Installs the queue-storage substrate (sequences, ring-state singletons, partitioned ready/done/lease tables, lane indexes, claim_ready_runtime()) into the named schema. The default ''awa'' substrate is migration-owned and default-shaped: lease_claim_receipts=TRUE and (queue=16, lease=8, claim=8). Operators wanting non-default slot counts or lease_claim_receipts=FALSE must use a custom queue-storage schema. SECURITY INVOKER, takes a per-schema advisory xact lock. See #308.';
+    'Installs the queue-storage substrate (sequences, ring-state singletons, partitioned ready/tombstone/done/lease tables, lane indexes, claim_ready_runtime()) into the named schema. The default ''awa'' substrate is migration-owned and default-shaped: lease_claim_receipts=TRUE and (queue=16, lease=8, claim=8). Operators wanting non-default slot counts or lease_claim_receipts=FALSE must use a custom queue-storage schema. SECURITY INVOKER, takes a per-schema advisory xact lock. See #308.';
 
 REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) FROM PUBLIC;
 

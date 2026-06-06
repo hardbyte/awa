@@ -27,6 +27,10 @@ async def main() -> None:
     if mode == "worker_chaos_probe":
         @client.task(ChaosProbe, queue=queue)
         async def handle(job):
+            if job.args.marker.startswith("rust-"):
+                # Keep the mixed-language smoke deterministic: wrong-language
+                # claims yield the job back without burning an attempt.
+                return awa.Snooze(seconds=0.05)
             print(
                 f"START mode={mode} pid={os.getpid()} job_id={job.id} marker={job.args.marker}",
                 flush=True,

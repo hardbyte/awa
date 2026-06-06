@@ -1003,6 +1003,10 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
         "prepared queue-storage schema should materialize ready_entries"
     );
     assert!(
+        relation_exists(&pool, "awa_queue_storage_prepared.ready_tombstones").await,
+        "prepared queue-storage schema should materialize ready_tombstones"
+    );
+    assert!(
         relation_exists(&pool, "awa_queue_storage_prepared.leases").await,
         "prepared queue-storage schema should materialize leases"
     );
@@ -1036,6 +1040,19 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
             .await
             .expect("schema readiness should be queryable after sequence drop"),
         "schema without job_id_seq must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!("DROP TABLE {schema}.ready_tombstones CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("test ready_tombstones drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after tombstone table drop"),
+        "schema without ready_tombstones must not be reported as ready"
     );
 
     prepare_queue_storage_schema(&pool, schema).await;

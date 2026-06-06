@@ -2,6 +2,20 @@
 
 AWA has three configuration surfaces: the **Rust runtime** (`ClientBuilder` + `QueueConfig`), the **Python runtime** (`client.start()`), and the **CLI** (`awa serve`, `awa job`, etc). This guide explains how they work rather than listing every option — use `--help`, IDE autocomplete, or the source for exhaustive reference.
 
+Terms used throughout this guide:
+
+- A **queue** is the worker subscription and capacity boundary.
+- A **claim** is the act of reserving a ready job for one attempt.
+- A **claim lease** (`run_lease`) is the monotonically increasing attempt guard
+  on a job; stale completions with an old value are rejected.
+- A **scheduled job** has a future `run_at` and waits outside the ready claim
+  path. Retry backoff and snooze use the same deferred backlog until their
+  `run_at` is due.
+- A **lane** is one ordered `(queue, priority, enqueue_shard)` stream.
+- A **segment** is a rotating partition that Awa eventually truncates.
+- A **receipt** is the lightweight short-attempt claim record; a **lease row**
+  is materialized when an attempt needs mutable execution state.
+
 ## How configuration flows
 
 ```
@@ -190,6 +204,25 @@ There is no active per-job-kind hard timeout today. The hard timeout is the
 queue's `deadline_duration`; moving long-running kinds onto their own queue is
 the intended way to give them a different timeout without making every job on a
 busy queue slower to rescue.
+
+## Scheduled jobs and deferred promotion
+
+Set `run_at` when enqueueing a job that should not be claimable yet. Awa stores
+that row in the deferred backlog and the maintenance leader promotes it to the
+ready ring once `run_at <= now()`.
+
+Retry backoff and `Snooze` use the same mechanism: the current attempt closes,
+a retryable row is written with its next `run_at`, and promotion makes it ready
+again later. Cron schedules are producers on top of the same enqueue path; a
+cron fire atomically records the schedule fire and inserts the resulting job.
+
+Operational knobs:
+
+- `promote_interval` controls how often maintenance checks for due deferred
+  rows.
+- Per-job `run_at` controls the due time.
+- Periodic schedules are declared in worker code with `periodic()` and managed
+  through the CLI/UI `cron` surface.
 
 ## Job priority and aging
 
@@ -447,6 +480,12 @@ job body. Public Awa APIs perform that hydration, and
 `{schema}.terminal_jobs` exposes the same hydrated terminal shape for
 read-only SQL inspection.
 
+Ready rows are not deleted for unclaimed cancellation, priority aging, or SQL
+compatibility deletes through `awa.jobs`. Those paths append to
+`{schema}.ready_tombstones_*`; claim and exact-count queries anti-join the
+tombstone ledger, and queue prune truncates it with the matching ready/done
+segment.
+
 The `completed_retention` and `failed_retention` knobs apply to the canonical
 compatibility path, not to queue-storage terminal history. In queue storage,
 use the queue-ring sizing and rotation knobs below to control how much
@@ -534,7 +573,7 @@ await client.start(
 
 | Knob | Default | What it controls |
 |---|---|---|
-| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. Ready-backed terminal rows rely on the matching ready partition until queue prune reclaims both. |
+| `queue_slot_count` | `16` | Number of rotating ready/tombstone/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. Ready-backed terminal rows rely on the matching ready partition until queue prune reclaims both. |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
 | `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current tuned recommendation; higher values should be benchmarked before use. |
