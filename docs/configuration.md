@@ -58,7 +58,7 @@ async def handle(job): ...
 await client.start([("email", 8)])
 ```
 
-Run separate worker processes (or separate fleets) per queue when you want **isolation**: a stuck `etl` queue can't starve `email`, deployment of a slow handler doesn't pause unrelated queues, and per- queue scaling is just a deployment knob. Run **one worker process across multiple queues** with `global_max_workers` and weighted mode when you want elastic capacity sharing — see [Weighted mode](#weighted-mode).
+Run separate worker processes (or separate fleets) per queue when you want **isolation**: a stuck `etl` queue can't starve `email`, deployment of a slow handler doesn't pause unrelated queues, and per-queue scaling is just a deployment knob. Run **one worker process across multiple queues** with `global_max_workers` and weighted mode when you want elastic capacity sharing — see [Weighted mode](#weighted-mode).
 
 ### Targeting specific job kinds within a queue
 
@@ -170,7 +170,17 @@ Register the handler once and pass explicit fanout queue configs to `start()`. P
 
 `route_by_key()` returns `{"queue": ..., "ordering_key": ...}` and can be passed directly to `insert()`, `insert_many_copy()`, or `enqueue_many_copy()` when the whole call shares the same key. `route_by_index()` returns only a queue for round-robin fanout when per-key FIFO is not needed. Python `enqueue_many_copy()` still takes one queue and one ordering key per call, so mixed-key COPY producers should group their batch before calling it.
 
-Use queue fanout before raising `claimers` when you need more end-to-end throughput and can accept partitioned ordering. Use `enqueue_shards` when a single physical queue should remain the public operational unit but can accept partitioned FIFO inside that queue. Use extra `claimers` only when one runtime cannot keep its worker permits full.
+### Choosing a throughput lever
+
+These knobs solve different bottlenecks:
+
+| Knob | What changes | Use it when |
+| --- | --- | --- |
+| `QueueFanout` | Routes one logical workload across multiple physical queues. Each physical queue has its own queue-level capacity, rate limit, claim cursor, completion stream, and metrics. | The workload can be partitioned by key or round-robin, and you want more end-to-end throughput from independent queue coordination paths. |
+| `enqueue_shards` | Keeps one physical queue name, but splits that queue into multiple ordered lanes. FIFO becomes per `(queue, priority, enqueue_shard)` instead of global per `(queue, priority)`. | Operators should still see one queue, but the workload can accept partitioned FIFO inside that queue. |
+| `claimers` | Adds more dispatcher/claimer loops for the same physical queue inside one worker runtime. They share the queue's worker permits and rate limiter. | One claimer is leaving worker permits idle. This is not the first lever for a hot queue because extra claimers can add transaction pressure without creating independent capacity domains. |
+
+For a hot workload that can be partitioned, start with `QueueFanout`. If the public queue should stay singular, consider `enqueue_shards`. Raise `claimers` only when measurements show the runtime is claim-starved rather than Postgres-bound.
 
 ### Python
 
