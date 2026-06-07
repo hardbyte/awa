@@ -234,4 +234,36 @@ mod tests {
             Err(QueueFanoutError::DuplicatePhysicalQueue { queue }) if queue == "email-a"
         ));
     }
+
+    #[test]
+    fn explicit_queues_preserve_caller_order() {
+        let fanout =
+            QueueFanout::from_physical_queues("email", ["email-fast", "email-bulk", "email-slow"])
+                .expect("fanout should build");
+
+        assert_eq!(
+            fanout.physical_queues(),
+            &[
+                "email-fast".to_string(),
+                "email-bulk".to_string(),
+                "email-slow".to_string(),
+            ]
+        );
+        assert_eq!(fanout.queue_for_index(0), "email-fast");
+        assert_eq!(fanout.queue_for_index(4), "email-bulk");
+    }
+
+    #[test]
+    fn width_is_bounded_by_queue_storage_shard_type() {
+        let too_wide = QueueFanout::from_physical_queues(
+            "email",
+            (0..=(i16::MAX as usize)).map(|idx| format!("email-{idx}")),
+        );
+
+        assert!(matches!(
+            too_wide,
+            Err(QueueFanoutError::TooManyPhysicalQueues { got, max })
+                if got == i16::MAX as usize + 1 && max == i16::MAX as usize
+        ));
+    }
 }

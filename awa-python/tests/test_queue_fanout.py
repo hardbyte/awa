@@ -34,6 +34,8 @@ def test_queue_fanout_round_robin_index_routing():
 
     with pytest.raises(awa.ValidationError, match="index must be >= 0"):
         fanout.queue_for_index(-1)
+    with pytest.raises(awa.ValidationError, match="index must be >= 0"):
+        fanout.route_by_index(-1)
 
 
 def test_queue_fanout_explicit_physical_queues():
@@ -90,7 +92,19 @@ def test_queue_fanout_validation_errors():
         awa.QueueFanout.from_physical_queues("email", ["email-a", "email-a"])
 
     fanout = awa.QueueFanout("email", 2)
+    with pytest.raises(awa.ValidationError, match="ordering_key must be bytes-like or str"):
+        fanout.queue_for_key(object())
+    with pytest.raises(awa.ValidationError, match="ordering_key must be bytes-like or str"):
+        fanout.route_by_key(object())
     with pytest.raises(awa.ValidationError, match="requires max_workers_per_queue"):
         fanout.queue_configs()
     with pytest.raises(awa.ValidationError, match="not both"):
         fanout.queue_configs(max_workers_per_queue=1, min_workers_per_queue=1)
+    with pytest.raises(awa.ValidationError, match="max_workers_per_queue must be > 0"):
+        fanout.queue_configs(max_workers_per_queue=0)
+    with pytest.raises(awa.ValidationError, match="weight must be > 0"):
+        fanout.queue_configs(min_workers_per_queue=0, weight=0)
+    with pytest.raises(awa.ValidationError, match="claimers must be > 0"):
+        fanout.queue_configs(max_workers_per_queue=1, claimers=0)
+    with pytest.raises(awa.ValidationError, match="claim_batch_size must be > 0"):
+        fanout.queue_configs(max_workers_per_queue=1, claim_batch_size=0)

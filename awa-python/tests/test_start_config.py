@@ -158,6 +158,24 @@ async def test_queue_fanout_configs_expand_and_dispatch(client):
     assert handled == [fanout.queue_for_index(1)]
 
 
+@pytest.mark.asyncio
+async def test_duplicate_fanout_queue_config_is_rejected(client):
+    """Duplicate physical queue declarations are rejected before dispatchers start."""
+    fanout = awa.QueueFanout("cfg_fanout_duplicate", 2)
+
+    @client.task(ConfigTestJob, queue=fanout.physical_queues[0])
+    async def handle(job):
+        return None
+
+    with pytest.raises(awa.AwaError, match="configured more than once"):
+        await client.start(
+            [
+                {"name": fanout.physical_queues[0], "max_workers": 1},
+                *fanout.queue_configs(max_workers_per_queue=1),
+            ]
+        )
+
+
 # -- Test 15: Invalid: tuple + global_max_workers --
 
 
