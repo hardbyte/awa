@@ -14,6 +14,7 @@ Awa (Māori: river) fills the gap between Postgres event queues that are too nar
 - A worker **claims** a job before running it. The claim increments `run_lease`, which guards completion so stale workers cannot finish a newer attempt.
 - A **lease** is the durable execution record for a live attempt. Short jobs usually stay on the receipt path; jobs that need heartbeat, progress, callbacks, or mutable attempt state materialize a lease row.
 - A **lane** is the ordered stream for one `(queue, priority, enqueue_shard)`. FIFO is strict inside a lane; raising shard count creates partitioned FIFO.
+- A **queue fanout** maps one hot logical workload to several physical queues so workers can drain independent claim/completion streams while preserving normal Awa durability and rescue semantics.
 - A **segment** is a ring partition Awa can rotate and later truncate. Segments keep high-churn queue history off long-lived row-vacuum paths.
 - A **ready tombstone** is a small marker saying an immutable ready row should no longer be claimed, for example after cancelling or reprioritizing an unclaimed job. The ready row itself stays append-only until segment prune.
 
@@ -70,6 +71,10 @@ Queue-storage soak reference, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95 p
 For high-volume queue-storage producers, use the direct queue-storage COPY path: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Configure direct-copy producers with the same queue-storage routing knobs as the worker fleet, especially `queue_stripe_count` / `queue_storage_queue_stripe_count`. The older `insert_many_copy()` API is the compatibility insert surface; it remains useful for canonical-storage compatibility and adapters, but it is not the queue-storage producer fast path.
 
 A phase-driven portable benchmark harness comparing Awa against pgque, procrastinate, pg-boss, river, oban, and pgmq on a shared Postgres instance lives in its own repository: [hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking). It records producer, subscriber, and end-to-end delivery latency alongside throughput, queue depth, dead tuples, WAL pressure, and transaction pressure over time.
+
+## Hot Queues
+
+Queues default to one physical queue, one enqueue shard, one claimer, and one queue-storage completion shard. Those defaults are intentionally conservative. For workloads that need more end-to-end throughput and can accept partitioned ordering, use `QueueFanout` to route one logical queue over several physical queues. Use `enqueue_shards` for partitioned FIFO inside one physical queue, and raise `claimers` only after measuring that a single claimer cannot keep worker permits full. See [Configuration](docs/configuration.md#logical-queue-fanout).
 
 Methodology and caveats live in [benchmarking notes](docs/benchmarking.md). Validation artifacts: [ADR-019 (queue storage)](docs/adr/bench/019-queue-storage-validation-2026-04-19.md) and [ADR-023 (receipt-plane ring partitioning)](docs/adr/bench/023-receipt-ring-validation-2026-04-26.md).
 

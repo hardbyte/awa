@@ -13,7 +13,7 @@ use awa_model::admin::{
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
-use awa_model::{storage as transition, JobArgs, PeriodicJob, QueueStorageConfig};
+use awa_model::{storage as transition, JobArgs, PeriodicJob, QueueFanout, QueueStorageConfig};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -222,6 +222,27 @@ impl ClientBuilder {
     /// Add a queue with its configuration.
     pub fn queue(mut self, name: impl Into<String>, config: QueueConfig) -> Self {
         self.queues.push((name.into(), config));
+        self
+    }
+
+    /// Add every physical queue in a logical queue fanout.
+    ///
+    /// This is equivalent to calling [`queue`] once for each physical queue in
+    /// the fanout. Producers should route inserts through the same
+    /// [`QueueFanout`] so workers and producers agree on the physical queue
+    /// names.
+    ///
+    /// The `config` is applied to each physical queue. In hard-reserved mode,
+    /// total logical capacity is therefore roughly `fanout.width() *
+    /// config.max_workers`; per-queue rate limits also apply per physical
+    /// queue. Divide those knobs yourself, or use weighted mode with a
+    /// `global_max_workers` cap, when you need a logical total.
+    ///
+    /// [`queue`]: ClientBuilder::queue
+    pub fn queue_fanout(mut self, fanout: &QueueFanout, config: QueueConfig) -> Self {
+        for queue in fanout.physical_queues() {
+            self.queues.push((queue.clone(), config.clone()));
+        }
         self
     }
 
@@ -2759,6 +2780,32 @@ mod tests {
             .build();
 
         assert!(result.is_ok(), "descriptor for declared queue should build");
+    }
+
+    #[tokio::test]
+    async fn queue_fanout_declares_each_physical_queue() {
+        let fanout = QueueFanout::new("email", 3).expect("fanout should build");
+
+        let client = Client::builder(lazy_pool())
+            .queue_fanout(
+                &fanout,
+                QueueConfig {
+                    max_workers: 7,
+                    ..QueueConfig::default()
+                },
+            )
+            .build()
+            .expect("fanout queues should build");
+
+        let queues: Vec<_> = client
+            .queues
+            .iter()
+            .map(|(queue, config)| (queue.as_str(), config.max_workers))
+            .collect();
+        assert_eq!(
+            queues,
+            vec![("email__p0", 7), ("email__p1", 7), ("email__p2", 7)]
+        );
     }
 
     #[tokio::test]

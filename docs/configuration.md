@@ -112,6 +112,40 @@ The key `QueueConfig` fields:
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
+### Logical Queue Fanout
+
+A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
+
+Very hot workloads can fan one logical queue out over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
+
+Rust producers and workers can share `QueueFanout`:
+
+```rust
+use awa::{Client, InsertOpts, QueueConfig, QueueFanout};
+
+let customer_updates = QueueFanout::new("customer-updates", 4)?;
+
+let client = Client::builder(pool.clone())
+    .queue_fanout(&customer_updates, QueueConfig {
+        // Applied per physical queue: 4 × 32 hard-reserved workers.
+        max_workers: 32,
+        ..Default::default()
+    })
+    .register::<UpdateCustomer, _, _>(handle_update)
+    .build()?;
+
+let opts = customer_updates.route_opts_by_key(
+    InsertOpts::default(),
+    format!("customer-{customer_id}").into_bytes(),
+);
+```
+
+With width `1`, `QueueFanout::new("email", 1)` uses the plain `email` queue. With width above `1`, the default physical names are stable: `email__p0`, `email__p1`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO even if each physical queue later raises `enqueue_shards`.
+
+`queue_fanout` applies the `QueueConfig` to each physical queue. In hard-reserved mode, total logical capacity is roughly `fanout.width() * max_workers`; `rate_limit` is also per physical queue. Divide those values yourself, or use `global_max_workers`, when you need a logical total cap across the fanout.
+
+Use queue fanout before raising `claimers` when you need more end-to-end throughput and can accept partitioned ordering. Use `enqueue_shards` when a single physical queue should remain the public operational unit but can accept partitioned FIFO inside that queue. Use extra `claimers` only when one runtime cannot keep its worker permits full.
+
 ### Python
 
 Tuple form for simple cases, dict form for full control:

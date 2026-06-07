@@ -15,7 +15,10 @@ mod runtime;
 mod storage;
 
 // Re-exports
-pub use awa_model::{CallbackConfig, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
+pub use awa_model::{
+    CallbackConfig, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder, QueueFanout,
+    QueueFanoutError,
+};
 pub use client::{
     BuildError, Client, ClientBuilder, HealthCheck, QueueCapacity, QueueHealth,
     TransitionWorkerRole,
