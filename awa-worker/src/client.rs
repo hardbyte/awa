@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +35,8 @@ pub enum BuildError {
     NoQueuesConfigured,
     #[error("queue descriptor declared for unknown queue '{queue}'")]
     QueueDescriptorWithoutQueue { queue: String },
+    #[error("queue '{queue}' configured more than once")]
+    DuplicateQueue { queue: String },
     #[error("sum of min_workers ({total_min}) exceeds global_max_workers ({global_max})")]
     MinWorkersExceedGlobal { total_min: u32, global_max: u32 },
     #[error("rate_limit max_rate must be > 0.0")]
@@ -928,6 +930,15 @@ impl ClientBuilder {
 
         if let Some(err) = self.storage_error.clone() {
             return Err(err);
+        }
+
+        let mut queue_names = HashSet::with_capacity(self.queues.len());
+        for (queue, _) in &self.queues {
+            if !queue_names.insert(queue.as_str()) {
+                return Err(BuildError::DuplicateQueue {
+                    queue: queue.clone(),
+                });
+            }
         }
 
         for queue in self.queue_descriptors.keys() {
@@ -2806,6 +2817,21 @@ mod tests {
             queues,
             vec![("email__p0", 7), ("email__p1", 7), ("email__p2", 7)]
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_queue_declarations_are_rejected() {
+        let fanout = QueueFanout::new("email", 2).expect("fanout should build");
+
+        let result = Client::builder(lazy_pool())
+            .queue("email__p0", QueueConfig::default())
+            .queue_fanout(&fanout, QueueConfig::default())
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(BuildError::DuplicateQueue { queue }) if queue == "email__p0"
+        ));
     }
 
     #[tokio::test]

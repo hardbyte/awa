@@ -53,7 +53,7 @@ If this becomes the next measured limiter, extend this ADR rather than adding a 
    - retry, purge, discard, and compatibility delete write a negative delta;
    - the delta key is the same counter key used today.
 2. Completion batches keep the existing grouping step, but append grouped deltas instead of `UPSERT`ing the live counter. A 512-job batch that touches one queue/priority/shard/bucket group should append one delta row, not 512.
-3. `queue_counts_exact` reads `queue_terminal_live_counts + SUM(unrolled terminal_count_deltas)`. The exact read remains honest while maintenance is behind.
+3. `queue_counts_exact` computes the live terminal component as `queue_terminal_live_counts + SUM(unrolled terminal_count_deltas)`, then adds pruned rollups from `queue_terminal_rollups` / `queue_lanes` as it does today. The exact read remains honest while maintenance is behind.
 4. Maintenance rolls closed delta segments into `queue_terminal_live_counts` in deterministic key order, then truncates those delta segments in the same transaction.
 5. The trust marker remains meaningful: it means the base counter plus all unrolled deltas is complete for the active schema. Rebuild recomputes the base counter from `done_entries` and clears/truncates the delta ledger.
 
