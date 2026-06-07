@@ -14,6 +14,13 @@ impl PyQueueFanout {
         Self { inner }
     }
 
+    fn positive_width(width: i64) -> PyResult<usize> {
+        if width <= 0 {
+            return Err(validation_error("queue fanout width must be > 0"));
+        }
+        Ok(width as usize)
+    }
+
     fn non_negative_index(index: i64) -> PyResult<usize> {
         if index < 0 {
             return Err(validation_error("index must be >= 0"));
@@ -30,7 +37,8 @@ fn map_fanout_error(err: awa_model::QueueFanoutError) -> PyErr {
 impl PyQueueFanout {
     #[new]
     #[pyo3(signature = (logical_queue, width))]
-    fn new(logical_queue: String, width: usize) -> PyResult<Self> {
+    fn new(logical_queue: String, width: i64) -> PyResult<Self> {
+        let width = Self::positive_width(width)?;
         awa_model::QueueFanout::new(logical_queue, width)
             .map(Self::from_inner)
             .map_err(map_fanout_error)

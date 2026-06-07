@@ -88,6 +88,12 @@ def test_queue_fanout_validation_errors():
         awa.QueueFanout("", 4)
     with pytest.raises(awa.ValidationError, match="width must be > 0"):
         awa.QueueFanout("email", 0)
+    with pytest.raises(awa.ValidationError, match="width must be > 0"):
+        awa.QueueFanout("email", -1)
+    with pytest.raises(awa.ValidationError, match="width must be > 0"):
+        awa.QueueFanout.from_physical_queues("email", [])
+    with pytest.raises(awa.ValidationError, match="physical queue must not be empty"):
+        awa.QueueFanout.from_physical_queues("email", ["email-a", ""])
     with pytest.raises(awa.ValidationError, match="duplicated"):
         awa.QueueFanout.from_physical_queues("email", ["email-a", "email-a"])
 
