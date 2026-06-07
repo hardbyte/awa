@@ -6,21 +6,15 @@ Superseded by ADR-019
 
 ## Context
 
-The original schema stored every job lifecycle state in one `awa.jobs` table.
-That worked well for modest queue sizes, but performance investigations
-exposed a bad scaling shape once large deferred frontiers were introduced.
+The original schema stored every job lifecycle state in one `awa.jobs` table. That worked well for modest queue sizes, but performance investigations exposed a bad scaling shape once large deferred frontiers were introduced.
 
-The critical issue was not just due-row lookup. With millions of future-dated
-rows present, every job still churned through the same heap and indexes:
+The critical issue was not just due-row lookup. With millions of future-dated rows present, every job still churned through the same heap and indexes:
 
 - `scheduled -> available`
 - `available -> running`
 - `running -> completed`
 
-Even after adding due-time indexes, cold deferred rows and hot execution rows
-shared the same physical structure. This made dispatch query plans more
-fragile, increased write amplification, and let background promotion work
-interfere with hot-path dispatch performance.
+Even after adding due-time indexes, cold deferred rows and hot execution rows shared the same physical structure. This made dispatch query plans more fragile, increased write amplification, and let background promotion work interfere with hot-path dispatch performance.
 
 ## Decision
 
@@ -42,15 +36,11 @@ This is a manual hot/cold split, not native table partitioning.
 
 ### Compatibility Surface
 
-`awa.jobs` remains available as a compatibility view so raw SQL, tests, and
-external producers do not need an immediate breaking change. `INSTEAD OF`
-triggers route writes to the correct physical table.
+`awa.jobs` remains available as a compatibility view so raw SQL, tests, and external producers do not need an immediate breaking change. `INSTEAD OF` triggers route writes to the correct physical table.
 
 ### Uniqueness
 
-Cross-table uniqueness is enforced through `awa.job_unique_claims` rather than
-through a partial unique index on the jobs heap. This keeps the uniqueness
-boundary intact across both physical tables.
+Cross-table uniqueness is enforced through `awa.job_unique_claims` rather than through a partial unique index on the jobs heap. This keeps the uniqueness boundary intact across both physical tables.
 
 ## Consequences
 
@@ -64,32 +54,15 @@ boundary intact across both physical tables.
 ### Negative
 
 - Adds trigger/view complexity to the schema
-- Introduces some risk that compatibility-view queries hide physical-table
-  costs if benchmarks or runtime code accidentally use the view on the hot path
-- Requires explicit care in tests and admin paths to query the right physical
-  table when measuring behavior
-- Lock-taking queries (`SELECT ... FOR UPDATE`, rescue operations) must target
-  the physical tables directly, not the `awa.jobs` view — `FOR UPDATE` is not
-  reliably supported on UNION ALL views, and the view's INSTEAD OF trigger
-  uses DELETE+INSERT which does not provide true row-level update atomicity
-- Reduces queue-local heap churn, but does not protect the primary from
-  unrelated long-lived snapshots pinning MVCC cleanup on `awa.jobs_hot`
+- Introduces some risk that compatibility-view queries hide physical-table costs if benchmarks or runtime code accidentally use the view on the hot path
+- Requires explicit care in tests and admin paths to query the right physical table when measuring behavior
+- Lock-taking queries (`SELECT ... FOR UPDATE`, rescue operations) must target the physical tables directly, not the `awa.jobs` view — `FOR UPDATE` is not reliably supported on UNION ALL views, and the view's INSTEAD OF trigger uses DELETE+INSERT which does not provide true row-level update atomicity
+- Reduces queue-local heap churn, but does not protect the primary from unrelated long-lived snapshots pinning MVCC cleanup on `awa.jobs_hot`
 
 ## Notes
 
-This decision deliberately favors explicit physical tables over native Postgres
-partitioning. State transitions would cause frequent row movement under
-state-based partitioning, while range partitioning would still leave hot and
-cold workloads intertwined. The manual split gives clearer operational control
-and simpler hot-path query tuning.
+This decision deliberately favors explicit physical tables over native Postgres partitioning. State transitions would cause frequent row movement under state-based partitioning, while range partitioning would still leave hot and cold workloads intertwined. The manual split gives clearer operational control and simpler hot-path query tuning.
 
 ## Relationship to ADR-019
 
-This ADR remains the historical explanation for the canonical hot/deferred
-split. ADR-019 replaces it as the primary storage direction for the queue
-storage engine: mutable state rows become append-only queue segments,
-`active_leases` hold the narrow dispatch/rescue fields, `attempt_state` holds
-optional per-attempt mutable data, and `lane_state` + segment cursors make
-up the control plane. The uniqueness decision in this ADR (claims in
-`awa.job_unique_claims`) carries through unchanged. See
-[ADR-019](019-queue-storage-redesign.md).
+This ADR remains the historical explanation for the canonical hot/deferred split. ADR-019 replaces it as the primary storage direction for the queue storage engine: mutable state rows become append-only queue segments, `active_leases` hold the narrow dispatch/rescue fields, `attempt_state` holds optional per-attempt mutable data, and `lane_state` + segment cursors make up the control plane. The uniqueness decision in this ADR (claims in `awa.job_unique_claims`) carries through unchanged. See [ADR-019](019-queue-storage-redesign.md).

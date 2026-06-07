@@ -9,6 +9,7 @@ Accepted
 In the default hard-reserved mode, each queue owns an independent semaphore with `max_workers` permits. This is simple but wasteful: if queue A is idle, its 50 reserved permits sit unused while queue B is overloaded and capped at its own 10.
 
 Operators want a **global worker pool** where queues share capacity, with:
+
 1. **Minimum guarantees** — each queue gets at least N workers even under contention.
 2. **Work-conserving allocation** — idle capacity flows to loaded queues.
 3. **Weighted fairness** — overflow capacity is split proportionally to configured weights.
@@ -31,11 +32,13 @@ overflow_capacity = global_max_workers - sum(min_workers)
 ```
 
 Each dispatcher calls `try_acquire(queue, wanted)` to request overflow permits. The pool tracks:
+
 - **held**: how many overflow permits each queue currently holds
 - **demand**: how many each queue last requested (updated every poll)
 - **weights**: configured per-queue weight (immutable)
 
 Fair share is computed as:
+
 ```
 contending_weight = sum of weights for queues with demand > 0 OR held > 0
 my_fair_share = ceil(total * my_weight / contending_weight)
@@ -49,6 +52,7 @@ This is work-conserving: when only one queue has demand, its fair share equals t
 The critical invariant is that every job marked `running` in the database must have a reserved execution slot. The previous design (snapshot available permits → claim → acquire) was racy with a shared pool.
 
 The new `poll_once()` flow:
+
 1. **Pre-acquire permits** (non-blocking `try_acquire_owned` + `OverflowPool::try_acquire`)
 2. **Apply rate limit** (truncate permits if rate-limited)
 3. **Claim from DB** (only as many as held permits)
@@ -82,6 +86,7 @@ impl ClientBuilder {
 ```
 
 Build-time validation:
+
 - `sum(min_workers) > global_max_workers` → `BuildError::MinWorkersExceedGlobal`
 - `weight == 0` → `BuildError::InvalidWeight`
 
@@ -114,10 +119,4 @@ pub enum QueueCapacity {
 
 ## Relationship to ADR-019
 
-Permit pre-acquisition is storage-plane-agnostic: it runs in the worker
-dispatcher before any claim SQL, so the weighted-concurrency decision
-carries through unchanged under queue storage. The claim query that
-consumes the pre-acquired permit targets `{schema}.ready_entries` +
-`{schema}.active_leases` instead of `awa.jobs_hot`, but the permit
-semantics and the permit-before-claim invariant are identical. See
-[ADR-019](019-queue-storage-redesign.md).
+Permit pre-acquisition is storage-plane-agnostic: it runs in the worker dispatcher before any claim SQL, so the weighted-concurrency decision carries through unchanged under queue storage. The claim query that consumes the pre-acquired permit targets `{schema}.ready_entries` + `{schema}.active_leases` instead of `awa.jobs_hot`, but the permit semantics and the permit-before-claim invariant are identical. See [ADR-019](019-queue-storage-redesign.md).

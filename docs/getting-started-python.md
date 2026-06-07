@@ -129,10 +129,7 @@ python -m awa --database-url "$DATABASE_URL" serve
 
 ## ORM Transaction Bridging
 
-Most applications should keep using their normal database stack for business
-tables. Use `AsyncClient`/`Client` for workers, admin calls, migrations, and
-queue-only producers; when a web request already has a transaction, enqueue
-through `awa.bridge` on that same connection/session.
+Most applications should keep using their normal database stack for business tables. Use `AsyncClient`/`Client` for workers, admin calls, migrations, and queue-only producers; when a web request already has a transaction, enqueue through `awa.bridge` on that same connection/session.
 
 Install the app database libraries you already use, for example:
 
@@ -170,8 +167,7 @@ async def create_order(session: AsyncSession, order_id: str, email: str) -> int:
     return job["id"]
 ```
 
-The same bridge supports asyncpg, psycopg3, SQLAlchemy, and Django; see
-[Bridge Adapters](bridge-adapters.md) for driver-specific examples.
+The same bridge supports asyncpg, psycopg3, SQLAlchemy, and Django; see [Bridge Adapters](bridge-adapters.md) for driver-specific examples.
 
 ### Routing related jobs to the same shard
 

@@ -8,12 +8,12 @@ Two rule sets, pick whichever matches your observability stack:
 ## What fires, and when
 
 | Rule | Severity | Fires when | Clears |
-|------|----------|-----------|--------|
+| --- | --- | --- | --- |
 | `awa_queue_lag_high` | warning | oldest `available` job > 5m for 2m | lag drops below 5m |
 | `awa_error_rate_elevated` | warning | failed / (completed + failed) > 5% for 5m | ratio drops below 5% |
-| `awa_rescues_spiking` *(Prom only)* | warning | rescues > 1/s for 5m | rescue rate drops |
+| `awa_rescues_spiking` _(Prom only)_ | warning | rescues > 1/s for 5m | rescue rate drops |
 | `awa_no_active_runtime` | critical | active runtimes = 0 for 5m | at least one runtime reporting |
-| `awa_throughput_collapsed` *(Prom only)* | warning | completion rate < 10% of 1h baseline for 10m | rate recovers |
+| `awa_throughput_collapsed` _(Prom only)_ | warning | completion rate < 10% of 1h baseline for 10m | rate recovers |
 | `awa_descriptor_drift_persistent` | info | descriptor drift detected for 15m | all live runtimes agree |
 
 Every rule's `description` annotation names the dashboard panel an operator should look at and links to the relevant awa-ui page. The 2–15 minute `for` windows deliberately skip transient spikes (rolling deploys, CI runs).
@@ -50,11 +50,7 @@ sed 's/DS_PROMETHEUS/prom/' docs/grafana/alerts/awa-alerts-prometheus.yaml \
 
 ## Validating the rules locally
 
-For the Prometheus rule set, run the observability side-stack in
-`docker/observability/` and point a local worker or benchmark at
-`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`. For the Postgres rule set,
-provision a Postgres datasource that can read the Awa schema and use Grafana's
-rule test UI after replacing `DS_POSTGRES` with that datasource UID.
+For the Prometheus rule set, run the observability side-stack in `docker/observability/` and point a local worker or benchmark at `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`. For the Postgres rule set, provision a Postgres datasource that can read the Awa schema and use Grafana's rule test UI after replacing `DS_POSTGRES` with that datasource UID.
 
 ## Extending
 

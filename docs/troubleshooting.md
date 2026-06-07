@@ -27,11 +27,7 @@ A job staying in `running` is not automatically a bug. It usually means one of t
 
 ### Inspect Running Jobs
 
-In 0.6 with the default queue-storage backend, running attempts live
-in `{schema}.leases` (lease-materialized attempts) and unmaterialized
-short-job claims live in `{schema}.lease_claims`. The `{schema}` is
-`awa` unless the operator chose a different name; replace below as
-needed.
+In 0.6 with the default queue-storage backend, running attempts live in `{schema}.leases` (lease-materialized attempts) and unmaterialized short-job claims live in `{schema}.lease_claims`. The `{schema}` is `awa` unless the operator chose a different name; replace below as needed.
 
 ```sql
 -- Materialized leases. heartbeat_at and deadline_at both populated.
@@ -119,90 +115,48 @@ Then investigate why the worker stopped.
 
 ### Admin Cancel Doesn't Wake A Running Worker
 
-`awa job cancel <id>` writes the cancellation to the database and emits
-`pg_notify('awa:cancel', {job_id, run_lease})`. Each worker runtime
-runs a `CancelListener` (PgListener-based) that picks up the
-notification and fires the matching `Arc<AtomicBool>` cancel flag the
-handler's `JobContext` holds — so the handler sees
-`ctx.is_cancelled() == true` on its next check and can stop cleanly.
+`awa job cancel <id>` writes the cancellation to the database and emits `pg_notify('awa:cancel', {job_id, run_lease})`. Each worker runtime runs a `CancelListener` (PgListener-based) that picks up the notification and fires the matching `Arc<AtomicBool>` cancel flag the handler's `JobContext` holds — so the handler sees `ctx.is_cancelled() == true` on its next check and can stop cleanly.
 
-If the listener fails to start or its connection drops, the listener
-logs a `warn!` and exits; admin cancels then silently fall back to
-heartbeat / deadline rescue for detection (i.e. the cancel does take
-effect on the next completion-time `run_lease` check, but the handler
-doesn't get the early wake-up). Symptoms: `awa job cancel` returns
-success and the database shows the job as `cancelled`, but a worker
-reports completing the cancelled `run_lease` long after the cancel
-was issued; the completion is rejected by `StaleCompleteRejected` so
-no harm done, just wasted work.
+If the listener fails to start or its connection drops, the listener logs a `warn!` and exits; admin cancels then silently fall back to heartbeat / deadline rescue for detection (i.e. the cancel does take effect on the next completion-time `run_lease` check, but the handler doesn't get the early wake-up). Symptoms: `awa job cancel` returns success and the database shows the job as `cancelled`, but a worker reports completing the cancelled `run_lease` long after the cancel was issued; the completion is rejected by `StaleCompleteRejected` so no harm done, just wasted work.
 
 To diagnose:
 
-- Search the worker logs for `Failed to create PG listener for admin
-  cancel` or `Failed to LISTEN on cancel channel`. Either message
-  means the listener started, hit the failure, and the runtime is
-  now in fallback mode.
-- Search for `PG cancel listener error; will retry` — the listener
-  saw a transient error and is sleeping 1s before reconnecting; not
-  a steady-state failure unless it spams the log.
-- Confirm `pg_listener` works from outside the runtime:
-  `psql -c "LISTEN \"awa:cancel\";"` and watch a separate session
-  fire `SELECT pg_notify('awa:cancel', '{}');`.
+- Search the worker logs for `Failed to create PG listener for admin cancel` or `Failed to LISTEN on cancel channel`. Either message means the listener started, hit the failure, and the runtime is now in fallback mode.
+- Search for `PG cancel listener error; will retry` — the listener saw a transient error and is sleeping 1s before reconnecting; not a steady-state failure unless it spams the log.
+- Confirm `pg_listener` works from outside the runtime: `psql -c "LISTEN \"awa:cancel\";"` and watch a separate session fire `SELECT pg_notify('awa:cancel', '{}');`.
 
 To recover:
 
-- Restart the worker process — the listener spawns at runtime
-  startup, so restart re-creates the listener with a fresh
-  connection.
-- If the failure is steady (e.g. a Postgres pool sized so all
-  connections are saturated by claim/complete traffic and `LISTEN`
-  can't acquire one), increase the pool max or dedicate a
-  connection to listening.
+- Restart the worker process — the listener spawns at runtime startup, so restart re-creates the listener with a fresh connection.
+- If the failure is steady (e.g. a Postgres pool sized so all connections are saturated by claim/complete traffic and `LISTEN` can't acquire one), increase the pool max or dedicate a connection to listening.
 
-In all cases the cancel itself is durable — only the early wake-up
-is lost. Long-running handlers that don't poll `ctx.is_cancelled()`
-between heartbeats won't notice the cancel until they finish or
-heartbeat-rescue fires.
+In all cases the cancel itself is durable — only the early wake-up is lost. Long-running handlers that don't poll `ctx.is_cancelled()` between heartbeats won't notice the cancel until they finish or heartbeat-rescue fires.
 
 ## Producer Enqueue Is Slower Than Expected
 
 ### What It Usually Means
 
-Producers are enqueuing well below the rate the application offers, batches
-are taking longer than expected, or the consumer fleet is permanently
-undersaturated despite plenty of producer concurrency.
+Producers are enqueuing well below the rate the application offers, batches are taking longer than expected, or the consumer fleet is permanently undersaturated despite plenty of producer concurrency.
 
 ### Reading The Producer Histograms
 
-The direct queue-storage COPY path
-(`QueueStorage::enqueue_params_copy` in Rust, `Client.enqueue_many_copy` in
-Python) records two histograms per batch:
+The direct queue-storage COPY path (`QueueStorage::enqueue_params_copy` in Rust, `Client.enqueue_many_copy` in Python) records two histograms per batch:
 
-| Metric | What it measures |
-|---|---|
-| `awa.enqueue.batch_size` | Rows per COPY call |
-| `awa.enqueue.duration` | Wall-clock time per COPY call |
+| Metric                   | What it measures              |
+| ------------------------ | ----------------------------- |
+| `awa.enqueue.batch_size` | Rows per COPY call            |
+| `awa.enqueue.duration`   | Wall-clock time per COPY call |
 
 Reading them together separates the two usual failure modes:
 
-- **Batches are tiny.** `batch_size` p50 sits at a handful of rows when the
-  upstream flow is bursty or chunked too aggressively. Throughput is bounded
-  by the per-batch round-trip cost, not the COPY itself. Increase chunk size
-  or batch the upstream side.
-- **Batches are slow.** `batch_size` p50 is reasonable (say ≥100) but
-  `duration` p99 is high. The COPY itself is contended on the DB side; see
-  the diagnoses below.
+- **Batches are tiny.** `batch_size` p50 sits at a handful of rows when the upstream flow is bursty or chunked too aggressively. Throughput is bounded by the per-batch round-trip cost, not the COPY itself. Increase chunk size or batch the upstream side.
+- **Batches are slow.** `batch_size` p50 is reasonable (say ≥100) but `duration` p99 is high. The COPY itself is contended on the DB side; see the diagnoses below.
 
 ### Diagnoses
 
 **1. Producer is going through the compatibility insert path.**
 
-`insert_many_copy_from_pool` / `client.insert_many_copy` routes every row
-through `awa.insert_job_compat()` once per row. On any database with
-non-trivial per-statement latency (auth-proxy hop, managed Postgres,
-network) the per-row function call dominates — measured at ~100–150 ms per
-row through a Cloud SQL Auth Proxy in staging, which caps a single producer
-at ~7 rows/sec regardless of batch or chunk size.
+`insert_many_copy_from_pool` / `client.insert_many_copy` routes every row through `awa.insert_job_compat()` once per row. On any database with non-trivial per-statement latency (auth-proxy hop, managed Postgres, network) the per-row function call dominates — measured at ~100–150 ms per row through a Cloud SQL Auth Proxy in staging, which caps a single producer at ~7 rows/sec regardless of batch or chunk size.
 
 Switch the producer to the direct queue-storage COPY entry point:
 
@@ -213,17 +167,13 @@ See [Producer path choice](configuration.md#producer-path-choice).
 
 **2. `enqueue_shards` is `1` for the contended queue.**
 
-The default `enqueue_shards = 1` means every producer contends on a single
-enqueue-head row per `(queue, priority)`. Multi-producer enqueue serialises
-through that row. Check the live value:
+The default `enqueue_shards = 1` means every producer contends on a single enqueue-head row per `(queue, priority)`. Multi-producer enqueue serialises through that row. Check the live value:
 
 ```sql
 SELECT queue, enqueue_shards FROM awa.queue_meta WHERE queue = '<queue>';
 ```
 
-If no row is returned the queue is running with the default `1`. Raise it
-explicitly (a 16-producer same-queue reference sweep measured 1.0× → 1.60× →
-2.75× → 3.69× at `S = 1/2/4/8`):
+If no row is returned the queue is running with the default `1`. Raise it explicitly (a 16-producer same-queue reference sweep measured 1.0× → 1.60× → 2.75× → 3.69× at `S = 1/2/4/8`):
 
 ```sql
 INSERT INTO awa.queue_meta (queue, enqueue_shards)
@@ -232,19 +182,11 @@ ON CONFLICT (queue)
 DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 ```
 
-Use an upsert: first-enqueue may create lane rows before any operator
-inserts a `queue_meta` row, so a plain `UPDATE` quietly affects zero rows.
-Raising `enqueue_shards` is a semantic switch from strict to partitioned
-FIFO; see [ADR-025](adr/025-sharded-enqueue-heads.md).
+Use an upsert: first-enqueue may create lane rows before any operator inserts a `queue_meta` row, so a plain `UPDATE` quietly affects zero rows. Raising `enqueue_shards` is a semantic switch from strict to partitioned FIFO; see [ADR-025](adr/025-sharded-enqueue-heads.md).
 
 **3. WAL or commit pressure on the database.**
 
-If batch size and shard count both look healthy, sample `pg_stat_activity`
-for `LWLock:WALWrite` / `LWLock:WALSync` waits and confirm the database is
-sized for the offered rate. The per-vCPU sustained-completion and
-burst-enqueue numbers in
-[`docs/deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#pick-a-vcpu-size)
-are useful reference points.
+If batch size and shard count both look healthy, sample `pg_stat_activity` for `LWLock:WALWrite` / `LWLock:WALSync` waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in [`docs/deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#pick-a-vcpu-size) are useful reference points.
 
 ## Leader Election Delays
 
@@ -317,19 +259,14 @@ If a job really needs `20m`, set a longer deadline for that queue.
 
 ### What It Usually Means
 
-If queue throughput starts to sag while lease tables keep accumulating dead
-tuples, the usual cause is not duplicate dispatch. The more common pattern is:
+If queue throughput starts to sag while lease tables keep accumulating dead tuples, the usual cause is not duplicate dispatch. The more common pattern is:
 
 - workers are still claiming and completing jobs
 - the maintenance leader is still rotating and pruning
-- one or more long-lived transactions on the primary are holding an old
-  snapshot open or touching older segments
-- prune cannot truncate old lease or terminal segments aggressively enough
-  because the MVCC horizon is pinned or a reader still holds a lockable view of
-  the segment
+- one or more long-lived transactions on the primary are holding an old snapshot open or touching older segments
+- prune cannot truncate old lease or terminal segments aggressively enough because the MVCC horizon is pinned or a reader still holds a lockable view of the segment
 
-This is the same general failure mode described in PlanetScale's "Keeping a
-Postgres queue healthy" post.
+This is the same general failure mode described in PlanetScale's "Keeping a Postgres queue healthy" post.
 
 ### Find The Active Queue-Storage Schema
 
@@ -371,14 +308,10 @@ ORDER BY n_dead_tup DESC, relname;
 Interpretation:
 
 - `ready_entries%` and `ready_tombstones%` should usually stay at or near zero dead tuples
-- `leases%` can rise within the current rotation window, but should fall again
-  after prune
-- `attempt_state` should roughly match live long-running attempts, not total
-  queue depth, and should return close to zero after drain
-- `autovacuum_count` staying flat for a long time can indicate vacuum is not
-  keeping up on churn-heavy lease partitions
-- persistent dead tuples across many `leases%` tables usually means prune is
-  blocked or the maintenance leader is unhealthy
+- `leases%` can rise within the current rotation window, but should fall again after prune
+- `attempt_state` should roughly match live long-running attempts, not total queue depth, and should return close to zero after drain
+- `autovacuum_count` staying flat for a long time can indicate vacuum is not keeping up on churn-heavy lease partitions
+- persistent dead tuples across many `leases%` tables usually means prune is blocked or the maintenance leader is unhealthy
 
 ### Inspect Long Transactions
 
@@ -413,14 +346,11 @@ Pay particular attention to:
 - reduce terminal-row retention if the terminal history is much larger than needed
 - review autovacuum settings if lease churn is expected continuously
 
-If you want to reproduce the behavior locally before changing settings, run the
-MVCC benchmark documented in `docs/benchmarking.md`.
+If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in `docs/benchmarking.md`.
 
 ## Something's In The DLQ
 
-The Dead Letter Queue is where terminal failures land when a queue has DLQ
-enabled. These rows are never claimed. Operators retry them, purge them, or let
-retention remove them.
+The Dead Letter Queue is where terminal failures land when a queue has DLQ enabled. These rows are never claimed. Operators retry them, purge them, or let retention remove them.
 
 Quick checks:
 
@@ -451,8 +381,7 @@ If DLQ depth is growing quickly:
 - inspect a few rows and compare `dlq_reason`
 - sample `awa job dump <id>` for the full error/progress chain
 - pause the upstream queue or producer if one failure mode is dominating
-- tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too
-  long for the incident volume
+- tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too long for the incident volume
 
 ## Common Error Cases
 
@@ -472,23 +401,15 @@ awa --database-url "$DATABASE_URL" migrate
 
 Cause:
 
-- A producer started before the queue-storage substrate had been
-  materialised on a fresh database, or the schema was dropped under a
-  running fleet.
+- A producer started before the queue-storage substrate had been materialised on a fresh database, or the schema was dropped under a running fleet.
 
-`awa.job_id_seq` is part of the queue-storage substrate created by the
-runtime's `prepare_schema` step the first time a worker boots against a
-schema — not by `awa migrate` alone, which builds the canonical surface.
-Migrations + worker startup together produce a usable schema.
+`awa.job_id_seq` is part of the queue-storage substrate created by the runtime's `prepare_schema` step the first time a worker boots against a schema — not by `awa migrate` alone, which builds the canonical surface. Migrations + worker startup together produce a usable schema.
 
 Fix:
 
-- Wait for the first consumer pod to log `Awa worker runtime started`
-  before scaling up producers.
-- If the schema was deliberately reset, re-run `awa migrate` **and** let
-  one worker pod boot to completion before resuming producer traffic.
-- If the error persists after both, the runtime may be pointing at a
-  different schema than the producer. Confirm with:
+- Wait for the first consumer pod to log `Awa worker runtime started` before scaling up producers.
+- If the schema was deliberately reset, re-run `awa migrate` **and** let one worker pod boot to completion before resuming producer traffic.
+- If the error persists after both, the runtime may be pointing at a different schema than the producer. Confirm with:
   ```sql
   SELECT awa.active_queue_storage_schema();
   ```
@@ -528,7 +449,7 @@ The descriptor catalog is refreshed by live workers on every runtime snapshot ti
   DELETE FROM awa.queue_descriptors WHERE queue = 'retired-queue';
   DELETE FROM awa.job_kind_descriptors WHERE kind = 'retired_kind';
   ```
-- If workers *should* be running, check `/runtime` for missing instances.
+- If workers _should_ be running, check `/runtime` for missing instances.
 - If the declaration moved to a different worker role that isn't deployed yet, the stale status will clear once that rollout completes.
 
 ### Queue or job-kind shows "descriptor drift" in the UI

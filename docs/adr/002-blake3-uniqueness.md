@@ -42,11 +42,11 @@ At 128 bits, the birthday bound is approximately 2^64 (~18.4 quintillion). To re
 
 For reference, at 16 bytes the probability of at least one collision among `n` keys is approximately `n^2 / (2 * 2^128)`:
 
-| Jobs | Collision probability |
-|---|---|
-| 1 billion (10^9) | ~1.5 x 10^-21 |
-| 1 trillion (10^12) | ~1.5 x 10^-15 |
-| 1 quadrillion (10^15) | ~1.5 x 10^-9 |
+| Jobs                  | Collision probability |
+| --------------------- | --------------------- |
+| 1 billion (10^9)      | ~1.5 x 10^-21         |
+| 1 trillion (10^12)    | ~1.5 x 10^-15         |
+| 1 quadrillion (10^15) | ~1.5 x 10^-9          |
 
 This is far beyond the operational lifetime of any job queue.
 

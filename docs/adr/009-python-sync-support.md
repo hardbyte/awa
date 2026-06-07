@@ -26,28 +26,29 @@ fn insert_sync(&self, py: Python<'_>, ...) -> PyResult<PyJob> {
 
 ### Sync methods added
 
-| Async method | Sync counterpart |
-|---|---|
-| `insert()` | `insert_sync()` |
-| `migrate()` | `migrate_sync()` |
-| `transaction()` | `transaction_sync()` -> `SyncTransaction` |
-| `retry(job_id)` | `retry_sync(job_id)` |
-| `cancel(job_id)` | `cancel_sync(job_id)` |
-| `retry_failed(...)` | `retry_failed_sync(...)` |
-| `discard_failed(kind)` | `discard_failed_sync(kind)` |
-| `pause_queue(...)` | `pause_queue_sync(...)` |
-| `resume_queue(queue)` | `resume_queue_sync(queue)` |
-| `drain_queue(queue)` | `drain_queue_sync(queue)` |
-| `queue_stats()` | `queue_stats_sync()` |
-| `list_jobs(...)` | `list_jobs_sync(...)` |
-| `health_check()` | `health_check_sync()` |
-| `insert_many_copy()` | `insert_many_copy_sync()` |
+| Async method           | Sync counterpart                          |
+| ---------------------- | ----------------------------------------- |
+| `insert()`             | `insert_sync()`                           |
+| `migrate()`            | `migrate_sync()`                          |
+| `transaction()`        | `transaction_sync()` -> `SyncTransaction` |
+| `retry(job_id)`        | `retry_sync(job_id)`                      |
+| `cancel(job_id)`       | `cancel_sync(job_id)`                     |
+| `retry_failed(...)`    | `retry_failed_sync(...)`                  |
+| `discard_failed(kind)` | `discard_failed_sync(kind)`               |
+| `pause_queue(...)`     | `pause_queue_sync(...)`                   |
+| `resume_queue(queue)`  | `resume_queue_sync(queue)`                |
+| `drain_queue(queue)`   | `drain_queue_sync(queue)`                 |
+| `queue_stats()`        | `queue_stats_sync()`                      |
+| `list_jobs(...)`       | `list_jobs_sync(...)`                     |
+| `health_check()`       | `health_check_sync()`                     |
+| `insert_many_copy()`   | `insert_many_copy_sync()`                 |
 
 **NOT synced:** `worker()`, `periodic()`, `start()`, `shutdown()` — these are worker lifecycle methods that are inherently async.
 
 ### `SyncTransaction` class
 
 New `PySyncTransaction` wrapping `Arc<Mutex<Option<Transaction>>>`:
+
 - Sync methods: `execute()`, `fetch_one()`, `fetch_optional()`, `fetch_all()`, `insert()`, `insert_many()`, `commit()`, `rollback()`
 - Sync context manager: `__enter__`/`__exit__` (not `__aenter__`/`__aexit__`)
 - Usage: `with client.transaction_sync() as tx:` — simpler than async's `async with await client.transaction() as tx:`

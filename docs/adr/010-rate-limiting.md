@@ -71,7 +71,4 @@ Build-time validation rejects `max_rate <= 0.0`.
 
 ## Relationship to ADR-019
 
-Rate limiting sits above the storage engine: token consumption happens in
-the dispatcher before the claim query fires, and composes identically with
-canonical and queue-storage backends. The per-worker token bucket is
-storage-plane-agnostic. See [ADR-019](019-queue-storage-redesign.md).
+Rate limiting sits above the storage engine: token consumption happens in the dispatcher before the claim query fires, and composes identically with canonical and queue-storage backends. The per-worker token bucket is storage-plane-agnostic. See [ADR-019](019-queue-storage-redesign.md).

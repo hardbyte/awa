@@ -67,8 +67,4 @@ Expose a public Python bridge module, `awa.bridge`, with insert-only helpers tha
 
 ## Relationship to ADR-016
 
-ADR-016 applies the same insert-only bridge principle to Rust driver
-integrations. Rust adapters use the public `awa::adapter::postgres`
-preparation and SQL contract; Python bridges keep their Python-facing API but
-must preserve the same validation, state selection, uniqueness, and
-transaction-participation semantics.
+ADR-016 applies the same insert-only bridge principle to Rust driver integrations. Rust adapters use the public `awa::adapter::postgres` preparation and SQL contract; Python bridges keep their Python-facing API but must preserve the same validation, state selection, uniqueness, and transaction-participation semantics.

@@ -85,13 +85,4 @@ Backoff calculation (`awa.backoff_duration`) and uniqueness bitmask checks (`awa
 
 ## Relationship to ADR-019
 
-ADR-019 changed Awa's primary physical storage layout from the canonical
-`jobs_hot` / `scheduled_jobs` split (described in this ADR's examples) to
-queue segments plus `active_leases`, `attempt_state`, and `lane_state`. The
-decision in this ADR still stands: Awa remains Postgres-only, and the
-redesign continues to lean on Postgres-native primitives (`FOR UPDATE SKIP
-LOCKED`, advisory locks, `LISTEN/NOTIFY`, `FOR SHARE` row locks across the
-segmented ring state) rather than a pluggable storage abstraction. The
-partial-index examples in this ADR reflect the pre-ADR-019 schema; the
-current hot-path indexes live on `ready_entries`, `active_leases`, and
-`deferred_jobs` — see [ADR-019](019-queue-storage-redesign.md).
+ADR-019 changed Awa's primary physical storage layout from the canonical `jobs_hot` / `scheduled_jobs` split (described in this ADR's examples) to queue segments plus `active_leases`, `attempt_state`, and `lane_state`. The decision in this ADR still stands: Awa remains Postgres-only, and the redesign continues to lean on Postgres-native primitives (`FOR UPDATE SKIP LOCKED`, advisory locks, `LISTEN/NOTIFY`, `FOR SHARE` row locks across the segmented ring state) rather than a pluggable storage abstraction. The partial-index examples in this ADR reflect the pre-ADR-019 schema; the current hot-path indexes live on `ready_entries`, `active_leases`, and `deferred_jobs` — see [ADR-019](019-queue-storage-redesign.md).

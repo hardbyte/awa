@@ -1,32 +1,18 @@
 # Bounded Claimers Per Queue
 
-> **Status: shipped as internal 0.6 queue-storage claim control.** The
-> release shape uses `queue_claimer_state` / `queue_claimer_leases` inside
-> the queue-storage engine to bound and adapt the number of active claimers
-> per hot queue. There is no public `QueueConfig::max_claimers` knob in the
-> 0.6 API; the dispatcher currently uses internal constants
-> (`MAX_CLAIMERS_PER_QUEUE = 4`, short lease/idle windows) and tests exercise
-> the storage-level lease behavior. The planning notes below are retained as
-> rationale and experiment history.
+> **Status: shipped as internal 0.6 queue-storage claim control.** The release shape uses `queue_claimer_state` / `queue_claimer_leases` inside the queue-storage engine to bound and adapt the number of active claimers per hot queue. There is no public `QueueConfig::max_claimers` knob in the 0.6 API; the dispatcher currently uses internal constants (`MAX_CLAIMERS_PER_QUEUE = 4`, short lease/idle windows) and tests exercise the storage-level lease behavior. The planning notes below are retained as rationale and experiment history.
 
 ## Release shape
 
 Bounded claimers are a queue-level claim-authority control plane:
 
-- Jobs still move directly from `ready_entries` to the existing receipt/lease
-  execution path; there is no reservation or pre-start job state.
-- At most a bounded number of runtime instances actively hit a hot queue's
-  claim path at one time.
+- Jobs still move directly from `ready_entries` to the existing receipt/lease execution path; there is no reservation or pre-start job state.
+- At most a bounded number of runtime instances actively hit a hot queue's claim path at one time.
 - Claim authority is time-bounded and can be reacquired or stolen when idle.
-- A shared `queue_claimer_state` target lets the runtime expand active claimers
-  when queue pressure proves one claimer is not enough, then contract toward
-  the cheap path when pressure falls.
-- Claimer ownership never owns jobs. If a claimer process dies, already-claimed
-  attempts are recovered by the existing receipt / lease rescue paths.
+- A shared `queue_claimer_state` target lets the runtime expand active claimers when queue pressure proves one claimer is not enough, then contract toward the cheap path when pressure falls.
+- Claimer ownership never owns jobs. If a claimer process dies, already-claimed attempts are recovered by the existing receipt / lease rescue paths.
 
-This mechanism is complementary to queue striping. Bounded claimers reduce
-cross-replica contention; striping reduces the amount of work funneled through
-one physical queue coordination path.
+This mechanism is complementary to queue striping. Bounded claimers reduce cross-replica contention; striping reduces the amount of work funneled through one physical queue coordination path.
 
 ## Why this exists
 
@@ -38,8 +24,7 @@ The queue-storage engine is now in a good place for:
 - low hot-path dead tuples
 - single large runtime shapes like `1x32`
 
-The investigation focused on the realistic many-small-replica shape on one
-hot queue:
+The investigation focused on the realistic many-small-replica shape on one hot queue:
 
 - `2x16`
 - `4x8`
@@ -57,12 +42,9 @@ The common failure mode is now clear:
 
 - any design that adds a second effective hot-path start transaction loses
 - any design that lets every replica contend on the same hot queue loses
-- any design that lies about `running_depth` or starts rescue semantics early
-  is unacceptable even if it benchmarks well
+- any design that lies about `running_depth` or starts rescue semantics early is unacceptable even if it benchmarks well
 
-The proposal that shipped in simplified/internal form reduces
-many-small-replica contention by limiting **how many replicas are allowed to
-claim from a queue at once**, while keeping job lifecycle semantics unchanged.
+The proposal that shipped in simplified/internal form reduces many-small-replica contention by limiting **how many replicas are allowed to claim from a queue at once**, while keeping job lifecycle semantics unchanged.
 
 ## Design summary
 
@@ -95,8 +77,7 @@ If a queue currently allows `2` or `4` active claimers:
 - they still claim from the same logical queue
 - they do **not** each receive a fixed `1/N` share of jobs
 
-So the design is about bounding and rotating **claim authority**, not dividing
-jobs into quotas.
+So the design is about bounding and rotating **claim authority**, not dividing jobs into quotas.
 
 That preserves:
 
@@ -112,8 +93,7 @@ This design should:
 - keep `1x32` roughly where it is now
 - preserve current short-job and long-running job semantics
 - keep hot-path dead tuples low
-- prefer strong fairness over time, not globally optimal fairness on every
-  single claim
+- prefer strong fairness over time, not globally optimal fairness on every single claim
 
 ## Historical Non-goals
 
@@ -319,8 +299,7 @@ with exits to:
 - waiting
 - dlq
 
-This is intentional. Bounded claimers change queue-level claim authority, not
-job execution semantics.
+This is intentional. Bounded claimers change queue-level claim authority, not job execution semantics.
 
 ## Fairness model
 
@@ -355,24 +334,19 @@ This is the intended trade:
 
 ## Adaptive bounded-claimers v2
 
-The fixed-cap experiment established that the claimer idea itself is useful,
-but a hard cap is too blunt:
+The fixed-cap experiment established that the claimer idea itself is useful, but a hard cap is too blunt:
 
 - it helps calm phases
 - it preserves the good `1x32` shape
-- but it can starve a hot queue during `pressure_1` and especially
-  `recovery_1`
+- but it can starve a hot queue during `pressure_1` and especially `recovery_1`
 
-So the next real design is **queue-global adaptive bounded claimers with
-anti-hoarding**, not fixed bounded claimers and not per-replica local
-adaptation.
+So the next real design is **queue-global adaptive bounded claimers with anti-hoarding**, not fixed bounded claimers and not per-replica local adaptation.
 
 That means:
 
 - the queue has one shared active-claimer target
 - replicas do not each privately decide their own target
-- one replica should not be allowed to monopolize all claimer slots while
-  others are healthy and interested
+- one replica should not be allowed to monopolize all claimer slots while others are healthy and interested
 
 ### Controller states
 
@@ -398,8 +372,7 @@ The queue-level controller should be modeled explicitly:
 [calm]
 ```
 
-This is still not a new job state machine. It is only a queue-level control
-loop over how many replicas are allowed to claim from that queue.
+This is still not a new job state machine. It is only a queue-level control loop over how many replicas are allowed to claim from that queue.
 
 ### Queue-global target
 
@@ -418,20 +391,16 @@ steady hot      -> target = 4
 backlog drains  -> target = 1
 ```
 
-That target should be derived from queue-level signals, not one replica's
-private claim streak.
+That target should be derived from queue-level signals, not one replica's private claim streak.
 
 ### Anti-hoarding
 
-The fixed-cap experiment showed that throughput can look healthy while one
-replica still does essentially all the useful claiming/completing work.
+The fixed-cap experiment showed that throughput can look healthy while one replica still does essentially all the useful claiming/completing work.
 
 So the next version needs an explicit anti-hoarding rule:
 
-- until the queue reaches its current target, prefer assigning claimer slots to
-  replicas that do not already own one for that queue
-- in the first adaptive version, cap ownership at **one claimer slot per
-  instance per queue**
+- until the queue reaches its current target, prefer assigning claimer slots to replicas that do not already own one for that queue
+- in the first adaptive version, cap ownership at **one claimer slot per instance per queue**
 
 This is still not a `1/N` job split. It only limits who may claim.
 
@@ -447,8 +416,7 @@ The queue should maintain:
 - `idle_threshold`
 - `lease_ttl`
 
-The first version should keep `min_claimers_per_queue = 1` and `max_claimers`
-small, likely `4`.
+The first version should keep `min_claimers_per_queue = 1` and `max_claimers` small, likely `4`.
 
 ### Inputs to the controller
 
@@ -543,12 +511,9 @@ These are the non-negotiables.
 6. Crash after claim:
    - existing receipt / attempt / lease rescue handles it
 7. Stale claimers cannot renew or continue owning once epoch changes.
-8. Idle claimers cannot block progress indefinitely because idle slots are
-   stealable.
-9. Changing the active claimer target changes only claim authority, not job
-   state.
-10. Contraction is safe because allowing a claimer lease to expire does not
-    revoke already-claimed jobs.
+8. Idle claimers cannot block progress indefinitely because idle slots are stealable.
+9. Changing the active claimer target changes only claim authority, not job state.
+10. Contraction is safe because allowing a claimer lease to expire does not revoke already-claimed jobs.
 
 ## Historical Measurement Plan
 
@@ -627,7 +592,7 @@ The minimum confidence plan should be:
 7. **Per-replica distribution**
    - confirm `4x8` does not collapse into one effective claimer after warmup
 
-Only keep it if the *pattern* is stable across repeats.
+Only keep it if the _pattern_ is stable across repeats.
 
 ### Success thresholds
 
@@ -641,15 +606,13 @@ The minimum bar to keep the design:
   - `recovery_1` no longer stalls or collapses
 - `8x4`
   - should improve in the same direction, even if it remains worse than `4x8`
-- dead tuples remain in the current low-hundreds regime, not canonical-style
-  tens of thousands
+- dead tuples remain in the current low-hundreds regime, not canonical-style tens of thousands
 - `running_depth` remains honest
 - crash-under-load remains correct
 
 ### Comparison against canonical
 
-Once the queue-storage shape looks good enough, rerun the realistic
-single-producer comparison against:
+Once the queue-storage shape looks good enough, rerun the realistic single-producer comparison against:
 
 - `awa`
 - `awa-canonical`
@@ -659,8 +622,7 @@ Especially for:
 - `1x32`
 - `4x8`
 
-That will tell us whether the new engine is now good enough in the deployment
-shape that still blocks shipping confidence.
+That will tell us whether the new engine is now good enough in the deployment shape that still blocks shipping confidence.
 
 ## Historical Implementation Phases
 
@@ -677,8 +639,7 @@ shape that still blocks shipping confidence.
 1. track owned claimer slots per queue
 2. renew only on successful claims
 3. compute a queue-local target claimer count from observed saturation
-4. attempt idle/expired steal only when the active claimer set is below the
-   adaptive target
+4. attempt idle/expired steal only when the active claimer set is below the adaptive target
 5. let excess claimers expire or relinquish during contraction
 
 ### Phase 3: claim path integration
@@ -703,17 +664,14 @@ These are not the next implementation, but they are worth preserving.
 
 This is the most important future escape hatch.
 
-For very hot logical queues, support mapping one logical queue to a fixed set of
-physical stripes / subqueues.
+For very hot logical queues, support mapping one logical queue to a fixed set of physical stripes / subqueues.
 
 That would give us:
 
 - a better default engine for normal queues
 - an explicit escape hatch for extreme single-queue workloads
 
-This should remain a real option even if bounded claimers work, because some
-production workloads will still want an operationally explicit way to spread a
-very hot queue across more coordination points.
+This should remain a real option even if bounded claimers work, because some production workloads will still want an operationally explicit way to spread a very hot queue across more coordination points.
 
 ### 2. Bounded active claimers plus striping
 
@@ -736,8 +694,7 @@ over:
 
 - perfect global ordering on every claim
 
-That principle has repeatedly matched the measurements better than globally
-optimal hot-path fairness.
+That principle has repeatedly matched the measurements better than globally optimal hot-path fairness.
 
 ## Current status after the first implementation pass
 
@@ -749,8 +706,7 @@ That version was informative but reverted:
   - `clean_1 800/s`
   - `pressure_1 1199/s`
   - `recovery_1 800/s`
-- after fixing the multi-replica report aggregation, it became clear that the
-  `4x8` shape did **not** collapse to zero throughput:
+- after fixing the multi-replica report aggregation, it became clear that the `4x8` shape did **not** collapse to zero throughput:
   - `clean_1 778/s`
   - `pressure_1 829/s`
   - `recovery_1 754/s`
@@ -762,8 +718,7 @@ That version was informative but reverted:
     - `pressure_1 5583 ms`
     - `recovery_1 17023 ms`
 
-So the next bounded-claimers iteration should **not** keep a rigid cap under
-all conditions.
+So the next bounded-claimers iteration should **not** keep a rigid cap under all conditions.
 
 The next variant should be:
 
@@ -771,8 +726,7 @@ The next variant should be:
 - locality-first when the queue is calm
 - able to expand active claimers during sustained saturation / recovery
 
-That keeps the same semantic model, but makes the claimer limit part of the
-runtime control loop rather than a hard static ceiling.
+That keeps the same semantic model, but makes the claimer limit part of the runtime control loop rather than a hard static ceiling.
 
 ## Current status after the adaptive MVP
 
@@ -793,8 +747,7 @@ What held up:
 What failed:
 
 - the realistic `4x8` gate collapsed
-- phase summaries showed effectively `0/s` useful throughput across
-  `clean_1`, `pressure_1`, and `recovery_1`
+- phase summaries showed effectively `0/s` useful throughput across `clean_1`, `pressure_1`, and `recovery_1`
 - the run emitted:
   - multi-second `COMMIT`s
   - blocked `queue_claimer_leases` updates
@@ -804,23 +757,18 @@ What failed:
 So the useful conclusion is:
 
 - **adaptive bounded claimers is not enough in its naïve form**
-- the claimer-lease control plane itself becomes a bottleneck in the hot queue
-  shape
+- the claimer-lease control plane itself becomes a bottleneck in the hot queue shape
 
-That means the next direction should not be “keep tuning the same adaptive
-controller.” It should be a broader control-plane rethink, likely one of:
+That means the next direction should not be “keep tuning the same adaptive controller.” It should be a broader control-plane rethink, likely one of:
 
 - a cheaper claimer-authority mechanism
 - or queue striping as an explicit hot-queue mode
 
-The latter should stay on the table even if a better bounded-claimers variant
-is found, because it remains the clearest operational escape hatch for extreme
-single-queue workloads.
+The latter should stay on the table even if a better bounded-claimers variant is found, because it remains the clearest operational escape hatch for extreme single-queue workloads.
 
 ## Current status after controller tuning
 
-The next adaptive tuning pass kept the same semantic model but moved target
-calculation off the hot claim round:
+The next adaptive tuning pass kept the same semantic model but moved target calculation off the hot claim round:
 
 - shared `queue_claimer_state`
 - queue-wide target refresh at most every `500ms`
@@ -834,8 +782,7 @@ Why it is being kept:
 
 - `1x32` remained healthy
 - `4x8` stayed genuinely multi-replica after warmup
-- `pressure_1` and `recovery_1` both improved relative to the earlier adaptive
-  pass
+- `pressure_1` and `recovery_1` both improved relative to the earlier adaptive pass
 
 Why it is not done yet:
 
@@ -848,17 +795,13 @@ After the crash-under-load rerun, that last point is now concrete:
 - the tuned controller still shows recovery-path maintenance errors
 - backlog and tails remain too high during restart/recovery
 
-So bounded claimers are still an active line of investigation, but no longer
-look like a complete hot-queue answer by themselves.
+So bounded claimers are still an active line of investigation, but no longer look like a complete hot-queue answer by themselves.
 
-This strengthens the case that **queue striping should move up from “future
-idea” to “real hot-queue mode”** if the next controller pass still cannot make
-the realistic and crash gates boring.
+This strengthens the case that **queue striping should move up from “future idea” to “real hot-queue mode”** if the next controller pass still cannot make the realistic and crash gates boring.
 
 ## Why this is the next design
 
-This design is attractive because it keeps the good properties of the current
-branch:
+This design is attractive because it keeps the good properties of the current branch:
 
 - direct short-job starts
 - honest running state
@@ -869,5 +812,4 @@ while attacking the measured remaining problem directly:
 
 - too many small replicas all trying to be claimers on one hot queue
 
-If it works, it is likely the cleanest path left to make the realistic `4x8`
-shape good enough to ship with confidence.
+If it works, it is likely the cleanest path left to make the realistic `4x8` shape good enough to ship with confidence.

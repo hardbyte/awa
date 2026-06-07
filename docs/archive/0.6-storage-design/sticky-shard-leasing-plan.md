@@ -1,11 +1,6 @@
 # Sticky Shard Leasing Plan
 
-> **Status: reverted experiment, kept as design context.** Sticky shard
-> leasing was prototyped during the 0.6 redesign but not adopted —
-> bounded claimers + queue striping (both shipped) cover the same
-> coordination pressure with simpler operational semantics. This doc is
-> kept for historical context on the design space; do not implement
-> from it without revisiting the trade-off against the shipped path.
+> **Status: reverted experiment, kept as design context.** Sticky shard leasing was prototyped during the 0.6 redesign but not adopted — bounded claimers + queue striping (both shipped) cover the same coordination pressure with simpler operational semantics. This doc is kept for historical context on the design space; do not implement from it without revisiting the trade-off against the shipped path.
 
 ## Why this exists
 
@@ -13,11 +8,9 @@ The queue-storage engine is now in a good place for:
 
 - single large runtime shapes like `1x32`
 - dead-tuple behavior on the hot queue plane
-- receipt/attempt/lease correctness for the common short-job and long-running
-  paths
+- receipt/attempt/lease correctness for the common short-job and long-running paths
 
-The remaining blocker for `0.6` is the realistic many-small-replica shape on
-one hot queue:
+The remaining blocker for `0.6` is the realistic many-small-replica shape on one hot queue:
 
 - `2x16`
 - `4x8`
@@ -40,13 +33,11 @@ This document is the implementation plan for that next design.
 
 It now describes **v2** of sticky shard leasing.
 
-v1 proved that shard-local ownership is compatible with the hot path and keeps
-dead tuples low, but it was too sticky:
+v1 proved that shard-local ownership is compatible with the hot path and keeps dead tuples low, but it was too sticky:
 
 - `1x32` stayed healthy
 - `4x8` still underutilized workers
-- `recovery_1` could stall because shard ownership was not redistributed fast
-  enough
+- `recovery_1` could stall because shard ownership was not redistributed fast enough
 
 So v2 keeps direct starts, but changes the ownership model to be:
 
@@ -58,10 +49,7 @@ So v2 keeps direct starts, but changes the ownership model to be:
 
 Use **sticky shard leasing** for the claim plane.
 
-Instead of one global claim cursor per `(queue, priority)`, split each hot lane
-into a small fixed set of claim shards. Replicas lease claim authority over
-those shards for a short period and claim directly from owned shards into the
-existing active-attempt path.
+Instead of one global claim cursor per `(queue, priority)`, split each hot lane into a small fixed set of claim shards. Replicas lease claim authority over those shards for a short period and claim directly from owned shards into the existing active-attempt path.
 
 The resulting shape is:
 
@@ -140,15 +128,13 @@ with exits to:
 - waiting
 - dlq
 
-That is intentional. Sticky shard leasing changes **claim authority**, not job
-lifecycle semantics.
+That is intentional. Sticky shard leasing changes **claim authority**, not job lifecycle semantics.
 
 ## Schema sketch
 
 ### 1. Shard-local claim heads
 
-Replace one row per `(queue, priority)` with one row per
-`(queue, priority, claim_shard)`:
+Replace one row per `(queue, priority)` with one row per `(queue, priority, claim_shard)`:
 
 ```sql
 CREATE TABLE {schema}.queue_claim_heads (
@@ -197,8 +183,7 @@ That can be:
 - stored physically as a column on `ready_entries`, or
 - derived in queries
 
-For the implementation pass, prefer a stored column because it simplifies
-indexing and avoids repeated modulo work in the hot claim query.
+For the implementation pass, prefer a stored column because it simplifies indexing and avoids repeated modulo work in the hot claim query.
 
 Suggested index:
 
@@ -252,8 +237,7 @@ Important v2 rule:
 
 - **do not** renew just because the dispatcher wakes
 - **do not** renew just because the replica exists
-- renew only on successful claim (or a very short post-claim grace window if we
-  later need one)
+- renew only on successful claim (or a very short post-claim grace window if we later need one)
 
 ### Steal / reclaim policy (v2)
 
@@ -306,8 +290,7 @@ Fairness comes from:
 
 Recommended first cap:
 
-- a replica may own at most `1-2` shards per `(queue, priority)` lane in the
-  initial implementation
+- a replica may own at most `1-2` shards per `(queue, priority)` lane in the initial implementation
 
 ## Safety invariants
 
@@ -323,8 +306,7 @@ These are the non-negotiable ones:
 6. Crash after claim:
    - existing receipt/attempt/lease rescue applies
 7. Stale owners cannot renew or continue claiming after `lease_epoch` changes.
-8. Idle owners do not block progress indefinitely because `owned-idle` shards
-   are stealable.
+8. Idle owners do not block progress indefinitely because `owned-idle` shards are stealable.
 
 ## Dead-tuple expectations
 
@@ -379,8 +361,7 @@ That is acceptable if lease rows remain:
 1. add cleanup of expired `lane_shard_leases`
 2. ensure stale owners naturally lose claim authority
 3. no job recovery path is needed for shard expiry, because jobs remain ready
-4. no shard should remain non-stealable indefinitely if it is not producing
-   successful claims
+4. no shard should remain non-stealable indefinitely if it is not producing successful claims
 
 ### Phase 5: metrics
 
@@ -422,7 +403,7 @@ We keep the change only if:
 3. `recovery_1` no longer stalls under `4x8`
 4. dead tuples stay low
 5. crash-under-load remains correct
-5. no new misleading control-plane state is required to explain `running_depth`
+6. no new misleading control-plane state is required to explain `running_depth`
 
 ## Non-goals for v1
 

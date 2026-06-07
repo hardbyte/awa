@@ -1,32 +1,23 @@
 # Issue 169 Storage Redesign Spike
 
-This is an archived design spike from the 0.6 storage investigation, kept for
-context because public issue threads refer to it. It is not the current 0.6
-implementation guide.
+This is an archived design spike from the 0.6 storage investigation, kept for context because public issue threads refer to it. It is not the current 0.6 implementation guide.
 
-For the queue-storage design that shipped in the 0.6 line, see
-[ADR-019](../../adr/019-queue-storage-redesign.md). Follow-up work on a
-future segment/cursor storage engine is tracked in the public issue tracker.
+For the queue-storage design that shipped in the 0.6 line, see [ADR-019](../../adr/019-queue-storage-redesign.md). Follow-up work on a future segment/cursor storage engine is tracked in the public issue tracker.
 
 ## Question
 
-Can Awa close the Issue 169 gap with **one** new storage model, rather than
-shipping two user-facing modes?
+Can Awa close the Issue 169 gap with **one** new storage model, rather than shipping two user-facing modes?
 
-The specific question in this follow-up was whether Awa could adopt a
-`pgq`/`pgque`-style rotation scheme, let maintenance own pruning, and avoid
-the earlier dual-mode recommendation.
+The specific question in this follow-up was whether Awa could adopt a `pgq`/`pgque`-style rotation scheme, let maintenance own pruning, and avoid the earlier dual-mode recommendation.
 
 ## Short answer
 
-Yes, one public model is credible, but only if we are willing to replace the
-current `jobs_hot` row-state machine with a new storage engine.
+Yes, one public model is credible, but only if we are willing to replace the current `jobs_hot` row-state machine with a new storage engine.
 
 What does **not** work:
 
 - rotating the current mutable rows across buckets/tables
-- moving payload/history into rotated tables while keeping the same mutable
-  `available -> running -> done` lifecycle in one hot table
+- moving payload/history into rotated tables while keeping the same mutable `available -> running -> done` lifecycle in one hot table
 
 What does look credible:
 
@@ -36,8 +27,7 @@ What does look credible:
 - maintenance-led best-effort rotation and prune
 - cached queue stats so long-running readers do not scan the prunable segments
 
-The spike results strongly suggest that **rotation only pays off once the queue
-row stops being the lifecycle state machine**.
+The spike results strongly suggest that **rotation only pays off once the queue row stops being the lifecycle state machine**.
 
 ## Why the earlier 2-mode idea existed
 
@@ -46,8 +36,7 @@ The previous 2-mode recommendation was a risk hedge:
 - the current per-row model maps cleanly to Awa's rich job semantics
 - the rotated append-only model maps cleanly to low-bloat queue storage
 
-Given the updated constraint that a big migration is acceptable for `0.6`, I
-do **not** think we need two public modes. I think we need one new engine.
+Given the updated constraint that a big migration is acceptable for `0.6`, I do **not** think we need two public modes. I think we need one new engine.
 
 ## What `pgq` is really buying
 
@@ -59,14 +48,11 @@ The useful `pgq` property is not "partitioning" by itself. It is this:
 - retry handling is separate from the main queue tables
 - maintenance owns the rotation/prune loop
 
-That is very different from Awa's current model, where the main queue row is
-mutated repeatedly as it moves through claim, heartbeat, retry, callback,
-completion, failure, and cleanup.
+That is very different from Awa's current model, where the main queue row is mutated repeatedly as it moves through claim, heartbeat, retry, callback, completion, failure, and cleanup.
 
 ## Experiments
 
-These were database spikes against local Postgres 17, not drop-in Awa
-implementations.
+These were database spikes against local Postgres 17, not drop-in Awa implementations.
 
 Common setup:
 
@@ -88,7 +74,7 @@ Model:
 Result:
 
 | Scenario | TPS | Avg latency | Prune ok | Prune blocked | Dead tuples |
-|---|---:|---:|---:|---:|---:|
+| --- | --: | --: | --: | --: | --: |
 | Mutable ring + history reader | 2157.0 | 1.854 ms | 0 | 10 | 25,890 |
 
 Dead tuples by bucket:
@@ -115,7 +101,7 @@ Model:
 #### 2a. Reader hits runtime only
 
 | Scenario | TPS | Avg latency | Prune ok | Prune blocked | Event dead | Runtime dead |
-|---|---:|---:|---:|---:|---:|---:|
+| --- | --: | --: | --: | --: | --: | --: |
 | Append ring + runtime reader | 2779.7 | 1.439 ms | 11 | 0 | 0 | 33,356 |
 
 Interpretation:
@@ -127,7 +113,7 @@ Interpretation:
 #### 2b. Reader hits history ring
 
 | Scenario | TPS | Avg latency | Prune ok | Prune blocked | Event dead | Runtime dead |
-|---|---:|---:|---:|---:|---:|---:|
+| --- | --: | --: | --: | --: | --: | --: |
 | Append ring + history reader | 2710.6 | 1.476 ms | 0 | 10 | 0 | 32,542 |
 
 Interpretation:
@@ -149,7 +135,7 @@ Model:
 #### 3a. Reader hits running claims only
 
 | Scenario | TPS | Avg latency | Prune ok | Prune blocked | Event dead | Done dead | Running dead |
-|---|---:|---:|---:|---:|---:|---:|---:|
+| --- | --: | --: | --: | --: | --: | --: | --: |
 | Claim ledger + running reader | 590.9 | 6.770 ms | 11 | 0 | 0 | 0 | 250 |
 
 Interpretation:
@@ -161,7 +147,7 @@ Interpretation:
 #### 3b. Reader hits event ring
 
 | Scenario | TPS | Avg latency | Prune ok | Prune blocked | Running dead |
-|---|---:|---:|---:|---:|---:|
+| --- | --: | --: | --: | --: | --: |
 | Claim ledger + history reader | 294.3 | 13.593 ms | 0 | 10 | 1,766 |
 
 Interpretation:
@@ -173,8 +159,7 @@ Interpretation:
 
 ### 1. Rotation is necessary but not sufficient
 
-If the hot lifecycle still lives in a mutable state table, dead tuples stay
-high even when payload/history is append-only.
+If the hot lifecycle still lives in a mutable state table, dead tuples stay high even when payload/history is append-only.
 
 ### 2. Maintenance can own pruning, but only under strict rules
 
@@ -186,30 +171,24 @@ However, pruning must be:
 - short lock timeout
 - retry later on conflict
 
-And the design must guarantee that long readers are **not** routinely touching
-the prunable segments.
+And the design must guarantee that long readers are **not** routinely touching the prunable segments.
 
 ### 3. The real break point is the claim model
 
-The dead tuple collapse only happened when I stopped treating the queue row as
-the mutable lifecycle record and turned the mutable part into a small claim
-ledger.
+The dead tuple collapse only happened when I stopped treating the queue row as the mutable lifecycle record and turned the mutable part into a small claim ledger.
 
 That is the important result from this spike.
 
 ### 4. A naive claim-ledger implementation is too slow
 
-The spike used anti-joins over event/done/running views to find the next
-claimable job. That cut dead tuples sharply, but it also cut throughput
-sharply.
+The spike used anti-joins over event/done/running views to find the next claimable job. That cut dead tuples sharply, but it also cut throughput sharply.
 
 So the right conclusion is **not** "ship the spike". The conclusion is:
 
 - the storage direction is right
 - the claim algorithm is wrong
 
-The real implementation needs a queue-local cursor/tick/range allocator, not a
-global anti-join over all history.
+The real implementation needs a queue-local cursor/tick/range allocator, not a global anti-join over all history.
 
 ## Revised recommendation for `0.6`
 
@@ -226,8 +205,7 @@ Ship **one** new storage engine, not two public modes.
 2. `in-flight leases`
 
 - small mutable table for active claims only
-- heartbeat / deadline / callback waiting live here or in adjacent small
-  control tables
+- heartbeat / deadline / callback waiting live here or in adjacent small control tables
 
 3. `done / retry / callback segments`
 
@@ -236,8 +214,7 @@ Ship **one** new storage engine, not two public modes.
 4. `queue stats cache`
 
 - maintenance-updated or event-updated counters
-- admin/UI reads queue depth and state from cache tables, not by scanning the
-  prunable segment ring in long transactions
+- admin/UI reads queue depth and state from cache tables, not by scanning the prunable segment ring in long transactions
 
 5. `claim allocator metadata`
 
@@ -249,12 +226,9 @@ Ship **one** new storage engine, not two public modes.
 The following current assumptions likely need to change:
 
 - `jobs_hot` stops being the canonical lifecycle table
-- `completed`, `failed`, and `cancelled` stop living as long-retained rows in
-  the claim table
-- `count(*) FROM jobs_hot` style analytics queries stop being the source of
-  truth for queue visibility
-- callback / retry / rescue flows need their own control-plane rows rather
-  than repeated rewrites of the queue row itself
+- `completed`, `failed`, and `cancelled` stop living as long-retained rows in the claim table
+- `count(*) FROM jobs_hot` style analytics queries stop being the source of truth for queue visibility
+- callback / retry / rescue flows need their own control-plane rows rather than repeated rewrites of the queue row itself
 
 ## What I would not do
 
@@ -262,8 +236,7 @@ I would **not** spend `0.6` on any of these as the headline answer:
 
 - declarative partitioning of the current `jobs_hot`
 - rotating mutable `jobs_hot` buckets without changing the lifecycle model
-- moving only payload/history to rotated tables while keeping the same mutable
-  runtime state machine
+- moving only payload/history to rotated tables while keeping the same mutable runtime state machine
 
 Those may help around the edges, but the spike says they do not close the gap.
 
@@ -276,14 +249,12 @@ Those may help around the edges, but the spike says they do not close the gap.
    - cold-segment eligibility checks
    - queue stats refresh / reconciliation
 3. Design the new claim allocator before writing schema migrations.
-4. Benchmark the new allocator under the same idle-in-tx reader harness before
-   merging the storage redesign.
+4. Benchmark the new allocator under the same idle-in-tx reader harness before merging the storage redesign.
 5. Keep admin/history queries off the prunable ring, or pruning will stall.
 
 ## Bottom line
 
-If the goal is to entirely close the gap, I no longer think the right answer is
-"two modes".
+If the goal is to entirely close the gap, I no longer think the right answer is "two modes".
 
 I think the right answer is:
 
@@ -294,6 +265,4 @@ I think the right answer is:
 - cached admin visibility
 - a non-naive claim allocator
 
-That is a bigger migration than the earlier dual-mode idea, but it is the
-first direction from the spike that looks capable of attacking the real
-problem instead of reshuffling the same row churn.
+That is a bigger migration than the earlier dual-mode idea, but it is the first direction from the spike that looks capable of attacking the real problem instead of reshuffling the same row churn.

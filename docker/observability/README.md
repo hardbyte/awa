@@ -1,10 +1,6 @@
 # Observability side-stack
 
-OTel collector + Prometheus + Grafana for visualising metrics from Awa workers
-or from the external
-[`hardbyte/postgresql-job-queue-benchmarking`](https://github.com/hardbyte/postgresql-job-queue-benchmarking)
-harness. The stack is independent of the workload under test, so it can be
-brought up and down without disturbing the benchmark's Postgres.
+OTel collector + Prometheus + Grafana for visualising metrics from Awa workers or from the external [`hardbyte/postgresql-job-queue-benchmarking`](https://github.com/hardbyte/postgresql-job-queue-benchmarking) harness. The stack is independent of the workload under test, so it can be brought up and down without disturbing the benchmark's Postgres.
 
 ## Quick start
 
@@ -14,8 +10,7 @@ cd docker/observability
 docker compose up -d
 ```
 
-Then run a worker or benchmark with the OTLP endpoint set. For example, from a
-checkout of the external benchmark harness:
+Then run a worker or benchmark with the OTLP endpoint set. For example, from a checkout of the external benchmark harness:
 
 ```bash
 cd /path/to/postgresql-job-queue-benchmarking
@@ -27,16 +22,13 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
     --skip-build
 ```
 
-Grafana lives at <http://localhost:13000> (admin/admin). The Awa dashboard
-is auto-loaded under the **Awa** folder.
+Grafana lives at <http://localhost:13000> (admin/admin). The Awa dashboard is auto-loaded under the **Awa** folder.
 
-Prometheus is at <http://localhost:19090>; the OTel collector's scrape
-endpoint is at <http://localhost:8889/metrics>.
+Prometheus is at <http://localhost:19090>; the OTel collector's scrape endpoint is at <http://localhost:8889/metrics>.
 
 ## What it captures
 
-Every metric `awa-metrics/src/lib.rs` declares, including ring-rotation and
-prune signals:
+Every metric `awa-metrics/src/lib.rs` declares, including ring-rotation and prune signals:
 
 - `awa_maintenance_rotate_attempts_total{awa_ring,awa_ring_outcome,awa_ring_blocker}`
 - `awa_maintenance_rotate_skipped_rows_bucket` (histogram)
@@ -45,21 +37,17 @@ prune signals:
 - `awa_ring_current_slot{awa_ring}`
 - `awa_ring_generation{awa_ring}`
 
-Plus the existing job/queue/dispatch metrics: `awa_job_*`, `awa_dispatch_*`,
-`awa_queue_*`, `awa_completion_*`, `awa_jobs_in_flight`, `awa_dlq_*`,
-`awa_storage_*`.
+Plus the existing job/queue/dispatch metrics: `awa_job_*`, `awa_dispatch_*`, `awa_queue_*`, `awa_completion_*`, `awa_jobs_in_flight`, `awa_dlq_*`, `awa_storage_*`.
 
 ## Resource budget
 
-| service | RSS limit | what it stores |
-|---------|-----------|----------------|
-| otel-collector | 512 MB | none (forwarding) |
-| prometheus | 1 GB | 24h retention |
-| grafana | 512 MB | dashboard cache |
+| service        | RSS limit | what it stores    |
+| -------------- | --------- | ----------------- |
+| otel-collector | 512 MB    | none (forwarding) |
+| prometheus     | 1 GB      | 24h retention     |
+| grafana        | 512 MB    | dashboard cache   |
 
-A 12 h overnight bench at the 4×8×200/s profile produces ≈70 MB of
-prometheus tsdb data. The retention is set to 24 h so back-to-back
-overnight runs don't trip the disk pressure auto-purge.
+A 12 h overnight bench at the 4×8×200/s profile produces ≈70 MB of prometheus tsdb data. The retention is set to 24 h so back-to-back overnight runs don't trip the disk pressure auto-purge.
 
 ## Tearing down
 

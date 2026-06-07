@@ -132,16 +132,12 @@ When the target queue is itself paused, the row shows a "queue paused" badge alo
 
 Operator surface for queue-storage `dlq_entries`.
 
-- **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, age,
-  and attempts.
-- **Bulk actions** — filter-scoped bulk retry and purge. Empty-filter actions
-  require explicit `all=true` confirmation through the API.
+- **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, age, and attempts.
+- **Bulk actions** — filter-scoped bulk retry and purge. Empty-filter actions require explicit `all=true` confirmation through the API.
 - **Detail (`/dlq/:id`)** — single-row inspection with retry and purge actions.
-- **Queue badge** — `/queues` shows a `+N DLQ` link next to queues with non-zero
-  DLQ depth.
+- **Queue badge** — `/queues` shows a `+N DLQ` link next to queues with non-zero DLQ depth.
 
-The shared `/jobs/:id` detail page also carries DLQ metadata when a job has
-already moved into the DLQ, so direct links keep working after routing.
+The shared `/jobs/:id` detail page also carries DLQ metadata when a job has already moved into the DLQ, so direct links keep working after routing.
 
 ## Interaction Patterns
 

@@ -1,13 +1,8 @@
 # AWA — Product Requirements Document (archived)
 
-> **Historical product brief — archived.** This document captures the
-> 0.x design intent at the time it was written (early 2026) and is
-> retained for context. It is **not** a description of current behavior;
-> for that, see [`docs/architecture.md`](../architecture.md),
-> [`docs/configuration.md`](../configuration.md), and the ADRs under
-> [`docs/adr/`](../adr/).
+> **Historical product brief — archived.** This document captures the 0.x design intent at the time it was written (early 2026) and is retained for context. It is **not** a description of current behavior; for that, see [`docs/architecture.md`](../architecture.md), [`docs/configuration.md`](../configuration.md), and the ADRs under [`docs/adr/`](../adr/).
 
-*Version: 1.0 — March 2026 (archived)*
+_Version: 1.0 — March 2026 (archived)_
 
 ---
 
@@ -19,7 +14,7 @@ The Rust runtime handles all queue machinery — polling, heartbeating, crash re
 
 **Positioning:** Postgres-native job execution for Rust and Python. One queue engine, two first-class languages.
 
-**Inspirations:** River (Go), Oban (Elixir), GoodJob (Ruby). All three converged on the same core design — Postgres as the only dependency, `SKIP LOCKED` for dispatch, transactional enqueue as the killer feature. None of them provide first-class multi-language *worker execution* — River's Python/Ruby clients are insert-only, Oban has a Python insert library but no workers. Awa's Python workers are full participants backed by a Rust runtime.
+**Inspirations:** River (Go), Oban (Elixir), GoodJob (Ruby). All three converged on the same core design — Postgres as the only dependency, `SKIP LOCKED` for dispatch, transactional enqueue as the killer feature. None of them provide first-class multi-language _worker execution_ — River's Python/Ruby clients are insert-only, Oban has a Python insert library but no workers. Awa's Python workers are full participants backed by a Rust runtime.
 
 ---
 
@@ -30,7 +25,7 @@ The Rust runtime handles all queue machinery — polling, heartbeating, crash re
 Existing Rust Postgres job queues are fragmented and incomplete:
 
 | Library | Status | Weakness |
-|---|---|---|
+| --- | --- | --- |
 | **sqlxmq** | Low activity (sqlx 0.8 update 2024, no new features since) | Best API design but stagnant |
 | **fang** | Active | Multi-backend dilutes PG depth, `typetag` dynamic dispatch |
 | **graphile_worker_rs** | Active | Port of Node.js system, inherits non-Rust conventions |
@@ -42,7 +37,7 @@ Existing Rust Postgres job queues are fragmented and incomplete:
 Python's most popular job queues (Celery, RQ, Dramatiq, ARQ) require Redis or RabbitMQ. Postgres-native alternatives exist but are pure Python — their queue engine performance is bounded by CPython:
 
 | Library | Status | Weakness |
-|---|---|---|
+| --- | --- | --- |
 | **Procrastinate** | Active, mature (v3.7) | Pure Python queue engine. Heartbeats compete with handler for event loop. No cross-language interop. |
 | **PgQueuer** | Active | Newer, less battle-tested. Pure Python. LISTEN/NOTIFY + SKIP LOCKED. |
 | **django-postgres-queue** | Active | Django-only. |
@@ -194,7 +189,7 @@ awa/
 ### Which Crate/Package Do I Depend On?
 
 | I want to… | Language | Depend on |
-|---|---|---|
+| --- | --- | --- |
 | Insert jobs from a Rust service (no worker) | Rust | `awa-model` |
 | Insert AND process jobs | Rust | `awa` (or `awa-model` + `awa-worker`) |
 | Insert and/or process jobs | Python | `pip install awa` |
@@ -226,7 +221,7 @@ scheduled ──(time passes)──▶ available ──(worker claims)──▶ 
 ```
 
 | State | Meaning |
-|---|---|
+| --- | --- |
 | `scheduled` | Enqueued with a future `run_at`. Not yet eligible. |
 | `available` | Ready to be claimed by a worker. |
 | `running` | Claimed. Being heartbeated. Has a hard `deadline_at`. |
@@ -242,7 +237,7 @@ scheduled ──(time passes)──▶ available ──(worker claims)──▶ 
 Five handler outcomes, identical semantics across Rust and Python:
 
 | Category | Rust | Python | Effect |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Completed** | `Ok(Completed)` | return `None` | → `completed` |
 | **Retryable error** | `Err(e)` | raise `Exception` | → `retryable` if attempts remain, else `failed`. Increments `attempt`. |
 | **Retry after** | `Ok(RetryAfter(d))` | return `awa.RetryAfter(seconds=N)` | → `retryable` with explicit backoff. Increments `attempt`. |
@@ -252,7 +247,7 @@ Five handler outcomes, identical semantics across Rust and Python:
 **Terminal errors (automatic):**
 
 | Failure | Cause | Behaviour |
-|---|---|---|
+| --- | --- | --- |
 | Args don't match schema | serde failure (Rust), `TypeError`/`ValidationError` (Python) | → `failed` immediately. No retry. Attempt incremented to record the error. |
 | Unknown `kind` | No handler registered | → `failed` immediately or skipped (configurable). |
 | Explicit terminal | `raise awa.TerminalError(...)` (Python) | → `failed` immediately regardless of remaining attempts. |
@@ -402,7 +397,7 @@ CREATE TRIGGER trg_awa_notify
 ## 8. Operational Limits
 
 | Parameter | Limit | Enforcement | Rationale |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `args` size | 500 KB | Advisory | Dequeue CTE reads full rows. Large args = slow claims. Store large data externally, pass a reference. |
 | `tags` count | 20 | CHECK constraint | Tags are for filtering, not free-form metadata. Use `metadata` JSONB for unbounded data. |
 | `tags` element length | 200 chars | CHECK constraint | Tags should be short labels. |
@@ -495,17 +490,17 @@ The `kind` string is the cross-language contract. Algorithm: CamelCase → snake
 
 **Golden test cases (must pass in both Rust and Python CI):**
 
-| Input | Kind |
-|---|---|
-| `SendEmail` | `send_email` |
+| Input                   | Kind                      |
+| ----------------------- | ------------------------- |
+| `SendEmail`             | `send_email`              |
 | `SendConfirmationEmail` | `send_confirmation_email` |
-| `SMTPEmail` | `smtp_email` |
-| `OAuthRefresh` | `o_auth_refresh` |
-| `PDFRenderJob` | `pdf_render_job` |
-| `ProcessV2Import` | `process_v2_import` |
-| `ReconcileQ3Revenue` | `reconcile_q3_revenue` |
-| `HTMLToPDF` | `html_to_pdf` |
-| `IOError` | `io_error` |
+| `SMTPEmail`             | `smtp_email`              |
+| `OAuthRefresh`          | `o_auth_refresh`          |
+| `PDFRenderJob`          | `pdf_render_job`          |
+| `ProcessV2Import`       | `process_v2_import`       |
+| `ReconcileQ3Revenue`    | `reconcile_q3_revenue`    |
+| `HTMLToPDF`             | `html_to_pdf`             |
+| `IOError`               | `io_error`                |
 
 Override always available: `#[awa(kind = "custom")]` (Rust), `@client.worker(T, kind="custom")` (Python).
 
@@ -625,11 +620,11 @@ RETURNING awa.jobs.*;
 **Priority aging** prevents starvation. A priority-4 job waiting 3× the aging interval becomes effectively priority-1. Default aging interval: 60s. Configurable per queue. Set to `MAX` to disable (strict priority, starvation possible).
 
 | Job priority | Wait time (60s interval) | Effective priority |
-|---|---|---|
-| 4 (low) | 0s | 4 |
-| 4 (low) | 60s | 3 |
-| 4 (low) | 120s | 2 |
-| 4 (low) | 180s+ | 1 (highest) |
+| ------------ | ------------------------ | ------------------ |
+| 4 (low)      | 0s                       | 4                  |
+| 4 (low)      | 60s                      | 3                  |
+| 4 (low)      | 120s                     | 2                  |
+| 4 (low)      | 180s+                    | 1 (highest)        |
 
 **Poll interval:** Default 200ms. LISTEN/NOTIFY wakeup reduces latency to <10ms. LISTEN requires a dedicated connection (one per worker process).
 
@@ -639,12 +634,12 @@ RETURNING awa.jobs.*;
 
 **Signal 2: Hard deadline (runaway protection).** Even healthy-heartbeating jobs are killed at `deadline_at`. Default: 5 minutes from claim. Override at insert time.
 
-| Failure mode | Heartbeat catches it? | Deadline catches it? |
-|---|---|---|
-| Worker killed (OOM, SIGKILL) | Yes | Eventually |
-| Network partition | Yes | Eventually |
-| Infinite loop in handler | No | **Yes** |
-| Deadlocked external call | No | **Yes** |
+| Failure mode                 | Heartbeat catches it? | Deadline catches it? |
+| ---------------------------- | --------------------- | -------------------- |
+| Worker killed (OOM, SIGKILL) | Yes                   | Eventually           |
+| Network partition            | Yes                   | Eventually           |
+| Infinite loop in handler     | No                    | **Yes**              |
+| Deadlocked external call     | No                    | **Yes**              |
 
 **Python advantage (assuming async workers — see Phase 0):** Heartbeat runs on the Rust tokio runtime, not the Python event loop. If Python handler code blocks the event loop, heartbeats continue. Awa preserves queue liveness even when Python handlers misbehave. This does NOT solve bad handler throughput or CPU-bound Python code.
 
@@ -717,15 +712,15 @@ Cross-language golden tests required. JSON canonicalization: UTF-8, sorted keys,
 
 **Unique states bitmask** (bits 0–4 set by default = scheduled, available, running, completed, retryable):
 
-| Bit | State |
-|-----|-------|
-| 0 | scheduled |
-| 1 | available |
-| 2 | running |
-| 3 | completed |
-| 4 | retryable |
-| 5 | failed |
-| 6 | cancelled |
+| Bit | State     |
+| --- | --------- |
+| 0   | scheduled |
+| 1   | available |
+| 2   | running   |
+| 3   | completed |
+| 4   | retryable |
+| 5   | failed    |
+| 6   | cancelled |
 
 Insert uses `ON CONFLICT (unique_key) WHERE ... DO NOTHING`.
 
@@ -747,7 +742,7 @@ Exponential backoff + jitter: `min(2^attempt + jitter, 24h)`. Produces: ~1s, ~2s
 Operators get day-one tools through CLI, Python, Rust, and documented SQL.
 
 | Operation | CLI | Python | Rust |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Retry one job | `awa job retry <id>` | `await client.retry(id)` | `awa_model::admin::retry(exec, id)` |
 | Cancel one job | `awa job cancel <id>` | `await client.cancel(id)` | `awa_model::admin::cancel(exec, id)` |
 | Retry failed by kind | `awa job retry-failed --kind X` | `await client.retry_failed(kind="X")` | `awa_model::admin::retry_failed_by_kind(...)` |
@@ -846,7 +841,7 @@ health = await client.health_check()
 Awa workers are stateless. Deploy as a `Deployment` with `replicas: N`. All coordination happens through Postgres.
 
 ```yaml
-terminationGracePeriodSeconds: 35  # slightly > drain timeout (30s)
+terminationGracePeriodSeconds: 35 # slightly > drain timeout (30s)
 livenessProbe:
   httpGet: { path: /healthz, port: 8080 }
   initialDelaySeconds: 5
@@ -930,7 +925,7 @@ ERROR awa: job.failed kind=send_email job_id=12347 error="validation_error: fiel
 Run on a single elected leader via `pg_try_advisory_lock`. Maintenance uses reserved connections (`maintenance_pool_size`) to avoid contention with workers.
 
 | Task | Frequency | Description |
-|---|---|---|
+| --- | --- | --- |
 | Heartbeat rescue | 30s | `running` + stale `heartbeat_at` (>90s) → `retryable` |
 | Deadline rescue | 30s | `running` + past `deadline_at` → `retryable` |
 | Scheduled promotion | 5s | `scheduled` past `run_at` → `available` |
@@ -1039,7 +1034,7 @@ Web UI. COPY ingestion. Webhook completion. Periodic/cron jobs. Rate limiting. O
 ## 22. Risks
 
 | Risk | Severity | Mitigation |
-|---|---|---|
+| --- | --- | --- |
 | `pyo3-asyncio` spike fails | **Critical** | Phase 0 gate. Fallback: sync workers on thread pool. |
 | `AwaTransaction` adoption friction | Medium | Honest framing: atomic path, not a DB toolkit. ORM bridging in v0.2. |
 | Maturin/wheel distribution | Medium | `cibuildwheel` + `maturin` in CI. Treat as real workstream. |

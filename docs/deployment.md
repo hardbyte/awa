@@ -25,41 +25,26 @@ In production, treat these as separate concerns:
 
 ## Queue Storage Cutover
 
-Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x
-clusters must use the staged storage-transition flow documented in
-[migrations.md](migrations.md) and the short operator checklist in
-[upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md).
+Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x clusters must use the staged storage-transition flow documented in [migrations.md](migrations.md) and the short operator checklist in [upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md).
 
 Operationally:
 
 - queue storage is the 0.6 worker engine
-- canonical tables remain in the schema for migration, rollback boundaries,
-  and compatibility SQL surfaces
-- while state is `canonical` or `prepared`, 0.5.x and 0.6 pods may coexist and
-  all writes/execution remain canonical
-- after `enter-mixed-transition`, new writes route to queue storage while 0.6
-  drain workers finish the canonical backlog
-- once queue-storage rows exist, rollback to a 0.5.x-only fleet is not
-  supported; finish the transition or restore from backup
+- canonical tables remain in the schema for migration, rollback boundaries, and compatibility SQL surfaces
+- while state is `canonical` or `prepared`, 0.5.x and 0.6 pods may coexist and all writes/execution remain canonical
+- after `enter-mixed-transition`, new writes route to queue storage while 0.6 drain workers finish the canonical backlog
+- once queue-storage rows exist, rollback to a 0.5.x-only fleet is not supported; finish the transition or restore from backup
 
-For a 0.5.x cluster, do not stop canonical workers and start queue-storage
-workers as a separate manual cutover. Use the storage commands so producer
-routing, canonical drain, queue-storage executor readiness, and rollback
-interlocks move together.
+For a 0.5.x cluster, do not stop canonical workers and start queue-storage workers as a separate manual cutover. Use the storage commands so producer routing, canonical drain, queue-storage executor readiness, and rollback interlocks move together.
 
-Current Rust and Python worker starts default to the correct effective engine
-for the storage-transition state. Only set `queue_storage_schema` /
-`ClientBuilder::queue_storage(...)` when you need to override the default
-schema name or segment sizing.
+Current Rust and Python worker starts default to the correct effective engine for the storage-transition state. Only set `queue_storage_schema` / `ClientBuilder::queue_storage(...)` when you need to override the default schema name or segment sizing.
 
 ## Connection Pool Sizing
 
 Practical starting point, based on the current runtime internals:
 
-- each active queue claimer keeps one `LISTEN` connection open for wakeups
-  (`sum(queue.claimers)`, which equals `queue_count` with default claimers)
-- one cancel listener keeps a `LISTEN` connection open for admin-cancel
-  notifications
+- each active queue claimer keeps one `LISTEN` connection open for wakeups (`sum(queue.claimers)`, which equals `queue_count` with default claimers)
+- one cancel listener keeps a `LISTEN` connection open for admin-cancel notifications
 - the elected leader holds one advisory-lock connection while it remains leader
 - claim, heartbeat, completion, cleanup, and handler SQL all share the same pool
 
@@ -69,8 +54,7 @@ Conservative starting heuristic, not a hard requirement:
 max_connections >= sum(queue.claimers) + 5
 ```
 
-With the default `claimers = 1`, this is the old shortcut:
-`max_connections >= queue_count + 5`.
+With the default `claimers = 1`, this is the old shortcut: `max_connections >= queue_count + 5`.
 
 Then add headroom for:
 
@@ -88,11 +72,7 @@ The Python client defaults to `max_connections=10`. `awa serve` defaults to a po
 
 ## Primary Database Hygiene
 
-Queue storage keeps the main ready path append-only, but Awa is still a
-high-churn Postgres workload. The main operational pitfall is no longer one
-giant mutable queue heap; it is long-lived readers or stale transactions that
-block lease or segment prune while the maintenance leader keeps rotating
-forward.
+Queue storage keeps the main ready path append-only, but Awa is still a high-churn Postgres workload. The main operational pitfall is no longer one giant mutable queue heap; it is long-lived readers or stale transactions that block lease or segment prune while the maintenance leader keeps rotating forward.
 
 Recommended practice:
 
@@ -100,15 +80,10 @@ Recommended practice:
 - run long-lived reporting queries against a replica when possible
 - avoid leaving sessions `idle in transaction`
 - monitor `pg_stat_activity` for long transactions
-- monitor `pg_stat_user_tables` on the active queue-storage schema; `ready`
-  segments should stay near zero dead tuples, lease segments may spike within
-  the rotation window but should collapse after prune, and `attempt_state`
-  should roughly track live long-running attempts
+- monitor `pg_stat_user_tables` on the active queue-storage schema; `ready` segments should stay near zero dead tuples, lease segments may spike within the rotation window but should collapse after prune, and `attempt_state` should roughly track live long-running attempts
 - tune autovacuum for the database if the lease tables churn heavily
 
-The nightly MVCC benchmark exists to catch changes that make this failure mode
-worse, but it is not a substitute for keeping the primary free of stale
-snapshots.
+The nightly MVCC benchmark exists to catch changes that make this failure mode worse, but it is not a substitute for keeping the primary free of stale snapshots.
 
 ## Docker
 
@@ -221,13 +196,9 @@ For smooth rollouts:
 3. Let old pods drain with `shutdown(...)`.
 4. Keep `terminationGracePeriodSeconds` slightly above that drain timeout.
 
-Code-only releases can roll normally because the schema migrations are
-additive-only.
+Code-only releases can roll normally because the schema migrations are additive-only.
 
-Storage-engine cutovers are different from normal code-only releases. Follow
-the staged `prepare -> enter-mixed-transition -> finalize` flow in
-[upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md) so the database state, producer
-routing, and runtime roles remain aligned.
+Storage-engine cutovers are different from normal code-only releases. Follow the staged `prepare -> enter-mixed-transition -> finalize` flow in [upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md) so the database state, producer routing, and runtime roles remain aligned.
 
 ## Queue Isolation Patterns
 
@@ -260,11 +231,7 @@ awa --database-url "$DATABASE_URL" serve --read-only
 
 This forces read-only even when the Postgres connection is fully writable — the UI hides mutation buttons and every mutation endpoint returns 503. See [configuration.md#read-only-mode](configuration.md#read-only-mode) for the tradeoff versus pointing at a read replica.
 
-If you expose the callback receiver endpoints for `HttpWorker`, also configure
-`AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) so `awa-ui` verifies
-`X-Awa-Signature` on callback requests. See
-[HTTP workers and callback signatures](http-callbacks.md) for the worker,
-function, and receiver contract.
+If you expose the callback receiver endpoints for `HttpWorker`, also configure `AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) so `awa-ui` verifies `X-Awa-Signature` on callback requests. See [HTTP workers and callback signatures](http-callbacks.md) for the worker, function, and receiver contract.
 
 ## Next
 

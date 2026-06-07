@@ -2,9 +2,7 @@
 
 ## Release Process
 
-Use pre-release tags before publishing a final version. Both crates.io and PyPI
-treat published versions as immutable — a botched release cannot be overwritten
-and the version number is burned.
+Use pre-release tags before publishing a final version. Both crates.io and PyPI treat published versions as immutable — a botched release cannot be overwritten and the version number is burned.
 
 ### Workflow
 
@@ -24,8 +22,7 @@ and the version number is burned.
 ### Steps
 
 1. Bump version in these release manifests:
-   - `Cargo.toml` (workspace `[workspace.package].version` and every
-     workspace dependency whose version points at an Awa crate being released)
+   - `Cargo.toml` (workspace `[workspace.package].version` and every workspace dependency whose version points at an Awa crate being released)
    - `awa/Cargo.toml` (`awa-testing` dev-dependency version)
    - `awa-cli/Cargo.toml` (`awa-ui` dependency version)
    - `awa-cli/pyproject.toml` (`[project].version` — controls CLI wheel version on PyPI)
@@ -34,18 +31,15 @@ and the version number is burned.
 2. Commit: `Bump version to 0.x.0-alpha.1`
 3. Push to a branch, wait for CI green.
 4. Tag and push: `git tag v0.x.0-alpha.1 && git push origin v0.x.0-alpha.1`
-5. The Release workflow builds wheels, publishes to crates.io and PyPI, and
-   creates a GitHub Release with binary assets.
+5. The Release workflow builds wheels, publishes to crates.io and PyPI, and creates a GitHub Release with binary assets.
 6. When ready for final: bump version to `0.x.0`, merge to main, tag `v0.x.0`.
 
 ### Why pre-releases matter
 
-v0.2.0 was published directly. The GitHub Release workflow tried to attach
-binary assets to an already-published release, which GitHub blocks. Pre-release
-tags avoid this because:
+v0.2.0 was published directly. The GitHub Release workflow tried to attach binary assets to an already-published release, which GitHub blocks. Pre-release tags avoid this because:
+
 - Draft releases are created by the workflow, not manually
-- If a pre-release has problems, you bump to `-alpha.2` instead of fighting
-  immutable registries
+- If a pre-release has problems, you bump to `-alpha.2` instead of fighting immutable registries
 
 ## Crate Dependencies
 
@@ -70,12 +64,12 @@ awa (facade)   awa-testing
 
 Key dependencies per crate:
 
-| Crate | Key deps |
-|-------|----------|
-| `awa-model` | sqlx, blake3, serde, chrono, chrono-tz, croner |
-| `awa-worker` | awa-model, tokio, opentelemetry |
-| `awa-ui` | awa-model, axum, rust-embed |
-| `awa-cli` | awa-model, awa-ui, axum, clap |
+| Crate        | Key deps                                         |
+| ------------ | ------------------------------------------------ |
+| `awa-model`  | sqlx, blake3, serde, chrono, chrono-tz, croner   |
+| `awa-worker` | awa-model, tokio, opentelemetry                  |
+| `awa-ui`     | awa-model, axum, rust-embed                      |
+| `awa-cli`    | awa-model, awa-ui, axum, clap                    |
 | `awa-python` | awa-model, awa-worker, pyo3, pyo3-async-runtimes |
 
 ## Running Tests

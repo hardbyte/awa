@@ -1,10 +1,8 @@
 # ADR-019 Validation Artifact (2026-04-19)
 
-This file records the exact commands and raw output used for the current
-validation numbers in ADR-019.
+This file records the exact commands and raw output used for the current validation numbers in ADR-019.
 
-All commands were run from the repository root on branch
-`feature/vacuum-aware-storage-redesign` with:
+All commands were run from the repository root on branch `feature/vacuum-aware-storage-redesign` with:
 
 ```text
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
@@ -139,8 +137,7 @@ ok
 
 One failed experiment is worth preserving because it changed the design:
 
-When `queue_lanes` was updated on every hot-path completion to maintain live
-`running` and `completed` counters, queue-storage throughput collapsed.
+When `queue_lanes` was updated on every hot-path completion to maintain live `running` and `completed` counters, queue-storage throughput collapsed.
 
 Command:
 
@@ -165,6 +162,4 @@ and after a partial rollback:
 [bench-va] Throughput: 628 jobs/sec
 ```
 
-The recovered design keeps only claim/enqueue control in `lane_state`, derives
-`running` from `active_leases`, and derives terminal counts from live
-`terminal_entries` plus a prune-time rollup.
+The recovered design keeps only claim/enqueue control in `lane_state`, derives `running` from `active_leases`, and derives terminal counts from live `terminal_entries` plus a prune-time rollup.

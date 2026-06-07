@@ -73,17 +73,9 @@ This suits short-lived functions (< 30s) where the HTTP round-trip is acceptable
 
 ### Callback authentication
 
-The callback endpoint must verify that incoming requests are legitimate. The
-worker signs the callback ID using BLAKE3 keyed hashing (already a workspace
-dependency via ADR-002) and includes the signature in the POST to the function
-as `X-Awa-Signature`. The function normally forwards that same header when it
-calls back; the callback endpoint verifies it before accepting `complete`,
-`fail`, or `heartbeat`.
+The callback endpoint must verify that incoming requests are legitimate. The worker signs the callback ID using BLAKE3 keyed hashing (already a workspace dependency via ADR-002) and includes the signature in the POST to the function as `X-Awa-Signature`. The function normally forwards that same header when it calls back; the callback endpoint verifies it before accepting `complete`, `fail`, or `heartbeat`.
 
-This is simpler and more performant than JWT or OAuth for this use case: the
-signature is tied to a specific callback ID, is cheap to compute, and doesn't
-require key rotation infrastructure. The concrete endpoint and signature
-contract lives in [HTTP workers and callback signatures](../http-callbacks.md).
+This is simpler and more performant than JWT or OAuth for this use case: the signature is tied to a specific callback ID, is cheap to compute, and doesn't require key rotation infrastructure. The concrete endpoint and signature contract lives in [HTTP workers and callback signatures](../http-callbacks.md).
 
 ### Feature gating
 
@@ -152,7 +144,7 @@ These are thin wrappers around the existing admin API. Users who don't run `awa-
 ## Prior Art
 
 | System | Pattern | How Awa compares |
-|--------|---------|-----------------|
+| --- | --- | --- |
 | Step Functions + Lambda | State machine invokes Lambda via task token | `HttpWorker` async mode + callback |
 | Temporal activity workers | Activity task dispatched to remote worker | Similar, but Awa is simpler (no workflow engine) |
 | Celery + HTTP backend | Custom HTTP transport | Awa's callback auth and timeout rescue are built-in |

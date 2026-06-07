@@ -1,9 +1,6 @@
 # AWA — Validation Test Plan
 
-Tests run against real Postgres 15+ (not managed services) using a dedicated
-test database. Most Rust/Python rows below are automated in CI; heavyweight
-soak, failover, benchmark, TLA+, and managed-service checks are run manually or
-in scheduled lanes when they need special infrastructure.
+Tests run against real Postgres 15+ (not managed services) using a dedicated test database. Most Rust/Python rows below are automated in CI; heavyweight soak, failover, benchmark, TLA+, and managed-service checks are run manually or in scheduled lanes when they need special infrastructure.
 
 ## Test Matrix
 
@@ -12,74 +9,68 @@ in scheduled lanes when they need special infrastructure.
 ### Correctness & Crash Recovery
 
 | # | Test | Rust | Py |
-|---|------|------|----|
-| T1 | No duplicate processing (100k jobs) | ✓ | |
-| T4 | `kill -9` crash recovery | ✓ | |
-| T5 | Deadline rescue (hung job) | ✓ | |
-| T6 | Transactional atomicity | ✓ | |
-| T7 | Transactional atomicity (Python) | | ✓ |
+| --- | --- | --- | --- |
+| T1 | No duplicate processing (100k jobs) | ✓ |  |
+| T4 | `kill -9` crash recovery | ✓ |  |
+| T5 | Deadline rescue (hung job) | ✓ |  |
+| T6 | Transactional atomicity | ✓ |  |
+| T7 | Transactional atomicity (Python) |  | ✓ |
 | T8 | Uniqueness under contention | ✓ | ✓ |
-| T9 | Hash cross-language consistency | ✓ | |
-| T10 | Priority ordering | ✓ | |
-| T12 | Queue isolation | ✓ | |
-| T18 | Backoff timing | ✓ | |
-| T19 | Snooze semantics | ✓ | |
-| T20 | Terminal error semantics | ✓ | |
-| T21 | Deserialization failure | ✓ | |
-| B1 | Late completion after rescue is no-op | ✓ | |
-| B2 | Late completion after cancel is no-op | ✓ | |
-| B3 | Shutdown waits for in-flight jobs | ✓ | |
-| B4 | Heartbeat alive during shutdown drain | ✓ | |
-| B5 | Deadline rescue signals ctx.is_cancelled() | ✓ | |
-| B6 | UniqueConflict.constraint field | ✓ | |
+| T9 | Hash cross-language consistency | ✓ |  |
+| T10 | Priority ordering | ✓ |  |
+| T12 | Queue isolation | ✓ |  |
+| T18 | Backoff timing | ✓ |  |
+| T19 | Snooze semantics | ✓ |  |
+| T20 | Terminal error semantics | ✓ |  |
+| T21 | Deserialization failure | ✓ |  |
+| B1 | Late completion after rescue is no-op | ✓ |  |
+| B2 | Late completion after cancel is no-op | ✓ |  |
+| B3 | Shutdown waits for in-flight jobs | ✓ |  |
+| B4 | Heartbeat alive during shutdown drain | ✓ |  |
+| B5 | Deadline rescue signals ctx.is_cancelled() | ✓ |  |
+| B6 | UniqueConflict.constraint field | ✓ |  |
 | B7 | Admin cancel signals in-flight handler cancellation | ✓ | ✓ |
-| T75 | Priority aging maintenance task promotes long-waiting low-priority jobs | ✓ | |
+| T75 | Priority aging maintenance task promotes long-waiting low-priority jobs | ✓ |  |
 
 ### Uniqueness (Python)
 
-| # | Test | Rust | Py |
-|---|------|------|----|
-| T8 | Uniqueness under contention (10 concurrent producers) | ✓ | |
-| PU1 | Unique insert happy path | | ✓ |
-| PU2 | Duplicate rejected (UniqueConflict) | | ✓ |
-| PU3 | by_queue: different queues allowed | | ✓ |
-| PU4 | by_queue: same queue rejected | | ✓ |
-| PU5 | by_args: different args allowed | | ✓ |
-| PU6 | by_period: same bucket rejected | | ✓ |
-| PU7 | by_period: different bucket allowed | | ✓ |
-| PU8 | Unicode args hash consistently | | ✓ |
-| PU9 | Nested dict args hash consistently | | ✓ |
-| PU10 | Empty args hash consistently | | ✓ |
-| PU11 | Large args (~100KB) hash consistently | | ✓ |
-| PU12 | No unique_opts allows duplicates | | ✓ |
-| PU13 | Sync insert with unique_opts | | ✓ |
+| #    | Test                                                  | Rust | Py  |
+| ---- | ----------------------------------------------------- | ---- | --- |
+| T8   | Uniqueness under contention (10 concurrent producers) | ✓    |     |
+| PU1  | Unique insert happy path                              |      | ✓   |
+| PU2  | Duplicate rejected (UniqueConflict)                   |      | ✓   |
+| PU3  | by_queue: different queues allowed                    |      | ✓   |
+| PU4  | by_queue: same queue rejected                         |      | ✓   |
+| PU5  | by_args: different args allowed                       |      | ✓   |
+| PU6  | by_period: same bucket rejected                       |      | ✓   |
+| PU7  | by_period: different bucket allowed                   |      | ✓   |
+| PU8  | Unicode args hash consistently                        |      | ✓   |
+| PU9  | Nested dict args hash consistently                    |      | ✓   |
+| PU10 | Empty args hash consistently                          |      | ✓   |
+| PU11 | Large args (~100KB) hash consistently                 |      | ✓   |
+| PU12 | No unique_opts allows duplicates                      |      | ✓   |
+| PU13 | Sync insert with unique_opts                          |      | ✓   |
 
 ### Admin & Resilience
 
 | # | Test | Rust | Py |
-|---|------|------|----|
-| T13 | Queue pause/resume | ✓ | |
-| T22 | Pool exhaustion resilience | ✓ | |
-| T26 | Migration idempotency | ✓ | |
-| T27 | Admin ops under load | ✓ | |
-| T72 | Runtime recovers after terminating Postgres backends | ✓ | |
+| --- | --- | --- | --- |
+| T13 | Queue pause/resume | ✓ |  |
+| T22 | Pool exhaustion resilience | ✓ |  |
+| T26 | Migration idempotency | ✓ |  |
+| T27 | Admin ops under load | ✓ |  |
+| T72 | Runtime recovers after terminating Postgres backends | ✓ |  |
 | T71 | Mixed Rust/Python workers share queue | Both | Both |
 | T73 | Sustained mixed workload survives node failure (see below) | Both | Both |
-| T74 | Hot-standby promotion | ✓ | |
-| HA1 | Postgres failover smoke | ✓ | |
+| T74 | Hot-standby promotion | ✓ |  |
+| HA1 | Postgres failover smoke | ✓ |  |
 
-**T73 ordering invariant:** Jobs are inserted *before* Rust clients start so that
-the Python worker exclusively claims `simple_chaos_job` rows. This avoids a race
-where Rust's instant `CompleteWorker` steals all simple jobs before the slower
-Python worker (400 ms/job) can claim any. The test confirms Python is mid-execution
-via its `START` stdout line, then kills it. Heartbeat backdating triggers rescue,
-and the `max_simple_attempt >= 2` assertion verifies re-processing by a surviving
-Rust worker.
+**T73 ordering invariant:** Jobs are inserted _before_ Rust clients start so that the Python worker exclusively claims `simple_chaos_job` rows. This avoids a race where Rust's instant `CompleteWorker` steals all simple jobs before the slower Python worker (400 ms/job) can claim any. The test confirms Python is mid-execution via its `START` stdout line, then kills it. Heartbeat backdating triggers rescue, and the `max_simple_attempt >= 2` assertion verifies re-processing by a surviving Rust worker.
 
 ### External Callbacks
 
 | # | Test | Rust | Py |
-|---|------|------|----|
+| --- | --- | --- | --- |
 | E1 | register_callback + WaitForCallback → waiting_external | ✓ | ✓ |
 | E2 | complete_external → completed | ✓ | ✓ |
 | E3 | fail_external → failed | ✓ | ✓ |
@@ -91,150 +82,150 @@ Rust worker.
 | E9/PE5 | Admin retry while waiting_external | ✓ | ✓ |
 | E10/PE6 | drain_queue includes waiting_external | ✓ | ✓ |
 | E11/PE7 | Race: complete during running (before WaitForCallback) | ✓ | ✓ |
-| E12 | Crash clears stale callback | ✓ | |
-| E13 | Uniqueness during waiting_external | ✓ | |
-| E15 | resolve_callback accepts running state | ✓ | |
+| E12 | Crash clears stale callback | ✓ |  |
+| E13 | Uniqueness during waiting_external | ✓ |  |
+| E15 | resolve_callback accepts running state | ✓ |  |
 | E16/PE8 | Stale callback rejected after rescue | ✓ | ✓ |
-| E17 | cancel_callback clears fields | ✓ | |
-| E18 | cancel_callback wrong lease is noop | ✓ | |
-| PE9 | Callback timeout rescued end-to-end by live runtime | | ✓ |
+| E17 | cancel_callback clears fields | ✓ |  |
+| E18 | cancel_callback wrong lease is noop | ✓ |  |
+| PE9 | Callback timeout rescued end-to-end by live runtime |  | ✓ |
 
 ### CEL Callback Expressions
 
-| # | Test | Rust | Py |
-|---|------|------|----|
-| C1-C2 | resolve_callback default actions (complete/ignore) | ✓ | ✓ |
-| C3-C4 | Filter expressions (pass/fail) | ✓ | |
-| C5-C6 | on_fail takes precedence over on_complete | ✓ | |
-| C7 | Transform payload | ✓ | |
-| C8-C9 | Invalid CEL fail-open | ✓ | |
-| C10 | Fallthrough to default action | ✓ | |
-| C11 | Invalid CEL at registration → validation error | ✓ | |
-| C12 | Double resolve → CallbackNotFound | ✓ | |
-| C14-C15 | Deeply nested / missing field (fail-open) | ✓ | |
-| C16 | resolve_callback accepts running state | ✓ | |
-| C17 | Concurrent resolve (FOR UPDATE prevents race) | ✓ | |
-| C18-C19 | CEL disabled: registration + resolution errors | ✓ | |
+| #       | Test                                               | Rust | Py  |
+| ------- | -------------------------------------------------- | ---- | --- |
+| C1-C2   | resolve_callback default actions (complete/ignore) | ✓    | ✓   |
+| C3-C4   | Filter expressions (pass/fail)                     | ✓    |     |
+| C5-C6   | on_fail takes precedence over on_complete          | ✓    |     |
+| C7      | Transform payload                                  | ✓    |     |
+| C8-C9   | Invalid CEL fail-open                              | ✓    |     |
+| C10     | Fallthrough to default action                      | ✓    |     |
+| C11     | Invalid CEL at registration → validation error     | ✓    |     |
+| C12     | Double resolve → CallbackNotFound                  | ✓    |     |
+| C14-C15 | Deeply nested / missing field (fail-open)          | ✓    |     |
+| C16     | resolve_callback accepts running state             | ✓    |     |
+| C17     | Concurrent resolve (FOR UPDATE prevents race)      | ✓    |     |
+| C18-C19 | CEL disabled: registration + resolution errors     | ✓    |     |
 
 ### Sequential Callbacks
 
 | # | Test | Rust | Py |
-|---|------|------|----|
+| --- | --- | --- | --- |
 | SC1 | wait_for_callback: suspend + resume | ✓ | ✓ (SC14) |
 | SC2 | Two sequential callbacks via admin API | ✓ | ✓ (SC15) |
-| SC3 | Timeout during second callback → retryable | ✓ | |
+| SC3 | Timeout during second callback → retryable | ✓ |  |
 | SC4/SC16 | Heartbeat extends timeout during wait | ✓ | ✓ |
-| SC5 | Concurrent resume: exactly one succeeds | ✓ | |
-| SC6 | Resume with wrong run_lease rejected | ✓ | |
-| SC7 | Crash/rescue after resume | ✓ | |
-| SC8 | Admin cancel after resume | ✓ | |
+| SC5 | Concurrent resume: exactly one succeeds | ✓ |  |
+| SC6 | Resume with wrong run_lease rejected | ✓ |  |
+| SC7 | Crash/rescue after resume | ✓ |  |
+| SC8 | Admin cancel after resume | ✓ |  |
 | SC9 | Resume preserves metadata | ✓ | ✓ |
-| SC10-SC12 | fail/resolve/retry on second callback | ✓ | |
-| SC13 | resume_external transitions to running with payload | | ✓ |
-| SC17 | Double resume fails with CallbackNotFound | | ✓ |
+| SC10-SC12 | fail/resolve/retry on second callback | ✓ |  |
+| SC13 | resume_external transitions to running with payload |  | ✓ |
+| SC17 | Double resume fails with CallbackNotFound |  | ✓ |
 
 ### HTTP Worker
 
-| # | Test | Rust | Py |
-|---|------|------|----|
-| HW1 | Sync mode 200 → completed | ✓ | — |
-| HW2 | Sync mode 500 → retryable | ✓ | — |
-| HW3 | Sync mode 400 → terminal fail | ✓ | — |
-| HW4 | Async mode 202 → callback complete | ✓ | — |
-| HW5 | Async mode 503 → retryable | ✓ | — |
-| HW6 | Async unreachable → retryable | ✓ | — |
-| HW7 | Custom headers | ✓ | — |
-| HW8 | BLAKE3 callback signature | ✓ | — |
-| HW9 | Callback URL construction | ✓ | — |
+| #   | Test                               | Rust | Py  |
+| --- | ---------------------------------- | ---- | --- |
+| HW1 | Sync mode 200 → completed          | ✓    | —   |
+| HW2 | Sync mode 500 → retryable          | ✓    | —   |
+| HW3 | Sync mode 400 → terminal fail      | ✓    | —   |
+| HW4 | Async mode 202 → callback complete | ✓    | —   |
+| HW5 | Async mode 503 → retryable         | ✓    | —   |
+| HW6 | Async unreachable → retryable      | ✓    | —   |
+| HW7 | Custom headers                     | ✓    | —   |
+| HW8 | BLAKE3 callback signature          | ✓    | —   |
+| HW9 | Callback URL construction          | ✓    | —   |
 
-*HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not exposed to Python.*
+_HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not exposed to Python._
 
 ### Python SDK
 
-| # | Test | Py |
-|---|------|----|
-| T58-T70 | Sync API variants (insert, cancel, retry, drain, list, etc.) | ✓ |
-| P12-P16 | start() config validation (dict, tuple, weighted, errors) | ✓ |
-| P17 | start() accepts all maintenance interval kwargs | ✓ |
-| PP1-PP5 | Progress tracking (set, merge, flush, checkpoint) | ✓ |
-| BR4 | Bridge: asyncpg/psycopg/SQLAlchemy/Django insert | ✓ |
+| #       | Test                                                         | Py  |
+| ------- | ------------------------------------------------------------ | --- |
+| T58-T70 | Sync API variants (insert, cancel, retry, drain, list, etc.) | ✓   |
+| P12-P16 | start() config validation (dict, tuple, weighted, errors)    | ✓   |
+| P17     | start() accepts all maintenance interval kwargs              | ✓   |
+| PP1-PP5 | Progress tracking (set, merge, flush, checkpoint)            | ✓   |
+| BR4     | Bridge: asyncpg/psycopg/SQLAlchemy/Django insert             | ✓   |
 
 ### Cron / Periodic Jobs
 
 | # | Test | Rust | Py |
-|---|------|------|----|
-| T34-T46 | Cron: migration, upsert, atomic CTE, dedup, backfill, DST | ✓ | |
-| T40-T41 | End-to-end periodic + metadata propagation | ✓ | |
-| CRP1-CRP9 | Cron pause / resume: state transitions, CTE guard, upsert preserves pause, manual trigger bypass, queue interaction | ✓ | |
+| --- | --- | --- | --- |
+| T34-T46 | Cron: migration, upsert, atomic CTE, dedup, backfill, DST | ✓ |  |
+| T40-T41 | End-to-end periodic + metadata propagation | ✓ |  |
+| CRP1-CRP9 | Cron pause / resume: state transitions, CTE guard, upsert preserves pause, manual trigger bypass, queue interaction | ✓ |  |
 
 ### COPY Batch Ingestion
 
 | # | Test | Rust | Py |
-|---|------|------|----|
+| --- | --- | --- | --- |
 | T47-T57a | COPY: empty, single, 1000, special chars, tags, unique, atomic | ✓ | ✓ |
 | QSC1-QSC2 | Queue storage COPY producer: ready/deferred direct COPY, unique-conflict rollback | ✓ | ✓ |
 
 ### Rate Limiting & Weighted Concurrency
 
 | # | Test | Rust | Py |
-|---|------|------|----|
-| RL1-RL6 | Rate limit: fast, throttle, burst, bottleneck, invalid | ✓ | |
-| W5-W13 | Weighted: backward compat, overflow, floor, cap, proportionality | ✓ | |
+| --- | --- | --- | --- |
+| RL1-RL6 | Rate limit: fast, throttle, burst, bottleneck, invalid | ✓ |  |
+| W5-W13 | Weighted: backward compat, overflow, floor, cap, proportionality | ✓ |  |
 
 ### Observability
 
-| # | Test | Rust |
-|---|------|------|
-| T28-T30 | Tracing spans + OTel metrics | ✓ |
-| OT1-OT4 | OTLP export end-to-end | ✓ |
+| #       | Test                         | Rust |
+| ------- | ---------------------------- | ---- |
+| T28-T30 | Tracing spans + OTel metrics | ✓    |
+| OT1-OT4 | OTLP export end-to-end       | ✓    |
 
 ### Bridge Adapters
 
 | # | Test | Rust | Py |
-|---|------|------|----|
-| BR1-BR3 | tokio-postgres bridge: atomicity, lease guard, unique conflict | ✓ | |
-| BR4 | Python bridge: asyncpg/psycopg/SQLAlchemy/Django | | ✓ |
+| --- | --- | --- | --- |
+| BR1-BR3 | tokio-postgres bridge: atomicity, lease guard, unique conflict | ✓ |  |
+| BR4 | Python bridge: asyncpg/psycopg/SQLAlchemy/Django |  | ✓ |
 
 ### UI (Admin)
 
 | # | Test | Rust |
-|---|------|------|
+| --- | --- | --- |
 | RO1-RO3 | Read-only serve: capabilities, mutations blocked, UI disables | ✓ |
 
 ### Admin Metadata Guardrails
 
-| # | Test | Rust |
-|---|------|------|
-| AM1 | Heartbeat/progress-only UPDATEs do not dirty queues or kinds | ✓ |
-| AM2 | flush_dirty_admin_metadata() drains backlog > 100 keys | ✓ |
+| #   | Test                                                         | Rust |
+| --- | ------------------------------------------------------------ | ---- |
+| AM1 | Heartbeat/progress-only UPDATEs do not dirty queues or kinds | ✓    |
+| AM2 | flush_dirty_admin_metadata() drains backlog > 100 keys       | ✓    |
 
 ### Benchmarks
 
 | # | Test | Rust | Py |
-|---|------|------|----|
-| T31-T33 | Throughput + latency + insert speed | ✓ | |
-| CL1-CL2 | Concurrent multi-queue lifecycle | ✓ | |
-| SP1-SP2 | Scheduled promotion at scale | ✓ | |
-| FB1-FB7 | Failure modes: terminal, retryable, callback, deadline, mixed | ✓ | |
-| FB8 | Failure modes (Python) | | ✓ |
-| PB1 | Portable cross-system enqueue throughput (Awa vs River vs Oban, 10k and 50k jobs) | | |
-| PB2 | Portable cross-system worker throughput (50/100/200 workers, no-op jobs) | | |
-| PB3 | Portable cross-system pickup latency (single job to idle queue) | | |
+| --- | --- | --- | --- |
+| T31-T33 | Throughput + latency + insert speed | ✓ |  |
+| CL1-CL2 | Concurrent multi-queue lifecycle | ✓ |  |
+| SP1-SP2 | Scheduled promotion at scale | ✓ |  |
+| FB1-FB7 | Failure modes: terminal, retryable, callback, deadline, mixed | ✓ |  |
+| FB8 | Failure modes (Python) |  | ✓ |
+| PB1 | Portable cross-system enqueue throughput (Awa vs River vs Oban, 10k and 50k jobs) |  |  |
+| PB2 | Portable cross-system worker throughput (50/100/200 workers, no-op jobs) |  |  |
+| PB3 | Portable cross-system pickup latency (single job to idle queue) |  |  |
 
 ### Dirty-key trigger overhead (measured v0.5.1, debug build, Docker PG 17)
 
 Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 
-| Config | Throughput | Overhead |
-|--------|-----------|----------|
-| No triggers (baseline) | 1963/s | — |
-| Noop PL/pgSQL trigger | 1855/s | 5.5% |
-| Full dirty-key triggers | 1832/s | **~7%** |
+| Config                  | Throughput | Overhead |
+| ----------------------- | ---------- | -------- |
+| No triggers (baseline)  | 1963/s     | —        |
+| Noop PL/pgSQL trigger   | 1855/s     | 5.5%     |
+| Full dirty-key triggers | 1832/s     | **~7%**  |
 
 ### Formal Models (TLA+)
 
 | # | Model | Invariants |
-|---|-------|------------|
+| --- | --- | --- |
 | TLA1 | AwaCore | Lease-guarded finalization, stale completion rejected |
 | TLA2 | AwaExtended | Shutdown/rescue/permit/fairness protocol |
 | TLA3 | AwaCbk | At-most-once callback resolution, sequential resume |
@@ -250,12 +241,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA13 | AwaStorageTransition | Storage-transition prepare, mixed-entry, finalize, and abort gates |
 | TLA14 | AwaDeadTupleContract | Hot-table reclaim-kind and partition-truncate contract |
 
-The formal suite includes passing configs and expected-counterexample configs.
-The expected-counterexample configs keep historical bugs executable: old
-dispatch claim, old view trigger, naive segment race, old storage-transition
-gate, shard-ignorant prune, and deliberate lock-order cycles. Trace configs
-use a `TraceIncomplete` invariant as a positive witness: a valid trace violates
-that invariant after TLC consumes every event.
+The formal suite includes passing configs and expected-counterexample configs. The expected-counterexample configs keep historical bugs executable: old dispatch claim, old view trigger, naive segment race, old storage-transition gate, shard-ignorant prune, and deliberate lock-order cycles. Trace configs use a `TraceIncomplete` invariant as a positive witness: a valid trace violates that invariant after TLC consumes every event.
 
 ## Running Tests
 

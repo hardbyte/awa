@@ -140,34 +140,19 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-If you use the compatibility `insert_many_copy` path (Rust
-`InsertOpts::copy()`), also grant:
+If you use the compatibility `insert_many_copy` path (Rust `InsertOpts::copy()`), also grant:
 
 ```sql
 GRANT TEMP ON DATABASE mydb TO awa_runtime;
 ```
 
-This allows creating temporary staging tables for the `COPY` bulk insert path.
-Queue-storage direct COPY (`QueueStorage::enqueue_params_copy` in Rust,
-`enqueue_many_copy` in Python) writes to the queue-storage tables directly and
-does not need this temporary-table grant.
+This allows creating temporary staging tables for the `COPY` bulk insert path. Queue-storage direct COPY (`QueueStorage::enqueue_params_copy` in Rust, `enqueue_many_copy` in Python) writes to the queue-storage tables directly and does not need this temporary-table grant.
 
 ### Custom queue-storage schema
 
-The queue-storage backend defaults to keeping its tables in the same
-`awa` schema, so the grants above cover both control-plane and
-queue-storage tables. See
-[Queue-storage substrate](queue-storage-substrate.md) for the full
-ownership contract — what `awa migrate` installs by default, how
-custom schemas are materialised via
-`awa.install_queue_storage_substrate()`, and why
-`awa storage prepare-queue-storage-schema --schema awa --reset` is
-rejected.
+The queue-storage backend defaults to keeping its tables in the same `awa` schema, so the grants above cover both control-plane and queue-storage tables. See [Queue-storage substrate](queue-storage-substrate.md) for the full ownership contract — what `awa migrate` installs by default, how custom schemas are materialised via `awa.install_queue_storage_substrate()`, and why `awa storage prepare-queue-storage-schema --schema awa --reset` is rejected.
 
-If you override the schema name (Rust:
-`QueueStorageConfig.schema`; Python: `queue_storage_schema=...`; CLI:
-`awa storage prepare-queue-storage-schema --schema <name>`), repeat
-the grant block against that schema:
+If you override the schema name (Rust: `QueueStorageConfig.schema`; Python: `queue_storage_schema=...`; CLI: `awa storage prepare-queue-storage-schema --schema <name>`), repeat the grant block against that schema:
 
 ```sql
 GRANT USAGE ON SCHEMA my_qs_schema TO awa_runtime;
@@ -188,17 +173,12 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-The default `awa` queue-storage substrate is migrated by `awa migrate`. Custom
-queue-storage schemas are migrated by
-`awa storage prepare-queue-storage-schema`, which should also run as the
-migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The
-runtime role needs read/write/execute privileges plus `TRUNCATE` for
-ring-partition rotation; it never needs DDL.
+The default `awa` queue-storage substrate is migrated by `awa migrate`. Custom queue-storage schemas are migrated by `awa storage prepare-queue-storage-schema`, which should also run as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role needs read/write/execute privileges plus `TRUNCATE` for ring-partition rotation; it never needs DDL.
 
 ### 5. Configure your processes
 
 | Process | Role | Connection string |
-|---|---|---|
+| --- | --- | --- |
 | `awa migrate` | `awa_migrator` | `postgres://awa_migrator:pass@host/db` |
 | Workers (Rust/Python) | `awa_runtime` | `postgres://awa_runtime:pass@host/db` |
 | `awa serve` (UI + API) | `awa_runtime` | `postgres://awa_runtime:pass@host/db` |
@@ -228,7 +208,7 @@ These writes are not trigger-driven; they come from `ClientBuilder::build()` / `
 Other PostgreSQL features used at runtime:
 
 | Feature | Purpose | Privilege needed |
-|---|---|---|
+| --- | --- | --- |
 | `LISTEN` / `NOTIFY` | Queue wakeup without polling | `CONNECT` (no extra grant) |
 | `pg_try_advisory_lock` | Leader election for maintenance | Built-in function (no grant) |
 | `COPY ... FROM STDIN` | Bulk insert path | `TEMP` on database |
@@ -297,27 +277,14 @@ This is additive — no schema changes, no downtime.
 
 ## Future: tighter runtime grants
 
-The current model requires broad table grants because compatibility triggers
-and helper functions still use `SECURITY INVOKER`. A future migration could
-convert the internal queue-storage helpers to `SECURITY DEFINER` (running as
-`awa_owner`), which would let the runtime role be restricted to the active
-queue-storage schema plus the shared control tables (`queue_meta`,
-`job_unique_claims`, `cron_jobs`, `runtime_instances`, and
-`runtime_storage_backends`). This is tracked but not yet implemented — the
-current model is secure for the separation it provides (runtime can't modify
-schema).
+The current model requires broad table grants because compatibility triggers and helper functions still use `SECURITY INVOKER`. A future migration could convert the internal queue-storage helpers to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
 
 ## Deployable roles
 
-Awa is one process binary, but for production it splits into several
-*deployable roles*. Each role has a different exposure profile, and
-mixing them onto the same listener is the most common source of
-operational risk. See [ADR-027](adr/027-callback-ingress-surface.md) for
-the design rationale and [`docs/http-callbacks.md`](http-callbacks.md)
-for the per-role deployment shape.
+Awa is one process binary, but for production it splits into several _deployable roles_. Each role has a different exposure profile, and mixing them onto the same listener is the most common source of operational risk. See [ADR-027](adr/027-callback-ingress-surface.md) for the design rationale and [`docs/http-callbacks.md`](http-callbacks.md) for the per-role deployment shape.
 
 | Role | Purpose | Exposure | Mutates job state? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Admin UI / API** (`awa serve`) | operator inspection and mutation — jobs, queues, runtime, DLQ, stats | private operator network | yes |
 | **Callback receiver** (`awa callbacks serve` or user-owned router) | `complete` / `fail` / `heartbeat` for `HttpWorker` async mode and external systems | public or partner-facing, signed | yes |
 | **Workers / dispatchers** (`awa::Client` with registered workers) | claim jobs, execute handlers, dispatch via `HttpWorker` | internal | yes |
@@ -332,7 +299,7 @@ A single development setup can collapse these onto one process: `awa serve` runs
 - **Private admin + public callback receiver:** `awa serve` on a private VPC subnet, `awa callbacks serve --callback-hmac-secret …` on an external load balancer. The receiver router omits static UI assets, the admin REST routes, and permissive CORS.
 - **User-owned callback API:** mount the three callback ingress routes inside your existing FastAPI / axum / Flask app, using `awa_model::callback_contract::verify` (Rust) or `awa.callback_contract.verify` (Python) so the signature contract cannot drift. See [`docs/callback-receivers.md`](callback-receivers.md).
 - **Receiver + maintenance-only runtime:** the receiver handles ingress while a dedicated runtime instance runs promotion / rescue / pruning. Workers stay on their own deployment. Maintenance-only runtime is tracked in [ADR-028](adr/028-maintenance-only-runtime-role.md).
-- **HTTP-worker deployments:** the worker process still runs an `awa::Client` — it claims jobs, calls the function, and registers the callback. The receiver is a separate listener. A function endpoint without a corresponding dispatcher process will *never* see jobs.
+- **HTTP-worker deployments:** the worker process still runs an `awa::Client` — it claims jobs, calls the function, and registers the callback. The receiver is a separate listener. A function endpoint without a corresponding dispatcher process will _never_ see jobs.
 
 ## Admin Surface
 
@@ -379,8 +346,7 @@ awa --database-url "$DATABASE_URL" serve --host 0.0.0.0 --port 3000
 
 If no callback secret is configured, signature verification is disabled. That is acceptable only for trusted internal deployments where the callback receiver is already protected by network boundaries or an authenticating proxy.
 
-The option name says `hmac` for operational familiarity, but the implementation
-uses BLAKE3 keyed hashing over the callback ID string, not RFC HMAC.
+The option name says `hmac` for operational familiarity, but the implementation uses BLAKE3 keyed hashing over the callback ID string, not RFC HMAC.
 
 ## Custom Callback Receivers
 

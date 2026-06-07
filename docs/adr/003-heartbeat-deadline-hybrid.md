@@ -97,14 +97,4 @@ For a worker crash, heartbeat recovery kicks in within ~90-120 seconds (stalenes
 
 ## Relationship to ADR-019
 
-ADR-019 moved the mutable runtime fields (`heartbeat_at`, `deadline_at`,
-`run_lease`, callback token/timeout) from `awa.jobs_hot` onto the
-`{schema}.active_leases` rows, keyed by `(job_id, run_lease)`. The recovery
-policy in this ADR is unchanged: heartbeat staleness and deadline expiry are
-both scanned on the maintenance leader, and rescued leases are re-enqueued
-into `ready_entries`. The `UPDATE awa.jobs_hot AS jobs SET heartbeat_at =
-now() ...` SQL example above reflects the pre-ADR-019 schema; the current
-batched heartbeat UPDATE targets `active_leases` with the same
-`(job_id, run_lease)` key. The spec-level guarantees are verified in
-`AwaSegmentedStorage.tla` (short-job rescue reachable via lease-level
-heartbeat freshness) — see [ADR-019](019-queue-storage-redesign.md).
+ADR-019 moved the mutable runtime fields (`heartbeat_at`, `deadline_at`, `run_lease`, callback token/timeout) from `awa.jobs_hot` onto the `{schema}.active_leases` rows, keyed by `(job_id, run_lease)`. The recovery policy in this ADR is unchanged: heartbeat staleness and deadline expiry are both scanned on the maintenance leader, and rescued leases are re-enqueued into `ready_entries`. The `UPDATE awa.jobs_hot AS jobs SET heartbeat_at = now() ...` SQL example above reflects the pre-ADR-019 schema; the current batched heartbeat UPDATE targets `active_leases` with the same `(job_id, run_lease)` key. The spec-level guarantees are verified in `AwaSegmentedStorage.tla` (short-job rescue reachable via lease-level heartbeat freshness) — see [ADR-019](019-queue-storage-redesign.md).

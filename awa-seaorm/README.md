@@ -1,25 +1,14 @@
 # awa-seaorm
 
-SeaORM integration helpers for the [Awa](https://github.com/hardbyte/awa)
-job queue.
+SeaORM integration helpers for the [Awa](https://github.com/hardbyte/awa) job queue.
 
-This crate is intentionally small. Awa's core is SQLx/Postgres-native, and a
-SeaORM `DatabaseConnection` already wraps a `sqlx::PgPool`, so most integration
-needs no glue at all:
+This crate is intentionally small. Awa's core is SQLx/Postgres-native, and a SeaORM `DatabaseConnection` already wraps a `sqlx::PgPool`, so most integration needs no glue at all:
 
-- building a client, running migrations, or reading job state — reach the pool
-  with `awa_pool()` / `pool()` and use Awa's existing APIs unchanged.
+- building a client, running migrations, or reading job state — reach the pool with `awa_pool()` / `pool()` and use Awa's existing APIs unchanged.
 
-The one thing the pool **can't** do is enqueue a job on the same connection as
-an in-flight SeaORM transaction — `get_postgres_connection_pool()` hands back a
-separate pooled connection, so a job inserted through it commits independently
-of your ORM writes. The `insert` / `insert_with` / `insert_raw` functions run
-Awa's canonical insert SQL through SeaORM's `ConnectionTrait`, so they bind to a
-`DatabaseConnection` *or* a `DatabaseTransaction` and let you enqueue a job
-atomically with the rest of a transaction.
+The one thing the pool **can't** do is enqueue a job on the same connection as an in-flight SeaORM transaction — `get_postgres_connection_pool()` hands back a separate pooled connection, so a job inserted through it commits independently of your ORM writes. The `insert` / `insert_with` / `insert_raw` functions run Awa's canonical insert SQL through SeaORM's `ConnectionTrait`, so they bind to a `DatabaseConnection` _or_ a `DatabaseTransaction` and let you enqueue a job atomically with the rest of a transaction.
 
-It does **not** replace Awa's core `sqlx` API, reimplement Awa's admin/lifecycle
-operations, or introduce a new storage engine.
+It does **not** replace Awa's core `sqlx` API, reimplement Awa's admin/lifecycle operations, or introduce a new storage engine.
 
 ## Usage
 

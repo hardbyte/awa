@@ -1,10 +1,8 @@
 # 0.6 Storage Design Archive
 
-This directory keeps branch-era design notes, reverted experiments, and dated
-performance reviews from the 0.6 queue-storage redesign.
+This directory keeps branch-era design notes, reverted experiments, and dated performance reviews from the 0.6 queue-storage redesign.
 
-These documents are useful design history, but they are not operator guidance.
-For the shipping 0.6 shape, prefer:
+These documents are useful design history, but they are not operator guidance. For the shipping 0.6 shape, prefer:
 
 - [Architecture](../../architecture.md)
 - [Configuration](../../configuration.md)
@@ -15,5 +13,4 @@ For the shipping 0.6 shape, prefer:
 
 Included archived notes:
 
-- [Issue 169 storage redesign spike](issue-169-storage-spike.md) — early
-  segment/claim-ledger exploration kept for issue-thread continuity.
+- [Issue 169 storage redesign spike](issue-169-storage-spike.md) — early segment/claim-ledger exploration kept for issue-thread continuity.

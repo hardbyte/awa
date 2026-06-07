@@ -64,7 +64,7 @@ The evaluator skips paused rows up front to avoid wasted CAS work, and the `atom
 
 `last_enqueued_at` is not touched while paused. On resume, the existing `missed_fire_policy` decides catch-up behaviour — a coalesced schedule fires once on resume; a catch-up schedule replays missed fires in order, bounded by the per-pass limit. Operators choose the catch-up shape when they register the schedule; pausing does not change it.
 
-Manual triggers (`trigger_cron_job`) bypass pause. Pause stops *automatic* fires; an explicit operator action is always allowed. Operators who want the schedule to be entirely inert should delete the row.
+Manual triggers (`trigger_cron_job`) bypass pause. Pause stops _automatic_ fires; an explicit operator action is always allowed. Operators who want the schedule to be entirely inert should delete the row.
 
 #### In-flight jobs and queue pause
 
