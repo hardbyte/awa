@@ -151,6 +151,7 @@ Claim is cursor-based rather than heap-scan based:
 - `queue_enqueue_heads` allocates lane sequence ranges at enqueue time per `(physical queue, priority, enqueue_shard)`.
 - `queue_claim_heads` advances monotonically during claim and is the authority for the next claimable lane position on the same shard-qualified lane.
 - The dispatcher pre-acquires execution permits before claiming, so every claimed `running` job has reserved local capacity.
+- `QueueFanout` is a Rust and Python helper for mapping one hot logical queue to several ordinary physical queue names. The storage engine does not add a separate group table for this; each physical queue keeps the normal lane, lease, DLQ, descriptor, and terminal-history contract.
 - Queue striping and bounded claimers reduce contention on very hot logical queues. Per-queue `claimers` can add dispatcher/claimer loops inside one runtime, but those loops share the queue's worker permits and rate limiter; they do not own jobs. Recovery still follows the receipt/lease state in Postgres.
 
 Priority ordering is by effective priority first. Within one enqueue shard the lane sequence is FIFO; across enqueue shards, strict global lane order is not promised. With queue storage, priority aging is applied at claim time rather than by physically rewriting ready rows. The ready/done/lease partitions carry shard-aware lane indexes on `(queue, priority, enqueue_shard, lane_seq)` so deep backlog claim probes do not scan a non-shard-selective lane index and post-filter most rows.

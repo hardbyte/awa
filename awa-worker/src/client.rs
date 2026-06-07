@@ -13,12 +13,12 @@ use awa_model::admin::{
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
-use awa_model::{storage as transition, JobArgs, PeriodicJob, QueueStorageConfig};
+use awa_model::{storage as transition, JobArgs, PeriodicJob, QueueFanout, QueueStorageConfig};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +35,8 @@ pub enum BuildError {
     NoQueuesConfigured,
     #[error("queue descriptor declared for unknown queue '{queue}'")]
     QueueDescriptorWithoutQueue { queue: String },
+    #[error("queue '{queue}' configured more than once")]
+    DuplicateQueue { queue: String },
     #[error("sum of min_workers ({total_min}) exceeds global_max_workers ({global_max})")]
     MinWorkersExceedGlobal { total_min: u32, global_max: u32 },
     #[error("rate_limit max_rate must be > 0.0")]
@@ -222,6 +224,27 @@ impl ClientBuilder {
     /// Add a queue with its configuration.
     pub fn queue(mut self, name: impl Into<String>, config: QueueConfig) -> Self {
         self.queues.push((name.into(), config));
+        self
+    }
+
+    /// Add every physical queue in a logical queue fanout.
+    ///
+    /// This is equivalent to calling [`queue`] once for each physical queue in
+    /// the fanout. Producers should route inserts through the same
+    /// [`QueueFanout`] so workers and producers agree on the physical queue
+    /// names.
+    ///
+    /// The `config` is applied to each physical queue. In hard-reserved mode,
+    /// total logical capacity is therefore roughly `fanout.width() *
+    /// config.max_workers`; per-queue rate limits also apply per physical
+    /// queue. Divide those knobs yourself, or use weighted mode with a
+    /// `global_max_workers` cap, when you need a logical total.
+    ///
+    /// [`queue`]: ClientBuilder::queue
+    pub fn queue_fanout(mut self, fanout: &QueueFanout, config: QueueConfig) -> Self {
+        for queue in fanout.physical_queues() {
+            self.queues.push((queue.clone(), config.clone()));
+        }
         self
     }
 
@@ -907,6 +930,15 @@ impl ClientBuilder {
 
         if let Some(err) = self.storage_error.clone() {
             return Err(err);
+        }
+
+        let mut queue_names = HashSet::with_capacity(self.queues.len());
+        for (queue, _) in &self.queues {
+            if !queue_names.insert(queue.as_str()) {
+                return Err(BuildError::DuplicateQueue {
+                    queue: queue.clone(),
+                });
+            }
         }
 
         for queue in self.queue_descriptors.keys() {
@@ -2759,6 +2791,47 @@ mod tests {
             .build();
 
         assert!(result.is_ok(), "descriptor for declared queue should build");
+    }
+
+    #[tokio::test]
+    async fn queue_fanout_declares_each_physical_queue() {
+        let fanout = QueueFanout::new("email", 3).expect("fanout should build");
+
+        let client = Client::builder(lazy_pool())
+            .queue_fanout(
+                &fanout,
+                QueueConfig {
+                    max_workers: 7,
+                    ..QueueConfig::default()
+                },
+            )
+            .build()
+            .expect("fanout queues should build");
+
+        let queues: Vec<_> = client
+            .queues
+            .iter()
+            .map(|(queue, config)| (queue.as_str(), config.max_workers))
+            .collect();
+        assert_eq!(
+            queues,
+            vec![("email__p0", 7), ("email__p1", 7), ("email__p2", 7)]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_queue_declarations_are_rejected() {
+        let fanout = QueueFanout::new("email", 2).expect("fanout should build");
+
+        let result = Client::builder(lazy_pool())
+            .queue("email__p0", QueueConfig::default())
+            .queue_fanout(&fanout, QueueConfig::default())
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(BuildError::DuplicateQueue { queue }) if queue == "email__p0"
+        ));
     }
 
     #[tokio::test]

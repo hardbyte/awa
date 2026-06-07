@@ -58,7 +58,7 @@ async def handle(job): ...
 await client.start([("email", 8)])
 ```
 
-Run separate worker processes (or separate fleets) per queue when you want **isolation**: a stuck `etl` queue can't starve `email`, deployment of a slow handler doesn't pause unrelated queues, and per- queue scaling is just a deployment knob. Run **one worker process across multiple queues** with `global_max_workers` and weighted mode when you want elastic capacity sharing — see [Weighted mode](#weighted-mode).
+Run separate worker processes (or separate fleets) per queue when you want **isolation**: a stuck `etl` queue can't starve `email`, deployment of a slow handler doesn't pause unrelated queues, and per-queue scaling is just a deployment knob. Run **one worker process across multiple queues** with `global_max_workers` and weighted mode when you want elastic capacity sharing — see [Weighted mode](#weighted-mode).
 
 ### Targeting specific job kinds within a queue
 
@@ -111,6 +111,76 @@ The key `QueueConfig` fields:
 | `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
+
+### Logical Queue Fanout
+
+A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
+
+Very hot workloads can fan one logical queue out over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
+
+Rust producers and workers can share `QueueFanout`:
+
+```rust
+use awa::{Client, InsertOpts, QueueConfig, QueueFanout};
+
+let customer_updates = QueueFanout::new("customer-updates", 4)?;
+
+let client = Client::builder(pool.clone())
+    .queue_fanout(&customer_updates, QueueConfig {
+        // Applied per physical queue: 4 × 32 hard-reserved workers.
+        max_workers: 32,
+        ..Default::default()
+    })
+    .register::<UpdateCustomer, _, _>(handle_update)
+    .build()?;
+
+let opts = customer_updates.route_opts_by_key(
+    InsertOpts::default(),
+    format!("customer-{customer_id}").into_bytes(),
+);
+```
+
+With width `1`, `QueueFanout::new("email", 1)` uses the plain `email` queue. With width above `1`, the default physical names are stable: `email__p0`, `email__p1`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO even if each physical queue later raises `enqueue_shards`.
+
+`queue_fanout` applies the `QueueConfig` to each physical queue. In hard-reserved mode, total logical capacity is roughly `fanout.width() * max_workers`; `rate_limit` is also per physical queue. Divide those values yourself, or use `global_max_workers`, when you need a logical total cap across the fanout.
+
+Python exposes the same deterministic router through the `awa.QueueFanout` class:
+
+```python
+fanout = awa.QueueFanout("customer-updates", 4)
+
+@client.task(UpdateCustomer, queue=fanout.physical_queues[0])
+async def update_customer(job):
+    ...
+
+await client.start(
+    fanout.queue_configs(
+        max_workers_per_queue=16,
+        claim_batch_size=512,
+    )
+)
+
+await client.insert(
+    UpdateCustomer(customer_id=customer_id, payload=payload),
+    **fanout.route_by_key(f"customer-{customer_id}"),
+)
+```
+
+Register the handler once and pass explicit fanout queue configs to `start()`. Python handlers are dispatched by job kind; the queue name on `@client.task` gives `start()` a declared queue to validate.
+
+`route_by_key()` returns `{"queue": ..., "ordering_key": ...}` and can be passed directly to `insert()`, `insert_many_copy()`, or `enqueue_many_copy()` when the whole call shares the same key. `route_by_index()` returns only a queue for round-robin fanout when per-key FIFO is not needed. Python `enqueue_many_copy()` still takes one queue and one ordering key per call, so mixed-key COPY producers should group their batch before calling it.
+
+### Choosing a throughput lever
+
+These knobs solve different bottlenecks:
+
+| Knob | What changes | Use it when |
+| --- | --- | --- |
+| `QueueFanout` | Routes one logical workload across multiple physical queues. Each physical queue has its own queue-level capacity, rate limit, claim cursor, completion stream, and metrics. | The workload can be partitioned by key or round-robin, and you want more end-to-end throughput from independent queue coordination paths. |
+| `enqueue_shards` | Keeps one physical queue name, but splits that queue into multiple ordered lanes. FIFO becomes per `(queue, priority, enqueue_shard)` instead of global per `(queue, priority)`. | Operators should still see one queue, but the workload can accept partitioned FIFO inside that queue. |
+| `claimers` | Adds more dispatcher/claimer loops for the same physical queue inside one worker runtime. They share the queue's worker permits and rate limiter. | One claimer is leaving worker permits idle. This is not the first lever for a hot queue because extra claimers can add transaction pressure without creating independent capacity domains. |
+
+For a hot workload that can be partitioned, start with `QueueFanout`. If the public queue should stay singular, consider `enqueue_shards`. Raise `claimers` only when measurements show the runtime is claim-starved rather than Postgres-bound.
 
 ### Python
 

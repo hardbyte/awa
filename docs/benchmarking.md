@@ -157,6 +157,10 @@ Key observations:
 
 Queue-storage e2e sweeps separate tuning from storage design. For the hot single-queue shape, `enqueue_shards = 4` plus larger completion batches sustained `7.9k` completed jobs/s with `200ms` p99 end-to-end latency and bounded depth. Increasing `claimers` did not materially improve that shape.
 
+When the application can accept partitioned ordering at the logical workload level, routing through several physical queues with `QueueFanout` is the preferred throughput lever: it creates independent claim and completion coordination streams rather than adding more claimers to one queue head.
+
+Replacing hot-path `queue_terminal_live_counts` updates with append-only terminal-count deltas is documented as a future extension of [ADR-026](adr/026-narrow-terminal-history.md#future-extension-append-only-terminal-count-deltas). That design targets WAL and dead-tuple pressure while preserving exact counts; do not treat it as available behavior until the ledger, maintenance rollup, and TLA+ updates are implemented.
+
 The offered-rate benchmark exercises absorption directly and samples WAL. With one claimer, `claim_batch_size = 512`, `AWA_COMPLETION_BATCH_SIZE = 512`, the fused receipt completion path, and `max_workers = 1024`, a 10-second no-op run at `10k/s` offered load keeps durable completions at the offered rate, drains to zero backlog, and writes `1.80 KiB` WAL per completed job. `max_workers = 512` is close but does not consistently meet the 10k offered target, because no-op handlers hold permits while waiting for durable completion acknowledgement.
 
 First-principles WAL accounting then compared the production path, a narrow `done_entries` row, and a deliberately non-production path that skipped `done_entries` entirely:

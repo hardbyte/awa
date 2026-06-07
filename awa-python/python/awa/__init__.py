@@ -6,6 +6,7 @@ from awa._awa import (
     # Job types
     Job,
     JobState,
+    QueueFanout,
     HealthCheck,
     QueueHealth,
     QueueStat,
@@ -53,6 +54,7 @@ __all__ = [
     # Job types
     "Job",
     "JobState",
+    "QueueFanout",
     "HealthCheck",
     "QueueHealth",
     "QueueStat",
