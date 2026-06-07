@@ -74,7 +74,7 @@ A phase-driven portable benchmark harness comparing Awa against pgque, procrasti
 
 ## Hot Queues
 
-Queues default to one physical queue, one enqueue shard, one claimer, and one queue-storage completion shard. Those defaults are intentionally conservative. For workloads that need more end-to-end throughput and can accept partitioned ordering, use `QueueFanout` to route one logical queue over several physical queues. Use `enqueue_shards` for partitioned FIFO inside one physical queue, and raise `claimers` only after measuring that a single claimer cannot keep worker permits full. See [Configuration](docs/configuration.md#logical-queue-fanout).
+Queues default to one physical queue, one enqueue shard, one claimer, and one queue-storage completion shard. Those defaults are intentionally conservative. For workloads that need more end-to-end throughput and can accept partitioned ordering, Rust and Python both expose `QueueFanout` to route one logical queue over several physical queues. Use `enqueue_shards` for partitioned FIFO inside one physical queue, and raise `claimers` only after measuring that a single claimer cannot keep worker permits full. See [Configuration](docs/configuration.md#logical-queue-fanout).
 
 Methodology and caveats live in [benchmarking notes](docs/benchmarking.md). Validation artifacts: [ADR-019 (queue storage)](docs/adr/bench/019-queue-storage-validation-2026-04-19.md) and [ADR-023 (receipt-plane ring partitioning)](docs/adr/bench/023-receipt-ring-validation-2026-04-26.md).
 

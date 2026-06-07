@@ -144,6 +144,32 @@ With width `1`, `QueueFanout::new("email", 1)` uses the plain `email` queue. Wit
 
 `queue_fanout` applies the `QueueConfig` to each physical queue. In hard-reserved mode, total logical capacity is roughly `fanout.width() * max_workers`; `rate_limit` is also per physical queue. Divide those values yourself, or use `global_max_workers`, when you need a logical total cap across the fanout.
 
+Python exposes the same deterministic router through the `awa.QueueFanout` class:
+
+```python
+fanout = awa.QueueFanout("customer-updates", 4)
+
+@client.task(UpdateCustomer, queue=fanout.physical_queues[0])
+async def update_customer(job):
+    ...
+
+await client.start(
+    fanout.queue_configs(
+        max_workers_per_queue=16,
+        claim_batch_size=512,
+    )
+)
+
+await client.insert(
+    UpdateCustomer(customer_id=customer_id, payload=payload),
+    **fanout.route_by_key(f"customer-{customer_id}"),
+)
+```
+
+Register the handler once and pass explicit fanout queue configs to `start()`. Python handlers are dispatched by job kind; the queue name on `@client.task` gives `start()` a declared queue to validate.
+
+`route_by_key()` returns `{"queue": ..., "ordering_key": ...}` and can be passed directly to `insert()`, `insert_many_copy()`, or `enqueue_many_copy()` when the whole call shares the same key. `route_by_index()` returns only a queue for round-robin fanout when per-key FIFO is not needed. Python `enqueue_many_copy()` still takes one queue and one ordering key per call, so mixed-key COPY producers should group their batch before calling it.
+
 Use queue fanout before raising `claimers` when you need more end-to-end throughput and can accept partitioned ordering. Use `enqueue_shards` when a single physical queue should remain the public operational unit but can accept partitioned FIFO inside that queue. Use extra `claimers` only when one runtime cannot keep its worker permits full.
 
 ### Python

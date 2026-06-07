@@ -126,6 +126,7 @@ python -m awa --database-url "$DATABASE_URL" serve
 - `await client.migrate()` runs migrations from Python instead of the CLI.
 - `awa.Client` provides a synchronous API for worker/admin/direct-producer code — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`).
 - `client.start()` accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See [Configuration reference](configuration.md).
+- `awa.QueueFanout` helps one hot logical queue use several physical queues while keeping routing deterministic. See [Logical queue fanout](configuration.md#logical-queue-fanout).
 
 ## ORM Transaction Bridging
 

@@ -51,6 +51,7 @@ For application tables, keep using your existing database library. The `awa.brid
 - **Transactional enqueue** — enqueue inside the same Postgres transaction as your application's writes, using your existing connection/session.
 - **Vacuum-aware storage** — append-only ready entries plus a partitioned receipt ring keep dead-tuple pressure bounded under sustained load. See [ADR-019](https://github.com/hardbyte/awa/blob/main/docs/adr/019-queue-storage-redesign.md) and [ADR-023](https://github.com/hardbyte/awa/blob/main/docs/adr/023-receipt-plane-ring-partitioning.md).
 - **COPY ingestion** — `enqueue_many_copy` streams directly into queue storage for high-volume Python producers. `insert_many_copy` remains the compatibility insert surface for canonical-storage and adapter-style callers. If workers use `queue_storage_queue_stripe_count > 1`, pass the same value to `enqueue_many_copy`.
+- **Queue fanout** — `QueueFanout` maps one hot logical queue to several physical queues so workers can drain independent streams without changing Awa's durability model.
 - **Crash-safe execution** — heartbeat-based lease tracking; jobs whose workers vanish are rescued automatically.
 - **Per-queue policy** — priorities, priority aging, weighted concurrency, rate limits, deadlines, retry/backoff, cron, dead-letter queue.
 - **Progress tracking** — handlers can write structured progress that survives across retries.
@@ -79,6 +80,31 @@ await client.insert(
 ```
 
 The key can be `bytes` or `str` (encoded UTF-8). Two enqueues with the same key always pick the same shard regardless of which producer process or batch they came from. At `enqueue_shards = 1` (the default) the key is ignored. See [`docs/adr/025-sharded-enqueue-heads.md`](https://github.com/hardbyte/awa/blob/main/docs/adr/025-sharded-enqueue-heads.md) for the full contract.
+
+## Logical queue fanout
+
+A logical queue is the workload name your application thinks in, such as `customer-updates`. A physical queue is the queue name stored in Postgres and claimed by workers. Most workloads use one physical queue. For a very hot workload where partitioned ordering is acceptable, use `QueueFanout` to spread one logical queue over several physical queues:
+
+```python
+fanout = awa.QueueFanout("customer-updates", 4)
+
+@client.task(UpdateCustomer, queue=fanout.physical_queues[0])
+async def update_customer(job):
+    ...
+
+await client.start(fanout.queue_configs(max_workers_per_queue=16))
+
+await client.insert(
+    UpdateCustomer(customer_id=42, payload=...),
+    **fanout.route_by_key("customer-42"),
+)
+```
+
+Register the handler once and pass explicit fanout queue configs to `start()`. Python handlers are dispatched by job kind; the queue name on `@client.task` gives `start()` a declared queue to validate.
+
+`route_by_key()` returns `queue` and `ordering_key`, so jobs for the same key pick the same physical queue and keep per-key FIFO. `route_by_index()` returns a round-robin queue for workloads that do not need per-key ordering. The worker `queue_configs()` helper is explicit about `max_workers_per_queue` because each physical queue is configured independently; pass `global_max_workers` to `start()` if you need a logical fleet-wide cap.
+
+`enqueue_many_copy()` is a homogeneous batch API: one queue and one optional ordering key per call. For mixed-key fanout batches, group jobs by physical queue and ordering key before calling it, or use individual inserts when preserving per-key FIFO matters more than batch size.
 
 ## Documentation
 

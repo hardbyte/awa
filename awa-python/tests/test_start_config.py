@@ -130,6 +130,34 @@ async def test_global_max_workers(client):
     await client.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_queue_fanout_configs_expand_and_dispatch(client):
+    """QueueFanout queue_configs() can be passed directly to start()."""
+    fanout = awa.QueueFanout("cfg_fanout", 2)
+    handled = []
+
+    @client.task(ConfigTestJob, queue=fanout.physical_queues[0])
+    async def handle(job):
+        handled.append(job.queue)
+        return None
+
+    await client.start(
+        fanout.queue_configs(max_workers_per_queue=1),
+        poll_interval_ms=25,
+    )
+
+    job = await client.insert(
+        ConfigTestJob("physical-1"),
+        queue=fanout.queue_for_index(1),
+    )
+    result = await wait_for_job_state(client, job.id, awa.JobState.Completed, timeout=5.0)
+
+    await client.shutdown()
+
+    assert result.state == awa.JobState.Completed
+    assert handled == [fanout.queue_for_index(1)]
+
+
 # -- Test 15: Invalid: tuple + global_max_workers --
 
 
