@@ -2,11 +2,11 @@
 
 ## Status
 
-Proposed for `0.6`. The initial implementation scope is the framework plus `set_priority` and `move_queue` operation kinds. Existing synchronous bulk retry, bulk cancel, and DLQ bulk endpoints stay as-is for `0.6`; migrating them to the framework is deferred.
+Accepted. The initial implementation scope is the framework plus `set_priority` and `move_queue` operation kinds. Existing synchronous bulk retry, bulk cancel, and DLQ bulk endpoints stay as-is for `0.6`; migrating them to the framework is deferred.
 
 ## Context
 
-Issue [#307](https://github.com/hardbyte/awa/issues/307) starts with a concrete gap: Awa has no first-class way to change the priority of an already queued job. Queue storage makes that more than a metadata update. An available row's priority is part of its physical dispatch lane, so reprioritizing requires moving the row from one `(queue, priority, enqueue_shard)` lane to another, assigning a new lane sequence, and leaving committed spent evidence in the source lane so claim cursors do not block.
+Awa needs a first-class way to change the priority of an already queued job. Queue storage makes that more than a metadata update. An available row's priority is part of its physical dispatch lane, so reprioritizing requires moving the row from one `(queue, priority, enqueue_shard)` lane to another, assigning a new lane sequence, and leaving committed spent evidence in the source lane so claim cursors do not block.
 
 The operator problem is broader than priority. The same shape appears in incident workflows such as:
 
@@ -258,7 +258,7 @@ Batch operation rows are the audit log for who did what and when. They are not i
 
 ### A. Add only synchronous `bulk-priority`
 
-This directly addresses #307 but leaves the same UX and safety gap for queue moves, cancel-by-filter, retry-by-filter, and tag edits. It also encourages large HTTP requests to sit on database work synchronously, with no durable progress or resume after client disconnect. Rejected.
+This directly addresses reprioritization but leaves the same UX and safety gap for queue moves, cancel-by-filter, retry-by-filter, and tag edits. It also encourages large HTTP requests to sit on database work synchronously, with no durable progress or resume after client disconnect. Rejected.
 
 ### B. Add separate async tables per operation kind
 
