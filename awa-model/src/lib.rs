@@ -42,7 +42,7 @@ pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
 pub use queue_fanout::{QueueFanout, QueueFanoutError};
 pub use queue_storage::{
     ClaimedEntry, ClaimedRuntimeJob, PruneOutcome, QueueCounts, QueueStorage, QueueStorageConfig,
-    RotateOutcome, SkipReason,
+    RotateOutcome, SkipReason, TerminalDeltaRollupOutcome,
 };
 pub use storage::StorageStatus;
 

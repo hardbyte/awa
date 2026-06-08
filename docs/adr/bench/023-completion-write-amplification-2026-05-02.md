@@ -50,4 +50,4 @@ The design keeps enough information for:
 - `load_job` / admin inspection of completed jobs
 - retry/replay tooling that expects terminal job identity and timing
 
-Transitions without a retained ready row, such as cancelling an unclaimed available job, still write a wide `done_entries` row.
+Transitions without a claimed attempt snapshot, such as cancelling an unclaimed available job, still write a wide `done_entries` row even though the ready lane itself is tombstoned and reclaimed later by queue prune.

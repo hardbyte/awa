@@ -17,6 +17,8 @@ It uses the storage naming set:
 - `terminal_segments` / `terminal_segment_cursor`
 - `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims` and `lease_claim_closures` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier)
 
+Terminal-count derived state (`queue_terminal_count_deltas`, `queue_terminal_live_counts`, and `queue_terminal_rollups`) is not lifecycle state and is not part of `AwaSegmentedStorage`. The append/truncate contract for those tables is covered by `AwaDeadTupleContract`, while Rust integration tests assert that exact reads include folded counters plus pending deltas.
+
 What it models:
 
 - append-only enqueue into `ready_entries`

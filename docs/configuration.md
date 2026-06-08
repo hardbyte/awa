@@ -460,6 +460,7 @@ DLQ rows are different: `dlq_entries` is a separate hold table and the maintenan
 | `cleanup_interval` | `60s` | How often the cleanup pass runs. |
 | `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
 | `dlq_cleanup_batch_size` | `1000` | DLQ-specific batch size. |
+| `ClientBuilder::terminal_count_rollup_interval` (Rust) / `terminal_count_rollup_interval_ms` (Python kwarg) | `30s` | Queue storage only: how often maintenance folds pending terminal-count deltas for sealed queue slots into compact live counters. Exact reads include pending deltas, so this affects compaction/WAL pressure rather than correctness. |
 
 ## Queue storage tuning
 
@@ -472,6 +473,14 @@ For bulk producers on queue storage, prefer direct queue-storage COPY: Python `e
 Direct-copy producers must use the same queue-storage routing config as the worker fleet. This matters most for `queue_stripe_count` / `queue_storage_queue_stripe_count`: a producer using the default unstriped config can write to `queue` while striped workers claim from `queue#0`, `queue#1`, etc. Rust producers should construct `QueueStorage` with the same `QueueStorageConfig` used by workers. Python producers should pass the same `queue_storage_queue_stripe_count` to `enqueue_many_copy()` when the fleet uses non-default striping.
 
 `insert_many_copy()` is the compatibility insert API. It is still useful when a caller needs the canonical insert surface, but in queue-storage mode it routes through the compatibility function rather than being the primary producer fast path.
+
+### Terminal count rollup
+
+Queue storage keeps exact terminal counts without updating mutable counter rows on the completion hot path. Terminal inserts append positive rows to `queue_terminal_count_deltas_*`; retry, discard, DLQ move, and compatibility delete append negative rows. Exact count reads sum those pending deltas with folded `queue_terminal_live_counts`.
+
+A queue slot is one partition in queue storage's rotating ready/done ring. A sealed slot is no longer the current write slot, so maintenance can fold its terminal-count deltas without touching the active completion segment.
+
+The maintenance leader folds pending deltas from sealed queue slots every `terminal_count_rollup_interval` (default `30s`) and processes at most four slots per tick. Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the delta ledger is growing faster than maintenance drains it.
 
 ### Rust
 

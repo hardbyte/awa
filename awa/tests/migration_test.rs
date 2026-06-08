@@ -1007,6 +1007,34 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
         "prepared queue-storage schema should materialize ready_tombstones"
     );
     assert!(
+        relation_exists(
+            &pool,
+            "awa_queue_storage_prepared.queue_terminal_count_deltas"
+        )
+        .await,
+        "prepared queue-storage schema should materialize queue_terminal_count_deltas"
+    );
+    let has_delta_nonzero_constraint: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_constraint AS c
+            JOIN pg_class AS t ON t.oid = c.conrelid
+            JOIN pg_namespace AS n ON n.oid = t.relnamespace
+            WHERE n.nspname = 'awa_queue_storage_prepared'
+              AND t.relname = 'queue_terminal_count_deltas'
+              AND c.conname = 'queue_terminal_count_deltas_nonzero'
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("terminal delta constraint probe should succeed");
+    assert!(
+        has_delta_nonzero_constraint,
+        "queue_terminal_count_deltas should reject no-op zero deltas"
+    );
+    assert!(
         relation_exists(&pool, "awa_queue_storage_prepared.leases").await,
         "prepared queue-storage schema should materialize leases"
     );
@@ -1057,6 +1085,21 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
 
     prepare_queue_storage_schema(&pool, schema).await;
     sqlx::query(&format!(
+        "DROP TABLE {schema}.queue_terminal_count_deltas CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test queue_terminal_count_deltas drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after terminal delta table drop"),
+        "schema without queue_terminal_count_deltas must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
         "DROP FUNCTION {schema}.claim_ready_runtime(text, bigint, double precision, double precision)"
     ))
         .execute(&pool)
@@ -1068,6 +1111,122 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
             .await
             .expect("schema readiness should be queryable after function drop"),
         "schema without claim_ready_runtime must not be reported as ready"
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_current_shape() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let schema = "awa_queue_storage_trusted_marker";
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("queue storage test schema should drop cleanly");
+    let store =
+        QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("queue storage schema preparation should succeed");
+
+    sqlx::raw_sql(&format!(
+        r#"
+        INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        )
+        VALUES (
+            0, 1, 9100001, 'migration_test_job', 'trusted_marker',
+            'completed'::awa.job_state, 2::smallint, 1::smallint,
+            1::bigint, 1::bigint, 0::smallint, now(), now(), '{{}}'::jsonb
+        );
+
+        INSERT INTO {schema}.queue_terminal_live_counts (
+            ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
+        )
+        VALUES (0, 'trusted_marker', 2::smallint, 0::smallint, 1::smallint, 1);
+
+        UPDATE {schema}.queue_ring_state
+        SET terminal_counter_trusted_at = now()
+        WHERE singleton = TRUE;
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed current-shape terminal counters");
+
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("idempotent prepare_schema should succeed");
+
+    let trusted: bool = sqlx::query_scalar(&format!(
+        "SELECT terminal_counter_trusted_at IS NOT NULL \
+         FROM {schema}.queue_ring_state WHERE singleton = TRUE"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("trust marker query should succeed");
+
+    assert!(
+        trusted,
+        "idempotent prepare_schema must not clear a trusted current-shape terminal counter"
+    );
+}
+
+#[tokio::test]
+async fn test_v030_preserves_untrusted_terminal_counter_marker_on_empty_schema() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let schema = "awa_queue_storage_untrusted_marker";
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("queue storage test schema should drop cleanly");
+    let store =
+        QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("queue storage schema preparation should succeed");
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state \
+         SET terminal_counter_trusted_at = NULL \
+         WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("clear trust marker");
+
+    for (_version, _desc, sql) in migrations::migration_sql_range(29, 30) {
+        sqlx::raw_sql(&sql)
+            .execute(&pool)
+            .await
+            .expect("v030 migration should rerun cleanly");
+    }
+
+    let trusted: bool = sqlx::query_scalar(&format!(
+        "SELECT terminal_counter_trusted_at IS NOT NULL \
+         FROM {schema}.queue_ring_state WHERE singleton = TRUE"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("trust marker query should succeed");
+
+    assert!(
+        !trusted,
+        "v030 must not re-trust a queue-storage schema whose marker was cleared before upgrade"
     );
 }
 

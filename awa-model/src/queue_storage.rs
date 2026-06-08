@@ -249,6 +249,10 @@ pub struct BusyCounts {
     pub queue_ready: i64,
     /// Queue ring: rows in the next `done_entries` child.
     pub queue_done: i64,
+    /// Queue ring: rows in the next `ready_tombstones` child.
+    pub queue_tombstones: i64,
+    /// Queue ring: rows in the next `queue_terminal_count_deltas` child.
+    pub queue_terminal_deltas: i64,
     /// Lease ring: rows in the next `leases` child.
     pub leases: i64,
     /// Claim ring: rows in the next `lease_claims` child.
@@ -274,6 +278,23 @@ pub enum PruneOutcome {
         reason: SkipReason,
         count: i64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalDeltaRollupOutcome {
+    pub rolled_slots: usize,
+    pub delta_rows: i64,
+    pub grouped_keys: i64,
+    pub skipped_active_slots: usize,
+    pub blocked_slots: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalDeltaSlotRollup {
+    Empty,
+    Rolled { delta_rows: i64, grouped_keys: i64 },
+    SkippedActive,
+    Blocked,
 }
 
 /// Discriminator for [`PruneOutcome::SkippedActive`].
@@ -350,6 +371,14 @@ fn ready_child_name(schema: &str, slot: usize) -> String {
 
 fn done_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.done_entries_{slot}")
+}
+
+fn ready_tombstone_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.ready_tombstones_{slot}")
+}
+
+fn terminal_delta_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.queue_terminal_count_deltas_{slot}")
 }
 
 fn done_ready_join(schema: &str, done_alias: &str, ready_alias: &str) -> String {
@@ -1052,6 +1081,7 @@ type ClaimCursorLaneKey = (String, i16, i16);
 type ConditionalClaimCursorAdvances = BTreeMap<i64, i64>;
 type GroupedClaimCursorAdvances =
     BTreeMap<ClaimCursorLaneKey, (Option<i64>, ConditionalClaimCursorAdvances)>;
+type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 
 struct CancelJobTxResult {
     row: JobRow,
@@ -2625,6 +2655,7 @@ impl QueueStorage {
             r#"
             TRUNCATE
                 {schema}.ready_entries,
+                {schema}.ready_tombstones,
                 {schema}.done_entries,
                 {schema}.dlq_entries,
                 {schema}.leases,
@@ -2635,6 +2666,7 @@ impl QueueStorage {
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
                 {schema}.queue_terminal_live_counts,
+                {schema}.queue_terminal_count_deltas,
                 {schema}.queue_claimer_leases,
                 {schema}.queue_claimer_state,
                 {schema}.queue_ring_slots,
@@ -3863,27 +3895,24 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
         }
 
-        // #290: maintain queue_terminal_live_counts as a denormalised
-        // count of live done_entries rows, keyed by
-        // (ready_slot, queue, priority, enqueue_shard) to match the
-        // ring + shard identity. Aggregate this batch into one row per
-        // group so a skewed full batch of N terminal inserts costs at
-        // most one UPSERT per (slot, queue, priority, shard) tuple
-        // touched. The read side (queue_counts_exact, switched in a
-        // follow-up PR) then sums these counters instead of scanning
-        // done_entries.
+        // Terminal counts stay exact without mutating the hot live-counter
+        // rows on every completion. The hot path appends signed deltas; the
+        // maintenance rollup folds them into queue_terminal_live_counts later.
         self.increment_live_terminal_counters_tx(tx, rows).await?;
 
         Ok(rows.len())
     }
 
-    /// Aggregate `rows` by `(ready_slot, queue, priority, enqueue_shard)`
-    /// and UPSERT the per-group delta into `queue_terminal_live_counts`.
-    /// Called from every terminal-insert path so the counter stays in
-    /// lockstep with `done_entries` cardinality. The invariant tested in
-    /// `queue_storage_runtime_test::test_queue_terminal_live_counts_*`
-    /// is that `SUM(live_terminal_count)` for a queue equals
-    /// `count(*) FROM done_entries WHERE queue = ANY(...)`.
+    /// Append positive terminal-count deltas for newly inserted terminal rows.
+    ///
+    /// The exact invariant is:
+    ///
+    /// `SUM(queue_terminal_live_counts) + SUM(queue_terminal_count_deltas)
+    /// == count(*) FROM done_entries`.
+    ///
+    /// Maintenance asynchronously folds delta rows into the live-counter table
+    /// and truncates the delta segment. The hot path therefore performs only
+    /// append-only writes.
     async fn increment_live_terminal_counters_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -3892,15 +3921,11 @@ impl QueueStorage {
         if rows.is_empty() {
             return Ok(());
         }
-        // BTreeMap, not HashMap: two concurrent transactions upserting the
-        // same set of counter keys must take row locks in the same order,
-        // or they can deadlock on the ON CONFLICT DO UPDATE. Sorted key
-        // iteration removes that race entirely. See also the matching
-        // ORDER BY in the fused CTE upsert.
-        let mut by_group: BTreeMap<(i32, String, i16, i16, i16), i64> = BTreeMap::new();
+        let mut by_group: BTreeMap<TerminalCounterKey, i64> = BTreeMap::new();
         for row in rows {
             let key = (
                 row.ready_slot,
+                row.ready_generation,
                 row.queue.clone(),
                 row.priority,
                 row.enqueue_shard,
@@ -3908,105 +3933,111 @@ impl QueueStorage {
             );
             *by_group.entry(key).or_insert(0) += 1;
         }
-        let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
-        let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
-        let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
-        let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
-        let mut counter_buckets: Vec<i16> = Vec::with_capacity(by_group.len());
-        let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
-        for ((slot, queue, prio, shard, bucket), delta) in by_group {
-            ready_slots.push(slot);
-            queues.push(queue);
-            priorities.push(prio);
-            enqueue_shards.push(shard);
-            counter_buckets.push(bucket);
-            deltas.push(delta);
-        }
-        let schema = self.schema();
-        // ORDER BY pins the lock-acquisition order PG sees inside the
-        // INSERT ... ON CONFLICT, matching the sorted Rust iteration above.
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-                ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
-            )
-            SELECT ready_slot, queue, priority, enqueue_shard, counter_bucket, delta
-            FROM unnest(
-                $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::smallint[], $6::bigint[]
-            ) AS d(ready_slot, queue, priority, enqueue_shard, counter_bucket, delta)
-            ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
-            ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
-            SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
-            "#
-        ))
-        .bind(&ready_slots)
-        .bind(&queues)
-        .bind(&priorities)
-        .bind(&enqueue_shards)
-        .bind(&counter_buckets)
-        .bind(&deltas)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        Ok(())
+        self.append_terminal_count_deltas_tx(tx, by_group).await
     }
 
-    /// Decrement `queue_terminal_live_counts` by the per-group magnitudes
-    /// implied by `rows`. Called from every terminal-delete path
-    /// (retry-from-terminal, DLQ move, discard). Rows whose group has no
-    /// counter row are tolerated (`GREATEST(0, ...)` floor) so the
-    /// operation is idempotent across re-runs.
+    /// Append negative terminal-count deltas for deleted terminal rows.
+    ///
+    /// This is used by retry-from-terminal, DLQ moves, discard paths, and the
+    /// SQL compatibility delete function. The negative row may cancel a
+    /// not-yet-rolled positive delta or reduce an already-folded live counter;
+    /// exact reads sum both sources, so either order is correct.
     async fn decrement_live_terminal_counters_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        rows: &[(i32, String, i16, i16, i16)],
+        rows: &[TerminalCounterKey],
     ) -> Result<(), AwaError> {
         if rows.is_empty() {
             return Ok(());
         }
-        // BTreeMap + ORDER BY: same deadlock-avoidance discipline as the
-        // increment helper. The UPDATE locks rows in the order PG sees
-        // its driving subquery; sorting the unnest input gives a stable
-        // (slot, queue, priority, shard) lock-acquisition order across
-        // concurrent transactions.
-        let mut by_group: BTreeMap<(i32, String, i16, i16, i16), i64> = BTreeMap::new();
+        let mut by_group: BTreeMap<TerminalCounterKey, i64> = BTreeMap::new();
         for key in rows {
-            *by_group.entry(key.clone()).or_insert(0) += 1;
+            *by_group.entry(key.clone()).or_insert(0) -= 1;
         }
+        self.append_terminal_count_deltas_tx(tx, by_group).await
+    }
+
+    async fn append_terminal_count_deltas_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        by_group: BTreeMap<TerminalCounterKey, i64>,
+    ) -> Result<(), AwaError> {
+        if by_group.is_empty() {
+            return Ok(());
+        }
+
         let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
+        let mut ready_generations: Vec<i64> = Vec::with_capacity(by_group.len());
         let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
         let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
         let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
         let mut counter_buckets: Vec<i16> = Vec::with_capacity(by_group.len());
         let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
-        for ((slot, queue, prio, shard, bucket), delta) in by_group {
+        for ((slot, generation, queue, prio, shard, bucket), delta) in by_group {
+            if delta == 0 {
+                continue;
+            }
             ready_slots.push(slot);
+            ready_generations.push(generation);
             queues.push(queue);
             priorities.push(prio);
             enqueue_shards.push(shard);
             counter_buckets.push(bucket);
             deltas.push(delta);
         }
+
+        if deltas.is_empty() {
+            return Ok(());
+        }
+
         let schema = self.schema();
         sqlx::query(&format!(
             r#"
-            UPDATE {schema}.queue_terminal_live_counts AS counts
-            SET live_terminal_count = GREATEST(0, counts.live_terminal_count - sorted.delta)
-            FROM (
-                SELECT ready_slot, queue, priority, enqueue_shard, counter_bucket, delta
-                FROM unnest(
-                    $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::smallint[], $6::bigint[]
-                ) AS d(ready_slot, queue, priority, enqueue_shard, counter_bucket, delta)
-                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
-            ) AS sorted
-            WHERE counts.ready_slot     = sorted.ready_slot
-              AND counts.queue          = sorted.queue
-              AND counts.priority       = sorted.priority
-              AND counts.enqueue_shard  = sorted.enqueue_shard
-              AND counts.counter_bucket = sorted.counter_bucket
+            INSERT INTO {schema}.queue_terminal_count_deltas (
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                counter_bucket,
+                terminal_delta
+            )
+            SELECT
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                counter_bucket,
+                terminal_delta
+            FROM unnest(
+                $1::int[],
+                $2::bigint[],
+                $3::text[],
+                $4::smallint[],
+                $5::smallint[],
+                $6::smallint[],
+                $7::bigint[]
+            ) AS d(
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                counter_bucket,
+                terminal_delta
+            )
+            ORDER BY
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                counter_bucket
             "#
         ))
         .bind(&ready_slots)
+        .bind(&ready_generations)
         .bind(&queues)
         .bind(&priorities)
         .bind(&enqueue_shards)
@@ -4022,11 +4053,12 @@ impl QueueStorage {
     /// from a slice of `DoneJobRow` (used by retry-from-terminal,
     /// DLQ move, and discard, all of which DELETE FROM done_entries
     /// with `RETURNING *` materialised into `DoneJobRow`).
-    fn done_rows_to_counter_keys(rows: &[DoneJobRow]) -> Vec<(i32, String, i16, i16, i16)> {
+    fn done_rows_to_counter_keys(rows: &[DoneJobRow]) -> Vec<TerminalCounterKey> {
         rows.iter()
             .map(|row| {
                 (
                     row.ready_slot,
+                    row.ready_generation,
                     row.queue.clone(),
                     row.priority,
                     row.enqueue_shard,
@@ -5348,29 +5380,33 @@ impl QueueStorage {
                 JOIN closed
                   ON closed.job_id = completed.job_id
                  AND closed.run_lease = completed.run_lease
-                RETURNING ready_slot, queue, priority, enqueue_shard, job_id, run_lease
+                RETURNING ready_slot, ready_generation, queue, priority, enqueue_shard, job_id, run_lease
             ),
-            -- #290: increment live terminal counters in lockstep with
-            -- the `terminal` INSERT above. Aggregate by group so a
-            -- skewed batch costs one UPSERT per touched
-            -- (slot, queue, priority, shard). Postgres executes
-            -- data-modifying CTEs unconditionally, so the outer SELECT
-            -- doesn't need to reference this stage.
-            --
-            -- ORDER BY pins the lock-acquisition order on the
-            -- ON CONFLICT DO UPDATE. Two concurrent receipt-fast batches
-            -- touching overlapping (slot, queue, priority, shard) tuples
-            -- would otherwise deadlock if their group iteration order
-            -- differed.
-            counter_upsert AS (
-                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-                    ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
+            -- Terminal counts use an append-only delta ledger on the hot
+            -- completion path. Maintenance folds these rows into
+            -- queue_terminal_live_counts later; exact reads sum both sources.
+            counter_delta AS (
+                INSERT INTO {schema}.queue_terminal_count_deltas (
+                    ready_slot,
+                    ready_generation,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    terminal_delta
                 )
                 SELECT
-                    ready_slot, queue, priority, enqueue_shard, counter_bucket, delta
+                    ready_slot,
+                    ready_generation,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    delta
                 FROM (
                     SELECT
                         terminal.ready_slot,
+                        terminal.ready_generation,
                         terminal.queue,
                         terminal.priority,
                         terminal.enqueue_shard,
@@ -5381,11 +5417,15 @@ impl QueueStorage {
                         )::smallint AS counter_bucket,
                         count(*)::bigint AS delta
                     FROM terminal
-                    GROUP BY terminal.ready_slot, terminal.queue, terminal.priority, terminal.enqueue_shard, counter_bucket
+                    GROUP BY
+                        terminal.ready_slot,
+                        terminal.ready_generation,
+                        terminal.queue,
+                        terminal.priority,
+                        terminal.enqueue_shard,
+                        counter_bucket
                 ) AS grouped
-                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
-                ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
-                SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
+                ORDER BY ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket
                 RETURNING 1
             )
             SELECT job_id, run_lease
@@ -5908,18 +5948,14 @@ impl QueueStorage {
     /// still-claimable ready rows. Use [`Self::queue_claimer_signal`] for the
     /// dispatcher hot path.
     ///
-    /// The live-terminal portion reads from `queue_terminal_live_counts`
-    /// (the #290 denormaliser) when [`Self::terminal_counter_trusted`]
-    /// returns true, and falls back to a `count(*) FROM done_entries`
-    /// scan when not. The fallback exists for the rolling-upgrade
-    /// window: a pre-#290 binary writing terminal rows would have
-    /// missed the counter, so reads against a fleet that hasn't yet
-    /// run `awa storage rebuild-terminal-counters` would otherwise
-    /// undercount. The trust marker is auto-set for fresh installs
-    /// (empty done_entries at prepare_schema time) and set explicitly
-    /// by the rebuild CLI; on an existing install before the operator
-    /// rebuilds, the trust marker stays NULL and the scan-based path
-    /// is used — "exact" stays honest.
+    /// The live-terminal portion reads from folded
+    /// `queue_terminal_live_counts` plus unrolled
+    /// `queue_terminal_count_deltas` when [`Self::terminal_counter_trusted`]
+    /// returns true, and falls back to a `count(*) FROM done_entries` scan
+    /// when not. The fallback exists for the rolling-upgrade window: older
+    /// binaries may have written terminal rows without maintaining the
+    /// counter/delta contract, so reads stay honest until the operator runs
+    /// `awa storage rebuild-terminal-counters`.
     async fn queue_counts_exact(
         &self,
         pool: &PgPool,
@@ -5935,9 +5971,20 @@ impl QueueStorage {
         let live_terminal_cte = if counter_trusted {
             format!(
                 "live_terminal AS (
-                    SELECT COALESCE(SUM(live_terminal_count), 0)::bigint AS terminal
-                    FROM {schema}.queue_terminal_live_counts
-                    WHERE queue = ANY($1)
+                    SELECT GREATEST(
+                        0,
+                        COALESCE((
+                            SELECT SUM(live_terminal_count)
+                            FROM {schema}.queue_terminal_live_counts
+                            WHERE queue = ANY($1)
+                        ), 0)
+                        +
+                        COALESCE((
+                            SELECT SUM(terminal_delta)
+                            FROM {schema}.queue_terminal_count_deltas
+                            WHERE queue = ANY($1)
+                        ), 0)
+                    )::bigint AS terminal
                 )"
             )
         } else {
@@ -6018,8 +6065,32 @@ impl QueueStorage {
                           AND NOT EXISTS (
                               SELECT 1 FROM {schema}.lease_claim_closures AS closures
                               WHERE closures.claim_slot = claims.claim_slot
-                                AND closures.job_id = claims.job_id
-                                AND closures.run_lease = claims.run_lease
+                                  AND closures.job_id = claims.job_id
+                                  AND closures.run_lease = claims.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.leases AS lease
+                              WHERE lease.job_id = claims.job_id
+                                AND lease.run_lease = claims.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.deferred_jobs AS deferred
+                              WHERE deferred.job_id = claims.job_id
+                                AND deferred.run_lease = claims.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.done_entries AS done
+                              WHERE done.job_id = claims.job_id
+                                AND done.run_lease = claims.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.dlq_entries AS dlq
+                              WHERE dlq.job_id = claims.job_id
+                                AND dlq.run_lease = claims.run_lease
                           )
                     ), 0)
                 )::bigint AS running
@@ -6250,8 +6321,8 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if let Some(terminal) = terminal {
-            // #290: the DELETE FROM done_entries above removes one terminal
-            // row; the counter must decrement in lockstep.
+            // The DELETE FROM done_entries above removes one terminal row;
+            // append a negative delta so exact counts stay in lockstep.
             self.decrement_live_terminal_counters_tx(
                 tx,
                 &Self::done_rows_to_counter_keys(std::slice::from_ref(&terminal)),
@@ -9853,8 +9924,8 @@ impl QueueStorage {
             return Ok(None);
         };
 
-        // #290: dlq inserts do not increment the live terminal counter, so
-        // the source DELETE must decrement it.
+        // DLQ inserts are outside done_entries, so the source terminal DELETE
+        // appends a negative delta.
         self.decrement_live_terminal_counters_tx(
             &mut tx,
             &Self::done_rows_to_counter_keys(std::slice::from_ref(&moved)),
@@ -9910,8 +9981,8 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        // #290: bulk DLQ move deletes from done_entries — decrement counter
-        // by the per-group magnitudes of the moved rows.
+        // Bulk DLQ move deletes from done_entries. Append negative deltas by
+        // the per-group magnitudes of the moved rows.
         self.decrement_live_terminal_counters_tx(&mut tx, &Self::done_rows_to_counter_keys(&moved))
             .await?;
         let dlq_at = Utc::now();
@@ -10153,9 +10224,9 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        // #290: discard removes terminal `failed` rows from done_entries
-        // (and `failed` DLQ rows from dlq_entries — counter is keyed on
-        // done_entries only). Decrement the counter by the per-group
+        // Discard removes terminal `failed` rows from done_entries (and
+        // `failed` DLQ rows from dlq_entries — exact terminal counts are keyed
+        // on done_entries only). Append negative deltas by the per-group
         // magnitudes of `deleted_done`.
         self.decrement_live_terminal_counters_tx(
             &mut tx,
@@ -10682,14 +10753,30 @@ impl QueueStorage {
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        let tombstone_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {}",
+            ready_tombstone_child_name(schema, next_slot as usize)
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let terminal_delta_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {}",
+            terminal_delta_child_name(schema, next_slot as usize)
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
-        if ready_count > 0 || done_count > 0 {
+        if ready_count > 0 || done_count > 0 || tombstone_count > 0 || terminal_delta_count > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
                     queue_ready: ready_count,
                     queue_done: done_count,
+                    queue_tombstones: tombstone_count,
+                    queue_terminal_deltas: terminal_delta_count,
                     ..Default::default()
                 },
             });
@@ -10815,9 +10902,8 @@ impl QueueStorage {
         })
     }
 
-    /// Rebuild the `queue_terminal_live_counts` table from scratch by
-    /// truncating it and re-aggregating `done_entries` (per #290). Run
-    /// this when:
+    /// Rebuild terminal counters from scratch by truncating folded live counts
+    /// and pending deltas, then re-aggregating `done_entries`. Run this when:
     ///
     /// - upgrading from a pre-#290 fleet, where in-flight binaries wrote
     ///   `done_entries` without maintaining the counter,
@@ -10849,7 +10935,7 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         sqlx::query(&format!(
-            "TRUNCATE TABLE {schema}.queue_terminal_live_counts"
+            "TRUNCATE TABLE {schema}.queue_terminal_live_counts, {schema}.queue_terminal_count_deltas"
         ))
         .execute(tx.as_mut())
         .await
@@ -10927,6 +11013,331 @@ impl QueueStorage {
         Ok(trusted.unwrap_or(false))
     }
 
+    /// Fold append-only terminal-count deltas into
+    /// `queue_terminal_live_counts` for sealed queue slots.
+    ///
+    /// Completions and terminal deletes append signed rows into
+    /// `queue_terminal_count_deltas` instead of updating the live counter on
+    /// the user-facing hot path. Exact reads sum folded live counts plus
+    /// pending deltas, so this rollup can run asynchronously. It intentionally
+    /// skips the current queue slot and any slot with active leases or open
+    /// receipt claims; that keeps rollup away from the segment receiving hot
+    /// completions and avoids racing future terminal deltas for the same
+    /// ready generation.
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rollup_terminal_count_deltas")]
+    pub async fn rollup_terminal_count_deltas(
+        &self,
+        pool: &PgPool,
+        max_slots: usize,
+    ) -> Result<TerminalDeltaRollupOutcome, AwaError> {
+        if max_slots == 0 {
+            return Ok(TerminalDeltaRollupOutcome::default());
+        }
+
+        let schema = self.schema();
+        let current_slot: i32 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT current_slot
+            FROM {schema}.queue_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let slots = self
+            .terminal_delta_rollup_candidates(pool, current_slot)
+            .await?;
+
+        let mut outcome = TerminalDeltaRollupOutcome::default();
+        for (slot, generation) in slots {
+            if outcome.rolled_slots >= max_slots {
+                break;
+            }
+            match self
+                .rollup_terminal_count_delta_slot(pool, slot, generation)
+                .await?
+            {
+                TerminalDeltaSlotRollup::Empty => {}
+                TerminalDeltaSlotRollup::Rolled {
+                    delta_rows,
+                    grouped_keys,
+                } => {
+                    outcome.rolled_slots += 1;
+                    outcome.delta_rows += delta_rows;
+                    outcome.grouped_keys += grouped_keys;
+                }
+                TerminalDeltaSlotRollup::SkippedActive => {
+                    outcome.skipped_active_slots += 1;
+                }
+                TerminalDeltaSlotRollup::Blocked => {
+                    outcome.blocked_slots += 1;
+                }
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    async fn terminal_delta_rollup_candidates(
+        &self,
+        pool: &PgPool,
+        current_slot: i32,
+    ) -> Result<Vec<(i32, i64)>, AwaError> {
+        let schema = self.schema();
+        let sealed_slots: Vec<(i32, i64)> = sqlx::query_as(&format!(
+            r#"
+            SELECT slot, generation
+            FROM {schema}.queue_ring_slots
+            WHERE generation >= 0
+              AND slot <> $1
+            ORDER BY generation ASC, slot ASC
+            "#
+        ))
+        .bind(current_slot)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let mut pending_slots = Vec::new();
+        for (slot, generation) in sealed_slots {
+            let Ok(slot_index) = usize::try_from(slot) else {
+                continue;
+            };
+            let delta_child = terminal_delta_child_name(schema, slot_index);
+            let has_pending: bool = sqlx::query_scalar(&format!(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {delta_child}
+                    WHERE ready_generation = $1
+                    LIMIT 1
+                )
+                "#
+            ))
+            .bind(generation)
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+            if has_pending {
+                pending_slots.push((slot, generation));
+            }
+        }
+
+        Ok(pending_slots)
+    }
+
+    async fn rollup_terminal_count_delta_slot(
+        &self,
+        pool: &PgPool,
+        slot: i32,
+        generation: i64,
+    ) -> Result<TerminalDeltaSlotRollup, AwaError> {
+        let schema = self.schema();
+        let delta_child = terminal_delta_child_name(schema, slot as usize);
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let current_slot: i32 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT current_slot
+            FROM {schema}.queue_ring_state
+            WHERE singleton = TRUE
+            FOR UPDATE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let slot_generation: Option<i64> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT generation
+            FROM {schema}.queue_ring_slots
+            WHERE slot = $1
+            FOR UPDATE
+            "#
+        ))
+        .bind(slot)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some(slot_generation) = slot_generation else {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::Empty);
+        };
+
+        if current_slot == slot {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::SkippedActive);
+        }
+
+        if slot_generation != generation {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::Empty);
+        }
+
+        sqlx::query("SET LOCAL lock_timeout = '50ms'")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        let lock_delta = sqlx::query(&format!(
+            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(tx.as_mut())
+        .await;
+
+        if lock_delta.is_err() {
+            let _ = tx.rollback().await;
+            return Ok(TerminalDeltaSlotRollup::Blocked);
+        }
+
+        let active_refs: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT
+                COALESCE((
+                    SELECT count(*)::bigint
+                    FROM {schema}.leases
+                    WHERE ready_slot = $1
+                      AND ready_generation = $2
+                ), 0)
+                +
+                COALESCE((
+                    SELECT count(*)::bigint
+                    FROM {schema}.lease_claims AS claims
+                    WHERE claims.ready_slot = $1
+                      AND claims.ready_generation = $2
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.lease_claim_closures AS closures
+                          WHERE closures.claim_slot = claims.claim_slot
+                            AND closures.job_id = claims.job_id
+                            AND closures.run_lease = claims.run_lease
+                      )
+                ), 0)
+            "#
+        ))
+        .bind(slot)
+        .bind(generation)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if active_refs > 0 {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::SkippedActive);
+        }
+
+        let delta_rows: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT count(*)::bigint
+            FROM {delta_child}
+            WHERE ready_generation = $1
+            "#
+        ))
+        .bind(generation)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if delta_rows == 0 {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::Empty);
+        }
+
+        let grouped_keys: i64 = sqlx::query_scalar(&format!(
+            r#"
+            WITH grouped AS MATERIALIZED (
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    SUM(terminal_delta)::bigint AS delta
+                FROM {delta_child}
+                WHERE ready_generation = $1
+                GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                HAVING SUM(terminal_delta) <> 0
+            ),
+            updated AS (
+                UPDATE {schema}.queue_terminal_live_counts AS counts
+                SET live_terminal_count = GREATEST(0, counts.live_terminal_count + grouped.delta)
+                FROM grouped
+                WHERE counts.ready_slot = grouped.ready_slot
+                  AND counts.queue = grouped.queue
+                  AND counts.priority = grouped.priority
+                  AND counts.enqueue_shard = grouped.enqueue_shard
+                  AND counts.counter_bucket = grouped.counter_bucket
+                RETURNING
+                    counts.ready_slot,
+                    counts.queue,
+                    counts.priority,
+                    counts.enqueue_shard,
+                    counts.counter_bucket
+            ),
+            inserted AS (
+                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    live_terminal_count
+                )
+                SELECT
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    grouped.counter_bucket,
+                    grouped.delta
+                FROM grouped
+                WHERE grouped.delta > 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM updated
+                      WHERE updated.ready_slot = grouped.ready_slot
+                        AND updated.queue = grouped.queue
+                        AND updated.priority = grouped.priority
+                        AND updated.enqueue_shard = grouped.enqueue_shard
+                        AND updated.counter_bucket = grouped.counter_bucket
+                  )
+                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
+                SET live_terminal_count =
+                    GREATEST(0, counts.live_terminal_count + EXCLUDED.live_terminal_count)
+                RETURNING 1
+            )
+            SELECT count(*)::bigint FROM grouped
+            "#
+        ))
+        .bind(generation)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let truncate_delta = sqlx::query(&format!("TRUNCATE TABLE {delta_child}"))
+            .execute(tx.as_mut())
+            .await;
+
+        match truncate_delta {
+            Ok(_) => {
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok(TerminalDeltaSlotRollup::Rolled {
+                    delta_rows,
+                    grouped_keys,
+                })
+            }
+            Err(_) => {
+                let _ = tx.rollback().await;
+                Ok(TerminalDeltaSlotRollup::Blocked)
+            }
+        }
+    }
+
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest")]
     pub async fn prune_oldest(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
@@ -10967,6 +11378,8 @@ impl QueueStorage {
 
         let ready_child = ready_child_name(schema, slot as usize);
         let done_child = done_child_name(schema, slot as usize);
+        let tomb_child = ready_tombstone_child_name(schema, slot as usize);
+        let delta_child = terminal_delta_child_name(schema, slot as usize);
 
         sqlx::query("SET LOCAL lock_timeout = '50ms'")
             .execute(tx.as_mut())
@@ -10974,7 +11387,7 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -11007,7 +11420,6 @@ impl QueueStorage {
             });
         }
 
-        let tomb_child = format!("{schema}.ready_tombstones_{slot}");
         let pending: i64 = sqlx::query_scalar(&format!(
             r#"
             SELECT count(*)::bigint
@@ -11066,7 +11478,7 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         let truncate = sqlx::query(&format!(
-            "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}"
+            "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child}"
         ))
         .execute(tx.as_mut())
         .await;

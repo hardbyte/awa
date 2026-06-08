@@ -50,7 +50,7 @@ Queue storage is the worker engine in 0.6. It is not one mutable jobs heap; it i
 
 | Plane | Tables | Shape | Why it matters |
 | --- | --- | --- | --- |
-| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*` | Ring partitions by `ready_slot` | Runnable and terminal rows stay append-first; rare ready mutations append tombstones instead of deleting ready rows; the whole segment is reclaimed by queue-ring prune. |
+| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*`, `queue_terminal_count_deltas_*` | Ring partitions by `ready_slot` | Runnable and terminal rows stay append-first; rare ready mutations append tombstones instead of deleting ready rows; terminal-count changes append signed deltas and the whole segment is reclaimed by queue-ring prune. |
 | Queue backlog | `deferred_jobs` | Plain table | Scheduled and retryable work stays out of the hot claim path until promotion. |
 | Operator hold | `dlq_entries` | Plain table | DLQ rows are explicit operator backlog with retry, purge, and retention cleanup. |
 | Receipt execution | `lease_claims_*`, `lease_claim_closures_*` | Ring partitions by `claim_slot` | Short attempts avoid mutable lease rows; live receipts are claims anti-joined with closures. |
@@ -70,6 +70,8 @@ Most applications should use the Rust, Python, CLI, or UI APIs rather than query
 | `ready_entries_*` | Physical runnable queue ring. | Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths. |
 | `ready_tombstones_*` | Physical ledger for ready lanes made unavailable by cancellation, priority aging, or similar out-of-band ready mutations. | Internal storage. Claim and exact-count paths anti-join it; maintenance truncates it with the matching ready segment. |
 | `done_entries_*` | Physical terminal fact ring. Ready-backed terminal rows can intentionally omit duplicated body columns. | Internal storage. Direct readers must tolerate nullable duplicated body fields; use `{schema}.terminal_jobs` for hydrated terminal rows. |
+| `queue_terminal_count_deltas_*` | Append-only signed terminal-count ledger. Terminal inserts append positive deltas; retry, discard, DLQ move, and compatibility delete append negative deltas. | Internal derived storage. Exact count reads include pending deltas; maintenance folds sealed-slot deltas into `queue_terminal_live_counts` and prune truncates the matching delta segment. |
+| `queue_terminal_live_counts`, `queue_terminal_rollups` | Folded terminal counters for retained and pruned queue segments. | Internal derived storage. Rebuild from `done_entries` if the trust marker is cleared or after a counter incident. |
 | `deferred_jobs` | Physical scheduled/retryable backlog table. | Internal storage. Promotion, retry, snooze, and cancellation own its transitions. |
 | `dlq_entries` | Durable operator hold table for DLQ-enabled terminal failures. | Operator surface through CLI/UI/API; direct SQL inspection is reasonable, direct mutation is not. |
 | `lease_claims_*` / `lease_claim_closures_*` | Receipt-plane execution history for short attempts. | Internal storage. Live receipt attempts are claims without matching closures. |
@@ -107,7 +109,7 @@ Core transitions:
 
 Terminal rows differ by storage backend:
 
-- In queue storage, `completed`, ordinary `failed`, and `cancelled` snapshots live in `done_entries_*` and are reclaimed by queue-ring prune. Ready-backed terminal rows are narrow: immutable job-body fields stay in the retained `ready_entries_*` row and public/admin reads hydrate through the storage surfaces described above. Unclaimed ready cancellation and priority aging do not delete ready rows; they append `ready_tombstones_*` rows so claim and exact-count paths skip the old lane until queue prune reclaims the segment.
+- In queue storage, `completed`, ordinary `failed`, and `cancelled` snapshots live in `done_entries_*` and are reclaimed by queue-ring prune. Ready-backed terminal rows are narrow: immutable job-body fields stay in the retained `ready_entries_*` row and public/admin reads hydrate through the storage surfaces described above. Unclaimed ready cancellation and priority aging do not delete ready rows; they append `ready_tombstones_*` rows so claim and exact-count paths skip the old lane until queue prune reclaims the segment. Terminal-count changes append to `queue_terminal_count_deltas_*`; exact count reads include those pending deltas until maintenance folds sealed slots into compact live counters.
 - DLQ-enabled terminal failures are routed or moved into `dlq_entries` instead of ordinary terminal history; that table has explicit retention cleanup plus operator retry/purge.
 - In the canonical compatibility path, terminal rows in `awa.jobs_hot` use row-by-row retention cleanup.
 
@@ -193,7 +195,7 @@ Queue storage has three independent rings, each advanced by the elected maintena
 
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 | --- | --- | --: | --- | --- |
-| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*` | `1000ms` | incoming ready/done/tombstone slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows and tombstones in that ready segment are reclaimed with their retained ready bodies |
+| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/done/tombstone/delta slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows, tombstones, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `250ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure |
 

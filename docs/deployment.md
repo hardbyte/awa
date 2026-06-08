@@ -80,7 +80,7 @@ Recommended practice:
 - run long-lived reporting queries against a replica when possible
 - avoid leaving sessions `idle in transaction`
 - monitor `pg_stat_activity` for long transactions
-- monitor `pg_stat_user_tables` on the active queue-storage schema; `ready` segments should stay near zero dead tuples, lease segments may spike within the rotation window but should collapse after prune, and `attempt_state` should roughly track live long-running attempts
+- monitor `pg_stat_user_tables` on the active queue-storage schema; ready, tombstone, done, and terminal-delta segments should stay near zero dead tuples, lease segments may spike within the rotation window but should collapse after prune, and `attempt_state` should roughly track live long-running attempts
 - tune autovacuum for the database if the lease tables churn heavily
 
 The nightly MVCC benchmark exists to catch changes that make this failure mode worse, but it is not a substitute for keeping the primary free of stale snapshots.
