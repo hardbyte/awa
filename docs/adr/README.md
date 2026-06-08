@@ -37,6 +37,7 @@ Template: `Status / Context / Decision / Consequences (positive, negative) / Alt
 | 027 | [Callback ingress as a deployable surface](027-callback-ingress-surface.md) | Proposed | Separate signed callback ingress from the admin UI/API and expose callback-only embedding/CLI paths | Refines ADR-018 and ADR-021; uses ADR-029 for durable callback-driven side effects |
 | 028 | [Maintenance-only runtime role](028-maintenance-only-runtime-role.md) | Proposed | Run promotion, rescue, pruning, and metadata maintenance without claiming or executing user jobs | Complements ADR-027 and ADR-018; uses ADR-029 for durable rescue-driven side effects |
 | 029 | [Transactional follow-up jobs](029-transactional-followup-jobs.md) | Accepted | Durable lifecycle side effects are delivered by enqueuing follow-up Awa jobs — atomically with the triggering state UPDATE for worker-driven outcomes and for callback resolution via the worker `Client`, best-effort in a separate transaction for maintenance rescue; hooks remain for observation | Codifies ADR-015's "enqueue another job" guidance; addresses the durable-event punt in ADRs 027/028 |
+| 030 | [Durable batch operations for operator bulk mutation](030-batch-operations.md) | Accepted | Filter-driven async bulk mutation with preview, progress, cancellation, retention, and maintenance-led execution; v0.6 starts with `set_priority` and `move_queue` | Refines ADR-019/025 operator mutation paths; complements ADR-028 |
 
 ## Validation artifacts
 

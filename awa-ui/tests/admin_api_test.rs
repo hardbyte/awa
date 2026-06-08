@@ -132,6 +132,28 @@ async fn post(app: &axum::Router, path: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
+async fn post_json(app: &axum::Router, path: &str, payload: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let json = serde_json::from_slice(&body).expect("response should deserialize");
+    (status, json)
+}
+
 async fn cleanup_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
     let queue_pattern = format!("{prefix}queue_%");
     let kind_pattern = format!("{prefix}kind_%");
@@ -1053,4 +1075,62 @@ async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
     assert_admin_endpoints_within_budget(&app, Duration::from_millis(50)).await;
 
     cleanup_scale_fixture(&pool, prefix).await;
+}
+
+#[tokio::test]
+async fn test_batch_ops_api_preview_submit_and_cancel() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let queue = "api_batch_ops";
+    clean_jobs(&pool, &[queue], &["api_batch_job"]).await;
+    sqlx::query("DELETE FROM awa.batch_operations")
+        .execute(&pool)
+        .await
+        .expect("clean batch ops");
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs_hot (kind, queue, args, state, priority)
+        VALUES ('api_batch_job', $1, '{}', 'available', 4)
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed job");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+    let payload = serde_json::json!({
+        "op_kind": "set_priority",
+        "filter": { "queue": queue },
+        "spec": { "priority": 1 },
+        "submitted_by": "api-test"
+    });
+
+    let (status, preview) = post_json(&app, "/api/batch-ops/preview", payload.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview["total_matched"], serde_json::json!(1));
+
+    let (status, operation) = post_json(&app, "/api/batch-ops", payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(operation["state"], serde_json::json!("pending"));
+
+    let id = operation["id"].as_str().expect("id should be string");
+    let response = get_json(&app, &format!("/api/batch-ops/{id}")).await;
+    assert_eq!(response["id"], operation["id"]);
+
+    let patch_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/batch-ops/{id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"state":"cancelling"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    assert_eq!(patch_response.status(), StatusCode::OK);
 }

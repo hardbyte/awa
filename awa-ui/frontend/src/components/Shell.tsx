@@ -320,6 +320,12 @@ const IconCron = () => (
     <path d="M10 5.5V10l3 2" />
   </svg>
 );
+const IconBatchOps = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M4 5h12M4 10h12M4 15h12" />
+    <path d="m13 3 3 2-3 2M13 8l3 2-3 2M13 13l3 2-3 2" />
+  </svg>
+);
 
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", Icon: IconDashboard },
@@ -328,6 +334,7 @@ const NAV_ITEMS = [
   { to: "/queues", label: "Queues", Icon: IconQueues },
   { to: "/runtime", label: "Runtime", Icon: IconRuntime },
   { to: "/cron", label: "Cron", Icon: IconCron },
+  { to: "/batch-ops", label: "Batch Ops", Icon: IconBatchOps },
 ] as const;
 
 export function Shell() {

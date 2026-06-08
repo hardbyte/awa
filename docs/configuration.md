@@ -316,16 +316,30 @@ There is a separate top-level `ClientBuilder::priority_aging_interval` that cont
 
 ### Changing priority after enqueue
 
-The ordinary job retry/cancel/admin path does **not** currently expose a general "reprioritize this queued job" operation. In queue storage, priority is part of the physical lane key (`queue`, `priority`, `enqueue_shard`, `lane_seq`), so changing an already-queued job's priority means moving it to a different lane and assigning a new lane sequence. That is a semantic operation, not a metadata update.
+Queued jobs can be reprioritized through durable batch operations. In queue storage, priority is part of the physical lane key (`queue`, `priority`, `enqueue_shard`, `lane_seq`), so changing an already-queued job's priority means tombstoning the old lane and appending a replacement ready row with a fresh lane sequence. That is a semantic operation, not a metadata update.
 
-Use one of these patterns instead:
+Use one of these patterns:
 
 - Choose the priority when inserting the job, periodic schedule, or direct-COPY batch.
 - Tune `priority_aging_interval` when the goal is fairness under sustained high-priority load.
 - For DLQ recovery, use `retry_from_dlq(..., priority=...)` (Python) or `RetryFromDlqOpts { priority: Some(...) }` (Rust/model API) to revive a DLQ row at a different priority.
-- For a pending job that truly must move priority, cancel it and enqueue a replacement with the new priority, after checking any uniqueness or idempotency contract that applies to that job kind.
+- For pending `available` or `scheduled` jobs, submit `op_kind = "set_priority"` through `/api/batch-ops` or `awa batch-ops submit`. The operation snapshots matching job ids, previews/counts the eligible population, and then applies changes asynchronously from the maintenance leader.
 
-Plain `retry` of a failed/cancelled/waiting job keeps the job's existing priority.
+Plain `retry` of a failed/cancelled/waiting job keeps the job's existing priority. Running, waiting, terminal, and DLQ rows are not reprioritized by batch operations; use cancel/retry semantics if an in-flight attempt must be interrupted.
+
+```bash
+awa batch-ops preview \
+  --op-kind set_priority \
+  --filter '{"queue":"default"}' \
+  --spec '{"priority":1}'
+
+awa batch-ops submit \
+  --op-kind set_priority \
+  --filter '{"queue":"default"}' \
+  --spec '{"priority":1}'
+```
+
+Batch-operation history is retained for `AWA_BATCH_OP_RETENTION_DAYS` days (default `90`). Use `awa batch-ops purge --before <timestamp>` for explicit cleanup of finalized operations.
 
 ## Queue and job-kind descriptors
 

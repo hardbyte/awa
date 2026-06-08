@@ -54,7 +54,8 @@ The TLA+ model does not represent the cold completed-history rollup cache. Rust 
 | `RescueToReady(j)` | `rescue_stale_heartbeats` (`queue_storage.rs:8575`) / `rescue_expired_deadlines` (`:8688`) in maintenance | `DELETE FROM leases ... RETURNING ...; INSERT INTO ready_entries ...` |
 | `CancelWaitingToTerminal(j)` | waiting branch in `cancel_job_tx` (`queue_storage.rs:5501`) | `DELETE FROM leases WHERE state IN ('running', 'waiting_external')`, hydrate from `ready_entries`, insert `done_entries`, close the matching receipt |
 | `CancelReadyToTerminal(j)` | available branch in `cancel_job_tx` | `SELECT ready_entries ... FOR UPDATE SKIP LOCKED`, append `ready_tombstones`, insert `done_entries(cancelled)`, and post-commit advance the claim cursor only if the cancelled lane was the current head. The ready row remains until queue prune. |
-| `ReprioritizeReady(j)` | `QueueStorage::age_waiting_priorities` | `SELECT ready_entries ... FOR UPDATE SKIP LOCKED`, append `ready_tombstones` for the old lane, append a new `ready_entries` row at the improved priority, and notify the queue. |
+| `ReprioritizeReady(j)` | `QueueStorage::age_waiting_priorities` and batch `set_priority` via `QueueStorage::set_priority_tx` / `move_ready_batch_fields_tx` | `SELECT ready_entries ... FOR UPDATE SKIP LOCKED`, append `ready_tombstones` for the old lane, append a new `ready_entries` row at the target priority, and notify the queue. Batch operations snapshot job ids in `awa.batch_operation_items`; item status and row mutation commit in one transaction so resume does not replay a completed item. |
+| `MoveQueueReady(j)` | batch `move_queue` via `QueueStorage::move_queue_tx` / `move_ready_batch_fields_tx` | Same abstract storage transition as `ReprioritizeReady`: tombstone source ready lane, append destination ready row with rewritten queue/optional priority, and notify the destination queue. Queue labels and cross-queue routing are outside `AwaSegmentedStorage`'s one-lane abstraction; lock-order implications are covered by `AwaStorageLockOrder`. |
 | `StaleCompleteRejected(w, j)` | `complete_runtime_batch` returning `CompletionOutcome::IgnoredStale` | `UPDATE leases ... WHERE run_lease = $2` matching 0 rows |
 | `MoveFailedToDlq(j)` | `QueueStorage::move_failed_to_dlq` (`queue_storage.rs:8127`); admin entry in `awa-model/src/dlq.rs:170` | hydrate from retained ready body, `DELETE FROM done_entries`, and `INSERT INTO dlq_entries` guarded by state=failed. The retained ready row remains until queue prune. |
 | `RetryFromDlq(j)` | `QueueStorage::retry_from_dlq` (`queue_storage.rs:8254`) | CTE: `DELETE FROM dlq_entries RETURNING ...` + `INSERT INTO ready_entries ...` (Rust resets `run_lease` to 0 because the new claim row will live in a different `claim_slot` partition; the spec keeps `run_lease` monotonic per-job since it abstracts away `claim_slot` from the receipt key); unique-conflict handled by `sync_unique_claim` |
@@ -131,6 +132,15 @@ The TLA+ storage model does not represent local worker-capacity accounting. Rust
 The TLA+ storage model treats `EnqueueReady` and `EnqueueDeferred` as logical per-job state transitions. Rust may batch the SQL implementation of producer side effects: allocating a contiguous lane sequence range, syncing enqueue-time `job_unique_claims` with one array-backed statement, and inserting rows with multi-row `INSERT` or COPY. Those batching choices refine the same logical actions as long as they commit in the same transaction as the ready/deferred append.
 
 Uniqueness itself is intentionally outside this storage model: duplicate rejection is covered by Rust integration tests around `job_unique_claims`. The model's enqueue preconditions start after a job has been admitted to the storage state, so batching uniqueness claims changes implementation granularity rather than the modeled lifecycle, lane, lease, or prune invariants.
+
+## Batch-operations control-plane note
+
+ADR-030 batch operations have two layers:
+
+- the durable control plane: `awa.batch_operations` plus `awa.batch_operation_items`, the maintenance runner state machine, cancellation, retention, and item-level accounting
+- the storage mutation: `set_priority` / `move_queue` on ready rows, implemented as ready tombstone + replacement ready append
+
+`AwaSegmentedStorage.tla` and `AwaStorageLockOrder.tla` model the second layer only. They prove that the ready-row mutation refines the existing ready-lane semantics and does not introduce a lock-order cycle at the storage-lock abstraction level. They do not model item-table exactly-once accounting, maintenance leader failover, HTTP/CLI submission, or retention cleanup. Those are covered by Rust integration/API tests and by the database constraints on `batch_operations` / `batch_operation_items`.
 
 ## Enqueue-shard prune note
 

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod admin;
+pub mod batch_operations;
 pub mod bridge;
 pub mod callback_contract;
 pub mod cron;
@@ -21,6 +22,10 @@ pub use admin::{
     QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
     QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome, RuntimeInstance,
     RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket, StorageCapability,
+};
+pub use batch_operations::{
+    BatchOperation, BatchOperationFilter, BatchOperationKind, BatchOperationPreview,
+    BatchOperationSpec, BatchOperationState, ListBatchOperationsFilter, SubmitBatchOperation,
 };
 
 /// Deprecated alias preserved for one release so existing downstream code

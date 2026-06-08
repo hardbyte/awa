@@ -195,6 +195,60 @@ export interface Capabilities {
   poll_interval_ms: number;
 }
 
+export type BatchOperationKind = "set_priority" | "move_queue";
+export type BatchOperationState =
+  | "pending"
+  | "scanning"
+  | "running"
+  | "cancelling"
+  | "completed"
+  | "cancelled"
+  | "failed";
+
+export interface BatchOperationFilter {
+  kind?: string;
+  queue?: string;
+  ids?: number[];
+  tag?: string;
+  state?: string;
+  created_at_gte?: string;
+  created_at_lt?: string;
+}
+
+export interface BatchOperationPayload {
+  op_kind: BatchOperationKind;
+  filter: BatchOperationFilter;
+  spec: Record<string, unknown>;
+  all?: boolean;
+  submitted_by?: string;
+}
+
+export interface BatchOperation {
+  id: string;
+  op_kind: BatchOperationKind;
+  filter: BatchOperationFilter;
+  spec: unknown;
+  state: BatchOperationState;
+  submitted_by: string | null;
+  submitted_at: string;
+  started_at: string | null;
+  finalized_at: string | null;
+  cursor: unknown | null;
+  total_matched: number | null;
+  processed: number;
+  skipped: number;
+  errored: number;
+  last_error: string | null;
+  runner_instance: string | null;
+  retention_until: string | null;
+  updated_at: string;
+}
+
+export interface BatchOperationPreview {
+  total_matched: number;
+  sample: JobRow[];
+}
+
 export interface StorageBacklogSample {
   /** ISO-8601 server timestamp when the sample was recorded. */
   at: string;
@@ -280,6 +334,44 @@ export function bulkCancel(ids: number[]): Promise<JobRow[]> {
   return apiFetch("/jobs/bulk-cancel", {
     method: "POST",
     body: JSON.stringify({ ids }),
+  });
+}
+
+// Batch operations
+export function fetchBatchOperations(params: {
+  state?: string;
+  limit?: number;
+} = {}): Promise<BatchOperation[]> {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
+  }
+  const query = qs.toString();
+  return apiFetch(`/batch-ops${query ? `?${query}` : ""}`);
+}
+
+export function previewBatchOperation(
+  payload: BatchOperationPayload
+): Promise<BatchOperationPreview> {
+  return apiFetch("/batch-ops/preview", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function submitBatchOperation(
+  payload: BatchOperationPayload
+): Promise<BatchOperation> {
+  return apiFetch("/batch-ops", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function cancelBatchOperation(id: string): Promise<BatchOperation> {
+  return apiFetch(`/batch-ops/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ state: "cancelling" }),
   });
 }
 

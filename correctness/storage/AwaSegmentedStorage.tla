@@ -987,6 +987,13 @@ ReprioritizeReady(j) ==
                    claimClosed>>
     /\ UnchangedSegmentState
 
+\* Batch move_queue is the same abstract storage transition as
+\* reprioritize in this one-lane model: tombstone the source ready lane
+\* and append a replacement ready row with a fresh lane sequence. The
+\* production implementation may also rewrite the queue label; queue labels
+\* are outside this focused lifecycle model.
+MoveQueueReady(j) == ReprioritizeReady(j)
+
 StaleCompleteRejected(w, j) ==
     /\ w \in Workers
     /\ j \in Jobs
@@ -1403,6 +1410,7 @@ Next ==
     \/ \E j \in Jobs : CancelReceiptOnlyToTerminal(j)
     \/ \E j \in Jobs : CancelReadyToTerminal(j)
     \/ \E j \in Jobs : ReprioritizeReady(j)
+    \/ \E j \in Jobs : MoveQueueReady(j)
     \/ \E w \in Workers, j \in Jobs : StaleCompleteRejected(w, j)
     \/ \E j \in Jobs : MoveFailedToDlq(j)
     \/ \E j \in Jobs : RetryFromDlq(j)

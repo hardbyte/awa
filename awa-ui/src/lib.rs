@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use rust_embed::Embed;
 use sqlx::PgPool;
@@ -69,6 +69,27 @@ pub async fn router_with(
         .route("/jobs/{id}/cancel", post(handlers::jobs::cancel_job))
         .route("/jobs/bulk-retry", post(handlers::jobs::bulk_retry))
         .route("/jobs/bulk-cancel", post(handlers::jobs::bulk_cancel))
+        // Batch operations
+        .route(
+            "/batch-ops",
+            get(handlers::batch_ops::list_batch_operations),
+        )
+        .route(
+            "/batch-ops",
+            post(handlers::batch_ops::submit_batch_operation),
+        )
+        .route(
+            "/batch-ops/preview",
+            post(handlers::batch_ops::preview_batch_operation),
+        )
+        .route(
+            "/batch-ops/{id}",
+            get(handlers::batch_ops::get_batch_operation),
+        )
+        .route(
+            "/batch-ops/{id}",
+            patch(handlers::batch_ops::patch_batch_operation),
+        )
         // Queues
         .route("/queues", get(handlers::queues::list_queues))
         .route(
