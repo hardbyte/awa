@@ -474,11 +474,10 @@ async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
 }
 
 /// Count of receipt-backed attempts that are currently "open" — claimed
-/// but not yet closed (completed, rescued, or materialized into a live
-/// lease row). The runtime derives this set from the partitioned
-/// `lease_claims` + `lease_claim_closures` tables anti-joined; this
-/// helper mirrors that exact query so test assertions read the same
-/// definition the runtime does.
+/// but not yet closed, materialized into a live lease row, or moved to
+/// another state table. The runtime derives this set from the partitioned
+/// `lease_claims` table with anti-joins; this helper mirrors that query so
+/// test assertions read the same definition the runtime does.
 async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     let schema = store.schema();
     let sql = format!(
@@ -495,6 +494,21 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
             SELECT 1 FROM {schema}.leases AS lease
             WHERE lease.job_id = claims.job_id
               AND lease.run_lease = claims.run_lease
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM {schema}.deferred_jobs AS deferred
+            WHERE deferred.job_id = claims.job_id
+              AND deferred.run_lease = claims.run_lease
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM {schema}.done_entries AS done
+            WHERE done.job_id = claims.job_id
+              AND done.run_lease = claims.run_lease
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM {schema}.dlq_entries AS dlq
+            WHERE dlq.job_id = claims.job_id
+              AND dlq.run_lease = claims.run_lease
         )
         "#,
     );
@@ -3800,6 +3814,67 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receipt_claims() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_receipt_materialized_counts";
+    let schema = "awa_qs_receipt_materialized_counts";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue receipt-count job");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim receipt-count job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
+
+    let receipt_only_counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue_counts with receipt-only claim");
+    assert_eq!(receipt_only_counts.running, 1);
+
+    store
+        .register_callback(
+            &pool,
+            claimed[0].job.id,
+            claimed[0].job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback and materialize receipt claim");
+    assert_eq!(lease_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+
+    let materialized_counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue_counts with materialized receipt claim");
+    assert_eq!(
+        materialized_counts.running, 1,
+        "materialized receipt-backed attempts have both a lease row and an \
+         open receipt row, but queue_counts must count the attempt once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_retry_successfully() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
@@ -5572,14 +5647,9 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
     assert_eq!(post_prune_fast.terminal, post_prune_exact.terminal);
 }
 
-/// #290 PR A1 invariant: every terminal-row insert path increments
-/// `queue_terminal_live_counts` so that `SUM(live_terminal_count)` for a
-/// queue equals `count(*) FROM done_entries WHERE queue = ANY(...)`.
-///
-/// PR A1 only wires the increment side. The decrement side (DLQ moves,
-/// discards, retry-from-terminal, SQL-compat deletes) lands in PR A2 and
-/// the read switch lands in PR B; this test deliberately avoids any
-/// terminal-delete path so the invariant holds on the increment side alone.
+/// ADR-026 invariant: every terminal-row insert path appends a positive
+/// `queue_terminal_count_deltas` row so that folded live counts plus pending
+/// deltas equals `count(*) FROM done_entries WHERE queue = ANY(...)`.
 ///
 /// The test exercises both insert paths:
 /// - `insert_done_rows_tx` via `complete_batch` on the lease-materialisation
@@ -5597,7 +5667,7 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper(
     let store = create_store(&pool, schema).await;
 
     assert_eq!(
-        live_count_sum(&pool, schema, queue).await,
+        terminal_counter_sum(&pool, schema, queue).await,
         done_entries_count(&pool, schema, queue).await,
         "invariant holds on empty queue"
     );
@@ -5615,16 +5685,22 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper(
     assert_eq!(completed, 7);
 
     let live_sum = live_count_sum(&pool, schema, queue).await;
+    let delta_sum = terminal_delta_sum(&pool, schema, queue).await;
+    let terminal_sum = terminal_counter_sum(&pool, schema, queue).await;
     let done_count = done_entries_count(&pool, schema, queue).await;
     assert_eq!(done_count, 7);
     assert_eq!(
-        live_sum, done_count,
-        "live counter sum must equal done_entries cardinality after complete_batch"
+        live_sum, 0,
+        "hot completion path must not update folded counters"
+    );
+    assert_eq!(delta_sum, 7, "hot completion path appends pending deltas");
+    assert_eq!(
+        terminal_sum, done_count,
+        "folded counters plus deltas must equal done_entries cardinality"
     );
 
     // A second completion batch on the same queue must accumulate, not
-    // replace — guards against the UPSERT using = instead of += on
-    // conflict.
+    // replace.
     store
         .enqueue_batch(&pool, queue, 1, 3)
         .await
@@ -5635,9 +5711,19 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper(
         .await
         .expect("complete 2");
     let live_sum = live_count_sum(&pool, schema, queue).await;
+    let delta_sum = terminal_delta_sum(&pool, schema, queue).await;
+    let terminal_sum = terminal_counter_sum(&pool, schema, queue).await;
     let done_count = done_entries_count(&pool, schema, queue).await;
     assert_eq!(done_count, 10);
-    assert_eq!(live_sum, done_count, "counter accumulates across batches");
+    assert_eq!(
+        live_sum, 0,
+        "folded counter remains untouched before rollup"
+    );
+    assert_eq!(delta_sum, 10, "delta ledger accumulates across batches");
+    assert_eq!(
+        terminal_sum, done_count,
+        "exact counter accumulates across batches"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5702,20 +5788,31 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_p
     assert_eq!(completed.len(), 5);
 
     let live_sum = live_count_sum(&pool, schema, queue).await;
+    let delta_sum = terminal_delta_sum(&pool, schema, queue).await;
+    let terminal_sum = terminal_counter_sum(&pool, schema, queue).await;
     let done_count = done_entries_count(&pool, schema, queue).await;
     assert_eq!(done_count, 5);
     assert_eq!(
-        live_sum, done_count,
-        "fused receipt fast path must also increment the counter"
+        live_sum, 0,
+        "fused receipt fast path must not update folded counters"
+    );
+    assert_eq!(
+        delta_sum, 5,
+        "fused receipt fast path must append pending deltas"
+    );
+    assert_eq!(
+        terminal_sum, done_count,
+        "fused receipt fast path must preserve exact terminal count"
     );
 }
 
-/// #290: every terminal-delete path keeps the counter invariant tight.
+/// ADR-026: every terminal-delete path keeps the exact counter invariant tight
+/// by appending negative terminal-count deltas.
 /// Exercises retry-from-terminal (`retry_job_tx`), single DLQ move
 /// (`move_failed_to_dlq`), bulk DLQ move (`bulk_move_failed_to_dlq`),
 /// and discard (`discard_failed_by_kind`). The invariant
-/// `SUM(live_terminal_count) == count(*) FROM done_entries` must hold
-/// after each operation.
+/// `SUM(live_terminal_count) + SUM(terminal_delta) == count(*) FROM done_entries`
+/// must hold after each operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -5785,9 +5882,9 @@ async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
     assert_invariant_holds(&pool, schema, queue, "after retry_job from terminal").await;
 }
 
-/// #290: prune folds counter rows into queue_terminal_rollups and
-/// clears the slot's live counter, keeping the invariant intact across
-/// rotate + prune.
+/// ADR-026: prune folds terminal rows into queue_terminal_rollups and clears
+/// the slot's folded counter and pending delta rows, keeping exact counts
+/// intact across rotate + prune even if the async rollup has not run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -5807,7 +5904,16 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
         .expect("complete");
 
     assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
-    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert_eq!(
+        live_count_sum(&pool, schema, queue).await,
+        0,
+        "folded counter is untouched before async rollup"
+    );
+    assert_eq!(
+        terminal_delta_sum(&pool, schema, queue).await,
+        5,
+        "pending deltas hold exact terminal count before rollup"
+    );
 
     match store.rotate(&pool).await.expect("rotate") {
         awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
@@ -5821,12 +5927,18 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
     // After prune:
     // - done_entries for this queue is empty (partition truncated)
     // - queue_terminal_live_counts has no rows for this slot
+    // - queue_terminal_count_deltas has no rows for this slot
     // - queue_terminal_rollups.pruned_completed_count absorbed the 5
     assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
     assert_eq!(
         live_count_sum(&pool, schema, queue).await,
         0,
         "live counter for the pruned slot must be cleared"
+    );
+    assert_eq!(
+        terminal_delta_sum(&pool, schema, queue).await,
+        0,
+        "pending deltas for the pruned slot must be truncated"
     );
     let rollup: i64 = sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint \
@@ -5839,10 +5951,62 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
     assert_eq!(rollup, 5, "rollup absorbed the pruned slot's counter");
 }
 
+/// ADR-026: maintenance can fold pending terminal-count deltas for a sealed
+/// queue slot into `queue_terminal_live_counts` without changing the exact
+/// terminal count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_count_delta_rollup";
+    let schema = "awa_qs_terminal_count_delta_rollup";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 6)
+        .await
+        .expect("enqueue");
+    let claimed = store.claim_batch(&pool, queue, 6).await.expect("claim");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
+
+    match store.rotate(&pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup terminal deltas");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(outcome.delta_rows, 6);
+    assert_eq!(outcome.grouped_keys, 6);
+    assert_eq!(outcome.skipped_active_slots, 0);
+    assert_eq!(outcome.blocked_slots, 0);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(counts.terminal, 6);
+}
+
 /// Direct-SQL seed for terminal-state test rows. Inserts into
-/// `done_entries` AND `queue_terminal_live_counts` so the invariant
-/// holds at seed time; the test then exercises delete paths to verify
-/// they decrement the counter correctly.
+/// `done_entries` AND folded `queue_terminal_live_counts` so the invariant
+/// holds at seed time; the test then exercises delete paths to verify they
+/// append negative deltas correctly.
 async fn seed_terminal_rows(pool: &sqlx::PgPool, schema: &str, queue: &str, state: &str, n: i64) {
     seed_terminal_rows_with_kind(pool, schema, queue, state, "chaos_job", n).await;
 }
@@ -5959,21 +6123,19 @@ async fn first_cancelled_job_id(pool: &sqlx::PgPool, schema: &str, queue: &str) 
 }
 
 async fn assert_invariant_holds(pool: &sqlx::PgPool, schema: &str, queue: &str, label: &str) {
-    let live = live_count_sum(pool, schema, queue).await;
+    let terminal = terminal_counter_sum(pool, schema, queue).await;
     let done = done_entries_count(pool, schema, queue).await;
     assert_eq!(
-        live, done,
-        "#290 invariant ({label}): SUM(live_terminal_count) ({live}) \
+        terminal, done,
+        "ADR-026 invariant ({label}): folded live counts plus pending deltas ({terminal}) \
          must equal count(*) FROM done_entries ({done})"
     );
 }
 
-/// #290 — SQL compat `DELETE FROM awa.jobs WHERE id = $1` routes to
-/// `awa.delete_job_compat()`. The v022 migration teaches the done_entries
-/// branch of that function to decrement `queue_terminal_live_counts`.
-/// Without it, deleting a terminal row via the SQL compat path drifts
-/// the counter from the underlying table — and once #305's read switch
-/// lands, the drift becomes operator-visible.
+/// ADR-026 — SQL compat `DELETE FROM awa.jobs WHERE id = $1` routes to
+/// `awa.delete_job_compat()`. The done_entries branch appends a negative
+/// terminal-count delta, so deleting a terminal row via the SQL compat path
+/// keeps exact counts aligned with the underlying table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -6163,6 +6325,21 @@ async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
     .fetch_one(pool)
     .await
     .expect("sum live_terminal_count")
+}
+
+async fn terminal_delta_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COALESCE(SUM(terminal_delta), 0)::bigint \
+         FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("sum terminal_delta")
+}
+
+async fn terminal_counter_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    live_count_sum(pool, schema, queue).await + terminal_delta_sum(pool, schema, queue).await
 }
 
 async fn done_entries_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {

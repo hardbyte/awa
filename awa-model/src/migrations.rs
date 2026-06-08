@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 29;
+pub const CURRENT_VERSION: i32 = 30;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -129,6 +129,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         &[V23_UP, V22_UP, V28_UP],
     ),
     (29, "Add durable batch operations control table", &[V29_UP]),
+    (
+        30,
+        "Add terminal-count delta ledger and async rollup",
+        &[V23_UP, V30_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -159,6 +164,7 @@ const V26_UP: &str = include_str!("../migrations/v026_cron_jobs_pause.sql");
 const V27_UP: &str = include_str!("../migrations/v027_sequence_lane_cursors.sql");
 const V28_UP: &str = include_str!("../migrations/v028_ready_tombstones.sql");
 const V29_UP: &str = include_str!("../migrations/v029_batch_operations.sql");
+const V30_UP: &str = include_str!("../migrations/v030_terminal_count_deltas.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

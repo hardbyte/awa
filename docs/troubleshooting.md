@@ -300,6 +300,7 @@ WHERE schemaname = '<schema>'
       OR relname LIKE 'ready_entries%'
       OR relname LIKE 'ready_tombstones%'
       OR relname LIKE 'done_entries%'
+      OR relname LIKE 'queue_terminal_count_deltas%'
       OR relname LIKE 'leases%'
   )
 ORDER BY n_dead_tup DESC, relname;
@@ -307,7 +308,7 @@ ORDER BY n_dead_tup DESC, relname;
 
 Interpretation:
 
-- `ready_entries%` and `ready_tombstones%` should usually stay at or near zero dead tuples
+- `ready_entries%`, `ready_tombstones%`, and `queue_terminal_count_deltas%` should usually stay at or near zero dead tuples
 - `leases%` can rise within the current rotation window, but should fall again after prune
 - `attempt_state` should roughly match live long-running attempts, not total queue depth, and should return close to zero after drain
 - `autovacuum_count` staying flat for a long time can indicate vacuum is not keeping up on churn-heavy lease partitions

@@ -948,6 +948,11 @@ BEGIN
     );
 
     EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS idx_%s_lease_claims_ready_ref ON %I.lease_claims (ready_slot, ready_generation)',
+        p_schema, p_schema
+    );
+
+    EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.lease_claim_closures (
             claim_slot INT NOT NULL,
@@ -1098,6 +1103,68 @@ BEGIN
         ) PARTITION BY LIST (ready_slot)
         $ddl$,
         p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.queue_terminal_count_deltas (
+            ready_slot       INT NOT NULL,
+            ready_generation BIGINT NOT NULL,
+            queue            TEXT NOT NULL,
+            priority         SMALLINT NOT NULL,
+            enqueue_shard    SMALLINT NOT NULL,
+            counter_bucket   SMALLINT NOT NULL DEFAULT 0,
+            terminal_delta   BIGINT NOT NULL,
+            recorded_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        ) PARTITION BY LIST (ready_slot)
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.queue_terminal_count_deltas ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()',
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        DO $inner$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint AS c
+                JOIN pg_class AS t ON t.oid = c.conrelid
+                JOIN pg_namespace AS n ON n.oid = t.relnamespace
+                WHERE n.nspname = %1$L
+                  AND t.relname = 'queue_terminal_count_deltas'
+                  AND c.conname = 'queue_terminal_count_deltas_nonzero'
+            ) THEN
+                ALTER TABLE %1$I.queue_terminal_count_deltas
+                    ADD CONSTRAINT queue_terminal_count_deltas_nonzero
+                    CHECK (terminal_delta <> 0);
+            END IF;
+        END
+        $inner$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'COMMENT ON TABLE %I.queue_terminal_count_deltas IS %L',
+        p_schema,
+        'Append-only signed terminal-count deltas. Completion/delete paths insert here; maintenance folds sealed-slot deltas into queue_terminal_live_counts and queue prune truncates the matching partition.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.queue_terminal_count_deltas.ready_generation IS %L',
+        p_schema,
+        'Generation guard for reused ready_slot partitions; rollup folds only deltas belonging to the sealed generation it is processing.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.queue_terminal_count_deltas.terminal_delta IS %L',
+        p_schema,
+        'Signed change to terminal row cardinality for the grouped lane bucket; positive for terminal inserts and negative for terminal deletes.'
     );
 
     EXECUTE format(
@@ -1255,8 +1322,8 @@ BEGIN
     );
 
     --------------------------------------------------------------------
-    -- ready_entries / ready_tombstones / done_entries partitions + lane
-    -- indexes.
+    -- ready_entries / ready_tombstones / done_entries /
+    -- queue_terminal_count_deltas partitions + lane indexes.
     --------------------------------------------------------------------
 
     FOR v_slot IN 0..(p_queue_slot_count - 1) LOOP
@@ -1306,6 +1373,11 @@ BEGIN
             'CREATE INDEX IF NOT EXISTS idx_%s_done_%s_job ON %I.%I (job_id)',
             p_schema, v_slot, p_schema, format('done_entries_%s', v_slot)
         );
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.queue_terminal_count_deltas FOR VALUES IN (%s)',
+            p_schema, format('queue_terminal_count_deltas_%s', v_slot), p_schema, v_slot
+        );
     END LOOP;
 
     --------------------------------------------------------------------
@@ -1329,6 +1401,40 @@ BEGIN
 
     EXECUTE format(
         'ALTER TABLE %I.queue_terminal_live_counts ADD COLUMN IF NOT EXISTS counter_bucket SMALLINT NOT NULL DEFAULT 0',
+        p_schema
+    );
+
+    -- If an upgraded schema already had live-counter rows before
+    -- counter_bucket existed, every aggregate row received DEFAULT 0.
+    -- The aggregate table has no job_id, so the installer cannot rebucket
+    -- those rows in place. Mark the counter untrusted only when the old
+    -- primary-key shape is still present; idempotent prepare_schema() calls on
+    -- an already-current schema must not clear a trusted marker.
+    EXECUTE format(
+        $ddl$
+        UPDATE %1$I.queue_ring_state
+        SET terminal_counter_trusted_at = NULL
+        WHERE singleton = TRUE
+          AND EXISTS (SELECT 1 FROM %1$I.queue_terminal_live_counts LIMIT 1)
+          AND EXISTS (SELECT 1 FROM %1$I.done_entries LIMIT 1)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pg_constraint AS c
+              JOIN pg_class AS t ON t.oid = c.conrelid
+              JOIN pg_namespace AS n ON n.oid = t.relnamespace
+              WHERE n.nspname = %1$L
+                AND t.relname = 'queue_terminal_live_counts'
+                AND c.contype = 'p'
+                AND EXISTS (
+                    SELECT 1
+                    FROM unnest(c.conkey) AS key(attnum)
+                    JOIN pg_attribute AS a
+                      ON a.attrelid = t.oid
+                     AND a.attnum = key.attnum
+                    WHERE a.attname = 'counter_bucket'
+                )
+          )
+        $ddl$,
         p_schema
     );
 
@@ -1384,24 +1490,6 @@ BEGIN
             autovacuum_vacuum_cost_limit = 2000,
             autovacuum_vacuum_cost_delay = 2
         )
-        $ddl$,
-        p_schema
-    );
-
-    -- If an upgraded schema already had live-counter rows before
-    -- counter_bucket existed, every aggregate row received DEFAULT 0.
-    -- The aggregate table has no job_id, so the installer cannot rebucket
-    -- those rows in place. Mark the counter untrusted here; v027's schema
-    -- rewalker rebuilds it from done_entries immediately after calling this
-    -- helper, and operator-initiated prepare_schema() remains honest even if
-    -- run outside the migration path.
-    EXECUTE format(
-        $ddl$
-        UPDATE %1$I.queue_ring_state
-        SET terminal_counter_trusted_at = NULL
-        WHERE singleton = TRUE
-          AND EXISTS (SELECT 1 FROM %1$I.queue_terminal_live_counts LIMIT 1)
-          AND EXISTS (SELECT 1 FROM %1$I.done_entries LIMIT 1)
         $ddl$,
         p_schema
     );

@@ -431,13 +431,13 @@ enum StorageCommands {
         #[arg(long, value_name = "DURATION", num_args = 0..=1, default_missing_value = "")]
         wait: Option<String>,
     },
-    /// Rebuild `queue_terminal_live_counts` from `done_entries`.
+    /// Rebuild terminal-count tables from `done_entries`.
     ///
     /// Use this after upgrading from a pre-#290 fleet, after any incident
-    /// that may have left the counter inconsistent with `done_entries`,
-    /// or as a routine drift-recovery step before relying on
-    /// counter-fed reads for billing-grade accuracy. Wraps the rebuild
-    /// in an advisory lock; best run on a quiesced fleet.
+    /// that may have left folded counters or pending deltas inconsistent
+    /// with `done_entries`, or as a routine drift-recovery step before relying
+    /// on counter-fed reads for billing-grade accuracy. Wraps the rebuild in
+    /// an advisory lock; best run on a quiesced fleet.
     RebuildTerminalCounters,
 }
 
@@ -1156,8 +1156,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let store = awa_model::QueueStorage::from_existing_schema(&schema)?;
                         let inserted = store.rebuild_terminal_counters(&pool).await?;
                         eprintln!(
-                            "rebuilt queue_terminal_live_counts in schema '{schema}': \
-                             {inserted} counter row(s) populated from done_entries"
+                            "rebuilt terminal counters in schema '{schema}': \
+                             {inserted} folded counter row(s) populated from done_entries; \
+                             pending deltas cleared"
                         );
                     }
                 },

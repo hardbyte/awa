@@ -183,11 +183,11 @@ pub struct AwaMetrics {
     /// Maintenance ring rotation attempts, attributed to (ring, outcome,
     /// blocker). For Rotated outcomes the `awa.ring.blocker` attribute is
     /// "none"; for SkippedBusy it carries the per-ring blocker label
-    /// ("queue.ready_rows", "queue.done_rows", "lease.rows", "claim.rows",
+    /// ("queue.ready_rows", "queue.done_rows", "queue.tombstone_rows",
+    /// "queue.terminal_delta_rows", "lease.rows", "claim.rows",
     /// "claim.closure_rows"). One increment per non-zero blocker means a
-    /// single SkippedBusy with both queue_ready and queue_done populated
-    /// emits two events — that's intentional so dashboards can attribute
-    /// blame independently per side.
+    /// single SkippedBusy with multiple populated fields emits multiple events;
+    /// that's intentional so dashboards can attribute blame independently.
     pub maintenance_rotate_attempts: Counter<u64>,
     /// Magnitudes of the per-blocker row counts when a rotation is
     /// SkippedBusy. Histogram so dashboards can show whether the ring is
@@ -961,6 +961,8 @@ impl AwaMetrics {
                 let blockers: &[(&str, i64)] = &[
                     ("queue.ready_rows", busy.queue_ready),
                     ("queue.done_rows", busy.queue_done),
+                    ("queue.tombstone_rows", busy.queue_tombstones),
+                    ("queue.terminal_delta_rows", busy.queue_terminal_deltas),
                     ("lease.rows", busy.leases),
                     ("claim.rows", busy.claims),
                     ("claim.closure_rows", busy.closures),

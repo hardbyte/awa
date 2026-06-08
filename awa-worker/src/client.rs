@@ -51,6 +51,8 @@ pub enum BuildError {
     InvalidBatchSize,
     #[error("dlq_cleanup_batch_size must be > 0")]
     InvalidDlqBatchSize,
+    #[error("terminal_count_rollup_interval must be > 0")]
+    InvalidTerminalCountRollupInterval,
     #[error("invalid queue storage config: {0}")]
     InvalidQueueStorage(String),
 }
@@ -143,6 +145,7 @@ pub struct ClientBuilder {
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
+    terminal_count_rollup_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -203,6 +206,7 @@ impl ClientBuilder {
             leader_election_interval: None,
             leader_check_interval: None,
             priority_aging_interval: None,
+            terminal_count_rollup_interval: None,
             completed_retention: None,
             failed_retention: None,
             descriptor_retention: None,
@@ -828,6 +832,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how often queue-storage terminal-count deltas are rolled into
+    /// folded live counters (default: 30s).
+    ///
+    /// Exact queue-depth reads include both folded counters and pending
+    /// deltas, so increasing this interval trades a larger append-only delta
+    /// ledger for fewer maintenance writes to the mutable counter table.
+    pub fn terminal_count_rollup_interval(mut self, interval: Duration) -> Self {
+        self.terminal_count_rollup_interval = Some(interval);
+        self
+    }
+
     /// Set how often queue depth/lag metrics are published (default: 30s).
     pub fn queue_stats_interval(mut self, interval: Duration) -> Self {
         self.queue_stats_interval = Some(interval);
@@ -978,6 +993,12 @@ impl ClientBuilder {
                 return Err(BuildError::InvalidDlqBatchSize);
             }
         }
+        if self
+            .terminal_count_rollup_interval
+            .is_some_and(|interval| interval.is_zero())
+        {
+            return Err(BuildError::InvalidTerminalCountRollupInterval);
+        }
 
         // Validate weighted mode constraints
         let overflow_pool = if let Some(global_max) = self.global_max_workers {
@@ -1062,6 +1083,7 @@ impl ClientBuilder {
             leader_election_interval: self.leader_election_interval,
             leader_check_interval: self.leader_check_interval,
             priority_aging_interval: self.priority_aging_interval,
+            terminal_count_rollup_interval: self.terminal_count_rollup_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
             descriptor_retention: self.descriptor_retention,
@@ -1161,6 +1183,7 @@ pub struct Client {
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
     priority_aging_interval: Option<Duration>,
+    terminal_count_rollup_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -1589,6 +1612,9 @@ impl Client {
         }
         if let Some(interval) = self.priority_aging_interval {
             maintenance = maintenance.priority_aging_interval(interval);
+        }
+        if let Some(interval) = self.terminal_count_rollup_interval {
+            maintenance = maintenance.terminal_count_rollup_interval(interval);
         }
         if let Some(retention) = self.completed_retention {
             maintenance = maintenance.completed_retention(retention);
@@ -2859,6 +2885,19 @@ mod tests {
             .build();
 
         assert!(matches!(result, Err(BuildError::InvalidDlqBatchSize)));
+    }
+
+    #[tokio::test]
+    async fn terminal_count_rollup_interval_must_be_positive() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .terminal_count_rollup_interval(Duration::ZERO)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(BuildError::InvalidTerminalCountRollupInterval)
+        ));
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ Awa (Māori: river) fills the gap between Postgres event queues that are too nar
 - **Rust and Python workers** — same queues, same storage engine, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
 - **Runtime-owned maintenance** — dispatch, rescue, queue/lease/claim ring rotation, pruning, and cleanup run in the worker fleet; no `pg_cron` ticker required.
-- **Segmented queue storage** — append-only ready/terminal partitions, a small ready-tombstone ledger, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
+- **Segmented queue storage** — append-first ready/terminal partitions, small ready-tombstone and terminal-count ledgers, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
 - **LISTEN/NOTIFY wakeup** — millisecond-scale pickup latency.
 - **HTTP Worker** — feature-gated worker that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with BLAKE3-signed callback auth.
 - **Weighted concurrency + rate limiting** — global worker pool with per-queue guarantees; per-queue token bucket.

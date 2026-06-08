@@ -6,7 +6,7 @@ Awa's queue-storage substrate is the set of per-schema tables, indexes, sequence
 
 | Owner | Scope | When it runs |
 | --- | --- | --- |
-| **`awa migrate`** | The canonical schema (`awa.schema_version`, `awa.runtime_instances`, `awa.storage_transition_state`, `awa.runtime_storage_backends`, etc.) **plus** the default queue-storage substrate at `awa.*` (`awa.ready_entries`, `awa.ready_tombstones`, `awa.done_entries`, `awa.leases`, `awa.queue_ring_state`, `awa.queue_terminal_live_counts`, the partitions for each, the `awa.claim_ready_runtime` helper, and the `awa.install_queue_storage_substrate` function itself). | Install time and operator-driven upgrades. |
+| **`awa migrate`** | The canonical schema (`awa.schema_version`, `awa.runtime_instances`, `awa.storage_transition_state`, `awa.runtime_storage_backends`, etc.) **plus** the default queue-storage substrate at `awa.*` (`awa.ready_entries`, `awa.ready_tombstones`, `awa.done_entries`, `awa.queue_terminal_count_deltas`, `awa.leases`, `awa.queue_ring_state`, `awa.queue_terminal_live_counts`, the partitions for each, the `awa.claim_ready_runtime` helper, and the `awa.install_queue_storage_substrate` function itself). | Install time and operator-driven upgrades. |
 | **`QueueStorage::prepare_schema()` (Rust) / `awa storage prepare-queue-storage-schema` (CLI)** | Non-default queue-storage schemas (anything other than `awa`), repair flows, test setups. Calls `awa.install_queue_storage_substrate(<schema>, ...)` and performs a small set of legacy upgrade fixups that don't belong in a forward-only DDL function. | Custom-schema deployments; targeted repair; the test suite. |
 | **The `awa.install_queue_storage_substrate(p_schema, ...)` SQL helper** | Per-schema DDL only. Idempotent. Activation-neutral — does NOT touch `awa.runtime_storage_backends` or `awa.storage_transition_state`. | Called by both `awa migrate` (for the default schema) and `prepare_schema()` (for custom schemas). Single source of truth for substrate DDL. |
 
@@ -113,7 +113,7 @@ The orchestration (start new-mode workers, stop old-mode workers, wait for drain
 The split between migration-owned default substrate and helper-installed custom substrate exists for three reasons:
 
 - **`awa migrate --sql` / `--extract-to` must reproduce the full default runtime schema** for external migration tools to be useful. All substrate DDL is reachable from the migration through the SQL helper, so the extracted SQL is complete.
-- **Migrations that depend on queue-storage tables can write unconditional DDL.** Operations like the `queue_terminal_live_counts` decrement inside `awa.delete_job_compat()` need the counter table to exist. Migration ordering guarantees it.
+- **Migrations that depend on queue-storage tables can write unconditional DDL.** Operations like the terminal-count delta append inside `awa.delete_job_compat()` need the delta table to exist. Migration ordering guarantees it.
 - **The default schema cannot be accidentally destroyed.** The reset guard above protects operators from a `DROP SCHEMA awa CASCADE` that would take the canonical migration tables with it.
 
 The helper is `SECURITY INVOKER` so callers need their own DDL privileges on the target schema; the runtime role does not gain DDL through the helper, which keeps the principle-of-least-privilege role model intact.

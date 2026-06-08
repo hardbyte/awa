@@ -665,6 +665,7 @@ class AsyncClient:
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        terminal_count_rollup_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
         queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
@@ -701,6 +702,11 @@ class AsyncClient:
         participating in the same storage transition should agree on that
         target schema.
 
+        ``terminal_count_rollup_interval_ms`` controls how often queue-storage
+        maintenance folds pending terminal-count deltas into compact live
+        counters. Exact reads include pending deltas, so the default favors
+        fewer hot counter updates over immediate folding.
+
         Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
         queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
         share the queue's worker permits; benchmark ``2`` or ``4`` before
@@ -721,6 +727,7 @@ class AsyncClient:
             heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
+            terminal_count_rollup_interval_ms=terminal_count_rollup_interval_ms,
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
             queue_storage_lease_slot_count=queue_storage_lease_slot_count,

@@ -99,6 +99,8 @@ TableSpec == [
     ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     ready_tombstones       |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    queue_terminal_count_deltas
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claim_closures   |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
@@ -121,7 +123,7 @@ TableSpec == [
     \* These tables receive UPDATEs at traffic rate but their LIVE
     \* row count is bounded by something traffic-independent, so
     \* autovacuum scans a small heap and keeps up cheaply.
-    \* All three have aggressive autovacuum knobs in DDL
+    \* These have aggressive autovacuum knobs in DDL
     \* (autovacuum_vacuum_scale_factor=0, autovacuum_vacuum_threshold
     \* in the low hundreds, autovacuum_vacuum_cost_limit=2000).
     \*
@@ -159,6 +161,8 @@ TableSpec == [
     \* Mutation rate scales with operator activity (queue creation,
     \* schema changes), not job throughput. RowVacuum is fine.
     queue_lanes            |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    queue_terminal_live_counts
+                           |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     queue_terminal_rollups |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     queue_claimer_state    |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
@@ -215,6 +219,7 @@ ClaimLegacyTx == <<
 CompleteReceiptsTx == <<
     Mut("Insert", "lease_claim_closures"),
     Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Delete", "attempt_state")
 >>
 
@@ -225,6 +230,7 @@ CompleteReceiptsTx == <<
 CompleteLegacyTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Delete", "attempt_state")
 >>
 
@@ -254,6 +260,7 @@ EnsureRunningTx == <<
 \* defensively deletes any orphan lease.
 CancelReceiptOnlyTx == <<
     Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "lease_claim_closures"),
     Mut("Delete", "leases")
 >>
@@ -262,13 +269,15 @@ CancelReceiptOnlyTx == <<
 CancelRunningTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "lease_claim_closures")
 >>
 
 \* cancel_job_tx ready branch (append-only ready segments)
 CancelReadyTx == <<
     Mut("Insert", "ready_tombstones"),
-    Mut("Insert", "done_entries")
+    Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas")
 >>
 
 \* age_ready_jobs_tx (reprioritize)
@@ -319,7 +328,8 @@ ResumeWaitingTx == <<
 \* complete_external / fail_external — terminal callback resolution.
 ResolveExternalTerminalTx == <<
     Mut("Delete", "leases"),
-    Mut("Insert", "done_entries")
+    Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas")
 >>
 
 \* retry_external — delete the waiting lease and park in deferred_jobs.
@@ -331,7 +341,24 @@ RetryExternalTx == <<
 \* DLQ admin lifecycle.
 MoveFailedToDlqTx == <<
     Mut("Delete", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "dlq_entries")
+>>
+
+DiscardTerminalTx == <<
+    Mut("Delete", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas")
+>>
+
+DeleteTerminalCompatTx == <<
+    Mut("Delete", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas")
+>>
+
+RetryFromTerminalTx == <<
+    Mut("Delete", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas"),
+    Mut("Insert", "ready_entries")
 >>
 
 RetryFromDlqTx == <<
@@ -371,7 +398,13 @@ PruneReadyTx  == <<
     Mut("Update", "queue_ring_slots"),
     Mut("Truncate", "ready_entries"),
     Mut("Truncate", "done_entries"),
-    Mut("Truncate", "ready_tombstones")
+    Mut("Truncate", "ready_tombstones"),
+    Mut("Truncate", "queue_terminal_count_deltas")
+>>
+
+TerminalDeltaRollupTx == <<
+    Mut("Update", "queue_terminal_live_counts"),
+    Mut("Truncate", "queue_terminal_count_deltas")
 >>
 
 RotateClaimsTx == << Mut("Update", "claim_ring_state") >>
@@ -389,10 +422,11 @@ Transactions == {
     ReprioritizeReadyTx,
     FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,
     EnterCallbackWaitTx, ResumeWaitingTx, ResolveExternalTerminalTx,
-    RetryExternalTx, MoveFailedToDlqTx, RetryFromDlqTx, PurgeDlqTx,
+    RetryExternalTx, MoveFailedToDlqTx, DiscardTerminalTx,
+    DeleteTerminalCompatTx, RetryFromTerminalTx, RetryFromDlqTx, PurgeDlqTx,
     HeartbeatTx, ProgressFlushTx,
     RotateLeasesTx, PruneLeasesTx,
-    RotateReadyTx, PruneReadyTx,
+    RotateReadyTx, PruneReadyTx, TerminalDeltaRollupTx,
     RotateClaimsTx, PruneClaimsTx
 }
 

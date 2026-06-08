@@ -6,7 +6,9 @@ use awa_model::cron::{
 };
 #[cfg(test)]
 use awa_model::SkipReason;
-use awa_model::{JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome};
+use awa_model::{
+    JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome, TerminalDeltaRollupOutcome,
+};
 use chrono::Utc;
 use croner::Cron;
 use sqlx::pool::PoolConnection;
@@ -444,6 +446,7 @@ pub struct MaintenanceService {
     /// priority improved by one level per interval elapsed (default: 60s).
     priority_aging_interval: Duration,
     batch_operations_interval: Duration,
+    terminal_count_rollup_interval: Duration,
     /// How long a descriptor catalog row can sit without being refreshed
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
@@ -453,6 +456,7 @@ pub struct MaintenanceService {
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
 const CRON_CATCH_UP_LIMIT: usize = 1_000;
+const TERMINAL_COUNT_ROLLUP_MAX_SLOTS_PER_TICK: usize = 4;
 type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
 
 impl MaintenanceService {
@@ -507,6 +511,7 @@ impl MaintenanceService {
             metadata_reconciliation_interval: Duration::from_secs(60),
             priority_aging_interval: Duration::from_secs(60),
             batch_operations_interval: Duration::from_secs(1),
+            terminal_count_rollup_interval: Duration::from_secs(30),
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
         }
     }
@@ -523,6 +528,13 @@ impl MaintenanceService {
     /// Set how often the maintenance leader processes batch-operation chunks.
     pub fn batch_operations_interval(mut self, interval: Duration) -> Self {
         self.batch_operations_interval = interval;
+        self
+    }
+
+    /// Set how often terminal-count delta rows are folded into the live
+    /// counter table for sealed queue segments (default: 30s).
+    pub fn terminal_count_rollup_interval(mut self, interval: Duration) -> Self {
+        self.terminal_count_rollup_interval = interval;
         self
     }
 
@@ -698,6 +710,8 @@ impl MaintenanceService {
                 tokio::time::interval(self.metadata_reconciliation_interval);
             let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
             let mut batch_operations_timer = tokio::time::interval(self.batch_operations_interval);
+            let mut terminal_count_rollup_timer =
+                tokio::time::interval(self.terminal_count_rollup_interval);
             let mut vacuum_queue_timer = self
                 .storage
                 .queue_storage()
@@ -750,6 +764,7 @@ impl MaintenanceService {
             metadata_reconciliation_timer.tick().await;
             priority_aging_timer.tick().await;
             batch_operations_timer.tick().await;
+            terminal_count_rollup_timer.tick().await;
             if let Some(timer) = &mut vacuum_queue_timer {
                 timer.tick().await;
             }
@@ -847,6 +862,12 @@ impl MaintenanceService {
                     _ = batch_operations_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("batch_operations", self.batch_operations_interval, &self.metrics) {
                             self.process_batch_operation().await;
+                            timer.finish();
+                        }
+                    }
+                    _ = terminal_count_rollup_timer.tick() => {
+                        if let Some(timer) = branch_tracker.try_begin("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
+                            self.rollup_terminal_count_deltas().await;
                             timer.finish();
                         }
                     }
@@ -1007,6 +1028,37 @@ impl MaintenanceService {
             }
             Ok(_) => {}
             Err(err) => warn!(error = %err, "failed to clean up expired batch operations"),
+        }
+    }
+
+    async fn rollup_terminal_count_deltas(&self) {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return;
+        };
+
+        match runtime
+            .store
+            .rollup_terminal_count_deltas(&self.pool, TERMINAL_COUNT_ROLLUP_MAX_SLOTS_PER_TICK)
+            .await
+        {
+            Ok(TerminalDeltaRollupOutcome {
+                rolled_slots: 0,
+                delta_rows: 0,
+                grouped_keys: 0,
+                skipped_active_slots: 0,
+                blocked_slots: 0,
+            }) => {}
+            Ok(outcome) => {
+                debug!(
+                    rolled_slots = outcome.rolled_slots,
+                    delta_rows = outcome.delta_rows,
+                    grouped_keys = outcome.grouped_keys,
+                    skipped_active_slots = outcome.skipped_active_slots,
+                    blocked_slots = outcome.blocked_slots,
+                    "rolled up queue-storage terminal count deltas"
+                );
+            }
+            Err(err) => warn!(error = %err, "failed to roll up terminal count deltas"),
         }
     }
 
@@ -2330,12 +2382,27 @@ impl MaintenanceService {
             ),
             ready AS (
                 SELECT
-                    queue,
+                    ready.queue,
                     count(*)::bigint AS available,
-                    EXTRACT(EPOCH FROM clock_timestamp() - min(run_at))::double precision
+                    EXTRACT(EPOCH FROM clock_timestamp() - min(ready.run_at))::double precision
                         AS lag_seconds
-                FROM {schema}.ready_entries
-                GROUP BY queue
+                FROM {schema}.ready_entries AS ready
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                 AND claims.enqueue_shard = ready.enqueue_shard
+                WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                        AND tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                  )
+                GROUP BY ready.queue
             ),
             leases AS (
                 SELECT
@@ -2345,6 +2412,44 @@ impl MaintenanceService {
                         AS waiting_external
                 FROM {schema}.leases
                 GROUP BY queue
+            ),
+            receipt_claims AS (
+                SELECT
+                    claims.queue,
+                    count(*)::bigint AS running
+                FROM {schema}.lease_claims AS claims
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {schema}.lease_claim_closures AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.leases AS lease
+                      WHERE lease.job_id = claims.job_id
+                        AND lease.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = claims.job_id
+                        AND deferred.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.done_entries AS done
+                      WHERE done.job_id = claims.job_id
+                        AND done.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = claims.job_id
+                        AND dlq.run_lease = claims.run_lease
+                  )
+                GROUP BY claims.queue
             ),
             deferred AS (
                 SELECT
@@ -2371,7 +2476,10 @@ impl MaintenanceService {
             SELECT
                 queues.queue,
                 COALESCE(ready.available, 0)::bigint AS available,
-                COALESCE(leases.running, 0)::bigint AS running,
+                (
+                    COALESCE(leases.running, 0)
+                    + COALESCE(receipt_claims.running, 0)
+                )::bigint AS running,
                 COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
                 COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
                 COALESCE(deferred.retryable, 0)::bigint AS retryable,
@@ -2383,6 +2491,8 @@ impl MaintenanceService {
               ON ready.queue = queues.queue
             LEFT JOIN leases
               ON leases.queue = queues.queue
+            LEFT JOIN receipt_claims
+              ON receipt_claims.queue = queues.queue
             LEFT JOIN deferred
               ON deferred.queue = queues.queue
             LEFT JOIN terminal
