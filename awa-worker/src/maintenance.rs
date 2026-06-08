@@ -983,7 +983,15 @@ impl MaintenanceService {
 
     async fn process_batch_operation(&self) {
         let runner_instance = Uuid::new_v4();
-        match awa_model::batch_operations::run_one_default_chunk(&self.pool, runner_instance).await
+        match awa_model::batch_operations::run_one_batch_operation_chunk_with_store(
+            &self.pool,
+            runner_instance,
+            100,
+            self.storage
+                .queue_storage()
+                .map(|runtime| runtime.store.as_ref()),
+        )
+        .await
         {
             Ok(outcome) if outcome.claimed => {
                 debug!(

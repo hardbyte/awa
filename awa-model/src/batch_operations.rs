@@ -12,6 +12,18 @@ use uuid::Uuid;
 const DEFAULT_CHUNK_SIZE: i64 = 100;
 const PREVIEW_SAMPLE_LIMIT: i64 = 10;
 const BATCH_RUNNER_LOCK_KEY: i64 = 0x4157_415f_4241_5443;
+const SCAN_INSERT_PAGE_SIZE: i64 = 10_000;
+
+const QUEUE_STORAGE_QUEUE_FILTER_SQL: &str = r#"
+(
+    $3::text IS NULL
+    OR queue = $3
+    OR (
+        queue LIKE ($3 || '#%')
+        AND substring(queue from (length($3) + 2)) ~ '^[0-9]+$'
+    )
+)
+"#;
 
 fn default_retention_days() -> i64 {
     std::env::var("AWA_BATCH_OP_RETENTION_DAYS")
@@ -362,6 +374,15 @@ pub async fn run_one_batch_operation_chunk(
     runner_instance: Uuid,
     chunk_size: i64,
 ) -> Result<BatchOperationRunOutcome, AwaError> {
+    run_one_batch_operation_chunk_with_store(pool, runner_instance, chunk_size, None).await
+}
+
+pub async fn run_one_batch_operation_chunk_with_store(
+    pool: &PgPool,
+    runner_instance: Uuid,
+    chunk_size: i64,
+    queue_storage: Option<&QueueStorage>,
+) -> Result<BatchOperationRunOutcome, AwaError> {
     let mut lock_conn = pool.acquire().await.map_err(map_sqlx_error)?;
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(BATCH_RUNNER_LOCK_KEY)
@@ -372,7 +393,9 @@ pub async fn run_one_batch_operation_chunk(
         return Ok(BatchOperationRunOutcome::default());
     }
 
-    let result = run_one_batch_operation_chunk_locked(pool, runner_instance, chunk_size).await;
+    let result =
+        run_one_batch_operation_chunk_locked(pool, runner_instance, chunk_size, queue_storage)
+            .await;
     let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(BATCH_RUNNER_LOCK_KEY)
         .execute(&mut *lock_conn)
@@ -384,6 +407,7 @@ async fn run_one_batch_operation_chunk_locked(
     pool: &PgPool,
     runner_instance: Uuid,
     chunk_size: i64,
+    queue_storage: Option<&QueueStorage>,
 ) -> Result<BatchOperationRunOutcome, AwaError> {
     let chunk_size = chunk_size.max(1);
     let Some(mut operation) = claim_next_operation(pool, runner_instance).await? else {
@@ -433,7 +457,7 @@ async fn run_one_batch_operation_chunk_locked(
     let mut errored = 0;
 
     for job_id in job_ids {
-        match apply_item(pool, operation.id, &operation.spec.0, job_id).await {
+        match apply_item(pool, queue_storage, operation.id, &operation.spec.0, job_id).await {
             Ok(ItemOutcome::Processed) => processed += 1,
             Ok(ItemOutcome::Skipped) => skipped += 1,
             Ok(ItemOutcome::Errored(_)) => {
@@ -607,9 +631,7 @@ async fn scan_operation(
     } else {
         count_matching_jobs(pool, &effective_filter, Some(0), Some(max_job_id)).await?
     };
-    let ids = load_matching_job_ids(pool, &effective_filter, 0, max_job_id, i64::MAX).await?;
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-    insert_operation_items(&mut tx, operation.id, &ids).await?;
     let operation = sqlx::query_as::<_, BatchOperation>(
         r#"
         UPDATE awa.batch_operations
@@ -631,6 +653,25 @@ async fn scan_operation(
     .await
     .map_err(map_sqlx_error)?;
     tx.commit().await.map_err(map_sqlx_error)?;
+
+    let mut after_job_id = 0;
+    while after_job_id < max_job_id {
+        let ids = load_matching_job_ids(
+            pool,
+            &effective_filter,
+            after_job_id,
+            max_job_id,
+            SCAN_INSERT_PAGE_SIZE,
+        )
+        .await?;
+        if ids.is_empty() {
+            break;
+        }
+        after_job_id = ids.iter().copied().max().unwrap_or(after_job_id);
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        insert_operation_items(&mut tx, operation.id, &ids).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+    }
     Ok(operation)
 }
 
@@ -761,12 +802,13 @@ enum ItemOutcome {
 
 async fn apply_item(
     pool: &PgPool,
+    queue_storage: Option<&QueueStorage>,
     operation_id: Uuid,
     spec: &BatchOperationSpec,
     job_id: i64,
 ) -> Result<ItemOutcome, AwaError> {
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-    let outcome = match apply_to_job_tx(&mut tx, spec, job_id).await {
+    let outcome = match apply_to_job_tx(&mut tx, queue_storage, spec, job_id).await {
         Ok(true) => ItemOutcome::Processed,
         Ok(false) => ItemOutcome::Skipped,
         Err(err) => {
@@ -834,11 +876,29 @@ async fn record_item_outcome_tx(
 
 async fn apply_to_job_tx(
     tx: &mut Transaction<'_, Postgres>,
+    queue_storage: Option<&QueueStorage>,
     spec: &BatchOperationSpec,
     job_id: i64,
 ) -> Result<bool, AwaError> {
-    if let Some(store) = QueueStorage::active_schema_in_tx(tx)
-        .await?
+    let active_schema = QueueStorage::active_schema_in_tx(tx).await?;
+    if let Some(store) =
+        queue_storage.filter(|store| Some(store.schema()) == active_schema.as_deref())
+    {
+        return match spec {
+            BatchOperationSpec::SetPriority { priority } => {
+                store.set_priority_tx(tx, job_id, *priority).await
+            }
+            BatchOperationSpec::MoveQueue { queue, priority } => {
+                store.move_queue_tx(tx, job_id, queue, *priority).await
+            }
+        };
+    }
+    if active_schema.is_some() && matches!(spec, BatchOperationSpec::MoveQueue { .. }) {
+        return Err(AwaError::Validation(
+            "queue-storage move_queue requires the configured QueueStorage runtime".to_string(),
+        ));
+    }
+    if let Some(store) = active_schema
         .map(QueueStorage::from_existing_schema)
         .transpose()?
     {
@@ -1031,13 +1091,13 @@ async fn max_matching_queue_storage_job_id(
         FROM candidates
         WHERE ($1::awa.job_state IS NULL OR state = $1)
           AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
+          AND {queue_filter}
           AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
           AND ($5::bigint[] IS NULL OR id = ANY($5))
           AND ($6::timestamptz IS NULL OR created_at >= $6)
           AND ($7::timestamptz IS NULL OR created_at < $7)
         "#
-    ))
+    , queue_filter = QUEUE_STORAGE_QUEUE_FILTER_SQL))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)
@@ -1173,7 +1233,7 @@ async fn load_matching_queue_storage_job_ids(
         FROM candidates
         WHERE ($1::awa.job_state IS NULL OR state = $1)
           AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
+          AND {queue_filter}
           AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
           AND ($5::bigint[] IS NULL OR id = ANY($5))
           AND ($6::timestamptz IS NULL OR created_at >= $6)
@@ -1183,7 +1243,7 @@ async fn load_matching_queue_storage_job_ids(
         ORDER BY id ASC
         LIMIT $10
         "#
-    ))
+    , queue_filter = QUEUE_STORAGE_QUEUE_FILTER_SQL))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)
@@ -1324,7 +1384,7 @@ async fn count_matching_queue_storage_jobs(
         FROM candidates
         WHERE ($1::awa.job_state IS NULL OR state = $1)
           AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
+          AND {queue_filter}
           AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
           AND ($5::bigint[] IS NULL OR id = ANY($5))
           AND ($6::timestamptz IS NULL OR created_at >= $6)
@@ -1332,7 +1392,7 @@ async fn count_matching_queue_storage_jobs(
           AND ($8::bigint IS NULL OR id > $8)
           AND ($9::bigint IS NULL OR id <= $9)
         "#
-    ))
+    , queue_filter = QUEUE_STORAGE_QUEUE_FILTER_SQL))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)
@@ -1396,7 +1456,7 @@ async fn load_matching_queue_storage_jobs(
         FROM candidates
         WHERE ($1::awa.job_state IS NULL OR state = $1)
           AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
+          AND {queue_filter}
           AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
           AND ($5::bigint[] IS NULL OR id = ANY($5))
           AND ($6::timestamptz IS NULL OR created_at >= $6)
@@ -1406,7 +1466,7 @@ async fn load_matching_queue_storage_jobs(
         ORDER BY id ASC
         LIMIT $10
         "#
-    ))
+    , queue_filter = QUEUE_STORAGE_QUEUE_FILTER_SQL))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)

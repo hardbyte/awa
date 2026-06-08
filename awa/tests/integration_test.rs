@@ -333,6 +333,92 @@ async fn test_batch_operation_rejects_ineligible_state_filter() {
 }
 
 #[tokio::test]
+async fn test_batch_operation_canonical_queue_filter_is_exact() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+    let queue = "integ_batch_exact_queue";
+    let queue_with_hash = "integ_batch_exact_queue#1";
+    clean_queue(client.pool(), queue).await;
+    clean_queue(client.pool(), queue_with_hash).await;
+    sqlx::query("DELETE FROM awa.batch_operations")
+        .execute(client.pool())
+        .await
+        .expect("clean batch operations");
+
+    let exact = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "exact@example.com".into(),
+            subject: "Exact".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let not_exact = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "hash@example.com".into(),
+            subject: "Hash".into(),
+        },
+        InsertOpts {
+            queue: queue_with_hash.into(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let preview = batch_operations::preview_batch_operation(
+        client.pool(),
+        BatchOperationSpec::SetPriority { priority: 1 },
+        BatchOperationFilter {
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("preview exact queue");
+    assert_eq!(preview.total_matched, 1);
+
+    let operation = batch_operations::submit_batch_operation(
+        client.pool(),
+        SubmitBatchOperation {
+            spec: BatchOperationSpec::SetPriority { priority: 1 },
+            filter: BatchOperationFilter {
+                queue: Some(queue.to_string()),
+                ..Default::default()
+            },
+            submitted_by: Some("test".to_string()),
+            allow_all: false,
+        },
+    )
+    .await
+    .expect("submit exact queue");
+    run_batch_operation_to_completion(client.pool(), operation.id).await;
+
+    assert_eq!(
+        admin::get_job(client.pool(), exact.id)
+            .await
+            .unwrap()
+            .priority,
+        1
+    );
+    assert_eq!(
+        admin::get_job(client.pool(), not_exact.id)
+            .await
+            .unwrap()
+            .priority,
+        4
+    );
+}
+
+#[tokio::test]
 async fn test_batch_operation_cancellation_marks_remaining_items_skipped() {
     let _guard = test_lock().lock().await;
     let client = setup().await;

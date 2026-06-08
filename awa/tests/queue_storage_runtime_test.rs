@@ -402,12 +402,21 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     .await
 }
 
-async fn run_queue_storage_batch_to_completion(pool: &sqlx::PgPool, operation_id: Uuid) {
+async fn run_queue_storage_batch_to_completion(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    operation_id: Uuid,
+) {
     let runner = Uuid::new_v4();
     for _ in 0..100 {
-        let outcome = batch_operations::run_one_batch_operation_chunk(pool, runner, 10)
-            .await
-            .expect("run batch operation chunk");
+        let outcome = batch_operations::run_one_batch_operation_chunk_with_store(
+            pool,
+            runner,
+            10,
+            Some(store),
+        )
+        .await
+        .expect("run batch operation chunk");
         if outcome.finalized || !outcome.claimed {
             break;
         }
@@ -1299,7 +1308,7 @@ async fn test_queue_storage_batch_set_priority_and_move_queue() {
     )
     .await
     .expect("submit set_priority batch op");
-    run_queue_storage_batch_to_completion(&pool, set_priority.id).await;
+    run_queue_storage_batch_to_completion(&pool, &store, set_priority.id).await;
 
     let reprioritized = store
         .load_job(&pool, job_id)
@@ -1329,7 +1338,7 @@ async fn test_queue_storage_batch_set_priority_and_move_queue() {
     )
     .await
     .expect("submit move_queue batch op");
-    run_queue_storage_batch_to_completion(&pool, move_queue.id).await;
+    run_queue_storage_batch_to_completion(&pool, &store, move_queue.id).await;
 
     let moved = store
         .load_job(&pool, job_id)
@@ -1351,6 +1360,191 @@ async fn test_queue_storage_batch_set_priority_and_move_queue() {
     assert_eq!(claimed[0].job.id, job_id);
     assert_eq!(claimed[0].job.queue, dest_queue);
     assert_eq!(claimed[0].job.priority, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_batch_ops_match_logical_striped_queue() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let source_queue = "qs_batch_striped_source";
+    let dest_queue = "qs_batch_striped_dest";
+    let schema = "awa_qs_batch_ops_striped";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    sqlx::query("DELETE FROM awa.batch_operations")
+        .execute(&pool)
+        .await
+        .expect("clean batch operations");
+
+    let first_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 913 },
+        InsertOpts {
+            queue: source_queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let second_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 914 },
+        InsertOpts {
+            queue: source_queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let preview = batch_operations::preview_batch_operation(
+        &pool,
+        BatchOperationSpec::MoveQueue {
+            queue: dest_queue.to_string(),
+            priority: Some(1),
+        },
+        BatchOperationFilter {
+            queue: Some(source_queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("preview striped logical queue");
+    assert_eq!(preview.total_matched, 2);
+
+    let operation = batch_operations::submit_batch_operation(
+        &pool,
+        SubmitBatchOperation {
+            spec: BatchOperationSpec::MoveQueue {
+                queue: dest_queue.to_string(),
+                priority: Some(1),
+            },
+            filter: BatchOperationFilter {
+                queue: Some(source_queue.to_string()),
+                ..Default::default()
+            },
+            submitted_by: Some("test".to_string()),
+            allow_all: false,
+        },
+    )
+    .await
+    .expect("submit striped move_queue batch op");
+    run_queue_storage_batch_to_completion(&pool, &store, operation.id).await;
+
+    let moved_first = store
+        .load_job(&pool, first_id)
+        .await
+        .expect("load first moved job")
+        .expect("first moved job should exist");
+    let moved_second = store
+        .load_job(&pool, second_id)
+        .await
+        .expect("load second moved job")
+        .expect("second moved job should exist");
+    assert!(
+        moved_first.queue == dest_queue || moved_first.queue.starts_with(&format!("{dest_queue}#"))
+    );
+    assert!(
+        moved_second.queue == dest_queue
+            || moved_second.queue.starts_with(&format!("{dest_queue}#"))
+    );
+    assert_eq!(moved_first.priority, 1);
+    assert_eq!(moved_second.priority, 1);
+
+    let claimed = store
+        .claim_runtime_batch(&pool, dest_queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim moved striped jobs");
+    let claimed_ids: HashSet<i64> = claimed.iter().map(|entry| entry.job.id).collect();
+    assert_eq!(claimed_ids, HashSet::from([first_id, second_id]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_move_queue_batch_requires_configured_store() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let source_queue = "qs_batch_requires_store_source";
+    let dest_queue = "qs_batch_requires_store_dest";
+    let schema = "awa_qs_batch_requires_store";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    sqlx::query("DELETE FROM awa.batch_operations")
+        .execute(&pool)
+        .await
+        .expect("clean batch operations");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 915 },
+        InsertOpts {
+            queue: source_queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let operation = batch_operations::submit_batch_operation(
+        &pool,
+        SubmitBatchOperation {
+            spec: BatchOperationSpec::MoveQueue {
+                queue: dest_queue.to_string(),
+                priority: None,
+            },
+            filter: BatchOperationFilter {
+                ids: Some(vec![job_id]),
+                ..Default::default()
+            },
+            submitted_by: Some("test".to_string()),
+            allow_all: false,
+        },
+    )
+    .await
+    .expect("submit move_queue batch op");
+
+    let runner = Uuid::new_v4();
+    for _ in 0..10 {
+        let outcome = batch_operations::run_one_batch_operation_chunk(&pool, runner, 10)
+            .await
+            .expect("run chunk without configured store");
+        if outcome.finalized || !outcome.claimed {
+            break;
+        }
+    }
+
+    let operation = batch_operations::get_batch_operation(&pool, operation.id)
+        .await
+        .expect("get operation");
+    assert_eq!(operation.errored, 1);
+    let job = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load job")
+        .expect("job should remain available");
+    assert!(job.queue == source_queue || job.queue.starts_with(&format!("{source_queue}#")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
