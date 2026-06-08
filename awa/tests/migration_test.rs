@@ -1034,6 +1034,16 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
         has_delta_nonzero_constraint,
         "queue_terminal_count_deltas should reject no-op zero deltas"
     );
+    let has_done_failed_index: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa_queue_storage_prepared.idx_awa_queue_storage_prepared_done_0_failed_queue') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("failed done_entries index probe should succeed");
+    assert!(
+        has_done_failed_index,
+        "done_entries failed-row metric probe should have a partial index"
+    );
     assert!(
         relation_exists(&pool, "awa_queue_storage_prepared.leases").await,
         "prepared queue-storage schema should materialize leases"
