@@ -56,7 +56,7 @@ Completion batches keep the existing grouping step, but append grouped deltas in
 
 `queue_counts_exact` computes the live terminal component as `queue_terminal_live_counts + SUM(queue_terminal_count_deltas)`, then adds pruned rollups from `queue_terminal_rollups` / `queue_lanes`. The exact read remains honest while maintenance is behind. If the terminal-counter trust marker is not set, the read path falls back to scanning `done_entries` so rolling upgrades and recovery windows stay honest.
 
-The maintenance leader rolls sealed delta segments into `queue_terminal_live_counts` in deterministic key order, then truncates the matching delta child in the same transaction. Rollup skips the current queue slot and any slot with active leases or open receipt claims. Queue prune also truncates the delta child after folding terminal history into permanent rollups, so a lagging counter rollup cannot block retention.
+The maintenance leader rolls sealed delta segments into `queue_terminal_live_counts` in deterministic key order, then truncates the matching delta child in the same transaction. Candidate selection is driven by sealed slots that actually contain pending deltas, so an empty old prefix cannot hide a later sealed slot that needs rollup. Rollup skips the current queue slot and any slot with active leases or open receipt claims. Queue prune also truncates the delta child after folding terminal history into permanent rollups, so a lagging counter rollup cannot block retention.
 
 The trust marker remains meaningful: it means the folded counter plus all unrolled deltas is complete for the active schema. Rebuild recomputes the folded counter from `done_entries` and clears the delta ledger.
 

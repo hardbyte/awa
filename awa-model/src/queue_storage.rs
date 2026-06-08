@@ -23,7 +23,6 @@ const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
-const TERMINAL_DELTA_ROLLUP_CANDIDATE_FACTOR: usize = 4;
 
 /// Deterministically map an ordering key to a shard in `[0, shards)`.
 ///
@@ -11036,9 +11035,9 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let (current_slot, slot_count): (i32, i32) = sqlx::query_as(&format!(
+        let current_slot: i32 = sqlx::query_scalar(&format!(
             r#"
-            SELECT current_slot, slot_count
+            SELECT current_slot
             FROM {schema}.queue_ring_state
             WHERE singleton = TRUE
             "#
@@ -11047,32 +11046,9 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let available_slots = (slot_count - 1).max(0) as usize;
-        if available_slots == 0 {
-            return Ok(TerminalDeltaRollupOutcome::default());
-        }
-        // A pinned old slot should not starve younger sealed slots forever.
-        // Scan a bounded window, but stop after rolling `max_slots` segments.
-        let candidate_limit = max_slots
-            .saturating_mul(TERMINAL_DELTA_ROLLUP_CANDIDATE_FACTOR)
-            .max(max_slots)
-            .min(available_slots);
-
-        let slots: Vec<(i32, i64)> = sqlx::query_as(&format!(
-            r#"
-            SELECT slot, generation
-            FROM {schema}.queue_ring_slots
-            WHERE generation >= 0
-              AND slot <> $1
-            ORDER BY generation ASC, slot ASC
-            LIMIT $2
-            "#
-        ))
-        .bind(current_slot)
-        .bind(candidate_limit as i64)
-        .fetch_all(pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        let slots = self
+            .terminal_delta_rollup_candidates(pool, current_slot)
+            .await?;
 
         let mut outcome = TerminalDeltaRollupOutcome::default();
         for (slot, generation) in slots {
@@ -11102,6 +11078,54 @@ impl QueueStorage {
         }
 
         Ok(outcome)
+    }
+
+    async fn terminal_delta_rollup_candidates(
+        &self,
+        pool: &PgPool,
+        current_slot: i32,
+    ) -> Result<Vec<(i32, i64)>, AwaError> {
+        let schema = self.schema();
+        let sealed_slots: Vec<(i32, i64)> = sqlx::query_as(&format!(
+            r#"
+            SELECT slot, generation
+            FROM {schema}.queue_ring_slots
+            WHERE generation >= 0
+              AND slot <> $1
+            ORDER BY generation ASC, slot ASC
+            "#
+        ))
+        .bind(current_slot)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let mut pending_slots = Vec::new();
+        for (slot, generation) in sealed_slots {
+            let Ok(slot_index) = usize::try_from(slot) else {
+                continue;
+            };
+            let delta_child = terminal_delta_child_name(schema, slot_index);
+            let has_pending: bool = sqlx::query_scalar(&format!(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {delta_child}
+                    WHERE ready_generation = $1
+                    LIMIT 1
+                )
+                "#
+            ))
+            .bind(generation)
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+            if has_pending {
+                pending_slots.push((slot, generation));
+            }
+        }
+
+        Ok(pending_slots)
     }
 
     async fn rollup_terminal_count_delta_slot(

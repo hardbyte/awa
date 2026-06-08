@@ -6003,6 +6003,77 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
     assert_eq!(counts.terminal, 6);
 }
 
+/// ADR-026: rollup candidate selection must not let old empty sealed slots
+/// hide a later sealed slot that has pending deltas. This matters when
+/// operators choose more queue slots than a single maintenance tick can fold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_skips_empty_old_slots() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_late_slot";
+    let schema = "awa_qs_terminal_delta_rollup_late_slot";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 32,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for _ in 0..21 {
+        match store.rotate(&pool).await.expect("rotate queue ring") {
+            awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+            other => panic!("expected Rotated, got {other:?}"),
+        }
+    }
+
+    let target_slot = 20_i32;
+    let target_generation: i64 = sqlx::query_scalar(&format!(
+        "SELECT generation FROM {schema}.queue_ring_slots WHERE slot = $1"
+    ))
+    .bind(target_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("target slot generation");
+    assert!(target_generation >= 0);
+
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.queue_terminal_count_deltas (
+            ready_slot, ready_generation, queue, priority, enqueue_shard,
+            counter_bucket, terminal_delta
+        )
+        VALUES ($1, $2, $3, 1, 0, 0, 7)
+        "#
+    ))
+    .bind(target_slot)
+    .bind(target_generation)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed terminal delta in later sealed slot");
+
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 7);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 1)
+        .await
+        .expect("rollup late pending slot");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(outcome.delta_rows, 1);
+    assert_eq!(outcome.grouped_keys, 1);
+    assert_eq!(outcome.skipped_active_slots, 0);
+    assert_eq!(outcome.blocked_slots, 0);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 7);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+}
+
 /// Direct-SQL seed for terminal-state test rows. Inserts into
 /// `done_entries` AND folded `queue_terminal_live_counts` so the invariant
 /// holds at seed time; the test then exercises delete paths to verify they
