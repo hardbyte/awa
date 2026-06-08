@@ -69,6 +69,11 @@ enum Commands {
         #[command(subcommand)]
         command: DlqCommands,
     },
+    /// Durable batch operation management
+    BatchOps {
+        #[command(subcommand)]
+        command: BatchOpsCommands,
+    },
     /// Start the web UI server
     Serve {
         /// Host to bind to
@@ -169,6 +174,54 @@ fn parse_callback_hmac_secret(secret: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(secret).map_err(|_| "callback secret must be valid hex".to_string())?;
     <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| "callback secret must be exactly 32 bytes (64 hex characters)".into())
+}
+
+fn parse_batch_operation_state(
+    state: &str,
+) -> Result<awa_model::batch_operations::BatchOperationState, Box<dyn std::error::Error>> {
+    match state {
+        "pending" => Ok(awa_model::batch_operations::BatchOperationState::Pending),
+        "scanning" => Ok(awa_model::batch_operations::BatchOperationState::Scanning),
+        "running" => Ok(awa_model::batch_operations::BatchOperationState::Running),
+        "cancelling" => Ok(awa_model::batch_operations::BatchOperationState::Cancelling),
+        "completed" => Ok(awa_model::batch_operations::BatchOperationState::Completed),
+        "cancelled" => Ok(awa_model::batch_operations::BatchOperationState::Cancelled),
+        "failed" => Ok(awa_model::batch_operations::BatchOperationState::Failed),
+        _ => Err(format!("unknown batch operation state: {state}").into()),
+    }
+}
+
+fn parse_batch_operation_spec(
+    op_kind: &str,
+    spec: &str,
+) -> Result<awa_model::batch_operations::BatchOperationSpec, Box<dyn std::error::Error>> {
+    match op_kind {
+        "set_priority" => {
+            #[derive(serde::Deserialize)]
+            struct SetPrioritySpec {
+                priority: i16,
+            }
+            let spec: SetPrioritySpec = serde_json::from_str(spec)?;
+            Ok(
+                awa_model::batch_operations::BatchOperationSpec::SetPriority {
+                    priority: spec.priority,
+                },
+            )
+        }
+        "move_queue" => {
+            #[derive(serde::Deserialize)]
+            struct MoveQueueSpec {
+                queue: String,
+                priority: Option<i16>,
+            }
+            let spec: MoveQueueSpec = serde_json::from_str(spec)?;
+            Ok(awa_model::batch_operations::BatchOperationSpec::MoveQueue {
+                queue: spec.queue,
+                priority: spec.priority,
+            })
+        }
+        _ => Err(format!("unknown batch operation kind: {op_kind}").into()),
+    }
 }
 
 #[derive(Subcommand)]
@@ -274,6 +327,57 @@ enum DlqCommands {
         /// accidentally wiping the DLQ.
         #[arg(long)]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BatchOpsCommands {
+    /// List batch operations
+    List {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
+    /// Show one batch operation as JSON
+    Get { id: uuid::Uuid },
+    /// Preview a batch operation without submitting it
+    Preview {
+        /// Operation kind: set_priority or move_queue
+        #[arg(long)]
+        op_kind: String,
+        /// JSON spec, e.g. '{"priority":1}' or '{"queue":"escalations"}'
+        #[arg(long)]
+        spec: String,
+        /// JSON filter, e.g. '{"queue":"default"}'
+        #[arg(long, default_value = "{}")]
+        filter: String,
+    },
+    /// Submit a batch operation
+    Submit {
+        /// Operation kind: set_priority or move_queue
+        #[arg(long)]
+        op_kind: String,
+        /// JSON spec, e.g. '{"priority":1}' or '{"queue":"escalations"}'
+        #[arg(long)]
+        spec: String,
+        /// JSON filter, e.g. '{"kind":"send_email"}'
+        #[arg(long, default_value = "{}")]
+        filter: String,
+        /// Required when the filter is empty
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        submitted_by: Option<String>,
+    },
+    /// Request cancellation for a running batch operation
+    Cancel { id: uuid::Uuid },
+    /// Purge finalized operations before a timestamp
+    Purge {
+        #[arg(long)]
+        before: DateTime<Utc>,
+        #[arg(long, default_value = "1000")]
+        limit: i64,
     },
 }
 
@@ -796,6 +900,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
+                Commands::BatchOps { command } => match command {
+                    BatchOpsCommands::List { state, limit } => {
+                        let state = state
+                            .as_deref()
+                            .map(parse_batch_operation_state)
+                            .transpose()?;
+                        let operations = awa_model::batch_operations::list_batch_operations(
+                            &pool,
+                            &awa_model::batch_operations::ListBatchOperationsFilter {
+                                state,
+                                limit: Some(limit),
+                            },
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&operations)?);
+                    }
+                    BatchOpsCommands::Get { id } => {
+                        let operation =
+                            awa_model::batch_operations::get_batch_operation(&pool, id).await?;
+                        println!("{}", serde_json::to_string_pretty(&operation)?);
+                    }
+                    BatchOpsCommands::Preview {
+                        op_kind,
+                        spec,
+                        filter,
+                    } => {
+                        let spec = parse_batch_operation_spec(&op_kind, &spec)?;
+                        let filter: awa_model::batch_operations::BatchOperationFilter =
+                            serde_json::from_str(&filter)?;
+                        let preview = awa_model::batch_operations::preview_batch_operation(
+                            &pool, spec, filter,
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&preview)?);
+                    }
+                    BatchOpsCommands::Submit {
+                        op_kind,
+                        spec,
+                        filter,
+                        all,
+                        submitted_by,
+                    } => {
+                        let spec = parse_batch_operation_spec(&op_kind, &spec)?;
+                        let filter: awa_model::batch_operations::BatchOperationFilter =
+                            serde_json::from_str(&filter)?;
+                        let operation = awa_model::batch_operations::submit_batch_operation(
+                            &pool,
+                            awa_model::batch_operations::SubmitBatchOperation {
+                                spec,
+                                filter,
+                                submitted_by,
+                                allow_all: all,
+                            },
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&operation)?);
+                    }
+                    BatchOpsCommands::Cancel { id } => {
+                        let operation =
+                            awa_model::batch_operations::request_batch_operation_cancellation(
+                                &pool, id,
+                            )
+                            .await?;
+                        println!("{}", serde_json::to_string_pretty(&operation)?);
+                    }
+                    BatchOpsCommands::Purge { before, limit } => {
+                        let purged = awa_model::batch_operations::purge_batch_operations_before(
+                            &pool, before, limit,
+                        )
+                        .await?;
+                        println!("Purged {purged} batch operations.");
+                    }
+                },
 
                 Commands::Cron { command } => match command {
                     CronCommands::List => {

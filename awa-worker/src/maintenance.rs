@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
 #[derive(Debug, Clone)]
@@ -442,6 +443,7 @@ pub struct MaintenanceService {
     /// Interval for priority aging — jobs waiting longer than this have their
     /// priority improved by one level per interval elapsed (default: 60s).
     priority_aging_interval: Duration,
+    batch_operations_interval: Duration,
     /// How long a descriptor catalog row can sit without being refreshed
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
@@ -504,6 +506,7 @@ impl MaintenanceService {
             dirty_key_recompute_interval: Duration::from_secs(2),
             metadata_reconciliation_interval: Duration::from_secs(60),
             priority_aging_interval: Duration::from_secs(60),
+            batch_operations_interval: Duration::from_secs(1),
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
         }
     }
@@ -514,6 +517,12 @@ impl MaintenanceService {
     /// a priority-4 job waiting 180s is treated as priority-1.
     pub fn priority_aging_interval(mut self, interval: Duration) -> Self {
         self.priority_aging_interval = interval;
+        self
+    }
+
+    /// Set how often the maintenance leader processes batch-operation chunks.
+    pub fn batch_operations_interval(mut self, interval: Duration) -> Self {
+        self.batch_operations_interval = interval;
         self
     }
 
@@ -688,6 +697,7 @@ impl MaintenanceService {
             let mut metadata_reconciliation_timer =
                 tokio::time::interval(self.metadata_reconciliation_interval);
             let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
+            let mut batch_operations_timer = tokio::time::interval(self.batch_operations_interval);
             let mut vacuum_queue_timer = self
                 .storage
                 .queue_storage()
@@ -739,6 +749,7 @@ impl MaintenanceService {
             dirty_key_timer.tick().await;
             metadata_reconciliation_timer.tick().await;
             priority_aging_timer.tick().await;
+            batch_operations_timer.tick().await;
             if let Some(timer) = &mut vacuum_queue_timer {
                 timer.tick().await;
             }
@@ -797,6 +808,7 @@ impl MaintenanceService {
                         if let Some(timer) = branch_tracker.try_begin("cleanup", self.cleanup_interval, &self.metrics) {
                             self.cleanup_completed().await;
                             self.cleanup_dlq_rows().await;
+                            self.cleanup_batch_operations().await;
                             self.cleanup_stale_runtime_snapshots().await;
                             self.cleanup_stale_descriptors().await;
                             timer.finish();
@@ -829,6 +841,12 @@ impl MaintenanceService {
                     _ = priority_aging_timer.tick() => {
                         if let Some(timer) = branch_tracker.try_begin("priority_aging", self.priority_aging_interval, &self.metrics) {
                             self.age_waiting_priorities().await;
+                            timer.finish();
+                        }
+                    }
+                    _ = batch_operations_timer.tick() => {
+                        if let Some(timer) = branch_tracker.try_begin("batch_operations", self.batch_operations_interval, &self.metrics) {
+                            self.process_batch_operation().await;
                             timer.finish();
                         }
                     }
@@ -961,6 +979,35 @@ impl MaintenanceService {
             count = self.periodic_jobs.len(),
             "Synced periodic jobs to database"
         );
+    }
+
+    async fn process_batch_operation(&self) {
+        let runner_instance = Uuid::new_v4();
+        match awa_model::batch_operations::run_one_default_chunk(&self.pool, runner_instance).await
+        {
+            Ok(outcome) if outcome.claimed => {
+                debug!(
+                    processed = outcome.processed,
+                    skipped = outcome.skipped,
+                    errored = outcome.errored,
+                    finalized = outcome.finalized,
+                    "processed batch operation chunk"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => warn!(error = %err, "failed to process batch operation chunk"),
+        }
+    }
+
+    async fn cleanup_batch_operations(&self) {
+        match awa_model::batch_operations::cleanup_expired_batch_operations(&self.pool, 1000).await
+        {
+            Ok(deleted) if deleted > 0 => {
+                debug!(deleted, "cleaned up expired batch operations");
+            }
+            Ok(_) => {}
+            Err(err) => warn!(error = %err, "failed to clean up expired batch operations"),
+        }
     }
 
     /// Evaluate all cron schedules and enqueue any that are due.

@@ -1,3 +1,4 @@
+pub mod batch_ops;
 pub mod callbacks;
 pub mod cron;
 pub mod dlq;

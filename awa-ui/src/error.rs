@@ -23,6 +23,12 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
+impl From<serde_json::Error> for ApiError {
+    fn from(err: serde_json::Error) -> Self {
+        ApiError::Awa(awa_model::AwaError::Validation(err.to_string()))
+    }
+}
+
 impl From<std::sync::Arc<crate::cache::CacheError>> for ApiError {
     fn from(err: std::sync::Arc<crate::cache::CacheError>) -> Self {
         // Moka wraps try_get_with errors in Arc. Extract the inner AwaError

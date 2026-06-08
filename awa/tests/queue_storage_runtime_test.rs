@@ -4,8 +4,9 @@
 //! queue_storage backend enabled.
 
 use awa::model::{
-    admin, insert, migrations, storage, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig,
-    RotateOutcome, SkipReason,
+    admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
+    BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
+    SubmitBatchOperation,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -399,6 +400,25 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
         },
     )
     .await
+}
+
+async fn run_queue_storage_batch_to_completion(pool: &sqlx::PgPool, operation_id: Uuid) {
+    let runner = Uuid::new_v4();
+    for _ in 0..100 {
+        let outcome = batch_operations::run_one_batch_operation_chunk(pool, runner, 10)
+            .await
+            .expect("run batch operation chunk");
+        if outcome.finalized || !outcome.claimed {
+            break;
+        }
+    }
+    let operation = batch_operations::get_batch_operation(pool, operation_id)
+        .await
+        .expect("get batch operation");
+    assert_eq!(
+        operation.state,
+        batch_operations::BatchOperationState::Completed
+    );
 }
 
 /// Scan candidate keys until every shard in `[0, shards)` has a
@@ -1238,6 +1258,99 @@ async fn test_queue_storage_cancel_available_tombstones_and_retains_ready_backin
         .expect("cancelled available job should be loadable");
     assert_eq!(loaded.state, JobState::Cancelled);
     assert_eq!(loaded.args["id"], serde_json::json!(88));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_batch_set_priority_and_move_queue() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let source_queue = "qs_batch_source";
+    let dest_queue = "qs_batch_dest";
+    let schema = "awa_qs_batch_ops";
+    let store = create_store(&pool, schema).await;
+    sqlx::query("DELETE FROM awa.batch_operations")
+        .execute(&pool)
+        .await
+        .expect("clean batch operations");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 912 },
+        InsertOpts {
+            queue: source_queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let set_priority = batch_operations::submit_batch_operation(
+        &pool,
+        SubmitBatchOperation {
+            spec: BatchOperationSpec::SetPriority { priority: 1 },
+            filter: BatchOperationFilter {
+                queue: Some(source_queue.to_string()),
+                ..Default::default()
+            },
+            submitted_by: Some("test".to_string()),
+            allow_all: false,
+        },
+    )
+    .await
+    .expect("submit set_priority batch op");
+    run_queue_storage_batch_to_completion(&pool, set_priority.id).await;
+
+    let reprioritized = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load reprioritized job")
+        .expect("reprioritized job should exist");
+    assert_eq!(reprioritized.priority, 1);
+    assert_eq!(
+        reprioritized.metadata.get("_awa_original_priority"),
+        Some(&serde_json::json!(4))
+    );
+
+    let move_queue = batch_operations::submit_batch_operation(
+        &pool,
+        SubmitBatchOperation {
+            spec: BatchOperationSpec::MoveQueue {
+                queue: dest_queue.to_string(),
+                priority: Some(2),
+            },
+            filter: BatchOperationFilter {
+                ids: Some(vec![job_id]),
+                ..Default::default()
+            },
+            submitted_by: Some("test".to_string()),
+            allow_all: false,
+        },
+    )
+    .await
+    .expect("submit move_queue batch op");
+    run_queue_storage_batch_to_completion(&pool, move_queue.id).await;
+
+    let moved = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load moved job")
+        .expect("moved job should exist");
+    assert_eq!(moved.queue, dest_queue);
+    assert_eq!(moved.priority, 2);
+    assert_eq!(
+        moved.metadata.get("_awa_original_queue"),
+        Some(&serde_json::json!(source_queue))
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, dest_queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim moved job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert_eq!(claimed[0].job.queue, dest_queue);
+    assert_eq!(claimed[0].job.priority, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

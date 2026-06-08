@@ -51,6 +51,12 @@ POST /api/jobs/:id/cancel
 POST /api/jobs/bulk-retry               { ids: [...] }
 POST /api/jobs/bulk-cancel              { ids: [...] }
 
+POST /api/batch-ops/preview             { op_kind, filter, spec }
+POST /api/batch-ops                     { op_kind, filter, spec, all?, submitted_by? }
+GET  /api/batch-ops?state=&limit=
+GET  /api/batch-ops/:id
+PATCH /api/batch-ops/:id                { state: "cancelling" }
+
 GET  /api/queues
 GET  /api/queues/:name
 GET  /api/queues/runtime

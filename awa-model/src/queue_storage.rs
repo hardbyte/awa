@@ -1058,7 +1058,35 @@ struct CancelJobTxResult {
     claim_cursor_advance: Option<ClaimCursorAdvance>,
 }
 
+struct ReadyBatchMoveResult {
+    moved: bool,
+}
+
 impl ReadyTransitionRow {
+    fn into_existing_ready_row(
+        self,
+        queue: String,
+        priority: i16,
+        payload: serde_json::Value,
+    ) -> ExistingReadyRow {
+        ExistingReadyRow {
+            job_id: self.job_id,
+            kind: self.kind,
+            queue,
+            args: self.args,
+            priority,
+            attempt: self.attempt,
+            run_lease: self.run_lease,
+            max_attempts: self.max_attempts,
+            run_at: self.run_at,
+            attempted_at: self.attempted_at,
+            created_at: self.created_at,
+            unique_key: self.unique_key,
+            unique_states: self.unique_states,
+            payload,
+        }
+    }
+
     fn into_done_row(
         self,
         state: JobState,
@@ -6802,6 +6830,288 @@ impl QueueStorage {
         self.advance_claim_cursors(pool, &claim_cursor_advances)
             .await;
         Ok(rows)
+    }
+
+    pub async fn set_priority(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        priority: i16,
+    ) -> Result<bool, AwaError> {
+        if !(1..=4).contains(&priority) {
+            return Err(AwaError::Validation(
+                "priority must be between 1 and 4".to_string(),
+            ));
+        }
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self.set_priority_tx(&mut tx, job_id, priority).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    pub async fn set_priority_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        priority: i16,
+    ) -> Result<bool, AwaError> {
+        if !(1..=4).contains(&priority) {
+            return Err(AwaError::Validation(
+                "priority must be between 1 and 4".to_string(),
+            ));
+        }
+
+        if self
+            .update_deferred_batch_fields_tx(tx, job_id, None, Some(priority))
+            .await?
+        {
+            return Ok(true);
+        }
+
+        let result = self
+            .move_ready_batch_fields_tx(tx, job_id, None, Some(priority))
+            .await?;
+        Ok(result.moved)
+    }
+
+    pub async fn move_queue(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        queue: &str,
+        priority: Option<i16>,
+    ) -> Result<bool, AwaError> {
+        if queue.is_empty() || queue.len() > 200 {
+            return Err(AwaError::Validation(
+                "destination queue must be 1..=200 characters".to_string(),
+            ));
+        }
+        if let Some(priority) = priority {
+            if !(1..=4).contains(&priority) {
+                return Err(AwaError::Validation(
+                    "priority must be between 1 and 4".to_string(),
+                ));
+            }
+        }
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self.move_queue_tx(&mut tx, job_id, queue, priority).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    pub async fn move_queue_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        queue: &str,
+        priority: Option<i16>,
+    ) -> Result<bool, AwaError> {
+        if queue.is_empty() || queue.len() > 200 {
+            return Err(AwaError::Validation(
+                "destination queue must be 1..=200 characters".to_string(),
+            ));
+        }
+        if let Some(priority) = priority {
+            if !(1..=4).contains(&priority) {
+                return Err(AwaError::Validation(
+                    "priority must be between 1 and 4".to_string(),
+                ));
+            }
+        }
+
+        if self
+            .update_deferred_batch_fields_tx(tx, job_id, Some(queue), priority)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        let result = self
+            .move_ready_batch_fields_tx(tx, job_id, Some(queue), priority)
+            .await?;
+        Ok(result.moved)
+    }
+
+    async fn update_deferred_batch_fields_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        queue: Option<&str>,
+        priority: Option<i16>,
+    ) -> Result<bool, AwaError> {
+        let schema = self.schema();
+        let row: Option<DeferredJobRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                COALESCE(payload, '{{}}'::jsonb) AS payload
+            FROM {schema}.deferred_jobs
+            WHERE job_id = $1
+              AND state = 'scheduled'
+            FOR UPDATE SKIP LOCKED
+            "#
+        ))
+        .bind(job_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some(row) = row else {
+            return Ok(false);
+        };
+
+        let old_queue = row.queue.clone();
+        let old_priority = row.priority;
+        let new_queue = queue.unwrap_or(&old_queue).to_string();
+        let new_priority = priority.unwrap_or(old_priority);
+        let mut payload = RuntimePayload::from_json(row.payload)?;
+        let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
+            AwaError::Validation("queue storage payload metadata must be a JSON object".to_string())
+        })?;
+        if queue.is_some() {
+            metadata
+                .entry("_awa_original_queue".to_string())
+                .or_insert_with(|| serde_json::Value::from(old_queue));
+        }
+        if priority.is_some() {
+            metadata
+                .entry("_awa_original_priority".to_string())
+                .or_insert_with(|| serde_json::Value::from(i64::from(old_priority)));
+        }
+
+        sqlx::query(&format!(
+            r#"
+            UPDATE {schema}.deferred_jobs
+            SET queue = $2,
+                priority = $3,
+                payload = $4
+            WHERE job_id = $1
+            "#
+        ))
+        .bind(job_id)
+        .bind(new_queue)
+        .bind(new_priority)
+        .bind(storage_payload(&payload.into_json()))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(true)
+    }
+
+    async fn move_ready_batch_fields_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        queue: Option<&str>,
+        priority: Option<i16>,
+    ) -> Result<ReadyBatchMoveResult, AwaError> {
+        let schema = self.schema();
+        let ready: Option<ReadyTransitionRow> = sqlx::query_as(&format!(
+            r#"
+            WITH target AS (
+                SELECT ready.*
+                FROM {schema}.ready_entries AS ready
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                 AND claims.enqueue_shard = ready.enqueue_shard
+                WHERE ready.job_id = $1
+                  AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                      WHERE tomb.queue = ready.queue
+                        AND tomb.priority = ready.priority
+                        AND tomb.enqueue_shard = ready.enqueue_shard
+                        AND tomb.lane_seq = ready.lane_seq
+                        AND tomb.ready_slot = ready.ready_slot
+                        AND tomb.ready_generation = ready.ready_generation
+                  )
+                ORDER BY ready.lane_seq DESC
+                LIMIT 1
+                FOR UPDATE OF ready SKIP LOCKED
+            ),
+            tombstone AS (
+                INSERT INTO {schema}.ready_tombstones (
+                    ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                )
+                SELECT ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+                FROM target
+                ON CONFLICT DO NOTHING
+            )
+            SELECT
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                enqueue_shard,
+                run_at,
+                attempted_at,
+                created_at,
+                unique_key,
+                unique_states,
+                COALESCE(payload, '{{}}'::jsonb) AS payload
+            FROM target
+            "#
+        ))
+        .bind(job_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some(ready) = ready else {
+            return Ok(ReadyBatchMoveResult { moved: false });
+        };
+
+        let old_queue = ready.queue.clone();
+        let old_priority = ready.priority;
+        let new_queue = queue.unwrap_or(&old_queue).to_string();
+        let new_priority = priority.unwrap_or(old_priority);
+        let mut payload = RuntimePayload::from_json(ready.payload.clone())?;
+        let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
+            AwaError::Validation("queue storage payload metadata must be a JSON object".to_string())
+        })?;
+        if queue.is_some() {
+            metadata
+                .entry("_awa_original_queue".to_string())
+                .or_insert_with(|| serde_json::Value::from(old_queue.clone()));
+        }
+        if priority.is_some() {
+            metadata
+                .entry("_awa_original_priority".to_string())
+                .or_insert_with(|| serde_json::Value::from(i64::from(old_priority)));
+        }
+
+        let notify_queue = new_queue.clone();
+        let ready_row = ready.into_existing_ready_row(new_queue, new_priority, payload.into_json());
+        self.insert_existing_ready_rows_tx(tx, vec![ready_row], Some(JobState::Available))
+            .await?;
+        self.notify_queues_tx(tx, std::iter::once(notify_queue))
+            .await?;
+
+        Ok(ReadyBatchMoveResult { moved: true })
     }
 
     pub async fn age_waiting_priorities(

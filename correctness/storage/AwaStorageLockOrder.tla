@@ -279,6 +279,22 @@ CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
+\* batch set_priority / move_queue ready-row lane move
+\*   SELECT source ready row FOR UPDATE after reading the source claim-head
+\*     cursor. The claim-head row itself is not locked by this path; the row
+\*     lock on ready_entries serializes against concurrent claim/cancel of the
+\*     same job and does not conflict with producers on lane heads.
+\*   INSERT source ready_tombstone
+\*   ensure/reserve destination enqueue lane
+\*   INSERT destination ready row
+\* The implementation serializes the overall batch runner with an advisory
+\* lock today. This plan still records the row/table locks so future
+\* multi-runner work has an explicit lock-order regression target.
+BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
+    << Step(ReadyChildResource(readySlot), ModeShared),
+       Step(LaneResource(dstQ, dstP), ModeExclusive),
+       Step(ReadyChildResource(readySlot), ModeShared) >>
+
 \* rotate_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
 \*   SELECT count(*) FROM lease_child[next_slot] (AccessShare on child)
@@ -523,6 +539,19 @@ StartCancelRunning(t, leaseSlot, readySlot, claimSlot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, readySlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ srcQ \in Queues
+    /\ dstQ \in Queues
+    /\ srcP \in Priorities
+    /\ dstP \in Priorities
+    /\ readySlot \in ReadySlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 \* Try to acquire the next lock in t's plan. Enabled iff no conflict.
 \* A blocked tx does not fire this — it simply sits until the blocker
 \* commits. The state-space accounts for "some other tx commits first"
@@ -586,7 +615,10 @@ Next ==
           StartCancelReceiptOnly(t, cs, rs, ls)
     \/ \E t \in TxIds, ls \in LeaseSlots, rs \in ReadySlots,
          cs \in ClaimSlots :
-          StartCancelRunning(t, ls, rs, cs)
+           StartCancelRunning(t, ls, rs, cs)
+    \/ \E t \in TxIds, srcQ \in Queues, dstQ \in Queues,
+         srcP \in Priorities, dstP \in Priorities, rs \in ReadySlots :
+          StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
