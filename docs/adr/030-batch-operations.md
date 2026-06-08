@@ -264,9 +264,15 @@ This directly addresses #307 but leaves the same UX and safety gap for queue mov
 
 For example, `priority_changes`, `queue_moves`, and future `bulk_cancels`. This keeps each operation schema explicit but duplicates lifecycle, progress, cancellation, retention, and UI work. Rejected in favor of a single operation table with operation-specific `spec` validation.
 
-### C. Run batch operations as ordinary Awa jobs
+### C. Run batch operations as ordinary Awa jobs / system jobs
 
-This is tempting because Awa already has durable jobs and progress. It creates the wrong dependency: repairing or moving a broken queue would depend on user-job dispatch being healthy, not paused, and not blocked by the backlog being repaired. It also mixes privileged control-plane work into user queues. Rejected.
+This is tempting because Awa already has durable jobs, retry, progress, and UI inspection. A future explicit **system jobs** lane could be a useful general-purpose internal work mechanism, but ordinary Awa jobs are the wrong substrate for this v0.6 operator workflow.
+
+The argument against ordinary jobs is dependency direction. Batch operations are repair/control-plane actions: an operator may need to reprioritize or move the exact queue backlog that is currently paused, overloaded, misconfigured, or unable to drain. If batch execution itself is dispatched through user-job claiming, the repair path depends on the subsystem being repaired. That creates bad incident behavior: a paused destination/source queue, a saturated queue, a broken handler registry, or a fleet intentionally running maintenance-only would block the bulk mutation.
+
+The second issue is privilege and blast radius. Batch operations mutate storage metadata and lane placement directly; they should run with maintenance/control-plane authority, not through user handler dispatch. Putting them in ordinary job tables also blurs retention and audit semantics: a batch op is an admin command with item accounting, cancellation, and 90-day audit retention, not a user workload with attempts, handler code, uniqueness, and DLQ policy.
+
+An explicit system-job engine could be revisited later if it has these properties: independent from user queues and pause state, maintenance-owned execution, no user handler registry dependency, separate permissions, and item-level accounting. At that point it would be close to the chosen `batch_operations` control-plane table. Rejected for `0.6` in favor of the smaller dedicated control-plane entity.
 
 ### D. Let operators run SQL or scripts
 

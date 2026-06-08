@@ -47,3 +47,7 @@ CREATE TABLE IF NOT EXISTS awa.batch_operation_items (
 CREATE INDEX IF NOT EXISTS idx_batch_operation_items_pending
     ON awa.batch_operation_items (operation_id, job_id)
     WHERE state = 'pending';
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (29, 'Add durable batch operations control table')
+ON CONFLICT (version) DO NOTHING;

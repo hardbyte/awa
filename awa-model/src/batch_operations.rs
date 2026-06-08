@@ -769,8 +769,26 @@ async fn apply_item(
     let outcome = match apply_to_job_tx(&mut tx, spec, job_id).await {
         Ok(true) => ItemOutcome::Processed,
         Ok(false) => ItemOutcome::Skipped,
-        Err(err) => ItemOutcome::Errored(format!("job_id={job_id}: {err}")),
+        Err(err) => {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            let outcome = ItemOutcome::Errored(format!("job_id={job_id}: {err}"));
+            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            record_item_outcome_tx(&mut tx, operation_id, job_id, &outcome).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(outcome);
+        }
     };
+    record_item_outcome_tx(&mut tx, operation_id, job_id, &outcome).await?;
+    tx.commit().await.map_err(map_sqlx_error)?;
+    Ok(outcome)
+}
+
+async fn record_item_outcome_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: Uuid,
+    job_id: i64,
+    outcome: &ItemOutcome,
+) -> Result<(), AwaError> {
     let (state, error, processed_delta, skipped_delta, errored_delta) = match &outcome {
         ItemOutcome::Processed => ("processed", None, 1_i64, 0_i64, 0_i64),
         ItemOutcome::Skipped => ("skipped", None, 0_i64, 1_i64, 0_i64),
@@ -811,8 +829,7 @@ async fn apply_item(
     .execute(tx.as_mut())
     .await
     .map_err(map_sqlx_error)?;
-    tx.commit().await.map_err(map_sqlx_error)?;
-    Ok(outcome)
+    Ok(())
 }
 
 async fn apply_to_job_tx(
@@ -858,7 +875,7 @@ async fn canonical_set_priority_tx(
                 WHEN metadata ? '_awa_original_priority' THEN metadata
                 ELSE jsonb_set(metadata, '{_awa_original_priority}', to_jsonb(priority), true)
             END
-        WHERE id = $1 AND state IN ('available', 'scheduled')
+        WHERE id = $1 AND state IN ('available', 'scheduled') AND priority <> $2
         "#,
     )
     .bind(job_id)
@@ -881,6 +898,7 @@ async fn canonical_move_queue_tx(
             SELECT id, queue, priority, metadata
             FROM awa.jobs
             WHERE id = $1 AND state IN ('available', 'scheduled')
+              AND (queue <> $2 OR ($3::smallint IS NOT NULL AND priority <> $3))
             FOR UPDATE
         ), stamped AS (
             SELECT

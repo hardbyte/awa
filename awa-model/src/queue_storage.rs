@@ -6978,8 +6978,20 @@ impl QueueStorage {
 
         let old_queue = row.queue.clone();
         let old_priority = row.priority;
-        let new_queue = queue.unwrap_or(&old_queue).to_string();
+        let requested_queue = queue.unwrap_or(&old_queue);
+        let old_logical_queue = self.logical_queue_name(&old_queue).to_string();
+        let new_queue = if queue.is_some()
+            && requested_queue != old_queue
+            && requested_queue != old_logical_queue
+        {
+            self.queue_stripe_for_enqueue(requested_queue, &row.unique_key, row.job_id)
+        } else {
+            old_queue.clone()
+        };
         let new_priority = priority.unwrap_or(old_priority);
+        if new_queue == old_queue && new_priority == old_priority {
+            return Ok(false);
+        }
         let mut payload = RuntimePayload::from_json(row.payload)?;
         let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
             AwaError::Validation("queue storage payload metadata must be a JSON object".to_string())
@@ -6987,7 +6999,7 @@ impl QueueStorage {
         if queue.is_some() {
             metadata
                 .entry("_awa_original_queue".to_string())
-                .or_insert_with(|| serde_json::Value::from(old_queue));
+                .or_insert_with(|| serde_json::Value::from(old_logical_queue));
         }
         if priority.is_some() {
             metadata
@@ -7087,8 +7099,20 @@ impl QueueStorage {
 
         let old_queue = ready.queue.clone();
         let old_priority = ready.priority;
-        let new_queue = queue.unwrap_or(&old_queue).to_string();
+        let requested_queue = queue.unwrap_or(&old_queue);
+        let old_logical_queue = self.logical_queue_name(&old_queue).to_string();
+        let new_queue = if queue.is_some()
+            && requested_queue != old_queue
+            && requested_queue != old_logical_queue
+        {
+            self.queue_stripe_for_enqueue(requested_queue, &ready.unique_key, ready.job_id)
+        } else {
+            old_queue.clone()
+        };
         let new_priority = priority.unwrap_or(old_priority);
+        if new_queue == old_queue && new_priority == old_priority {
+            return Ok(ReadyBatchMoveResult { moved: false });
+        }
         let mut payload = RuntimePayload::from_json(ready.payload.clone())?;
         let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
             AwaError::Validation("queue storage payload metadata must be a JSON object".to_string())
@@ -7096,7 +7120,7 @@ impl QueueStorage {
         if queue.is_some() {
             metadata
                 .entry("_awa_original_queue".to_string())
-                .or_insert_with(|| serde_json::Value::from(old_queue.clone()));
+                .or_insert_with(|| serde_json::Value::from(old_logical_queue));
         }
         if priority.is_some() {
             metadata

@@ -10,8 +10,11 @@ test.describe("Batch operations page", () => {
     await page.route("**/api/capabilities", (route) =>
       route.fulfill({ json: { read_only: false, poll_interval_ms: 2000 } })
     );
-    await page.route("**/api/batch-ops?limit=50", (route) =>
-      route.fulfill({
+    await page.route("**/api/batch-ops*", (route) => {
+      if (route.request().method() !== "GET") return route.fallback();
+      const url = new URL(route.request().url());
+      if (url.pathname !== "/api/batch-ops") return route.fallback();
+      return route.fulfill({
         json: submitted
           ? [
               {
@@ -36,8 +39,8 @@ test.describe("Batch operations page", () => {
               },
             ]
           : [],
-      })
-    );
+      });
+    });
     await page.route("**/api/batch-ops/preview", (route) =>
       route.fulfill({ json: { total_matched: 2, sample: [] } })
     );
@@ -84,6 +87,6 @@ test.describe("Batch operations page", () => {
     await page.getByRole("button", { name: "Preview" }).click();
     await expect(page.getByText("Preview matched 2 job(s)")).toBeVisible();
     await page.getByRole("button", { name: "Submit" }).click();
-    await expect(page.getByText("11111111")).toBeVisible();
+    await expect(page.getByRole("gridcell", { name: "11111111" })).toBeVisible();
   });
 });
