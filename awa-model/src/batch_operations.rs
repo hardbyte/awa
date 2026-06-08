@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 const DEFAULT_CHUNK_SIZE: i64 = 100;
 const PREVIEW_SAMPLE_LIMIT: i64 = 10;
+const SCAN_PAGE_SIZE: i64 = 10_000;
 const BATCH_RUNNER_LOCK_KEY: i64 = 0x4157_415f_4241_5443;
 
 fn default_retention_days() -> i64 {
@@ -607,9 +608,37 @@ async fn scan_operation(
     } else {
         count_matching_jobs(pool, &effective_filter, Some(0), Some(max_job_id)).await?
     };
-    let ids = load_matching_job_ids(pool, &effective_filter, 0, max_job_id, i64::MAX).await?;
-    let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-    insert_operation_items(&mut tx, operation.id, &ids).await?;
+    let operation_id = operation.id;
+    let mut after_job_id = 0;
+    while after_job_id < max_job_id {
+        let ids = load_matching_job_ids(
+            pool,
+            &effective_filter,
+            after_job_id,
+            max_job_id,
+            SCAN_PAGE_SIZE,
+        )
+        .await?;
+        let Some(last_job_id) = ids.last().copied() else {
+            break;
+        };
+        after_job_id = last_job_id;
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        insert_operation_items(&mut tx, operation_id, &ids).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM awa.batch_operations WHERE id = $1")
+                .bind(operation_id)
+                .fetch_one(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+        if state == BatchOperationState::Cancelling.as_str() {
+            return get_batch_operation(pool, operation_id).await;
+        }
+    }
+
     let operation = sqlx::query_as::<_, BatchOperation>(
         r#"
         UPDATE awa.batch_operations
@@ -617,21 +646,24 @@ async fn scan_operation(
             total_matched = $2,
             cursor = $3,
             updated_at = clock_timestamp()
-        WHERE id = $1
+        WHERE id = $1 AND state = 'scanning'
         RETURNING *
         "#,
     )
-    .bind(operation.id)
+    .bind(operation_id)
     .bind(total_matched)
     .bind(Json(BatchOperationCursor {
         after_job_id: 0,
         max_job_id,
     }))
-    .fetch_one(tx.as_mut())
+    .fetch_optional(pool)
     .await
     .map_err(map_sqlx_error)?;
-    tx.commit().await.map_err(map_sqlx_error)?;
-    Ok(operation)
+
+    match operation {
+        Some(operation) => Ok(operation),
+        None => get_batch_operation(pool, operation_id).await,
+    }
 }
 
 async fn finalize_operation(

@@ -7057,14 +7057,6 @@ impl QueueStorage {
                 ORDER BY ready.lane_seq DESC
                 LIMIT 1
                 FOR UPDATE OF ready SKIP LOCKED
-            ),
-            tombstone AS (
-                INSERT INTO {schema}.ready_tombstones (
-                    ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
-                )
-                SELECT ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
-                FROM target
-                ON CONFLICT DO NOTHING
             )
             SELECT
                 ready_slot,
@@ -7113,6 +7105,26 @@ impl QueueStorage {
         if new_queue == old_queue && new_priority == old_priority {
             return Ok(ReadyBatchMoveResult { moved: false });
         }
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.ready_tombstones (
+                ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT DO NOTHING
+            "#
+        ))
+        .bind(ready.ready_slot)
+        .bind(ready.ready_generation)
+        .bind(&ready.queue)
+        .bind(ready.priority)
+        .bind(ready.enqueue_shard)
+        .bind(ready.lane_seq)
+        .bind(ready.job_id)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         let mut payload = RuntimePayload::from_json(ready.payload.clone())?;
         let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
             AwaError::Validation("queue storage payload metadata must be a JSON object".to_string())

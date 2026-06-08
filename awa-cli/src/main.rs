@@ -336,7 +336,7 @@ enum BatchOpsCommands {
     List {
         #[arg(long)]
         state: Option<String>,
-        #[arg(long, default_value = "20")]
+        #[arg(long, default_value = "20", value_parser = clap::value_parser!(i64).range(1..))]
         limit: i64,
     },
     /// Show one batch operation as JSON
@@ -376,7 +376,7 @@ enum BatchOpsCommands {
     Purge {
         #[arg(long)]
         before: DateTime<Utc>,
-        #[arg(long, default_value = "1000")]
+        #[arg(long, default_value = "1000", value_parser = clap::value_parser!(i64).range(1..))]
         limit: i64,
     },
 }

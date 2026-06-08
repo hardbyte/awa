@@ -1354,6 +1354,49 @@ async fn test_queue_storage_batch_set_priority_and_move_queue() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_batch_ready_noop_does_not_tombstone() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let queue = "qs_batch_noop";
+    let schema = "awa_qs_batch_noop";
+    let store = create_store(&pool, schema).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 913 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let moved = store
+        .set_priority(&pool, job_id, 2)
+        .await
+        .expect("set_priority no-op should not fail");
+    assert!(!moved, "set_priority to the existing priority is a no-op");
+
+    let tombstones: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_tombstones WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count tombstones");
+    assert_eq!(tombstones, 0, "no-op must not tombstone the ready row");
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim after no-op");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ready_tombstone_head_advances_claim_cursor() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(6).await;

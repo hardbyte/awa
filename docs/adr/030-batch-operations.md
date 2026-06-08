@@ -179,10 +179,10 @@ For queue storage available rows, changing priority moves the row to a new physi
 
 1. Recheck that the source ready row is still live and operation-eligible.
 2. Resolve the target `(queue, priority, enqueue_shard)` lane.
-3. Lock the lane/head rows needed to prevent claim or another lane mutation from observing a half move.
-4. Reserve a new `lane_seq` from the destination lane.
-5. Insert the destination `ready_entries` row with the new priority.
-6. Insert a source `ready_tombstones` row.
+3. Lock the source `ready_entries` row with `FOR UPDATE`; the source claim-head row is read but not locked.
+4. Reserve a new `lane_seq` from the destination lane, which takes the destination lane/head lock in the normal enqueue order.
+5. Insert a source `ready_tombstones` row.
+6. Insert the destination `ready_entries` row with the new priority.
 7. Stamp `_awa_original_priority` once if missing.
 8. Commit.
 
@@ -208,10 +208,10 @@ For queue storage available rows, the per-row helper is the same lane move as `s
 2. Resolve the destination queue's `enqueue_shards` configuration.
 3. Route the destination row through the normal queue-storage reinsert helper. Because ready/deferred storage does not retain the producer's original ordering key, moved no-key rows use the destination queue's shard rotor. The source shard is irrelevant after the move.
 4. Resolve the destination `(queue, priority, enqueue_shard)` lane.
-5. Lock the required source and destination lane/head rows.
-6. Reserve the destination `lane_seq`.
-7. Insert the destination `ready_entries` row with the queue column rewritten.
-8. Insert a source `ready_tombstones` row.
+5. Lock the source `ready_entries` row with `FOR UPDATE`; the source claim-head row is read but not locked.
+6. Reserve the destination `lane_seq`, taking the destination lane/head lock in the normal enqueue order.
+7. Insert a source `ready_tombstones` row.
+8. Insert the destination `ready_entries` row with the queue column rewritten.
 9. Stamp `_awa_original_queue` once if missing, and `_awa_original_priority` if priority is also changed.
 10. Commit.
 

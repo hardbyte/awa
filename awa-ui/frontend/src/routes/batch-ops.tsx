@@ -39,6 +39,25 @@ function progressText(operation: BatchOperation): string {
   return `${accounted}/${total}`;
 }
 
+function parsePriority(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const priority = Number(trimmed);
+  if (!Number.isInteger(priority) || priority < 1 || priority > 4) return null;
+  return priority;
+}
+
+function isPayloadFormValid(form: {
+  opKind: BatchOperationKind;
+  priority: string;
+  destinationQueue: string;
+}): boolean {
+  const priority = parsePriority(form.priority);
+  if (form.opKind === "set_priority") return priority !== null;
+  if (!form.destinationQueue.trim()) return false;
+  return !form.priority.trim() || priority !== null;
+}
+
 function buildPayload(form: {
   opKind: BatchOperationKind;
   queue: string;
@@ -59,19 +78,21 @@ function buildPayload(form: {
     ...(ids.length > 0 ? { ids } : {}),
   };
   if (form.opKind === "set_priority") {
+    const priority = parsePriority(form.priority);
     return {
       op_kind: "set_priority",
       filter,
-      spec: { priority: Number(form.priority) },
+      spec: { priority: priority ?? 1 },
       submitted_by: "ui",
     };
   }
+  const priority = parsePriority(form.priority);
   return {
     op_kind: "move_queue",
     filter,
     spec: {
       queue: form.destinationQueue.trim(),
-      ...(form.priority.trim() ? { priority: Number(form.priority) } : {}),
+      ...(priority !== null ? { priority } : {}),
     },
     submitted_by: "ui",
   };
@@ -88,6 +109,7 @@ export function BatchOpsPage() {
     priority: "1",
     destinationQueue: "",
   });
+  const isPayloadValid = useMemo(() => isPayloadFormValid(form), [form]);
   const payload = useMemo(() => buildPayload(form), [form]);
 
   const operationsQuery = useQuery({
@@ -97,7 +119,10 @@ export function BatchOpsPage() {
   });
 
   const previewMutation = useMutation({
-    mutationFn: () => previewBatchOperation(payload),
+    mutationFn: () => {
+      if (!isPayloadValid) throw new Error("Invalid batch operation payload");
+      return previewBatchOperation(payload);
+    },
     onSuccess: (preview) => {
       toast.success(`Preview matched ${preview.total_matched} job(s)`);
     },
@@ -105,7 +130,10 @@ export function BatchOpsPage() {
   });
 
   const submitMutation = useMutation({
-    mutationFn: () => submitBatchOperation(payload),
+    mutationFn: () => {
+      if (!isPayloadValid) throw new Error("Invalid batch operation payload");
+      return submitBatchOperation(payload);
+    },
     onSuccess: (operation) => {
       void queryClient.invalidateQueries({ queryKey: ["batch-ops"] });
       toast.success(`Submitted batch operation ${operation.id.slice(0, 8)}`);
@@ -171,8 +199,8 @@ export function BatchOpsPage() {
           )}
         </div>
         <div className="mt-4 flex gap-2">
-          <Button onPress={() => previewMutation.mutate()} isDisabled={readOnly || previewMutation.isPending}>Preview</Button>
-          <Button intent="primary" onPress={() => submitMutation.mutate()} isDisabled={readOnly || submitMutation.isPending}>Submit</Button>
+          <Button onPress={() => previewMutation.mutate()} isDisabled={readOnly || previewMutation.isPending || !isPayloadValid}>Preview</Button>
+          <Button intent="primary" onPress={() => submitMutation.mutate()} isDisabled={readOnly || submitMutation.isPending || !isPayloadValid}>Submit</Button>
         </div>
       </section>
 
