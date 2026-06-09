@@ -287,6 +287,7 @@ pub struct TerminalDeltaRollupOutcome {
     pub grouped_keys: i64,
     pub skipped_active_slots: usize,
     pub blocked_slots: usize,
+    pub skipped_mvcc_pinned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +295,7 @@ enum TerminalDeltaSlotRollup {
     Empty,
     Rolled { delta_rows: i64, grouped_keys: i64 },
     SkippedActive,
+    SkippedMvccPinned,
     Blocked,
 }
 
@@ -11040,7 +11042,9 @@ impl QueueStorage {
     /// skips the current queue slot and any slot with active leases or open
     /// receipt claims; that keeps rollup away from the segment receiving hot
     /// completions and avoids racing future terminal deltas for the same
-    /// ready generation.
+    /// ready generation. Rollup also stands down while another backend pins the
+    /// MVCC horizon, leaving the append-only deltas visible to exact reads
+    /// until the horizon clears.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rollup_terminal_count_deltas")]
     pub async fn rollup_terminal_count_deltas(
         &self,
@@ -11088,6 +11092,10 @@ impl QueueStorage {
                 TerminalDeltaSlotRollup::SkippedActive => {
                     outcome.skipped_active_slots += 1;
                 }
+                TerminalDeltaSlotRollup::SkippedMvccPinned => {
+                    outcome.skipped_mvcc_pinned = true;
+                    break;
+                }
                 TerminalDeltaSlotRollup::Blocked => {
                     outcome.blocked_slots += 1;
                 }
@@ -11095,6 +11103,33 @@ impl QueueStorage {
         }
 
         Ok(outcome)
+    }
+
+    async fn terminal_delta_rollup_mvcc_horizon_pinned_tx(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+    ) -> Result<bool, AwaError> {
+        let pinned: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND backend_type = 'client backend'
+                  AND (
+                      backend_xmin IS NOT NULL
+                      OR (
+                          backend_xid IS NOT NULL
+                          AND state LIKE 'idle in transaction%'
+                      )
+                  )
+            )
+            "#,
+        )
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(pinned)
     }
 
     async fn terminal_delta_rollup_candidates(
@@ -11193,6 +11228,11 @@ impl QueueStorage {
         if slot_generation != generation {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(TerminalDeltaSlotRollup::Empty);
+        }
+
+        if Self::terminal_delta_rollup_mvcc_horizon_pinned_tx(&mut tx).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
         sqlx::query("SET LOCAL lock_timeout = '50ms'")
