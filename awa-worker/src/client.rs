@@ -296,7 +296,7 @@ impl ClientBuilder {
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: Fn(T, &crate::context::JobContext) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + 'static,
     {
         let kind = T::kind().to_string();
         let worker = TypedWorker {
@@ -1113,7 +1113,7 @@ struct TypedWorker<T, F, Fut>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: Fn(T, &crate::context::JobContext) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + 'static,
 {
     kind: &'static str,
     handler: Arc<F>,
@@ -1125,7 +1125,7 @@ impl<T, F, Fut> Worker for TypedWorker<T, F, Fut>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: Fn(T, &crate::context::JobContext) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + 'static,
 {
     fn kind(&self) -> &'static str {
         self.kind
@@ -2426,6 +2426,23 @@ mod tests {
         let config = QueueConfig::default();
         assert_eq!(config.claimers, 1);
         assert_eq!(config.claim_batch_size, 512);
+    }
+
+    #[tokio::test]
+    async fn register_accepts_send_non_sync_handler_future() {
+        #[derive(serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
+        struct NonSyncFutureJob;
+
+        let _client = Client::builder(lazy_pool())
+            .queue("non_sync_future", QueueConfig::default())
+            .register::<NonSyncFutureJob, _, _>(|_, _| async move {
+                let cell = std::cell::Cell::new(0_u8);
+                tokio::task::yield_now().await;
+                cell.set(1);
+                Ok(JobResult::Completed)
+            })
+            .build()
+            .expect("send but non-sync handler future should compile");
     }
 
     fn base_database_url() -> String {
