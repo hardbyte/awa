@@ -1066,6 +1066,31 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
         .execute(&pool)
         .await
         .expect("failed done_entries test index should drop cleanly");
+
+    sqlx::raw_sql(
+        r#"
+        DROP SCHEMA IF EXISTS awa_queue_storage_v031_partial CASCADE;
+        CREATE SCHEMA awa_queue_storage_v031_partial;
+        CREATE TABLE awa_queue_storage_v031_partial.queue_ring_state (
+            singleton BOOLEAN PRIMARY KEY,
+            slot_count INT NOT NULL
+        );
+        INSERT INTO awa_queue_storage_v031_partial.queue_ring_state
+            (singleton, slot_count)
+        VALUES (TRUE, 1);
+        CREATE TABLE awa_queue_storage_v031_partial.done_entries (
+            ready_slot INT NOT NULL,
+            queue TEXT NOT NULL
+        ) PARTITION BY LIST (ready_slot);
+        CREATE TABLE awa_queue_storage_v031_partial.done_entries_0
+            PARTITION OF awa_queue_storage_v031_partial.done_entries
+            FOR VALUES IN (0);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("partial queue-storage probe schema should be creatable");
+
     sqlx::query("DELETE FROM awa.schema_version WHERE version >= 31")
         .execute(&pool)
         .await

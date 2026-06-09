@@ -17,6 +17,10 @@ BEGIN
         FROM pg_namespace AS n
         WHERE to_regclass(format('%I.queue_ring_state', n.nspname)) IS NOT NULL
           AND to_regclass(format('%I.done_entries', n.nspname)) IS NOT NULL
+          AND to_regprocedure(format(
+              '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+              n.nspname
+          )) IS NOT NULL
     LOOP
         EXECUTE format(
             'SELECT slot_count FROM %I.queue_ring_state WHERE singleton = TRUE',
@@ -32,6 +36,16 @@ BEGIN
             v_child_name := format('done_entries_%s', v_slot);
 
             IF to_regclass(format('%I.%I', v_schema, v_child_name)) IS NULL THEN
+                CONTINUE;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = v_schema
+                  AND table_name = v_child_name
+                  AND column_name = 'state'
+            ) THEN
                 CONTINUE;
             END IF;
 
