@@ -12,7 +12,7 @@ use or for legacy code that uses the ``_sync`` method suffixes directly.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, Awaitable, Callable, Literal, TypeVar
+from typing import Any, Awaitable, Callable, Literal, TypedDict, TypeVar
 
 from awa._awa import (
     CallbackToken,
@@ -33,6 +33,53 @@ DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT = 16
 DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT = 8
 DEFAULT_QUEUE_STORAGE_CLAIM_SLOT_COUNT = 8
 DEFAULT_QUEUE_STORAGE_QUEUE_STRIPE_COUNT = 1
+
+BatchOperationKind = Literal["set_priority", "move_queue"]
+BatchOperationState = Literal[
+    "pending",
+    "scanning",
+    "running",
+    "cancelling",
+    "completed",
+    "cancelled",
+    "failed",
+]
+
+
+class BatchOperationFilter(TypedDict, total=False):
+    kind: str
+    queue: str
+    ids: list[int]
+    tag: str
+    state: str
+    created_at_gte: dt.datetime | str
+    created_at_lt: dt.datetime | str
+
+
+class BatchOperationPreview(TypedDict, total=False):
+    total_matched: int
+    sample: list[Job]
+
+
+class BatchOperation(TypedDict, total=False):
+    id: str
+    op_kind: str
+    filter: dict[str, Any]
+    spec: dict[str, Any]
+    state: str
+    submitted_by: str | None
+    submitted_at: str
+    started_at: str | None
+    finalized_at: str | None
+    cursor: dict[str, Any] | None
+    total_matched: int | None
+    processed: int
+    skipped: int
+    errored: int
+    last_error: str | None
+    runner_instance: str | None
+    retention_until: str | None
+    updated_at: str
 
 
 class AsyncClient:
@@ -318,6 +365,132 @@ class AsyncClient:
         return await self._raw.list_jobs(
             state=state, kind=kind, queue=queue, limit=limit
         )
+
+    # --- Durable batch operations -----------------------------------------
+    #
+    # Batch operations are maintenance-led admin mutations. They snapshot an
+    # eligible job set, apply changes in small chunks, and keep progress /
+    # cancellation state in `awa.batch_operations`.
+
+    async def preview_batch_operation(
+        self,
+        op_kind: BatchOperationKind,
+        *,
+        spec: dict[str, Any],
+        filter: BatchOperationFilter | None = None,
+    ) -> BatchOperationPreview:
+        """Preview a durable batch operation without submitting it."""
+        return await self._raw.preview_batch_operation(
+            op_kind, spec, filter=filter
+        )
+
+    async def submit_batch_operation(
+        self,
+        op_kind: BatchOperationKind,
+        *,
+        spec: dict[str, Any],
+        filter: BatchOperationFilter | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a durable batch operation for maintenance-led execution."""
+        return await self._raw.submit_batch_operation(
+            op_kind,
+            spec,
+            filter=filter,
+            submitted_by=submitted_by,
+            allow_all=allow_all,
+        )
+
+    async def preview_set_priority(
+        self,
+        priority: int,
+        *,
+        filter: BatchOperationFilter | None = None,
+    ) -> BatchOperationPreview:
+        """Preview reprioritizing queued `available` / `scheduled` jobs."""
+        return await self.preview_batch_operation(
+            "set_priority", spec={"priority": priority}, filter=filter
+        )
+
+    async def set_priority(
+        self,
+        priority: int,
+        *,
+        filter: BatchOperationFilter | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a durable batch operation that changes queued job priority."""
+        return await self.submit_batch_operation(
+            "set_priority",
+            spec={"priority": priority},
+            filter=filter,
+            submitted_by=submitted_by,
+            allow_all=allow_all,
+        )
+
+    async def preview_move_queue(
+        self,
+        queue: str,
+        *,
+        priority: int | None = None,
+        filter: BatchOperationFilter | None = None,
+    ) -> BatchOperationPreview:
+        """Preview moving queued `available` / `scheduled` jobs to another queue."""
+        spec: dict[str, Any] = {"queue": queue}
+        if priority is not None:
+            spec["priority"] = priority
+        return await self.preview_batch_operation(
+            "move_queue", spec=spec, filter=filter
+        )
+
+    async def move_queue(
+        self,
+        queue: str,
+        *,
+        priority: int | None = None,
+        filter: BatchOperationFilter | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a durable batch operation that moves queued jobs to another queue."""
+        spec: dict[str, Any] = {"queue": queue}
+        if priority is not None:
+            spec["priority"] = priority
+        return await self.submit_batch_operation(
+            "move_queue",
+            spec=spec,
+            filter=filter,
+            submitted_by=submitted_by,
+            allow_all=allow_all,
+        )
+
+    async def list_batch_operations(
+        self,
+        *,
+        state: BatchOperationState | None = None,
+        limit: int = 100,
+    ) -> list[BatchOperation]:
+        """List recent durable batch operations."""
+        return await self._raw.list_batch_operations(state=state, limit=limit)
+
+    async def get_batch_operation(self, operation_id: str) -> BatchOperation:
+        """Fetch one durable batch operation by UUID."""
+        return await self._raw.get_batch_operation(operation_id)
+
+    async def cancel_batch_operation(self, operation_id: str) -> BatchOperation:
+        """Request cooperative cancellation for an active batch operation."""
+        return await self._raw.cancel_batch_operation(operation_id)
+
+    async def purge_batch_operations(
+        self,
+        before: dt.datetime,
+        *,
+        limit: int = 1000,
+    ) -> int:
+        """Purge finalized batch operations whose `finalized_at` is before `before`."""
+        return await self._raw.purge_batch_operations(before, limit=limit)
 
     # --- Dead Letter Queue -------------------------------------------------
     #
@@ -978,6 +1151,124 @@ class Client:
         return self._raw.list_jobs_sync(
             state=state, kind=kind, queue=queue, limit=limit
         )
+
+    # --- Durable batch operations (sync) ----------------------------------
+
+    def preview_batch_operation(
+        self,
+        op_kind: BatchOperationKind,
+        *,
+        spec: dict[str, Any],
+        filter: BatchOperationFilter | None = None,
+    ) -> BatchOperationPreview:
+        """Preview a durable batch operation without submitting it."""
+        return self._raw.preview_batch_operation_sync(op_kind, spec, filter=filter)
+
+    def submit_batch_operation(
+        self,
+        op_kind: BatchOperationKind,
+        *,
+        spec: dict[str, Any],
+        filter: BatchOperationFilter | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a durable batch operation for maintenance-led execution."""
+        return self._raw.submit_batch_operation_sync(
+            op_kind,
+            spec,
+            filter=filter,
+            submitted_by=submitted_by,
+            allow_all=allow_all,
+        )
+
+    def preview_set_priority(
+        self,
+        priority: int,
+        *,
+        filter: BatchOperationFilter | None = None,
+    ) -> BatchOperationPreview:
+        """Preview reprioritizing queued `available` / `scheduled` jobs."""
+        return self.preview_batch_operation(
+            "set_priority", spec={"priority": priority}, filter=filter
+        )
+
+    def set_priority(
+        self,
+        priority: int,
+        *,
+        filter: BatchOperationFilter | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a durable batch operation that changes queued job priority."""
+        return self.submit_batch_operation(
+            "set_priority",
+            spec={"priority": priority},
+            filter=filter,
+            submitted_by=submitted_by,
+            allow_all=allow_all,
+        )
+
+    def preview_move_queue(
+        self,
+        queue: str,
+        *,
+        priority: int | None = None,
+        filter: BatchOperationFilter | None = None,
+    ) -> BatchOperationPreview:
+        """Preview moving queued `available` / `scheduled` jobs to another queue."""
+        spec: dict[str, Any] = {"queue": queue}
+        if priority is not None:
+            spec["priority"] = priority
+        return self.preview_batch_operation("move_queue", spec=spec, filter=filter)
+
+    def move_queue(
+        self,
+        queue: str,
+        *,
+        priority: int | None = None,
+        filter: BatchOperationFilter | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> BatchOperation:
+        """Submit a durable batch operation that moves queued jobs to another queue."""
+        spec: dict[str, Any] = {"queue": queue}
+        if priority is not None:
+            spec["priority"] = priority
+        return self.submit_batch_operation(
+            "move_queue",
+            spec=spec,
+            filter=filter,
+            submitted_by=submitted_by,
+            allow_all=allow_all,
+        )
+
+    def list_batch_operations(
+        self,
+        *,
+        state: BatchOperationState | None = None,
+        limit: int = 100,
+    ) -> list[BatchOperation]:
+        """List recent durable batch operations."""
+        return self._raw.list_batch_operations_sync(state=state, limit=limit)
+
+    def get_batch_operation(self, operation_id: str) -> BatchOperation:
+        """Fetch one durable batch operation by UUID."""
+        return self._raw.get_batch_operation_sync(operation_id)
+
+    def cancel_batch_operation(self, operation_id: str) -> BatchOperation:
+        """Request cooperative cancellation for an active batch operation."""
+        return self._raw.cancel_batch_operation_sync(operation_id)
+
+    def purge_batch_operations(
+        self,
+        before: dt.datetime,
+        *,
+        limit: int = 1000,
+    ) -> int:
+        """Purge finalized batch operations whose `finalized_at` is before `before`."""
+        return self._raw.purge_batch_operations_sync(before, limit=limit)
 
     def health_check(self) -> HealthCheck:
         """Runtime health check."""

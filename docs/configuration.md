@@ -339,6 +339,34 @@ awa batch-ops submit \
   --spec '{"priority":1}'
 ```
 
+Python clients expose the same durable control-plane operation. Async and sync clients use the same method names; omit `await` when using `awa.Client`:
+
+```python
+preview = await client.preview_set_priority(
+    1,
+    filter={"queue": "default", "state": "available"},
+)
+print(preview["total_matched"])
+
+operation = await client.set_priority(
+    1,
+    filter={"queue": "default"},
+    submitted_by="ops@example.com",
+)
+
+operation = await client.cancel_batch_operation(operation["id"])
+```
+
+The generic Python envelope is also available when you want exact parity with the HTTP API:
+
+```python
+operation = await client.submit_batch_operation(
+    "move_queue",
+    spec={"queue": "escalations", "priority": 1},
+    filter={"tag": "incident-123"},
+)
+```
+
 Batch-operation history is retained for `AWA_BATCH_OP_RETENTION_DAYS` days (default `90`). Use `awa batch-ops purge --before <timestamp>` for explicit cleanup of finalized operations.
 
 ## Queue and job-kind descriptors

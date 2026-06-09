@@ -425,6 +425,12 @@ All coordination through Postgres. The Rust runtime owns dispatch, leases, heart
 - [021: Sequential callbacks and callback heartbeats](docs/adr/021-enhanced-external-wait.md)
 - [022: Descriptor catalog](docs/adr/022-descriptor-catalog.md)
 - [023: Receipt plane ring partitioning](docs/adr/023-receipt-plane-ring-partitioning.md)
+- [025: Sharded enqueue heads](docs/adr/025-sharded-enqueue-heads.md)
+- [026: Narrow terminal history](docs/adr/026-narrow-terminal-history.md)
+- [027: Callback ingress as a deployable surface](docs/adr/027-callback-ingress-surface.md)
+- [028: Maintenance-only runtime role](docs/adr/028-maintenance-only-runtime-role.md)
+- [029: Transactional follow-up jobs](docs/adr/029-transactional-followup-jobs.md)
+- [030: Durable batch operations](docs/adr/030-batch-operations.md)
 
 See [docs/adr/README.md](docs/adr/README.md) for the index with status and supersession.
 

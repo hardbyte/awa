@@ -365,6 +365,36 @@ class Client:
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
     async def get_job(self, job_id: int) -> Job[dict[str, Any]]: ...
+    async def preview_batch_operation(
+        self,
+        op_kind: str,
+        spec: dict[str, Any],
+        *,
+        filter: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+    async def submit_batch_operation(
+        self,
+        op_kind: str,
+        spec: dict[str, Any],
+        *,
+        filter: dict[str, Any] | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> dict[str, Any]: ...
+    async def list_batch_operations(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]: ...
+    async def get_batch_operation(self, id: str) -> dict[str, Any]: ...
+    async def cancel_batch_operation(self, id: str) -> dict[str, Any]: ...
+    async def purge_batch_operations(
+        self,
+        before: datetime.datetime,
+        *,
+        limit: int = 1000,
+    ) -> int: ...
     async def list_dlq(
         self,
         *,
@@ -625,6 +655,36 @@ class Client:
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
     def get_job_sync(self, job_id: int) -> Job[dict[str, Any]]: ...
+    def preview_batch_operation_sync(
+        self,
+        op_kind: str,
+        spec: dict[str, Any],
+        *,
+        filter: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+    def submit_batch_operation_sync(
+        self,
+        op_kind: str,
+        spec: dict[str, Any],
+        *,
+        filter: dict[str, Any] | None = None,
+        submitted_by: str | None = None,
+        allow_all: bool = False,
+    ) -> dict[str, Any]: ...
+    def list_batch_operations_sync(
+        self,
+        *,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]: ...
+    def get_batch_operation_sync(self, id: str) -> dict[str, Any]: ...
+    def cancel_batch_operation_sync(self, id: str) -> dict[str, Any]: ...
+    def purge_batch_operations_sync(
+        self,
+        before: datetime.datetime,
+        *,
+        limit: int = 1000,
+    ) -> int: ...
     def health_check_sync(self) -> HealthCheck: ...
     def insert_many_copy_sync(
         self,

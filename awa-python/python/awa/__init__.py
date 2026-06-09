@@ -43,7 +43,15 @@ from awa._awa import (
     CallbackNotFound,
 )
 
-from awa.client import AsyncClient, Client
+from awa.client import (
+    AsyncClient,
+    BatchOperation,
+    BatchOperationFilter,
+    BatchOperationKind,
+    BatchOperationPreview,
+    BatchOperationState,
+    Client,
+)
 from awa import callback_contract
 
 __all__ = [
@@ -51,6 +59,11 @@ __all__ = [
     "Client",
     "AsyncClient",
     "RawClient",
+    "BatchOperation",
+    "BatchOperationFilter",
+    "BatchOperationKind",
+    "BatchOperationPreview",
+    "BatchOperationState",
     # Job types
     "Job",
     "JobState",

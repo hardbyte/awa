@@ -54,6 +54,7 @@ For application tables, keep using your existing database library. The `awa.brid
 - **Queue fanout** — `QueueFanout` maps one hot logical queue to several physical queues so workers can drain independent streams without changing Awa's durability model.
 - **Crash-safe execution** — heartbeat-based lease tracking; jobs whose workers vanish are rescued automatically.
 - **Per-queue policy** — priorities, priority aging, weighted concurrency, rate limits, deadlines, retry/backoff, cron, dead-letter queue.
+- **Durable batch operations** — preview, submit, monitor, and cancel async operator mutations such as reprioritizing queued jobs or moving a backlog to another queue.
 - **Progress tracking** — handlers can write structured progress that survives across retries.
 - **Web UI (optional)** — `pip install 'awa-pg[ui]'` pulls in the [`awa-cli`](https://pypi.org/project/awa-cli/) wheel, which ships the dashboard binary. Then `python -m awa serve` (or `awa serve` directly) runs a live queue inspector, DLQ triage console, and retry controls on `http://127.0.0.1:3000`. The default `awa-pg` install stays small for workers and producers that don't need the dashboard.
 
@@ -64,6 +65,34 @@ python -m awa --database-url "$DATABASE_URL" migrate
 ```
 
 Fresh installs go straight to the queue-storage engine on first migrate. Existing 0.5.x installations should follow [`docs/upgrade-0.5-to-0.6.md`](https://github.com/hardbyte/awa/blob/main/docs/upgrade-0.5-to-0.6.md) for the staged transition.
+
+## Durable batch operations
+
+Batch operations are for operator-scale mutations. They preview a filtered set, persist a control-plane record, and let the maintenance leader apply the mutation in small chunks. Python exposes the generic envelope and helpers for the first two operation kinds:
+
+```python
+preview = await client.preview_set_priority(
+    1,
+    filter={"queue": "default", "state": "available"},
+)
+
+operation = await client.set_priority(
+    1,
+    filter={"queue": "default"},
+    submitted_by="ops@example.com",
+)
+
+operation = await client.move_queue(
+    "escalations",
+    priority=1,
+    filter={"tag": "incident-123"},
+)
+
+active = await client.list_batch_operations(state="running")
+await client.cancel_batch_operation(operation["id"])
+```
+
+`awa.Client` has the same methods for synchronous scripts. Batch operations affect queued `available` and `scheduled` jobs; running, waiting, terminal, and DLQ rows keep their current attempt state.
 
 ## Partitioned FIFO and ordering keys
 
