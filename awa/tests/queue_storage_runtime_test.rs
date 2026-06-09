@@ -6008,6 +6008,80 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
     assert_eq!(counts.terminal, 6);
 }
 
+/// Terminal-count rollup mutates `queue_terminal_live_counts`, so it should
+/// stand down while another backend is pinning the MVCC horizon. Exact reads
+/// remain correct because they include pending delta rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_skips_pinned_mvcc_horizon() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_mvcc_pin";
+    let schema = "awa_qs_terminal_delta_rollup_mvcc_pin";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 6)
+        .await
+        .expect("enqueue");
+    let claimed = store.claim_batch(&pool, queue, 6).await.expect("claim");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+    match store.rotate(&pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+
+    let mut pinned = pool.acquire().await.expect("acquire pinned connection");
+    sqlx::query("BEGIN")
+        .execute(&mut *pinned)
+        .await
+        .expect("begin pinned transaction");
+    sqlx::query("SELECT txid_current()")
+        .fetch_one(&mut *pinned)
+        .await
+        .expect("establish pinned transaction xid");
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup terminal deltas under pin");
+    assert_eq!(outcome.rolled_slots, 0);
+    assert_eq!(outcome.delta_rows, 0);
+    assert_eq!(outcome.grouped_keys, 0);
+    assert_eq!(outcome.skipped_active_slots, 0);
+    assert_eq!(outcome.blocked_slots, 0);
+    assert!(outcome.skipped_mvcc_pinned);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts remain exact under pin");
+    assert_eq!(counts.terminal, 6);
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut *pinned)
+        .await
+        .expect("release pinned transaction");
+    drop(pinned);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup terminal deltas after pin release");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(outcome.delta_rows, 6);
+    assert_eq!(outcome.grouped_keys, 6);
+    assert!(!outcome.skipped_mvcc_pinned);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
+}
+
 /// ADR-026: rollup candidate selection must not let old empty sealed slots
 /// hide a later sealed slot that has pending deltas. This matters when
 /// operators choose more queue slots than a single maintenance tick can fold.

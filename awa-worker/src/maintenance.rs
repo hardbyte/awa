@@ -1068,6 +1068,7 @@ impl MaintenanceService {
                 grouped_keys: 0,
                 skipped_active_slots: 0,
                 blocked_slots: 0,
+                skipped_mvcc_pinned: false,
             }) => {}
             Ok(outcome) => {
                 debug!(
@@ -1076,6 +1077,7 @@ impl MaintenanceService {
                     grouped_keys = outcome.grouped_keys,
                     skipped_active_slots = outcome.skipped_active_slots,
                     blocked_slots = outcome.blocked_slots,
+                    skipped_mvcc_pinned = outcome.skipped_mvcc_pinned,
                     "rolled up queue-storage terminal count deltas"
                 );
             }

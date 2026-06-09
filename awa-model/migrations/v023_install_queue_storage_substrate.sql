@@ -1152,7 +1152,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON TABLE %I.queue_terminal_count_deltas IS %L',
         p_schema,
-        'Append-only signed terminal-count deltas. Completion/delete paths insert here; maintenance folds sealed-slot deltas into queue_terminal_live_counts and queue prune truncates the matching partition.'
+        'Append-only signed terminal-count deltas. Completion/delete paths insert here; maintenance folds sealed-slot deltas into queue_terminal_live_counts when no visible backend snapshot or idle transaction id pins the MVCC horizon, and queue prune truncates the matching partition.'
     );
 
     EXECUTE format(

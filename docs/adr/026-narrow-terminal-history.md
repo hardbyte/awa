@@ -56,7 +56,9 @@ Completion batches keep the existing grouping step, but append grouped deltas in
 
 `queue_counts_exact` computes the live terminal component as `queue_terminal_live_counts + SUM(queue_terminal_count_deltas)`, then adds pruned rollups from `queue_terminal_rollups` / `queue_lanes`. The exact read remains honest while maintenance is behind. If the terminal-counter trust marker is not set, the read path falls back to scanning `done_entries` so rolling upgrades and recovery windows stay honest.
 
-The maintenance leader rolls sealed delta segments into `queue_terminal_live_counts` in deterministic key order, then truncates the matching delta child in the same transaction. Candidate selection is driven by sealed slots that actually contain pending deltas, so an empty old prefix cannot hide a later sealed slot that needs rollup. Rollup skips the current queue slot and any slot with active leases or open receipt claims. Queue prune also truncates the delta child after folding terminal history into permanent rollups, so a lagging counter rollup cannot block retention.
+The maintenance leader rolls sealed delta segments into `queue_terminal_live_counts` in deterministic key order, then truncates the matching delta child in the same transaction. Candidate selection is driven by sealed slots that actually contain pending deltas, so an empty old prefix cannot hide a later sealed slot that needs rollup. Rollup skips the current queue slot and any slot with active leases or open receipt claims.
+
+Rollup is also MVCC-horizon aware. If PostgreSQL reports another backend with an open snapshot in the current database, or an idle transaction with an assigned transaction id, maintenance returns before mutating `queue_terminal_live_counts` or locking the delta child. The pending deltas remain append-only and exact reads remain honest because they include the delta sum. When the horizon clears, a later maintenance tick folds the sealed deltas. Queue prune also truncates the delta child after folding terminal history into permanent rollups, so a lagging counter rollup cannot block retention.
 
 The trust marker remains meaningful: it means the folded counter plus all unrolled deltas is complete for the active schema. Rebuild recomputes the folded counter from `done_entries` and clears the delta ledger.
 
@@ -66,6 +68,7 @@ Correctness requirements for the delta ledger:
 - Exact reads must include every committed terminal mutation exactly once: either in the rolled-up counter or in the unrolled delta sum.
 - Rollup must be crash-safe and idempotent. Applying deltas and truncating the delta segment must commit together.
 - Rollup must acquire counter rows in deterministic order.
+- Rollup may defer while the MVCC horizon is pinned, but the deferral must happen before mutating folded counters or truncating pending deltas.
 - Segment prune may truncate pending delta rows only because it first folds terminal history from `done_entries` into permanent rollups; exact reads no longer need those pending deltas after the terminal segment is pruned.
 - The storage TLA+ models track terminal deltas as append-only, partition-truncated derived state; they do not make job safety depend on counter rollup timing.
 
@@ -84,6 +87,7 @@ Correctness requirements for the delta ledger:
 - Terminal delete paths have one more responsibility: append the matching negative terminal-count delta before re-enqueuing, moving to DLQ, or discarding.
 - Queue-prune logic must continue treating ready and terminal rows as one retention unit.
 - Exact terminal-count reads must include both folded counters and pending deltas. Operational SQL that reads only `queue_terminal_live_counts` sees folded state, not the full exact count.
+- Pending delta rows can accumulate while long reader transactions pin the MVCC horizon. That is intentional: it trades a larger append-only ledger for near-zero dead tuples in `queue_terminal_live_counts` during the pin.
 
 ## Alternatives Considered
 

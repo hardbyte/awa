@@ -406,6 +406,11 @@ TerminalDeltaRollupTx == <<
     Mut("Update", "queue_terminal_live_counts"),
     Mut("Truncate", "queue_terminal_count_deltas")
 >>
+\* If another backend pins the MVCC horizon with an open snapshot or idle
+\* transaction id, terminal-count rollup returns before mutating the folded
+\* counter or truncating the delta child. This SELECT-only shape generates no
+\* dead tuples; exact reads include the still-pending delta rows.
+TerminalDeltaRollupPinnedTx == << >>
 
 RotateClaimsTx == << Mut("Update", "claim_ring_state") >>
 PruneClaimsTx  == <<
@@ -426,7 +431,7 @@ Transactions == {
     DeleteTerminalCompatTx, RetryFromTerminalTx, RetryFromDlqTx, PurgeDlqTx,
     HeartbeatTx, ProgressFlushTx,
     RotateLeasesTx, PruneLeasesTx,
-    RotateReadyTx, PruneReadyTx, TerminalDeltaRollupTx,
+    RotateReadyTx, PruneReadyTx, TerminalDeltaRollupTx, TerminalDeltaRollupPinnedTx,
     RotateClaimsTx, PruneClaimsTx
 }
 

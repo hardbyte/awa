@@ -13,7 +13,7 @@ Line numbers in this doc refer to `awa-model/src/queue_storage.rs` unless stated
 | `deferredEntries` | `{schema}.deferred_jobs` |
 | `waitingLeases` | subset of `{schema}.leases` rows with `state = 'waiting_external'`; there is no waiting table |
 | `terminalEntries` | `{schema}.done_entries` (ADR-019 target name: `terminal_entries`). ADR-026 makes ready-backed terminal rows narrow: duplicated immutable body fields hydrate from the retained `{schema}.ready_entries` row until queue prune reclaims both. |
-| terminal-count derived state | `{schema}.queue_terminal_count_deltas`, `{schema}.queue_terminal_live_counts`, and `{schema}.queue_terminal_rollups`. `AwaSegmentedStorage` does not model these as lifecycle variables because they do not affect claimability, lease ownership, or stale-write rejection. `AwaDeadTupleContract` models their mutation/reclaim shape, and Rust tests assert exact reads use folded counts plus pending deltas. |
+| terminal-count derived state | `{schema}.queue_terminal_count_deltas`, `{schema}.queue_terminal_live_counts`, and `{schema}.queue_terminal_rollups`. `AwaSegmentedStorage` does not model these as lifecycle variables because they do not affect claimability, lease ownership, or stale-write rejection. `AwaDeadTupleContract` models their mutation/reclaim shape, and Rust tests assert exact reads use folded counts plus pending deltas while rollup is deferred under a pinned MVCC horizon. |
 | `dlqEntries` | `{schema}.dlq_entries` |
 | `activeLeases` | live rows in `{schema}.leases`, including both `running` and `waiting_external` |
 | `attemptState` | `{schema}.attempt_state` |
@@ -29,7 +29,7 @@ Line numbers in this doc refer to `awa-model/src/queue_storage.rs` unless stated
 | `claimSegments[seg]` state | same semantics as other segment families; `{schema}.claim_ring_state.current_slot` identifies the open partition, `{schema}.claim_ring_slots(slot)` tracks per-partition generation. Seeded in `prepare_schema`; rotated by `rotate_claims`. |
 | `claimSegmentCursor` | `{schema}.claim_ring_state.current_slot`. |
 
-The TLA+ lifecycle model does not represent the completed-history rollup cache or terminal-count delta ledger. Rust stores permanent pruned counts in `{schema}.queue_terminal_rollups`, with `queue_lanes.pruned_completed_count` kept only as a transitional legacy source for backfill / fallback reads during upgrades. Pending retained-segment count deltas live in `{schema}.queue_terminal_count_deltas` until maintenance folds sealed slots into `{schema}.queue_terminal_live_counts`.
+The TLA+ lifecycle model does not represent the completed-history rollup cache or terminal-count delta ledger. Rust stores permanent pruned counts in `{schema}.queue_terminal_rollups`, with `queue_lanes.pruned_completed_count` kept only as a transitional legacy source for backfill / fallback reads during upgrades. Pending retained-segment count deltas live in `{schema}.queue_terminal_count_deltas` until maintenance folds sealed slots into `{schema}.queue_terminal_live_counts`; if another backend pins the MVCC horizon with an open snapshot or idle transaction id, that fold is a SELECT-only no-op and exact reads continue to include the pending deltas.
 
 ## Action mapping
 

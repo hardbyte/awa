@@ -480,7 +480,9 @@ Queue storage keeps exact terminal counts without updating mutable counter rows 
 
 A queue slot is one partition in queue storage's rotating ready/done ring. A sealed slot is no longer the current write slot, so maintenance can fold its terminal-count deltas without touching the active completion segment.
 
-The maintenance leader folds pending deltas from sealed queue slots every `terminal_count_rollup_interval` (default `30s`) and processes at most four slots per tick. Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the delta ledger is growing faster than maintenance drains it.
+The maintenance leader folds pending deltas from sealed queue slots every `terminal_count_rollup_interval` (default `30s`) and processes at most four slots per tick. Rollup is MVCC-horizon aware: if another backend is holding a visible snapshot open, or is idle in a transaction with an assigned transaction id, maintenance leaves pending delta rows append-only and tries again on a later tick. Exact counts remain correct because they read folded counters plus pending deltas.
+
+Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the delta ledger is growing faster than maintenance drains it. Under long reader transactions, lowering the interval does not force rollup; the useful fix is to release the pinned snapshot or let queue prune reclaim the whole sealed segment.
 
 ### Rust
 
