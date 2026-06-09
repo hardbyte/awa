@@ -2029,23 +2029,22 @@ impl Client {
         let available_rows = if let Some(store) = effective_storage.queue_storage_store() {
             sqlx::query_as::<_, (String, i64)>(&format!(
                 r#"
-                SELECT ready.queue, count(*)::bigint AS available
-                FROM {}.ready_entries AS ready
+                SELECT
+                    enqueues.queue,
+                    COALESCE(
+                        sum(GREATEST(
+                            {}.sequence_next_value(enqueues.seq_name)
+                                - {}.sequence_next_value(claims.seq_name),
+                            0
+                        )),
+                        0
+                    )::bigint AS available
+                FROM {}.queue_enqueue_heads AS enqueues
                 JOIN {}.queue_claim_heads AS claims
-                  ON claims.queue = ready.queue
-                 AND claims.priority = ready.priority
-                 AND claims.enqueue_shard = ready.enqueue_shard
-                WHERE ready.lane_seq >= {}.sequence_next_value(claims.seq_name)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {}.ready_tombstones AS tomb
-                      WHERE tomb.ready_slot = ready.ready_slot
-                        AND tomb.ready_generation = ready.ready_generation
-                        AND tomb.queue = ready.queue
-                        AND tomb.priority = ready.priority
-                        AND tomb.enqueue_shard = ready.enqueue_shard
-                        AND tomb.lane_seq = ready.lane_seq
-                  )
-                GROUP BY ready.queue
+                  ON claims.queue = enqueues.queue
+                 AND claims.priority = enqueues.priority
+                 AND claims.enqueue_shard = enqueues.enqueue_shard
+                GROUP BY enqueues.queue
                 "#,
                 store.schema(),
                 store.schema(),

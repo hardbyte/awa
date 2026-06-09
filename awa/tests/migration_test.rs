@@ -1034,10 +1034,85 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
         has_delta_nonzero_constraint,
         "queue_terminal_count_deltas should reject no-op zero deltas"
     );
+    let has_done_failed_index: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa_queue_storage_prepared.idx_awa_queue_storage_prepared_done_0_failed_queue') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("failed done_entries index probe should succeed");
+    assert!(
+        has_done_failed_index,
+        "done_entries failed-row metric probe should have a partial index"
+    );
     assert!(
         relation_exists(&pool, "awa_queue_storage_prepared.leases").await,
         "prepared queue-storage schema should materialize leases"
     );
+}
+
+#[tokio::test]
+async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let schema = "awa_queue_storage_v031_index";
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    let index_name = format!("idx_{schema}_done_0_failed_queue");
+    sqlx::query(&format!("DROP INDEX IF EXISTS {schema}.{index_name}"))
+        .execute(&pool)
+        .await
+        .expect("failed done_entries test index should drop cleanly");
+
+    sqlx::raw_sql(
+        r#"
+        DROP SCHEMA IF EXISTS awa_queue_storage_v031_partial CASCADE;
+        CREATE SCHEMA awa_queue_storage_v031_partial;
+        CREATE TABLE awa_queue_storage_v031_partial.queue_ring_state (
+            singleton BOOLEAN PRIMARY KEY,
+            slot_count INT NOT NULL
+        );
+        INSERT INTO awa_queue_storage_v031_partial.queue_ring_state
+            (singleton, slot_count)
+        VALUES (TRUE, 1);
+        CREATE TABLE awa_queue_storage_v031_partial.done_entries (
+            ready_slot INT NOT NULL,
+            queue TEXT NOT NULL
+        ) PARTITION BY LIST (ready_slot);
+        CREATE TABLE awa_queue_storage_v031_partial.done_entries_0
+            PARTITION OF awa_queue_storage_v031_partial.done_entries
+            FOR VALUES IN (0);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("partial queue-storage probe schema should be creatable");
+
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 31")
+        .execute(&pool)
+        .await
+        .expect("schema_version rewind should succeed");
+
+    migrations::run(&pool)
+        .await
+        .expect("v031 should rerun cleanly");
+
+    let has_done_failed_index: bool = sqlx::query_scalar(&format!(
+        "SELECT to_regclass('{schema}.{index_name}') IS NOT NULL"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("failed done_entries index probe should succeed");
+    assert!(
+        has_done_failed_index,
+        "v031 must backfill failed-row metric indexes for existing queue-storage schemas"
+    );
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
 #[tokio::test]

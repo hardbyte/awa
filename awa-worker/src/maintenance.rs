@@ -183,6 +183,25 @@ impl MaintenanceBranchTracker {
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
     ) -> Option<BranchTimer<'a>> {
+        self.try_begin_with_cooldown(branch, tick_interval, metrics, BRANCH_COOLDOWN_TICKS)
+    }
+
+    fn try_begin_without_cooldown<'a>(
+        &'a self,
+        branch: &'static str,
+        tick_interval: Duration,
+        metrics: &'a crate::metrics::AwaMetrics,
+    ) -> Option<BranchTimer<'a>> {
+        self.try_begin_with_cooldown(branch, tick_interval, metrics, 0)
+    }
+
+    fn try_begin_with_cooldown<'a>(
+        &'a self,
+        branch: &'static str,
+        tick_interval: Duration,
+        metrics: &'a crate::metrics::AwaMetrics,
+        cooldown_ticks: u32,
+    ) -> Option<BranchTimer<'a>> {
         let mut branches = self
             .branches
             .lock()
@@ -216,22 +235,24 @@ impl MaintenanceBranchTracker {
                 let cross_threshold = state.consecutive_overrun >= OVERRUN_HYSTERESIS_K;
                 if cross_threshold && !state.is_delayed {
                     state.is_delayed = true;
-                    state.cooldown_ticks_remaining = BRANCH_COOLDOWN_TICKS;
+                    state.cooldown_ticks_remaining = cooldown_ticks;
                     warn!(
                         branch,
                         last_duration_ms = last_duration.as_millis() as u64,
                         tick_interval_ms = tick_interval.as_millis() as u64,
                         upper_threshold_ms = upper_threshold.as_millis() as u64,
                         consecutive_overrun = state.consecutive_overrun,
-                        cooldown_ticks = BRANCH_COOLDOWN_TICKS,
-                        "maintenance branch overran tick interval, entering cooldown",
+                        cooldown_ticks,
+                        "maintenance branch overran tick interval",
                     );
                     metrics.record_maintenance_branch_overrun(branch);
-                    return None;
-                } else if cross_threshold && state.is_delayed {
+                    if cooldown_ticks > 0 {
+                        return None;
+                    }
+                } else if cross_threshold && state.is_delayed && cooldown_ticks > 0 {
                     // Already delayed and another overrun arrived —
                     // re-arm cooldown but stay quiet about it.
-                    state.cooldown_ticks_remaining = BRANCH_COOLDOWN_TICKS;
+                    state.cooldown_ticks_remaining = cooldown_ticks;
                     return None;
                 }
             } else if last_duration < lower_threshold {
@@ -866,7 +887,7 @@ impl MaintenanceService {
                         }
                     }
                     _ = terminal_count_rollup_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
+                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
                             self.rollup_terminal_count_deltas().await;
                             timer.finish();
                         }
@@ -2362,47 +2383,83 @@ impl MaintenanceService {
         runtime: &crate::storage::QueueStorageRuntime,
     ) {
         let schema = runtime.store.schema();
+        // This is a high-cadence metrics path, not an admin exact-count
+        // endpoint. Keep it on queue-storage control tables and bounded
+        // lane-head probes so long retained ready/done segments do not
+        // compete with worker traffic. Admin surfaces that need exact
+        // availability still go through QueueStorage::queue_counts().
         let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
             r#"
-            WITH queues AS (
+            WITH head_signal AS (
+                SELECT
+                    enqueues.queue,
+                    enqueues.priority,
+                    enqueues.enqueue_shard,
+                    {schema}.sequence_next_value(enqueues.seq_name) AS next_seq,
+                    {schema}.sequence_next_value(claims.seq_name) AS claim_seq
+                FROM {schema}.queue_enqueue_heads AS enqueues
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = enqueues.queue
+                 AND claims.priority = enqueues.priority
+                 AND claims.enqueue_shard = enqueues.enqueue_shard
+            ),
+            queues AS (
                 SELECT DISTINCT queue
                 FROM (
                     SELECT queue FROM awa.queue_meta
                     UNION ALL
-                    SELECT queue FROM {schema}.ready_entries
+                    SELECT queue FROM head_signal
                     UNION ALL
                     SELECT queue FROM {schema}.leases
                     UNION ALL
+                    SELECT queue FROM {schema}.lease_claims
+                    UNION ALL
                     SELECT queue FROM {schema}.deferred_jobs
                     UNION ALL
-                    SELECT queue FROM {schema}.done_entries
+                    SELECT queue FROM {schema}.queue_terminal_live_counts
+                    UNION ALL
+                    SELECT queue FROM {schema}.queue_terminal_rollups
                     UNION ALL
                     SELECT queue FROM {schema}.dlq_entries
                 ) queues
             ),
             ready AS (
                 SELECT
-                    ready.queue,
-                    count(*)::bigint AS available,
-                    EXTRACT(EPOCH FROM clock_timestamp() - min(ready.run_at))::double precision
+                    head_signal.queue,
+                    COALESCE(
+                        sum(GREATEST(head_signal.next_seq - head_signal.claim_seq, 0)),
+                        0
+                    )::bigint AS available
+                FROM head_signal
+                GROUP BY head_signal.queue
+            ),
+            lag AS (
+                SELECT
+                    head_signal.queue,
+                    EXTRACT(EPOCH FROM clock_timestamp() - min(next_ready.run_at))::double precision
                         AS lag_seconds
-                FROM {schema}.ready_entries AS ready
-                JOIN {schema}.queue_claim_heads AS claims
-                  ON claims.queue = ready.queue
-                 AND claims.priority = ready.priority
-                 AND claims.enqueue_shard = ready.enqueue_shard
-                WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.ready_tombstones AS tomb
-                      WHERE tomb.ready_slot = ready.ready_slot
-                        AND tomb.ready_generation = ready.ready_generation
-                        AND tomb.queue = ready.queue
-                        AND tomb.priority = ready.priority
-                        AND tomb.enqueue_shard = ready.enqueue_shard
-                        AND tomb.lane_seq = ready.lane_seq
-                  )
-                GROUP BY ready.queue
+                FROM head_signal
+                JOIN LATERAL (
+                    SELECT ready.run_at
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.queue = head_signal.queue
+                      AND ready.priority = head_signal.priority
+                      AND ready.enqueue_shard = head_signal.enqueue_shard
+                      AND ready.lane_seq >= head_signal.claim_seq
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.ready_tombstones AS tomb
+                          WHERE tomb.ready_slot = ready.ready_slot
+                            AND tomb.ready_generation = ready.ready_generation
+                            AND tomb.queue = ready.queue
+                            AND tomb.priority = ready.priority
+                            AND tomb.enqueue_shard = ready.enqueue_shard
+                            AND tomb.lane_seq = ready.lane_seq
+                      )
+                    ORDER BY ready.lane_seq
+                    LIMIT 1
+                ) AS next_ready ON TRUE
+                GROUP BY head_signal.queue
             ),
             leases AS (
                 SELECT
@@ -2431,24 +2488,6 @@ impl MaintenanceService {
                       WHERE lease.job_id = claims.job_id
                         AND lease.run_lease = claims.run_lease
                   )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.deferred_jobs AS deferred
-                      WHERE deferred.job_id = claims.job_id
-                        AND deferred.run_lease = claims.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.done_entries AS done
-                      WHERE done.job_id = claims.job_id
-                        AND done.run_lease = claims.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.dlq_entries AS dlq
-                      WHERE dlq.job_id = claims.job_id
-                        AND dlq.run_lease = claims.run_lease
-                  )
                 GROUP BY claims.queue
             ),
             deferred AS (
@@ -2462,8 +2501,9 @@ impl MaintenanceService {
             terminal AS (
                 SELECT
                     queue,
-                    count(*) FILTER (WHERE state = 'failed')::bigint AS failed_done
+                    count(*)::bigint AS failed_done
                 FROM {schema}.done_entries
+                WHERE state = 'failed'
                 GROUP BY queue
             ),
             dlq AS (
@@ -2485,10 +2525,12 @@ impl MaintenanceService {
                 COALESCE(deferred.retryable, 0)::bigint AS retryable,
                 COALESCE(terminal.failed_done, 0)::bigint AS failed_done,
                 COALESCE(dlq.failed_dlq, 0)::bigint AS failed_dlq,
-                ready.lag_seconds
+                lag.lag_seconds
             FROM queues
             LEFT JOIN ready
               ON ready.queue = queues.queue
+            LEFT JOIN lag
+              ON lag.queue = queues.queue
             LEFT JOIN leases
               ON leases.queue = queues.queue
             LEFT JOIN receipt_claims
@@ -2547,7 +2589,10 @@ impl MaintenanceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use awa_model::{migrations, QueueStorage, QueueStorageConfig};
     use chrono::TimeZone;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::OnceLock;
 
     fn cron_row(
         cron_expr: &str,
@@ -2663,6 +2708,87 @@ mod tests {
 
     fn metrics_for_test() -> crate::metrics::AwaMetrics {
         crate::metrics::AwaMetrics::from_global()
+    }
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+    }
+
+    fn db_test_mutex() -> &'static tokio::sync::Mutex<()> {
+        static MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn ensure_database_exists(url: &str) {
+        let parts = url
+            .rsplit_once('/')
+            .expect("DATABASE_URL must include a database name");
+        let database_name = parts.1.to_string();
+        let admin_url = format!("{}/postgres", parts.0);
+        let admin_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("Failed to connect to admin database for maintenance tests");
+        let create_sql = format!("CREATE DATABASE {database_name}");
+        match sqlx::query(&create_sql).execute(&admin_pool).await {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+            Err(err) => panic!("Failed to create maintenance test database {database_name}: {err}"),
+        }
+    }
+
+    async fn setup_pool(max_connections: u32) -> PgPool {
+        let url = database_url();
+        ensure_database_exists(&url).await;
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .expect("Failed to connect to maintenance test database")
+    }
+
+    async fn reset_schema(pool: &PgPool) {
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS awa CASCADE")
+            .execute(pool)
+            .await
+            .expect("Failed to drop awa schema");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_storage_metrics_query_uses_bounded_observability_path() {
+        let _guard = db_test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("migrations should succeed");
+
+        let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+        store.install(&pool).await.expect("queue storage install");
+
+        let runtime = crate::storage::QueueStorageRuntime::new(
+            QueueStorageConfig::default(),
+            Duration::from_millis(1000),
+            Duration::from_millis(250),
+        )
+        .expect("queue storage runtime");
+        let service = MaintenanceService::new(
+            pool,
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime.clone()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        );
+
+        service.publish_queue_storage_health_metrics(&runtime).await;
     }
 
     #[test]
@@ -2797,6 +2923,45 @@ mod tests {
         assert_eq!(
             cooldown, BRANCH_COOLDOWN_TICKS,
             "cooldown armed to BRANCH_COOLDOWN_TICKS at flip"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_without_cooldown_tracks_overrun_but_keeps_running() {
+        let tracker = MaintenanceBranchTracker::new();
+        let metrics = metrics_for_test();
+        seed_last_duration(
+            &tracker,
+            "terminal_count_rollup",
+            Duration::from_millis(250),
+        );
+
+        let mut ran = Vec::new();
+        for _ in 0..OVERRUN_HYSTERESIS_K {
+            let timer = tracker.try_begin_without_cooldown(
+                "terminal_count_rollup",
+                Duration::from_millis(100),
+                &metrics,
+            );
+            ran.push(timer.is_some());
+            if timer.is_some() {
+                tracker.record_finish("terminal_count_rollup", Duration::from_millis(250));
+            }
+        }
+
+        assert_eq!(
+            ran,
+            vec![true, true, true],
+            "no-cooldown branches should keep running on overrun"
+        );
+        let (cooldown, overrun, _) = tracker
+            .cooldown_snapshot("terminal_count_rollup")
+            .expect("snapshot");
+        assert_eq!(cooldown, 0, "no-cooldown branch must not arm cooldown");
+        assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
+        assert!(
+            tracker.snapshot("terminal_count_rollup").unwrap().1,
+            "overrun state should still be observable"
         );
     }
 

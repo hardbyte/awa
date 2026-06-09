@@ -1375,6 +1375,11 @@ BEGIN
         );
 
         EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_done_%s_failed_queue ON %I.%I (queue) WHERE state = ''failed''::awa.job_state',
+            p_schema, v_slot, p_schema, format('done_entries_%s', v_slot)
+        );
+
+        EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.queue_terminal_count_deltas FOR VALUES IN (%s)',
             p_schema, format('queue_terminal_count_deltas_%s', v_slot), p_schema, v_slot
         );

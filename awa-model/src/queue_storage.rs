@@ -345,6 +345,13 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
     AwaError::Database(err)
 }
 
+fn is_lock_contention_error(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("55P03")
+    )
+}
+
 fn validate_ident(ident: &str) -> Result<(), AwaError> {
     let mut chars = ident.chars();
     match chars.next() {
@@ -10935,6 +10942,16 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         sqlx::query(&format!(
+            "LOCK TABLE {schema}.done_entries, \
+             {schema}.queue_terminal_count_deltas, \
+             {schema}.queue_terminal_live_counts \
+             IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
             "TRUNCATE TABLE {schema}.queue_terminal_live_counts, {schema}.queue_terminal_count_deltas"
         ))
         .execute(tx.as_mut())
@@ -11189,9 +11206,16 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await;
 
-        if lock_delta.is_err() {
-            let _ = tx.rollback().await;
-            return Ok(TerminalDeltaSlotRollup::Blocked);
+        match lock_delta {
+            Ok(_) => {}
+            Err(err) if is_lock_contention_error(&err) => {
+                let _ = tx.rollback().await;
+                return Ok(TerminalDeltaSlotRollup::Blocked);
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(map_sqlx_error(err));
+            }
         }
 
         let active_refs: i64 = sqlx::query_scalar(&format!(
@@ -11331,9 +11355,13 @@ impl QueueStorage {
                     grouped_keys,
                 })
             }
-            Err(_) => {
+            Err(err) if is_lock_contention_error(&err) => {
                 let _ = tx.rollback().await;
                 Ok(TerminalDeltaSlotRollup::Blocked)
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(map_sqlx_error(err))
             }
         }
     }
