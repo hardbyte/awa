@@ -183,6 +183,25 @@ impl MaintenanceBranchTracker {
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
     ) -> Option<BranchTimer<'a>> {
+        self.try_begin_with_cooldown(branch, tick_interval, metrics, BRANCH_COOLDOWN_TICKS)
+    }
+
+    fn try_begin_without_cooldown<'a>(
+        &'a self,
+        branch: &'static str,
+        tick_interval: Duration,
+        metrics: &'a crate::metrics::AwaMetrics,
+    ) -> Option<BranchTimer<'a>> {
+        self.try_begin_with_cooldown(branch, tick_interval, metrics, 0)
+    }
+
+    fn try_begin_with_cooldown<'a>(
+        &'a self,
+        branch: &'static str,
+        tick_interval: Duration,
+        metrics: &'a crate::metrics::AwaMetrics,
+        cooldown_ticks: u32,
+    ) -> Option<BranchTimer<'a>> {
         let mut branches = self
             .branches
             .lock()
@@ -216,22 +235,24 @@ impl MaintenanceBranchTracker {
                 let cross_threshold = state.consecutive_overrun >= OVERRUN_HYSTERESIS_K;
                 if cross_threshold && !state.is_delayed {
                     state.is_delayed = true;
-                    state.cooldown_ticks_remaining = BRANCH_COOLDOWN_TICKS;
+                    state.cooldown_ticks_remaining = cooldown_ticks;
                     warn!(
                         branch,
                         last_duration_ms = last_duration.as_millis() as u64,
                         tick_interval_ms = tick_interval.as_millis() as u64,
                         upper_threshold_ms = upper_threshold.as_millis() as u64,
                         consecutive_overrun = state.consecutive_overrun,
-                        cooldown_ticks = BRANCH_COOLDOWN_TICKS,
-                        "maintenance branch overran tick interval, entering cooldown",
+                        cooldown_ticks,
+                        "maintenance branch overran tick interval",
                     );
                     metrics.record_maintenance_branch_overrun(branch);
-                    return None;
-                } else if cross_threshold && state.is_delayed {
+                    if cooldown_ticks > 0 {
+                        return None;
+                    }
+                } else if cross_threshold && state.is_delayed && cooldown_ticks > 0 {
                     // Already delayed and another overrun arrived —
                     // re-arm cooldown but stay quiet about it.
-                    state.cooldown_ticks_remaining = BRANCH_COOLDOWN_TICKS;
+                    state.cooldown_ticks_remaining = cooldown_ticks;
                     return None;
                 }
             } else if last_duration < lower_threshold {
@@ -866,7 +887,7 @@ impl MaintenanceService {
                         }
                     }
                     _ = terminal_count_rollup_timer.tick() => {
-                        if let Some(timer) = branch_tracker.try_begin("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
+                        if let Some(timer) = branch_tracker.try_begin_without_cooldown("terminal_count_rollup", self.terminal_count_rollup_interval, &self.metrics) {
                             self.rollup_terminal_count_deltas().await;
                             timer.finish();
                         }
@@ -2391,6 +2412,8 @@ impl MaintenanceService {
                     UNION ALL
                     SELECT queue FROM {schema}.leases
                     UNION ALL
+                    SELECT queue FROM {schema}.lease_claims
+                    UNION ALL
                     SELECT queue FROM {schema}.deferred_jobs
                     UNION ALL
                     SELECT queue FROM {schema}.queue_terminal_live_counts
@@ -2900,6 +2923,45 @@ mod tests {
         assert_eq!(
             cooldown, BRANCH_COOLDOWN_TICKS,
             "cooldown armed to BRANCH_COOLDOWN_TICKS at flip"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_without_cooldown_tracks_overrun_but_keeps_running() {
+        let tracker = MaintenanceBranchTracker::new();
+        let metrics = metrics_for_test();
+        seed_last_duration(
+            &tracker,
+            "terminal_count_rollup",
+            Duration::from_millis(250),
+        );
+
+        let mut ran = Vec::new();
+        for _ in 0..OVERRUN_HYSTERESIS_K {
+            let timer = tracker.try_begin_without_cooldown(
+                "terminal_count_rollup",
+                Duration::from_millis(100),
+                &metrics,
+            );
+            ran.push(timer.is_some());
+            if timer.is_some() {
+                tracker.record_finish("terminal_count_rollup", Duration::from_millis(250));
+            }
+        }
+
+        assert_eq!(
+            ran,
+            vec![true, true, true],
+            "no-cooldown branches should keep running on overrun"
+        );
+        let (cooldown, overrun, _) = tracker
+            .cooldown_snapshot("terminal_count_rollup")
+            .expect("snapshot");
+        assert_eq!(cooldown, 0, "no-cooldown branch must not arm cooldown");
+        assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
+        assert!(
+            tracker.snapshot("terminal_count_rollup").unwrap().1,
+            "overrun state should still be observable"
         );
     }
 

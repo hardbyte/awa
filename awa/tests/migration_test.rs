@@ -1051,6 +1051,46 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
 }
 
 #[tokio::test]
+async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let schema = "awa_queue_storage_v031_index";
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    let index_name = format!("idx_{schema}_done_0_failed_queue");
+    sqlx::query(&format!("DROP INDEX IF EXISTS {schema}.{index_name}"))
+        .execute(&pool)
+        .await
+        .expect("failed done_entries test index should drop cleanly");
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 31")
+        .execute(&pool)
+        .await
+        .expect("schema_version rewind should succeed");
+
+    migrations::run(&pool)
+        .await
+        .expect("v031 should rerun cleanly");
+
+    let has_done_failed_index: bool = sqlx::query_scalar(&format!(
+        "SELECT to_regclass('{schema}.{index_name}') IS NOT NULL"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("failed done_entries index probe should succeed");
+    assert!(
+        has_done_failed_index,
+        "v031 must backfill failed-row metric indexes for existing queue-storage schemas"
+    );
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+}
+
+#[tokio::test]
 async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;

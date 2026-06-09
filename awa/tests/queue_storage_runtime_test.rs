@@ -3861,6 +3861,11 @@ async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receip
         .expect("register callback and materialize receipt claim");
     assert_eq!(lease_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        0,
+        "materializing a receipt-backed attempt must not close the receipt"
+    );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
 
     let materialized_counts = store
