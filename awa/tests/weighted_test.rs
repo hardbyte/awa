@@ -618,10 +618,17 @@ async fn test_weight_proportionality() {
 
     client.start().await.unwrap();
 
-    // Wait for enough jobs to complete to see steady-state behavior
+    // Wait for enough jobs to complete to see steady-state behavior. Wait on
+    // the snapshot publication itself, not the completion counter: the worker
+    // increments the counter before storing the snapshot, so polling the
+    // counter could observe SNAPSHOT_END a beat before the stores land.
     let start = std::time::Instant::now();
     loop {
-        if total_completed.load(Ordering::SeqCst) >= SNAPSHOT_END {
+        if base_a.load(Ordering::SeqCst) != SNAPSHOT_UNSET
+            && base_b.load(Ordering::SeqCst) != SNAPSHOT_UNSET
+            && snapshot_a.load(Ordering::SeqCst) != SNAPSHOT_UNSET
+            && snapshot_b.load(Ordering::SeqCst) != SNAPSHOT_UNSET
+        {
             break;
         }
         if start.elapsed() > Duration::from_secs(20) {
@@ -637,7 +644,11 @@ async fn test_weight_proportionality() {
     // [SNAPSHOT_BASE, SNAPSHOT_END]; if the run was too slow to reach
     // SNAPSHOT_END, neither queue drained, so the final counts are still a
     // valid share measurement.
-    let (ca, cb, window) = if snapshot_a.load(Ordering::SeqCst) != SNAPSHOT_UNSET {
+    let snapshots_published = base_a.load(Ordering::SeqCst) != SNAPSHOT_UNSET
+        && base_b.load(Ordering::SeqCst) != SNAPSHOT_UNSET
+        && snapshot_a.load(Ordering::SeqCst) != SNAPSHOT_UNSET
+        && snapshot_b.load(Ordering::SeqCst) != SNAPSHOT_UNSET;
+    let (ca, cb, window) = if snapshots_published {
         (
             snapshot_a.load(Ordering::SeqCst) - base_a.load(Ordering::SeqCst),
             snapshot_b.load(Ordering::SeqCst) - base_b.load(Ordering::SeqCst),

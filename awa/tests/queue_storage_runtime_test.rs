@@ -114,12 +114,24 @@ const TEST_DB_PREFIX: &str = "awa_qsrt_";
 static TEMPLATE_DB: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 static TEST_DB_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Caps concurrently-running tests. With ~90 tests requesting pools of up to
-/// 20 connections each, an uncapped run exhausts the Postgres server's
-/// default `max_connections = 100` and tests fail with `PoolTimedOut`.
-static TEST_CONCURRENCY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+/// Budget of concurrently-open test pool connections. Each test acquires
+/// permits equal to its pool's `max_connections`, so the aggregate worst case
+/// stays below the Postgres server's default `max_connections = 100`
+/// (with headroom for the transient admin/template connections). Uncapped,
+/// ~90 parallel tests exhaust the server and fail with `PoolTimedOut`.
+const TEST_CONNECTION_BUDGET: u32 = 80;
+static TEST_CONNECTION_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(TEST_CONNECTION_BUDGET as usize);
 
-/// Held for the duration of a test; releasing it admits the next queued test.
+/// Per-test permit floor. Each test runs a full client (dispatcher, workers,
+/// maintenance leader); without a floor, small-pool tests admit ~20 runtimes
+/// at once and CPU starvation makes wait-for-state assertions time out.
+/// Flooring the weight at BUDGET/8 keeps test concurrency near 8 regardless
+/// of pool size while still charging big-pool tests their real weight.
+const TEST_PERMIT_FLOOR: u32 = TEST_CONNECTION_BUDGET / 8;
+
+/// Held for the duration of a test; dropping it returns the test's connection
+/// budget to the pool of permits.
 struct TestDbGuard {
     _permit: tokio::sync::SemaphorePermit<'static>,
 }
@@ -185,11 +197,16 @@ async fn ensure_template_database() -> &'static str {
         .await
 }
 
-async fn setup_pool(max_connections: u32) -> (sqlx::PgPool, TestDbGuard) {
-    let permit = TEST_CONCURRENCY
-        .acquire()
+async fn setup_pool(max_connections: u32) -> (TestDbGuard, sqlx::PgPool) {
+    assert!(
+        max_connections <= TEST_CONNECTION_BUDGET,
+        "test requested a {max_connections}-connection pool, above the \
+         {TEST_CONNECTION_BUDGET}-connection test budget — it would deadlock waiting for permits"
+    );
+    let permit = TEST_CONNECTION_PERMITS
+        .acquire_many(max_connections.max(TEST_PERMIT_FLOOR))
         .await
-        .expect("test concurrency semaphore is never closed");
+        .expect("test connection semaphore is never closed");
     let template_name = ensure_template_database().await;
     let db_name = format!(
         "{TEST_DB_PREFIX}{}_{}",
@@ -225,12 +242,15 @@ async fn setup_pool(max_connections: u32) -> (sqlx::PgPool, TestDbGuard) {
         .connect(&url)
         .await
         .expect("Failed to connect to database");
-    (pool, TestDbGuard { _permit: permit })
+    // Guard first: call sites bind `let (_db_guard, pool) = ...`, and locals
+    // drop in reverse declaration order, so the pool handle drops before the
+    // permit is released.
+    (TestDbGuard { _permit: permit }, pool)
 }
 
 #[tokio::test]
 async fn test_queue_storage_prepare_schema_completes_with_single_connection_pool() {
-    let (pool, _db_guard) = setup_pool(1).await;
+    let (_db_guard, pool) = setup_pool(1).await;
     let store =
         QueueStorage::new(QueueStorageConfig::default()).expect("queue storage config is valid");
 
@@ -249,7 +269,7 @@ async fn test_queue_storage_prepare_schema_completes_with_single_connection_pool
 
 #[tokio::test]
 async fn test_queue_storage_prepare_schema_concurrent_startups_serialize() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
 
     let mut handles = Vec::new();
     for _ in 0..4 {
@@ -1101,7 +1121,7 @@ impl Worker for CompleteWorker {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_completed_done_row_is_narrow_and_hydrates_from_ready() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_narrow_done_complete";
     let schema = "awa_qs_narrow_done_complete";
     let store = create_store(&pool, schema).await;
@@ -1169,7 +1189,7 @@ async fn test_queue_storage_completed_done_row_is_narrow_and_hydrates_from_ready
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_failed_narrow_done_row_can_retry_from_ready_hydration() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_narrow_done_retry";
     let schema = "awa_qs_narrow_done_retry";
     let store = create_store(&pool, schema).await;
@@ -1246,7 +1266,7 @@ async fn test_queue_storage_failed_narrow_done_row_can_retry_from_ready_hydratio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_cancel_available_tombstones_and_retains_ready_backing() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_wide_available_cancel";
     let schema = "awa_qs_wide_available_cancel";
     let store = create_store(&pool, schema).await;
@@ -1314,7 +1334,7 @@ async fn test_queue_storage_cancel_available_tombstones_and_retains_ready_backin
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_batch_set_priority_and_move_queue() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let source_queue = "qs_batch_source";
     let dest_queue = "qs_batch_dest";
     let schema = "awa_qs_batch_ops";
@@ -1406,7 +1426,7 @@ async fn test_queue_storage_batch_set_priority_and_move_queue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_batch_ready_noop_does_not_tombstone() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_batch_noop";
     let schema = "awa_qs_batch_noop";
     let store = create_store(&pool, schema).await;
@@ -1448,7 +1468,7 @@ async fn test_queue_storage_batch_ready_noop_does_not_tombstone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ready_tombstone_head_advances_claim_cursor() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_tombstone_head";
     let schema = "awa_qs_tombstone_head";
     let store = create_store(&pool, schema).await;
@@ -1502,7 +1522,7 @@ async fn test_queue_storage_ready_tombstone_head_advances_claim_cursor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ready_tombstone_non_head_does_not_skip_live_prefix() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_tombstone_non_head";
     let schema = "awa_qs_tombstone_non_head";
     let store = create_store(&pool, schema).await;
@@ -1690,7 +1710,7 @@ impl Worker for MultiClientTrackingWorker {
 /// `test_claim_ring_rotate_and_prune_under_load` covers the busy-path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_claim_ring_rotates_and_prunes_empty() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_claim_ring";
     let store = create_store_with_config(
         &pool,
@@ -1812,7 +1832,7 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
 ///   unboundedly under closure-only completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_claim_ring_rotate_and_prune_under_load() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let schema = "awa_qs_claim_ring_reclaim";
     let queue = "qs_claim_ring_reclaim";
     let store = create_store_with_config(
@@ -1979,7 +1999,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
 /// the claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_claim_ring_open";
     let store = create_store_with_config(
         &pool,
@@ -2044,7 +2064,7 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
 /// plumbing is live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_admin_cancel_wakes_in_flight_handler() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_admin_cancel_wake";
     let queue = "qs_admin_cancel_wake";
     let store = create_store_with_config(
@@ -2166,7 +2186,7 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
 /// `lease_claim_closures` reflect the lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_receipt_claims_is_absent_after_install() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_open_receipt_claims_absent";
     let queue = "qs_open_receipt_claims_absent";
     let store = create_store_with_config(
@@ -2264,7 +2284,7 @@ async fn test_open_receipt_claims_is_absent_after_install() {
 /// the claim it tombstones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_partition_routing() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_claim_partition_routing";
     let queue = "qs_claim_partition_routing";
     let store = create_store_with_config(
@@ -2389,7 +2409,7 @@ async fn test_lease_claim_partition_routing() {
 /// and ring state are consistent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_rotation_isolation() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_claim_rotation_isolation";
     let queue = "qs_claim_rotation_isolation";
     let store = create_store_with_config(
@@ -2489,7 +2509,7 @@ async fn test_lease_claim_rotation_isolation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_legacy_zero_deadline_claim_conversion_error_rolls_back() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_legacy_zero_deadline_claim_rollback";
     let queue = "qs_legacy_zero_deadline_claim_rollback";
     let store = create_store(&pool, schema).await;
@@ -2541,7 +2561,7 @@ async fn test_legacy_zero_deadline_claim_conversion_error_rolls_back() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_legacy_zero_deadline_claim_without_receipts_succeeds() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_legacy_zero_deadline_claim";
     let queue = "qs_legacy_zero_deadline_claim";
     let store = create_store(&pool, schema).await;
@@ -2596,7 +2616,7 @@ async fn test_legacy_zero_deadline_claim_without_receipts_succeeds() {
 /// Validates the rename → create partitioned → copy → drop path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_migration_preserves_rows() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_claim_migration";
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(&pool)
@@ -2801,7 +2821,7 @@ async fn test_lease_claim_migration_preserves_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_retry_after() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_retry_runtime";
     let schema = "awa_qs_runtime_retry";
     let store = create_store(&pool, schema).await;
@@ -2846,7 +2866,7 @@ async fn test_queue_storage_runtime_retry_after() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_two_clients_drain_without_duplicate_execution() {
-    let (pool, _db_guard) = setup_pool(20).await;
+    let (_db_guard, pool) = setup_pool(20).await;
     let queue = "qs_two_clients";
     let schema = "awa_qs_two_clients";
     let store = create_store(&pool, schema).await;
@@ -2969,7 +2989,7 @@ async fn test_queue_storage_two_clients_drain_without_duplicate_execution() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_after_retry_after_is_noop() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_late_complete_retry";
     let schema = "awa_qs_guard_late_complete_retry";
     let store = create_store(&pool, schema).await;
@@ -3024,7 +3044,7 @@ async fn test_queue_storage_late_completion_after_retry_after_is_noop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_cannot_finalize_reclaimed_running_attempt() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_reclaimed_running";
     let schema = "awa_qs_guard_reclaimed_running";
     let store = create_store(&pool, schema).await;
@@ -3100,7 +3120,7 @@ async fn test_queue_storage_late_completion_cannot_finalize_reclaimed_running_at
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_late_completion_after_cancel_is_noop() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_late_cancel";
     let schema = "awa_qs_guard_late_cancel";
     let store = create_store(&pool, schema).await;
@@ -3147,7 +3167,7 @@ async fn test_queue_storage_late_completion_after_cancel_is_noop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_dlq_and_retry_race_has_single_winner() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_dlq_race";
     let schema = "awa_qs_guard_dlq_race";
     let store = create_store(&pool, schema).await;
@@ -3203,7 +3223,7 @@ async fn test_queue_storage_dlq_and_retry_race_has_single_winner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_register_callback_rejects_stale_lease() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_callback_lease";
     let schema = "awa_qs_guard_callback_lease";
     let store = create_store(&pool, schema).await;
@@ -3283,7 +3303,7 @@ async fn test_queue_storage_register_callback_rejects_stale_lease() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_attempt_state_short_job";
     let schema = "awa_qs_runtime_attempt_state_short";
     let store = create_store(&pool, schema).await;
@@ -3347,7 +3367,7 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_short_job";
     let schema = "awa_qs_runtime_lease_claim_short";
     let store = create_store_with_config(
@@ -3442,7 +3462,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_capacity_wake_drains_after_partial_drain() {
     let (exporter, meter_provider) = install_in_memory_metrics();
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_capacity_wake_partial_drain";
     let schema = "awa_qs_capacity_wake_partial_drain";
     let store_config = QueueStorageConfig {
@@ -3534,7 +3554,7 @@ async fn test_queue_storage_capacity_wake_drains_after_partial_drain() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_short_job_striped";
     let schema = "awa_qs_runtime_lease_claim_short_striped";
     let store = create_store_with_config(
@@ -3614,7 +3634,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
 /// adds alongside the lease-side `rescue_expired_deadlines` scan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_deadline_rescue";
     let schema = "awa_qs_runtime_lease_claim_deadline_rescue";
     let store = create_store_with_config(
@@ -3702,7 +3722,7 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_materialize_heartbeat";
     let schema = "awa_qs_runtime_lease_claim_materialize_heartbeat";
     let store = create_store_with_config(
@@ -3826,7 +3846,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receipt_claims() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_materialized_counts";
     let schema = "awa_qs_receipt_materialized_counts";
     let store = create_store_with_config(
@@ -3891,7 +3911,7 @@ async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receip
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_retry_successfully() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_retry";
     let schema = "awa_qs_runtime_lease_claim_retry";
     let store = create_store_with_config(
@@ -3957,7 +3977,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_leases() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_fail_retryable";
     let schema = "awa_qs_runtime_lease_claim_fail_retryable";
     let store = create_store_with_config(
@@ -4011,7 +4031,7 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heartbeat() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_attempt_rescue";
     let schema = "awa_qs_runtime_lease_claim_attempt_rescue";
     let store = create_store_with_config(
@@ -4130,7 +4150,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_sequence_gap_uncommitted_enqueue";
     let schema = "awa_qs_sequence_gap_uncommitted_enqueue";
     let store = create_store_with_config(
@@ -4211,7 +4231,7 @@ async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advance_is_lost() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_claim_lost_cursor_advance";
     let schema = "awa_qs_receipt_claim_lost_cursor_advance";
     let store = create_store_with_config(
@@ -4452,7 +4472,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_rescue";
     let schema = "awa_qs_runtime_lease_claim_rescue";
     let store = create_store_with_config(
@@ -4587,7 +4607,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_snooze() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_snooze_runtime";
     let schema = "awa_qs_runtime_snooze";
     let store = create_store(&pool, schema).await;
@@ -4634,7 +4654,7 @@ async fn test_queue_storage_runtime_snooze() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_heartbeat_rescue";
     let schema = "awa_qs_runtime_heartbeat_rescue";
     let store = create_store(&pool, schema).await;
@@ -4703,7 +4723,7 @@ async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_admin_runtime";
     let schema = "awa_qs_admin_runtime";
     let store = create_store(&pool, schema).await;
@@ -4846,7 +4866,7 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_prune_live_slot";
     let schema = "awa_qs_runtime_prune_live_slot";
     let store = create_store(&pool, schema).await;
@@ -4947,7 +4967,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_prune_treats_ready_tombstone_as_spent() {
-    let (pool, _db_guard) = setup_pool(6).await;
+    let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_prune_tombstone";
     let schema = "awa_qs_prune_tombstone";
     let store = create_store(&pool, schema).await;
@@ -5001,7 +5021,7 @@ async fn test_queue_storage_prune_treats_ready_tombstone_as_spent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_prune_pending_shard_scope";
     let schema = "awa_qs_prune_pending_shard_scope";
     let store = create_store(&pool, schema).await;
@@ -5103,7 +5123,7 @@ async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills_them() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_legacy_pruned_rollup";
     let schema = "awa_qs_legacy_pruned_rollup";
     let store = create_store(&pool, schema).await;
@@ -5171,7 +5191,7 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
 /// remove the misleading shape from psql inspections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_legacy_snapshot_drop";
     let _store = create_store(&pool, schema).await;
 
@@ -5224,7 +5244,7 @@ async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() 
 ///     `>= scan` (never under-counts)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_available_count_matches_ready_entries_scan() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_avail_count_drift";
     let schema = "awa_qs_avail_count_drift";
     let store = create_store(&pool, schema).await;
@@ -5444,7 +5464,7 @@ async fn test_available_count_matches_ready_entries_scan() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_striped_counts";
     let schema = "awa_qs_striped_counts";
     let store = create_store_with_config(
@@ -5534,7 +5554,7 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
 /// observability use case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_counts_fast_steady";
     let schema = "awa_qs_counts_fast_steady";
     let store = create_store(&pool, schema).await;
@@ -5658,7 +5678,7 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
 ///   below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_helper";
     let schema = "awa_qs_terminal_live_counts_helper";
     let store = create_store(&pool, schema).await;
@@ -5725,7 +5745,7 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_path() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_fast";
     let schema = "awa_qs_terminal_live_counts_fast";
     // lease_claim_receipts: true makes the receipt fast-complete path
@@ -5811,7 +5831,7 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_p
 /// must hold after each operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_delete";
     let schema = "awa_qs_terminal_live_counts_delete";
     let store = create_store(&pool, schema).await;
@@ -5882,7 +5902,7 @@ async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
 /// intact across rotate + prune even if the async rollup has not run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_prune";
     let schema = "awa_qs_terminal_live_counts_prune";
     let store = create_store(&pool, schema).await;
@@ -5950,7 +5970,7 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
 /// terminal count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_count_delta_rollup";
     let schema = "awa_qs_terminal_count_delta_rollup";
     let store = create_store(&pool, schema).await;
@@ -6001,7 +6021,7 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
 /// remain correct because they include pending delta rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_count_delta_rollup_skips_pinned_mvcc_horizon() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_delta_rollup_mvcc_pin";
     let schema = "awa_qs_terminal_delta_rollup_mvcc_pin";
     let store = create_store(&pool, schema).await;
@@ -6074,7 +6094,7 @@ async fn test_queue_terminal_count_delta_rollup_skips_pinned_mvcc_horizon() {
 /// operators choose more queue slots than a single maintenance tick can fold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_count_delta_rollup_skips_empty_old_slots() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_delta_rollup_late_slot";
     let schema = "awa_qs_terminal_delta_rollup_late_slot";
     let store = create_store_with_config(
@@ -6274,7 +6294,7 @@ async fn assert_invariant_holds(pool: &sqlx::PgPool, schema: &str, queue: &str, 
 /// keeps exact counts aligned with the underlying table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_sql_compat";
     let schema = "awa_qs_terminal_live_counts_sql_compat";
     // create_store activates this schema via the storage transition
@@ -6313,7 +6333,7 @@ async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
 /// `done_entries`, restoring the invariant after any drift.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_rebuild";
     let schema = "awa_qs_terminal_live_counts_rebuild";
     let store = create_store(&pool, schema).await;
@@ -6351,7 +6371,7 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
 /// the counter directly. This keeps the "exact" naming honest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_counter_trust";
     let schema = "awa_qs_terminal_counter_trust";
     let store = create_store(&pool, schema).await;
@@ -6487,7 +6507,7 @@ async fn done_entries_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_striped_claims_probe_stripes_round_robin() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_striped_round_robin";
     let schema = "awa_qs_striped_round_robin";
     let store = create_store_with_config(
@@ -6530,7 +6550,7 @@ async fn test_queue_storage_striped_claims_probe_stripes_round_robin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues() {
-    let (pool, _db_guard) = setup_pool(20).await;
+    let (_db_guard, pool) = setup_pool(20).await;
     let queue = "qs_striped_claim_enqueue";
     let schema = "awa_qs_striped_claim_enqueue";
     let config = QueueStorageConfig {
@@ -6584,7 +6604,7 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_claim_lease_lock";
     let schema = "awa_qs_runtime_claim_lease_lock";
     let store = create_store(&pool, schema).await;
@@ -6625,7 +6645,7 @@ async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_dynamic_priority_aging";
     let schema = "awa_qs_dynamic_priority_aging";
     let store = create_store_with_config(
@@ -6697,7 +6717,7 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_aged_completion_keeps_lane_priority_for_done_key() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_aged_completion_lane_priority";
     let schema = "awa_qs_aged_completion_lane_priority";
     let store = create_store_with_config(
@@ -6782,7 +6802,7 @@ async fn test_queue_storage_aged_completion_keeps_lane_priority_for_done_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_bounded_claimers_limit";
     let store = create_store(&pool, schema).await;
     let queue = "qs_bounded_claimers_limit";
@@ -6810,7 +6830,7 @@ async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_bounded_claimers_can_steal_idle_slot() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_bounded_claimers_idle";
     let store = create_store(&pool, schema).await;
     let queue = "qs_bounded_claimers_idle";
@@ -6850,7 +6870,7 @@ async fn test_queue_storage_bounded_claimers_can_steal_idle_slot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_bounded_claimers_heartbeat";
     let store = create_store(&pool, schema).await;
     let queue = "qs_bounded_claimers_heartbeat";
@@ -6952,7 +6972,7 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_prune_reader_lock";
     let schema = "awa_qs_runtime_prune_reader_lock";
     let store = create_store(&pool, schema).await;
@@ -7015,7 +7035,7 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_complete_external() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_callback_complete";
     let schema = "awa_qs_runtime_callback";
     let store = create_store(&pool, schema).await;
@@ -7080,7 +7100,7 @@ async fn test_queue_storage_runtime_complete_external() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_terminal_failure_moves_to_dlq() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_dlq";
     let schema = "awa_qs_runtime_dlq_terminal";
     let store = create_store(&pool, schema).await;
@@ -7148,7 +7168,7 @@ async fn test_queue_storage_runtime_terminal_failure_moves_to_dlq() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_callback_dlq";
     let schema = "awa_qs_runtime_dlq_callback";
     let store = create_store(&pool, schema).await;
@@ -7232,7 +7252,7 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_dlq_api_round_trip() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_dlq_api";
     let schema = "awa_qs_runtime_dlq_api";
     let store = create_store(&pool, schema).await;
@@ -7344,7 +7364,7 @@ async fn test_queue_storage_dlq_api_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_dlq_bulk_ops";
     let schema = "awa_qs_runtime_dlq_bulk_ops";
     let store = create_store(&pool, schema).await;
@@ -7423,7 +7443,7 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_dlq_purge_guard";
     let schema = "awa_qs_runtime_dlq_purge_guard";
     let store = create_store(&pool, schema).await;
@@ -7501,7 +7521,7 @@ async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_dlq_unique_conflict";
     let schema = "awa_qs_runtime_dlq_unique_conflict";
     let store = create_store(&pool, schema).await;
@@ -7572,7 +7592,7 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_admin_bulk_retry_atomic";
     let schema = "awa_qs_admin_bulk_retry_atomic";
     let store = create_store(&pool, schema).await;
@@ -7648,7 +7668,7 @@ async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_admin_retry_failed_by_kind_rolls_back_on_unique_conflict() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_admin_retry_kind_atomic";
     let schema = "awa_qs_admin_retry_kind_atomic";
     let store = create_store(&pool, schema).await;
@@ -7716,7 +7736,7 @@ async fn test_queue_storage_admin_retry_failed_by_kind_rolls_back_on_unique_conf
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_done() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_discard_failed_done";
     let schema = "awa_qs_discard_failed_done";
     let store = create_store(&pool, schema).await;
@@ -7783,7 +7803,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_discard_failed_dlq";
     let schema = "awa_qs_discard_failed_dlq";
     let store = create_store(&pool, schema).await;
@@ -7852,7 +7872,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
-    let (pool, _db_guard) = setup_pool(10).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_jobs_view_compat";
     let schema = "awa_qs_jobs_view_compat";
     let store = create_store(&pool, schema).await;
@@ -7990,7 +8010,7 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
 /// (`floor(elapsed / interval) = 2`, capped at min priority 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_priority_aging_lifts_effective_priority_and_records_original() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_priority_aging_lift";
     let schema = "awa_qs_priority_aging_lift";
     let store = create_store(&pool, schema).await;
@@ -8064,7 +8084,7 @@ async fn test_priority_aging_lifts_effective_priority_and_records_original() {
 /// future refactor can't accidentally always-stamp the metadata.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_priority_aging_off_does_not_stamp_original() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_priority_aging_off";
     let schema = "awa_qs_priority_aging_off";
     let store = create_store(&pool, schema).await;
@@ -8119,7 +8139,7 @@ async fn test_priority_aging_off_does_not_stamp_original() {
 /// helper's comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_ensure_lane_rollback";
     let schema = "awa_qs_ensure_lane_rollback";
     let store = create_store(&pool, schema).await;
@@ -8215,7 +8235,7 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
 ///    load-bearing in the key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_multi_shard_round_trip_through_completion() {
-    let (pool, _db_guard) = setup_pool(8).await;
+    let (_db_guard, pool) = setup_pool(8).await;
     let queue = "qs_multi_shard_round_trip";
     let schema = "awa_qs_multi_shard_round_trip";
     let store_config = QueueStorageConfig {
@@ -8328,7 +8348,7 @@ async fn test_queue_storage_multi_shard_round_trip_through_completion() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
-    let (pool, _db_guard) = setup_pool(8).await;
+    let (_db_guard, pool) = setup_pool(8).await;
     let queue = "qs_multi_shard_public_counts";
     let schema = "awa_qs_multi_shard_public_counts";
     let store_config = QueueStorageConfig {
@@ -8419,7 +8439,7 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
 /// 3. Across enough distinct keys every shard is visited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ordering_key_routes_to_stable_shard() {
-    let (pool, _db_guard) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_ordering_key_routes";
     let schema = "awa_qs_ordering_key_routes";
     let store_config = QueueStorageConfig {
@@ -8524,7 +8544,7 @@ async fn test_queue_storage_ordering_key_routes_to_stable_shard() {
 /// `claim_seq` ended at its `next_seq` — i.e. no shard was starved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
-    let (pool, _db_guard) = setup_pool(8).await;
+    let (_db_guard, pool) = setup_pool(8).await;
     let queue = "qs_shard_fairness";
     let schema = "awa_qs_shard_fairness";
     let store_config = QueueStorageConfig {
@@ -8666,7 +8686,7 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
 ///    fresh runtime would never enqueue to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
-    let (pool, _db_guard) = setup_pool(8).await;
+    let (_db_guard, pool) = setup_pool(8).await;
     let queue = "qs_shard_lowering";
     let schema = "awa_qs_shard_lowering";
     let store_config = QueueStorageConfig {
