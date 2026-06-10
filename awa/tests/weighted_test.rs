@@ -618,10 +618,13 @@ async fn test_weight_proportionality() {
 
     client.start().await.unwrap();
 
-    // Wait for enough jobs to complete to see steady-state behavior
+    // Wait for enough jobs to complete to see steady-state behavior. Wait on
+    // the snapshot publication itself, not the completion counter: the worker
+    // increments the counter before storing the snapshot, so polling the
+    // counter could observe SNAPSHOT_END a beat before the stores land.
     let start = std::time::Instant::now();
     loop {
-        if total_completed.load(Ordering::SeqCst) >= SNAPSHOT_END {
+        if snapshot_a.load(Ordering::SeqCst) != SNAPSHOT_UNSET {
             break;
         }
         if start.elapsed() > Duration::from_secs(20) {
