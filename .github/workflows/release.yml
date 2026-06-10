@@ -746,3 +746,14 @@ jobs:
         run: cargo publish --package awa --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+      - name: Wait for index
+        run: sleep 30
+
+      # awa-seaorm depends on the awa facade, so it publishes last. First
+      # publish auto-creates the crate on crates.io under the token owner's
+      # namespace.
+      - name: Publish awa-seaorm
+        run: cargo publish --package awa-seaorm --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
