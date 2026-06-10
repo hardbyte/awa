@@ -347,7 +347,7 @@ Pay particular attention to:
 - reduce terminal-row retention if the terminal history is much larger than needed
 - review autovacuum settings if lease churn is expected continuously
 
-If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in `docs/benchmarking.md`.
+If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in `docs/benchmarking.md`. Preventative guidance — reader placement, session timeouts, alerting, and autovacuum capacity flags — lives in [`deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#mvcc-discipline-long-running-readers-pin-the-whole-database).
 
 ## Something's In The DLQ
 
