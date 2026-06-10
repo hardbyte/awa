@@ -237,34 +237,6 @@ jobs:
       - name: Run E2E tests
         run: npx playwright test
 
-  # ─── PyO3 Spike ─────────────────────────────────────────
-  pyo3-spike:
-    name: PyO3 async bridge spike
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: spike/pyo3-async
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "spike/pyo3-async -> spike/pyo3-async/target"
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-      - name: Create venv and install deps
-        run: |
-          uv venv .venv
-          uv pip install maturin pytest pytest-asyncio
-      - name: Build extension
-        run: .venv/bin/maturin develop
-      - name: Run spike tests
-        run: .venv/bin/pytest test_spike.py -v
-
   # ─── CLI wheel build test ───────────────────────────────
   cli-wheel-build:
     name: CLI wheel build
