@@ -68,7 +68,6 @@ async def async_client():
     finally:
         reset = awa.Client(DATABASE_URL)
         try:
-            reset.migrate()
             _reset_control_plane(reset)
         finally:
             reset.close()

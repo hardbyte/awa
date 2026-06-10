@@ -58,7 +58,7 @@ class BatchOperationFilter(TypedDict, total=False):
 
 class BatchOperationPreview(TypedDict, total=False):
     total_matched: int
-    sample: list[Job]
+    sample: list[dict[str, Any]]
 
 
 class BatchOperation(TypedDict, total=False):
