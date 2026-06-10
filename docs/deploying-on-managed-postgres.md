@@ -105,6 +105,53 @@ The compat-friendly `insert_many_copy_from_pool` / `client.insert_many_copy` pat
 
 See [`configuration.md`](configuration.md#producer-path-choice) for the full surface comparison.
 
+## MVCC discipline: long-running readers pin the whole database
+
+Awa's queue storage keeps its hot path append-only and reclaims segments with `TRUNCATE`, but it is still a Postgres schema and is subject to the database-wide MVCC horizon. Any transaction holding an old snapshot — a `psql` session left `idle in transaction`, a BI tool with a long read transaction, `pg_dump`, a stuck migration — prevents vacuum and Awa's maintenance pruning from reclaiming row versions created after that snapshot, in every table in the database.
+
+Under sustained load this degrades throughput, not correctness: jobs are not lost, but completion rate sags and backlog accumulates until the pinning transaction releases, after which the backlog drains. Every per-row Postgres queue (River, Oban, pg-boss, Graphile, pgmq) shares this failure mode. The long-horizon scenario in [`benchmarking.md`](benchmarking.md) reproduces it on demand; [`troubleshooting.md`](troubleshooting.md#dead-tuples-growing-in-queue-storage) covers diagnosis on a live system.
+
+Operational rules, in priority order:
+
+### 1. Keep long-running analytical readers off the queue database
+
+Reporting, BI dashboards, and ad-hoc analytical sessions belong on a separate database — a different instance, a read replica, or an ETL copy. The Awa admin UI and `queue_counts` reads are short bounded transactions and are fine against the primary; the thing to keep away is any client that holds a transaction (or repeatable-read snapshot) open for minutes.
+
+### 2. Bound non-Awa sessions with timeouts
+
+For roles that humans or reporting tools use against the same database:
+
+```sql
+ALTER ROLE analyst SET idle_in_transaction_session_timeout = '5min';
+ALTER ROLE analyst SET statement_timeout = '5min';
+```
+
+Managed engines expose the same settings as instance flags if you would rather enforce a database-wide ceiling and exempt specific roles.
+
+### 3. Alert on old transactions
+
+The leading indicator is `pg_stat_activity.xact_start` age, not dead-tuple counts — by the time dead tuples are visible the horizon has been pinned for a while. A query suitable for a Grafana/postgres-exporter gauge:
+
+```sql
+SELECT COALESCE(max(extract(epoch FROM now() - xact_start)), 0) AS max_xact_age_seconds
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND xact_start IS NOT NULL
+  AND backend_type = 'client backend';
+```
+
+Alert when `max_xact_age_seconds` exceeds a few multiples of your normal longest job; `300` is a reasonable starting threshold for short-job workloads. The drill-down query for finding the offending session is in [`troubleshooting.md`](troubleshooting.md#inspect-long-transactions).
+
+### 4. Give autovacuum enough capacity
+
+The queue-storage substrate ships aggressive per-table autovacuum storage parameters on its hot mutable tables (ring state, heads, leases, claims), so per-table thresholds are normally not yours to tune. What managed-Postgres defaults often starve is instance-wide vacuum capacity. If the churn query in [`troubleshooting.md`](troubleshooting.md#inspect-table-churn) shows `autovacuum_count` flat while dead tuples climb on `leases%` or `attempt_state`, raise these flags:
+
+- `autovacuum_max_workers` (default 3 is low for a busy queue database sharing the instance with application tables)
+- `autovacuum_vacuum_cost_limit` / lower `autovacuum_vacuum_cost_delay` so workers actually keep up
+- on Cloud SQL / AlloyDB these are instance flags (`gcloud sql instances patch --database-flags=...`); a restart may be required
+
+Note that no autovacuum setting helps while a horizon is pinned — vacuum cannot reclaim what an open snapshot can still see. Rules 1–3 prevent the pin; rule 4 makes recovery fast after it releases.
+
 ## Things that broke for us in staging — worth pre-empting
 
 These all eventually have fixes or workarounds, but each one cost hours the first time:

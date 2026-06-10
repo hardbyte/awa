@@ -476,8 +476,10 @@ async fn test_weight_proportionality() {
     clean_queue(&pool, queue_a).await;
     clean_queue(&pool, queue_b).await;
 
-    // Insert enough jobs so both queues are always loaded
-    for i in 0..60 {
+    // Insert enough jobs so both queues stay loaded through the measurement
+    // window: neither queue can drain before the final snapshot at
+    // SNAPSHOT_END total completions.
+    for i in 0..120 {
         insert_with(
             &pool,
             &WeightedJob { index: i },
@@ -490,7 +492,7 @@ async fn test_weight_proportionality() {
         .unwrap();
         insert_with(
             &pool,
-            &WeightedJob { index: i + 60 },
+            &WeightedJob { index: i + 120 },
             InsertOpts {
                 queue: queue_b.into(),
                 ..Default::default()
@@ -506,6 +508,22 @@ async fn test_weight_proportionality() {
     let max_concurrent_b = Arc::new(AtomicU32::new(0));
     let current_a = Arc::new(AtomicU32::new(0));
     let current_b = Arc::new(AtomicU32::new(0));
+    // The proportionality measurement must be recorded by the workers
+    // themselves at fixed completion counts. The queues hold a finite number
+    // of jobs; if the test task polls and snapshots, a starved runner can let
+    // both queues fully drain between polls and the counts converge regardless
+    // of weighting. The first SNAPSHOT_BASE completions are also excluded as
+    // ramp-up: weighted overflow allocation needs a few dispatch rounds to
+    // settle, and including startup in the share measurement makes the
+    // assertion timing-sensitive under parallel test load.
+    const SNAPSHOT_BASE: u32 = 40;
+    const SNAPSHOT_END: u32 = 160;
+    const SNAPSHOT_UNSET: u32 = u32::MAX;
+    let total_completed = Arc::new(AtomicU32::new(0));
+    let base_a = Arc::new(AtomicU32::new(SNAPSHOT_UNSET));
+    let base_b = Arc::new(AtomicU32::new(SNAPSHOT_UNSET));
+    let snapshot_a = Arc::new(AtomicU32::new(SNAPSHOT_UNSET));
+    let snapshot_b = Arc::new(AtomicU32::new(SNAPSHOT_UNSET));
 
     struct ProportionWorker {
         completed_a: Arc<AtomicU32>,
@@ -514,6 +532,11 @@ async fn test_weight_proportionality() {
         max_concurrent_b: Arc<AtomicU32>,
         current_a: Arc<AtomicU32>,
         current_b: Arc<AtomicU32>,
+        total_completed: Arc<AtomicU32>,
+        base_a: Arc<AtomicU32>,
+        base_b: Arc<AtomicU32>,
+        snapshot_a: Arc<AtomicU32>,
+        snapshot_b: Arc<AtomicU32>,
     }
 
     #[async_trait::async_trait]
@@ -534,6 +557,21 @@ async fn test_weight_proportionality() {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 self.current_b.fetch_sub(1, Ordering::SeqCst);
                 self.completed_b.fetch_add(1, Ordering::SeqCst);
+            }
+            match self.total_completed.fetch_add(1, Ordering::SeqCst) + 1 {
+                SNAPSHOT_BASE => {
+                    self.base_a
+                        .store(self.completed_a.load(Ordering::SeqCst), Ordering::SeqCst);
+                    self.base_b
+                        .store(self.completed_b.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                SNAPSHOT_END => {
+                    self.snapshot_a
+                        .store(self.completed_a.load(Ordering::SeqCst), Ordering::SeqCst);
+                    self.snapshot_b
+                        .store(self.completed_b.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                _ => {}
             }
             Ok(JobResult::Completed)
         }
@@ -569,6 +607,11 @@ async fn test_weight_proportionality() {
             max_concurrent_b: max_concurrent_b.clone(),
             current_a: current_a.clone(),
             current_b: current_b.clone(),
+            total_completed: total_completed.clone(),
+            base_a: base_a.clone(),
+            base_b: base_b.clone(),
+            snapshot_a: snapshot_a.clone(),
+            snapshot_b: snapshot_b.clone(),
         })
         .build()
         .unwrap();
@@ -578,26 +621,39 @@ async fn test_weight_proportionality() {
     // Wait for enough jobs to complete to see steady-state behavior
     let start = std::time::Instant::now();
     loop {
-        let total = completed_a.load(Ordering::SeqCst) + completed_b_counter.load(Ordering::SeqCst);
-        if total >= 80 {
+        if total_completed.load(Ordering::SeqCst) >= SNAPSHOT_END {
             break;
         }
-        if start.elapsed() > Duration::from_secs(15) {
+        if start.elapsed() > Duration::from_secs(20) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     client.shutdown(Duration::from_secs(3)).await;
 
-    let ca = completed_a.load(Ordering::SeqCst);
-    let cb = completed_b_counter.load(Ordering::SeqCst);
-
     // Weighted overflow controls sustained share, not a strict peak concurrency
     // bound, so assert on completed work rather than max instantaneous
-    // concurrency.
+    // concurrency. Prefer the worker-recorded post-ramp-up window
+    // [SNAPSHOT_BASE, SNAPSHOT_END]; if the run was too slow to reach
+    // SNAPSHOT_END, neither queue drained, so the final counts are still a
+    // valid share measurement.
+    let (ca, cb, window) = if snapshot_a.load(Ordering::SeqCst) != SNAPSHOT_UNSET {
+        (
+            snapshot_a.load(Ordering::SeqCst) - base_a.load(Ordering::SeqCst),
+            snapshot_b.load(Ordering::SeqCst) - base_b.load(Ordering::SeqCst),
+            "post-ramp-up window",
+        )
+    } else {
+        (
+            completed_a.load(Ordering::SeqCst),
+            completed_b_counter.load(Ordering::SeqCst),
+            "timeout fallback (full run)",
+        )
+    };
+
     assert!(
         ca > cb,
-        "Queue A (weight=3) should complete more jobs ({ca}) than B (weight=1, {cb})"
+        "Queue A (weight=3) should complete more jobs ({ca}) than B (weight=1, {cb}) in the {window}"
     );
 }
 
