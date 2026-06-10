@@ -191,6 +191,7 @@ _HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not 
 | # | Test | Rust |
 | --- | --- | --- |
 | RO1-RO3 | Read-only serve: capabilities, mutations blocked, UI disables | ✓ |
+| UIB1-UIB3 | Batch operations page: set-priority preview/submit, move-queue payload, cancellation request | ✓ |
 
 ### Admin Metadata Guardrails
 

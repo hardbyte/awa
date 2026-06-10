@@ -134,6 +134,17 @@ Paused schedules render with a "paused" badge and the `paused_by` label. Pause/R
 
 When the target queue is itself paused, the row shows a "queue paused" badge alongside the queue name and the expanded detail explains that fires continue to enqueue jobs into the paused queue but those jobs dispatch only after the queue is resumed. Cron pause and queue pause are independent — one is "stop scheduling," the other is "stop dispatching."
 
+### Batch Operations (`/batch-ops`)
+
+Operator surface for durable async mutations recorded in `awa.batch_operations`.
+
+- **New operation form** — choose `set_priority` or `move_queue`, filter by queue, kind, or explicit ids, then preview before submitting.
+- **Preview** — calls `/api/batch-ops/preview` and reports the eligible row count. Preview is advisory; execution rechecks eligibility while the maintenance leader runs the operation.
+- **History table** — lists recent operations with id, kind, state, progress, error count, and submitted age.
+- **Cancellation** — active `pending`, `scanning`, and `running` operations expose a Cancel action, which requests cooperative cancellation at chunk boundaries.
+
+The first UI form intentionally covers the common operator paths. The API and Python/Rust surfaces also support tag, state, and created-at filters for callers that need more precise automation.
+
 ### Dead Letter Queue (`/dlq`, `/dlq/:id`)
 
 Operator surface for queue-storage `dlq_entries`.

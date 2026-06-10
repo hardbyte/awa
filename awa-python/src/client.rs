@@ -7,6 +7,10 @@ use crate::transaction::{
 };
 use crate::worker::PythonWorker;
 use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
+use awa_model::batch_operations::{
+    BatchOperationFilter, BatchOperationKind, BatchOperationSpec, BatchOperationState,
+    ListBatchOperationsFilter, SubmitBatchOperation,
+};
 use awa_model::{
     CronMissedFirePolicy, InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage,
     QueueStorageConfig,
@@ -19,6 +23,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use uuid::Uuid;
 
 fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     if !timeout_seconds.is_finite() || timeout_seconds.is_sign_negative() {
@@ -1255,6 +1260,136 @@ impl PyClient {
                 }
                 Ok(list.unbind())
             })
+        })
+    }
+
+    /// Preview a durable batch operation without submitting it.
+    #[pyo3(signature = (op_kind, spec, *, filter=None))]
+    fn preview_batch_operation<'py>(
+        &self,
+        py: Python<'py>,
+        op_kind: String,
+        spec: Py<PyAny>,
+        filter: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let spec = parse_batch_operation_spec(py, &op_kind, &spec)?;
+        let filter = parse_batch_operation_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let preview = awa_model::batch_operations::preview_batch_operation(&pool, spec, filter)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| batch_operation_to_py(py, &preview))
+        })
+    }
+
+    /// Submit a durable batch operation for maintenance-led execution.
+    #[pyo3(signature = (op_kind, spec, *, filter=None, submitted_by=None, allow_all=false))]
+    fn submit_batch_operation<'py>(
+        &self,
+        py: Python<'py>,
+        op_kind: String,
+        spec: Py<PyAny>,
+        filter: Option<Py<PyAny>>,
+        submitted_by: Option<String>,
+        allow_all: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let spec = parse_batch_operation_spec(py, &op_kind, &spec)?;
+        let filter = parse_batch_operation_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let operation = awa_model::batch_operations::submit_batch_operation(
+                &pool,
+                SubmitBatchOperation {
+                    spec,
+                    filter,
+                    submitted_by,
+                    allow_all,
+                },
+            )
+            .await
+            .map_err(map_awa_error)?;
+            Python::attach(|py| batch_operation_to_py(py, &operation))
+        })
+    }
+
+    /// List recent durable batch operations.
+    #[pyo3(signature = (*, state=None, limit=100))]
+    fn list_batch_operations<'py>(
+        &self,
+        py: Python<'py>,
+        state: Option<String>,
+        limit: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = state
+            .as_deref()
+            .map(parse_batch_operation_state)
+            .transpose()?;
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let operations = awa_model::batch_operations::list_batch_operations(
+                &pool,
+                &ListBatchOperationsFilter {
+                    state,
+                    limit: Some(limit),
+                },
+            )
+            .await
+            .map_err(map_awa_error)?;
+            Python::attach(|py| batch_operation_to_py(py, &operations))
+        })
+    }
+
+    /// Fetch one durable batch operation by UUID string.
+    fn get_batch_operation<'py>(
+        &self,
+        py: Python<'py>,
+        id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let id = Uuid::parse_str(&id).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid batch operation id: {err}"))
+        })?;
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let operation = awa_model::batch_operations::get_batch_operation(&pool, id)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| batch_operation_to_py(py, &operation))
+        })
+    }
+
+    /// Request cooperative cancellation for an active durable batch operation.
+    fn cancel_batch_operation<'py>(
+        &self,
+        py: Python<'py>,
+        id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let id = Uuid::parse_str(&id).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid batch operation id: {err}"))
+        })?;
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let operation =
+                awa_model::batch_operations::request_batch_operation_cancellation(&pool, id)
+                    .await
+                    .map_err(map_awa_error)?;
+            Python::attach(|py| batch_operation_to_py(py, &operation))
+        })
+    }
+
+    /// Purge finalized durable batch operations older than `before`.
+    #[pyo3(signature = (before, *, limit=1000))]
+    fn purge_batch_operations<'py>(
+        &self,
+        py: Python<'py>,
+        before: DateTime<Utc>,
+        limit: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            awa_model::batch_operations::purge_batch_operations_before(&pool, before, limit)
+                .await
+                .map_err(map_awa_error)
         })
     }
 
@@ -2611,6 +2746,135 @@ impl PyClient {
         })
     }
 
+    #[pyo3(signature = (op_kind, spec, *, filter=None))]
+    fn preview_batch_operation_sync(
+        &self,
+        py: Python<'_>,
+        op_kind: String,
+        spec: Py<PyAny>,
+        filter: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let spec = parse_batch_operation_spec(py, &op_kind, &spec)?;
+        let filter = parse_batch_operation_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let preview =
+                    awa_model::batch_operations::preview_batch_operation(&pool, spec, filter)
+                        .await
+                        .map_err(map_awa_error)?;
+                Python::attach(|py| batch_operation_to_py(py, &preview))
+            })
+        })
+    }
+
+    #[pyo3(signature = (op_kind, spec, *, filter=None, submitted_by=None, allow_all=false))]
+    fn submit_batch_operation_sync(
+        &self,
+        py: Python<'_>,
+        op_kind: String,
+        spec: Py<PyAny>,
+        filter: Option<Py<PyAny>>,
+        submitted_by: Option<String>,
+        allow_all: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let spec = parse_batch_operation_spec(py, &op_kind, &spec)?;
+        let filter = parse_batch_operation_filter(py, filter.as_ref())?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let operation = awa_model::batch_operations::submit_batch_operation(
+                    &pool,
+                    SubmitBatchOperation {
+                        spec,
+                        filter,
+                        submitted_by,
+                        allow_all,
+                    },
+                )
+                .await
+                .map_err(map_awa_error)?;
+                Python::attach(|py| batch_operation_to_py(py, &operation))
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, state=None, limit=100))]
+    fn list_batch_operations_sync(
+        &self,
+        py: Python<'_>,
+        state: Option<String>,
+        limit: i64,
+    ) -> PyResult<Py<PyAny>> {
+        let state = state
+            .as_deref()
+            .map(parse_batch_operation_state)
+            .transpose()?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let operations = awa_model::batch_operations::list_batch_operations(
+                    &pool,
+                    &ListBatchOperationsFilter {
+                        state,
+                        limit: Some(limit),
+                    },
+                )
+                .await
+                .map_err(map_awa_error)?;
+                Python::attach(|py| batch_operation_to_py(py, &operations))
+            })
+        })
+    }
+
+    fn get_batch_operation_sync(&self, py: Python<'_>, id: String) -> PyResult<Py<PyAny>> {
+        let id = Uuid::parse_str(&id).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid batch operation id: {err}"))
+        })?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let operation = awa_model::batch_operations::get_batch_operation(&pool, id)
+                    .await
+                    .map_err(map_awa_error)?;
+                Python::attach(|py| batch_operation_to_py(py, &operation))
+            })
+        })
+    }
+
+    fn cancel_batch_operation_sync(&self, py: Python<'_>, id: String) -> PyResult<Py<PyAny>> {
+        let id = Uuid::parse_str(&id).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid batch operation id: {err}"))
+        })?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let operation =
+                    awa_model::batch_operations::request_batch_operation_cancellation(&pool, id)
+                        .await
+                        .map_err(map_awa_error)?;
+                Python::attach(|py| batch_operation_to_py(py, &operation))
+            })
+        })
+    }
+
+    #[pyo3(signature = (before, *, limit=1000))]
+    fn purge_batch_operations_sync(
+        &self,
+        py: Python<'_>,
+        before: DateTime<Utc>,
+        limit: i64,
+    ) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::batch_operations::purge_batch_operations_before(&pool, before, limit)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
     /// Get a single job by ID (sync).
     fn get_job_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<PyJob> {
         let pool = self.pool.clone();
@@ -3209,6 +3473,120 @@ fn parse_job_state(value: &str) -> PyResult<JobState> {
             "unknown job state: {other}"
         ))),
     }
+}
+
+fn parse_batch_operation_kind(value: &str) -> PyResult<BatchOperationKind> {
+    BatchOperationKind::try_from(value).map_err(map_awa_error)
+}
+
+fn parse_batch_operation_state(value: &str) -> PyResult<BatchOperationState> {
+    BatchOperationState::try_from(value).map_err(map_awa_error)
+}
+
+fn parse_batch_operation_spec(
+    py: Python<'_>,
+    op_kind: &str,
+    spec: &Py<PyAny>,
+) -> PyResult<BatchOperationSpec> {
+    let spec = spec.bind(py);
+    let dict: &Bound<'_, PyDict> = spec.cast().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("batch operation spec must be a dict")
+    })?;
+
+    match parse_batch_operation_kind(op_kind)? {
+        BatchOperationKind::SetPriority => {
+            let priority: i16 = required_dict_item(dict, "priority")?.extract()?;
+            Ok(BatchOperationSpec::SetPriority { priority })
+        }
+        BatchOperationKind::MoveQueue => {
+            let queue: String = required_dict_item(dict, "queue")?.extract()?;
+            let priority = optional_dict_item(dict, "priority")?
+                .map(|value| value.extract::<i16>())
+                .transpose()?;
+            Ok(BatchOperationSpec::MoveQueue { queue, priority })
+        }
+    }
+}
+
+fn parse_batch_operation_filter(
+    py: Python<'_>,
+    filter: Option<&Py<PyAny>>,
+) -> PyResult<BatchOperationFilter> {
+    let Some(filter) = filter else {
+        return Ok(BatchOperationFilter::default());
+    };
+
+    let filter = filter.bind(py);
+    if filter.is_none() {
+        return Ok(BatchOperationFilter::default());
+    }
+
+    let dict: &Bound<'_, PyDict> = filter.cast().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("batch operation filter must be a dict or None")
+    })?;
+
+    let kind = optional_dict_item(dict, "kind")?
+        .map(|value| value.extract::<String>())
+        .transpose()?;
+    let queue = optional_dict_item(dict, "queue")?
+        .map(|value| value.extract::<String>())
+        .transpose()?;
+    let ids = optional_dict_item(dict, "ids")?
+        .map(|value| value.extract::<Vec<i64>>())
+        .transpose()?;
+    let tag = optional_dict_item(dict, "tag")?
+        .map(|value| value.extract::<String>())
+        .transpose()?;
+    let state = optional_dict_item(dict, "state")?
+        .map(|value| value.extract::<String>().and_then(|s| parse_job_state(&s)))
+        .transpose()?;
+    let created_at_gte =
+        optional_dict_item(dict, "created_at_gte")?.map(extract_datetime).transpose()?;
+    let created_at_lt =
+        optional_dict_item(dict, "created_at_lt")?.map(extract_datetime).transpose()?;
+
+    Ok(BatchOperationFilter {
+        kind,
+        queue,
+        ids,
+        tag,
+        state,
+        created_at_gte,
+        created_at_lt,
+    })
+}
+
+fn optional_dict_item<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    Ok(dict.get_item(key)?.filter(|value| !value.is_none()))
+}
+
+fn required_dict_item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+    optional_dict_item(dict, key)?.ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!("batch operation spec missing '{key}'"))
+    })
+}
+
+fn extract_datetime(value: Bound<'_, PyAny>) -> PyResult<DateTime<Utc>> {
+    if let Ok(datetime) = value.extract::<DateTime<Utc>>() {
+        return Ok(datetime);
+    }
+
+    let text: String = value.extract()?;
+    DateTime::parse_from_rfc3339(&text)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid RFC3339 timestamp: {err}"))
+        })
+}
+
+fn batch_operation_to_py<T: serde::Serialize>(py: Python<'_>, value: &T) -> PyResult<Py<PyAny>> {
+    let json = serde_json::to_value(value)
+        .map_err(awa_model::AwaError::Serialization)
+        .map_err(map_awa_error)?;
+    crate::job::json_to_py(py, &json)
 }
 
 fn parse_default_action(value: &str) -> PyResult<awa_model::admin::DefaultAction> {
