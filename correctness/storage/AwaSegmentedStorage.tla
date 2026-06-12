@@ -54,6 +54,11 @@ EXTENDS TLC, Naturals, FiniteSets
 \* earlier open_receipt_claims INSERT+DELETE frontier: the entire
 \* receipt plane is reclaimed by partition rotation, which is what makes
 \* the 0.6 vacuum-aware story complete.
+\* The Rust implementation also keeps a per-claim-slot stale-rescue
+\* cursor in claim_ring_slots. This model treats that cursor as an
+\* implementation refinement over claimOpen / claimClosed history rather
+\* than lifecycle state: advancing the cursor is safe only across claims
+\* already closed, lease-managed, or closed by the same rescue step.
 \*
 \* Enqueue-shard modelling (ADR-025): `laneState` here represents one
 \* `(queue, priority, enqueue_shard)` triple. The Rust implementation

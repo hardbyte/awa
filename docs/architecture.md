@@ -53,7 +53,7 @@ Queue storage is the worker engine in 0.6. It is not one mutable jobs heap; it i
 | Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*`, `queue_terminal_count_deltas_*` | Ring partitions by `ready_slot` | Runnable and terminal rows stay append-first; rare ready mutations append tombstones instead of deleting ready rows; terminal-count changes append signed deltas and the whole segment is reclaimed by queue-ring prune. |
 | Queue backlog | `deferred_jobs` | Plain table | Scheduled and retryable work stays out of the hot claim path until promotion. |
 | Operator hold | `dlq_entries` | Plain table | DLQ rows are explicit operator backlog with retry, purge, and retention cleanup. |
-| Receipt execution | `lease_claims_*`, `lease_claim_closures_*` | Ring partitions by `claim_slot` | Short attempts avoid mutable lease rows; live receipts are claims anti-joined with closures. |
+| Receipt execution | `lease_claims_*`, `lease_claim_closures_*` | Ring partitions by `claim_slot` | Short attempts avoid mutable lease rows; live receipts are claims anti-joined with closures, while stale-rescue scans advance a tiny per-slot cursor over closed history. |
 | Materialized execution | `leases_*`, `attempt_state` | Lease ring plus mutable state table | Attempts escalate here when they need callback waiting, progress, or other mutable attempt state. |
 | Control | `queue_lanes`, heads, ring-state tables, `queue_meta`, descriptors, runtimes, cron, uniqueness | Narrow metadata tables | Claim cursors, queue state, operator metadata, uniqueness, and liveness are kept separate from payload history. |
 
@@ -74,7 +74,7 @@ Most applications should use the Rust, Python, CLI, or UI APIs rather than query
 | `queue_terminal_live_counts`, `queue_terminal_rollups` | Folded terminal counters for retained and pruned queue segments. | Internal derived storage. Rebuild from `done_entries` if the trust marker is cleared or after a counter incident. |
 | `deferred_jobs` | Physical scheduled/retryable backlog table. | Internal storage. Promotion, retry, snooze, and cancellation own its transitions. |
 | `dlq_entries` | Durable operator hold table for DLQ-enabled terminal failures. | Operator surface through CLI/UI/API; direct SQL inspection is reasonable, direct mutation is not. |
-| `lease_claims_*` / `lease_claim_closures_*` | Receipt-plane execution history for short attempts. | Internal storage. Live receipt attempts are claims without matching closures. |
+| `lease_claims_*` / `lease_claim_closures_*` | Receipt-plane execution history for short attempts. | Internal storage. Live receipt attempts are claims without matching closures. Maintenance uses `claim_ring_slots` rescue cursors to keep stale-rescue scans bounded when closed receipt history cannot yet be truncated. |
 | `leases_*` / `attempt_state` | Materialized execution state for heartbeat, callbacks, progress, and other mutable attempt data. | Internal storage. Runtime and rescue paths own mutations. |
 | `queue_lanes`, queue heads, ring-state tables, `queue_meta` | Claim cursors, enqueue heads, rotation/prune state, and queue storage configuration. | Internal control surface except documented configuration fields such as `queue_meta.enqueue_shards`. If no `queue_meta` row exists for a queue, enqueue defaults to one shard; operators should configure shard counts with an UPSERT before load tests or production traffic. |
 | descriptors, runtime snapshots, cron tables | Operator metadata and scheduler declarations. | Public through Awa APIs and UI; SQL reads are acceptable for reporting. Writes should go through the corresponding Awa APIs. |
@@ -197,7 +197,7 @@ Queue storage has three independent rings, each advanced by the elected maintena
 | --- | --- | --: | --- | --- |
 | Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/done/tombstone/delta slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows, tombstones, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `250ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
-| Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure |
+| Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure; stale-rescue cursors are reset when the slot is truncated |
 
 The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.
 
@@ -205,7 +205,7 @@ The common safety pattern is:
 
 1. Lock the ring-state row with `FOR UPDATE`.
 2. Choose the incoming or oldest initialized slot.
-3. Use a short `SET LOCAL lock_timeout = '50ms'` before child-table `ACCESS EXCLUSIVE` locks in prune paths.
+3. Take child-table `ACCESS EXCLUSIVE` locks with `NOWAIT` in automatic prune paths so maintenance gives up immediately under contention.
 4. Recheck liveness after acquiring the partition lock.
 5. `TRUNCATE` only partitions that are proven inactive.
 

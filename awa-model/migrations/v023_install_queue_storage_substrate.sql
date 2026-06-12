@@ -260,9 +260,44 @@ BEGIN
     EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.claim_ring_slots (
-            slot       INT PRIMARY KEY,
-            generation BIGINT NOT NULL
+            slot                       INT PRIMARY KEY,
+            generation                 BIGINT NOT NULL,
+            rescue_cursor_claimed_at   TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            rescue_cursor_job_id       BIGINT NOT NULL DEFAULT 0,
+            rescue_cursor_run_lease    BIGINT NOT NULL DEFAULT 0
         )
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.claim_ring_slots
+            ADD COLUMN IF NOT EXISTS rescue_cursor_claimed_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            ADD COLUMN IF NOT EXISTS rescue_cursor_job_id BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS rescue_cursor_run_lease BIGINT NOT NULL DEFAULT 0
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_claimed_at IS
+            'Receipt-rescue cursor: claimed_at component of the last claim in this slot that maintenance proved closed, lease-managed, or rescued.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_job_id IS
+            'Receipt-rescue cursor tie-breaker: job_id component of the last claim in this slot that maintenance proved safe to skip.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_run_lease IS
+            'Receipt-rescue cursor tie-breaker: run_lease component of the last claim in this slot that maintenance proved safe to skip.'
         $ddl$,
         p_schema
     );
@@ -940,6 +975,11 @@ BEGIN
 
     EXECUTE format(
         'CREATE INDEX IF NOT EXISTS idx_%s_lease_claims_stale ON %I.lease_claims (materialized_at, claimed_at, job_id)',
+        p_schema, p_schema
+    );
+
+    EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS idx_%s_lease_claims_rescue_cursor ON %I.lease_claims (claimed_at, job_id, run_lease)',
         p_schema, p_schema
     );
 

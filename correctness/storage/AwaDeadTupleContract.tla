@@ -175,8 +175,9 @@ TableSpec == [
     claim_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
     \* ---- Ring-slot rows ----
-    \* One row per slot, ~handful of slots. Generation is the only
-    \* mutating column.
+    \* One row per slot, ~handful of slots. Queue/lease slots mutate only
+    \* generation; claim slots also carry the stale-receipt rescue cursor.
+    \* These updates happen at maintenance cadence, not per job.
     queue_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     lease_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     claim_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""]
@@ -241,10 +242,13 @@ CloseReceiptTx == <<
 >>
 
 \* rescue_stale_receipt_claims_tx — queue_storage.rs:6672
-\* Anti-joins lease_claims against closures + leases; closes
-\* stragglers by appending to lease_claim_closures.
+\* Scans from the per-slot claim_ring_slots rescue cursor, anti-joins
+\* lease_claims against closures + leases, closes stragglers by appending
+\* to lease_claim_closures, then advances the tiny control-plane cursor
+\* over the proved-safe prefix.
 RescueReceiptsTx == <<
-    Mut("Insert", "lease_claim_closures")
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "claim_ring_slots")
 >>
 
 \* ensure_running_leases_from_receipts_tx — queue_storage.rs:6102

@@ -44,7 +44,7 @@ Apply ADR-019's rotation-and-prune pattern to the receipt plane. Remove `open_re
 
 1. `lease_claims` becomes `PARTITIONED BY LIST (claim_slot)` with a small fixed set of child partitions (`lease_claims_0..N-1`).
 2. `lease_claim_closures` becomes `PARTITIONED BY LIST (claim_slot)` with matching children. A closure row lives in the same `claim_slot` as its originating claim.
-3. A new control-plane pair `claim_ring_state` and `claim_ring_slots` coordinates rotation, mirroring the existing `lease_ring_state` and `lease_ring_slots`.
+3. A new control-plane pair `claim_ring_state` and `claim_ring_slots` coordinates rotation, mirroring the existing `lease_ring_state` and `lease_ring_slots`. `claim_ring_slots` also stores a per-slot stale-rescue cursor over `(claimed_at, job_id, run_lease)`.
 4. `open_receipt_claims` is deleted. Its indexes and the schema-install backfill are dropped.
 
 ### Hot path
@@ -59,13 +59,13 @@ Apply ADR-019's rotation-and-prune pattern to the receipt plane. Remove `open_re
 
 ### Open-claim queries
 
-Every read that currently targets `open_receipt_claims` becomes a bounded scan over the active `lease_claims` child partitions, anti-joined with the matching `lease_claim_closures` children:
+Every read that currently targets `open_receipt_claims` becomes a bounded read over the active `lease_claims` child partitions, anti-joined with the matching `lease_claim_closures` children:
 
 - "Is `(job_id, run_lease)` still open?" — PK lookup into active claim partitions, anti-join closures. Used by the completion guard and by `load_job` on receipt-backed attempts.
-- "Scan stale receipt claims for rescue." — range scan on `claimed_at < cutoff` in active claim partitions, anti-join closures.
+- "Scan stale receipt claims for rescue." — per-slot cursor scan ordered by `(claimed_at, job_id, run_lease)`, anti-join closures and materialized leases, and close stale candidates by appending rescue closures.
 - "Count in-flight receipt-backed attempts." — count active-partition rows minus matching closure rows.
 
-Active partitions are bounded by the claim-ring rotation window, which is sized so that even worst-case throughput keeps the anti-join surface smaller than what `open_receipt_claims` used to hold dynamically.
+The rescue cursor advances only across a prefix of claims that maintenance has proved closed, materialized into the lease plane, or closed by that rescue transaction. A fresh open receipt can block cursor advancement, but the bounded scan window can still rescue stale receipts that appear later in the same slot. This keeps liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune.
 
 ### Rotation and prune
 
@@ -75,7 +75,7 @@ Active partitions are bounded by the claim-ring rotation window, which is sized 
   1. `FOR UPDATE` on `claim_ring_state`.
   2. `FOR UPDATE` on the target `claim_ring_slots` row.
   3. `ACCESS EXCLUSIVE NOWAIT` on both partitions (claims and closures).
-  5. Liveness recheck: every claim must have a closure, then `TRUNCATE`.
+  4. Liveness recheck: every claim must have a closure, then reset the slot's rescue cursor and `TRUNCATE`.
 - Partition truncation never races with claim because claim always writes to the ring's current slot and rotation advances the current slot atomically under the same lock order.
 
 ### Invariants preserved
@@ -91,7 +91,7 @@ This is a breaking schema change even though the external API does not change.
 1. A new migration creates `claim_ring_state`, `claim_ring_slots`, and the partitioned `lease_claims` / `lease_claim_closures` shapes.
 2. Existing `lease_claims` and `lease_claim_closures` rows are rewritten into the current slot of the new partitioned parents.
 3. The legacy `open_receipt_claims` table is not part of the live read path. `prepare_schema()` drops it when empty, and refuses to proceed if it still contains rows so an operator can drain or reverse-migrate those rows deliberately.
-4. Subsequent claim, complete, rescue, and count paths target the partitioned claim/closure tables; the live receipt set is derived as an anti-join over the active claim-ring partitions.
+4. Subsequent claim, complete, rescue, and count paths target the partitioned claim/closure tables. The live receipt set is derived as an anti-join over the active claim-ring partitions; stale-rescue scans also use the per-slot cursor stored on `claim_ring_slots`.
 
 TLA+ coverage (`AwaSegmentedStorage`, `AwaStorageLockOrder`) is extended to model the claim-ring rotation and the rescue-before-truncate precondition, parallel to the existing lease-ring model.
 
@@ -154,6 +154,7 @@ This ADR has been implemented for 0.6:
 
 - `lease_claims` and `lease_claim_closures` are partitioned by `claim_slot`.
 - `claim_ring_state` and `claim_ring_slots` control rotation and prune.
+- `claim_ring_slots` stores stale-rescue cursors so maintenance skips closed receipt history without reintroducing a per-claim mutable frontier.
 - `open_receipt_claims` is removed from fresh installs and is no longer a hot path table.
 - `lease_claim_receipts` defaults to `true`.
 - Receipts mode supports per-claim deadlines. The claim path writes `deadline_at` onto the `lease_claims` row when `QueueConfig.deadline_duration > 0`, and a sibling rescue scan (`rescue_expired_receipt_deadlines_tx`) force-closes claims whose `deadline_at` has passed without a closure or materialized lease, writing a `'deadline_expired'` closure. The maintenance entry point (`rescue_expired_deadlines`) merges the lease-side and receipt-side scans into one batch per tick, so receipts mode and the existing hard-deadline behaviour compose without operator intervention.

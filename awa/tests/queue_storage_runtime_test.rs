@@ -3770,6 +3770,194 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_rescue_cursor_advances_closed_prefix_only() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_rescue_cursor";
+    let schema = "awa_qs_runtime_receipt_rescue_cursor";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_a = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 11 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_b = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 12 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_c = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 13 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::ZERO)
+        .await
+        .expect("claim three receipt-backed jobs");
+    assert_eq!(claimed.len(), 3);
+    assert!(
+        claimed.iter().all(|entry| entry.claim.lease_claim_receipt),
+        "all claims should stay on the receipt plane"
+    );
+
+    let claim_a = claimed
+        .iter()
+        .find(|entry| entry.job.id == job_a)
+        .expect("claim for job A")
+        .clone();
+    let claim_b = claimed
+        .iter()
+        .find(|entry| entry.job.id == job_b)
+        .expect("claim for job B");
+    let claim_c = claimed
+        .iter()
+        .find(|entry| entry.job.id == job_c)
+        .expect("claim for job C")
+        .clone();
+    let claim_b = claim_b.clone();
+
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_a,
+        claim_a.job.run_lease,
+        Duration::from_secs(300),
+    )
+    .await;
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_b,
+        claim_b.job.run_lease,
+        Duration::from_secs(200),
+    )
+    .await;
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_c,
+        claim_c.job.run_lease,
+        Duration::from_secs(100),
+    )
+    .await;
+
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+        VALUES ($1, $2, clock_timestamp(), clock_timestamp())
+        "#
+    ))
+    .bind(job_b)
+    .bind(claim_b.job.run_lease)
+    .execute(&pool)
+    .await
+    .expect("seed fresh heartbeat blocker");
+
+    let completed = store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&claim_a))
+        .await
+        .expect("complete first claim");
+    assert_eq!(completed, vec![(job_a, claim_a.job.run_lease)]);
+
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::from_secs(90))
+        .await
+        .expect("receipt rescue should rescue stale claims");
+    assert_eq!(
+        rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_c],
+        "fresh heartbeat on job B must not prevent rescuing stale job C"
+    );
+
+    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT rescue_cursor_claimed_at, rescue_cursor_job_id, rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = $1
+        "#
+    ))
+    .bind(claim_a.claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read rescue cursor after first rescue");
+    assert_eq!(
+        (cursor.1, cursor.2),
+        (job_a, claim_a.job.run_lease),
+        "cursor can advance over the completed prefix but must stop before fresh job B"
+    );
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.attempt_state
+        SET heartbeat_at = clock_timestamp() - interval '300 seconds',
+            updated_at = clock_timestamp()
+        WHERE job_id = $1 AND run_lease = $2
+        "#
+    ))
+    .bind(job_b)
+    .bind(claim_b.job.run_lease)
+    .execute(&pool)
+    .await
+    .expect("make heartbeat blocker stale");
+
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::from_secs(90))
+        .await
+        .expect("receipt rescue should resume after blocker turns stale");
+    assert_eq!(
+        rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_b],
+        "second rescue should close the formerly fresh blocker only"
+    );
+
+    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT rescue_cursor_claimed_at, rescue_cursor_job_id, rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = $1
+        "#
+    ))
+    .bind(claim_a.claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read rescue cursor after second rescue");
+    assert_eq!(
+        (cursor.1, cursor.2),
+        (job_c, claim_c.job.run_lease),
+        "cursor should advance through the rescued blocker and already-closed tail"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_materialize_heartbeat";

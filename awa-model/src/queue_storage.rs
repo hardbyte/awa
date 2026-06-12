@@ -23,6 +23,8 @@ const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
+const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
+const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -8195,80 +8197,199 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         cutoff: DateTime<Utc>,
     ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        let mut rescued = Vec::new();
+        let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
+
+        for slot in 0..self.claim_slot_count() {
+            let mut slot_rescued = self
+                .rescue_stale_receipt_claims_for_slot_tx(tx, slot as i32, cutoff, remaining)
+                .await?;
+            remaining = remaining.saturating_sub(slot_rescued.len() as i64);
+            rescued.append(&mut slot_rescued);
+
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        Ok(rescued)
+    }
+
+    async fn rescue_stale_receipt_claims_for_slot_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        slot: i32,
+        cutoff: DateTime<Utc>,
+        rescue_limit: i64,
+    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
         let schema = self.schema();
+        let claim_child = claim_child_name(schema, slot as usize);
+        let closure_child = closure_child_name(schema, slot as usize);
         let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
-            WITH stale_claims AS (
-                -- Rescue scans partitioned lease_claims anti-joined
-                -- with lease_claim_closures.
+            WITH cursor_row AS (
                 SELECT
-                    claims.claim_slot,
-                    claims.ready_slot,
-                    claims.ready_generation,
-                    claims.job_id,
-                    claims.queue,
-                    'running'::awa.job_state AS state,
-                    claims.priority,
-                    claims.attempt,
-                    claims.run_lease,
-                    claims.max_attempts,
-                    claims.lane_seq,
-                    claims.enqueue_shard,
-                    claims.claimed_at AS attempted_at
-                FROM {schema}.lease_claims AS claims
-                LEFT JOIN {schema}.attempt_state AS attempt
-                  ON attempt.job_id = claims.job_id
-                 AND attempt.run_lease = claims.run_lease
-                WHERE COALESCE(attempt.heartbeat_at, claims.claimed_at) < $1
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.claim_slot = claims.claim_slot
-                        AND closures.job_id = claims.job_id
-                        AND closures.run_lease = claims.run_lease
-                  )
+                    rescue_cursor_claimed_at,
+                    rescue_cursor_job_id,
+                    rescue_cursor_run_lease
+                FROM {schema}.claim_ring_slots
+                WHERE slot = $1
+                FOR UPDATE
+            ),
+            candidates AS MATERIALIZED (
+                SELECT
+                    ordered.*,
+                    row_number() OVER (
+                        ORDER BY ordered.claimed_at, ordered.job_id, ordered.run_lease
+                    ) AS rn
+                FROM (
+                    SELECT
+                        claims.claim_slot,
+                        claims.ready_slot,
+                        claims.ready_generation,
+                        claims.job_id,
+                        claims.queue,
+                        claims.priority,
+                        claims.attempt,
+                        claims.run_lease,
+                        claims.max_attempts,
+                        claims.lane_seq,
+                        claims.enqueue_shard,
+                        claims.claimed_at,
+                        COALESCE(attempt.heartbeat_at, claims.claimed_at) < $2 AS is_stale,
+                        EXISTS (
+                            SELECT 1 FROM {closure_child} AS closures
+                            WHERE closures.claim_slot = claims.claim_slot
+                              AND closures.job_id = claims.job_id
+                              AND closures.run_lease = claims.run_lease
+                        ) AS is_closed,
+                        EXISTS (
+                            SELECT 1 FROM {schema}.leases AS lease
+                            WHERE lease.job_id = claims.job_id
+                              AND lease.run_lease = claims.run_lease
+                        ) AS is_lease_managed
+                    FROM {claim_child} AS claims
+                    CROSS JOIN cursor_row
+                    LEFT JOIN {schema}.attempt_state AS attempt
+                      ON attempt.job_id = claims.job_id
+                     AND attempt.run_lease = claims.run_lease
+                    WHERE claims.claim_slot = $1
+                      AND (claims.claimed_at, claims.job_id, claims.run_lease)
+                          > (
+                              cursor_row.rescue_cursor_claimed_at,
+                              cursor_row.rescue_cursor_job_id,
+                              cursor_row.rescue_cursor_run_lease
+                            )
+                    ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
+                    LIMIT $3
+                ) AS ordered
+            ),
+            stale_candidates AS (
+                SELECT candidates.*
+                FROM candidates
+                WHERE NOT is_closed
+                  AND NOT is_lease_managed
+                  AND is_stale
+                ORDER BY rn
+                LIMIT $4
+            ),
+            stale_locked AS (
+                SELECT stale_candidates.*
+                FROM stale_candidates
+                JOIN {claim_child} AS claims
+                  ON claims.claim_slot = stale_candidates.claim_slot
+                 AND claims.job_id = stale_candidates.job_id
+                 AND claims.run_lease = stale_candidates.run_lease
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {closure_child} AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                )
                   -- A claim that already materialized into `leases` is
                   -- on the lease-side heartbeat-rescue path (see
                   -- `rescue_stale_heartbeats`). Rescuing it again here
                   -- would write a second closure for an attempt the
-                  -- runtime is still tracking via its lease row, and on
-                  -- commit produce a double-failure transition. Mirror
-                  -- the same anti-join `load_job` uses to disambiguate.
+                  -- runtime is still tracking via its lease row.
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
                       WHERE lease.job_id = claims.job_id
                         AND lease.run_lease = claims.run_lease
                   )
-                ORDER BY COALESCE(attempt.heartbeat_at, claims.claimed_at) ASC
-                LIMIT 500
                 FOR UPDATE OF claims SKIP LOCKED
             ),
             inserted AS (
                 INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
-                SELECT stale_claims.claim_slot, stale_claims.job_id, stale_claims.run_lease, 'rescued', clock_timestamp()
-                FROM stale_claims
+                SELECT stale_locked.claim_slot, stale_locked.job_id, stale_locked.run_lease, 'rescued', clock_timestamp()
+                FROM stale_locked
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                RETURNING job_id, run_lease
+                RETURNING claim_slot, job_id, run_lease
+            ),
+            annotated AS (
+                SELECT
+                    candidates.*,
+                    (
+                        candidates.is_closed
+                        OR candidates.is_lease_managed
+                        OR EXISTS (
+                            SELECT 1 FROM inserted
+                            WHERE inserted.claim_slot = candidates.claim_slot
+                              AND inserted.job_id = candidates.job_id
+                              AND inserted.run_lease = candidates.run_lease
+                        )
+                    ) AS advanceable
+                FROM candidates
+            ),
+            bounded AS (
+                SELECT
+                    annotated.*,
+                    min(CASE WHEN NOT annotated.advanceable THEN annotated.rn END) OVER () AS first_blocked_rn
+                FROM annotated
+            ),
+            advance_target AS (
+                SELECT claimed_at, job_id, run_lease
+                FROM bounded
+                WHERE first_blocked_rn IS NULL OR rn < first_blocked_rn
+                ORDER BY rn DESC
+                LIMIT 1
+            ),
+            advance_cursor AS (
+                UPDATE {schema}.claim_ring_slots AS slots
+                SET rescue_cursor_claimed_at = advance_target.claimed_at,
+                    rescue_cursor_job_id = advance_target.job_id,
+                    rescue_cursor_run_lease = advance_target.run_lease
+                FROM advance_target
+                WHERE slots.slot = $1
+                RETURNING slots.slot
+            ),
+            cursor_advance AS (
+                SELECT count(*) FROM advance_cursor
             )
             SELECT
-                stale_claims.ready_slot,
-                stale_claims.ready_generation,
-                stale_claims.job_id,
-                stale_claims.queue,
-                stale_claims.state,
-                stale_claims.priority,
-                stale_claims.attempt,
-                stale_claims.run_lease,
-                stale_claims.max_attempts,
-                stale_claims.lane_seq,
-                stale_claims.enqueue_shard,
-                stale_claims.attempted_at
-            FROM stale_claims
+                stale_locked.ready_slot,
+                stale_locked.ready_generation,
+                stale_locked.job_id,
+                stale_locked.queue,
+                'running'::awa.job_state AS state,
+                stale_locked.priority,
+                stale_locked.attempt,
+                stale_locked.run_lease,
+                stale_locked.max_attempts,
+                stale_locked.lane_seq,
+                stale_locked.enqueue_shard,
+                stale_locked.claimed_at AS attempted_at
+            FROM stale_locked
             JOIN inserted
-              ON inserted.job_id = stale_claims.job_id
-             AND inserted.run_lease = stale_claims.run_lease
+              ON inserted.claim_slot = stale_locked.claim_slot
+             AND inserted.job_id = stale_locked.job_id
+             AND inserted.run_lease = stale_locked.run_lease
+            CROSS JOIN cursor_advance
             "#
         ))
+        .bind(slot)
         .bind(cutoff)
+        .bind(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT)
+        .bind(rescue_limit)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -11923,6 +12044,19 @@ impl QueueStorage {
 
         match truncate {
             Ok(_) => {
+                sqlx::query(&format!(
+                    r#"
+                    UPDATE {schema}.claim_ring_slots
+                    SET rescue_cursor_claimed_at = '-infinity'::timestamptz,
+                        rescue_cursor_job_id = 0,
+                        rescue_cursor_run_lease = 0
+                    WHERE slot = $1
+                    "#
+                ))
+                .bind(slot)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
                 Ok(PruneOutcome::Pruned {
                     slot,

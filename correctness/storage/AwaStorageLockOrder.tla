@@ -237,14 +237,17 @@ CloseReceiptPlan(claimSlot) ==
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
 \* rescue_stale_receipt_claims_tx (queue_storage.rs:6672)
+\*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
 \*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)
 \*     FOR UPDATE OF claims SKIP LOCKED
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
+\*   UPDATE claim_ring_slots[slot] rescue cursor
 \* The leases anti-join takes AccessShare on the leases
 \* parent so rescue can race against prune_oldest_leases.
 RescueReceiptsPlan(claimSlot) ==
-    << Step(ClaimChildResource(claimSlot), ModeShared),
+    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
+       Step(ClaimChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
