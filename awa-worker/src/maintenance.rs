@@ -107,7 +107,7 @@ const OVERRUN_LOWER_NUM: u32 = 7;
 const OVERRUN_LOWER_DEN: u32 = 10;
 
 /// Number of ticks to suppress a delayed branch's body. At the default
-/// `lease_rotate_interval = 250ms`, 120 ticks = 30s wall time of quiet
+/// `lease_rotate_interval = 1000ms`, 120 ticks = 120s wall time of quiet
 /// before the branch tries again. Re-armed on every overrun
 /// observation while still delayed.
 const BRANCH_COOLDOWN_TICKS: u32 = 120;
@@ -355,8 +355,8 @@ struct PruneBackoffState {
     backoff_level: u8,
 }
 
-/// Cap on the backoff exponent. `2^5 = 32` ticks; at the 250ms default
-/// `lease_rotate_interval` that is ~8s between prune attempts under
+/// Cap on the backoff exponent. `2^5 = 32` ticks; at the 1000ms default
+/// `lease_rotate_interval` that is ~32s between prune attempts under
 /// sustained pin pressure. Long enough to cut the per-tick scan cost
 /// dramatically; short enough that prune resumes promptly once the
 /// snapshot is released.

@@ -196,7 +196,7 @@ Queue storage has three independent rings, each advanced by the elected maintena
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 | --- | --- | --: | --- | --- |
 | Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/done/tombstone/delta slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows, tombstones, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
-| Lease | `leases_*` | `250ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
+| Lease | `leases_*` | `1000ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure; stale-rescue cursors are reset when the slot is truncated |
 
 The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.
