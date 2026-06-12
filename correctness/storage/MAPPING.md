@@ -63,10 +63,10 @@ The TLA+ lifecycle model does not represent the completed-history rollup cache o
 | `PurgeDlq(j)` | `purge_dlq_job` / `purge_dlq` in `awa-model/src/dlq.rs:382, 423` | `DELETE FROM dlq_entries WHERE ...` |
 | `RotateReadySegments` | maintenance `rotate_ready` (`awa-worker/src/maintenance.rs`) | `UPDATE queue_ring_state SET current_slot = next` + partition attach/detach |
 | `RotateLeaseSegments` | `QueueStorage::rotate_leases` | `UPDATE lease_ring_state` with child-partition busy check |
-| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready/terminal queue family (`queue_storage.rs:9080`) | `FOR UPDATE` on `queue_ring_state` and `queue_ring_slots[slot]`, then `LOCK TABLE ... ACCESS EXCLUSIVE`, recheck active rows, then `TRUNCATE`; ready-backed terminal rows, ready tombstones, and pending terminal-count deltas are reclaimed with their retained ready bodies, and Rust updates `{schema}.queue_terminal_rollups` after successful terminal prune accounting |
+| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready/terminal queue family (`queue_storage.rs:9080`) | `FOR UPDATE` on `queue_ring_state` and `queue_ring_slots[slot]`, then `LOCK TABLE ... ACCESS EXCLUSIVE NOWAIT`, recheck active rows, then `TRUNCATE`; ready-backed terminal rows, ready tombstones, and pending terminal-count deltas are reclaimed with their retained ready bodies, and Rust updates `{schema}.queue_terminal_rollups` after successful terminal prune accounting |
 | `PruneLeaseSegment` | `QueueStorage::prune_oldest_leases` (`queue_storage.rs:9208`) | `TRUNCATE` the selected `leases_N` child only after active-row checks |
 | `RotateClaimSegments` | maintenance `QueueStorage::rotate_claims` (`queue_storage.rs:9333`), wired via `Maintenance::rotate_queue_storage_claims` at the `claim_rotate_interval` tick | `FOR UPDATE` on `claim_ring_state`, busy-check both child partitions, then `UPDATE claim_ring_state SET current_slot = next, generation = next_gen` with compare-and-swap on `(current_slot, generation)` |
-| `PruneClaimSegment(seg)` | `QueueStorage::prune_oldest_claims` (`queue_storage.rs:9433`) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `SET LOCAL lock_timeout = '50ms'`, `LOCK TABLE` `lease_claims_N` and `lease_claim_closures_N` `IN ACCESS EXCLUSIVE MODE`, recheck not-current, anti-join check that every claim has a closure (`PartitionTruncateSafety`), then `TRUNCATE` both children |
+| `PruneClaimSegment(seg)` | `QueueStorage::prune_oldest_claims` (`queue_storage.rs:9433`) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `LOCK TABLE` `lease_claims_N` and `lease_claim_closures_N` `IN ACCESS EXCLUSIVE MODE NOWAIT`, recheck not-current, anti-join check that every claim has a closure (`PartitionTruncateSafety`), then `TRUNCATE` both children |
 | `RescueStaleReceipt(j, r)` | `rescue_stale_receipt_claims_tx` (`queue_storage.rs:6672`), invoked from maintenance `rescue_stale_heartbeats`. Excludes claims already materialized into `leases` so the lease-side rescue path owns those. The spec takes the explicit `(j, r)` so concurrent rescue / re-claim races are reachable: rescue can fire on an old attempt's `(j, r_old)` receipt while `(j, r_old + 1)` already has an open receipt in a newer partition. | anti-join `lease_claims` against `lease_claim_closures` and against `leases` over the active partitions; close stragglers by appending to `lease_claim_closures` (rescue closure outcome `'rescued'`) |
 | `CancelRunningToTerminal(j)` | `cancel_job_tx` lease branch (`queue_storage.rs:5501`, ~line 5581) | `DELETE FROM leases ... RETURNING`, `insert_done_rows_tx` (state = `cancelled`), `close_receipt_tx` (writes the `'cancelled'` closure into the matching claim partition), `pg_notify('awa:cancel', ...)` |
 | `CancelReceiptOnlyToTerminal(j)` | `cancel_job_tx` receipt-only branch (`queue_storage.rs:5621`) | `SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED` → `insert_done_rows_tx` → `INSERT INTO lease_claim_closures` → defensive `DELETE FROM leases` (sweeps any concurrent materialization) → `pg_notify` |
@@ -197,16 +197,16 @@ The spec's PruneLeaseSegment transition also captures the analogous concern on `
 
 1. `FOR UPDATE` on `queue_ring_state` to serialise against concurrent rotates
 2. `FOR UPDATE` on the target `queue_ring_slots` row
-3. `SET LOCAL lock_timeout = '50ms'`, then `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` on the ready and done partition children — this blocks the AccessShare lock that the claim CTE takes when reading `{schema}.ready_entries_%s`, forcing prune to wait for in-flight claims to commit (or bail via the 50 ms `lock_timeout`)
+3. `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE NOWAIT` on the ready and done partition children — this conflicts with the AccessShare lock that the claim CTE takes when reading `{schema}.ready_entries_%s`, but prune bails immediately instead of queueing behind a long reader
 4. Only AFTER the lock is held does the count-active-leases check run inside the same transaction — so any lease inserted by a concurrent claim will be visible to the check
 
-All prune paths set `SET LOCAL lock_timeout = '50ms'` so they abort gracefully under contention rather than stalling.
+All automatic prune paths use `NOWAIT` for child-table `ACCESS EXCLUSIVE` locks so they abort gracefully under contention rather than queueing ahead of normal worker traffic.
 
 So the "check-then-act" framing is inaccurate: the Rust code is "lock-then-check-then-act", with the lock being the load-bearing part.
 
 ### Role of the race spec going forward
 
-The spec plus `AwaSegmentedStorageRaces.cfg` (race-exposing) and `AwaSegmentedStorageRacesSafe.cfg` (checked-commit) is a regression harness. If any future refactor weakens the checked-commit discipline on `lease_ring_state`, or weakens the `ACCESS EXCLUSIVE` on the partition children, the race spec will still produce a counterexample and the safe spec will still pass — making the invariant the checked-commit enforces a clear statement of what the SQL coordination is buying.
+The spec plus `AwaSegmentedStorageRaces.cfg` (race-exposing) and `AwaSegmentedStorageRacesSafe.cfg` (checked-commit) is a regression harness. If any future refactor weakens the checked-commit discipline on `lease_ring_state`, or weakens the `ACCESS EXCLUSIVE NOWAIT` on the partition children, the race spec will still produce a counterexample and the safe spec will still pass — making the invariant the checked-commit enforces a clear statement of what the SQL coordination is buying.
 
 ### Lock-order regression harness
 
@@ -307,10 +307,10 @@ Model checking results:
 - `ClaimedEntry` carries `claim_slot: i32` so completion can route the closure INSERT to the matching partition without an extra lookup.
 - `prepare_schema()` drops `open_receipt_claims` on every install (refusing if it has rows). `reset()` does the same and clears any `_legacy` tables left over from a partial migration.
 - `claim_slot_count` (default 8, minimum 2) sets the partition count. `claim_rotate_interval` (defaulting to `queue_rotate_interval`) drives the rotation cadence; `ClientBuilder::claim_rotate_interval` overrides per-test or per-bench.
-- `rotate_claims` advances the cursor with a `FOR UPDATE` on `claim_ring_state` and a busy-check on both child partitions of the next slot — the rotation invariant is "the slot we're flipping onto must be empty". `prune_oldest_claims` walks the full ring-state → slot-row → child `ACCESS EXCLUSIVE` lock sequence and refuses to TRUNCATE while any claim in the partition lacks a matching closure (`PartitionTruncateSafety`).
+- `rotate_claims` advances the cursor with a `FOR UPDATE` on `claim_ring_state` and a busy-check on both child partitions of the next slot — the rotation invariant is "the slot we're flipping onto must be empty". `prune_oldest_claims` walks the full ring-state → slot-row → child `ACCESS EXCLUSIVE NOWAIT` lock sequence and refuses to TRUNCATE while any claim in the partition lacks a matching closure (`PartitionTruncateSafety`).
 
 ### Coverage
 
 `queue_storage_runtime_test` (49 tests) covers the lifecycle: partition routing, rotation isolation, partition migration on schema upgrade, the rotate / prune busy-and-safety predicates, admin cancel of running attempts, the open-receipt-claims absence invariant, the full short-job lifecycle, and the rescue paths for heartbeat / deadline / receipt-only attempts.
 
-`receipt_plane_chaos_test` (4 `#[ignore]`-d nightly tests) covers flood / concurrency / lock-order scenarios: rescue throughput under overload, prune-skips-active under concurrent traffic, the `ACCESS EXCLUSIVE` barrier between TRUNCATE and concurrent inserts, and admin-cancel-during-materialize orphan-lease cleanup.
+`receipt_plane_chaos_test` (4 `#[ignore]`-d nightly tests) covers flood / concurrency / lock-order scenarios: rescue throughput under overload, prune-skips-active under concurrent traffic, the `ACCESS EXCLUSIVE NOWAIT` barrier between TRUNCATE and concurrent inserts, and admin-cancel-during-materialize orphan-lease cleanup.

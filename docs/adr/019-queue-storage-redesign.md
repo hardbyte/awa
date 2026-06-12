@@ -152,13 +152,13 @@ The leader-elected maintenance service owns:
 - queue depth publication
 - DLQ retention cleanup
 
-All prune paths remain best-effort and use short lock timeouts. The explicit lock contract is:
+All prune paths remain best-effort and take their child-table locks with `NOWAIT`. The explicit lock contract is:
 
 - claim takes `FOR UPDATE OF claims SKIP LOCKED` on `queue_claim_heads` while it advances the claim cursor and inserts the claim
 - rotate publishes the next lease slot with a compare-and-swap update on `lease_ring_state`
-- prune-ready takes `FOR UPDATE` on `queue_ring_state`, `FOR UPDATE` on the target `queue_ring_slots` row, and `ACCESS EXCLUSIVE` on the child partitions before it rechecks liveness and truncates
-- prune-leases derives the oldest initialized slot from `lease_ring_state`, locks the child partition `ACCESS EXCLUSIVE`, rechecks that the slot is not current, then truncates if it is empty
-- prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on the target `claim_ring_slots` row, and `ACCESS EXCLUSIVE` on both the matching `lease_claims_*` and `lease_claim_closures_*` partitions, verifies every claim in the slot has a matching closure, then `TRUNCATE`s both partitions in lockstep. Open claims make prune skip the slot until normal completion or the separate receipt-rescue scans close them.
+- prune-ready takes `FOR UPDATE` on `queue_ring_state`, `FOR UPDATE` on the target `queue_ring_slots` row, and `ACCESS EXCLUSIVE NOWAIT` on the child partitions before it rechecks liveness and truncates
+- prune-leases derives the oldest initialized slot from `lease_ring_state`, locks the child partition `ACCESS EXCLUSIVE NOWAIT`, rechecks that the slot is not current, then truncates if it is empty
+- prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on the target `claim_ring_slots` row, and `ACCESS EXCLUSIVE NOWAIT` on both the matching `lease_claims_*` and `lease_claim_closures_*` partitions, verifies every claim in the slot has a matching closure, then `TRUNCATE`s both partitions in lockstep. Open claims make prune skip the slot until normal completion or the separate receipt-rescue scans close them.
 
 That order is deliberate. The TLA+ storage race / lock-order models exist to prove that claim, rotate, and prune cannot interleave into “claim lands in a pruned segment” behavior.
 
@@ -167,7 +167,7 @@ Rotation and prune policy is also part of this decision:
 - lease and claim-ring segments rotate quickly because their churn is the remaining hot-path source
 - ready / terminal segments rotate more slowly than the lease and claim rings; deferred and DLQ rows are plain backlog/hold tables with their own promotion, retry, purge, and retention cleanup paths
 - prune walks sealed segments oldest-first
-- prune uses `SET LOCAL lock_timeout = '50ms'` and returns gracefully when a reader or writer still holds the segment
+- prune returns gracefully when a reader or writer still holds the segment, without queueing an `ACCESS EXCLUSIVE` request behind that reader
 - long-lived readers can still pin a segment horizon, so operators are expected to run analytical reads on replicas and keep primary-side `statement_timeout` discipline
 
 Ordinary queue-storage terminal history is therefore a rotation-and-prune story, not a row-by-row delete story. DLQ retention remains a bounded cleanup pass against the separate `dlq_entries` hold table, and the canonical compatibility path still has row-retention cleanup.

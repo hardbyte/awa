@@ -11316,13 +11316,8 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
-        sqlx::query("SET LOCAL lock_timeout = '50ms'")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
         let lock_delta = sqlx::query(&format!(
-            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
         ))
         .execute(tx.as_mut())
         .await;
@@ -11543,13 +11538,8 @@ impl QueueStorage {
         let tomb_child = ready_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
 
-        sqlx::query("SET LOCAL lock_timeout = '50ms'")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
         ))
         .execute(tx.as_mut())
         .await;
@@ -11833,10 +11823,13 @@ impl QueueStorage {
         // `correctness/storage/AwaStorageLockOrder.tla` requires the
         // sequence `lease_ring_state FOR UPDATE` →
         // `lease_ring_slots[slot] FOR UPDATE` → `ACCESS EXCLUSIVE` on
-        // the child. Without these locks a concurrent rotator can flip
-        // the cursor under the prune's liveness check (current_slot
-        // recheck races a CAS update) and prune what should be the
-        // active partition.
+        // the child. The child lock is NOWAIT because prune is
+        // best-effort; a long reader must not put maintenance at the
+        // head of the relation-lock queue and stall normal
+        // claim/complete traffic. Without these locks a concurrent
+        // rotator can flip the cursor under the prune's liveness check
+        // (current_slot recheck races a CAS update) and prune what
+        // should be the active partition.
         let state: (i32, i64, i32) = sqlx::query_as(&format!(
             r#"
             SELECT current_slot, generation, slot_count
@@ -11874,13 +11867,8 @@ impl QueueStorage {
 
         let lease_child = lease_child_name(schema, slot as usize);
 
-        sqlx::query("SET LOCAL lock_timeout = '50ms'")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
         let lock_table = sqlx::query(&format!(
-            "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12064,10 +12052,9 @@ impl QueueStorage {
     ///
     /// 1. `FOR UPDATE` on `claim_ring_state` (serialises with rotate).
     /// 2. `FOR UPDATE` on the target `claim_ring_slots` row.
-    /// 3. `SET LOCAL lock_timeout = '50ms'` then `LOCK TABLE ACCESS
-    ///    EXCLUSIVE` on both children (serialises with in-flight
-    ///    claim/complete/rescue writers; gives up gracefully under
-    ///    contention).
+    /// 3. `LOCK TABLE ACCESS EXCLUSIVE NOWAIT` on both children
+    ///    (serialises with in-flight claim/complete/rescue writers;
+    ///    gives up immediately under contention).
     /// 4. Verifies the slot is not the current one, and that every
     ///    claim in the partition has a matching closure row.
     /// 5. `TRUNCATE` both children in a single statement.
@@ -12122,13 +12109,8 @@ impl QueueStorage {
         let claim_child = claim_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
 
-        sqlx::query("SET LOCAL lock_timeout = '50ms'")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {claim_child}, {closure_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {claim_child}, {closure_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
         ))
         .execute(tx.as_mut())
         .await;

@@ -20,15 +20,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-fn is_lock_timeout_sqlx(err: &sqlx::Error) -> bool {
+fn is_lock_contention_sqlx(err: &sqlx::Error) -> bool {
     matches!(
         err,
         sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("55P03")
     )
 }
 
-fn is_lock_timeout_awa(err: &AwaError) -> bool {
-    matches!(err, AwaError::Database(db_err) if is_lock_timeout_sqlx(db_err))
+fn is_lock_contention_awa(err: &AwaError) -> bool {
+    matches!(err, AwaError::Database(db_err) if is_lock_contention_sqlx(db_err))
 }
 
 fn base_database_url() -> String {
@@ -565,7 +565,7 @@ async fn maintenance_loop(
                             .queue_prune_skipped_active
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(err) if is_lock_timeout_awa(&err) => {
+                    Err(err) if is_lock_contention_awa(&err) => {
                         counters.queue_prune_blocked.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(err) => panic!("Vacuum-aware prune failed: {err:?}"),
@@ -598,7 +598,7 @@ async fn maintenance_loop(
                             .lease_prune_skipped_active
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(err) if is_lock_timeout_awa(&err) => {
+                    Err(err) if is_lock_contention_awa(&err) => {
                         counters
                             .lease_prune_blocked
                             .fetch_add(1, Ordering::Relaxed);

@@ -74,8 +74,7 @@ Active partitions are bounded by the claim-ring rotation window, which is sized 
 - Prune order mirrors `prune_oldest` and `prune_oldest_leases`:
   1. `FOR UPDATE` on `claim_ring_state`.
   2. `FOR UPDATE` on the target `claim_ring_slots` row.
-  3. `SET LOCAL lock_timeout = '50ms'`.
-  4. `ACCESS EXCLUSIVE` on both partitions (claims and closures).
+  3. `ACCESS EXCLUSIVE NOWAIT` on both partitions (claims and closures).
   5. Liveness recheck: every claim must have a closure, then `TRUNCATE`.
 - Partition truncation never races with claim because claim always writes to the ring's current slot and rotation advances the current slot atomically under the same lock order.
 
@@ -118,7 +117,7 @@ Success criteria for this redesign, measured on the long-horizon portable harnes
 
 - This is a breaking schema migration.
 - "Currently open" queries move from a single bounded-frontier lookup to a bounded anti-join across a small number of active partitions. Query planning needs spot-checking once the partition count is chosen.
-- Rescue gains a partition-aware variant and must run before prune takes `ACCESS EXCLUSIVE`. The interaction point is small but adds a prune-path precondition not present for `ready` / `done`.
+- Rescue gains a partition-aware variant and must run before prune takes `ACCESS EXCLUSIVE NOWAIT`. The interaction point is small but adds a prune-path precondition not present for `ready` / `done`.
 - The default-success path still appends a `done_entries` row. ADR-026 later narrowed that row by hydrating duplicated immutable body fields from the retained ready row, but kept `done_entries` as the durable terminal record used by queue counts, retention, `load_job`, and terminal inspection.
 
 ## Alternatives Considered
