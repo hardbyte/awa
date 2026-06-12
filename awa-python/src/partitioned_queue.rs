@@ -130,9 +130,7 @@ impl PyPartitionedQueue {
                 ));
             }
             (Some(0), None) => {
-                return Err(validation_error(
-                    "max_workers_per_partition must be > 0",
-                ));
+                return Err(validation_error("max_workers_per_partition must be > 0"));
             }
             _ => {}
         }

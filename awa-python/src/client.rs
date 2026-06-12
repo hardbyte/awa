@@ -1343,11 +1343,7 @@ impl PyClient {
     }
 
     /// Fetch one durable batch operation by UUID string.
-    fn get_batch_operation<'py>(
-        &self,
-        py: Python<'py>,
-        id: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn get_batch_operation<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
         let id = Uuid::parse_str(&id).map_err(|err| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid batch operation id: {err}"))
         })?;
@@ -2307,6 +2303,7 @@ impl PyClient {
             ordering_key.as_ref(),
             opts.as_deref(),
         )?;
+        let queue_counts = enqueue_batch_queue_counts(&insert_params);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let schema = QueueStorage::active_schema(&pool)
@@ -2328,7 +2325,7 @@ impl PyClient {
                 .enqueue_params_copy(&pool, &insert_params)
                 .await
                 .map_err(map_awa_error)?;
-            metrics.record_enqueue_batch(&queue, count as u64, started.elapsed());
+            record_enqueue_batch_metrics(&metrics, &queue_counts, count as u64, started.elapsed());
             Ok(count)
         })
     }
@@ -2373,6 +2370,7 @@ impl PyClient {
             ordering_key.as_ref(),
             opts.as_deref(),
         )?;
+        let queue_counts = enqueue_batch_queue_counts(&insert_params);
 
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -2395,7 +2393,12 @@ impl PyClient {
                     .enqueue_params_copy(&pool, &insert_params)
                     .await
                     .map_err(map_awa_error)?;
-                metrics.record_enqueue_batch(&queue, count as u64, started.elapsed());
+                record_enqueue_batch_metrics(
+                    &metrics,
+                    &queue_counts,
+                    count as u64,
+                    started.elapsed(),
+                );
                 Ok(count)
             })
         })
@@ -3150,13 +3153,51 @@ impl PyClient {
     }
 }
 
-/// Convert a list of Python job args into InsertParams for the COPY path.
+/// Group prepared COPY params by their routed queue for enqueue metrics.
+///
+/// Per-job `opts` can route one batch across several queues, so the
+/// enqueue metrics cannot attribute the whole batch to the batch-level
+/// default queue name. Counts are prepared rows per queue; uniqueness
+/// skips inside the store are not visible per queue, so a homogeneous
+/// batch should prefer the store-reported total.
+fn enqueue_batch_queue_counts(params: &[InsertParams]) -> Vec<(String, u64)> {
+    let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for param in params {
+        *counts.entry(param.opts.queue.as_str()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(queue, count)| (queue.to_string(), count))
+        .collect()
+}
+
+fn record_enqueue_batch_metrics(
+    metrics: &awa_worker::AwaMetrics,
+    queue_counts: &[(String, u64)],
+    stored_total: u64,
+    elapsed: std::time::Duration,
+) {
+    match queue_counts {
+        [(queue, _)] => metrics.record_enqueue_batch(queue, stored_total, elapsed),
+        many => {
+            for (queue, prepared) in many {
+                metrics.record_enqueue_batch(queue, *prepared, elapsed);
+            }
+        }
+    }
+}
+
+/// Per-job overrides parsed from a COPY batch `opts` entry.
+///
+/// `ordering_key` is tri-state: absent falls back to the batch-level
+/// key, while an explicit `None` clears it for that job.
 #[derive(Debug, Clone, Default)]
 struct PerJobInsertOpts {
     queue: Option<String>,
     ordering_key: Option<Option<Vec<u8>>>,
 }
 
+/// Convert a list of Python job args into InsertParams for the COPY path.
 #[allow(clippy::too_many_arguments)]
 fn prepare_insert_many_params(
     py: Python<'_>,
@@ -3279,7 +3320,11 @@ fn parse_one_job_insert_opts(
     let queue = dict
         .get_item("queue")?
         .filter(|value| !value.is_none())
-        .map(|value| value.extract::<String>())
+        .map(|value| {
+            value
+                .extract::<String>()
+                .map_err(|_| validation_error("opts queue must be a string"))
+        })
         .transpose()?;
     if queue.as_deref() == Some("") {
         return Err(validation_error("opts queue must not be empty"));
@@ -3638,10 +3683,12 @@ fn parse_batch_operation_filter(
     let state = optional_dict_item(dict, "state")?
         .map(|value| value.extract::<String>().and_then(|s| parse_job_state(&s)))
         .transpose()?;
-    let created_at_gte =
-        optional_dict_item(dict, "created_at_gte")?.map(extract_datetime).transpose()?;
-    let created_at_lt =
-        optional_dict_item(dict, "created_at_lt")?.map(extract_datetime).transpose()?;
+    let created_at_gte = optional_dict_item(dict, "created_at_gte")?
+        .map(extract_datetime)
+        .transpose()?;
+    let created_at_lt = optional_dict_item(dict, "created_at_lt")?
+        .map(extract_datetime)
+        .transpose()?;
 
     Ok(BatchOperationFilter {
         kind,
@@ -3802,4 +3849,48 @@ fn parse_queue_retention_overrides(
     }
 
     Ok(overrides)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enqueue_batch_queue_counts;
+    use awa_model::{InsertOpts, InsertParams};
+
+    fn params_for_queue(queue: &str) -> InsertParams {
+        InsertParams {
+            kind: "test".to_string(),
+            args: serde_json::json!({}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn enqueue_batch_queue_counts_groups_by_routed_queue() {
+        let params = vec![
+            params_for_queue("partition-a"),
+            params_for_queue("partition-b"),
+            params_for_queue("partition-a"),
+        ];
+
+        assert_eq!(
+            enqueue_batch_queue_counts(&params),
+            vec![
+                ("partition-a".to_string(), 2),
+                ("partition-b".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn enqueue_batch_queue_counts_homogeneous_batch_is_single_entry() {
+        let params = vec![params_for_queue("email"), params_for_queue("email")];
+
+        assert_eq!(
+            enqueue_batch_queue_counts(&params),
+            vec![("email".to_string(), 2)]
+        );
+    }
 }
