@@ -13,7 +13,9 @@ use awa_model::admin::{
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
-use awa_model::{storage as transition, JobArgs, PeriodicJob, QueueFanout, QueueStorageConfig};
+use awa_model::{
+    storage as transition, JobArgs, PartitionedQueue, PeriodicJob, QueueStorageConfig,
+};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -231,22 +233,27 @@ impl ClientBuilder {
         self
     }
 
-    /// Add every physical queue in a logical queue fanout.
+    /// Add every physical queue in a logical partitioned queue.
     ///
     /// This is equivalent to calling [`queue`] once for each physical queue in
-    /// the fanout. Producers should route inserts through the same
-    /// [`QueueFanout`] so workers and producers agree on the physical queue
+    /// the partitioned queue. Producers should route inserts through the same
+    /// [`PartitionedQueue`] so workers and producers agree on the physical queue
     /// names.
     ///
     /// The `config` is applied to each physical queue. In hard-reserved mode,
-    /// total logical capacity is therefore roughly `fanout.width() *
-    /// config.max_workers`; per-queue rate limits also apply per physical
+    /// total logical capacity is therefore roughly
+    /// `partitioned_queue.partitions() * config.max_workers`; per-queue rate
+    /// limits also apply per physical
     /// queue. Divide those knobs yourself, or use weighted mode with a
     /// `global_max_workers` cap, when you need a logical total.
     ///
     /// [`queue`]: ClientBuilder::queue
-    pub fn queue_fanout(mut self, fanout: &QueueFanout, config: QueueConfig) -> Self {
-        for queue in fanout.physical_queues() {
+    pub fn partitioned_queue(
+        mut self,
+        partitioned_queue: &PartitionedQueue,
+        config: QueueConfig,
+    ) -> Self {
+        for queue in partitioned_queue.physical_queues() {
             self.queues.push((queue.clone(), config.clone()));
         }
         self
@@ -2489,6 +2496,7 @@ mod tests {
         match sqlx::query(&create_sql).execute(&admin_pool).await {
             Ok(_) => {}
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {}
             Err(err) => panic!("Failed to create client test database {database_name}: {err}"),
         }
     }
@@ -2836,19 +2844,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_fanout_declares_each_physical_queue() {
-        let fanout = QueueFanout::new("email", 3).expect("fanout should build");
+    async fn partitioned_queue_declares_each_physical_queue() {
+        let partitioned_queue =
+            PartitionedQueue::new("email", 3).expect("partitioned queue should build");
 
         let client = Client::builder(lazy_pool())
-            .queue_fanout(
-                &fanout,
+            .partitioned_queue(
+                &partitioned_queue,
                 QueueConfig {
                     max_workers: 7,
                     ..QueueConfig::default()
                 },
             )
             .build()
-            .expect("fanout queues should build");
+            .expect("partitioned queue queues should build");
 
         let queues: Vec<_> = client
             .queues
@@ -2857,22 +2866,23 @@ mod tests {
             .collect();
         assert_eq!(
             queues,
-            vec![("email__p0", 7), ("email__p1", 7), ("email__p2", 7)]
+            vec![("email", 7), ("email__p1", 7), ("email__p2", 7)]
         );
     }
 
     #[tokio::test]
     async fn duplicate_queue_declarations_are_rejected() {
-        let fanout = QueueFanout::new("email", 2).expect("fanout should build");
+        let partitioned_queue =
+            PartitionedQueue::new("email", 2).expect("partitioned queue should build");
 
         let result = Client::builder(lazy_pool())
-            .queue("email__p0", QueueConfig::default())
-            .queue_fanout(&fanout, QueueConfig::default())
+            .queue("email", QueueConfig::default())
+            .partitioned_queue(&partitioned_queue, QueueConfig::default())
             .build();
 
         assert!(matches!(
             result,
-            Err(BuildError::DuplicateQueue { queue }) if queue == "email__p0"
+            Err(BuildError::DuplicateQueue { queue }) if queue == "email"
         ));
     }
 

@@ -266,6 +266,23 @@ def test_insert_many_copy_sync(client):
         assert job.args["to"] == f"copy{i}@example.com"
 
 
+def test_insert_many_copy_sync_per_job_opts(client):
+    jobs_data = [
+        SyncEmail(to="copy-a@example.com", subject="Copy A"),
+        SyncEmail(to="copy-b@example.com", subject="Copy B"),
+    ]
+    results = client.insert_many_copy(
+        jobs_data,
+        queue="unused_default",
+        opts=[
+            {"queue": "sync_copy_a", "ordering_key": "customer-a"},
+            {"queue": "sync_copy_b", "ordering_key": None},
+        ],
+    )
+
+    assert [job.queue for job in results] == ["sync_copy_a", "sync_copy_b"]
+
+
 def test_enqueue_many_copy_sync_queue_storage(client):
     schema = "awa_py_sync_enqueue_many_copy"
     queue = "sync_enqueue_many_copy"

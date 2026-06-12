@@ -157,7 +157,7 @@ Key observations:
 
 Queue-storage e2e sweeps separate tuning from storage design. For the hot single-queue shape, `enqueue_shards = 4` plus larger completion batches sustained `7.9k` completed jobs/s with `200ms` p99 end-to-end latency and bounded depth. Increasing `claimers` did not materially improve that shape.
 
-When the application can accept partitioned ordering at the logical workload level, routing through several physical queues with `QueueFanout` is the preferred throughput lever: it creates independent claim and completion coordination streams rather than adding more claimers to one queue head.
+When the application can accept partitioned ordering at the logical workload level, routing through several physical queues with `PartitionedQueue` is the preferred throughput lever: it creates independent claim and completion coordination streams rather than adding more claimers to one queue head.
 
 ADR-026 terminal-count deltas remove hot-path `queue_terminal_live_counts` updates. Completion and terminal-delete paths append signed deltas, exact reads include pending deltas, and maintenance folds sealed slots into compact counters only when the MVCC horizon is not pinned by another backend snapshot or idle transaction id. Benchmark runs should therefore sample `queue_terminal_count_deltas_*` alongside `queue_terminal_live_counts` so regressions distinguish pending append-only rows from mutable-counter dead tuples.
 

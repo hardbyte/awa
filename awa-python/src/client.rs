@@ -1,5 +1,7 @@
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
-use crate::errors::{map_awa_error, map_connect_error, map_sqlx_error, state_error};
+use crate::errors::{
+    map_awa_error, map_connect_error, map_sqlx_error, state_error, validation_error,
+};
 use crate::job::{py_to_json, PyJob};
 use crate::transaction::{
     insert_raw_job, parse_ordering_key, parse_run_at, parse_unique_opts, PySyncTransaction,
@@ -2175,7 +2177,7 @@ impl PyClient {
 
     // ── COPY batch insert/enqueue (async + sync) ────────────────────
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many_copy<'py>(
         &self,
@@ -2190,6 +2192,7 @@ impl PyClient {
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
         ordering_key: Option<Py<PyAny>>,
+        opts: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2204,6 +2207,7 @@ impl PyClient {
             run_at.as_ref(),
             unique_opts.as_ref(),
             ordering_key.as_ref(),
+            opts.as_deref(),
         )?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2220,7 +2224,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many_copy_sync(
         &self,
@@ -2235,6 +2239,7 @@ impl PyClient {
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
         ordering_key: Option<Py<PyAny>>,
+        opts: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<Vec<PyJob>> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2249,6 +2254,7 @@ impl PyClient {
             run_at.as_ref(),
             unique_opts.as_ref(),
             ordering_key.as_ref(),
+            opts.as_deref(),
         )?;
 
         py.detach(|| {
@@ -2261,7 +2267,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, queue_storage_queue_stripe_count=1))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, opts=None, queue_storage_queue_stripe_count=1))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue_many_copy<'py>(
         &self,
@@ -2276,6 +2282,7 @@ impl PyClient {
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
         ordering_key: Option<Py<PyAny>>,
+        opts: Option<Vec<Py<PyAny>>>,
         queue_storage_queue_stripe_count: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
         if queue_storage_queue_stripe_count == 0 {
@@ -2298,6 +2305,7 @@ impl PyClient {
             run_at.as_ref(),
             unique_opts.as_ref(),
             ordering_key.as_ref(),
+            opts.as_deref(),
         )?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2325,7 +2333,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, queue_storage_queue_stripe_count=1))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, opts=None, queue_storage_queue_stripe_count=1))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue_many_copy_sync(
         &self,
@@ -2340,6 +2348,7 @@ impl PyClient {
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
         ordering_key: Option<Py<PyAny>>,
+        opts: Option<Vec<Py<PyAny>>>,
         queue_storage_queue_stripe_count: u32,
     ) -> PyResult<usize> {
         if queue_storage_queue_stripe_count == 0 {
@@ -2362,6 +2371,7 @@ impl PyClient {
             run_at.as_ref(),
             unique_opts.as_ref(),
             ordering_key.as_ref(),
+            opts.as_deref(),
         )?;
 
         py.detach(|| {
@@ -3141,6 +3151,12 @@ impl PyClient {
 }
 
 /// Convert a list of Python job args into InsertParams for the COPY path.
+#[derive(Debug, Clone, Default)]
+struct PerJobInsertOpts {
+    queue: Option<String>,
+    ordering_key: Option<Option<Vec<u8>>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_insert_many_params(
     py: Python<'_>,
@@ -3154,6 +3170,7 @@ fn prepare_insert_many_params(
     run_at: Option<&Py<PyAny>>,
     unique_opts: Option<&Py<PyAny>>,
     ordering_key: Option<&Py<PyAny>>,
+    opts: Option<&[Py<PyAny>]>,
 ) -> PyResult<Vec<InsertParams>> {
     let metadata_json = metadata
         .map(|value| py_to_json(py, value.bind(py)))
@@ -3168,9 +3185,11 @@ fn prepare_insert_many_params(
     let ordering_key = ordering_key
         .map(|value| parse_ordering_key(py, value.bind(py)))
         .transpose()?;
+    let per_job_opts = parse_per_job_insert_opts(py, opts, jobs.len())?;
 
     jobs.iter()
-        .map(|job| {
+        .enumerate()
+        .map(|(idx, job)| {
             let bound = job.bind(py);
             let kind_str = match &kind {
                 Some(k) => k.clone(),
@@ -3180,23 +3199,102 @@ fn prepare_insert_many_params(
                 }?,
             };
             let args_json = serialize_args(py, bound)?;
+            let job_opts = per_job_opts.as_ref().map(|items| &items[idx]);
+            let job_queue = job_opts
+                .and_then(|opts| opts.queue.as_ref())
+                .cloned()
+                .unwrap_or_else(|| queue.to_string());
+            let job_ordering_key = match job_opts.and_then(|opts| opts.ordering_key.as_ref()) {
+                Some(value) => value.clone(),
+                None => ordering_key.clone(),
+            };
             Ok(InsertParams {
                 kind: kind_str,
                 args: args_json,
                 opts: InsertOpts {
-                    queue: queue.to_string(),
+                    queue: job_queue,
                     priority,
                     max_attempts,
                     run_at: run_at_dt,
                     metadata: metadata_json.clone(),
                     tags: tags.to_vec(),
                     unique: unique.clone(),
-                    ordering_key: ordering_key.clone(),
+                    ordering_key: job_ordering_key,
                     ..Default::default()
                 },
             })
         })
         .collect()
+}
+
+fn parse_per_job_insert_opts(
+    py: Python<'_>,
+    opts: Option<&[Py<PyAny>]>,
+    jobs_len: usize,
+) -> PyResult<Option<Vec<PerJobInsertOpts>>> {
+    let Some(opts) = opts else {
+        return Ok(None);
+    };
+
+    if opts.len() != jobs_len {
+        return Err(validation_error(format!(
+            "opts length must match jobs length (got {}, expected {})",
+            opts.len(),
+            jobs_len
+        )));
+    }
+
+    opts.iter()
+        .map(|item| parse_one_job_insert_opts(py, item.bind(py)))
+        .collect::<PyResult<Vec<_>>>()
+        .map(Some)
+}
+
+fn parse_one_job_insert_opts(
+    py: Python<'_>,
+    item: &Bound<'_, PyAny>,
+) -> PyResult<PerJobInsertOpts> {
+    if item.is_none() {
+        return Ok(PerJobInsertOpts::default());
+    }
+
+    let dict: &Bound<'_, PyDict> = item
+        .cast()
+        .map_err(|_| validation_error("each opts entry must be a dict or None"))?;
+
+    for (key, _) in dict.iter() {
+        let key: String = key
+            .extract()
+            .map_err(|_| validation_error("opts keys must be strings"))?;
+        match key.as_str() {
+            "queue" | "ordering_key" => {}
+            other => {
+                return Err(validation_error(format!(
+                    "unsupported opts key '{other}'; expected 'queue' or 'ordering_key'"
+                )));
+            }
+        }
+    }
+
+    let queue = dict
+        .get_item("queue")?
+        .filter(|value| !value.is_none())
+        .map(|value| value.extract::<String>())
+        .transpose()?;
+    if queue.as_deref() == Some("") {
+        return Err(validation_error("opts queue must not be empty"));
+    }
+
+    let ordering_key = match dict.get_item("ordering_key")? {
+        None => None,
+        Some(value) if value.is_none() => Some(None),
+        Some(value) => Some(Some(parse_ordering_key(py, &value)?)),
+    };
+
+    Ok(PerJobInsertOpts {
+        queue,
+        ordering_key,
+    })
 }
 
 /// Parsed queue configuration from Python input.

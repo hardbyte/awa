@@ -113,6 +113,23 @@ ADR-026 adds the retained-body shape for ready-backed terminal rows. `TerminalHa
 
 See [`MAPPING.md`](./MAPPING.md) for the action-by-action correspondence between TLA+ transitions and the Rust implementation, including the SQL statements that enforce each guard.
 
+## Partitioned-queue routing companion spec
+
+[`AwaPartitionedQueueRouting.tla`](./AwaPartitionedQueueRouting.tla) models the ADR-031 `PartitionedQueue` boundary above storage. A partitioned queue is not a new table family: each partition is an ordinary physical queue with the same ready, lease, receipt, terminal, DLQ, tombstone, and prune behaviour checked by `AwaSegmentedStorage`.
+
+The companion spec checks the routing refinement that storage deliberately abstracts away:
+
+- produced rows land in the partition selected for their key
+- the original ordering key still chooses the queue-storage enqueue shard inside that partition
+- lane sequence numbers are unique only within `(partition, shard)`, matching ADR-025's scoped FIFO
+- the configured key set demonstrates that every partition can reach every shard, which is the model-level counterpart to the Rust domain-separated hash distribution test
+
+Run it with:
+
+```bash
+./correctness/run-tlc.sh storage/AwaPartitionedQueueRouting.tla
+```
+
 ## Lock-order companion spec
 
 [`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each storage-engine transaction (claim, rotate-leases, prune-leases, rotate-ready, prune-ready) as an ordered sequence of Postgres lock acquisitions, with a simplified shared/exclusive compatibility matrix that captures the cases relevant to deadlock analysis. Invariants:

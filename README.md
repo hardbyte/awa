@@ -14,7 +14,7 @@ Awa (Māori: river) fills the gap between Postgres event queues that are too nar
 - A worker **claims** a job before running it. The claim increments `run_lease`, which guards completion so stale workers cannot finish a newer attempt.
 - A **lease** is the durable execution record for a live attempt. Short jobs usually stay on the receipt path; jobs that need heartbeat, progress, callbacks, or mutable attempt state materialize a lease row.
 - A **lane** is the ordered stream for one `(queue, priority, enqueue_shard)`. FIFO is strict inside a lane; raising shard count creates partitioned FIFO.
-- A **queue fanout** maps one hot logical workload to several physical queues so workers can drain independent claim/completion streams while preserving normal Awa durability and rescue semantics.
+- A **partitioned queue** maps one hot logical workload to several physical queues so workers can drain independent claim/completion streams while preserving normal Awa durability and rescue semantics.
 - A **segment** is a ring partition Awa can rotate and later truncate. Segments keep high-churn queue history off long-lived row-vacuum paths.
 - A **ready tombstone** is a small marker saying an immutable ready row should no longer be claimed, for example after cancelling or reprioritizing an unclaimed job. The ready row itself stays append-only until segment prune.
 
@@ -74,7 +74,7 @@ A phase-driven portable benchmark harness comparing Awa against pgque, procrasti
 
 ## Hot Queues
 
-Queues default to one physical queue, one enqueue shard, one claimer, and one queue-storage completion shard. Those defaults are intentionally conservative. For workloads that need more end-to-end throughput and can accept partitioned ordering, Rust and Python both expose `QueueFanout` to route one logical queue over several physical queues. `enqueue_shards` and `claimers` address different bottlenecks; see [Choosing a throughput lever](docs/configuration.md#choosing-a-throughput-lever) before changing them.
+Queues default to one physical queue, one enqueue shard, one claimer, and one queue-storage completion shard. Those defaults are intentionally conservative. For workloads that need more end-to-end throughput and can accept partitioned ordering, Rust and Python both expose `PartitionedQueue` to route one logical queue over several physical queues. `enqueue_shards` and `claimers` address different bottlenecks; see [Choosing a throughput lever](docs/configuration.md#choosing-a-throughput-lever) before changing them.
 
 Methodology and caveats live in [benchmarking notes](docs/benchmarking.md). Validation artifacts: [ADR-019 (queue storage)](docs/adr/bench/019-queue-storage-validation-2026-04-19.md) and [ADR-023 (receipt-plane ring partitioning)](docs/adr/bench/023-receipt-ring-validation-2026-04-26.md).
 

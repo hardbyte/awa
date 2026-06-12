@@ -134,6 +134,14 @@ The TLA+ storage model treats `EnqueueReady` and `EnqueueDeferred` as logical pe
 
 Uniqueness itself is intentionally outside this storage model: duplicate rejection is covered by Rust integration tests around `job_unique_claims`. The model's enqueue preconditions start after a job has been admitted to the storage state, so batching uniqueness claims changes implementation granularity rather than the modeled lifecycle, lane, lease, or prune invariants.
 
+## Partitioned queue routing note
+
+`PartitionedQueue` lives in `awa-model/src/partitioned_queue.rs`, is re-exported by `awa` and `awa-worker`, and is wrapped for Python as `awa.PartitionedQueue`. It maps one logical queue to a caller-declared list of ordinary physical queue names. The worker builder expands that list into ordinary `QueueConfig` declarations; producer helpers stamp the selected physical queue onto `InsertOpts`.
+
+That makes partitioned queues a routing refinement above `AwaSegmentedStorage`, not a new lifecycle variable. Each physical queue keeps the same `(queue, priority, enqueue_shard, lane_seq)` lane identity, lease/receipt safety, terminal retention, DLQ, and prune contracts already mapped in this document.
+
+[`AwaPartitionedQueueRouting.tla`](./AwaPartitionedQueueRouting.tla) pins the cross-layer routing property: the partition selector is domain-separated from ADR-025's enqueue-shard selector, but key-routed producers still pass the original ordering key into storage. The Rust test `partition_hash_is_domain_separated_from_enqueue_shard_hash` is the code-level distribution regression for the same issue.
+
 ## Batch-operations control-plane note
 
 ADR-030 batch operations have two layers:

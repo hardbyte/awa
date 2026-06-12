@@ -24,27 +24,34 @@ const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 
-/// Deterministically map an ordering key to a shard in `[0, shards)`.
+/// Portable 64-bit hash over raw ordering-key bytes.
 ///
-/// Inputs sharing a key always produce the same shard, which is what
-/// lets producers preserve FIFO within a key when the destination
-/// queue is sharded. `shards <= 1` returns shard 0 unconditionally.
-///
-/// The hash is a portable 64-bit rolling hash over the raw key bytes.
-/// It is intentionally simple enough to implement byte-for-byte in
+/// This is intentionally simple enough to implement byte-for-byte in
 /// `awa.insert_job_compat`, so SQL, Rust, and Python producers that
-/// pass the same ordering-key bytes land jobs on the same shard.
-pub fn shard_for_ordering_key(ordering_key: &[u8], shards: i16) -> i16 {
-    if shards <= 1 {
-        return 0;
-    }
+/// pass the same ordering-key bytes can derive the same routing facts.
+pub fn ordering_key_hash64(ordering_key: &[u8]) -> u64 {
     let mut hash: u128 = 14_695_981_039_346_656_037;
     const PRIME: u128 = 1_099_511_628_211;
     const MASK: u128 = u64::MAX as u128;
     for byte in ordering_key {
         hash = hash.wrapping_mul(PRIME).wrapping_add(*byte as u128) & MASK;
     }
-    (hash % (shards as u128)) as i16
+    hash as u64
+}
+
+/// Deterministically map an ordering key to a shard in `[0, shards)`.
+///
+/// Inputs sharing a key always produce the same shard, which is what
+/// lets producers preserve FIFO within a key when the destination
+/// queue is sharded. `shards <= 1` returns shard 0 unconditionally.
+///
+/// This deliberately remains the raw `ordering_key_hash64(key) % shards`
+/// mapping used by SQL compatibility producers.
+pub fn shard_for_ordering_key(ordering_key: &[u8], shards: i16) -> i16 {
+    if shards <= 1 {
+        return 0;
+    }
+    (ordering_key_hash64(ordering_key) % shards as u64) as i16
 }
 
 fn terminal_counter_bucket(job_id: i64) -> i16 {

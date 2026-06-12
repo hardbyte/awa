@@ -4,7 +4,7 @@ mod client;
 mod dlq;
 mod errors;
 mod job;
-mod queue_fanout;
+mod partitioned_queue;
 mod telemetry;
 mod transaction;
 mod worker;
@@ -96,7 +96,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<job::PyCallbackToken>()?;
     m.add_class::<client::PyResolveResult>()?;
     m.add_class::<dlq::PyDlqEntry>()?;
-    m.add_class::<queue_fanout::PyQueueFanout>()?;
+    m.add_class::<partitioned_queue::PyPartitionedQueue>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;
