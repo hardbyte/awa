@@ -2369,7 +2369,7 @@ async fn test_lease_claim_partition_routing() {
     let job_id = enqueue_job(
         &pool,
         &store,
-        &RetryJob { id: 777 },
+        &CompleteJob { id: 777 },
         InsertOpts {
             queue: queue.to_string(),
             ..Default::default()
@@ -2377,31 +2377,33 @@ async fn test_lease_claim_partition_routing() {
     )
     .await;
 
-    let client = queue_storage_client(
-        &pool,
-        queue,
-        QueueStorageConfig {
-            schema: schema.to_string(),
-            queue_slot_count: 4,
-            lease_slot_count: 2,
-            claim_slot_count: 4,
-            queue_stripe_count: 1,
-            lease_claim_receipts: true,
-        },
-        RetryOnceWorker,
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim partition-routed job");
+    assert_eq!(claimed.len(), 1, "job should be claimed");
+    assert_eq!(claimed[0].job.id, job_id, "claimed job id");
+    assert!(
+        claimed[0].claim.lease_claim_receipt,
+        "test setup must exercise the receipt claim path"
     );
-    client.start().await.expect("client start");
+    assert_eq!(
+        claimed[0].claim.claim_slot, current_slot,
+        "claim should use the rotated current slot"
+    );
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete partition-routed claim");
 
-    let _completed = wait_for_job_state(
-        &store,
-        &pool,
-        job_id,
-        &[JobState::Completed],
-        Duration::from_secs(10),
-    )
-    .await;
+    let completed = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load completed job")
+        .expect("completed job row");
+    assert_eq!(completed.state, JobState::Completed);
 
-    // Assert claim and closure both live in claim_slot = 2, and in the
+    // Assert claim and closure both live in the current claim slot, and in the
     // matching physical child partition.
     let claim_slot: i32 = sqlx::query_scalar(&format!(
         "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 ORDER BY run_lease DESC LIMIT 1"
@@ -2410,7 +2412,10 @@ async fn test_lease_claim_partition_routing() {
     .fetch_one(&pool)
     .await
     .expect("read claim_slot from lease_claims");
-    assert_eq!(claim_slot, 2, "claim row should land in current slot");
+    assert_eq!(
+        claim_slot, current_slot,
+        "claim row should land in current slot"
+    );
 
     let closure_slot: i32 = sqlx::query_scalar(&format!(
         "SELECT claim_slot FROM {schema}.lease_claim_closures WHERE job_id = $1 ORDER BY closed_at DESC LIMIT 1"
@@ -2445,8 +2450,6 @@ async fn test_lease_claim_partition_routing() {
         closure_in_child >= 1,
         "closure row must be in lease_claim_closures_2"
     );
-
-    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// Rotation-isolation check for the ADR-023 claim ring. A claim landed

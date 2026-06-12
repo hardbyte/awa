@@ -2397,9 +2397,9 @@ impl MaintenanceService {
         let schema = runtime.store.schema();
         // This is a high-cadence metrics path, not an admin exact-count
         // endpoint. Keep it on queue-storage control tables and bounded
-        // lane-head probes so long retained ready/done segments do not
-        // compete with worker traffic. Admin surfaces that need exact
-        // availability still go through QueueStorage::queue_counts().
+        // lane-head probes so long retained ready/done/receipt segments do
+        // not compete with worker traffic. Admin surfaces that need exact
+        // counts still go through QueueStorage::queue_counts().
         let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
             r#"
             WITH head_signal AS (
@@ -2423,8 +2423,6 @@ impl MaintenanceService {
                     SELECT queue FROM head_signal
                     UNION ALL
                     SELECT queue FROM {schema}.leases
-                    UNION ALL
-                    SELECT queue FROM {schema}.lease_claims
                     UNION ALL
                     SELECT queue FROM {schema}.deferred_jobs
                     UNION ALL
@@ -2482,26 +2480,6 @@ impl MaintenanceService {
                 FROM {schema}.leases
                 GROUP BY queue
             ),
-            receipt_claims AS (
-                SELECT
-                    claims.queue,
-                    count(*)::bigint AS running
-                FROM {schema}.lease_claims AS claims
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM {schema}.lease_claim_closures AS closures
-                    WHERE closures.claim_slot = claims.claim_slot
-                      AND closures.job_id = claims.job_id
-                      AND closures.run_lease = claims.run_lease
-                )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.leases AS lease
-                      WHERE lease.job_id = claims.job_id
-                        AND lease.run_lease = claims.run_lease
-                  )
-                GROUP BY claims.queue
-            ),
             deferred AS (
                 SELECT
                     queue,
@@ -2528,10 +2506,7 @@ impl MaintenanceService {
             SELECT
                 queues.queue,
                 COALESCE(ready.available, 0)::bigint AS available,
-                (
-                    COALESCE(leases.running, 0)
-                    + COALESCE(receipt_claims.running, 0)
-                )::bigint AS running,
+                COALESCE(leases.running, 0)::bigint AS running,
                 COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
                 COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
                 COALESCE(deferred.retryable, 0)::bigint AS retryable,
@@ -2545,8 +2520,6 @@ impl MaintenanceService {
               ON lag.queue = queues.queue
             LEFT JOIN leases
               ON leases.queue = queues.queue
-            LEFT JOIN receipt_claims
-              ON receipt_claims.queue = queues.queue
             LEFT JOIN deferred
               ON deferred.queue = queues.queue
             LEFT JOIN terminal
@@ -2800,7 +2773,29 @@ mod tests {
             Arc::new(HashMap::new()),
         );
 
-        service.publish_queue_storage_health_metrics(&runtime).await;
+        let mut receipt_lock_tx = service
+            .pool
+            .begin()
+            .await
+            .expect("begin receipt lock transaction");
+        sqlx::query(
+            "LOCK TABLE awa.lease_claims, awa.lease_claim_closures IN ACCESS EXCLUSIVE MODE",
+        )
+        .execute(receipt_lock_tx.as_mut())
+        .await
+        .expect("lock receipt tables");
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            service.publish_queue_storage_health_metrics(&runtime),
+        )
+        .await
+        .expect("queue-storage metrics must not wait on receipt tables");
+
+        receipt_lock_tx
+            .rollback()
+            .await
+            .expect("release receipt table locks");
     }
 
     #[test]
