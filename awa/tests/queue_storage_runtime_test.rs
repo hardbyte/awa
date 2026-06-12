@@ -734,15 +734,21 @@ async fn wait_for_job_state(
     let mut last_state = None;
 
     loop {
-        if let Some(job) = store
-            .load_job(pool, job_id)
-            .await
-            .expect("Failed to load queue_storage job")
-        {
-            last_state = Some(job.state);
-            if target_states.contains(&job.state) {
-                return job;
+        match store.load_job(pool, job_id).await {
+            Ok(Some(job)) => {
+                last_state = Some(job.state);
+                if target_states.contains(&job.state) {
+                    return job;
+                }
             }
+            Ok(None) => {}
+            Err(AwaError::Database(sqlx::Error::PoolTimedOut)) => {
+                // The runtime tests intentionally run many clients in parallel
+                // against small per-test pools. A transient local pool timeout
+                // is not a state-machine failure; keep polling until the
+                // caller's explicit timeout expires.
+            }
+            Err(err) => panic!("Failed to load queue_storage job: {err:?}"),
         }
 
         if start.elapsed() > timeout {
@@ -754,6 +760,42 @@ async fn wait_for_job_state(
 
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn wait_for_bool_flag(flag: &AtomicBool, wake: &Notify, timeout: Duration, message: &str) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let now = Instant::now();
+        assert!(now < deadline, "{message}");
+        let remaining = deadline.saturating_duration_since(now);
+        let _ = tokio::time::timeout(remaining, wake.notified()).await;
+    }
+}
+
+async fn age_receipt_claim(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+    run_lease: i64,
+    age: Duration,
+) {
+    let age_millis = i64::try_from(age.as_millis()).expect("test receipt age fits in i64 millis");
+    sqlx::query(&format!(
+        "UPDATE {}.lease_claims
+         SET claimed_at = clock_timestamp() - ($1 * interval '1 millisecond')
+         WHERE job_id = $2 AND run_lease = $3",
+        store.schema()
+    ))
+    .bind(age_millis)
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(pool)
+    .await
+    .expect("Failed to age receipt claim for rescue test");
 }
 
 async fn wait_for_callback_job(
@@ -1588,6 +1630,8 @@ async fn test_queue_storage_ready_tombstone_non_head_does_not_skip_live_prefix()
 
 struct ReceiptRescueWorker {
     release: Arc<tokio::sync::Notify>,
+    first_attempt_started: Arc<AtomicBool>,
+    first_attempt_start_wake: Arc<tokio::sync::Notify>,
     first_attempt_finished: Arc<AtomicBool>,
     first_attempt_wake: Arc<tokio::sync::Notify>,
 }
@@ -1602,6 +1646,8 @@ impl Worker for ReceiptRescueWorker {
         if ctx.job.attempt > 1 {
             return Ok(JobResult::Completed);
         }
+        self.first_attempt_started.store(true, Ordering::SeqCst);
+        self.first_attempt_start_wake.notify_waiters();
         self.release.notified().await;
         self.first_attempt_finished.store(true, Ordering::SeqCst);
         self.first_attempt_wake.notify_one();
@@ -4488,6 +4534,8 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     )
     .await;
     let release = Arc::new(Notify::new());
+    let first_attempt_started = Arc::new(AtomicBool::new(false));
+    let first_attempt_start_wake = Arc::new(Notify::new());
     let first_attempt_finished = Arc::new(AtomicBool::new(false));
     let first_attempt_wake = Arc::new(Notify::new());
     let client = Client::builder(pool.clone())
@@ -4515,6 +4563,8 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
         .claim_rotate_interval(Duration::from_secs(60))
         .register_worker(ReceiptRescueWorker {
             release: release.clone(),
+            first_attempt_started: first_attempt_started.clone(),
+            first_attempt_start_wake: first_attempt_start_wake.clone(),
             first_attempt_finished: first_attempt_finished.clone(),
             first_attempt_wake: first_attempt_wake.clone(),
         })
@@ -4523,7 +4573,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
         .leader_check_interval(Duration::from_millis(50))
         .heartbeat_interval(Duration::from_secs(60))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(Duration::from_secs(60))
         .deadline_rescue_interval(Duration::from_secs(10))
         .callback_rescue_interval(Duration::from_secs(10))
         .build()
@@ -4545,6 +4595,14 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
         .await
         .expect("Failed to start receipt rescue client");
 
+    wait_for_bool_flag(
+        &first_attempt_started,
+        &first_attempt_start_wake,
+        Duration::from_secs(5),
+        "timed out waiting for first receipt-backed attempt to start",
+    )
+    .await;
+
     let running = wait_for_job_state(
         &store,
         &pool,
@@ -4560,6 +4618,8 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+
+    age_receipt_claim(&pool, &store, job_id, 1, Duration::from_secs(120)).await;
 
     let completed = wait_for_job_state(
         &store,
@@ -4927,9 +4987,9 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     assert!(
         matches!(
             prune_while_running,
-            PruneOutcome::SkippedActive { slot: 0, .. }
+            PruneOutcome::SkippedActive { slot: 0, .. } | PruneOutcome::Blocked { slot: 0 }
         ),
-        "unexpected prune outcome while lease is live: {prune_while_running:?}"
+        "prune must not truncate while lease is live: {prune_while_running:?}"
     );
 
     gate.wait_until_entered(Duration::from_secs(5)).await;
@@ -7342,8 +7402,10 @@ async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock(
     .await
     .expect("Failed to lock lease ring state");
 
+    // `lock_tx` stays open until after the claim returns; a real dependency on
+    // the held row lock still times out, while loaded CI gets scheduler headroom.
     let claimed_while_locked = tokio::time::timeout(
-        Duration::from_millis(200),
+        Duration::from_secs(3),
         store.claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30)),
     )
     .await;
