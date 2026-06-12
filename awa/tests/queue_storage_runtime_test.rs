@@ -1998,6 +1998,20 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     // Prune the oldest initialized slot. With every claim in slot 0
     // having a matching closure, PartitionTruncateSafety holds and
     // prune TRUNCATEs both children.
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.claim_ring_slots
+        SET rescue_cursor_claimed_at = clock_timestamp(),
+            rescue_cursor_job_id = $1,
+            rescue_cursor_run_lease = 1
+        WHERE slot = 0
+        "#
+    ))
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .expect("seed non-default rescue cursor before claim prune");
+
     let prune_outcome = store
         .prune_oldest_claims(&pool)
         .await
@@ -2027,6 +2041,24 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         post_prune_closures, 0,
         "lease_claim_closures_0 must be empty post-prune"
     );
+    let cursor_reset: (bool, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT
+            rescue_cursor_claimed_at = '-infinity'::timestamptz,
+            rescue_cursor_job_id,
+            rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = 0
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read claim rescue cursor after claim prune");
+    assert_eq!(
+        cursor_reset,
+        (true, 0, 0),
+        "claim prune should reset only the matching claim-slot rescue cursor"
+    );
 
     // And now rotate onto slot 0 succeeds.
     match store
@@ -2037,6 +2069,77 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected Rotated to slot 0 after prune, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_lease_prune_keeps_claim_cursor";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    match store
+        .rotate_leases(&pool)
+        .await
+        .expect("rotate_leases -> slot 1")
+    {
+        RotateOutcome::Rotated { slot, generation } => {
+            assert_eq!(slot, 1);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("expected Rotated {{ slot: 1, generation: 1 }}, got {other:?}"),
+    }
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.claim_ring_slots
+        SET rescue_cursor_claimed_at = clock_timestamp(),
+            rescue_cursor_job_id = 42,
+            rescue_cursor_run_lease = 7
+        WHERE slot = 0
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed claim rescue cursor before lease prune");
+
+    let prune = store
+        .prune_oldest_leases(&pool)
+        .await
+        .expect("prune_oldest_leases");
+    assert!(
+        matches!(prune, PruneOutcome::Pruned { slot: 0 }),
+        "lease prune should truncate empty lease slot 0, got {prune:?}"
+    );
+
+    let cursor: (bool, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT
+            rescue_cursor_claimed_at = '-infinity'::timestamptz,
+            rescue_cursor_job_id,
+            rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = 0
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read claim rescue cursor after lease prune");
+    assert_eq!(
+        cursor,
+        (false, 42, 7),
+        "lease pruning must not mutate claim rescue cursors; lease and claim slots are independent rings"
+    );
 }
 
 /// Wave-1 regression test for the prune safety predicate. If a claim
@@ -5196,14 +5299,20 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     .await;
     assert_eq!(completed.state, JobState::Completed);
 
-    let prune_after_completion = store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("Failed to prune oldest completed slot");
-    assert!(
-        matches!(prune_after_completion, PruneOutcome::Pruned { slot: 0, .. }),
-        "unexpected prune outcome after completion: {prune_after_completion:?}"
-    );
+    let prune_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let prune_after_completion = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("Failed to prune oldest completed slot");
+        match prune_after_completion {
+            PruneOutcome::Pruned { slot: 0, .. } => break,
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => panic!("unexpected prune outcome after completion: {other:?}"),
+        }
+    }
 
     let counts_after_prune = store
         .queue_counts(&pool, queue)

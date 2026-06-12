@@ -12044,19 +12044,6 @@ impl QueueStorage {
 
         match truncate {
             Ok(_) => {
-                sqlx::query(&format!(
-                    r#"
-                    UPDATE {schema}.claim_ring_slots
-                    SET rescue_cursor_claimed_at = '-infinity'::timestamptz,
-                        rescue_cursor_job_id = 0,
-                        rescue_cursor_run_lease = 0
-                    WHERE slot = $1
-                    "#
-                ))
-                .bind(slot)
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
                 Ok(PruneOutcome::Pruned {
                     slot,
@@ -12307,6 +12294,19 @@ impl QueueStorage {
 
         match truncate {
             Ok(_) => {
+                sqlx::query(&format!(
+                    r#"
+                    UPDATE {schema}.claim_ring_slots
+                    SET rescue_cursor_claimed_at = '-infinity'::timestamptz,
+                        rescue_cursor_job_id = 0,
+                        rescue_cursor_run_lease = 0
+                    WHERE slot = $1
+                    "#
+                ))
+                .bind(slot)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
                 Ok(PruneOutcome::Pruned {
                     slot,
