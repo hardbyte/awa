@@ -243,16 +243,17 @@ pub enum RotateOutcome {
         slot: i32,
         generation: i64,
     },
-    /// Target slot has live state; rotation deferred. `busy` carries the
-    /// per-table row counts observed at the gate (only fields relevant to
-    /// the ring being rotated are populated).
+    /// Target slot has live state; rotation deferred. `busy` carries a
+    /// bounded per-table presence indicator observed at the gate (only fields
+    /// relevant to the ring being rotated are populated).
     SkippedBusy {
         slot: i32,
         busy: BusyCounts,
     },
 }
 
-/// Per-table row counts observed at a rotation gate. Each ring populates
+/// Per-table presence observed at a rotation gate. Each non-zero value means
+/// "this table was non-empty"; it is not an exact row count. Each ring populates
 /// only the fields meaningful for it; unused fields stay zero. The
 /// maintenance loop emits one OTel metric label per non-zero field so
 /// dashboards can attribute "rotation pinned" to the responsible side.
@@ -459,6 +460,14 @@ fn claim_child_name(schema: &str, slot: usize) -> String {
 
 fn closure_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closures_{slot}")
+}
+
+fn busy_indicator(has_rows: bool) -> i64 {
+    if has_rows {
+        1
+    } else {
+        0
+    }
 }
 
 fn oldest_initialized_ring_slot(
@@ -10811,6 +10820,16 @@ impl QueueStorage {
         Ok(moved.len())
     }
 
+    async fn relation_has_rows_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        relation: &str,
+    ) -> Result<bool, AwaError> {
+        sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM {relation} LIMIT 1)"))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)
+    }
+
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
     pub async fn rotate(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
@@ -10829,44 +10848,32 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
-        let ready_count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*)::bigint FROM {}",
-            ready_child_name(schema, next_slot as usize)
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        let done_count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*)::bigint FROM {}",
-            done_child_name(schema, next_slot as usize)
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        let tombstone_count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*)::bigint FROM {}",
-            ready_tombstone_child_name(schema, next_slot as usize)
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        let terminal_delta_count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*)::bigint FROM {}",
-            terminal_delta_child_name(schema, next_slot as usize)
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let ready_busy =
+            Self::relation_has_rows_tx(&mut tx, &ready_child_name(schema, next_slot as usize))
+                .await?;
+        let done_busy =
+            Self::relation_has_rows_tx(&mut tx, &done_child_name(schema, next_slot as usize))
+                .await?;
+        let tombstone_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &ready_tombstone_child_name(schema, next_slot as usize),
+        )
+        .await?;
+        let terminal_delta_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &terminal_delta_child_name(schema, next_slot as usize),
+        )
+        .await?;
 
-        if ready_count > 0 || done_count > 0 || tombstone_count > 0 || terminal_delta_count > 0 {
+        if ready_busy || done_busy || tombstone_busy || terminal_delta_busy {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
-                    queue_ready: ready_count,
-                    queue_done: done_count,
-                    queue_tombstones: tombstone_count,
-                    queue_terminal_deltas: terminal_delta_count,
+                    queue_ready: busy_indicator(ready_busy),
+                    queue_done: busy_indicator(done_busy),
+                    queue_tombstones: busy_indicator(tombstone_busy),
+                    queue_terminal_deltas: busy_indicator(terminal_delta_busy),
                     ..Default::default()
                 },
             });
@@ -10932,20 +10939,16 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
-        let lease_count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*)::bigint FROM {}",
-            lease_child_name(schema, next_slot as usize)
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let lease_busy =
+            Self::relation_has_rows_tx(&mut tx, &lease_child_name(schema, next_slot as usize))
+                .await?;
 
-        if lease_count > 0 {
+        if lease_busy {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
-                    leases: lease_count,
+                    leases: busy_indicator(lease_busy),
                     ..Default::default()
                 },
             });
@@ -10972,14 +10975,13 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if rotated.rows_affected() == 0 {
-            // Another rotator beat us to the CAS; the row count we sampled
-            // before is stale. Report the count we did see — it's still the
-            // best evidence available about what made this attempt give up.
+            // Another rotator beat us to the CAS. Report the bounded
+            // presence evidence we sampled before giving up.
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
-                    leases: lease_count,
+                    leases: busy_indicator(lease_busy),
                     ..Default::default()
                 },
             });
@@ -11549,12 +11551,15 @@ impl QueueStorage {
             return Ok(PruneOutcome::Blocked { slot });
         }
 
-        let active_leases: i64 = sqlx::query_scalar(&format!(
+        let active_leases: bool = sqlx::query_scalar(&format!(
             r#"
-            SELECT count(*)::bigint
-            FROM {schema}.leases
-            WHERE ready_slot = $1
-              AND ready_generation = $2
+            SELECT EXISTS (
+                SELECT 1
+                FROM {schema}.leases
+                WHERE ready_slot = $1
+                  AND ready_generation = $2
+                LIMIT 1
+            )
             "#
         ))
         .bind(slot)
@@ -11563,45 +11568,48 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if active_leases > 0 {
+        if active_leases {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {
                 slot,
                 reason: SkipReason::QueueActiveLeases,
-                count: active_leases,
+                count: busy_indicator(active_leases),
             });
         }
 
-        let pending: i64 = sqlx::query_scalar(&format!(
+        let pending: bool = sqlx::query_scalar(&format!(
             r#"
-            SELECT count(*)::bigint
-            FROM {ready_child} AS ready
-            LEFT JOIN {done_child} AS done
-              ON done.ready_generation = ready.ready_generation
-             AND done.queue = ready.queue
-             AND done.priority = ready.priority
-             AND done.enqueue_shard = ready.enqueue_shard
-             AND done.lane_seq = ready.lane_seq
-            LEFT JOIN {tomb_child} AS tomb
-              ON tomb.ready_generation = ready.ready_generation
-             AND tomb.queue = ready.queue
-             AND tomb.priority = ready.priority
-             AND tomb.enqueue_shard = ready.enqueue_shard
-             AND tomb.lane_seq = ready.lane_seq
-            WHERE done.lane_seq IS NULL
-              AND tomb.lane_seq IS NULL
+            SELECT EXISTS (
+                SELECT 1
+                FROM {ready_child} AS ready
+                LEFT JOIN {done_child} AS done
+                  ON done.ready_generation = ready.ready_generation
+                 AND done.queue = ready.queue
+                 AND done.priority = ready.priority
+                 AND done.enqueue_shard = ready.enqueue_shard
+                 AND done.lane_seq = ready.lane_seq
+                LEFT JOIN {tomb_child} AS tomb
+                  ON tomb.ready_generation = ready.ready_generation
+                 AND tomb.queue = ready.queue
+                 AND tomb.priority = ready.priority
+                 AND tomb.enqueue_shard = ready.enqueue_shard
+                 AND tomb.lane_seq = ready.lane_seq
+                WHERE done.lane_seq IS NULL
+                  AND tomb.lane_seq IS NULL
+                LIMIT 1
+            )
             "#
         ))
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        if pending > 0 {
+        if pending {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {
                 slot,
                 reason: SkipReason::QueuePendingReady,
-                count: pending,
+                count: busy_indicator(pending),
             });
         }
 
@@ -11898,18 +11906,14 @@ impl QueueStorage {
             });
         }
 
-        let active_leases: i64 =
-            sqlx::query_scalar(&format!("SELECT count(*)::bigint FROM {lease_child}"))
-                .fetch_one(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+        let active_leases = Self::relation_has_rows_tx(&mut tx, &lease_child).await?;
 
-        if active_leases > 0 {
+        if active_leases {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {
                 slot,
                 reason: SkipReason::LeaseActive,
-                count: active_leases,
+                count: busy_indicator(active_leases),
             });
         }
 
@@ -11973,29 +11977,20 @@ impl QueueStorage {
         // mix fresh claims with legacy rows and defeat the point of
         // partitioning. Non-empty `lease_claim_closures_<next>` means
         // prune fell behind on closures specifically.
-        let claim_count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*)::bigint FROM {}",
-            claim_child_name(schema, next_slot as usize)
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let claim_busy =
+            Self::relation_has_rows_tx(&mut tx, &claim_child_name(schema, next_slot as usize))
+                .await?;
+        let closure_busy =
+            Self::relation_has_rows_tx(&mut tx, &closure_child_name(schema, next_slot as usize))
+                .await?;
 
-        let closure_count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*)::bigint FROM {}",
-            closure_child_name(schema, next_slot as usize)
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if claim_count > 0 || closure_count > 0 {
+        if claim_busy || closure_busy {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
-                    claims: claim_count,
-                    closures: closure_count,
+                    claims: busy_indicator(claim_busy),
+                    closures: busy_indicator(closure_busy),
                     ..Default::default()
                 },
             });
@@ -12022,15 +12017,14 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if rotated.rows_affected() == 0 {
-            // Lost the CAS race; the row counts we sampled may now be
-            // stale, but they're the best evidence about why this attempt
-            // gave up.
+            // Lost the CAS race. Report the bounded presence evidence we
+            // sampled before giving up.
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
-                    claims: claim_count,
-                    closures: closure_count,
+                    claims: busy_indicator(claim_busy),
+                    closures: busy_indicator(closure_busy),
                     ..Default::default()
                 },
             });
@@ -12145,15 +12139,18 @@ impl QueueStorage {
         // have a matching closure. Any open claim means a worker is
         // still running (or a rescue hasn't fired yet); we bail and let
         // normal lifecycle drain the partition.
-        let open_claims: i64 = sqlx::query_scalar(&format!(
+        let open_claims: bool = sqlx::query_scalar(&format!(
             r#"
-            SELECT count(*)::bigint
-            FROM {claim_child} AS claims
-            WHERE NOT EXISTS (
-                SELECT 1 FROM {closure_child} AS closures
-                WHERE closures.claim_slot = claims.claim_slot
-                  AND closures.job_id = claims.job_id
-                  AND closures.run_lease = claims.run_lease
+            SELECT EXISTS (
+                SELECT 1
+                FROM {claim_child} AS claims
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {closure_child} AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                )
+                LIMIT 1
             )
             "#
         ))
@@ -12161,12 +12158,12 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if open_claims > 0 {
+        if open_claims {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {
                 slot,
                 reason: SkipReason::ClaimOpen,
-                count: open_claims,
+                count: busy_indicator(open_claims),
             });
         }
 
