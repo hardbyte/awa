@@ -355,6 +355,63 @@ async def test_enqueue_many_copy_queue_storage(client):
 
 
 @pytest.mark.asyncio
+async def test_copy_batch_per_job_opts_route_mixed_queues(client):
+    """COPY batch APIs accept per-job queue/ordering_key overrides."""
+    inserted = await client.insert_many_copy(
+        [
+            SendEmail(to="compat-a@example.com", subject="Compat A"),
+            SendEmail(to="compat-b@example.com", subject="Compat B"),
+        ],
+        queue="unused_default",
+        opts=[
+            {"queue": "compat_partition_a", "ordering_key": "customer-a"},
+            {"queue": "compat_partition_b", "ordering_key": None},
+        ],
+    )
+    assert [job.queue for job in inserted] == [
+        "compat_partition_a",
+        "compat_partition_b",
+    ]
+
+    schema = "awa_py_enqueue_many_copy_opts"
+    queue = awa.PartitionedQueue("py_partitioned_copy", 2)
+    await client.install_queue_storage(schema=schema, reset=True)
+
+    count = await client.enqueue_many_copy(
+        [
+            SendEmail(to="direct-a@example.com", subject="Direct A"),
+            SendEmail(to="direct-b@example.com", subject="Direct B"),
+        ],
+        queue="unused_default",
+        opts=[
+            queue.route_by_index(0),
+            queue.route_by_index(1),
+        ],
+    )
+    assert count == 2
+
+    tx = await client.transaction()
+    rows = await tx.fetch_all(
+        f"""
+        SELECT queue, count(*)::bigint AS count
+        FROM {schema}.ready_entries
+        WHERE queue IN ($1, $2)
+        GROUP BY queue
+        ORDER BY queue
+        """,
+        queue.queue_for_index(0),
+        queue.queue_for_index(1),
+    )
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.commit()
+
+    assert [(row["queue"], row["count"]) for row in rows] == [
+        (queue.queue_for_index(0), 1),
+        (queue.queue_for_index(1), 1),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ordering_key_routes_all_async_python_insert_paths(client):
     """ordering_key pins native async client, tx, and COPY inserts."""
     schema = "awa_py_ordering_key"

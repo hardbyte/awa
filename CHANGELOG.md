@@ -2,6 +2,16 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## [Unreleased]
+
+### Added
+
+- **Per-job routing in Python COPY batch APIs** ([#348](https://github.com/hardbyte/awa/pull/348), [ADR-031](docs/adr/031-partitioned-queues.md)). `insert_many_copy` / `enqueue_many_copy` (async and sync) accept `opts=[...]` entries that override `queue` and `ordering_key` per job, so one COPY call can carry a mixed-partition batch. Batch-level kwargs remain defaults; an explicit `"ordering_key": None` clears the key for that job.
+
+### Changed
+
+- **Breaking (beta series): `QueueFanout` is replaced by `PartitionedQueue`** ([#348](https://github.com/hardbyte/awa/pull/348), [ADR-031](docs/adr/031-partitioned-queues.md)); no compatibility alias. Besides the rename (`width` → `partitions`, `queue_fanout` → `partitioned_queue`, Python `*_per_queue` config kwargs → `*_per_partition`), routing behavior differs from beta.2: partition 0 is now the logical queue name itself (`email`, `email__p1`, ...) so direct enqueues to the logical name stay consumable, and key→partition selection uses a domain-separated hash so it composes with ADR-025 enqueue-shard routing (the same key may land on a different partition than under beta.2 `QueueFanout`). Drain fanout queues before upgrading producers/workers, or pin explicit names via `from_physical_queues`.
+
 ## [0.6.0-beta.2] — 2026-06-10
 
 Second beta of the 0.6 line. The headline is storage-engine work under pinned MVCC horizons ([#169](https://github.com/hardbyte/awa/issues/169)): sequence-backed cursors, append-only ready segments, and a terminal-count delta ledger replace the remaining hot-row update paths that beta.1 still carried. This is also the release the #169 stable gate will be validated against — see "Benchmark evidence" below.
@@ -25,7 +35,7 @@ Migrations v022–v031 apply via `awa migrate` (or the SQL-only path in [`docs/m
 - **Transactional follow-up jobs** ([ADR-029](docs/adr/029-transactional-followup-jobs.md), [#285](https://github.com/hardbyte/awa/pull/285)/[#288](https://github.com/hardbyte/awa/pull/288)). `ClientBuilder::on_completed_enqueue` (and friends) registers a follow-up job inserted in the same transaction as the lifecycle transition for worker-driven outcomes; callback resolution through the worker `Client` commits transition + follow-up atomically too. Maintenance rescue stays best-effort by design.
 - **Callback-only router and user-owned callback layers** ([#291](https://github.com/hardbyte/awa/pull/291)/[#293](https://github.com/hardbyte/awa/pull/293), closes [#281](https://github.com/hardbyte/awa/issues/281)). The callback ingress contract is shared and the URL prefix configurable; embed Awa's router or implement the contract in your own API layer — axum and FastAPI examples documented.
 - **`WaitingForCallback` lifecycle event + client-side callback resolution** ([#276](https://github.com/hardbyte/awa/pull/276)). Jobs parking on `WaitForCallback` are now visible to lifecycle hooks, and `Client` gains `resolve_callback` / `complete_external` / `fail_external` / `retry_external` that dispatch the matching terminal event in-process.
-- **Queue fanout helper** ([#327](https://github.com/hardbyte/awa/pull/327)). Rust `QueueFanout` + `ClientBuilder::queue_fanout` and Python `awa.QueueFanout` for deterministic routing from one hot logical queue to multiple physical queues; duplicate physical declarations are rejected.
+- **Queue fanout helper** ([#327](https://github.com/hardbyte/awa/pull/327)). Rust `QueueFanout` + `ClientBuilder::queue_fanout` and Python `awa.QueueFanout` for deterministic routing from one hot logical queue to multiple physical queues; duplicate physical declarations are rejected. Replaced by `PartitionedQueue` in [#348](https://github.com/hardbyte/awa/pull/348).
 - **Cron schedule pause / resume** ([#320](https://github.com/hardbyte/awa/pull/320), migration v026). `POST /api/cron/{name}/pause` / `/resume`; the evaluator skips paused rows and the `atomic_enqueue` CTE re-checks `paused_at IS NULL` so a pause asserted mid-evaluation still takes effect. `last_enqueued_at` is untouched while paused, so `missed_fire_policy` decides catch-up on resume. Manual `trigger_cron_job` bypasses pause. The `/cron` UI gains Pause/Resume controls.
 - **`awa storage finalize --wait` / `--check`** ([#298](https://github.com/hardbyte/awa/pull/298)). `--wait` polls and finalizes once readiness gates stay clear for two consecutive observations; `--check` is a dry-run that exits 2 when blocked.
 - **Storage-transition readiness UI** ([#299](https://github.com/hardbyte/awa/pull/299)). Time-in-state, epoch-anchored backlog history, a prominent `prepared_schema_ready=false` warning with the remediation command, and a rollback-boundaries panel.

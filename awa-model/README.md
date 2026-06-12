@@ -8,7 +8,7 @@ Most Rust applications should depend on the [`awa`](https://crates.io/crates/awa
 
 - **Job model** — `JobRow`, `JobState`, `InsertOpts`, `UniqueOpts`, `InsertParams`.
 - **Insertion** — `insert`, `insert_with`, `insert_many`, `insert_many_copy` for the compatibility insert surface, and `QueueStorage::enqueue_params_copy` for direct queue-storage COPY ingestion with an explicitly configured queue-storage engine.
-- **Queue fanout** — `QueueFanout` gives enqueue-only producers the same deterministic physical queue routing workers use for very hot logical queues.
+- **Partitioned queues** — `PartitionedQueue` gives enqueue-only producers the same deterministic physical queue routing workers use for very hot logical queues.
 - **Migrations** — `migrations::run` applies the schema; `migrations`, `migration_sql`, `migration_sql_range`, and `current_version` expose the catalog for tooling.
 - **Admin** (`admin`) — retry, cancel (single, by unique key, bulk), pause/resume/drain queues, queue and job-kind overviews, runtime instance snapshots, dirty-key recompute, and descriptor sync (`sync_queue_descriptors`, `sync_job_kind_descriptors`, `cleanup_stale_descriptors`).
 - **Dead Letter Queue** (`dlq`) — `DlqRow`, `DlqMetadata`, `ListDlqFilter`, `RetryFromDlqOpts`, list / retry / move / purge helpers backing the `awa dlq` CLI and the DLQ admin UI tab.

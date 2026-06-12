@@ -7,7 +7,7 @@ name = "awa-pg"
 requires-python = ">=3.10"
 version = "0.6.0-beta.2"
 description = "Postgres-native background job queue — Python SDK with async/sync workers, transactional enqueue, and progress tracking. Install awa-pg[ui] to add the bundled web dashboard."
-readme = {file = "../README.md", content-type = "text/markdown"}
+readme = "README.md"
 license = {text = "MIT OR Apache-2.0"}
 authors = [{name = "Brian Thorne"}]
 keywords = ["postgres", "job-queue", "background-jobs", "async", "celery-alternative"]

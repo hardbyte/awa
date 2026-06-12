@@ -162,8 +162,13 @@ class AsyncClient:
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
     ) -> list[Job]:
-        """Bulk insert jobs through the compatibility COPY surface."""
+        """Bulk insert jobs through the compatibility COPY surface.
+
+        Batch-level keyword arguments are defaults. ``opts`` can override
+        ``queue`` and ``ordering_key`` per job.
+        """
         return await self._raw.insert_many_copy(
             jobs,
             kind=kind,
@@ -175,6 +180,7 @@ class AsyncClient:
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
+            opts=opts,
         )
 
     async def enqueue_many_copy(
@@ -190,9 +196,14 @@ class AsyncClient:
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
         queue_storage_queue_stripe_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_STRIPE_COUNT,
     ) -> int:
-        """Enqueue jobs into active queue storage using direct COPY."""
+        """Enqueue jobs into active queue storage using direct COPY.
+
+        Batch-level keyword arguments are defaults. ``opts`` can override
+        ``queue`` and ``ordering_key`` per job.
+        """
         return await self._raw.enqueue_many_copy(
             jobs,
             kind=kind,
@@ -204,6 +215,7 @@ class AsyncClient:
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
+            opts=opts,
             queue_storage_queue_stripe_count=queue_storage_queue_stripe_count,
         )
 
@@ -981,8 +993,13 @@ class Client:
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
     ) -> list[Job]:
-        """Bulk insert jobs through the compatibility COPY surface."""
+        """Bulk insert jobs through the compatibility COPY surface.
+
+        Batch-level keyword arguments are defaults. ``opts`` can override
+        ``queue`` and ``ordering_key`` per job.
+        """
         return self._raw.insert_many_copy_sync(
             jobs,
             kind=kind,
@@ -994,6 +1011,7 @@ class Client:
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
+            opts=opts,
         )
 
     def enqueue_many_copy(
@@ -1009,9 +1027,14 @@ class Client:
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
         queue_storage_queue_stripe_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_STRIPE_COUNT,
     ) -> int:
-        """Enqueue jobs into active queue storage using direct COPY."""
+        """Enqueue jobs into active queue storage using direct COPY.
+
+        Batch-level keyword arguments are defaults. ``opts`` can override
+        ``queue`` and ``ordering_key`` per job.
+        """
         return self._raw.enqueue_many_copy_sync(
             jobs,
             kind=kind,
@@ -1023,6 +1046,7 @@ class Client:
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
+            opts=opts,
             queue_storage_queue_stripe_count=queue_storage_queue_stripe_count,
         )
 

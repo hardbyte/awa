@@ -112,21 +112,21 @@ The key `QueueConfig` fields:
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
-### Logical Queue Fanout
+### Partitioned Queues
 
 A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
 
-Very hot workloads can fan one logical queue out over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
+Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
 
-Rust producers and workers can share `QueueFanout`:
+Rust producers and workers can share `PartitionedQueue`:
 
 ```rust
-use awa::{Client, InsertOpts, QueueConfig, QueueFanout};
+use awa::{Client, InsertOpts, QueueConfig, PartitionedQueue};
 
-let customer_updates = QueueFanout::new("customer-updates", 4)?;
+let customer_updates = PartitionedQueue::new("customer-updates", 4)?;
 
 let client = Client::builder(pool.clone())
-    .queue_fanout(&customer_updates, QueueConfig {
+    .partitioned_queue(&customer_updates, QueueConfig {
         // Applied per physical queue: 4 × 32 hard-reserved workers.
         max_workers: 32,
         ..Default::default()
@@ -140,35 +140,35 @@ let opts = customer_updates.route_opts_by_key(
 );
 ```
 
-With width `1`, `QueueFanout::new("email", 1)` uses the plain `email` queue. With width above `1`, the default physical names are stable: `email__p0`, `email__p1`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO even if each physical queue later raises `enqueue_shards`.
+With one partition, `PartitionedQueue::new("email", 1)` uses the plain `email` queue. With more than one partition, partition 0 remains the logical queue name and later partitions use stable suffixes: `email`, `email__p1`, `email__p2`, and so on. Key-based routing sets both the selected physical queue and `InsertOpts::ordering_key`, so related jobs keep per-key FIFO inside the selected partition even if each physical queue later raises `enqueue_shards`.
 
-`queue_fanout` applies the `QueueConfig` to each physical queue. In hard-reserved mode, total logical capacity is roughly `fanout.width() * max_workers`; `rate_limit` is also per physical queue. Divide those values yourself, or use `global_max_workers`, when you need a logical total cap across the fanout.
+`partitioned_queue` applies the `QueueConfig` to each physical queue. In hard-reserved mode, total logical capacity is roughly `partitioned_queue.partitions() * max_workers`; `rate_limit` is also per physical queue. Divide those values yourself, or use `global_max_workers`, when you need a logical total cap across the partitioned queue.
 
-Python exposes the same deterministic router through the `awa.QueueFanout` class:
+Python exposes the same deterministic router through the `awa.PartitionedQueue` class:
 
 ```python
-fanout = awa.QueueFanout("customer-updates", 4)
+queue = awa.PartitionedQueue("customer-updates", 4)
 
-@client.task(UpdateCustomer, queue=fanout.physical_queues[0])
+@client.task(UpdateCustomer, queue=queue.physical_queues[0])
 async def update_customer(job):
     ...
 
 await client.start(
-    fanout.queue_configs(
-        max_workers_per_queue=16,
+    queue.queue_configs(
+        max_workers_per_partition=16,
         claim_batch_size=512,
     )
 )
 
 await client.insert(
     UpdateCustomer(customer_id=customer_id, payload=payload),
-    **fanout.route_by_key(f"customer-{customer_id}"),
+    **queue.route_by_key(f"customer-{customer_id}"),
 )
 ```
 
-Register the handler once and pass explicit fanout queue configs to `start()`. Python handlers are dispatched by job kind; the queue name on `@client.task` gives `start()` a declared queue to validate.
+Register the handler once and pass explicit partition queue configs to `start()`. Python handlers are dispatched by job kind; the queue name on `@client.task` gives `start()` a declared queue to validate.
 
-`route_by_key()` returns `{"queue": ..., "ordering_key": ...}` and can be passed directly to `insert()`, `insert_many_copy()`, or `enqueue_many_copy()` when the whole call shares the same key. `route_by_index()` returns only a queue for round-robin fanout when per-key FIFO is not needed. Python `enqueue_many_copy()` still takes one queue and one ordering key per call, so mixed-key COPY producers should group their batch before calling it.
+`route_by_key()` returns `{"queue": ..., "ordering_key": ...}` and can be passed directly to `insert()`. For `insert_many_copy()` and `enqueue_many_copy()`, pass `opts=[queue.route_by_key(key) for ...]` when a batch contains jobs for multiple partitions. `route_by_index()` returns only a queue for round-robin partitioning when per-key FIFO is not needed.
 
 ### Choosing a throughput lever
 
@@ -176,11 +176,11 @@ These knobs solve different bottlenecks:
 
 | Knob | What changes | Use it when |
 | --- | --- | --- |
-| `QueueFanout` | Routes one logical workload across multiple physical queues. Each physical queue has its own queue-level capacity, rate limit, claim cursor, completion stream, and metrics. | The workload can be partitioned by key or round-robin, and you want more end-to-end throughput from independent queue coordination paths. |
+| `PartitionedQueue` | Routes one logical workload across multiple physical queues. Each physical queue has its own queue-level capacity, rate limit, claim cursor, completion stream, and metrics. | The workload can be partitioned by key or round-robin, and you want more end-to-end throughput from independent queue coordination paths. |
 | `enqueue_shards` | Keeps one physical queue name, but splits that queue into multiple ordered lanes. FIFO becomes per `(queue, priority, enqueue_shard)` instead of global per `(queue, priority)`. | Operators should still see one queue, but the workload can accept partitioned FIFO inside that queue. |
 | `claimers` | Adds more dispatcher/claimer loops for the same physical queue inside one worker runtime. They share the queue's worker permits and rate limiter. | One claimer is leaving worker permits idle. This is not the first lever for a hot queue because extra claimers can add transaction pressure without creating independent capacity domains. |
 
-For a hot workload that can be partitioned, start with `QueueFanout`. If the public queue should stay singular, consider `enqueue_shards`. Raise `claimers` only when measurements show the runtime is claim-starved rather than Postgres-bound.
+For a hot workload that can be partitioned, start with `PartitionedQueue`. If the public queue should stay singular, consider `enqueue_shards`. Raise `claimers` only when measurements show the runtime is claim-starved rather than Postgres-bound.
 
 ### Python
 

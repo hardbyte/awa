@@ -76,17 +76,17 @@ awa::insert_with(&pool, &UpdateCustomer { ... }, opts).await?;
 
 Jobs sharing an `ordering_key` always pick the same shard, so the shard's strict FIFO carries over to per-key FIFO. At `enqueue_shards = 1` the key is ignored. See [ADR-025](../docs/adr/025-sharded-enqueue-heads.md) for the full contract.
 
-## Logical Queue Fanout
+## Partitioned Queues
 
-For very hot workloads, `QueueFanout` gives Rust producers and workers the same deterministic physical queue set for one logical queue:
+For very hot workloads, `PartitionedQueue` gives Rust producers and workers the same deterministic physical queue set for one logical queue:
 
 ```rust
-use awa::{InsertOpts, QueueConfig, QueueFanout};
+use awa::{InsertOpts, QueueConfig, PartitionedQueue};
 
-let updates = QueueFanout::new("customer-updates", 4)?;
+let updates = PartitionedQueue::new("customer-updates", 4)?;
 
 let client = awa::Client::builder(pool.clone())
-    .queue_fanout(&updates, QueueConfig {
+    .partitioned_queue(&updates, QueueConfig {
         max_workers: 32, // per physical queue
         ..Default::default()
     })
@@ -100,7 +100,7 @@ let opts = updates.route_opts_by_key(
 awa::insert_with(&pool, &UpdateCustomer { ... }, opts).await?;
 ```
 
-This is ordinary Awa queueing under the hood: each physical queue keeps its durable claim, lease, retry, DLQ, and completion behavior. The helper only standardizes naming and routing so applications do not hand-roll fanout.
+This is ordinary Awa queueing under the hood: each physical queue keeps its durable claim, lease, retry, DLQ, and completion behavior. The helper only standardizes naming and routing so applications do not hand-roll partitioning.
 
 ## Documentation
 

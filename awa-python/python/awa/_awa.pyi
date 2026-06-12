@@ -19,31 +19,31 @@ class JobState(IntEnum):
     WaitingExternal = ...
     def __str__(self) -> str: ...
 
-class QueueFanout:
-    """Deterministic physical-queue fanout for one hot logical queue."""
+class PartitionedQueue:
+    """Deterministic physical queue partitions for one hot logical queue."""
 
-    def __init__(self, logical_queue: str, width: int) -> None: ...
+    def __init__(self, logical_queue: str, partitions: int) -> None: ...
     @classmethod
     def from_physical_queues(
         cls, logical_queue: str, physical_queues: Sequence[str]
-    ) -> QueueFanout: ...
+    ) -> PartitionedQueue: ...
     @property
     def logical_queue(self) -> str: ...
     @property
     def physical_queues(self) -> list[str]: ...
     @property
-    def width(self) -> int: ...
+    def partitions(self) -> int: ...
     def queue_for_key(self, key: bytes | str) -> str: ...
     def queue_for_index(self, index: int) -> str: ...
     def route_by_key(self, key: bytes | str) -> dict[str, str | bytes]: ...
     def route_by_index(self, index: int) -> dict[str, str]: ...
     def queue_configs(
         self,
-        max_workers_per_queue: int | None = None,
+        max_workers_per_partition: int | None = None,
         *,
-        min_workers_per_queue: int | None = None,
+        min_workers_per_partition: int | None = None,
         weight: int = 1,
-        rate_limit_per_queue: tuple[float, int] | None = None,
+        rate_limit_per_partition: tuple[float, int] | None = None,
         priority_aging_interval_ms: int | None = None,
         deadline_duration_ms: int | None = None,
         claimers: int | None = None,
@@ -507,6 +507,7 @@ class Client:
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     async def enqueue_many_copy(
         self,
@@ -521,6 +522,8 @@ class Client:
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
+        queue_storage_queue_stripe_count: int = 1,
     ) -> int: ...
     def periodic(
         self,
@@ -699,6 +702,7 @@ class Client:
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     def enqueue_many_copy_sync(
         self,
@@ -713,6 +717,8 @@ class Client:
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        opts: list[dict[str, Any] | None] | None = None,
+        queue_storage_queue_stripe_count: int = 1,
     ) -> int: ...
     # External callback completion (sync)
     def complete_external_sync(

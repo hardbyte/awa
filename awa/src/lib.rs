@@ -13,11 +13,11 @@ pub use awa_model;
 pub use awa_model::{
     self as model, adapter, admin, bridge, callback_contract, insert, insert_many,
     insert_many_copy, insert_many_copy_from_pool, insert_with, map_sqlx_error, migrations,
-    prepare_job_insert, prepare_raw_job_insert, storage, AwaError, CallbackConfig, DefaultAction,
-    DlqMetadata, DlqRow, InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState,
-    ListDlqFilter, PreparedJobInsert, QueueDescriptor, QueueFanout, QueueFanoutError, QueueStorage,
-    QueueStorageConfig, ResolveOutcome, RetryFromDlqOpts, StorageCapability, StorageStatus,
-    UniqueOpts,
+    partition_for_ordering_key, partition_hash64, prepare_job_insert, prepare_raw_job_insert,
+    storage, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow, InsertOpts,
+    InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState, ListDlqFilter, PartitionedQueue,
+    PartitionedQueueError, PreparedJobInsert, QueueDescriptor, QueueStorage, QueueStorageConfig,
+    ResolveOutcome, RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
 };
 
 // Re-export worker runtime
