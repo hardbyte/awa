@@ -48,7 +48,7 @@ module-name = "awa._awa"
 [dependency-groups]
 dev = [
     "asyncpg>=0.31.0",
-    "django>=5.2",
+    "django>=5.2.14",
     "greenlet>=3.0",
     "psycopg>=3.3.3",
     "psycopg-binary>=3.3.3",
