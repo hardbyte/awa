@@ -140,7 +140,7 @@ Uniqueness itself is intentionally outside this storage model: duplicate rejecti
 
 That makes partitioned queues a routing refinement above `AwaSegmentedStorage`, not a new lifecycle variable. Each physical queue keeps the same `(queue, priority, enqueue_shard, lane_seq)` lane identity, lease/receipt safety, terminal retention, DLQ, and prune contracts already mapped in this document.
 
-[`AwaPartitionedQueueRouting.tla`](./AwaPartitionedQueueRouting.tla) pins the cross-layer routing property: the partition selector is domain-separated from ADR-025's enqueue-shard selector, but key-routed producers still pass the original ordering key into storage. The Rust test `partition_hash_is_domain_separated_from_enqueue_shard_hash` is the code-level distribution regression for the same issue.
+[`AwaPartitionedQueueRouting.tla`](./AwaPartitionedQueueRouting.tla) pins the cross-layer routing property with abstract key hashes. Storage shard routing is derived as `h % ShardCount`, while partition routing is derived from a domain-separated partition hash. The broken config reuses the same low bits for both modulo reductions and fails the coverage invariant, matching the Rust `partition_hash_is_domain_separated_from_enqueue_shard_hash` distribution regression.
 
 ## Batch-operations control-plane note
 

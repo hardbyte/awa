@@ -119,15 +119,21 @@ See [`MAPPING.md`](./MAPPING.md) for the action-by-action correspondence between
 
 The companion spec checks the routing refinement that storage deliberately abstracts away:
 
-- produced rows land in the partition selected for their key
-- the original ordering key still chooses the queue-storage enqueue shard inside that partition
+- abstract key hashes land in the partition selected by the domain-separated partition hash
+- the same base hash still chooses the queue-storage enqueue shard as `h % ShardCount` inside that partition
 - lane sequence numbers are unique only within `(partition, shard)`, matching ADR-025's scoped FIFO
 - the configured key set demonstrates that every partition can reach every shard, which is the model-level counterpart to the Rust domain-separated hash distribution test
 
-Run it with:
+Run the passing config with:
 
 ```bash
 ./correctness/run-tlc.sh storage/AwaPartitionedQueueRouting.tla
+```
+
+Run the broken correlated-hash witness with:
+
+```bash
+./correctness/run-tlc.sh storage/AwaPartitionedQueueRouting.tla storage/AwaPartitionedQueueRoutingBroken.cfg
 ```
 
 ## Lock-order companion spec

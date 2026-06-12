@@ -120,6 +120,6 @@ The implementation should have:
 - Python tests for `PartitionedQueue`, queue config expansion, and per-job COPY opts.
 - Integration tests that a worker registered on a partitioned queue can claim from every partition.
 - Benchmarks covering partition counts `1`, `2`, `4`, and `8`, plus at least one `partitions x enqueue_shards` keyed-routing cell.
-- A focused TLA+ routing model (`AwaPartitionedQueueRouting`) checking that partition routing composes with enqueue-shard routing while lane sequence identity remains scoped to `(partition, shard)`.
+- A focused TLA+ routing model (`AwaPartitionedQueueRouting`) checking abstract key-hash routing: storage shard selection is derived from the base hash, partition selection is domain-separated, lane sequence identity remains scoped to `(partition, shard)`, and a broken correlated-hash config fails as expected.
 
 The ADR-019 storage lifecycle models do not need a new table or transition while partitioned queues remain client-side routing over independent ordinary queues. Revisit `AwaSegmentedStorage` itself only if routing or persisted partition metadata becomes part of the storage invariants.
