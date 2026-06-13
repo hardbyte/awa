@@ -12102,9 +12102,13 @@ impl QueueStorage {
                     carried_failed_rows,
                 })
             }
-            Err(_) => {
+            Err(err) if is_lock_contention_error(&err) => {
                 let _ = tx.rollback().await;
                 Ok(PruneOutcome::Blocked { slot })
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(map_sqlx_error(err))
             }
         }
     }
@@ -12219,9 +12223,13 @@ impl QueueStorage {
                     carried_failed_rows: 0,
                 })
             }
-            Err(_) => {
+            Err(err) if is_lock_contention_error(&err) => {
                 let _ = tx.rollback().await;
                 Ok(PruneOutcome::Blocked { slot })
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(map_sqlx_error(err))
             }
         }
     }
@@ -12482,9 +12490,13 @@ impl QueueStorage {
                     carried_failed_rows: 0,
                 })
             }
-            Err(_) => {
+            Err(err) if is_lock_contention_error(&err) => {
                 let _ = tx.rollback().await;
                 Ok(PruneOutcome::Blocked { slot })
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(map_sqlx_error(err))
             }
         }
     }
