@@ -214,11 +214,12 @@ ClaimLegacyTx == <<
 >>
 
 \* complete_runtime_batch (receipts mode)
-\* The hot path fuses receipt closure and narrow terminal insertion into
-\* one SQL statement, but the logical mutation set remains append-only on
-\* the receipt/terminal plane.
+\* Successful receipt completion uses the synchronous done_entries row as
+\* durable receipt-closure evidence and does not append a duplicate
+\* lease_claim_closures row on the hot path. Cold terminal-delete paths
+\* materialize an explicit closure if they remove that done evidence before
+\* claim prune.
 CompleteReceiptsTx == <<
-    Mut("Insert", "lease_claim_closures"),
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Delete", "attempt_state")
@@ -346,22 +347,26 @@ RetryExternalTx == <<
 
 \* DLQ admin lifecycle.
 MoveFailedToDlqTx == <<
+    Mut("Insert", "lease_claim_closures"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "dlq_entries")
 >>
 
 DiscardTerminalTx == <<
+    Mut("Insert", "lease_claim_closures"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
 
 DeleteTerminalCompatTx == <<
+    Mut("Insert", "lease_claim_closures"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
 
 RetryFromTerminalTx == <<
+    Mut("Insert", "lease_claim_closures"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "ready_entries")

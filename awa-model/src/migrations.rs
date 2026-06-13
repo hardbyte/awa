@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 33;
+pub const CURRENT_VERSION: i32 = 34;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -149,6 +149,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Add per-slot receipt-rescue cursors for queue storage",
         &[V23_UP, V33_UP],
     ),
+    (
+        34,
+        "Materialize receipt closures before terminal compatibility deletes",
+        &[V34_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -183,6 +188,7 @@ const V30_UP: &str = include_str!("../migrations/v030_terminal_count_deltas.sql"
 const V31_UP: &str = include_str!("../migrations/v031_queue_storage_failed_done_indexes.sql");
 const V32_UP: &str = include_str!("../migrations/v032_failed_terminal_retention.sql");
 const V33_UP: &str = include_str!("../migrations/v033_receipt_rescue_cursors.sql");
+const V34_UP: &str = include_str!("../migrations/v034_receipt_terminal_delete_closures.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

@@ -221,13 +221,14 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
        Step(ReadyChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared) >>
 
-\* complete_runtime_batch receipt branch (ADR-023)
+\* complete_runtime_batch receipt branch (ADR-023/026)
 \*   No queue_lanes lock (completion does not gate on a lane row)
-\*   INSERT INTO lease_claim_closures (routed to the originating claim_slot)
-\*   INSERT INTO done_entries / dlq_entries / deferred_jobs
+\*   Successful receipt completion uses done_entries as durable closure
+\*   evidence and does not insert lease_claim_closures on the hot path.
+\*   Non-success close paths are modelled by CloseReceiptPlan /
+\*   CancelReceiptOnlyPlan / CancelRunningPlan.
 CompletePlan(claimSlot, readySlot) ==
-    << Step(ClosureChildResource(claimSlot), ModeShared),
-       Step(DoneChildResource(readySlot), ModeShared) >>
+    << Step(DoneChildResource(readySlot), ModeShared) >>
 
 \* close_receipt_tx (queue_storage.rs:6517, called from cancel_job_tx)
 \*   WITH locked_claim AS (SELECT ... FROM lease_claims FOR UPDATE)
@@ -280,6 +281,15 @@ CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
 CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
     << Step(LeaseChildResource(leaseSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared),
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared) >>
+
+\* terminal-delete paths that remove done_entries evidence before claim prune
+\* can consume the corresponding receipt. Rust materializes an explicit
+\* closure in the same transaction. The representative plan covers
+\* retry-from-terminal, DLQ move, discard, and SQL compatibility delete.
+TerminalDeletePlan(readySlot, claimSlot) ==
+    << Step(DoneChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
@@ -543,6 +553,16 @@ StartCancelRunning(t, leaseSlot, readySlot, claimSlot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartTerminalDelete(t, readySlot, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ readySlot \in ReadySlots
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = TerminalDeletePlan(readySlot, claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, readySlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -620,6 +640,8 @@ Next ==
     \/ \E t \in TxIds, ls \in LeaseSlots, rs \in ReadySlots,
          cs \in ClaimSlots :
            StartCancelRunning(t, ls, rs, cs)
+    \/ \E t \in TxIds, rs \in ReadySlots, cs \in ClaimSlots :
+          StartTerminalDelete(t, rs, cs)
     \/ \E t \in TxIds, srcQ \in Queues, dstQ \in Queues,
          srcP \in Priorities, dstP \in Priorities, rs \in ReadySlots :
           StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)

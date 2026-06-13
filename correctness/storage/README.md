@@ -42,7 +42,7 @@ What it models:
 - stale completion rejection via per-worker lease snapshots
 - segment rotation and prune safety for ready, tombstone, lease, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
 - unpartitioned backlog row-vacuum handling for `deferred_jobs` and `dlq_entries`
-- receipt-plane append-only receipts and closures matched into the same `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction.
+- receipt-plane append-only receipts with explicit closures for non-success exits and terminal-row evidence for successful completions. `RescueStaleReceipt` models Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction.
 - a second config with two workers to exercise interleavings on the same storage invariants
 
 Heartbeat freshness is tracked at the lease level (not `attempt_state`) to match the Rust implementation. `ParkToWaiting` clears heartbeat freshness while keeping the lease row live; `ResumeWaitingToRunning` restores a running lease on the same `run_lease`.
@@ -56,7 +56,7 @@ Key safety checks include:
 - DLQ rows hold no live runtime (no lease, attempt_state, etc.)
 - `dlq_entries` and `terminal_entries` are disjoint (a job is in exactly one terminal family at a time)
 - pruned terminal segments hold no live terminal rows; terminal rotation is deadlock-free and respects the same open/sealed/pruned lifecycle as the other families
-- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have a matching closure before `TRUNCATE` fires
+- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have explicit closure evidence or durable terminal/deferred/DLQ evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while a claim row still depends on it.
 
 What it intentionally does not model:
 
