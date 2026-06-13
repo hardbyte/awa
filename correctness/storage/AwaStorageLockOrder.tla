@@ -237,6 +237,7 @@ CloseReceiptPlan(claimSlot) ==
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
 \* rescue_stale_receipt_claims_tx (queue_storage.rs:8195)
+\*   plain SELECT of claim_ring_state to prefer the oldest initialized slot
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
 \*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)

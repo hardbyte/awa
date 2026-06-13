@@ -299,14 +299,14 @@ DeleteReadyCompatTx == <<
     Mut("Insert", "ready_tombstones")
 >>
 
-\* fail_to_dlq / fail_terminal — queue_storage.rs:10049, 10094
+\* fail_to_dlq / fail_terminal — queue_storage.rs:10081, 10126
 FailToDlqTx == <<
     Mut("Delete", "leases"),
     Mut("Delete", "attempt_state"),
     Mut("Insert", "dlq_entries")
 >>
 
-\* retry_after / snooze — queue_storage.rs:9915, 9965
+\* retry_after / snooze — queue_storage.rs:9947, 9997
 RetryToDeferredTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "deferred_jobs")

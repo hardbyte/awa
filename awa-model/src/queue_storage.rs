@@ -8197,12 +8197,44 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         cutoff: DateTime<Utc>,
     ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        let schema = self.schema();
         let mut rescued = Vec::new();
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
+        let preferred_slot: Option<i32> = sqlx::query_as::<_, (i32, i64, i32)>(&format!(
+            r#"
+            SELECT current_slot, generation, slot_count
+            FROM {schema}.claim_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?
+        .and_then(|(current_slot, generation, slot_count)| {
+            oldest_initialized_ring_slot(current_slot, generation, slot_count)
+                .map(|(slot, _generation)| slot)
+                .filter(|slot| *slot >= 0 && (*slot as usize) < self.claim_slot_count())
+        });
+
+        if let Some(slot) = preferred_slot {
+            let mut slot_rescued = self
+                .rescue_stale_receipt_claims_for_slot_tx(tx, slot, cutoff, remaining)
+                .await?;
+            remaining = remaining.saturating_sub(slot_rescued.len() as i64);
+            rescued.append(&mut slot_rescued);
+            if remaining == 0 {
+                return Ok(rescued);
+            }
+        }
 
         for slot in 0..self.claim_slot_count() {
+            let slot = slot as i32;
+            if Some(slot) == preferred_slot {
+                continue;
+            }
+
             let mut slot_rescued = self
-                .rescue_stale_receipt_claims_for_slot_tx(tx, slot as i32, cutoff, remaining)
+                .rescue_stale_receipt_claims_for_slot_tx(tx, slot, cutoff, remaining)
                 .await?;
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
             rescued.append(&mut slot_rescued);
@@ -11706,9 +11738,12 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await;
 
-        if lock_tables.is_err() {
+        if let Err(err) = lock_tables {
             let _ = tx.rollback().await;
-            return Ok(PruneOutcome::Blocked { slot });
+            if is_lock_contention_error(&err) {
+                return Ok(PruneOutcome::Blocked { slot });
+            }
+            return Err(map_sqlx_error(err));
         }
 
         let active_leases: bool = sqlx::query_scalar(&format!(
@@ -12041,9 +12076,12 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await;
 
-        if lock_table.is_err() {
+        if let Err(err) = lock_table {
             let _ = tx.rollback().await;
-            return Ok(PruneOutcome::Blocked { slot });
+            if is_lock_contention_error(&err) {
+                return Ok(PruneOutcome::Blocked { slot });
+            }
+            return Err(map_sqlx_error(err));
         }
 
         let current_slot: i32 = sqlx::query_scalar(&format!(
@@ -12269,9 +12307,12 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await;
 
-        if lock_tables.is_err() {
+        if let Err(err) = lock_tables {
             let _ = tx.rollback().await;
-            return Ok(PruneOutcome::Blocked { slot });
+            if is_lock_contention_error(&err) {
+                return Ok(PruneOutcome::Blocked { slot });
+            }
+            return Err(map_sqlx_error(err));
         }
 
         // After taking ACCESS EXCLUSIVE, recheck that the slot is not
