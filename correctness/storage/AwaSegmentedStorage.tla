@@ -55,13 +55,20 @@ EXTENDS TLC, Naturals, FiniteSets
 \* force-close stragglers via RescueStaleReceipt. This replaces the
 \* earlier open_receipt_claims INSERT+DELETE frontier: the entire
 \* receipt plane is reclaimed by partition rotation.
-\* The Rust implementation also keeps a per-claim-slot stale-rescue
-\* cursor in claim_ring_slots. This model treats that cursor as an
-\* implementation refinement over claimOpen / claimClosed history rather
-\* than lifecycle state: the cursor is a cyclic bounded sweep position.
-\* Fresh claims may be skipped for this pass and revisited after wrap;
-\* stale open claims stop cursor advancement until a rescue step closes
-\* them.
+\* The Rust implementation also keeps per-claim-slot rescue cursors
+\* in claim_ring_slots. This model treats those cursors as implementation
+\* refinements over claimOpen / claimClosed history rather than lifecycle
+\* state. The stale-receipt cursor is a cyclic bounded sweep over
+\* (claimed_at, job_id, run_lease): fresh claims may be skipped for this
+\* pass and revisited after wrap, while stale open claims stop cursor
+\* advancement until a rescue step closes them. The deadline cursor is a
+\* separate bounded sweep over (deadline_at, job_id, run_lease): closed
+\* and lease-managed claims are skipped, expired open receipt claims are
+\* force-closed, and the first open future-deadline claim stops
+\* advancement until it expires or closes through normal completion.
+\* Both cursors refine the same storage facts modelled here: an open
+\* claim is removed from claimOpen and a matching closure evidence row is
+\* represented in claimClosed.
 \*
 \* Enqueue-shard modelling (ADR-025): `laneState` here represents one
 \* `(queue, priority, enqueue_shard)` triple. The Rust implementation

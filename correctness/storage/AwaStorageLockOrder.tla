@@ -253,6 +253,21 @@ RescueReceiptsPlan(claimSlot) ==
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
+\* rescue_expired_receipt_deadlines_tx
+\*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
+\*   bounded scan of lease_claims_<slot> ordered by deadline_at
+\*   anti-join lease_claim_closures_<slot> and leases parent
+\*   FOR UPDATE OF expired claim rows SKIP LOCKED
+\*   INSERT INTO lease_claim_closures ... deadline_expired
+\*   UPDATE claim_ring_slots[slot] deadline cursor
+\* Same resource order as stale receipt rescue; only the index order and
+\* advancement predicate differ.
+RescueReceiptDeadlinesPlan(claimSlot) ==
+    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared) >>
+
 \* ensure_running_leases_from_receipts_tx (queue_storage.rs:7574)
 \*   CTE claim_refs: SELECT ... FROM lease_claims FOR UPDATE OF claims
 \*   INSERT INTO leases ...
@@ -521,6 +536,15 @@ StartRescueReceipts(t, claimSlot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartRescueReceiptDeadlines(t, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = RescueReceiptDeadlinesPlan(claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 StartEnsureRunning(t, claimSlot, leaseSlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -632,6 +656,7 @@ Next ==
     \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartCloseReceipt(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceipts(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceiptDeadlines(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots, ls \in LeaseSlots :
           StartEnsureRunning(t, cs, ls)
     \/ \E t \in TxIds, cs \in ClaimSlots, rs \in ReadySlots,

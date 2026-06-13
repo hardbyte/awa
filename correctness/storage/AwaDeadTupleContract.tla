@@ -254,6 +254,18 @@ RescueReceiptsTx == <<
     Mut("Update", "claim_ring_slots")
 >>
 
+\* rescue_expired_receipt_deadlines_tx — queue_storage.rs:8597
+\* Uses a second per-slot claim_ring_slots cursor ordered by deadline_at.
+\* Closed / lease-managed claims advance the cursor, expired open receipt
+\* claims are closed by appending deadline_expired closure rows, and the
+\* first open future-deadline claim stops advancement. The cursor UPDATE is
+\* on the tiny claim_ring_slots control table; no receipt-history row is
+\* updated or deleted.
+RescueReceiptDeadlinesTx == <<
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "claim_ring_slots")
+>>
+
 \* ensure_running_leases_from_receipts_tx — queue_storage.rs:7574
 \* Materialize a receipt into a real lease row. INSERTs the lease,
 \* UPDATEs the claim's materialized_at column.
@@ -433,7 +445,7 @@ PruneClaimsTx  == <<
 Transactions == {
     ClaimReceiptsTx, ClaimLegacyTx,
     CompleteReceiptsTx, CompleteLegacyTx,
-    CloseReceiptTx, RescueReceiptsTx, EnsureRunningTx,
+    CloseReceiptTx, RescueReceiptsTx, RescueReceiptDeadlinesTx, EnsureRunningTx,
     CancelReceiptOnlyTx, CancelRunningTx, CancelReadyTx, DeleteReadyCompatTx,
     ReprioritizeReadyTx,
     FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,

@@ -44,7 +44,7 @@ Apply ADR-019's rotation-and-prune pattern to the receipt plane. Remove `open_re
 
 1. `lease_claims` becomes `PARTITIONED BY LIST (claim_slot)` with a small fixed set of child partitions (`lease_claims_0..N-1`).
 2. `lease_claim_closures` becomes `PARTITIONED BY LIST (claim_slot)` with matching children. A closure row lives in the same `claim_slot` as its originating claim.
-3. A new control-plane pair `claim_ring_state` and `claim_ring_slots` coordinates rotation, mirroring the existing `lease_ring_state` and `lease_ring_slots`. `claim_ring_slots` also stores a per-slot stale-rescue cursor over `(claimed_at, job_id, run_lease)`.
+3. A new control-plane pair `claim_ring_state` and `claim_ring_slots` coordinates rotation, mirroring the existing `lease_ring_state` and `lease_ring_slots`. `claim_ring_slots` also stores per-slot rescue cursors: stale rescue sweeps `(claimed_at, job_id, run_lease)`, while deadline rescue sweeps `(deadline_at, job_id, run_lease)`.
 4. `open_receipt_claims` is deleted. Its indexes and the schema-install backfill are dropped.
 
 ### Hot path
@@ -63,9 +63,10 @@ Every read that currently targets `open_receipt_claims` becomes a bounded read o
 
 - "Is `(job_id, run_lease)` still open?" — PK lookup into active claim partitions, anti-join explicit closures plus `done_entries`, `deferred_jobs`, and `dlq_entries`. Used by the completion guard and by `load_job` on receipt-backed attempts.
 - "Scan stale receipt claims for rescue." — per-slot cursor scan ordered by `(claimed_at, job_id, run_lease)`, anti-join explicit closures, durable disposition rows, and materialized leases, and close stale candidates by appending rescue closures.
+- "Scan expired receipt deadlines for rescue." — independent per-slot cursor scan ordered by `(deadline_at, job_id, run_lease)`, anti-join explicit closures and materialized leases, close expired open receipt claims by appending `deadline_expired` closures, and stop before the first open future-deadline claim.
 - "Count in-flight receipt-backed attempts." — count active-partition rows minus matching closure or durable disposition evidence.
 
-The rescue cursor is a bounded cyclic sweep cursor. Each pass scans forward from the cursor and wraps to the start of the partition when it reaches the end. Maintenance can advance over closed claims, materialized lease-plane claims, fresh claims, and claims it closes in the current rescue transaction; it stops before a stale open claim that it did not close. This keeps liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune, without letting one healthy long-running receipt pin all later stale receipts behind it.
+Both rescue cursors are bounded cyclic sweeps. Each pass scans forward from the cursor and wraps to the start of the partition when it reaches the end. Stale rescue can advance over closed claims, materialized lease-plane claims, fresh claims, and claims it closes in the current rescue transaction; it stops before a stale open claim that it did not close. Deadline rescue can advance over closed claims, materialized lease-plane claims, and claims it closes in the current rescue transaction; it stops before an open future-deadline claim because earlier deadlines must be resolved before later deadlines matter. These cursors keep liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune, without reintroducing a mutable open-receipt frontier.
 
 ### Rotation and prune
 
@@ -83,7 +84,7 @@ The rescue cursor is a bounded cyclic sweep cursor. Each pass scans forward from
 
 - At-least-once delivery: a partition cannot truncate while live claims remain in it. Rescue is the gating step, not the prune itself.
 - `(job_id, run_lease)` stale-writer protection: the authoritative record is the claim row plus its closure evidence. For successful receipt completion that evidence is the synchronous `done_entries` terminal fact; non-success and rescue paths use `lease_claim_closures`. Adding partitioning changes where those rows live, not what they mean.
-- Heartbeat / deadline / callback-timeout rescue: unchanged. Those continue to run against `attempt_state` and `active_leases`.
+- Heartbeat / callback-timeout rescue: unchanged for materialized leases. Deadline rescue is split by storage shape: materialized leases stay on the lease-side deadline path, while receipt-only claims use the deadline cursor and append a `deadline_expired` closure before entering the same retry / DLQ routing.
 
 ### Migration
 
@@ -92,7 +93,7 @@ This is a breaking schema change even though the external API does not change.
 1. A new migration creates `claim_ring_state`, `claim_ring_slots`, and the partitioned `lease_claims` / `lease_claim_closures` shapes.
 2. Existing `lease_claims` and `lease_claim_closures` rows are rewritten into the current slot of the new partitioned parents.
 3. The legacy `open_receipt_claims` table is not part of the live read path. `prepare_schema()` drops it when empty, and refuses to proceed if it still contains rows so an operator can drain or reverse-migrate those rows deliberately.
-4. Subsequent claim, complete, rescue, and count paths target the partitioned claim/closure tables. The live receipt set is derived as an anti-join over the active claim-ring partitions; stale-rescue scans also use the per-slot cursor stored on `claim_ring_slots`.
+4. Subsequent claim, complete, rescue, and count paths target the partitioned claim/closure tables. The live receipt set is derived as an anti-join over the active claim-ring partitions; stale-rescue and deadline-rescue scans use separate per-slot cursors stored on `claim_ring_slots`.
 
 TLA+ coverage (`AwaSegmentedStorage`, `AwaStorageLockOrder`) is extended to model the claim-ring rotation and the rescue-before-truncate precondition, parallel to the existing lease-ring model.
 
@@ -155,11 +156,11 @@ This ADR has been implemented for 0.6:
 
 - `lease_claims` and `lease_claim_closures` are partitioned by `claim_slot`.
 - `claim_ring_state` and `claim_ring_slots` control rotation and prune.
-- `claim_ring_slots` stores per-slot stale-rescue sweep cursors so maintenance walks receipt history in bounded cyclic windows without reintroducing a per-claim mutable frontier. The sweep can pass fresh claims and revisit them after wrap; stale open claims stop advancement until rescue closes them.
+- `claim_ring_slots` stores per-slot stale-rescue and deadline-rescue sweep cursors so maintenance walks receipt history in bounded cyclic windows without reintroducing a per-claim mutable frontier. The stale sweep can pass fresh claims and revisit them after wrap; stale open claims stop advancement until rescue closes them. The deadline sweep is ordered by `deadline_at`, closes expired receipt-only claims, and stops before the first open future-deadline claim.
 - `open_receipt_claims` is removed from fresh installs and is no longer a hot path table.
 - `lease_claim_receipts` defaults to `true`.
 - Successful receipt completion writes `done_entries` as the durable terminal fact and closure evidence; it does not write a duplicate `lease_claim_closures` row. Terminal-delete paths that remove that evidence before claim prune first materialize an explicit `terminal_removed` closure.
-- Receipts mode supports per-claim deadlines. The claim path writes `deadline_at` onto the `lease_claims` row when `QueueConfig.deadline_duration > 0`, and a sibling rescue scan (`rescue_expired_receipt_deadlines_tx`) force-closes claims whose `deadline_at` has passed without a closure or materialized lease, writing a `'deadline_expired'` closure. The maintenance entry point (`rescue_expired_deadlines`) merges the lease-side and receipt-side scans into one batch per tick, so receipts mode and the existing hard-deadline behaviour compose without operator intervention.
+- Receipts mode supports per-claim deadlines. The claim path writes `deadline_at` onto the `lease_claims` row when `QueueConfig.deadline_duration > 0`, and a sibling rescue scan (`rescue_expired_receipt_deadlines_tx`) advances by `claim_ring_slots.deadline_cursor_*` to force-close claims whose `deadline_at` has passed without a closure or materialized lease, writing a `'deadline_expired'` closure. The maintenance entry point (`rescue_expired_deadlines`) merges the lease-side and receipt-side scans into one batch per tick, so receipts mode and the existing hard-deadline behaviour compose without operator intervention.
 
 Validation evidence is split by purpose:
 

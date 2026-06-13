@@ -4009,6 +4009,123 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_terminal_evidence() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_deadline_cursor";
+    let schema = "awa_qs_receipt_deadline_cursor";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 21 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 22 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim deadline cursor jobs");
+    assert_eq!(claimed.len(), 2);
+    assert!(claimed.iter().all(|entry| entry.claim.lease_claim_receipt));
+
+    store
+        .complete_runtime_batch(&pool, &claimed[0..1])
+        .await
+        .expect("complete first receipt job");
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.lease_claims
+        SET deadline_at = CASE
+            WHEN job_id = $1 THEN clock_timestamp() - interval '10 seconds'
+            WHEN job_id = $2 THEN clock_timestamp() + interval '10 minutes'
+        END
+        WHERE job_id IN ($1, $2)
+        "#
+    ))
+    .bind(first)
+    .bind(second)
+    .execute(&pool)
+    .await
+    .expect("set receipt deadlines");
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("deadline rescue should advance over terminal evidence");
+    assert!(
+        rescued.is_empty(),
+        "terminal evidence should close the expired first claim and the future second claim must not be rescued"
+    );
+
+    let cursor_job: i64 = sqlx::query_scalar(&format!(
+        "SELECT deadline_cursor_job_id FROM {schema}.claim_ring_slots WHERE slot = $1"
+    ))
+    .bind(claimed[0].claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read deadline cursor");
+    assert_eq!(
+        cursor_job, first,
+        "deadline cursor should advance past the completed claim instead of rechecking it forever"
+    );
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.lease_claims \
+         SET deadline_at = clock_timestamp() - interval '1 second' \
+         WHERE job_id = $1"
+    ))
+    .bind(second)
+    .execute(&pool)
+    .await
+    .expect("expire second receipt deadline");
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("deadline rescue should continue after cursor");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, second);
+
+    let closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.lease_claim_closures"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count receipt closures");
+    assert_eq!(
+        closures, 1,
+        "successful completion remains closed by done_entries; only the rescued open claim writes an explicit closure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_wraps() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_rescue_cursor";

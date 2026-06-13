@@ -25,6 +25,7 @@ const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
+const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -8538,16 +8539,111 @@ impl QueueStorage {
     /// disambiguation: a claim that has already materialized into
     /// `leases` is on the lease-side deadline-rescue path, and
     /// rescuing it here would double-close it.
+    ///
+    /// Unlike the lease-side scan, receipt deadline rescue walks each
+    /// claim partition through a tiny cursor ordered by deadline. That
+    /// keeps a long MVCC horizon from making every maintenance tick
+    /// re-prove old successful receipt completions until claim prune
+    /// can truncate the partition.
     async fn rescue_expired_receipt_deadlines_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        let mut rescued = Vec::new();
+        let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
+        for slot in 0..self.claim_slot_count() {
+            let mut slot_rescued = self
+                .rescue_expired_receipt_deadlines_for_slot_tx(tx, slot as i32, remaining)
+                .await?;
+            remaining = remaining.saturating_sub(slot_rescued.len() as i64);
+            rescued.append(&mut slot_rescued);
+
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        Ok(rescued)
+    }
+
+    async fn rescue_expired_receipt_deadlines_for_slot_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        slot: i32,
+        rescue_limit: i64,
+    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        if rescue_limit <= 0 {
+            return Ok(Vec::new());
+        }
+
         let schema = self.schema();
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+        let claim_child = claim_child_name(schema, slot as usize);
+        let closure_child = closure_child_name(schema, slot as usize);
+        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_child, "claims");
         let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
-            WITH expired_claims AS (
+            WITH cursor_row AS (
+                SELECT
+                    deadline_cursor_deadline_at,
+                    deadline_cursor_job_id,
+                    deadline_cursor_run_lease
+                FROM {schema}.claim_ring_slots
+                WHERE slot = $1
+                FOR UPDATE
+            ),
+            after_cursor AS MATERIALIZED (
+                SELECT
+                    claims.claim_slot,
+                    claims.job_id,
+                    claims.run_lease,
+                    row_number() OVER (
+                        ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
+                    ) AS rn
+                FROM {claim_child} AS claims
+                CROSS JOIN cursor_row
+                WHERE claims.claim_slot = $1
+                  AND claims.deadline_at IS NOT NULL
+                  AND (claims.deadline_at, claims.job_id, claims.run_lease)
+                      > (
+                          cursor_row.deadline_cursor_deadline_at,
+                          cursor_row.deadline_cursor_job_id,
+                          cursor_row.deadline_cursor_run_lease
+                        )
+                ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
+                LIMIT $2
+            ),
+            after_count AS (
+                SELECT count(*)::bigint AS count FROM after_cursor
+            ),
+            before_cursor AS MATERIALIZED (
+                SELECT
+                    claims.claim_slot,
+                    claims.job_id,
+                    claims.run_lease,
+                    after_count.count + row_number() OVER (
+                        ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
+                    ) AS rn
+                FROM {claim_child} AS claims
+                CROSS JOIN cursor_row
+                CROSS JOIN after_count
+                WHERE after_count.count < $2
+                  AND claims.claim_slot = $1
+                  AND claims.deadline_at IS NOT NULL
+                  AND (claims.deadline_at, claims.job_id, claims.run_lease)
+                      <= (
+                          cursor_row.deadline_cursor_deadline_at,
+                          cursor_row.deadline_cursor_job_id,
+                          cursor_row.deadline_cursor_run_lease
+                        )
+                ORDER BY claims.deadline_at, claims.job_id, claims.run_lease
+                LIMIT (SELECT GREATEST($2 - count, 0) FROM after_count)
+            ),
+            candidate_keys AS MATERIALIZED (
+                SELECT claim_slot, job_id, run_lease, rn FROM after_cursor
+                UNION ALL
+                SELECT claim_slot, job_id, run_lease, rn FROM before_cursor
+            ),
+            candidates AS MATERIALIZED (
                 SELECT
                     claims.claim_slot,
                     claims.ready_slot,
@@ -8561,51 +8657,123 @@ impl QueueStorage {
                     claims.max_attempts,
                     claims.lane_seq,
                     claims.enqueue_shard,
-                    claims.claimed_at AS attempted_at
-            FROM {schema}.lease_claims AS claims
-            WHERE claims.deadline_at IS NOT NULL
-              AND claims.deadline_at < clock_timestamp()
-              AND NOT {closed_evidence}
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.leases AS lease
+                    claims.claimed_at,
+                    claims.deadline_at,
+                    claims.deadline_at < clock_timestamp() AS is_expired,
+                    {closed_evidence} AS is_closed,
+                    EXISTS (
+                        SELECT 1 FROM {schema}.leases AS lease
+                        WHERE lease.job_id = claims.job_id
+                          AND lease.run_lease = claims.run_lease
+                    ) AS is_lease_managed,
+                    candidate_keys.rn
+                FROM candidate_keys
+                JOIN {claim_child} AS claims
+                  ON claims.claim_slot = candidate_keys.claim_slot
+                 AND claims.job_id = candidate_keys.job_id
+                 AND claims.run_lease = candidate_keys.run_lease
+            ),
+            expired_candidates AS (
+                SELECT candidates.*
+                FROM candidates
+                WHERE NOT is_closed
+                  AND NOT is_lease_managed
+                  AND is_expired
+                ORDER BY rn
+                LIMIT $3
+            ),
+            expired_locked AS (
+                SELECT expired_candidates.*
+                FROM expired_candidates
+                JOIN {claim_child} AS claims
+                  ON claims.claim_slot = expired_candidates.claim_slot
+                 AND claims.job_id = expired_candidates.job_id
+                 AND claims.run_lease = expired_candidates.run_lease
+                WHERE NOT {closed_evidence}
+                  AND claims.deadline_at < clock_timestamp()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
                       WHERE lease.job_id = claims.job_id
                         AND lease.run_lease = claims.run_lease
                   )
-                ORDER BY claims.deadline_at ASC
-                LIMIT 500
                 FOR UPDATE OF claims SKIP LOCKED
             ),
             inserted AS (
                 INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
                 SELECT
-                    expired_claims.claim_slot,
-                    expired_claims.job_id,
-                    expired_claims.run_lease,
+                    expired_locked.claim_slot,
+                    expired_locked.job_id,
+                    expired_locked.run_lease,
                     'deadline_expired',
                     clock_timestamp()
-                FROM expired_claims
+                FROM expired_locked
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                RETURNING job_id, run_lease
+                RETURNING claim_slot, job_id, run_lease
+            ),
+            annotated AS (
+                SELECT
+                    candidates.*,
+                    (
+                        candidates.is_closed
+                        OR candidates.is_lease_managed
+                        OR EXISTS (
+                            SELECT 1 FROM inserted
+                            WHERE inserted.claim_slot = candidates.claim_slot
+                              AND inserted.job_id = candidates.job_id
+                              AND inserted.run_lease = candidates.run_lease
+                        )
+                    ) AS advanceable
+                FROM candidates
+            ),
+            bounded AS (
+                SELECT
+                    annotated.*,
+                    min(CASE WHEN NOT annotated.advanceable THEN annotated.rn END) OVER () AS first_blocked_rn
+                FROM annotated
+            ),
+            advance_target AS (
+                SELECT deadline_at, job_id, run_lease
+                FROM bounded
+                WHERE first_blocked_rn IS NULL OR rn < first_blocked_rn
+                ORDER BY rn DESC
+                LIMIT 1
+            ),
+            advance_cursor AS (
+                UPDATE {schema}.claim_ring_slots AS slots
+                SET deadline_cursor_deadline_at = advance_target.deadline_at,
+                    deadline_cursor_job_id = advance_target.job_id,
+                    deadline_cursor_run_lease = advance_target.run_lease
+                FROM advance_target
+                WHERE slots.slot = $1
+                RETURNING slots.slot
+            ),
+            cursor_advance AS (
+                SELECT count(*) FROM advance_cursor
             )
             SELECT
-                expired_claims.ready_slot,
-                expired_claims.ready_generation,
-                expired_claims.job_id,
-                expired_claims.queue,
-                expired_claims.state,
-                expired_claims.priority,
-                expired_claims.attempt,
-                expired_claims.run_lease,
-                expired_claims.max_attempts,
-                expired_claims.lane_seq,
-                expired_claims.enqueue_shard,
-                expired_claims.attempted_at
-            FROM expired_claims
+                expired_locked.ready_slot,
+                expired_locked.ready_generation,
+                expired_locked.job_id,
+                expired_locked.queue,
+                expired_locked.state,
+                expired_locked.priority,
+                expired_locked.attempt,
+                expired_locked.run_lease,
+                expired_locked.max_attempts,
+                expired_locked.lane_seq,
+                expired_locked.enqueue_shard,
+                expired_locked.claimed_at AS attempted_at
+            FROM expired_locked
             JOIN inserted
-              ON inserted.job_id = expired_claims.job_id
-             AND inserted.run_lease = expired_claims.run_lease
+              ON inserted.claim_slot = expired_locked.claim_slot
+             AND inserted.job_id = expired_locked.job_id
+             AND inserted.run_lease = expired_locked.run_lease
+            CROSS JOIN cursor_advance
             "#
         ))
+        .bind(slot)
+        .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
+        .bind(rescue_limit)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -12476,7 +12644,10 @@ impl QueueStorage {
                     UPDATE {schema}.claim_ring_slots
                     SET rescue_cursor_claimed_at = '-infinity'::timestamptz,
                         rescue_cursor_job_id = 0,
-                        rescue_cursor_run_lease = 0
+                        rescue_cursor_run_lease = 0,
+                        deadline_cursor_deadline_at = '-infinity'::timestamptz,
+                        deadline_cursor_job_id = 0,
+                        deadline_cursor_run_lease = 0
                     WHERE slot = $1
                     "#
                 ))
