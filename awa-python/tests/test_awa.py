@@ -540,8 +540,11 @@ async def test_admin_retry_failed_and_discard_failed(client):
     )
     await tx.commit()
 
-    retried = await client.retry_failed(queue="admin_py")
-    assert len(retried) == 2
+    result = await client.retry_failed(queue="admin_py")
+    assert len(result.jobs) == 2
+    assert result.matched == 2
+    # Canonical backend has no per-queue rollups, so pruned_failed_count is None.
+    assert result.pruned_failed_count is None
 
     tx2 = await client.transaction()
     await tx2.execute(

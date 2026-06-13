@@ -167,6 +167,14 @@ AND done.lane_seq = ready.lane_seq
 
 Dropping `done.enqueue_shard = ready.enqueue_shard` is exactly the historical bug reproduced by `AwaShardedPruneBroken.cfg`.
 
+### Failed-retention carry-forward (ADR-032) is outside this model's scope
+
+ADR-032 adds a failed-retention floor: when queue prune reclaims a sealed slot, `failed` terminal rows still inside `failed_retention` are widened into self-contained terminal rows and re-inserted into the live segment before the old slot is truncated, so they survive rotation. The Rust prune transaction does the carry (select in-floor failed rows, hydrate the immutable body from the retained ready row, insert wide into the live `done_entries` child under `current_slot` / its generation, re-append the positive terminal-count delta under the new slot) and excludes carried rows from the truncated-slot rollup fold.
+
+`AwaShardedPrune.tla` does not model this, and does not need to. Its `DoneRowsComeFromReadyRows` invariant constrains only **ready-backed** done rows: every modelled done row is keyed to a ready row on the same `(shard, seq, seg)`. A carried failed row is the opposite class — a **wide, synthetic** terminal row that is deliberately decoupled from any ready body (the same synthetic shape `AwaSegmentedStorage` already allows for unclaimed-cancellation and scheduled-cancellation terminal rows, per the `terminalEntries` mapping above). It does not enter the model's ready-backed done set, so the implementation as designed does not violate `DoneRowsComeFromReadyRows`. The model's `NoPendingReadyDropped` property is also unaffected: carry-forward only ever moves `done_entries` rows, never a still-pending ready row.
+
+The carry's correctness obligations are tested in Rust rather than modelled in TLA+: the destination-slot stability under concurrent rotate is the `queue_ring_state FOR UPDATE` lock-hold argument in ADR-032 (the lock order itself is covered by `AwaStorageLockOrder.tla`, which already serializes `PruneReadyPlan` against `RotateReadyPlan` on the ring-state resource), and the exact-count consistency of re-appending the carried rows' deltas under the new slot is covered by `test_queue_terminal_live_counts_rebuild_restores_invariant` and the terminal-counter trust-marker test. Adding a carry action to `AwaShardedPrune.tla` without modelling a second (synthetic) done-row class would be vacuous, so the model is left as-is and this note records the boundary.
+
 ## Known modelling gaps with implementation implications
 
 ### Claim vs Rotate race — resolved by checked commit on lease rotation state

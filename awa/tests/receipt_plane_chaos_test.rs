@@ -303,7 +303,7 @@ async fn test_receipt_rescue_makes_progress_under_overload() {
         .await
         .expect("prune slot 0 after rescue drain");
     assert!(
-        matches!(prune, PruneOutcome::Pruned { slot: 0 }),
+        matches!(prune, PruneOutcome::Pruned { slot: 0, .. }),
         "prune must succeed once every claim has a closure, got {prune:?}"
     );
 }
@@ -459,7 +459,7 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
         .await
         .expect("prune after reader release");
     assert!(
-        matches!(pruned, PruneOutcome::Pruned { slot: 0 }),
+        matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "prune must succeed once reader releases, got {pruned:?}"
     );
 

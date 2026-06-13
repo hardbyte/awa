@@ -124,8 +124,34 @@ def test_retry_failed_sync(client):
     )
     tx.commit()
 
-    retried = client.retry_failed(queue="sync_retry")
-    assert len(retried) >= 1
+    result = client.retry_failed(queue="sync_retry")
+    assert len(result.jobs) >= 1
+    assert result.matched >= 1
+    assert result.matched >= len(result.jobs)
+    # Canonical backend has no per-queue rollups, so pruned_failed_count is None.
+    assert result.pruned_failed_count is None
+
+
+def test_retry_failed_sync_queue_storage_reports_pruned_count(client):
+    """On queue_storage, retry_failed(queue=...) surfaces the rollup count.
+
+    With no failed rows the result is deterministic: nothing matched, and the
+    per-queue pruned-failed rollup sum is Some(0) (clamped >= 0) — no prune
+    race, no sleeps.
+    """
+    schema = "awa_py_sync_retry_pruned"
+    client.install_queue_storage(schema=schema, reset=True)
+    try:
+        result = client.retry_failed(queue="sync_retry_pruned")
+        assert result.jobs == []
+        assert result.matched == 0
+        assert result.pruned_failed_count == 0
+    finally:
+        tx = client.transaction()
+        tx.execute(
+            "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+        )
+        tx.commit()
 
 
 # -- Test 16: discard_failed_sync --

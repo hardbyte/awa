@@ -12,10 +12,12 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 import awa
+import awa.__main__ as awa_main
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -193,6 +195,26 @@ def test_job_retry_failed_requires_filter():
     )
     assert result.returncode == 1
     assert "--kind" in result.stderr and "--queue" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_job_retry_failed_renders_outcome(capsys):
+    class FakeClient:
+        async def retry_failed(self, *, kind=None, queue=None):
+            assert kind is None
+            assert queue == "email"
+            return SimpleNamespace(jobs=[object(), object()], matched=3, pruned_failed_count=5)
+
+    await awa_main._dispatch_job(
+        FakeClient(),
+        SimpleNamespace(job_cmd="retry-failed", kind=None, queue="email"),
+    )
+
+    assert (
+        capsys.readouterr().out.strip()
+        == "Retried 2 failed jobs (matched 3; 1 raced or pruned); "
+        "5 failed rows have been pruned past retention and are no longer retryable"
+    )
 
 
 # ── live integration ────────────────────────────────────────────────────

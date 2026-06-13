@@ -22,6 +22,7 @@ from awa._awa import (
     Job,
     QueueStat,
     ResolveResult,
+    RetryFailedResult,
     SyncTransaction,
     Transaction,
 )
@@ -306,8 +307,15 @@ class AsyncClient:
 
     async def retry_failed(
         self, *, kind: str | None = None, queue: str | None = None
-    ) -> list[Job]:
-        """Retry all failed jobs matching the filter."""
+    ) -> RetryFailedResult:
+        """Retry all failed jobs matching the filter.
+
+        Returns a :class:`RetryFailedResult` with ``jobs`` (the rows moved
+        back to available), ``matched`` (failed rows the filter scanned;
+        ``matched - len(jobs)`` raced or were pruned past retention), and
+        ``pruned_failed_count`` (cumulative failed rows pruned past retention
+        for the queue, or ``None`` when filtering by kind).
+        """
         return await self._raw.retry_failed(kind=kind, queue=queue)
 
     async def discard_failed(self, kind: str) -> int:
@@ -1114,8 +1122,15 @@ class Client:
 
     def retry_failed(
         self, *, kind: str | None = None, queue: str | None = None
-    ) -> list[Job]:
-        """Retry all failed jobs matching the filter."""
+    ) -> RetryFailedResult:
+        """Retry all failed jobs matching the filter.
+
+        Returns a :class:`RetryFailedResult` with ``jobs`` (the rows moved
+        back to available), ``matched`` (failed rows the filter scanned;
+        ``matched - len(jobs)`` raced or were pruned past retention), and
+        ``pruned_failed_count`` (cumulative failed rows pruned past retention
+        for the queue, or ``None`` when filtering by kind).
+        """
         return self._raw.retry_failed_sync(kind=kind, queue=queue)
 
     def discard_failed(self, kind: str) -> int:

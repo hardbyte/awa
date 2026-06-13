@@ -1115,6 +1115,87 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
     assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
+async fn rollups_failed_column_exists(pool: &PgPool, schema: &str) -> bool {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = 'queue_terminal_rollups'
+              AND column_name = 'pruned_failed_count'
+        )
+        "#,
+    )
+    .bind(schema)
+    .fetch_one(pool)
+    .await
+    .expect("pruned_failed_count column probe should succeed")
+}
+
+#[tokio::test]
+async fn test_v032_backfills_queue_storage_pruned_failed_rollup_column() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let schema = "awa_queue_storage_v032_rollups";
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    // Simulate a substrate prepared by a pre-v032 binary.
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.queue_terminal_rollups DROP COLUMN pruned_failed_count"
+    ))
+    .execute(&pool)
+    .await
+    .expect("pruned_failed_count test column should drop cleanly");
+
+    // A look-alike schema without the claim function must be skipped by
+    // the substrate discovery filter.
+    sqlx::raw_sql(
+        r#"
+        DROP SCHEMA IF EXISTS awa_queue_storage_v032_partial CASCADE;
+        CREATE SCHEMA awa_queue_storage_v032_partial;
+        CREATE TABLE awa_queue_storage_v032_partial.queue_ring_state (
+            singleton BOOLEAN PRIMARY KEY,
+            slot_count INT NOT NULL
+        );
+        CREATE TABLE awa_queue_storage_v032_partial.queue_terminal_rollups (
+            queue TEXT NOT NULL,
+            priority SMALLINT NOT NULL,
+            pruned_completed_count BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (queue, priority)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("partial queue-storage probe schema should be creatable");
+
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 32")
+        .execute(&pool)
+        .await
+        .expect("schema_version rewind should succeed");
+
+    migrations::run(&pool)
+        .await
+        .expect("v032 should rerun cleanly");
+
+    assert!(
+        rollups_failed_column_exists(&pool, schema).await,
+        "v032 must backfill pruned_failed_count for existing queue-storage schemas"
+    );
+    assert!(
+        !rollups_failed_column_exists(&pool, "awa_queue_storage_v032_partial").await,
+        "v032 must skip schemas that are not real queue-storage substrates"
+    );
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+}
+
 #[tokio::test]
 async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() {
     let _guard = acquire_migration_guard().await;

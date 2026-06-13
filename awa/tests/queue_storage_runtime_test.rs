@@ -1957,7 +1957,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         .await
         .expect("prune_oldest_claims");
     match prune_outcome {
-        PruneOutcome::Pruned { slot } => assert_eq!(slot, 0),
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected Pruned {{ slot: 0 }}, got {other:?}"),
     }
 
@@ -4921,7 +4921,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     );
 
     let prune_while_running = store
-        .prune_oldest(&pool)
+        .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune oldest live slot");
     assert!(
@@ -4946,11 +4946,11 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     assert_eq!(completed.state, JobState::Completed);
 
     let prune_after_completion = store
-        .prune_oldest(&pool)
+        .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune oldest completed slot");
     assert!(
-        matches!(prune_after_completion, PruneOutcome::Pruned { slot: 0 }),
+        matches!(prune_after_completion, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after completion: {prune_after_completion:?}"
     );
 
@@ -4996,11 +4996,11 @@ async fn test_queue_storage_prune_treats_ready_tombstone_as_spent() {
     );
 
     let prune = store
-        .prune_oldest(&pool)
+        .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune tombstoned ready slot");
     assert!(
-        matches!(prune, PruneOutcome::Pruned { slot: 0 }),
+        matches!(prune, PruneOutcome::Pruned { slot: 0, .. }),
         "tombstoned ready rows should not keep the old queue slot active: {prune:?}"
     );
 
@@ -5097,7 +5097,7 @@ async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard
     );
 
     let prune = store
-        .prune_oldest(&pool)
+        .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune oldest queue slot");
     assert!(
@@ -5645,7 +5645,11 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
         awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
         other => panic!("expected Rotated, got {other:?}"),
     }
-    match store.prune_oldest(&pool).await.expect("prune_oldest") {
+    match store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("prune_oldest")
+    {
         awa_model::queue_storage::PruneOutcome::Pruned { .. } => {}
         other => panic!("expected Pruned, got {other:?}"),
     }
@@ -5933,7 +5937,11 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
         awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
         other => panic!("expected Rotated, got {other:?}"),
     }
-    match store.prune_oldest(&pool).await.expect("prune_oldest") {
+    match store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("prune_oldest")
+    {
         awa_model::queue_storage::PruneOutcome::Pruned { .. } => {}
         other => panic!("expected Pruned, got {other:?}"),
     }
@@ -5963,6 +5971,713 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
     .await
     .expect("rollup sum");
     assert_eq!(rollup, 5, "rollup absorbed the pruned slot's counter");
+}
+
+/// #337: prune re-homes failed terminal rows inside the retention floor
+/// into the live `done_entries` segment as self-contained wide rows
+/// (still retryable, exact counts intact), while failed rows past the
+/// floor fold into `queue_terminal_rollups.pruned_failed_count` and
+/// non-failed terminals fold into `pruned_completed_count`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_carries_failed_rows_inside_retention_floor() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_failed_retention";
+    let schema = "awa_qs_prune_failed_retention";
+    let store = create_store(&pool, schema).await;
+
+    // Slot 0: one completed row, one fresh failed row (inside the
+    // floor), one failed row backdated past the floor.
+    let mut job_ids = Vec::new();
+    for id in [1, 2, 3] {
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+            .await
+            .expect("claim retention-floor job");
+        let claimed = claimed.into_iter().next().expect("missing claimed job");
+        if id == 1 {
+            store
+                .complete_runtime_batch(&pool, std::slice::from_ref(&claimed))
+                .await
+                .expect("complete retention-floor job");
+        } else {
+            store
+                .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+                .await
+                .expect("fail retention-floor job")
+                .expect("running job should fail");
+        }
+        job_ids.push(job_id);
+    }
+    let carried_job_id = job_ids[1];
+    let expired_job_id = job_ids[2];
+    sqlx::query(&format!(
+        "UPDATE {schema}.done_entries SET finalized_at = now() - interval '2 hours' \
+         WHERE job_id = $1"
+    ))
+    .bind(expired_job_id)
+    .execute(&pool)
+    .await
+    .expect("backdate expired failed row");
+
+    // The soon-to-be-carried row starts narrow (ready-backed).
+    let (args, max_attempts, _run_at, created_at, _payload) =
+        done_body_columns(&pool, &store, carried_job_id).await;
+    assert!(args.is_none(), "failed row should start ready-backed");
+    assert!(max_attempts.is_none());
+    assert!(created_at.is_none());
+
+    match store.rotate(&pool).await.expect("rotate") {
+        RotateOutcome::Rotated { slot: 1, .. } => {}
+        other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
+    }
+    match store
+        .prune_oldest(&pool, Duration::from_secs(3600))
+        .await
+        .expect("prune_oldest")
+    {
+        PruneOutcome::Pruned {
+            slot: 0,
+            carried_failed_rows: 1,
+        } => {}
+        other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 1 }}, got {other:?}"),
+    }
+
+    // The fresh failed row was carried to the live slot as a wide,
+    // self-contained row; the completed and expired rows are gone.
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 1);
+    let (carried_slot, carried_state): (i32, String) = sqlx::query_as(&format!(
+        "SELECT ready_slot, state::text FROM {schema}.done_entries WHERE job_id = $1"
+    ))
+    .bind(carried_job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("carried row");
+    assert_eq!(carried_slot, 1, "carried row must live in the current slot");
+    assert_eq!(carried_state, "failed");
+    let (args, max_attempts, run_at, created_at, _payload) =
+        done_body_columns(&pool, &store, carried_job_id).await;
+    assert!(
+        args.is_some() && max_attempts.is_some() && run_at.is_some() && created_at.is_some(),
+        "carried row must be widened — its ready backing row was truncated"
+    );
+
+    // Exact counts moved with the carried row (ADR-026 invariant), and
+    // the rollup split the truncated rows by state.
+    assert_invariant_holds(&pool, schema, queue, "after retention-floor prune").await;
+    let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint, \
+                COALESCE(SUM(pruned_failed_count), 0)::bigint \
+         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("rollup sums");
+    assert_eq!(
+        pruned_completed, 1,
+        "completed row folds into the completed column"
+    );
+    assert_eq!(
+        pruned_failed, 1,
+        "expired failed row folds into the failed column"
+    );
+
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(counts.available, 0);
+    assert_eq!(counts.terminal, 3, "rollups (2) + carried live row (1)");
+    assert_eq!(counts.pruned_failed, 1);
+
+    // The carried row stays retryable.
+    let retried = store
+        .retry_job(&pool, carried_job_id)
+        .await
+        .expect("retry carried job");
+    assert!(
+        retried.is_some(),
+        "carried failed row must remain retryable"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after retrying carried row").await;
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(counts.available, 1);
+    assert_eq!(counts.terminal, 2, "retry removed the carried live row");
+}
+
+/// #337: `retry_failed_by_queue` reports matched-vs-retried counts and
+/// surfaces the cumulative number of failed rows pruned past the
+/// retention floor; `retry_failed_by_kind` reports `None` for the
+/// pruned count because rollups carry no kind dimension.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_retry_failed_outcome_surfaces_pruned_rows() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_retry_failed_outcome";
+    let schema = "awa_qs_retry_failed_outcome";
+    let store = create_store(&pool, schema).await;
+
+    // Two failed rows: one fresh (inside the floor, carried by prune)
+    // and one backdated past the floor (pruned for good).
+    let mut job_ids = Vec::new();
+    for id in [1, 2] {
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+            .await
+            .expect("claim retry-outcome job")
+            .into_iter()
+            .next()
+            .expect("missing claimed job");
+        store
+            .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+            .await
+            .expect("fail retry-outcome job")
+            .expect("running job should fail");
+        job_ids.push(job_id);
+    }
+    let carried_job_id = job_ids[0];
+    let expired_job_id = job_ids[1];
+    sqlx::query(&format!(
+        "UPDATE {schema}.done_entries SET finalized_at = now() - interval '2 hours' \
+         WHERE job_id = $1"
+    ))
+    .bind(expired_job_id)
+    .execute(&pool)
+    .await
+    .expect("backdate expired failed row");
+
+    match store.rotate(&pool).await.expect("rotate") {
+        RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    match store
+        .prune_oldest(&pool, Duration::from_secs(3600))
+        .await
+        .expect("prune_oldest")
+    {
+        PruneOutcome::Pruned {
+            carried_failed_rows: 1,
+            ..
+        } => {}
+        other => panic!("expected Pruned with one carried row, got {other:?}"),
+    }
+
+    let outcome = admin::retry_failed_by_queue(&pool, queue)
+        .await
+        .expect("retry_failed_by_queue");
+    assert_eq!(
+        outcome.retried.len(),
+        1,
+        "only the carried failed row is still retryable"
+    );
+    assert_eq!(outcome.retried[0].id, carried_job_id);
+    assert_eq!(
+        outcome.matched, 1,
+        "the expired row must not match the retry scan"
+    );
+    assert_eq!(
+        outcome.pruned_failed_count,
+        Some(1),
+        "queue-scoped retries surface failed rows pruned past retention"
+    );
+
+    // Kind-scoped retries cannot scope the pruned count to the kind.
+    let outcome = admin::retry_failed_by_kind(&pool, CompleteJob::kind())
+        .await
+        .expect("retry_failed_by_kind");
+    assert!(
+        outcome.retried.is_empty(),
+        "the carried row was already retried above"
+    );
+    assert_eq!(outcome.matched, 0);
+    assert_eq!(outcome.pruned_failed_count, None);
+}
+
+/// #337: a mix of completed and failed terminal rows under a generous
+/// retention floor. The completed rows fold into `pruned_completed_count`;
+/// the failed rows (including a NARROW ready-backed one) are carried into
+/// the live segment as self-contained wide rows, so `pruned_failed_count`
+/// stays untouched. `admin::retry_failed_by_queue` then revives the
+/// carried jobs end-to-end, proving the carried bodies survived the
+/// widening; `rebuild_terminal_counters` re-aggregates from `done_entries`
+/// and the ADR-026 invariant still holds against the carried rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_carry_forward_rebuild";
+    let schema = "awa_qs_prune_carry_forward_rebuild";
+    let store = create_store(&pool, schema).await;
+
+    // Slot 0: two completed rows and two failed rows, all inside the
+    // floor. Every row enters narrow (ready-backed); the two failed rows
+    // are the carry candidates.
+    let mut completed_ids = Vec::new();
+    let mut failed_ids = Vec::new();
+    for id in [1, 2, 3, 4] {
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+            .await
+            .expect("claim carry-forward job")
+            .into_iter()
+            .next()
+            .expect("missing claimed job");
+        if id <= 2 {
+            store
+                .complete_runtime_batch(&pool, std::slice::from_ref(&claimed))
+                .await
+                .expect("complete carry-forward job");
+            completed_ids.push(job_id);
+        } else {
+            store
+                .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+                .await
+                .expect("fail carry-forward job")
+                .expect("running job should fail");
+            failed_ids.push(job_id);
+        }
+    }
+
+    // Both failed rows start NARROW (ready-backed): their wide body
+    // columns are elided and only hydrate from the ready child.
+    for &failed_id in &failed_ids {
+        let (args, max_attempts, _run_at, created_at, _payload) =
+            done_body_columns(&pool, &store, failed_id).await;
+        assert!(
+            args.is_none() && max_attempts.is_none() && created_at.is_none(),
+            "failed row {failed_id} should start ready-backed (narrow)"
+        );
+    }
+
+    match store.rotate(&pool).await.expect("rotate") {
+        RotateOutcome::Rotated { slot: 1, .. } => {}
+        other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
+    }
+    match store
+        .prune_oldest(&pool, Duration::from_secs(3600))
+        .await
+        .expect("prune_oldest")
+    {
+        PruneOutcome::Pruned {
+            slot: 0,
+            carried_failed_rows: 2,
+        } => {}
+        other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 2 }}, got {other:?}"),
+    }
+
+    // Only the two failed rows survive in done_entries, both widened to
+    // self-contained wide rows in the live slot with intact bodies.
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 2);
+    for &failed_id in &failed_ids {
+        let (carried_slot, carried_state): (i32, String) = sqlx::query_as(&format!(
+            "SELECT ready_slot, state::text FROM {schema}.done_entries WHERE job_id = $1"
+        ))
+        .bind(failed_id)
+        .fetch_one(&pool)
+        .await
+        .expect("carried row");
+        assert_eq!(
+            carried_slot, 1,
+            "carried row {failed_id} must live in the live slot"
+        );
+        assert_eq!(carried_state, "failed");
+        let (args, max_attempts, run_at, created_at, payload) =
+            done_body_columns(&pool, &store, failed_id).await;
+        assert!(
+            args.is_some()
+                && max_attempts.is_some()
+                && run_at.is_some()
+                && created_at.is_some()
+                && payload.is_some(),
+            "carried row {failed_id} must be widened — its ready backing row was truncated"
+        );
+    }
+
+    // Completed rows folded into the completed column; pruned_failed_count
+    // is untouched because no failed row was past the floor.
+    let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint, \
+                COALESCE(SUM(pruned_failed_count), 0)::bigint \
+         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("rollup sums");
+    assert_eq!(
+        pruned_completed, 2,
+        "both completed rows fold into the completed column"
+    );
+    assert_eq!(
+        pruned_failed, 0,
+        "no failed row was past the floor, so the failed column stays at zero"
+    );
+
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(
+        counts.terminal, 4,
+        "rollup completed (2) + carried live rows (2)"
+    );
+    assert_eq!(counts.pruned_failed, 0);
+
+    // The carried rows' exact-count evidence moved with them: rebuilding
+    // the counters from done_entries ground truth keeps the ADR-026
+    // invariant intact against the carried rows (mirror of the #290
+    // rebuild test, but exercised on carried terminal facts).
+    let rebuilt = store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild terminal counters after carry");
+    assert!(
+        rebuilt >= 1,
+        "rebuild should re-populate counter rows for the carried slot"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after rebuild over carried rows").await;
+    assert_eq!(
+        terminal_counter_sum(&pool, schema, queue).await,
+        2,
+        "rebuilt counter equals the two carried failed rows"
+    );
+
+    // End-to-end revival through the admin path: both carried jobs are
+    // still failed-and-retryable, proving the widened bodies are
+    // self-contained.
+    let outcome = admin::retry_failed_by_queue(&pool, queue)
+        .await
+        .expect("retry_failed_by_queue");
+    assert_eq!(
+        outcome.matched, 2,
+        "both carried failed rows match the retry scan"
+    );
+    assert_eq!(
+        outcome.retried.len(),
+        2,
+        "both carried failed rows are revived"
+    );
+    let revived: HashSet<i64> = outcome.retried.iter().map(|job| job.id).collect();
+    let expected: HashSet<i64> = failed_ids.iter().copied().collect();
+    assert_eq!(
+        revived, expected,
+        "the revived jobs are exactly the carried ones"
+    );
+    for job in &outcome.retried {
+        assert_eq!(
+            job.state,
+            JobState::Available,
+            "revived job is runnable again"
+        );
+    }
+    assert_eq!(
+        outcome.pruned_failed_count,
+        Some(0),
+        "no rows were pruned past the floor for this queue"
+    );
+
+    // Retrying the carried rows removed them from done_entries; the
+    // invariant continues to hold.
+    assert_invariant_holds(&pool, schema, queue, "after reviving carried rows").await;
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(counts.available, 2, "both carried jobs are runnable again");
+    assert_eq!(
+        counts.terminal, 2,
+        "retry removed the two carried live rows"
+    );
+}
+
+/// #337: failed rows past the floor are pruned for good. With
+/// `Duration::ZERO` the floor is disabled, so a fresh failed row folds
+/// into `pruned_failed_count` exactly like an expired one. The pruned
+/// rows are no longer retryable: `retry_failed_by_queue` returns an empty
+/// `retried` set with `matched == 0`, surfaces the cumulative pruned
+/// count, and `queue_counts_exact` still includes the pruned rows in its
+/// terminal total while `QueueCounts.pruned_failed` reports them
+/// standing. `retry_failed_by_kind` cannot scope the pruned count to a
+/// kind, so it reports `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_past_floor_folds_failed_into_rollup() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_past_floor_fold";
+    let schema = "awa_qs_prune_past_floor_fold";
+    let store = create_store(&pool, schema).await;
+
+    // Slot 0: three failed rows, all fresh and inside any real floor.
+    for id in [1, 2, 3] {
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+            .await
+            .expect("claim past-floor job")
+            .into_iter()
+            .next()
+            .expect("missing claimed job");
+        store
+            .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+            .await
+            .expect("fail past-floor job")
+            .expect("running job should fail");
+    }
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 3);
+
+    match store.rotate(&pool).await.expect("rotate") {
+        RotateOutcome::Rotated { slot: 1, .. } => {}
+        other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
+    }
+    // Duration::ZERO disables the floor: every failed row is treated as
+    // past-floor and pruned for good — no carry.
+    match store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("prune_oldest")
+    {
+        PruneOutcome::Pruned {
+            slot: 0,
+            carried_failed_rows: 0,
+        } => {}
+        other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 0 }}, got {other:?}"),
+    }
+
+    // No live done rows remain; all three failed rows folded into the
+    // failed rollup column.
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+    let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint, \
+                COALESCE(SUM(pruned_failed_count), 0)::bigint \
+         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("rollup sums");
+    assert_eq!(pruned_completed, 0, "no completed rows in this scenario");
+    assert_eq!(
+        pruned_failed, 3,
+        "all three failed rows fold into the failed column"
+    );
+
+    // The pruned failed rows are no longer retryable.
+    let outcome = admin::retry_failed_by_queue(&pool, queue)
+        .await
+        .expect("retry_failed_by_queue");
+    assert!(
+        outcome.retried.is_empty(),
+        "pruned failed rows cannot be revived"
+    );
+    assert_eq!(
+        outcome.matched, 0,
+        "no done_entries failed rows remain to match"
+    );
+    assert_eq!(
+        outcome.pruned_failed_count,
+        Some(3),
+        "queue-scoped retries surface all three failed rows pruned past retention"
+    );
+
+    // The exact terminal total still counts the pruned rows, and the
+    // standing pruned_failed surface matches the rollup sum.
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(
+        counts.terminal, 3,
+        "exact terminal total includes the pruned failed rows"
+    );
+    assert_eq!(
+        counts.pruned_failed, 3,
+        "QueueCounts.pruned_failed == N pruned failed rows"
+    );
+
+    // Kind-scoped retries cannot scope the pruned count to a kind.
+    let outcome = admin::retry_failed_by_kind(&pool, CompleteJob::kind())
+        .await
+        .expect("retry_failed_by_kind");
+    assert!(outcome.retried.is_empty());
+    assert_eq!(outcome.matched, 0);
+    assert_eq!(
+        outcome.pruned_failed_count, None,
+        "rollups carry no kind dimension, so the pruned count is unscopable"
+    );
+}
+
+/// #337: a carried failed row must be carried again — exactly once — when
+/// its new slot becomes prunable. Rotating the ring all the way around so
+/// the slot holding the carried row is the oldest sealed slot, then
+/// pruning with the floor again, re-homes the same row into the new live
+/// slot without duplicating it in `done_entries` and without drifting the
+/// exact counters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_prune_re_carry_stable";
+    let schema = "awa_qs_prune_re_carry_stable";
+    // Default 4-slot queue ring: slot 0 holds the failed row, it is
+    // carried to slot 1 by the first prune, and a full lap (1→2→3→0)
+    // makes slot 1 the oldest sealed slot for the second prune.
+    let store = create_store(&pool, schema).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim re-carry job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    store
+        .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("fail re-carry job")
+        .expect("running job should fail");
+
+    // First carry: rotate 0→1, prune slot 0 → row carried into slot 1.
+    match store.rotate(&pool).await.expect("rotate") {
+        RotateOutcome::Rotated { slot: 1, .. } => {}
+        other => panic!("expected Rotated {{ slot: 1 }}, got {other:?}"),
+    }
+    match store
+        .prune_oldest(&pool, Duration::from_secs(3600))
+        .await
+        .expect("prune_oldest")
+    {
+        PruneOutcome::Pruned {
+            slot: 0,
+            carried_failed_rows: 1,
+        } => {}
+        other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 1 }}, got {other:?}"),
+    }
+    assert_eq!(
+        done_entries_count(&pool, schema, queue).await,
+        1,
+        "exactly one done row after first carry"
+    );
+    let first_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT ready_slot FROM {schema}.done_entries WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("first carried slot");
+    assert_eq!(first_slot, 1, "row carried into the live slot");
+    assert_invariant_holds(&pool, schema, queue, "after first carry").await;
+
+    // Lap the ring so the carried row's slot (1) becomes the oldest
+    // sealed slot again: 1→2→3→0. The carried row keeps slot 2/3/0
+    // empty, so each rotate succeeds.
+    for expected_slot in [2_i32, 3, 0] {
+        match store.rotate(&pool).await.expect("rotate around ring") {
+            RotateOutcome::Rotated { slot, .. } if slot == expected_slot => {}
+            other => panic!("expected Rotated {{ slot: {expected_slot} }}, got {other:?}"),
+        }
+    }
+
+    // Second prune: current slot is 0, so the oldest sealed non-current
+    // slot is slot 1 (the carried row). It is carried again into slot 0.
+    match store
+        .prune_oldest(&pool, Duration::from_secs(3600))
+        .await
+        .expect("prune_oldest re-carry")
+    {
+        PruneOutcome::Pruned {
+            slot: 1,
+            carried_failed_rows: 1,
+        } => {}
+        other => panic!("expected Pruned {{ slot: 1, carried_failed_rows: 1 }}, got {other:?}"),
+    }
+
+    // Carried exactly once: still a single done row, now in slot 0, with
+    // an intact wide body and consistent counters (no duplication).
+    assert_eq!(
+        done_entries_count(&pool, schema, queue).await,
+        1,
+        "re-carry must not duplicate the done row"
+    );
+    let second_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT ready_slot FROM {schema}.done_entries WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("re-carried slot");
+    assert_eq!(second_slot, 0, "row re-carried into the new live slot");
+    let (args, max_attempts, run_at, created_at, payload) =
+        done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        args.is_some()
+            && max_attempts.is_some()
+            && run_at.is_some()
+            && created_at.is_some()
+            && payload.is_some(),
+        "re-carried row stays a self-contained wide row"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after re-carry").await;
+    assert_eq!(
+        terminal_counter_sum(&pool, schema, queue).await,
+        1,
+        "counters track exactly one terminal row across the re-carry"
+    );
+
+    // No failed row was ever past the floor, so nothing folded into the
+    // rollup despite two prunes.
+    let pruned_failed: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(SUM(pruned_failed_count), 0)::bigint \
+         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("rollup failed sum");
+    assert_eq!(
+        pruned_failed, 0,
+        "the row was always carried, never pruned past the floor"
+    );
+
+    // Still retryable after two carries.
+    let retried = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("retry re-carried job");
+    assert!(retried.is_some(), "re-carried row must remain retryable");
+    assert_invariant_holds(&pool, schema, queue, "after retrying re-carried row").await;
 }
 
 /// ADR-026: maintenance can fold pending terminal-count deltas for a sealed
@@ -7010,7 +7725,7 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
     .expect("Failed to lock ready/done reader tables");
 
     let blocked = store
-        .prune_oldest(&pool)
+        .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune while reader lock held");
     assert!(
@@ -7024,11 +7739,11 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
         .expect("Failed to release reader lock");
 
     let pruned = store
-        .prune_oldest(&pool)
+        .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune after reader lock release");
     assert!(
-        matches!(pruned, PruneOutcome::Pruned { slot: 0 }),
+        matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after reader lock release: {pruned:?}"
     );
 }

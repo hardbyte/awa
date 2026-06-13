@@ -1732,14 +1732,24 @@ impl MaintenanceService {
             return;
         }
 
-        match runtime.store.prune_oldest(&self.pool).await {
+        match runtime
+            .store
+            .prune_oldest(&self.pool, self.failed_retention)
+            .await
+        {
             Ok(outcome) => {
                 self.metrics.record_prune_outcome("queue", &outcome);
                 prune_tracker.record_outcome(PRUNE_BRANCH_QUEUE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
-                    PruneOutcome::Pruned { slot } => {
-                        debug!(slot, "Pruned queue storage queue segment");
+                    PruneOutcome::Pruned {
+                        slot,
+                        carried_failed_rows,
+                    } => {
+                        debug!(
+                            slot,
+                            carried_failed_rows, "Pruned queue storage queue segment"
+                        );
                     }
                     PruneOutcome::Blocked { slot } => {
                         debug!(slot, "Queue storage queue segment prune blocked");
@@ -1802,7 +1812,7 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_LEASE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
-                    PruneOutcome::Pruned { slot } => {
+                    PruneOutcome::Pruned { slot, .. } => {
                         debug!(slot, "Pruned queue storage lease segment");
                     }
                     PruneOutcome::Blocked { slot } => {
@@ -1870,7 +1880,7 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_CLAIM, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
-                    PruneOutcome::Pruned { slot } => {
+                    PruneOutcome::Pruned { slot, .. } => {
                         debug!(slot, "Pruned queue storage claim segment");
                     }
                     PruneOutcome::Blocked { slot } => {
@@ -3231,7 +3241,13 @@ mod tests {
         assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((4, 2)));
 
         // Recovery: Pruned clears everything.
-        tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Pruned { slot: 0 });
+        tracker.record_outcome(
+            PRUNE_BRANCH_LEASE,
+            &PruneOutcome::Pruned {
+                slot: 0,
+                carried_failed_rows: 0,
+            },
+        );
         assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((0, 0)));
         assert!(!tracker.should_skip(PRUNE_BRANCH_LEASE));
     }

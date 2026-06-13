@@ -95,6 +95,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyHealthCheck>()?;
     m.add_class::<job::PyCallbackToken>()?;
     m.add_class::<client::PyResolveResult>()?;
+    m.add_class::<client::PyRetryFailedResult>()?;
     m.add_class::<dlq::PyDlqEntry>()?;
     m.add_class::<partitioned_queue::PyPartitionedQueue>()?;
 

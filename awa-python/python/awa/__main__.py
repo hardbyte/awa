@@ -337,8 +337,18 @@ async def _dispatch_job(client: "awa.AsyncClient", args: argparse.Namespace) -> 
         await client.cancel(args.id)
         print(f"Cancelled job {args.id}")
     elif jc == "retry-failed":
-        jobs = await client.retry_failed(kind=args.kind, queue=args.queue)
-        print(f"Retried {len(jobs)} failed jobs")
+        outcome = await client.retry_failed(kind=args.kind, queue=args.queue)
+        retried = len(outcome.jobs)
+        message = f"Retried {retried} failed jobs"
+        if outcome.matched != retried:
+            dropped = max(0, outcome.matched - retried)
+            message += f" (matched {outcome.matched}; {dropped} raced or pruned)"
+        if outcome.pruned_failed_count is not None and outcome.pruned_failed_count > 0:
+            message += (
+                f"; {outcome.pruned_failed_count} failed rows have been pruned "
+                "past retention and are no longer retryable"
+            )
+        print(message)
     elif jc == "discard":
         count = await client.discard_failed(args.kind)
         print(f"Discarded {count} failed jobs of kind '{args.kind}'")

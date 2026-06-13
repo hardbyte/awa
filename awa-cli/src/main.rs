@@ -690,18 +690,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     JobCommands::RetryFailed { kind, queue } => {
-                        let count = if let Some(kind) = kind {
-                            let jobs = awa_model::admin::retry_failed_by_kind(&pool, &kind).await?;
-                            jobs.len()
+                        let outcome = if let Some(kind) = kind {
+                            awa_model::admin::retry_failed_by_kind(&pool, &kind).await?
                         } else if let Some(queue) = queue {
-                            let jobs =
-                                awa_model::admin::retry_failed_by_queue(&pool, &queue).await?;
-                            jobs.len()
+                            awa_model::admin::retry_failed_by_queue(&pool, &queue).await?
                         } else {
                             eprintln!("Must specify --kind or --queue");
                             std::process::exit(1);
                         };
-                        println!("Retried {count} failed jobs");
+                        let retried = outcome.retried.len() as u64;
+                        let mut message = format!("Retried {retried} failed jobs");
+                        if outcome.matched != retried {
+                            let dropped = outcome.matched.saturating_sub(retried);
+                            message.push_str(&format!(
+                                " (matched {}; {dropped} raced or pruned)",
+                                outcome.matched
+                            ));
+                        }
+                        if let Some(pruned) = outcome.pruned_failed_count {
+                            if pruned > 0 {
+                                message.push_str(&format!(
+                                    "; {pruned} failed rows have been pruned past retention \
+                                     and are no longer retryable"
+                                ));
+                            }
+                        }
+                        println!("{message}");
                     }
 
                     JobCommands::Discard { kind } => {

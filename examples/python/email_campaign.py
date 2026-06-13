@@ -125,7 +125,7 @@ async def main():
 
     if fail_count > 0:
         retried = await client.retry_failed(queue="email")
-        print(f"Retrying {len(retried)} failed emails...")
+        print(f"Retrying {len(retried.jobs)} failed emails...")
         await asyncio.sleep(5)
 
     print(f"Final: {sent_count} total sent")
