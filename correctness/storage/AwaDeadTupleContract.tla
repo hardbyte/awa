@@ -241,7 +241,7 @@ CloseReceiptTx == <<
     Mut("Insert", "lease_claim_closures")
 >>
 
-\* rescue_stale_receipt_claims_tx — queue_storage.rs:6672
+\* rescue_stale_receipt_claims_tx — queue_storage.rs:8195
 \* Scans from the per-slot claim_ring_slots rescue cursor, anti-joins
 \* lease_claims against closures + leases, closes stragglers by appending
 \* to lease_claim_closures, then advances the tiny control-plane cursor
@@ -259,7 +259,7 @@ EnsureRunningTx == <<
     Mut("Update", "lease_claims")
 >>
 
-\* cancel_job_tx receipt-only branch — queue_storage.rs:5621
+\* cancel_job_tx receipt-only branch — queue_storage.rs:6568
 \* Closes the receipt with a `cancelled` outcome, inserts a done row,
 \* defensively deletes any orphan lease.
 CancelReceiptOnlyTx == <<
@@ -297,14 +297,14 @@ DeleteReadyCompatTx == <<
     Mut("Insert", "ready_tombstones")
 >>
 
-\* fail_to_dlq / fail_terminal — queue_storage.rs:8055, 8088
+\* fail_to_dlq / fail_terminal — queue_storage.rs:10010, 10055
 FailToDlqTx == <<
     Mut("Delete", "leases"),
     Mut("Delete", "attempt_state"),
     Mut("Insert", "dlq_entries")
 >>
 
-\* retry_after / snooze — queue_storage.rs:7945, 7981
+\* retry_after / snooze — queue_storage.rs:9876, 9926
 RetryToDeferredTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "deferred_jobs")

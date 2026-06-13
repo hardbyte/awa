@@ -236,7 +236,7 @@ CloseReceiptPlan(claimSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
-\* rescue_stale_receipt_claims_tx (queue_storage.rs:6672)
+\* rescue_stale_receipt_claims_tx (queue_storage.rs:8195)
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
 \*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)
@@ -259,7 +259,7 @@ EnsureRunningPlan(claimSlot, leaseSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
-\* cancel_job_tx receipt-only branch (queue_storage.rs:5621)
+\* cancel_job_tx receipt-only branch (queue_storage.rs:6568)
 \*   SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED
 \*   insert_done_rows_tx → INSERT INTO done_entries
 \*   INSERT INTO lease_claim_closures

@@ -329,11 +329,10 @@ impl MaintenanceBranchTracker {
 /// Per-segment exponential backoff for the prune step of the queue /
 /// lease / claim ring-rotation branches. The rotate step is always
 /// cheap (cursor advance under an advisory lock); the prune step is
-/// what hurts under pinned MVCC: every tick attempts `LOCK TABLE
-/// <child> IN ACCESS EXCLUSIVE MODE` (with a 50ms timeout) followed by
-/// `SELECT count(*) FROM <child>`. Under a pinned snapshot the child
-/// can't be reclaimed, so the count walks dead tuples and the prune
-/// returns `SkippedActive` — every tick. This tracker skips
+/// what hurts under pinned MVCC: every tick attempts a best-effort child
+/// `ACCESS EXCLUSIVE NOWAIT` lock followed by a bounded liveness check.
+/// Under a pinned snapshot the child can't be reclaimed, so prune
+/// returns `SkippedActive` or `Blocked` repeatedly. This tracker skips
 /// the next 2^level ticks (capped at 32) after a `SkippedActive` or
 /// `Blocked` outcome, doubling on each repeat. A successful `Pruned`
 /// resets to no backoff. `Noop` (ring empty / nothing to consider)
