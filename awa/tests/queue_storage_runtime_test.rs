@@ -2118,7 +2118,7 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
         .await
         .expect("prune_oldest_leases");
     assert!(
-        matches!(prune, PruneOutcome::Pruned { slot: 0 }),
+        matches!(prune, PruneOutcome::Pruned { slot: 0, .. }),
         "lease prune should truncate empty lease slot 0, got {prune:?}"
     );
 
