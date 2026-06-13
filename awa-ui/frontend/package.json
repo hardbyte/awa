@@ -26,12 +26,12 @@
     "@tailwindcss/vite": "^4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "@vitejs/plugin-react": "^4",
+    "@vitejs/plugin-react": "^6",
     "tailwindcss": "^4",
     "tailwindcss-react-aria-components": "^2",
     "tw-animate-css": "^1",
     "typescript": "^5.7",
-    "vite": "^6",
+    "vite": "^8",
     "vitest": "^4.1.0"
   }
 }
