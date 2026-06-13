@@ -6269,6 +6269,53 @@ async fn test_queue_storage_retry_failed_outcome_surfaces_pruned_rows() {
     assert_eq!(outcome.pruned_failed_count, None);
 }
 
+/// Bulk retry callers can pass duplicate ids (or receive duplicate ids
+/// from defensive scans). Queue storage must attempt each job once so
+/// `matched` reports unique jobs, not input cardinality.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_retry_jobs_by_ids_dedupes_duplicate_ids() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_retry_jobs_dedupe";
+    let schema = "awa_qs_retry_jobs_dedupe";
+    let store = create_store(&pool, schema).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim dedupe job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    store
+        .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("fail dedupe job")
+        .expect("running job should fail");
+
+    let (retried, matched) = store
+        .retry_jobs_by_ids(&pool, &[job_id, job_id, job_id])
+        .await
+        .expect("retry duplicate ids");
+
+    assert_eq!(matched, 1, "duplicate ids count as one matched job");
+    assert_eq!(retried.len(), 1, "duplicate ids retry once");
+    assert_eq!(retried[0].id, job_id);
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+    let counts = store.queue_counts(&pool, queue).await.expect("counts");
+    assert_eq!(counts.available, 1);
+    assert_eq!(counts.terminal, 0);
+}
+
 /// #337: a mix of completed and failed terminal rows under a generous
 /// retention floor. The completed rows fold into `pruned_completed_count`;
 /// the failed rows (including a NARROW ready-backed one) are carried into

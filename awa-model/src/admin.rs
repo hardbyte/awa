@@ -650,8 +650,8 @@ pub async fn cancel_by_unique_key(
 pub struct RetryFailedOutcome {
     /// Jobs actually transitioned back to runnable state.
     pub retried: Vec<JobRow>,
-    /// Failed rows matched by the scan that selected retry candidates.
-    /// `matched - retried.len()` rows raced to another state or were
+    /// Failed jobs matched by the scan that selected retry candidates.
+    /// `matched - retried.len()` jobs raced to another state or were
     /// pruned between the scan and the retry.
     pub matched: u64,
     /// Cumulative count of failed rows pruned past the retention floor
@@ -671,7 +671,7 @@ pub async fn retry_failed_by_kind(
     if let Some(store) = active_queue_storage(pool).await? {
         let sql = format!(
             r#"
-            SELECT job_id
+            SELECT DISTINCT job_id
             FROM {schema}.done_entries
             WHERE kind = $1
               AND state = 'failed'
@@ -716,7 +716,7 @@ pub async fn retry_failed_by_queue(
     if let Some(store) = active_queue_storage(pool).await? {
         let sql = format!(
             r#"
-            SELECT job_id
+            SELECT DISTINCT job_id
             FROM {schema}.done_entries
             WHERE queue = $1
               AND state = 'failed'

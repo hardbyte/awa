@@ -231,8 +231,8 @@ impl PyResolveResult {
 pub struct PyRetryFailedResult {
     /// The jobs that were actually moved back to available.
     jobs: Vec<PyJob>,
-    /// Number of failed jobs matched by the filter before retrying.
-    /// `matched - len(jobs)` ids raced or were pruned past retention.
+    /// Number of unique failed jobs matched by the filter before retrying.
+    /// `matched - len(jobs)` jobs raced or were pruned past retention.
     #[pyo3(get)]
     pub matched: u64,
     /// Cumulative count of failed rows pruned past retention for the queue

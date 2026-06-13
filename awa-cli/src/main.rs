@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
 mod storage_wait;
@@ -239,13 +239,8 @@ enum JobCommands {
     Retry { id: i64 },
     /// Cancel a job
     Cancel { id: i64 },
-    /// Retry all failed jobs by kind
-    RetryFailed {
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(long)]
-        queue: Option<String>,
-    },
+    /// Retry all failed jobs by kind or queue
+    RetryFailed(RetryFailedArgs),
     /// Discard failed jobs by kind
     Discard {
         #[arg(long)]
@@ -451,6 +446,15 @@ enum QueueCommands {
     Drain { queue: String },
     /// Show queue statistics
     Stats,
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct RetryFailedArgs {
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long)]
+    queue: Option<String>,
 }
 
 #[tokio::main]
@@ -689,14 +693,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("Cancelled job {id}");
                     }
 
-                    JobCommands::RetryFailed { kind, queue } => {
+                    JobCommands::RetryFailed(RetryFailedArgs { kind, queue }) => {
                         let outcome = if let Some(kind) = kind {
                             awa_model::admin::retry_failed_by_kind(&pool, &kind).await?
                         } else if let Some(queue) = queue {
                             awa_model::admin::retry_failed_by_queue(&pool, &queue).await?
                         } else {
-                            eprintln!("Must specify --kind or --queue");
-                            std::process::exit(1);
+                            unreachable!("clap requires exactly one retry-failed filter")
                         };
                         let retried = outcome.retried.len() as u64;
                         let mut message = format!("Retried {retried} failed jobs");
@@ -1227,4 +1230,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn job_retry_failed_requires_exactly_one_filter() {
+        assert!(
+            Cli::try_parse_from(["awa", "job", "retry-failed", "--kind", "email"]).is_ok(),
+            "--kind alone should be accepted"
+        );
+        assert!(
+            Cli::try_parse_from(["awa", "job", "retry-failed", "--queue", "critical"]).is_ok(),
+            "--queue alone should be accepted"
+        );
+        assert!(
+            Cli::try_parse_from(["awa", "job", "retry-failed"]).is_err(),
+            "retry-failed must require a filter"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "awa",
+                "job",
+                "retry-failed",
+                "--kind",
+                "email",
+                "--queue",
+                "critical",
+            ])
+            .is_err(),
+            "retry-failed must reject ambiguous filters"
+        );
+    }
 }

@@ -311,7 +311,7 @@ class AsyncClient:
         """Retry all failed jobs matching the filter.
 
         Returns a :class:`RetryFailedResult` with ``jobs`` (the rows moved
-        back to available), ``matched`` (failed rows the filter scanned;
+        back to available), ``matched`` (unique failed jobs the filter scanned;
         ``matched - len(jobs)`` raced or were pruned past retention), and
         ``pruned_failed_count`` (cumulative failed rows pruned past retention
         for the queue, or ``None`` when filtering by kind).
@@ -1126,7 +1126,7 @@ class Client:
         """Retry all failed jobs matching the filter.
 
         Returns a :class:`RetryFailedResult` with ``jobs`` (the rows moved
-        back to available), ``matched`` (failed rows the filter scanned;
+        back to available), ``matched`` (unique failed jobs the filter scanned;
         ``matched - len(jobs)`` raced or were pruned past retention), and
         ``pruned_failed_count`` (cumulative failed rows pruned past retention
         for the queue, or ``None`` when filtering by kind).

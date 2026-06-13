@@ -197,6 +197,22 @@ def test_job_retry_failed_requires_filter():
     assert "--kind" in result.stderr and "--queue" in result.stderr
 
 
+def test_job_retry_failed_rejects_ambiguous_filter_before_db():
+    result = _cli(
+        "--database-url",
+        "postgres://127.0.0.1:1/nonexistent",
+        "job",
+        "retry-failed",
+        "--kind",
+        "email",
+        "--queue",
+        "critical",
+    )
+    assert result.returncode == 1
+    assert "exactly one" in result.stderr
+    assert "--kind" in result.stderr and "--queue" in result.stderr
+
+
 @pytest.mark.asyncio
 async def test_job_retry_failed_renders_outcome(capsys):
     class FakeClient:

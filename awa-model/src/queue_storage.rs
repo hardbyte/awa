@@ -6460,30 +6460,32 @@ impl QueueStorage {
         Ok(row)
     }
 
-    /// Retry jobs by id inside a single transaction. Returns the
-    /// retried rows together with the number of ids attempted: ids
-    /// whose terminal row raced to another state or was pruned between
-    /// the caller's scan and this call are skipped, so
-    /// `attempted - retried.len()` is the count of ids that were
+    /// Retry jobs by id inside a single transaction. Duplicate ids are
+    /// collapsed so each job is attempted at most once. Returns the
+    /// retried rows together with the number of unique ids attempted:
+    /// ids whose terminal row raced to another state or was pruned
+    /// between the caller's scan and this call are skipped, so
+    /// `attempted - retried.len()` is the count of unique ids that were
     /// requested but not retried.
     pub async fn retry_jobs_by_ids(
         &self,
         pool: &PgPool,
         ids: &[i64],
     ) -> Result<(Vec<JobRow>, u64), AwaError> {
-        if ids.is_empty() {
+        let unique_ids: BTreeSet<i64> = ids.iter().copied().collect();
+        if unique_ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let mut rows = Vec::with_capacity(ids.len());
-        for job_id in ids {
+        let mut rows = Vec::with_capacity(unique_ids.len());
+        for job_id in &unique_ids {
             if let Some(row) = self.retry_job_tx(&mut tx, *job_id).await? {
                 rows.push(row);
             }
         }
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok((rows, ids.len() as u64))
+        Ok((rows, unique_ids.len() as u64))
     }
 
     /// Write a `<outcome>` closure row for any matching open receipt.

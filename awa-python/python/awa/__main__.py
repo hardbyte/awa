@@ -167,8 +167,8 @@ def main() -> None:
     # client. Doing this inside the async dispatch would mean a bad flag
     # still tries to connect and then times out — unfriendly for scripts.
     if args.command == "job" and args.job_cmd == "retry-failed":
-        if not args.kind and not args.queue:
-            print("Must specify --kind or --queue", file=sys.stderr)
+        if bool(args.kind) == bool(args.queue):
+            print("Specify exactly one of --kind or --queue", file=sys.stderr)
             sys.exit(1)
     if args.command == "dlq" and args.dlq_cmd in {"retry-all", "purge"}:
         has_filter = args.kind or args.queue or args.tag

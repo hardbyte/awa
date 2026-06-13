@@ -56,7 +56,7 @@ awa --database-url $DATABASE_URL serve
 | `job dump-run <id> [--attempt N]` | Pretty-print one attempt run |
 | `job retry <id>` | Retry a failed or cancelled job |
 | `job cancel <id>` | Cancel a job |
-| `job retry-failed --kind K` | Retry every failed job of a given kind |
+| `job retry-failed (--kind K \| --queue Q)` | Retry every failed job matching exactly one filter |
 | `job discard --kind K` | Delete every failed job of a given kind |
 | `queue stats` | Per-queue depth, lag, and throughput |
 | `queue pause / resume / drain <queue>` | Queue admin |
