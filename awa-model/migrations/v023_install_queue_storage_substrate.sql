@@ -283,21 +283,21 @@ BEGIN
     EXECUTE format(
         $ddl$
         COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_claimed_at IS
-            'Receipt-rescue cursor: claimed_at component of the last claim in this slot that maintenance proved closed, lease-managed, or rescued.'
+            'Receipt-rescue sweep cursor: claimed_at component of the last claim visited in this slot; stale unclosed claims stop advancement until rescue closes them, and fresh claims are revisited after wrap.'
         $ddl$,
         p_schema
     );
     EXECUTE format(
         $ddl$
         COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_job_id IS
-            'Receipt-rescue cursor tie-breaker: job_id component of the last claim in this slot that maintenance proved safe to skip.'
+            'Receipt-rescue sweep cursor tie-breaker: job_id component of the last claim visited in this slot.'
         $ddl$,
         p_schema
     );
     EXECUTE format(
         $ddl$
         COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_run_lease IS
-            'Receipt-rescue cursor tie-breaker: run_lease component of the last claim in this slot that maintenance proved safe to skip.'
+            'Receipt-rescue sweep cursor tie-breaker: run_lease component of the last claim visited in this slot.'
         $ddl$,
         p_schema
     );

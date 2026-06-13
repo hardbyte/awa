@@ -229,7 +229,7 @@ CompletePlan(claimSlot, readySlot) ==
     << Step(ClosureChildResource(claimSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared) >>
 
-\* close_receipt_tx (queue_storage.rs:5450, called from cancel_job_tx)
+\* close_receipt_tx (queue_storage.rs:6517, called from cancel_job_tx)
 \*   WITH locked_claim AS (SELECT ... FROM lease_claims FOR UPDATE)
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
 CloseReceiptPlan(claimSlot) ==
@@ -251,7 +251,7 @@ RescueReceiptsPlan(claimSlot) ==
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
-\* ensure_running_leases_from_receipts_tx (queue_storage.rs:6102)
+\* ensure_running_leases_from_receipts_tx (queue_storage.rs:7574)
 \*   CTE claim_refs: SELECT ... FROM lease_claims FOR UPDATE OF claims
 \*   INSERT INTO leases ...
 \*   UPDATE lease_claims SET materialized_at = ...

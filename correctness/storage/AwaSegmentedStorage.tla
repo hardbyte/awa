@@ -57,8 +57,10 @@ EXTENDS TLC, Naturals, FiniteSets
 \* The Rust implementation also keeps a per-claim-slot stale-rescue
 \* cursor in claim_ring_slots. This model treats that cursor as an
 \* implementation refinement over claimOpen / claimClosed history rather
-\* than lifecycle state: advancing the cursor is safe only across claims
-\* already closed, lease-managed, or closed by the same rescue step.
+\* than lifecycle state: the cursor is a cyclic bounded sweep position.
+\* Fresh claims may be skipped for this pass and revisited after wrap;
+\* stale open claims stop cursor advancement until a rescue step closes
+\* them.
 \*
 \* Enqueue-shard modelling (ADR-025): `laneState` here represents one
 \* `(queue, priority, enqueue_shard)` triple. The Rust implementation

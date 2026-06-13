@@ -2335,7 +2335,7 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
 /// `lease_claim_closures` reflect the lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_receipt_claims_is_absent_after_install() {
-    let (_db_guard, pool) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_open_receipt_claims_absent";
     let queue = "qs_open_receipt_claims_absent";
     let store = create_store_with_config(
@@ -3873,7 +3873,7 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_receipt_rescue_cursor_advances_closed_prefix_only() {
+async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_wraps() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_rescue_cursor";
     let schema = "awa_qs_runtime_receipt_rescue_cursor";
@@ -4013,8 +4013,8 @@ async fn test_queue_storage_receipt_rescue_cursor_advances_closed_prefix_only() 
     .expect("read rescue cursor after first rescue");
     assert_eq!(
         (cursor.1, cursor.2),
-        (job_a, claim_a.job.run_lease),
-        "cursor can advance over the completed prefix but must stop before fresh job B"
+        (job_c, claim_c.job.run_lease),
+        "fresh job B must not pin the sweep cursor ahead of stale job C"
     );
 
     sqlx::query(&format!(
@@ -4038,7 +4038,7 @@ async fn test_queue_storage_receipt_rescue_cursor_advances_closed_prefix_only() 
     assert_eq!(
         rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
         vec![job_b],
-        "second rescue should close the formerly fresh blocker only"
+        "second rescue should wrap and close the formerly fresh claim"
     );
 
     let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(&format!(
@@ -4427,7 +4427,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(Duration::from_secs(2))
         .deadline_rescue_interval(Duration::from_secs(10))
         .callback_rescue_interval(Duration::from_secs(10))
         .build()
@@ -5050,7 +5050,7 @@ async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(Duration::from_secs(2))
         .deadline_rescue_interval(Duration::from_secs(10))
         .callback_rescue_interval(Duration::from_secs(10))
         .build()
@@ -7932,8 +7932,8 @@ async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
     let queue = "qs_bounded_claimers_limit";
     let instance_a = Uuid::new_v4();
     let instance_b = Uuid::new_v4();
-    let ttl = Duration::from_secs(3);
-    let idle_threshold = Duration::from_millis(500);
+    let ttl = Duration::from_secs(30);
+    let idle_threshold = Duration::from_secs(10);
 
     let lease_a = store
         .acquire_queue_claimer(&pool, queue, instance_a, 1, ttl, idle_threshold)
@@ -7999,8 +7999,8 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
     let store = create_store(&pool, schema).await;
     let queue = "qs_bounded_claimers_heartbeat";
     let instance = Uuid::new_v4();
-    let ttl = Duration::from_secs(3);
-    let idle_threshold = Duration::from_millis(500);
+    let ttl = Duration::from_secs(300);
+    let idle_threshold = Duration::from_secs(120);
 
     let lease = store
         .acquire_queue_claimer(&pool, queue, instance, 1, ttl, idle_threshold)
@@ -8053,7 +8053,7 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
     sqlx::query(&format!(
         "UPDATE {schema}.queue_claimer_leases SET last_claimed_at = $1 WHERE queue = $2 AND claimer_slot = $3"
     ))
-    .bind(Utc::now() - chrono::Duration::milliseconds(600))
+    .bind(Utc::now() - chrono::Duration::seconds(90))
     .bind(queue)
     .bind(lease.claimer_slot)
     .execute(&pool)

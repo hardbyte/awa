@@ -65,7 +65,7 @@ Every read that currently targets `open_receipt_claims` becomes a bounded read o
 - "Scan stale receipt claims for rescue." — per-slot cursor scan ordered by `(claimed_at, job_id, run_lease)`, anti-join closures and materialized leases, and close stale candidates by appending rescue closures.
 - "Count in-flight receipt-backed attempts." — count active-partition rows minus matching closure rows.
 
-The rescue cursor advances only across a prefix of claims that maintenance has proved closed, materialized into the lease plane, or closed by that rescue transaction. A fresh open receipt can block cursor advancement, but the bounded scan window can still rescue stale receipts that appear later in the same slot. This keeps liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune.
+The rescue cursor is a bounded cyclic sweep cursor. Each pass scans forward from the cursor and wraps to the start of the partition when it reaches the end. Maintenance can advance over closed claims, materialized lease-plane claims, fresh claims, and claims it closes in the current rescue transaction; it stops before a stale open claim that it did not close. This keeps liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune, without letting one healthy long-running receipt pin all later stale receipts behind it.
 
 ### Rotation and prune
 
@@ -154,7 +154,7 @@ This ADR has been implemented for 0.6:
 
 - `lease_claims` and `lease_claim_closures` are partitioned by `claim_slot`.
 - `claim_ring_state` and `claim_ring_slots` control rotation and prune.
-- `claim_ring_slots` stores stale-rescue cursors so maintenance skips closed receipt history without reintroducing a per-claim mutable frontier.
+- `claim_ring_slots` stores per-slot stale-rescue sweep cursors so maintenance walks receipt history in bounded cyclic windows without reintroducing a per-claim mutable frontier. The sweep can pass fresh claims and revisit them after wrap; stale open claims stop advancement until rescue closes them.
 - `open_receipt_claims` is removed from fresh installs and is no longer a hot path table.
 - `lease_claim_receipts` defaults to `true`.
 - Receipts mode supports per-claim deadlines. The claim path writes `deadline_at` onto the `lease_claims` row when `QueueConfig.deadline_duration > 0`, and a sibling rescue scan (`rescue_expired_receipt_deadlines_tx`) force-closes claims whose `deadline_at` has passed without a closure or materialized lease, writing a `'deadline_expired'` closure. The maintenance entry point (`rescue_expired_deadlines`) merges the lease-side and receipt-side scans into one batch per tick, so receipts mode and the existing hard-deadline behaviour compose without operator intervention.

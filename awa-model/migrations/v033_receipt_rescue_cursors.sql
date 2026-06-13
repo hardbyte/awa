@@ -1,4 +1,4 @@
--- Add per-claim-slot receipt-rescue cursors to installed queue-storage
+-- Add per-claim-slot receipt-rescue sweep cursors to installed queue-storage
 -- substrates. The helper body lives in v023 and is refreshed before this
 -- migration runs; this sweep applies the additive columns and rescue index to
 -- every substrate that already exists.

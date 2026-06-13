@@ -235,23 +235,25 @@ CompleteLegacyTx == <<
     Mut("Delete", "attempt_state")
 >>
 
-\* close_receipt_tx — queue_storage.rs:5450
+\* close_receipt_tx — queue_storage.rs:6517
 \* Used by cancel_job_tx and the rescue path.
 CloseReceiptTx == <<
     Mut("Insert", "lease_claim_closures")
 >>
 
 \* rescue_stale_receipt_claims_tx — queue_storage.rs:8195
-\* Scans from the per-slot claim_ring_slots rescue cursor, anti-joins
-\* lease_claims against closures + leases, closes stragglers by appending
-\* to lease_claim_closures, then advances the tiny control-plane cursor
-\* over the proved-safe prefix.
+\* Sweeps from the per-slot claim_ring_slots rescue cursor, anti-joins
+\* lease_claims against closures + leases, closes stale stragglers by
+\* appending to lease_claim_closures, then advances the tiny
+\* control-plane cursor across closed, lease-managed, fresh, or newly
+\* rescued rows. Stale open rows not closed by the transaction stop the
+\* cursor until a later pass.
 RescueReceiptsTx == <<
     Mut("Insert", "lease_claim_closures"),
     Mut("Update", "claim_ring_slots")
 >>
 
-\* ensure_running_leases_from_receipts_tx — queue_storage.rs:6102
+\* ensure_running_leases_from_receipts_tx — queue_storage.rs:7574
 \* Materialize a receipt into a real lease row. INSERTs the lease,
 \* UPDATEs the claim's materialized_at column.
 EnsureRunningTx == <<
@@ -297,14 +299,14 @@ DeleteReadyCompatTx == <<
     Mut("Insert", "ready_tombstones")
 >>
 
-\* fail_to_dlq / fail_terminal — queue_storage.rs:10010, 10055
+\* fail_to_dlq / fail_terminal — queue_storage.rs:10049, 10094
 FailToDlqTx == <<
     Mut("Delete", "leases"),
     Mut("Delete", "attempt_state"),
     Mut("Insert", "dlq_entries")
 >>
 
-\* retry_after / snooze — queue_storage.rs:9876, 9926
+\* retry_after / snooze — queue_storage.rs:9915, 9965
 RetryToDeferredTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "deferred_jobs")

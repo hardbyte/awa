@@ -42,7 +42,7 @@ What it models:
 - stale completion rejection via per-worker lease snapshots
 - segment rotation and prune safety for ready, tombstone, lease, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
 - unpartitioned backlog row-vacuum handling for `deferred_jobs` and `dlq_entries`
-- receipt-plane append-only receipts and closures matched into the same `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it can skip only a contiguous prefix already proved closed, lease-managed, or closed by the rescue transaction.
+- receipt-plane append-only receipts and closures matched into the same `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction.
 - a second config with two workers to exercise interleavings on the same storage invariants
 
 Heartbeat freshness is tracked at the lease level (not `attempt_state`) to match the Rust implementation. `ParkToWaiting` clears heartbeat freshness while keeping the lease row live; `ResumeWaitingToRunning` restores a running lease on the same `run_lease`.

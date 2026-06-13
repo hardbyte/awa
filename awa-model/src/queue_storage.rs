@@ -8236,53 +8236,91 @@ impl QueueStorage {
                 WHERE slot = $1
                 FOR UPDATE
             ),
+            after_cursor AS MATERIALIZED (
+                SELECT
+                    claims.claim_slot,
+                    claims.job_id,
+                    claims.run_lease,
+                    row_number() OVER (
+                        ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
+                    ) AS rn
+                FROM {claim_child} AS claims
+                CROSS JOIN cursor_row
+                WHERE claims.claim_slot = $1
+                  AND (claims.claimed_at, claims.job_id, claims.run_lease)
+                      > (
+                          cursor_row.rescue_cursor_claimed_at,
+                          cursor_row.rescue_cursor_job_id,
+                          cursor_row.rescue_cursor_run_lease
+                        )
+                ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
+                LIMIT $3
+            ),
+            after_count AS (
+                SELECT count(*)::bigint AS count FROM after_cursor
+            ),
+            before_cursor AS MATERIALIZED (
+                SELECT
+                    claims.claim_slot,
+                    claims.job_id,
+                    claims.run_lease,
+                    after_count.count + row_number() OVER (
+                        ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
+                    ) AS rn
+                FROM {claim_child} AS claims
+                CROSS JOIN cursor_row
+                CROSS JOIN after_count
+                WHERE after_count.count < $3
+                  AND claims.claim_slot = $1
+                  AND (claims.claimed_at, claims.job_id, claims.run_lease)
+                      <= (
+                          cursor_row.rescue_cursor_claimed_at,
+                          cursor_row.rescue_cursor_job_id,
+                          cursor_row.rescue_cursor_run_lease
+                        )
+                ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
+                LIMIT (SELECT GREATEST($3 - count, 0) FROM after_count)
+            ),
+            candidate_keys AS MATERIALIZED (
+                SELECT claim_slot, job_id, run_lease, rn FROM after_cursor
+                UNION ALL
+                SELECT claim_slot, job_id, run_lease, rn FROM before_cursor
+            ),
             candidates AS MATERIALIZED (
                 SELECT
-                    ordered.*,
-                    row_number() OVER (
-                        ORDER BY ordered.claimed_at, ordered.job_id, ordered.run_lease
-                    ) AS rn
-                FROM (
-                    SELECT
-                        claims.claim_slot,
-                        claims.ready_slot,
-                        claims.ready_generation,
-                        claims.job_id,
-                        claims.queue,
-                        claims.priority,
-                        claims.attempt,
-                        claims.run_lease,
-                        claims.max_attempts,
-                        claims.lane_seq,
-                        claims.enqueue_shard,
-                        claims.claimed_at,
-                        COALESCE(attempt.heartbeat_at, claims.claimed_at) < $2 AS is_stale,
-                        EXISTS (
-                            SELECT 1 FROM {closure_child} AS closures
-                            WHERE closures.claim_slot = claims.claim_slot
-                              AND closures.job_id = claims.job_id
-                              AND closures.run_lease = claims.run_lease
-                        ) AS is_closed,
-                        EXISTS (
-                            SELECT 1 FROM {schema}.leases AS lease
-                            WHERE lease.job_id = claims.job_id
-                              AND lease.run_lease = claims.run_lease
-                        ) AS is_lease_managed
-                    FROM {claim_child} AS claims
-                    CROSS JOIN cursor_row
-                    LEFT JOIN {schema}.attempt_state AS attempt
-                      ON attempt.job_id = claims.job_id
-                     AND attempt.run_lease = claims.run_lease
-                    WHERE claims.claim_slot = $1
-                      AND (claims.claimed_at, claims.job_id, claims.run_lease)
-                          > (
-                              cursor_row.rescue_cursor_claimed_at,
-                              cursor_row.rescue_cursor_job_id,
-                              cursor_row.rescue_cursor_run_lease
-                            )
-                    ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
-                    LIMIT $3
-                ) AS ordered
+                    claims.claim_slot,
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.job_id,
+                    claims.queue,
+                    claims.priority,
+                    claims.attempt,
+                    claims.run_lease,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.enqueue_shard,
+                    claims.claimed_at,
+                    COALESCE(attempt.heartbeat_at, claims.claimed_at) < $2 AS is_stale,
+                    EXISTS (
+                        SELECT 1 FROM {closure_child} AS closures
+                        WHERE closures.claim_slot = claims.claim_slot
+                          AND closures.job_id = claims.job_id
+                          AND closures.run_lease = claims.run_lease
+                    ) AS is_closed,
+                    EXISTS (
+                        SELECT 1 FROM {schema}.leases AS lease
+                        WHERE lease.job_id = claims.job_id
+                          AND lease.run_lease = claims.run_lease
+                    ) AS is_lease_managed,
+                    candidate_keys.rn
+                FROM candidate_keys
+                JOIN {claim_child} AS claims
+                  ON claims.claim_slot = candidate_keys.claim_slot
+                 AND claims.job_id = candidate_keys.job_id
+                 AND claims.run_lease = candidate_keys.run_lease
+                LEFT JOIN {schema}.attempt_state AS attempt
+                  ON attempt.job_id = claims.job_id
+                 AND attempt.run_lease = claims.run_lease
             ),
             stale_candidates AS (
                 SELECT candidates.*
@@ -8331,6 +8369,7 @@ impl QueueStorage {
                     (
                         candidates.is_closed
                         OR candidates.is_lease_managed
+                        OR NOT candidates.is_stale
                         OR EXISTS (
                             SELECT 1 FROM inserted
                             WHERE inserted.claim_slot = candidates.claim_slot
