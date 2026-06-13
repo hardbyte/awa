@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 31;
+pub const CURRENT_VERSION: i32 = 32;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -139,6 +139,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Backfill failed done-entry metric indexes for queue storage",
         &[V31_UP],
     ),
+    (
+        32,
+        "Add pruned_failed_count to queue_terminal_rollups for the failed terminal retention floor",
+        &[V23_UP, V32_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -171,6 +176,7 @@ const V28_UP: &str = include_str!("../migrations/v028_ready_tombstones.sql");
 const V29_UP: &str = include_str!("../migrations/v029_batch_operations.sql");
 const V30_UP: &str = include_str!("../migrations/v030_terminal_count_deltas.sql");
 const V31_UP: &str = include_str!("../migrations/v031_queue_storage_failed_done_indexes.sql");
+const V32_UP: &str = include_str!("../migrations/v032_failed_terminal_retention.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

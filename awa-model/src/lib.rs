@@ -20,8 +20,9 @@ pub use adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, Prepared
 pub use admin::{
     CallbackConfig, DefaultAction, JobKindDescriptor, JobKindOverview, ListJobsFilter,
     QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
-    QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome, RuntimeInstance,
-    RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket, StorageCapability,
+    QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome,
+    RetryFailedOutcome, RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput,
+    StateTimeseriesBucket, StorageCapability,
 };
 pub use batch_operations::{
     BatchOperation, BatchOperationFilter, BatchOperationKind, BatchOperationPreview,

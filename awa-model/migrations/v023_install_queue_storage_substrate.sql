@@ -717,9 +717,15 @@ BEGIN
             queue                  TEXT NOT NULL,
             priority               SMALLINT NOT NULL,
             pruned_completed_count BIGINT NOT NULL DEFAULT 0,
+            pruned_failed_count    BIGINT NOT NULL DEFAULT 0,
             PRIMARY KEY (queue, priority)
         )
         $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.queue_terminal_rollups ADD COLUMN IF NOT EXISTS pruned_failed_count BIGINT NOT NULL DEFAULT 0',
         p_schema
     );
 

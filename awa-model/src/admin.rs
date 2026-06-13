@@ -644,12 +644,34 @@ pub async fn cancel_by_unique_key(
     }
 }
 
+/// Result of a bulk failed-job retry ([`retry_failed_by_kind`] /
+/// [`retry_failed_by_queue`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryFailedOutcome {
+    /// Jobs actually transitioned back to runnable state.
+    pub retried: Vec<JobRow>,
+    /// Failed jobs matched by the scan that selected retry candidates.
+    /// `matched - retried.len()` jobs raced to another state or were
+    /// pruned between the scan and the retry.
+    pub matched: u64,
+    /// Cumulative count of failed rows pruned past the retention floor
+    /// for the selected queue, summed over
+    /// `queue_terminal_rollups` priorities. These rows can no longer be
+    /// retried. `None` when the count cannot be scoped to the
+    /// selection: kind-based retries (rollups carry no kind dimension)
+    /// and the canonical (non queue-storage) backend.
+    pub pruned_failed_count: Option<u64>,
+}
+
 /// Retry all failed jobs of a given kind.
-pub async fn retry_failed_by_kind(pool: &PgPool, kind: &str) -> Result<Vec<JobRow>, AwaError> {
+pub async fn retry_failed_by_kind(
+    pool: &PgPool,
+    kind: &str,
+) -> Result<RetryFailedOutcome, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         let sql = format!(
             r#"
-            SELECT job_id
+            SELECT DISTINCT job_id
             FROM {schema}.done_entries
             WHERE kind = $1
               AND state = 'failed'
@@ -658,7 +680,12 @@ pub async fn retry_failed_by_kind(pool: &PgPool, kind: &str) -> Result<Vec<JobRo
             schema = store.schema()
         );
         let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(kind).fetch_all(pool).await?;
-        return store.retry_jobs_by_ids(pool, &ids).await;
+        let (retried, matched) = store.retry_jobs_by_ids(pool, &ids).await?;
+        return Ok(RetryFailedOutcome {
+            retried,
+            matched,
+            pruned_failed_count: None,
+        });
     }
 
     let rows = sqlx::query_as::<_, JobRow>(
@@ -674,15 +701,22 @@ pub async fn retry_failed_by_kind(pool: &PgPool, kind: &str) -> Result<Vec<JobRo
     .fetch_all(pool)
     .await?;
 
-    Ok(rows)
+    Ok(RetryFailedOutcome {
+        matched: rows.len() as u64,
+        retried: rows,
+        pruned_failed_count: None,
+    })
 }
 
 /// Retry all failed jobs in a given queue.
-pub async fn retry_failed_by_queue(pool: &PgPool, queue: &str) -> Result<Vec<JobRow>, AwaError> {
+pub async fn retry_failed_by_queue(
+    pool: &PgPool,
+    queue: &str,
+) -> Result<RetryFailedOutcome, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
         let sql = format!(
             r#"
-            SELECT job_id
+            SELECT DISTINCT job_id
             FROM {schema}.done_entries
             WHERE queue = $1
               AND state = 'failed'
@@ -691,7 +725,13 @@ pub async fn retry_failed_by_queue(pool: &PgPool, queue: &str) -> Result<Vec<Job
             schema = store.schema()
         );
         let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(queue).fetch_all(pool).await?;
-        return store.retry_jobs_by_ids(pool, &ids).await;
+        let (retried, matched) = store.retry_jobs_by_ids(pool, &ids).await?;
+        let pruned_failed_count = store.pruned_failed_count_for_queue(pool, queue).await?;
+        return Ok(RetryFailedOutcome {
+            retried,
+            matched,
+            pruned_failed_count: Some(pruned_failed_count),
+        });
     }
 
     let rows = sqlx::query_as::<_, JobRow>(
@@ -707,7 +747,11 @@ pub async fn retry_failed_by_queue(pool: &PgPool, queue: &str) -> Result<Vec<Job
     .fetch_all(pool)
     .await?;
 
-    Ok(rows)
+    Ok(RetryFailedOutcome {
+        matched: rows.len() as u64,
+        retried: rows,
+        pruned_failed_count: None,
+    })
 }
 
 /// Discard (delete) all failed jobs of a given kind.
@@ -2677,7 +2721,8 @@ pub async fn refresh_admin_metadata(pool: &PgPool) -> Result<(), AwaError> {
 /// Retry multiple jobs by ID. Only retries failed, cancelled, or waiting_external jobs.
 pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
-        return store.retry_jobs_by_ids(pool, ids).await;
+        let (rows, _attempted) = store.retry_jobs_by_ids(pool, ids).await?;
+        return Ok(rows);
     }
 
     let rows = sqlx::query_as::<_, JobRow>(

@@ -226,6 +226,53 @@ impl PyResolveResult {
     }
 }
 
+#[pyclass(frozen, name = "RetryFailedResult", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyRetryFailedResult {
+    /// The jobs that were actually moved back to available.
+    jobs: Vec<PyJob>,
+    /// Number of unique failed jobs matched by the filter before retrying.
+    /// `matched - len(jobs)` jobs raced or were pruned past retention.
+    #[pyo3(get)]
+    pub matched: u64,
+    /// Cumulative count of failed rows pruned past retention for the queue
+    /// (no longer retryable). `None` on the by-kind path, which has no
+    /// queue/priority rollup dimension to read.
+    #[pyo3(get)]
+    pub pruned_failed_count: Option<u64>,
+}
+
+#[pymethods]
+impl PyRetryFailedResult {
+    #[getter]
+    fn jobs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let list = pyo3::types::PyList::empty(py);
+        for job in &self.jobs {
+            list.append(Py::new(py, job.clone())?)?;
+        }
+        Ok(list.into_any().unbind())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RetryFailedResult(jobs={}, matched={}, pruned_failed_count={:?})",
+            self.jobs.len(),
+            self.matched,
+            self.pruned_failed_count
+        )
+    }
+}
+
+impl From<awa_model::RetryFailedOutcome> for PyRetryFailedResult {
+    fn from(outcome: awa_model::RetryFailedOutcome) -> Self {
+        Self {
+            jobs: outcome.retried.into_iter().map(PyJob::from).collect(),
+            matched: outcome.matched,
+            pruned_failed_count: outcome.pruned_failed_count,
+        }
+    }
+}
+
 #[pyclass(frozen, name = "QueueHealth", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQueueHealth {
@@ -918,20 +965,14 @@ impl PyClient {
         }
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let jobs = match (kind, queue) {
+            let outcome = match (kind, queue) {
                 (Some(kind), None) => awa_model::admin::retry_failed_by_kind(&pool, &kind).await,
                 (None, Some(queue)) => awa_model::admin::retry_failed_by_queue(&pool, &queue).await,
                 _ => unreachable!(),
             }
             .map_err(map_awa_error)?;
 
-            Python::attach(|py| {
-                let list = pyo3::types::PyList::empty(py);
-                for job in jobs {
-                    list.append(Py::new(py, PyJob::from(job))?)?;
-                }
-                Ok(list.unbind())
-            })
+            Ok(PyRetryFailedResult::from(outcome))
         })
     }
 
@@ -2623,7 +2664,7 @@ impl PyClient {
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
-    ) -> PyResult<Vec<PyJob>> {
+    ) -> PyResult<PyRetryFailedResult> {
         match (&kind, &queue) {
             (Some(_), None) | (None, Some(_)) => {}
             _ => {
@@ -2635,7 +2676,7 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let jobs = match (kind, queue) {
+                let outcome = match (kind, queue) {
                     (Some(kind), None) => {
                         awa_model::admin::retry_failed_by_kind(&pool, &kind).await
                     }
@@ -2645,7 +2686,7 @@ impl PyClient {
                     _ => unreachable!(),
                 }
                 .map_err(map_awa_error)?;
-                Ok(jobs.into_iter().map(PyJob::from).collect())
+                Ok(PyRetryFailedResult::from(outcome))
             })
         })
     }

@@ -552,7 +552,7 @@ async fn maintenance_loop(
                     }
                 }
 
-                match store.prune_oldest(&pool).await {
+                match store.prune_oldest(&pool, Duration::ZERO).await {
                     Ok(PruneOutcome::Noop) => {}
                     Ok(PruneOutcome::Pruned { .. }) => {
                         counters.queue_prune_ok.fetch_add(1, Ordering::Relaxed);
@@ -787,10 +787,10 @@ async fn test_queue_storage_round_trip_smoke() {
         .expect("Failed to rotate smoke queue slot");
     assert!(matches!(rotated_queue, RotateOutcome::Rotated { .. }));
     let pruned_queue = store
-        .prune_oldest(&pool)
+        .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune smoke queue slot");
-    assert!(matches!(pruned_queue, PruneOutcome::Pruned { slot: 0 }));
+    assert!(matches!(pruned_queue, PruneOutcome::Pruned { slot: 0, .. }));
 
     let rotated_leases = store
         .rotate_leases(&pool)
@@ -801,7 +801,10 @@ async fn test_queue_storage_round_trip_smoke() {
         .prune_oldest_leases(&pool)
         .await
         .expect("Failed to prune smoke lease slot");
-    assert!(matches!(pruned_leases, PruneOutcome::Pruned { slot: 0 }));
+    assert!(matches!(
+        pruned_leases,
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
 
     let final_counts = store
         .queue_counts(&pool, "smoke")

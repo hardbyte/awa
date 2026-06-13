@@ -475,14 +475,16 @@ Queue storage is the worker engine in `0.6`: ordinary terminal snapshots (`compl
 
 Ready rows are not deleted for unclaimed cancellation, priority aging, or SQL compatibility deletes through `awa.jobs`. Those paths append to `{schema}.ready_tombstones_*`; claim and exact-count queries anti-join the tombstone ledger, and queue prune truncates it with the matching ready/done segment.
 
-The `completed_retention` and `failed_retention` knobs apply to the canonical compatibility path, not to queue-storage terminal history. In queue storage, use the queue-ring sizing and rotation knobs below to control how much ordinary terminal history remains queryable.
+`failed_retention` is a retention floor for non-DLQ `failed` terminal rows in **both** storage engines: a failed terminal row stays retryable for at least `failed_retention` past the moment it failed. On the canonical compatibility path the floor is enforced by row cleanup leaving recent `failed` rows in place. In queue storage the floor is enforced by carry-forward at prune time: when a queue slot is reclaimed, `failed` rows still inside the floor are widened into self-contained terminal rows and re-inserted into the live segment before the old slot is truncated, so they survive rotation regardless of how fast the ring turns over. Failed rows that have aged past the floor are pruned; their count is recorded in `queue_terminal_rollups.pruned_failed_count` and surfaced as `QueueCounts.pruned_failed`, a cumulative, monotonic count of failed rows no longer retryable. See [ADR-032](adr/032-failed-terminal-retention.md). `cancelled` rows are not held by the floor — cancellation is an explicit decision and cancelled rows are reclaimed with their segment.
+
+`completed_retention` is canonical-only: it bounds how long completed jobs stay queryable on the compatibility path. Queue storage keeps ordinary completed terminal history in the rotating ring and reclaims it by queue-ring prune; use the queue-ring sizing and rotation knobs below to control how much remains queryable.
 
 DLQ rows are different: `dlq_entries` is a separate hold table and the maintenance leader deletes rows older than `dlq_retention` in bounded cleanup passes.
 
 | Knob | Default | What it does |
 | --- | --- | --- |
-| `completed_retention` | `24h` | Canonical compatibility path only: how long completed jobs stay queryable before row cleanup deletes them. Queue storage uses queue-ring prune instead. |
-| `failed_retention` | `72h` | Canonical compatibility path only: same for failed/cancelled jobs excluding DLQ. Queue storage uses queue-ring prune instead. |
+| `completed_retention` | `24h` | Canonical compatibility path only: how long completed jobs stay queryable before row cleanup deletes them. Queue storage reclaims completed history by queue-ring prune instead. |
+| `failed_retention` | `72h` | Both engines: a non-DLQ `failed` terminal row stays retryable for at least this long past failure. Canonical enforces it by leaving recent failed rows in place; queue storage enforces it by carry-forward at prune time. Does not apply to `cancelled` rows or to the DLQ. |
 | `dlq_retention` | `30d` | How long DLQ rows stay in `dlq_entries` before bounded cleanup deletes them. |
 | `descriptor_retention` | `30d` | How long stale queue/kind descriptor catalog rows survive. |
 | `cleanup_interval` | `60s` | How often the cleanup pass runs. |

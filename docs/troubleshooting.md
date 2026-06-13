@@ -344,7 +344,7 @@ Pay particular attention to:
 - move analytical reads to a replica
 - shorten transaction scope in admin or reporting code
 - confirm one maintenance leader is healthy; rotation and prune are leader-owned
-- reduce terminal-row retention if the terminal history is much larger than needed
+- reduce terminal-row retention if the terminal history is much larger than needed; note that `failed_retention` is a floor — non-DLQ `failed` rows stay retryable for at least that long in both engines (queue storage carries in-floor failed rows forward at prune time), and the cumulative count of failed rows aged past the floor is visible as `QueueCounts.pruned_failed`
 - review autovacuum settings if lease churn is expected continuously
 
 If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in `docs/benchmarking.md`. Preventative guidance — reader placement, session timeouts, alerting, and autovacuum capacity flags — lives in [`deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#mvcc-discipline-long-running-readers-pin-the-whole-database).

@@ -167,8 +167,8 @@ def main() -> None:
     # client. Doing this inside the async dispatch would mean a bad flag
     # still tries to connect and then times out — unfriendly for scripts.
     if args.command == "job" and args.job_cmd == "retry-failed":
-        if not args.kind and not args.queue:
-            print("Must specify --kind or --queue", file=sys.stderr)
+        if bool(args.kind) == bool(args.queue):
+            print("Specify exactly one of --kind or --queue", file=sys.stderr)
             sys.exit(1)
     if args.command == "dlq" and args.dlq_cmd in {"retry-all", "purge"}:
         has_filter = args.kind or args.queue or args.tag
@@ -337,8 +337,18 @@ async def _dispatch_job(client: "awa.AsyncClient", args: argparse.Namespace) -> 
         await client.cancel(args.id)
         print(f"Cancelled job {args.id}")
     elif jc == "retry-failed":
-        jobs = await client.retry_failed(kind=args.kind, queue=args.queue)
-        print(f"Retried {len(jobs)} failed jobs")
+        outcome = await client.retry_failed(kind=args.kind, queue=args.queue)
+        retried = len(outcome.jobs)
+        message = f"Retried {retried} failed jobs"
+        if outcome.matched != retried:
+            dropped = max(0, outcome.matched - retried)
+            message += f" (matched {outcome.matched}; {dropped} raced or pruned)"
+        if outcome.pruned_failed_count is not None and outcome.pruned_failed_count > 0:
+            message += (
+                f"; {outcome.pruned_failed_count} failed rows have been pruned "
+                "past retention and are no longer retryable"
+            )
+        print(message)
     elif jc == "discard":
         count = await client.discard_failed(args.kind)
         print(f"Discarded {count} failed jobs of kind '{args.kind}'")

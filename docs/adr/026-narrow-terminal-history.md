@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted. The "Queue-prune logic must continue treating ready and terminal rows as one retention unit" consequence below is **amended by [ADR-032: Failed terminal retention floor](032-failed-terminal-retention.md)** for `failed` terminal rows inside the `failed_retention` floor: queue prune carries those rows forward into the live segment as wide self-contained terminal rows (the synthetic shape this ADR already defines for unclaimed/scheduled cancellation), decoupling them from the retained ready body so they stay retryable past their original segment. Ordinary terminal history is still one retention unit.
 
 ## Context
 
@@ -85,7 +85,7 @@ Correctness requirements for the delta ledger:
 
 - Direct SQL against `done_entries.args`, `max_attempts`, `run_at`, `created_at`, `unique_key`, `unique_states`, or `payload` must tolerate `NULL` on ready-backed terminal rows. Use `{schema}.terminal_jobs` unless code intentionally needs the physical storage representation.
 - Terminal delete paths have one more responsibility: append the matching negative terminal-count delta before re-enqueuing, moving to DLQ, or discarding.
-- Queue-prune logic must continue treating ready and terminal rows as one retention unit.
+- Queue-prune logic must continue treating ready and terminal rows as one retention unit. ([ADR-032](032-failed-terminal-retention.md) amends this for `failed` rows inside the `failed_retention` floor, which prune carries forward as wide self-contained terminal rows.)
 - Exact terminal-count reads must include both folded counters and pending deltas. Operational SQL that reads only `queue_terminal_live_counts` sees folded state, not the full exact count.
 - Pending delta rows can accumulate while long reader transactions pin the MVCC horizon. That is intentional: it trades a larger append-only ledger for near-zero dead tuples in `queue_terminal_live_counts` during the pin.
 

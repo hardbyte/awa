@@ -213,6 +213,12 @@ pub struct QueueCounts {
     /// included failed and cancelled terminals; renamed in #290 along
     /// with the counter-backed read path.
     pub terminal: i64,
+    /// Cumulative count of `failed` terminal rows pruned past the
+    /// failed-retention floor, summed from
+    /// `queue_terminal_rollups.pruned_failed_count`. These rows no
+    /// longer exist in `done_entries` and cannot be retried.
+    /// Monotonically non-decreasing — rollups never shrink.
+    pub pruned_failed: i64,
 }
 
 /// Cheap available-only signal used by the dispatcher's claimer-sizing
@@ -273,6 +279,11 @@ pub enum PruneOutcome {
     Noop,
     Pruned {
         slot: i32,
+        /// Failed terminal rows inside the failed-retention floor that
+        /// the queue prune re-homed into the live `done_entries`
+        /// segment instead of dropping. Always zero for the lease and
+        /// claim rings.
+        carried_failed_rows: u64,
     },
     /// Lock acquisition timed out (held-tx, lock contention).
     Blocked {
@@ -4240,14 +4251,16 @@ impl QueueStorage {
         deltas: I,
     ) -> Result<(), AwaError>
     where
-        I: IntoIterator<Item = (String, i16, i64)>,
+        I: IntoIterator<Item = (String, i16, i64, i64)>,
     {
-        let mut grouped: BTreeMap<(String, i16), i64> = BTreeMap::new();
-        for (queue, priority, pruned_completed_delta) in deltas {
-            if pruned_completed_delta == 0 {
+        let mut grouped: BTreeMap<(String, i16), (i64, i64)> = BTreeMap::new();
+        for (queue, priority, pruned_completed_delta, pruned_failed_delta) in deltas {
+            if pruned_completed_delta == 0 && pruned_failed_delta == 0 {
                 continue;
             }
-            *grouped.entry((queue, priority)).or_insert(0_i64) += pruned_completed_delta;
+            let entry = grouped.entry((queue, priority)).or_insert((0_i64, 0_i64));
+            entry.0 += pruned_completed_delta;
+            entry.1 += pruned_failed_delta;
         }
 
         if grouped.is_empty() {
@@ -4258,43 +4271,53 @@ impl QueueStorage {
         let mut queues = Vec::with_capacity(grouped.len());
         let mut priorities = Vec::with_capacity(grouped.len());
         let mut pruned_completed_deltas = Vec::with_capacity(grouped.len());
+        let mut pruned_failed_deltas = Vec::with_capacity(grouped.len());
 
-        for ((queue, priority), pruned_completed_delta) in grouped {
+        for ((queue, priority), (pruned_completed_delta, pruned_failed_delta)) in grouped {
             queues.push(queue);
             priorities.push(priority);
             pruned_completed_deltas.push(pruned_completed_delta);
+            pruned_failed_deltas.push(pruned_failed_delta);
         }
 
         sqlx::query(&format!(
             r#"
-            WITH deltas(queue, priority, pruned_completed_delta) AS (
+            WITH deltas(queue, priority, pruned_completed_delta, pruned_failed_delta) AS (
                 SELECT *
                 FROM unnest(
                     $1::text[],
                     $2::smallint[],
-                    $3::bigint[]
+                    $3::bigint[],
+                    $4::bigint[]
                 )
             )
             INSERT INTO {schema}.queue_terminal_rollups AS rollups (
                 queue,
                 priority,
-                pruned_completed_count
+                pruned_completed_count,
+                pruned_failed_count
             )
             SELECT
                 deltas.queue,
                 deltas.priority,
-                deltas.pruned_completed_delta
+                deltas.pruned_completed_delta,
+                deltas.pruned_failed_delta
             FROM deltas
             ON CONFLICT (queue, priority) DO UPDATE
             SET pruned_completed_count = GREATEST(
-                0,
-                rollups.pruned_completed_count + EXCLUDED.pruned_completed_count
-            )
+                    0,
+                    rollups.pruned_completed_count + EXCLUDED.pruned_completed_count
+                ),
+                pruned_failed_count = GREATEST(
+                    0,
+                    rollups.pruned_failed_count + EXCLUDED.pruned_failed_count
+                )
             "#
         ))
         .bind(&queues)
         .bind(&priorities)
         .bind(&pruned_completed_deltas)
+        .bind(&pruned_failed_deltas)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -6012,7 +6035,7 @@ impl QueueStorage {
                 )"
             )
         };
-        let row: (i64, i64, i64) = sqlx::query_as(&format!(
+        let row: (i64, i64, i64, i64) = sqlx::query_as(&format!(
             r#"
             WITH lane_counts AS (
                 -- Exact count: a ready row is available iff its
@@ -6041,22 +6064,30 @@ impl QueueStorage {
                   )
             ),
             pruned_terminal AS (
-                SELECT COALESCE(
-                    sum(
-                        GREATEST(
-                            COALESCE(lanes.pruned_completed_count, 0),
-                            COALESCE(rollups.pruned_completed_count, 0)
-                        )
-                    ),
-                    0
-                )::bigint AS completed
+                -- The GREATEST legacy dedupe applies to the completed
+                -- column only: queue_lanes never carried a failed
+                -- column, so failed counts come from the rollups alone.
+                SELECT
+                    COALESCE(
+                        sum(
+                            GREATEST(
+                                COALESCE(lanes.pruned_completed_count, 0),
+                                COALESCE(rollups.pruned_completed_count, 0)
+                            )
+                        ),
+                        0
+                    )::bigint AS completed,
+                    COALESCE(
+                        sum(COALESCE(rollups.pruned_failed_count, 0)),
+                        0
+                    )::bigint AS failed
                 FROM (
                     SELECT queue, priority, pruned_completed_count
                     FROM {schema}.queue_lanes
                     WHERE queue = ANY($1)
                 ) AS lanes
                 FULL OUTER JOIN (
-                    SELECT queue, priority, pruned_completed_count
+                    SELECT queue, priority, pruned_completed_count, pruned_failed_count
                     FROM {schema}.queue_terminal_rollups
                     WHERE queue = ANY($1)
                 ) AS rollups
@@ -6115,7 +6146,9 @@ impl QueueStorage {
             SELECT
                 lane_counts.available,
                 live_running.running,
-                pruned_terminal.completed + live_terminal.terminal AS terminal
+                pruned_terminal.completed + pruned_terminal.failed
+                    + live_terminal.terminal AS terminal,
+                pruned_terminal.failed AS pruned_failed
             FROM lane_counts
             CROSS JOIN pruned_terminal
             CROSS JOIN live_running
@@ -6127,11 +6160,12 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let (available, running, terminal) = row;
+        let (available, running, terminal, pruned_failed) = row;
         Ok(QueueCounts {
             available,
             running,
             terminal,
+            pruned_failed,
         })
     }
 
@@ -6160,7 +6194,8 @@ impl QueueStorage {
     ///   `waiting_external` is *not* included — it's reported as part
     ///   of admin's parked-callback view, not running.
     /// - **terminal** is read from the persisted
-    ///   `queue_terminal_rollups.pruned_completed_count` denormaliser.
+    ///   `queue_terminal_rollups` denormaliser
+    ///   (`pruned_completed_count + pruned_failed_count`).
     ///   Rows currently in `done_entries` that have not yet rolled up
     ///   are not included. Strictly a lower bound; converges to the
     ///   exact count when rotation prunes the live `done_entries`
@@ -6202,20 +6237,24 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         // terminal: denormalised rollup only. Live (un-rolled-up)
-        // done_entries rows are excluded — see method-level docs.
-        let terminal: i64 = sqlx::query_scalar(&format!(
+        // done_entries rows are excluded — see method-level docs. The
+        // GREATEST legacy dedupe applies to the completed column only:
+        // queue_lanes never carried a failed column.
+        let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
             r#"
-            SELECT COALESCE(sum(GREATEST(
-                COALESCE(lanes.pruned_completed_count, 0),
-                COALESCE(rollups.pruned_completed_count, 0)
-            )), 0)::bigint
+            SELECT
+                COALESCE(sum(GREATEST(
+                    COALESCE(lanes.pruned_completed_count, 0),
+                    COALESCE(rollups.pruned_completed_count, 0)
+                )), 0)::bigint,
+                COALESCE(sum(COALESCE(rollups.pruned_failed_count, 0)), 0)::bigint
             FROM (
                 SELECT queue, priority, pruned_completed_count
                 FROM {schema}.queue_lanes
                 WHERE queue = ANY($1)
             ) AS lanes
             FULL OUTER JOIN (
-                SELECT queue, priority, pruned_completed_count
+                SELECT queue, priority, pruned_completed_count, pruned_failed_count
                 FROM {schema}.queue_terminal_rollups
                 WHERE queue = ANY($1)
             ) AS rollups
@@ -6229,8 +6268,35 @@ impl QueueStorage {
         Ok(QueueCounts {
             available,
             running,
-            terminal,
+            terminal: pruned_completed + pruned_failed,
+            pruned_failed,
         })
+    }
+
+    /// Cumulative count of `failed` terminal rows pruned past the
+    /// retention floor for a queue, summed over the queue's
+    /// `queue_terminal_rollups` priorities (and stripes, for striped
+    /// queues). Monotonic — rollups never decrease. These rows no
+    /// longer exist in `done_entries` and cannot be retried.
+    pub async fn pruned_failed_count_for_queue(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let queues = self.physical_queues_for_logical(queue);
+        let pruned_failed: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT COALESCE(sum(pruned_failed_count), 0)::bigint
+            FROM {schema}.queue_terminal_rollups
+            WHERE queue = ANY($1)
+            "#
+        ))
+        .bind(&queues)
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(pruned_failed.max(0) as u64)
     }
 
     async fn retry_job_tx<'a>(
@@ -6394,24 +6460,32 @@ impl QueueStorage {
         Ok(row)
     }
 
+    /// Retry jobs by id inside a single transaction. Duplicate ids are
+    /// collapsed so each job is attempted at most once. Returns the
+    /// retried rows together with the number of unique ids attempted:
+    /// ids whose terminal row raced to another state or was pruned
+    /// between the caller's scan and this call are skipped, so
+    /// `attempted - retried.len()` is the count of unique ids that were
+    /// requested but not retried.
     pub async fn retry_jobs_by_ids(
         &self,
         pool: &PgPool,
         ids: &[i64],
-    ) -> Result<Vec<JobRow>, AwaError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
+    ) -> Result<(Vec<JobRow>, u64), AwaError> {
+        let unique_ids: BTreeSet<i64> = ids.iter().copied().collect();
+        if unique_ids.is_empty() {
+            return Ok((Vec::new(), 0));
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let mut rows = Vec::with_capacity(ids.len());
-        for job_id in ids {
+        let mut rows = Vec::with_capacity(unique_ids.len());
+        for job_id in &unique_ids {
             if let Some(row) = self.retry_job_tx(&mut tx, *job_id).await? {
                 rows.push(row);
             }
         }
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(rows)
+        Ok((rows, unique_ids.len() as u64))
     }
 
     /// Write a `<outcome>` closure row for any matching open receipt.
@@ -11413,8 +11487,21 @@ impl QueueStorage {
         }
     }
 
+    /// Prune the oldest sealed queue ring slot.
+    ///
+    /// `failed_retention` is the floor for `failed` terminal rows: rows
+    /// with `finalized_at` inside the floor are re-homed into the live
+    /// `done_entries` segment (still retryable) instead of being
+    /// truncated with the slot. `Duration::ZERO` disables the floor and
+    /// prunes every terminal row. Granularity is whole seconds,
+    /// matching DLQ retention. The floor applies to `failed` only —
+    /// `cancelled` is an explicit operator action and is always pruned.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest")]
-    pub async fn prune_oldest(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
+    pub async fn prune_oldest(
+        &self,
+        pool: &PgPool,
+        failed_retention: Duration,
+    ) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -11528,6 +11615,129 @@ impl QueueStorage {
             });
         }
 
+        let failed_retention_secs = i64::try_from(failed_retention.as_secs()).unwrap_or(i64::MAX);
+        let retention_floor = failed_retention_secs > 0;
+
+        // #337: failed terminal rows still inside the retention floor
+        // are re-homed into the live done segment before the TRUNCATE
+        // so they stay retryable. The queue_ring_state row is held FOR
+        // UPDATE above, which serializes against rotate — the current
+        // slot cannot move while carried rows are re-inserted into it.
+        let carried_failed_rows = if retention_floor {
+            let (current_generation,): (i64,) = sqlx::query_as(&format!(
+                "SELECT generation FROM {schema}.queue_ring_slots WHERE slot = $1"
+            ))
+            .bind(state.0)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Carried rows are widened to the self-contained synthetic
+            // done-row shape (the COALESCE chain mirrors
+            // `done_row_projection`) because the ready rows they would
+            // otherwise hydrate from are truncated with this slot.
+            // Deliberately no ON CONFLICT: lane_seq comes from
+            // never-resetting sequences, so a PK collision means
+            // corrupted terminal state and must abort the prune loudly
+            // rather than silently drop a terminal fact.
+            let carried = sqlx::query(&format!(
+                r#"
+                INSERT INTO {schema}.done_entries (
+                    ready_slot, ready_generation, job_id, kind, queue,
+                    args, state, priority, attempt, run_lease,
+                    max_attempts, lane_seq, enqueue_shard, run_at,
+                    attempted_at, finalized_at, created_at, unique_key,
+                    unique_states, payload
+                )
+                SELECT
+                    $2,
+                    $3,
+                    done.job_id,
+                    done.kind,
+                    done.queue,
+                    COALESCE(done.args, ready.args, '{{}}'::jsonb),
+                    done.state,
+                    done.priority,
+                    done.attempt,
+                    done.run_lease,
+                    COALESCE(done.max_attempts, ready.max_attempts, 25::smallint),
+                    done.lane_seq,
+                    done.enqueue_shard,
+                    COALESCE(done.run_at, ready.run_at, done.finalized_at),
+                    COALESCE(done.attempted_at, ready.attempted_at),
+                    done.finalized_at,
+                    COALESCE(done.created_at, ready.created_at, done.finalized_at),
+                    COALESCE(done.unique_key, ready.unique_key),
+                    COALESCE(done.unique_states, ready.unique_states),
+                    COALESCE(done.payload, ready.payload, '{{}}'::jsonb)
+                FROM {done_child} AS done
+                LEFT JOIN {ready_child} AS ready
+                  ON ready.ready_slot = done.ready_slot
+                 AND ready.ready_generation = done.ready_generation
+                 AND ready.queue = done.queue
+                 AND ready.priority = done.priority
+                 AND ready.enqueue_shard = done.enqueue_shard
+                 AND ready.lane_seq = done.lane_seq
+                WHERE done.state = 'failed'
+                  AND done.finalized_at >= now() - make_interval(secs => $1::bigint)
+                "#
+            ))
+            .bind(failed_retention_secs)
+            .bind(state.0)
+            .bind(current_generation)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .rows_affected();
+
+            if carried > 0 {
+                // This slot's live counter rows and delta segment are
+                // wiped below, so the carried rows' exact-count
+                // evidence moves with them: re-append positive deltas
+                // under the current slot, grouped exactly like the
+                // completion path's delta append.
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {schema}.queue_terminal_count_deltas (
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        counter_bucket,
+                        terminal_delta
+                    )
+                    SELECT
+                        $2,
+                        $3,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        mod(
+                            mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
+                                + {TERMINAL_COUNTER_BUCKETS}::bigint,
+                            {TERMINAL_COUNTER_BUCKETS}::bigint
+                        )::smallint AS counter_bucket,
+                        count(*)::bigint
+                    FROM {done_child}
+                    WHERE state = 'failed'
+                      AND finalized_at >= now() - make_interval(secs => $1::bigint)
+                    GROUP BY queue, priority, enqueue_shard, counter_bucket
+                    ORDER BY queue, priority, enqueue_shard, counter_bucket
+                    "#
+                ))
+                .bind(failed_retention_secs)
+                .bind(state.0)
+                .bind(current_generation)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+            carried
+        } else {
+            0
+        };
+
         // #290: scan the about-to-be-truncated partition for the rollup
         // fold. The rollup column is *permanent* state, so we MUST fold
         // from ground truth (the `{done_child}` partition itself), not
@@ -11541,13 +11751,29 @@ impl QueueStorage {
         // itself stays authoritative. See PR #304 reviewer finding
         // "High: A1 can persist stale counter state before the
         // read-switch PR" for the trade-off.
-        let pruned_terminal_counts: Vec<(String, i16, i64)> = sqlx::query_as(&format!(
+        //
+        // Carried failed rows are excluded from both columns: they are
+        // still live in `done_entries`, so folding them into the
+        // permanent rollup would double-count them.
+        let pruned_terminal_counts: Vec<(String, i16, i64, i64)> = sqlx::query_as(&format!(
             r#"
-            SELECT queue, priority, count(*)::bigint AS pruned_count
+            SELECT
+                queue,
+                priority,
+                (count(*) FILTER (WHERE state <> 'failed'))::bigint AS pruned_completed_count,
+                (count(*) FILTER (
+                    WHERE state = 'failed'
+                      AND (
+                          $2::boolean IS FALSE
+                          OR finalized_at < now() - make_interval(secs => $1::bigint)
+                      )
+                ))::bigint AS pruned_failed_count
             FROM {done_child}
             GROUP BY queue, priority
             "#
         ))
+        .bind(failed_retention_secs)
+        .bind(retention_floor)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -11579,7 +11805,17 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
-                Ok(PruneOutcome::Pruned { slot })
+                if carried_failed_rows > 0 {
+                    tracing::info!(
+                        slot,
+                        carried_failed_rows,
+                        "Carried failed terminal rows inside the retention floor to the live done segment"
+                    );
+                }
+                Ok(PruneOutcome::Pruned {
+                    slot,
+                    carried_failed_rows,
+                })
             }
             Err(_) => {
                 let _ = tx.rollback().await;
@@ -11696,7 +11932,10 @@ impl QueueStorage {
         match truncate {
             Ok(_) => {
                 tx.commit().await.map_err(map_sqlx_error)?;
-                Ok(PruneOutcome::Pruned { slot })
+                Ok(PruneOutcome::Pruned {
+                    slot,
+                    carried_failed_rows: 0,
+                })
             }
             Err(_) => {
                 let _ = tx.rollback().await;
@@ -11956,7 +12195,10 @@ impl QueueStorage {
         match truncate {
             Ok(_) => {
                 tx.commit().await.map_err(map_sqlx_error)?;
-                Ok(PruneOutcome::Pruned { slot })
+                Ok(PruneOutcome::Pruned {
+                    slot,
+                    carried_failed_rows: 0,
+                })
             }
             Err(_) => {
                 let _ = tx.rollback().await;

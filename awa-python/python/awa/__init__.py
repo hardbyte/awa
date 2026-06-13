@@ -14,6 +14,8 @@ from awa._awa import (
     CallbackToken,
     WaitForCallback,
     ResolveResult,
+    # Admin
+    RetryFailedResult,
     # Dead Letter Queue
     DlqEntry,
     # Transaction
@@ -75,6 +77,8 @@ __all__ = [
     "CallbackToken",
     "WaitForCallback",
     "ResolveResult",
+    # Admin
+    "RetryFailedResult",
     # Dead Letter Queue
     "DlqEntry",
     # Transaction
