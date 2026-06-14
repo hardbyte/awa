@@ -183,11 +183,12 @@ TwoStripeQueuesOK ==
 \* awa-model/src/queue_storage.rs as noted inline.
 
 \* insert_ready_rows_tx / insert_ready_rows_copy_tx
-\*   UPDATE queue_enqueue_heads for each grouped physical queue
+\*   reserve_enqueue_seq takes a transaction-scoped lane lock for each
+\*   grouped physical queue
 \*   INSERT / COPY ready rows
-\*   UPDATE queue_lanes for each grouped physical queue
+\*   INSERT ready_segments for each grouped physical queue
 \*
-\* The model collapses the queue_enqueue_heads and queue_lanes rows
+\* The model collapses the reserve_enqueue_seq advisory lock and lane rows
 \* into LaneResource, because the deadlock class we care about is
 \* multi-stripe transactions taking lane-family locks in different
 \* physical-queue orders. Enqueue keeps a stable physical-stripe order.

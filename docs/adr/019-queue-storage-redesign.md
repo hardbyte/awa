@@ -47,6 +47,7 @@ The implementation and migrations use these physical names:
 - `lane_state` maps to `{schema}.queue_lanes`
 - enqueue heads map to `{schema}.queue_enqueue_heads`
 - claim heads map to `{schema}.queue_claim_heads`
+- `ready_segments` maps to `{schema}.ready_segments`
 
 ### Physical layout
 
@@ -54,7 +55,7 @@ The implementation and migrations use these physical names:
 
 - Immediate jobs are appended to rotating ready partitions.
 - Ready rows are immutable once written.
-- Claim order is driven by queue-local lane metadata rather than scanning a large mutable heap.
+- Claim order is driven by queue-local lane metadata and the compact `{schema}.ready_segments` map rather than scanning a large mutable heap.
 
 2. `ready_tombstones`
 
@@ -98,7 +99,7 @@ The implementation and migrations use these physical names:
 7. `lane_state` and segment cursor tables
 
 - Queue-local lane metadata is intentionally split so one row family does not absorb every enqueue and claim mutation.
-- `lane_state` itself is reduced to stable per-lane identity and legacy fallback fields. `queue_enqueue_heads` and `queue_claim_heads` remain as stable lane registries and lock targets; the mutable enqueue and claim cursors live in PostgreSQL sequences referenced by those rows.
+- `lane_state` itself is reduced to stable per-lane identity and legacy fallback fields. `queue_enqueue_heads` and `queue_claim_heads` remain as stable lane registries. The mutable enqueue and claim cursors live in PostgreSQL sequences referenced by those rows; enqueue reserves sequence ranges under a transaction-scoped lane advisory lock, while claim still locks `queue_claim_heads` to choose and emit work.
 - Availability counts have two grades. The dispatcher hot path and high-cadence worker metrics read `sum(enqueue_sequence_cursor - claim_sequence_cursor)` from the lane heads — two PK reads plus sequence state reads per lane, no scan over `ready_entries`. Admin calls that need exact availability (`queue_counts`) scan `ready_entries WHERE lane_seq >= claim_sequence_cursor` anti-joined with `ready_tombstones`. The dispatcher and metrics tolerate transient over-count from committed gaps, uncommitted sequence reservations, and tombstoned unclaimed rows; the cursor is only advanced after committed claims/cancels and only across committed spent/tombstoned prefixes, so it can lag but cannot skip visible ready work. **historical:** earlier iterations cached this as `queue_lanes.available_count` (a third counter mutated on every enqueue / claim / completion); long-horizon profiling under pinned xmin showed the cache was the dominant dead-tuple source, so v016 removed it in favour of the head-difference derivation.
 - Completed-history rollups live in a separate cold cache table so prune can preserve queue counts without serializing on the hot `lane_state` rows.
 - Completion must not update `lane_state` on every terminal transition; the hot path only mutates claim/enqueue control state. `running` is derived from active leases/receipts. ADR-026 terminal counts use append-only `queue_terminal_count_deltas` on the terminal path, folded `queue_terminal_live_counts` for sealed retained segments, and the post-prune `queue_terminal_rollups` cache. The permanent rollup is written in the prune transaction to a separate cold table rather than to `lane_state`, so prune does not serialize on the same hot rows as claim and enqueue.
@@ -109,7 +110,7 @@ The implementation and migrations use these physical names:
 
 ### Lifecycle mapping
 
-- Enqueue immediate job: append to `ready_entries`.
+- Enqueue immediate job: reserve a lane sequence range under the lane advisory lock, append to `ready_entries`, and append compact `ready_segments` metadata in the same transaction.
 - Claim: lock the queue's `queue_claim_heads` row, join the matching `queue_enqueue_heads` row, select the next ready entries, treat any matching `ready_tombstones` rows as spent lane evidence, increment `run_lease`, append a receipt into `lease_claims` by default, and advance the claim cursor based on committed spent evidence plus the rows actually selected after commit.
 - Receipt-backed deadlines: per-queue deadlines live on `lease_claims.deadline_at` until the attempt materializes into the lease plane for callbacks, progress, or other mutable state.
 - Receipt rescue before materialization: close the stale receipt append-only and requeue it without first materializing a mutable `leases` row.

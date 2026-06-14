@@ -404,6 +404,66 @@ BEGIN
 
     EXECUTE format(
         $ddl$
+        CREATE TABLE IF NOT EXISTS %I.ready_segments (
+            ready_slot       INT NOT NULL,
+            ready_generation BIGINT NOT NULL,
+            queue            TEXT NOT NULL,
+            priority         SMALLINT NOT NULL,
+            enqueue_shard    SMALLINT NOT NULL DEFAULT 0,
+            first_lane_seq   BIGINT NOT NULL,
+            next_lane_seq    BIGINT NOT NULL,
+            first_run_at     TIMESTAMPTZ NOT NULL,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            CHECK (first_lane_seq < next_lane_seq),
+            PRIMARY KEY (queue, priority, enqueue_shard, first_lane_seq)
+        )
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'COMMENT ON TABLE %I.ready_segments IS %L',
+        p_schema,
+        'Append-only lane segment map from committed ready lane ranges to queue ring slot/generation. Claim uses this compact control plane to target a ready slot/generation before validating ready_entries; prune deletes segment rows with the matching ready slot.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.ready_segments.first_lane_seq IS %L',
+        p_schema,
+        'Inclusive first lane sequence covered by this committed ready segment.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.ready_segments.next_lane_seq IS %L',
+        p_schema,
+        'Exclusive upper lane sequence covered by this committed ready segment.'
+    );
+
+    EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS idx_%s_ready_segments_lane_next ON %I.ready_segments (queue, priority, enqueue_shard, next_lane_seq, first_lane_seq)',
+        p_schema, p_schema
+    );
+
+    EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS idx_%s_ready_segments_slot ON %I.ready_segments (ready_slot, ready_generation)',
+        p_schema, p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.ready_segments SET (
+            fillfactor = 90,
+            autovacuum_vacuum_scale_factor = 0.0,
+            autovacuum_vacuum_threshold = 200,
+            autovacuum_vacuum_cost_limit = 2000,
+            autovacuum_vacuum_cost_delay = 2
+        )
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
         ALTER TABLE %I.queue_claim_heads SET (
             fillfactor = 50,
             autovacuum_vacuum_scale_factor = 0.0,
@@ -629,26 +689,28 @@ BEGIN
             END IF;
 
             v_lock_key := format('%%I.%%I', %1$L, v_seq_name);
-            PERFORM pg_advisory_lock(hashtextextended(v_lock_key, 0));
-            BEGIN
-                EXECUTE format(
-                    'SELECT nextval(%%L::regclass)::bigint',
-                    format('%%I.%%I', %1$L, v_seq_name)
-                )
-                INTO v_start;
+            -- Hold the lane reservation lock until the surrounding enqueue
+            -- transaction ends. Sequence movement is non-transactional: if a
+            -- later producer could reserve and commit lane N+1 while an
+            -- earlier producer still holds uncommitted lane N, claim could
+            -- advance past N and strand the earlier job when it eventually
+            -- commits. The transaction-scoped lock preserves visibility order
+            -- within a lane while aborted reservations still become harmless
+            -- sequence gaps.
+            PERFORM pg_advisory_xact_lock(hashtextextended(v_lock_key, 0));
+            EXECUTE format(
+                'SELECT nextval(%%L::regclass)::bigint',
+                format('%%I.%%I', %1$L, v_seq_name)
+            )
+            INTO v_start;
 
-                IF p_count > 1 THEN
-                    EXECUTE format(
-                        'SELECT setval(%%L::regclass, %%s, true)',
-                        format('%%I.%%I', %1$L, v_seq_name),
-                        v_start + p_count - 1
-                    );
-                END IF;
-            EXCEPTION WHEN OTHERS THEN
-                PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
-                RAISE;
-            END;
-            PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
+            IF p_count > 1 THEN
+                EXECUTE format(
+                    'SELECT setval(%%L::regclass, %%s, true)',
+                    format('%%I.%%I', %1$L, v_seq_name),
+                    v_start + p_count - 1
+                );
+            END IF;
 
             RETURN v_start;
         END;
@@ -1793,6 +1855,72 @@ BEGIN
         );
     END LOOP;
 
+    -- Backfill ready segment metadata for existing committed ready rows.
+    -- Runtime enqueue writes one segment per contiguous lane range, but
+    -- upgraded schemas can already contain ready rows before the table
+    -- existed. Segment rows are compact control-plane metadata; they are
+    -- deleted when the owning ready slot is pruned.
+    EXECUTE format(
+        $ddl$
+        WITH ordered AS (
+            SELECT
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                lane_seq,
+                run_at,
+                lane_seq - row_number() OVER (
+                    PARTITION BY ready_slot, ready_generation, queue, priority, enqueue_shard
+                    ORDER BY lane_seq
+                )::bigint AS contiguous_group
+            FROM %1$I.ready_entries
+        ),
+        segments AS (
+            SELECT
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                min(lane_seq)::bigint AS first_lane_seq,
+                (max(lane_seq) + 1)::bigint AS next_lane_seq,
+                (array_agg(run_at ORDER BY lane_seq))[1] AS first_run_at
+            FROM ordered
+            GROUP BY
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                contiguous_group
+        )
+        INSERT INTO %1$I.ready_segments (
+            ready_slot,
+            ready_generation,
+            queue,
+            priority,
+            enqueue_shard,
+            first_lane_seq,
+            next_lane_seq,
+            first_run_at
+        )
+        SELECT
+            ready_slot,
+            ready_generation,
+            queue,
+            priority,
+            enqueue_shard,
+            first_lane_seq,
+            next_lane_seq,
+            first_run_at
+        FROM segments
+        ON CONFLICT (queue, priority, enqueue_shard, first_lane_seq) DO NOTHING
+        $ddl$,
+        p_schema
+    );
+
     --------------------------------------------------------------------
     -- queue_terminal_live_counts (#290).
     --------------------------------------------------------------------
@@ -2189,24 +2317,24 @@ BEGIN
             ) AS cursors
             LEFT JOIN LATERAL (
                 SELECT
-                    ready.ready_slot,
-                    ready.ready_generation,
-                    ready.run_at,
+                    segment.ready_slot,
+                    segment.ready_generation,
+                    segment.first_run_at AS run_at,
                     CASE
                         WHEN p_aging_secs > 0 THEN GREATEST(
                             1,
                             claims.priority - FLOOR(
-                                EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / p_aging_secs
+                                EXTRACT(EPOCH FROM (clock_timestamp() - segment.first_run_at)) / p_aging_secs
                             )::smallint
                         )::smallint
                         ELSE claims.priority
                     END AS effective_priority
-                FROM %1$I.ready_entries AS ready
-                WHERE ready.queue = p_queue
-                  AND ready.priority = claims.priority
-                  AND ready.enqueue_shard = claims.enqueue_shard
-                  AND ready.lane_seq >= cursors.claim_seq
-                ORDER BY ready.lane_seq ASC
+                FROM %1$I.ready_segments AS segment
+                WHERE segment.queue = p_queue
+                  AND segment.priority = claims.priority
+                  AND segment.enqueue_shard = claims.enqueue_shard
+                  AND segment.next_lane_seq > cursors.claim_seq
+                ORDER BY segment.first_lane_seq ASC
                 LIMIT 1
             ) AS candidate ON TRUE
             WHERE claims.queue = p_queue
@@ -2229,14 +2357,31 @@ BEGIN
             END IF;
 
             SELECT
-                ready.ready_slot,
-                ready.ready_generation,
+                segment.ready_slot,
+                segment.ready_generation
+            INTO
+                v_target_slot,
+                v_target_generation
+            FROM %1$I.ready_segments AS segment
+            WHERE segment.queue = p_queue
+              AND segment.priority = v_lane_priority
+              AND segment.enqueue_shard = v_lane_shard
+              AND segment.next_lane_seq > v_lane_claim_seq
+            ORDER BY segment.first_lane_seq ASC
+            LIMIT 1;
+
+            IF NOT FOUND THEN
+                -- No committed ready segment is visible yet. The enqueue
+                -- sequence may include uncommitted reservations, so do not
+                -- advance the claim cursor.
+                RETURN;
+            END IF;
+
+            SELECT
                 ready.job_id,
                 ready.run_lease,
                 ready.lane_seq
             INTO
-                v_target_slot,
-                v_target_generation,
                 v_head_job_id,
                 v_head_run_lease,
                 v_head_lane_seq
@@ -2244,18 +2389,17 @@ BEGIN
             WHERE ready.queue = p_queue
               AND ready.priority = v_lane_priority
               AND ready.enqueue_shard = v_lane_shard
+              AND ready.ready_slot = v_target_slot
+              AND ready.ready_generation = v_target_generation
               AND ready.lane_seq >= v_lane_claim_seq
             ORDER BY ready.lane_seq ASC
             LIMIT 1;
 
             IF NOT FOUND THEN
-                -- The enqueue cursor is sequence-backed and can include
-                -- uncommitted reservations. If no committed ready row is
-                -- visible yet, do not advance the claim cursor to the enqueue
-                -- cursor: that can skip a ready row when the enqueue
-                -- transaction commits moments later. True gaps from admin
-                -- deletes are harmless over-count drift and close naturally
-                -- when a later committed row on the lane is claimed.
+                -- The segment row is committed by the same transaction as
+                -- the ready rows, so this should only happen during a rolling
+                -- upgrade or after manual catalog damage. Keep the claim
+                -- cursor conservative rather than advancing over unseen work.
                 RETURN;
             END IF;
 
@@ -2309,7 +2453,12 @@ BEGIN
                 SELECT EXISTS (
                     SELECT 1
                     FROM %1$I.receipt_completion_batches AS existing_batches
-                    WHERE existing_batches.job_ids @> ARRAY[v_head_job_id]::bigint[]
+                    WHERE existing_batches.ready_slot = v_target_slot
+                      AND existing_batches.ready_generation = v_target_generation
+                      AND existing_batches.queue = p_queue
+                      AND existing_batches.priority = v_lane_priority
+                      AND existing_batches.enqueue_shard = v_lane_shard
+                      AND existing_batches.job_ids @> ARRAY[v_head_job_id]::bigint[]
                       AND EXISTS (
                           SELECT 1
                           FROM unnest(
@@ -2424,7 +2573,12 @@ BEGIN
                         OR EXISTS (
                             SELECT 1
                             FROM %1$I.receipt_completion_batches AS existing_batches
-                            WHERE existing_batches.job_ids @> ARRAY[selected.job_id]::bigint[]
+                            WHERE existing_batches.ready_slot = v_target_slot
+                              AND existing_batches.ready_generation = v_target_generation
+                              AND existing_batches.queue = p_queue
+                              AND existing_batches.priority = v_lane_priority
+                              AND existing_batches.enqueue_shard = v_lane_shard
+                              AND existing_batches.job_ids @> ARRAY[selected.job_id]::bigint[]
                               AND EXISTS (
                                   SELECT 1
                                   FROM unnest(
@@ -2489,6 +2643,14 @@ BEGIN
                     -- claim transaction could still abort.
                     PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_spent_next_seq);
                 END IF;
+
+                -- The spent-prefix path is a recovery/maintenance path for
+                -- stale claim cursors, tombstones, or already-emitted
+                -- attempts. Return after moving the cursor so the common
+                -- claim query can stay narrow: it only needs to filter
+                -- ready_tombstones and does not plan every terminal evidence
+                -- relation on every hot-path claim.
+                RETURN;
             END IF;
 
             RETURN QUERY
@@ -2546,86 +2708,7 @@ BEGIN
             selected_with_spent AS (
                 SELECT
                     selected.*,
-                    CASE
-                        WHEN COALESCE(v_head_attempt_spent, FALSE) THEN
-                            (
-                                -- Claim cursor advancement is deliberately
-                                -- post-commit for newly emitted attempts:
-                                -- PostgreSQL sequence movement is
-                                -- non-transactional, so advancing inside the
-                                -- claim transaction could skip committed work
-                                -- if that transaction later aborts. If the
-                                -- post-commit advance is lost, the cursor may
-                                -- lag and this ready row can be selected again
-                                -- after ring rotation.
-                                --
-                                -- Treat the next run_lease as an idempotency
-                                -- key. Once committed evidence exists for
-                                -- (job_id, run_lease), the attempt has already
-                                -- been emitted. Legitimate retries re-enter
-                                -- ready/deferred state with
-                                -- selected.run_lease advanced, so they target
-                                -- a new idempotency key.
-                                selected.is_tombstone
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.lease_claims AS existing_claims
-                                    WHERE existing_claims.job_id = selected.job_id
-                                      AND existing_claims.run_lease = selected.run_lease + 1
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.lease_claim_closures AS existing_closures
-                                    WHERE existing_closures.job_id = selected.job_id
-                                      AND existing_closures.run_lease = selected.run_lease + 1
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.receipt_completion_batches AS existing_batches
-                                    WHERE existing_batches.job_ids @> ARRAY[selected.job_id]::bigint[]
-                                      AND EXISTS (
-                                          SELECT 1
-                                          FROM unnest(
-                                              existing_batches.job_ids,
-                                              existing_batches.run_leases
-                                          ) AS completed(job_id, run_lease)
-                                          WHERE completed.job_id = selected.job_id
-                                            AND completed.run_lease = selected.run_lease + 1
-                                      )
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.leases AS existing_leases
-                                    WHERE existing_leases.job_id = selected.job_id
-                                      AND existing_leases.run_lease = selected.run_lease + 1
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.done_entries AS existing_done
-                                    WHERE existing_done.job_id = selected.job_id
-                                      AND existing_done.run_lease = selected.run_lease + 1
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.deferred_jobs AS existing_deferred
-                                    WHERE existing_deferred.job_id = selected.job_id
-                                      AND existing_deferred.run_lease = selected.run_lease + 1
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.dlq_entries AS existing_dlq
-                                    WHERE existing_dlq.job_id = selected.job_id
-                                      AND existing_dlq.run_lease = selected.run_lease + 1
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                    FROM %1$I.ready_entries AS existing_ready
-                                    WHERE existing_ready.job_id = selected.job_id
-                                      AND existing_ready.run_lease = selected.run_lease + 1
-                                )
-                            )
-                        ELSE selected.is_tombstone
-                    END AS attempt_spent
+                    selected.is_tombstone AS attempt_spent
                 FROM selected
             ),
             %2$s

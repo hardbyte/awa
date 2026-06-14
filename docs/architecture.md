@@ -50,7 +50,7 @@ Queue storage is the worker engine in 0.6. It is not one mutable jobs heap; it i
 
 | Plane | Tables | Shape | Why it matters |
 | --- | --- | --- | --- |
-| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | Ring partitions by `ready_slot` | Runnable and terminal rows stay append-first; rare ready mutations append tombstones instead of deleting ready rows; successful receipt completions can use compact batch terminal history; terminal-count changes append signed deltas and the whole segment is reclaimed by queue-ring prune. |
+| Queue | `ready_entries_*`, `ready_tombstones_*`, `ready_segments`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | Ring partitions by `ready_slot` plus a compact ready-segment map | Runnable and terminal rows stay append-first; rare ready mutations append tombstones instead of deleting ready rows; claim routes through compact ready segments before reading ready rows; successful receipt completions can use compact batch terminal history; terminal-count changes append signed deltas and the whole segment is reclaimed by queue-ring prune. |
 | Queue backlog | `deferred_jobs` | Plain table | Scheduled and retryable work stays out of the hot claim path until promotion. |
 | Operator hold | `dlq_entries` | Plain table | DLQ rows are explicit operator backlog with retry, purge, and retention cleanup. |
 | Receipt execution | `lease_claims_*`, `lease_claim_closures_*`, `lease_claim_closure_batches_*` | Ring partitions by `claim_slot` | Short attempts avoid mutable lease rows; live receipts are claims anti-joined with durable closure evidence, while stale-rescue and deadline-rescue scans advance tiny per-slot cursors over rescue-eligible history. |
@@ -69,6 +69,7 @@ Most applications should use the Rust, Python, CLI, or UI APIs rather than query
 | `{schema}.terminal_jobs` | Read-only hydrated view over queue-storage terminal history. It joins narrow `done_entries_*` rows and compact `receipt_completion_batches_*` rows back to retained `ready_entries_*` bodies. | Public read surface for SQL inspection and reporting of terminal queue-storage rows. It is not a write or transition surface. |
 | `ready_entries_*` | Physical runnable queue ring. | Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths. |
 | `ready_tombstones_*` | Physical ledger for ready lanes made unavailable by cancellation, priority aging, or similar out-of-band ready mutations. | Internal storage. Claim treats matching rows as spent lane evidence and exact-count paths skip them; maintenance truncates it with the matching ready segment. |
+| `ready_segments` | Compact control-plane map from committed ready lane ranges to their ready slot/generation. | Internal storage. Claim uses it to choose the target ready segment before validating `ready_entries_*`; prune deletes rows for the ready slot it has reclaimed. |
 | `done_entries_*` | Physical terminal fact ring for failed, cancelled, non-receipt, and wide terminal rows. Ready-backed rows can intentionally omit duplicated body columns. | Internal storage. Direct readers must tolerate nullable duplicated body fields and must not assume all completed rows are present here; use `{schema}.terminal_jobs` for hydrated terminal rows. |
 | `receipt_completion_batches_*` | Compact physical terminal history for successful receipt-backed completions. Each row stores one completion batch and expands through `{schema}.terminal_jobs`. | Internal storage. Optimized for hot-path append and queue-ring truncate; not a public query surface. Claim-closure proof for these completions lives in `lease_claim_closure_batches_*`. |
 | `receipt_completion_tombstones_*` | Cold deletion ledger for completed rows synthesized from `receipt_completion_batches_*`. | Internal storage. SQL compatibility delete writes here so `terminal_jobs` can hide a compact completed row without mutating the compact batch. |
@@ -140,7 +141,7 @@ sequenceDiagram
     D->>E: execute handlers
 ```
 
-Enqueue is transactional: if the producer's outer transaction rolls back, the job never becomes visible. Immediate jobs append to `ready_entries_*`; future scheduled or retryable jobs append to `deferred_jobs`.
+Enqueue is transactional: if the producer's outer transaction rolls back, the job never becomes visible. Immediate jobs reserve a lane sequence range under a transaction-scoped lane lock, append to `ready_entries_*`, and append a compact `ready_segments` range for the committed lane sequence range; future scheduled or retryable jobs append to `deferred_jobs`. The lane lock is held until commit or rollback so a later producer cannot make lane `N+1` visible while lane `N` can still commit.
 
 `deferred_jobs` is deliberately outside the claim path. The maintenance leader promotes due `scheduled` and `retryable` rows into `ready_entries_*` in batches and notifies the target queues. Cron schedules are just producers for ordinary jobs: when a schedule fires, the cron transaction records the fire and enqueues the job atomically, using `ready_entries_*` for immediate fires or `deferred_jobs` when the enqueue carries a future `run_at`.
 
@@ -152,7 +153,8 @@ There are two COPY-shaped producer paths:
 Claim is cursor-based rather than heap-scan based:
 
 - `queue_meta.enqueue_shards` controls how many independent enqueue/claim head rows a queue has. The default is one shard. Raising it changes the ordering contract to FIFO within `(queue, priority, enqueue_shard)`, with no global ordering promise across shards.
-- `queue_enqueue_heads` allocates lane sequence ranges at enqueue time per `(physical queue, priority, enqueue_shard)`.
+- `queue_enqueue_heads` owns the sequence name for each `(physical queue, priority, enqueue_shard)` lane. Producers reserve lane sequence ranges under a transaction-scoped advisory lock keyed by that sequence name.
+- `ready_segments` maps committed lane sequence ranges to the ready slot/generation that stores their immutable ready rows. Claim consults this compact map first, then validates the target ready head.
 - `queue_claim_heads` advances monotonically during claim and is the authority for the next claimable lane position on the same shard-qualified lane.
 - The dispatcher pre-acquires execution permits before claiming, so every claimed `running` job has reserved local capacity.
 - `PartitionedQueue` is a Rust and Python helper for mapping one hot logical queue to several ordinary physical queue names. The storage engine does not add a separate group table for this; each physical queue keeps the normal lane, lease, DLQ, descriptor, and terminal-history contract.
@@ -197,7 +199,7 @@ Queue storage has three independent rings, each advanced by the elected maintena
 
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 | --- | --- | --: | --- | --- |
-| Queue | `ready_entries_*`, `ready_tombstones_*`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/terminal/tombstone/delta slot is empty | oldest non-current slot has no active leases, no retained ready rows at or ahead of their lane claim cursors, and no receipt claims without closure evidence; terminal rows, compact completion batches, tombstones, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
+| Queue | `ready_entries_*`, `ready_tombstones_*`, `ready_segments`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/terminal/tombstone/delta slot is empty | oldest non-current slot has no active leases, no retained ready rows at or ahead of their lane claim cursors, and no receipt claims without closure evidence; terminal rows, compact completion batches, tombstones, ready-segment metadata, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `1000ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*`, `lease_claim_closure_batches_*` | matches queue ring | incoming claims/closures/closure-batches slot is empty | every claim in the oldest non-current slot has durable closure evidence; stale-rescue cursors are reset when the slot is truncated |
 

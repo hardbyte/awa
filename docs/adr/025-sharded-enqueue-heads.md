@@ -6,7 +6,7 @@ Accepted. The shard plane is operational; `awa.queue_meta.enqueue_shards` govern
 
 ## Context
 
-The queue-storage engine allocates each enqueue batch a contiguous `lane_seq` range by advancing a single counter per `(queue, priority)` lane:
+The original queue-storage engine allocated each enqueue batch a contiguous `lane_seq` range by advancing a single counter per `(queue, priority)` lane:
 
 ```sql
 UPDATE queue_enqueue_heads
@@ -15,7 +15,7 @@ WHERE queue = $1 AND priority = $2
 RETURNING next_seq - $count;
 ```
 
-This is one row-level lock per producer transaction. Concurrent producers for the same lane serialise on that lock. The semantics are correct and the contract is strict FIFO within the lane; the cost is that producer throughput on a single hot lane is bounded by the end-to-end cost of touching that one row — commit, WAL flush, and the next producer's lock acquire.
+That was one row-level lock per producer transaction. Concurrent producers for the same lane serialised on that lock. The semantics were correct and the contract was strict FIFO within the lane; the cost was that producer throughput on a single hot lane was bounded by the end-to-end cost of touching that one row — commit, WAL flush, and the next producer's lock acquire.
 
 Wait-event sampling on a 16-producer same-queue workload attributes producer time as follows:
 
@@ -61,7 +61,7 @@ Receipts and leases carry the shard end-to-end: the claim's `enqueue_shard` ride
 
 `enqueue_shards > 1` is a semantic mode switch, not a hidden performance optimization. It changes the ordering contract the queue offers and operators opt into it per queue. The peer comparison is SQS Standard vs FIFO, Kafka partitions, Pub/Sub ordering keys, and RabbitMQ sharded queues: a partition is the ordering scope, the operator picks how many partitions, and producers route into them.
 
-`lane_seq` is allocated by `UPDATE queue_enqueue_heads SET next_seq = ...` keyed by `(queue, priority, enqueue_shard)`. Each shard owns an independent strictly-increasing sequence. The contract:
+`lane_seq` is allocated by a PostgreSQL sequence named from `(queue, priority, enqueue_shard)`. `queue_enqueue_heads` stores the sequence name, and `reserve_enqueue_seq` takes a transaction-scoped advisory lock on that lane before reserving the range. The lock is held until the enqueue transaction commits or rolls back, so a later producer cannot commit lane `N+1` while lane `N` can still become visible. Each shard owns an independent strictly-increasing sequence. The contract:
 
 - **`enqueue_shards = 1` (default): strict FIFO per `(queue, priority)`.** Identical to the pre-shard contract. Workloads that depend on cross-producer FIFO at the lane level stay here.
 - **`enqueue_shards > 1`: partitioned FIFO per `(queue, priority, enqueue_shard)`.** Strict FIFO is preserved within each shard. No ordering is promised across shards. Two rows enqueued to different shards may be claimed in either order depending on which shard the claim path visits first.
@@ -72,7 +72,7 @@ Choosing `S > 1` is the same kind of decision as choosing SQS Standard over SQS 
 
 Two modes share the `shard_for_enqueue` entry point:
 
-1. **Rotor (default).** When the caller does not supply an `ordering_key`, the per-store `AtomicU16` rotor selects a shard modulo the queue's shard count. Selection is **per `(queue, priority)` sub-batch within a single `insert_*_tx` call** — all rotor-routed rows that share a destination lane in one batch collapse onto the same shard so a 500-row batch issues one `advance_enqueue_head` UPDATE and one INSERT instead of 500. The rotor advances on each pick, so successive batches spread across shards. This per-batch amortisation is what makes `enqueue_shards > 1` net-faster than `S = 1` at moderate producer concurrency; per-row pick was measured to invert the curve (S>1 slower than S=1) because each batch fanned into S sub-INSERTs.
+1. **Rotor (default).** When the caller does not supply an `ordering_key`, the per-store `AtomicU16` rotor selects a shard modulo the queue's shard count. Selection is **per `(queue, priority)` sub-batch within a single `insert_*_tx` call** — all rotor-routed rows that share a destination lane in one batch collapse onto the same shard so a 500-row batch issues one sequence-range reservation and one INSERT instead of 500. The rotor advances on each pick, so successive batches spread across shards. This per-batch amortisation is what makes `enqueue_shards > 1` net-faster than `S = 1` at moderate producer concurrency; per-row pick was measured to invert the curve (S>1 slower than S=1) because each batch fanned into S sub-INSERTs.
 
 2. **`InsertOpts::ordering_key` (hash-routed).** When the caller pins a key, `shard_for_ordering_key` maps the key bytes into `[0, shards)` deterministically. Awa uses a portable 64-bit rolling hash implemented in Rust and in the SQL compatibility function, so Rust, SQL, and Python producers route the same key bytes to the same shard without relying on a PostgreSQL extension.
 

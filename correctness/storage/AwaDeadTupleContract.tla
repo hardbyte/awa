@@ -98,6 +98,12 @@ TableSpec == [
     \* TRUNCATE on partition prune.
     ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     ready_tombstones       |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    \* One row per committed ready lane range, not per completion. The
+    \* live row count is bounded by the retained queue-ring slots times
+    \* producer/reroute batch ranges per slot; prune deletes the segment
+    \* rows when it truncates the owning ready slot.
+    ready_segments         |-> [kind |-> "Warm", hot |-> "hot",
+                                bounded_by |-> "retained_ready_slot_lane_ranges"],
     done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     receipt_completion_batches
                            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
@@ -205,6 +211,13 @@ Tables == DOMAIN TableSpec
 \* claim CTE, or a DELETE removed from the completion path).
 
 Mut(op, tbl) == [op |-> op, table |-> tbl]
+
+\* enqueue_params_batch / enqueue_params_copy immediate-ready path.
+\* Ready rows and compact ready segment metadata commit together.
+EnqueueReadyTx == <<
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
+>>
 
 \* claim_runtime_batch (receipts mode) — queue_storage.rs claim CTE
 ClaimReceiptsTx == <<
@@ -314,7 +327,8 @@ CancelReadyTx == <<
 \* age_ready_jobs_tx (reprioritize)
 ReprioritizeReadyTx == <<
     Mut("Insert", "ready_tombstones"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 \* delete_job_compat ready branch. SQL DELETE from the public awa.jobs view
@@ -340,7 +354,8 @@ RetryToDeferredTx == <<
 \* promote_due_state — DELETE deferred_jobs, INSERT ready_entries
 PromoteDeferredTx == <<
     Mut("Delete", "deferred_jobs"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 \* enter_callback_wait — waiting_external is a state on the leases row.
@@ -406,12 +421,14 @@ RetryFromTerminalTx == <<
     Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 RetryFromDlqTx == <<
     Mut("Delete", "dlq_entries"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 PurgeDlqTx == <<
@@ -449,7 +466,8 @@ PruneReadyTx  == <<
     Mut("Truncate", "receipt_completion_batches"),
     Mut("Truncate", "receipt_completion_tombstones"),
     Mut("Truncate", "ready_tombstones"),
-    Mut("Truncate", "queue_terminal_count_deltas")
+    Mut("Truncate", "queue_terminal_count_deltas"),
+    Mut("Delete", "ready_segments")
 >>
 
 TerminalDeltaRollupTx == <<
@@ -471,7 +489,7 @@ PruneClaimsTx  == <<
 >>
 
 Transactions == {
-    ClaimReceiptsTx, ClaimLegacyTx,
+    EnqueueReadyTx, ClaimReceiptsTx, ClaimLegacyTx,
     CompleteReceiptsTx, CompleteLegacyTx,
     CloseReceiptTx, RescueReceiptsTx, RescueReceiptDeadlinesTx, EnsureRunningTx,
     CancelReceiptOnlyTx, CancelRunningTx, CancelReadyTx, DeleteReadyCompatTx,

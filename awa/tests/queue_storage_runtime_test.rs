@@ -614,6 +614,17 @@ async fn ready_tombstone_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64
         .expect("Failed to count ready_tombstones")
 }
 
+async fn ready_segment_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.ready_segments",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count ready_segments")
+}
+
 async fn tombstone_ready_job(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) {
     let schema = store.schema();
     sqlx::query(&format!(
@@ -4603,6 +4614,11 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
         },
     )
     .await;
+    assert_eq!(
+        ready_segment_count(&pool, &store).await,
+        1,
+        "enqueue should append a compact ready segment for claim routing"
+    );
 
     client
         .start()
@@ -5094,6 +5110,192 @@ async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence
     );
 
     tx.rollback().await.expect("rollback reservation holder");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_enqueue_reservation_orders_visibility";
+    let schema = "awa_qs_enqueue_reservation_orders_visibility";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let _job_id = enqueue_job(
+        &pool,
+        &store,
+        &HeartbeatRescueJob { id: 70 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("initial claim should succeed");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].claim.lane_seq, 1);
+
+    let claim_cursor = || async {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT {schema}.sequence_next_value(seq_name)
+             FROM {schema}.queue_claim_heads
+             WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
+        ))
+        .bind(queue)
+        .bind(2_i16)
+        .bind(0_i16)
+        .fetch_one(&pool)
+        .await
+        .expect("claim cursor")
+    };
+    assert_eq!(claim_cursor().await, 2);
+
+    let mut reservation_tx = pool.begin().await.expect("begin enqueue reservation");
+    let reserved: i64 = sqlx::query_scalar(&format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .bind(1_i64)
+    .fetch_one(reservation_tx.as_mut())
+    .await
+    .expect("reserve enqueue sequence");
+    assert_eq!(reserved, 2);
+
+    let later_started = Arc::new(Notify::new());
+    let later_started_task = Arc::clone(&later_started);
+    let later_pool = pool.clone();
+    let later_schema = schema.to_string();
+    let later_queue = queue.to_string();
+    let later = tokio::spawn(async move {
+        let mut tx = later_pool.begin().await.expect("begin later enqueue");
+        later_started_task.notify_one();
+        let lane_seq: i64 = sqlx::query_scalar(&format!(
+            "SELECT {later_schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+        ))
+        .bind(&later_queue)
+        .bind(2_i16)
+        .bind(0_i16)
+        .bind(1_i64)
+        .fetch_one(tx.as_mut())
+        .await
+        .expect("reserve later enqueue sequence");
+
+        let job_id: i64 = sqlx::query_scalar(&format!(
+            "SELECT nextval('{later_schema}.job_id_seq'::regclass)::bigint"
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .expect("allocate later job id");
+        let (ready_slot, ready_generation): (i32, i64) = sqlx::query_as(&format!(
+            "SELECT current_slot, generation
+             FROM {later_schema}.queue_ring_state
+             WHERE singleton = TRUE"
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .expect("current queue ring");
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {later_schema}.ready_entries (
+                ready_slot, ready_generation, job_id, kind, queue, args,
+                priority, attempt, run_lease, max_attempts, lane_seq,
+                enqueue_shard, run_at, attempted_at, created_at,
+                unique_key, unique_states, payload
+            )
+            VALUES (
+                $1, $2, $3, 'heartbeat_rescue_job', $4, '{{"id": 71}}'::jsonb,
+                2, 0, 0, 3, $5,
+                0, clock_timestamp(), NULL, clock_timestamp(),
+                NULL, NULL, '{{}}'::jsonb
+            )
+            "#
+        ))
+        .bind(ready_slot)
+        .bind(ready_generation)
+        .bind(job_id)
+        .bind(&later_queue)
+        .bind(lane_seq)
+        .execute(tx.as_mut())
+        .await
+        .expect("insert later ready row");
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {later_schema}.ready_segments (
+                ready_slot, ready_generation, queue, priority, enqueue_shard,
+                first_lane_seq, next_lane_seq, first_run_at
+            )
+            VALUES ($1, $2, $3, 2, 0, $4, $4 + 1, clock_timestamp())
+            "#
+        ))
+        .bind(ready_slot)
+        .bind(ready_generation)
+        .bind(&later_queue)
+        .bind(lane_seq)
+        .execute(tx.as_mut())
+        .await
+        .expect("insert later ready segment");
+
+        tx.commit().await.expect("commit later enqueue");
+        lane_seq
+    });
+
+    later_started.notified().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !later.is_finished(),
+        "a later enqueue on the same lane must wait while an earlier reservation can still commit"
+    );
+
+    let missed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim against open earlier reservation should not fail");
+    assert!(
+        missed.is_empty(),
+        "claim must not emit a later committed row while an earlier reservation can still commit"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        2,
+        "claim cursor must not advance past an open earlier reservation"
+    );
+
+    reservation_tx
+        .rollback()
+        .await
+        .expect("rollback earlier reservation");
+    let later_lane = tokio::time::timeout(Duration::from_secs(5), later)
+        .await
+        .expect("later enqueue should unblock after rollback")
+        .expect("later enqueue task should succeed");
+    assert_eq!(
+        later_lane, 3,
+        "rolled-back sequence reservations remain gaps, so the next committed lane advances"
+    );
+
+    let claimed_after_rollback = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim after earlier reservation rollback should succeed");
+    assert_eq!(claimed_after_rollback.len(), 1);
+    assert_eq!(claimed_after_rollback[0].claim.lane_seq, 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5889,6 +6091,11 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     assert_eq!(counts_after_prune.available, 0);
     assert_eq!(counts_after_prune.running, 0);
     assert_eq!(counts_after_prune.terminal, 1);
+    assert_eq!(
+        ready_segment_count(&pool, &store).await,
+        0,
+        "queue prune should reclaim ready segment metadata with the ready slot"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
