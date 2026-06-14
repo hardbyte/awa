@@ -12610,22 +12610,13 @@ impl QueueStorage {
         let receipt_tomb_child = receipt_completion_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
 
-        set_prune_lock_timeout_tx(&mut tx).await?;
-
-        let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
-        ))
-        .execute(tx.as_mut())
-        .await;
-
-        if let Err(err) = lock_tables {
-            let _ = tx.rollback().await;
-            if is_lock_contention_error(&err) {
-                return Ok(PruneOutcome::Blocked { slot });
-            }
-            return Err(map_sqlx_error(err));
-        }
-
+        // Queue prune has three common skip gates. Prove them before
+        // taking ACCESS EXCLUSIVE on the ready/terminal child tables:
+        // the target slot is sealed under the queue ring lock, and any
+        // in-flight producer/claimer that already saw this slot must
+        // still hold a conflicting child-table lock. If a gate fires,
+        // skipping here avoids blocking hot claim reads behind a prune
+        // attempt that cannot truncate anyway.
         let active_leases: bool = sqlx::query_scalar(&format!(
             r#"
             SELECT EXISTS (
@@ -12722,6 +12713,22 @@ impl QueueStorage {
                 reason: SkipReason::QueuePendingReady,
                 count: busy_indicator(pending),
             });
+        }
+
+        set_prune_lock_timeout_tx(&mut tx).await?;
+
+        let lock_tables = sqlx::query(&format!(
+            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(tx.as_mut())
+        .await;
+
+        if let Err(err) = lock_tables {
+            let _ = tx.rollback().await;
+            if is_lock_contention_error(&err) {
+                return Ok(PruneOutcome::Blocked { slot });
+            }
+            return Err(map_sqlx_error(err));
         }
 
         let failed_retention_secs = i64::try_from(failed_retention.as_secs()).unwrap_or(i64::MAX);

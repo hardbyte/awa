@@ -399,18 +399,23 @@ RotateReadyPlan(nextSlot) ==
 \* prune_oldest
 \*   SELECT ... FROM queue_ring_state FOR UPDATE
 \*   SELECT ... FROM queue_ring_slots FOR UPDATE
+\*   prove sealed-slot skip gates before child exclusive locks:
+\*     active leases (leases parent), unclosed receipt claims, and pending
+\*     retained ready rows at or beyond the lane cursor
 \*   LOCK TABLE ready/done/tombstone/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
-\*   SELECT count FROM leases WHERE ready_slot = $1 (AccessShare on leases parent)
+\*   skip-gate success returns before the exclusive lock path; the plan
+\*     below models the successful truncate path after those proofs pass
 PruneReadyPlan(slot) ==
     << Step(QueueRingStateResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared),
        Step(ReadyChildResource(slot), ModeExclusive),
        Step(DoneChildResource(slot), ModeExclusive),
        Step(ReadyTombstoneChildResource(slot), ModeExclusive),
        Step(ReceiptBatchChildResource(slot), ModeExclusive),
        Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
-       Step(TerminalDeltaChildResource(slot), ModeExclusive),
-       Step(LeasesParentResource, ModeShared) >>
+       Step(TerminalDeltaChildResource(slot), ModeExclusive) >>
 
 \* rotate_claims (ADR-023)
 \*   SELECT ... FROM claim_ring_state FOR UPDATE
