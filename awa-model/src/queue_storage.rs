@@ -506,6 +506,20 @@ fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closure_batches_{slot}")
 }
 
+fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, AwaError> {
+    let index = usize::try_from(slot).map_err(|_| {
+        AwaError::Validation(format!(
+            "invalid {ring} ring slot {slot}: slot must be non-negative"
+        ))
+    })?;
+    if index >= slot_count {
+        return Err(AwaError::Validation(format!(
+            "invalid {ring} ring slot {slot}: configured slot count is {slot_count}"
+        )));
+    }
+    Ok(index)
+}
+
 fn receipt_closed_evidence_sql(
     schema: &str,
     closure_rel: &str,
@@ -5648,32 +5662,17 @@ impl QueueStorage {
 
         let schema = self.schema();
         let finalized_at = Utc::now();
-        let claim_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.claim_slot).collect();
-        let ready_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.ready_slot).collect();
-        let ready_generations: Vec<i64> = claimed
-            .iter()
-            .map(|entry| entry.claim.ready_generation)
-            .collect();
         let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
-        let queues: Vec<String> = claimed
-            .iter()
-            .map(|entry| entry.job.queue.clone())
-            .collect();
-        let priorities: Vec<i16> = claimed.iter().map(|entry| entry.claim.priority).collect();
-        let attempts: Vec<i16> = claimed.iter().map(|entry| entry.job.attempt).collect();
         let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
-        let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.claim.lane_seq).collect();
-        let enqueue_shards: Vec<i16> = claimed
-            .iter()
-            .map(|entry| entry.claim.enqueue_shard)
-            .collect();
-        let attempted_ats: Vec<Option<DateTime<Utc>>> =
-            claimed.iter().map(|entry| entry.job.attempted_at).collect();
-        let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; claimed.len()];
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-        let closed_evidence =
-            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+        let mut by_partition: BTreeMap<usize, Vec<&ClaimedRuntimeJob>> = BTreeMap::new();
+        for entry in claimed {
+            let claim_slot_index =
+                ring_slot_index(entry.claim.claim_slot, self.claim_slot_count(), "claim")?;
+            by_partition
+                .entry(claim_slot_index)
+                .or_default()
+                .push(entry);
+        }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -5692,243 +5691,275 @@ impl QueueStorage {
             return Err(err);
         }
 
-        let completed = sqlx::query_as(&format!(
-            r#"
-            WITH completed(
-                claim_slot,
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                priority,
-                attempt,
-                run_lease,
-                lane_seq,
-                enqueue_shard,
-                attempted_at,
-                finalized_at
-            ) AS (
-                SELECT *
-                FROM unnest(
-                    $1::int[],
-                    $2::int[],
-                    $3::bigint[],
-                    $4::bigint[],
-                    $5::text[],
-                    $6::smallint[],
-                    $7::smallint[],
-                    $8::bigint[],
-                    $9::bigint[],
-                    $10::smallint[],
-                    $11::timestamptz[],
-                    $12::timestamptz[]
-                )
-            ),
-            locked_claims AS (
-                SELECT claims.claim_slot, claims.job_id, claims.run_lease, claims.receipt_id
-                FROM {schema}.lease_claims AS claims
-                JOIN completed
-                  ON completed.claim_slot = claims.claim_slot
-                 AND completed.job_id = claims.job_id
-                 AND completed.run_lease = claims.run_lease
-                WHERE NOT {closed_evidence}
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.leases AS lease
-                      WHERE lease.job_id = claims.job_id
-                        AND lease.run_lease = claims.run_lease
-                  )
-                FOR UPDATE OF claims
-            ),
-            deleted_attempts AS (
-                DELETE FROM {schema}.attempt_state AS attempt
-                USING locked_claims
-                WHERE attempt.job_id = locked_claims.job_id
-                  AND attempt.run_lease = locked_claims.run_lease
-                RETURNING attempt.job_id
-            ),
-            completed_rows AS (
-                SELECT completed.*, locked_claims.receipt_id
-                FROM completed
-                JOIN locked_claims
-                  ON locked_claims.claim_slot = completed.claim_slot
-                 AND locked_claims.job_id = completed.job_id
-                 AND locked_claims.run_lease = completed.run_lease
-            ),
-            claim_closure_batches AS (
-                INSERT INTO {schema}.lease_claim_closure_batches (
-                    claim_slot,
-                    ready_slot,
-                    ready_generation,
-                    outcome,
-                    closed_count,
-                    receipt_ids,
-                    receipt_ranges,
-                    closed_at
-                )
-                SELECT
-                    completed.claim_slot,
-                    completed.ready_slot,
-                    completed.ready_generation,
-                    'completed',
-                    count(*)::int AS closed_count,
-                    array_agg(completed.receipt_id ORDER BY completed.lane_seq, completed.job_id),
-                    range_agg(int8range(completed.receipt_id, completed.receipt_id + 1, '[)') ORDER BY completed.receipt_id),
-                    max(completed.finalized_at)
-                FROM completed_rows AS completed
-                GROUP BY
-                    completed.claim_slot,
-                    completed.ready_slot,
-                    completed.ready_generation
-                RETURNING claim_slot, ready_slot, ready_generation, receipt_ids
-            ),
-            terminal AS (
-                INSERT INTO {schema}.receipt_completion_batches (
-                    ready_slot,
-                    ready_generation,
-                    claim_slot,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    completed_count,
-                    job_ids,
-                    run_leases,
-                    lane_seqs,
-                    attempts,
-                    attempted_ats,
-                    finalized_at
-                )
-                SELECT
-                    completed.ready_slot,
-                    completed.ready_generation,
-                    completed.claim_slot,
-                    completed.queue,
-                    completed.priority,
-                    completed.enqueue_shard,
-                    count(*)::int AS completed_count,
-                    array_agg(completed.job_id ORDER BY completed.lane_seq, completed.job_id),
-                    array_agg(completed.run_lease ORDER BY completed.lane_seq, completed.job_id),
-                    array_agg(completed.lane_seq ORDER BY completed.lane_seq, completed.job_id),
-                    array_agg(completed.attempt ORDER BY completed.lane_seq, completed.job_id),
-                    array_agg(completed.attempted_at ORDER BY completed.lane_seq, completed.job_id),
-                    max(completed.finalized_at)
-                FROM completed_rows AS completed
-                GROUP BY
-                    completed.ready_slot,
-                    completed.ready_generation,
-                    completed.claim_slot,
-                    completed.queue,
-                    completed.priority,
-                    completed.enqueue_shard
-                RETURNING
-                    ready_slot,
-                    ready_generation,
-                    claim_slot,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    job_ids,
-                    run_leases
-            ),
-            terminal_rows AS (
-                SELECT completed_rows.*
-                FROM completed_rows
-            ),
-            counted AS (
-                SELECT
-                    terminal_rows.ready_slot,
-                    terminal_rows.ready_generation,
-                    terminal_rows.job_id,
-                    terminal_rows.run_lease,
-                    terminal_rows.queue,
-                    terminal_rows.priority,
-                    terminal_rows.enqueue_shard
-                FROM terminal_rows
-                JOIN terminal
-                  ON terminal.ready_slot = terminal_rows.ready_slot
-                 AND terminal.ready_generation = terminal_rows.ready_generation
-                 AND terminal.claim_slot = terminal_rows.claim_slot
-                 AND terminal.queue = terminal_rows.queue
-                 AND terminal.priority = terminal_rows.priority
-                 AND terminal.enqueue_shard = terminal_rows.enqueue_shard
-                 AND terminal.job_ids @> ARRAY[terminal_rows.job_id]
-            ),
-            -- Terminal counts use an append-only delta ledger on the hot
-            -- completion path. Maintenance folds these rows into
-            -- queue_terminal_live_counts later; exact reads sum both sources.
-            counter_delta AS (
-                INSERT INTO {schema}.queue_terminal_count_deltas (
-                    ready_slot,
-                    ready_generation,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    counter_bucket,
-                    terminal_delta
-                )
-                SELECT
-                    ready_slot,
-                    ready_generation,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    counter_bucket,
-                    delta
-                FROM (
-                    SELECT
-                        counted.ready_slot,
-                        counted.ready_generation,
-                        counted.queue,
-                        counted.priority,
-                        counted.enqueue_shard,
-                        mod(
-                            mod(counted.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                                + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                            {TERMINAL_COUNTER_BUCKETS}::bigint
-                        )::smallint AS counter_bucket,
-                        count(*)::bigint AS delta
-                    FROM counted
-                    GROUP BY
-                        counted.ready_slot,
-                        counted.ready_generation,
-                        counted.queue,
-                        counted.priority,
-                        counted.enqueue_shard,
-                        counter_bucket
-                ) AS grouped
-                ORDER BY ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket
-                RETURNING 1
-            )
-            SELECT job_id, run_lease
-            FROM counted
-            CROSS JOIN (SELECT count(*) FROM claim_closure_batches) AS closure_batch_write
-            "#
-        ))
-        .bind(&claim_slots)
-        .bind(&ready_slots)
-        .bind(&ready_generations)
-        .bind(&job_ids)
-        .bind(&queues)
-        .bind(&priorities)
-        .bind(&attempts)
-        .bind(&run_leases)
-        .bind(&lane_seqs)
-        .bind(&enqueue_shards)
-        .bind(&attempted_ats)
-        .bind(&finalized_ats)
-        .fetch_all(tx.as_mut())
-        .await;
+        let mut rows = Vec::with_capacity(claimed.len());
+        for (claim_slot_index, group) in by_partition {
+            let claim_rel = claim_child_name(schema, claim_slot_index);
+            let closure_rel = closure_child_name(schema, claim_slot_index);
+            let closure_batch_rel = claim_closure_batch_child_name(schema, claim_slot_index);
+            let receipt_batch_rel = format!("{schema}.receipt_completion_batches");
+            let delta_rel = format!("{schema}.queue_terminal_count_deltas");
+            let closed_evidence =
+                receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
 
-        match completed {
-            Ok(rows) => {
-                tx.commit().await.map_err(map_sqlx_error)?;
-                Ok(rows)
-            }
-            Err(err) => {
-                let _ = tx.rollback().await;
-                Err(map_sqlx_error(err))
-            }
+            let claim_slots: Vec<i32> = group.iter().map(|entry| entry.claim.claim_slot).collect();
+            let ready_slots: Vec<i32> = group.iter().map(|entry| entry.claim.ready_slot).collect();
+            let ready_generations: Vec<i64> = group
+                .iter()
+                .map(|entry| entry.claim.ready_generation)
+                .collect();
+            let job_ids: Vec<i64> = group.iter().map(|entry| entry.job.id).collect();
+            let queues: Vec<String> = group.iter().map(|entry| entry.job.queue.clone()).collect();
+            let priorities: Vec<i16> = group.iter().map(|entry| entry.claim.priority).collect();
+            let attempts: Vec<i16> = group.iter().map(|entry| entry.job.attempt).collect();
+            let run_leases: Vec<i64> = group.iter().map(|entry| entry.job.run_lease).collect();
+            let lane_seqs: Vec<i64> = group.iter().map(|entry| entry.claim.lane_seq).collect();
+            let enqueue_shards: Vec<i16> = group
+                .iter()
+                .map(|entry| entry.claim.enqueue_shard)
+                .collect();
+            let attempted_ats: Vec<Option<DateTime<Utc>>> =
+                group.iter().map(|entry| entry.job.attempted_at).collect();
+            let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; group.len()];
+
+            let completed: Vec<(i64, i64)> = match sqlx::query_as(&format!(
+                r#"
+                WITH completed(
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    queue,
+                    priority,
+                    attempt,
+                    run_lease,
+                    lane_seq,
+                    enqueue_shard,
+                    attempted_at,
+                    finalized_at
+                ) AS (
+                    SELECT *
+                    FROM unnest(
+                        $1::int[],
+                        $2::int[],
+                        $3::bigint[],
+                        $4::bigint[],
+                        $5::text[],
+                        $6::smallint[],
+                        $7::smallint[],
+                        $8::bigint[],
+                        $9::bigint[],
+                        $10::smallint[],
+                        $11::timestamptz[],
+                        $12::timestamptz[]
+                    )
+                ),
+                locked_claims AS (
+                    SELECT claims.claim_slot, claims.job_id, claims.run_lease, claims.receipt_id
+                    FROM {claim_rel} AS claims
+                    JOIN completed
+                      ON completed.claim_slot = claims.claim_slot
+                     AND completed.job_id = claims.job_id
+                     AND completed.run_lease = claims.run_lease
+                    WHERE NOT {closed_evidence}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.leases AS lease
+                          WHERE lease.job_id = claims.job_id
+                            AND lease.run_lease = claims.run_lease
+                      )
+                    FOR UPDATE OF claims
+                ),
+                deleted_attempts AS (
+                    DELETE FROM {schema}.attempt_state AS attempt
+                    USING locked_claims
+                    WHERE attempt.job_id = locked_claims.job_id
+                      AND attempt.run_lease = locked_claims.run_lease
+                    RETURNING attempt.job_id
+                ),
+                completed_rows AS (
+                    SELECT completed.*, locked_claims.receipt_id
+                    FROM completed
+                    JOIN locked_claims
+                      ON locked_claims.claim_slot = completed.claim_slot
+                     AND locked_claims.job_id = completed.job_id
+                     AND locked_claims.run_lease = completed.run_lease
+                ),
+                claim_closure_batches AS (
+                    INSERT INTO {closure_batch_rel} (
+                        claim_slot,
+                        ready_slot,
+                        ready_generation,
+                        outcome,
+                        closed_count,
+                        receipt_ids,
+                        receipt_ranges,
+                        closed_at
+                    )
+                    SELECT
+                        completed.claim_slot,
+                        completed.ready_slot,
+                        completed.ready_generation,
+                        'completed',
+                        count(*)::int AS closed_count,
+                        array_agg(completed.receipt_id ORDER BY completed.lane_seq, completed.job_id),
+                        range_agg(int8range(completed.receipt_id, completed.receipt_id + 1, '[)') ORDER BY completed.receipt_id),
+                        max(completed.finalized_at)
+                    FROM completed_rows AS completed
+                    GROUP BY
+                        completed.claim_slot,
+                        completed.ready_slot,
+                        completed.ready_generation
+                    RETURNING claim_slot, ready_slot, ready_generation, receipt_ids
+                ),
+                terminal AS (
+                    INSERT INTO {receipt_batch_rel} (
+                        ready_slot,
+                        ready_generation,
+                        claim_slot,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        completed_count,
+                        job_ids,
+                        run_leases,
+                        lane_seqs,
+                        attempts,
+                        attempted_ats,
+                        finalized_at
+                    )
+                    SELECT
+                        completed.ready_slot,
+                        completed.ready_generation,
+                        completed.claim_slot,
+                        completed.queue,
+                        completed.priority,
+                        completed.enqueue_shard,
+                        count(*)::int AS completed_count,
+                        array_agg(completed.job_id ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.run_lease ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.lane_seq ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.attempt ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.attempted_at ORDER BY completed.lane_seq, completed.job_id),
+                        max(completed.finalized_at)
+                    FROM completed_rows AS completed
+                    GROUP BY
+                        completed.ready_slot,
+                        completed.ready_generation,
+                        completed.claim_slot,
+                        completed.queue,
+                        completed.priority,
+                        completed.enqueue_shard
+                    RETURNING
+                        ready_slot,
+                        ready_generation,
+                        claim_slot,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        job_ids,
+                        run_leases
+                ),
+                terminal_rows AS (
+                    SELECT completed_rows.*
+                    FROM completed_rows
+                ),
+                counted AS (
+                    SELECT
+                        terminal_rows.ready_slot,
+                        terminal_rows.ready_generation,
+                        terminal_rows.job_id,
+                        terminal_rows.run_lease,
+                        terminal_rows.queue,
+                        terminal_rows.priority,
+                        terminal_rows.enqueue_shard
+                    FROM terminal_rows
+                    JOIN terminal
+                      ON terminal.ready_slot = terminal_rows.ready_slot
+                     AND terminal.ready_generation = terminal_rows.ready_generation
+                     AND terminal.claim_slot = terminal_rows.claim_slot
+                     AND terminal.queue = terminal_rows.queue
+                     AND terminal.priority = terminal_rows.priority
+                     AND terminal.enqueue_shard = terminal_rows.enqueue_shard
+                     AND terminal.job_ids @> ARRAY[terminal_rows.job_id]
+                ),
+                -- Terminal counts use an append-only delta ledger on the hot
+                -- completion path. Maintenance folds these rows into
+                -- queue_terminal_live_counts later; exact reads sum both sources.
+                counter_delta AS (
+                    INSERT INTO {delta_rel} (
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        counter_bucket,
+                        terminal_delta
+                    )
+                    SELECT
+                        ready_slot,
+                        ready_generation,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        counter_bucket,
+                        delta
+                    FROM (
+                        SELECT
+                            counted.ready_slot,
+                            counted.ready_generation,
+                            counted.queue,
+                            counted.priority,
+                            counted.enqueue_shard,
+                            mod(
+                                mod(counted.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
+                                    + {TERMINAL_COUNTER_BUCKETS}::bigint,
+                                {TERMINAL_COUNTER_BUCKETS}::bigint
+                            )::smallint AS counter_bucket,
+                            count(*)::bigint AS delta
+                        FROM counted
+                        GROUP BY
+                            counted.ready_slot,
+                            counted.ready_generation,
+                            counted.queue,
+                            counted.priority,
+                            counted.enqueue_shard,
+                            counter_bucket
+                    ) AS grouped
+                    ORDER BY ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket
+                    RETURNING 1
+                )
+                SELECT job_id, run_lease
+                FROM counted
+                CROSS JOIN (SELECT count(*) FROM claim_closure_batches) AS closure_batch_write
+                "#
+            ))
+            .bind(&claim_slots)
+            .bind(&ready_slots)
+            .bind(&ready_generations)
+            .bind(&job_ids)
+            .bind(&queues)
+            .bind(&priorities)
+            .bind(&attempts)
+            .bind(&run_leases)
+            .bind(&lane_seqs)
+            .bind(&enqueue_shards)
+            .bind(&attempted_ats)
+            .bind(&finalized_ats)
+            .fetch_all(tx.as_mut())
+            .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(map_sqlx_error(err));
+                }
+            };
+
+            rows.extend(completed);
         }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(rows)
     }
 
     #[tracing::instrument(
@@ -12407,6 +12438,44 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
+        let ready_child = ready_child_name(schema, slot as usize);
+        let pending_ready: bool = sqlx::query_scalar(&format!(
+            r#"
+            WITH claim_cursors AS MATERIALIZED (
+                SELECT
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    {schema}.sequence_next_value(seq_name) AS claim_seq
+                FROM {schema}.queue_claim_heads
+            )
+            SELECT EXISTS (
+                SELECT 1
+                FROM claim_cursors AS claims
+                CROSS JOIN LATERAL (
+                    SELECT 1
+                    FROM {ready_child} AS ready
+                    WHERE ready.ready_generation = $1
+                      AND ready.queue = claims.queue
+                      AND ready.priority = claims.priority
+                      AND ready.enqueue_shard = claims.enqueue_shard
+                      AND ready.lane_seq >= claims.claim_seq
+                    LIMIT 1
+                ) AS pending_ready
+                LIMIT 1
+            )
+            "#
+        ))
+        .bind(generation)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if pending_ready {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::SkippedActive);
+        }
+
         set_prune_lock_timeout_tx(&mut tx).await?;
 
         let lock_delta = sqlx::query(&format!(
@@ -12427,27 +12496,15 @@ impl QueueStorage {
             }
         }
 
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-        let closed_evidence =
-            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
-        let active_refs: i64 = sqlx::query_scalar(&format!(
+        let active_leases: bool = sqlx::query_scalar(&format!(
             r#"
-            SELECT
-                COALESCE((
-                    SELECT count(*)::bigint
-                    FROM {schema}.leases
-                    WHERE ready_slot = $1
-                      AND ready_generation = $2
-                ), 0)
-                +
-                COALESCE((
-                    SELECT count(*)::bigint
-                    FROM {schema}.lease_claims AS claims
-                    WHERE claims.ready_slot = $1
-                      AND claims.ready_generation = $2
-                      AND NOT {closed_evidence}
-                ), 0)
+            SELECT EXISTS (
+                SELECT 1
+                FROM {schema}.leases
+                WHERE ready_slot = $1
+                  AND ready_generation = $2
+                LIMIT 1
+            )
             "#
         ))
         .bind(slot)
@@ -12456,7 +12513,72 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if active_refs > 0 {
+        if active_leases {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::SkippedActive);
+        }
+
+        let count_proves_claim_refs_closed: bool = sqlx::query_scalar(&format!(
+            r#"
+            WITH claim_count AS (
+                SELECT count(*)::bigint AS total
+                FROM {schema}.lease_claims AS claims
+                WHERE claims.ready_slot = $1
+                  AND claims.ready_generation = $2
+            ),
+            explicit_count AS (
+                SELECT count(*)::bigint AS total
+                FROM {schema}.lease_claims AS claims
+                JOIN {schema}.lease_claim_closures AS closures
+                  ON closures.claim_slot = claims.claim_slot
+                 AND closures.job_id = claims.job_id
+                 AND closures.run_lease = claims.run_lease
+                WHERE claims.ready_slot = $1
+                  AND claims.ready_generation = $2
+            ),
+            compact_count AS (
+                SELECT COALESCE(sum(closed_count), 0)::bigint AS total
+                FROM {schema}.lease_claim_closure_batches AS batches
+                WHERE batches.ready_slot = $1
+                  AND batches.ready_generation = $2
+            )
+            SELECT claim_count.total = explicit_count.total + compact_count.total
+            FROM claim_count, explicit_count, compact_count
+            "#
+        ))
+        .bind(slot)
+        .bind(generation)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let closure_rel = format!("{schema}.lease_claim_closures");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+        let unclosed_claim_refs: bool = if count_proves_claim_refs_closed {
+            false
+        } else {
+            sqlx::query_scalar(&format!(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {schema}.lease_claims AS claims
+                    WHERE claims.ready_slot = $1
+                      AND claims.ready_generation = $2
+                      AND NOT {closed_evidence}
+                    LIMIT 1
+                )
+                "#
+            ))
+            .bind(slot)
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+        };
+
+        if unclosed_claim_refs {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(TerminalDeltaSlotRollup::SkippedActive);
         }
@@ -12664,6 +12786,47 @@ impl QueueStorage {
             });
         }
 
+        let pending: bool = sqlx::query_scalar(&format!(
+            r#"
+            WITH claim_cursors AS MATERIALIZED (
+                SELECT
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    {schema}.sequence_next_value(seq_name) AS claim_seq
+                FROM {schema}.queue_claim_heads
+            )
+            SELECT EXISTS (
+                SELECT 1
+                FROM claim_cursors AS claims
+                CROSS JOIN LATERAL (
+                    SELECT 1
+                    FROM {ready_child} AS ready
+                    WHERE ready.ready_generation = $1
+                      AND ready.queue = claims.queue
+                      AND ready.priority = claims.priority
+                      AND ready.enqueue_shard = claims.enqueue_shard
+                      AND ready.lane_seq >= claims.claim_seq
+                    LIMIT 1
+                ) AS pending_ready
+                LIMIT 1
+            )
+            "#
+        ))
+        .bind(generation)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if pending {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueuePendingReady,
+                count: busy_indicator(pending),
+            });
+        }
+
         let closure_rel = format!("{schema}.lease_claim_closures");
         let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
         let closed_evidence =
@@ -12729,47 +12892,6 @@ impl QueueStorage {
                 slot,
                 reason: SkipReason::QueueUnclosedClaimRefs,
                 count: busy_indicator(unclosed_claim_refs),
-            });
-        }
-
-        let pending: bool = sqlx::query_scalar(&format!(
-            r#"
-            WITH claim_cursors AS MATERIALIZED (
-                SELECT
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    {schema}.sequence_next_value(seq_name) AS claim_seq
-                FROM {schema}.queue_claim_heads
-            )
-            SELECT EXISTS (
-                SELECT 1
-                FROM claim_cursors AS claims
-                CROSS JOIN LATERAL (
-                    SELECT 1
-                    FROM {ready_child} AS ready
-                    WHERE ready.ready_generation = $1
-                      AND ready.queue = claims.queue
-                      AND ready.priority = claims.priority
-                      AND ready.enqueue_shard = claims.enqueue_shard
-                      AND ready.lane_seq >= claims.claim_seq
-                    LIMIT 1
-                ) AS pending_ready
-                LIMIT 1
-            )
-            "#
-        ))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if pending {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::QueuePendingReady,
-                count: busy_indicator(pending),
             });
         }
 

@@ -71,7 +71,7 @@ Most applications should use the Rust, Python, CLI, or UI APIs rather than query
 | `ready_tombstones_*` | Physical ledger for ready lanes made unavailable by cancellation, priority aging, or similar out-of-band ready mutations. | Internal storage. Claim treats matching rows as spent lane evidence and exact-count paths skip them; maintenance truncates it with the matching ready segment. |
 | `ready_segments` | Compact control-plane map from committed ready lane ranges to their ready slot/generation. | Internal storage. Claim uses it to choose the target ready segment before validating `ready_entries_*`; ranges are split when the lane-head `run_at` timestamp changes so claim-time priority aging stays exact as the cursor advances; prune deletes rows for the ready slot it has reclaimed. |
 | `done_entries_*` | Physical terminal fact ring for failed, cancelled, non-receipt, and wide terminal rows. Ready-backed rows can intentionally omit duplicated body columns. | Internal storage. Direct readers must tolerate nullable duplicated body fields and must not assume all completed rows are present here; use `{schema}.terminal_jobs` for hydrated terminal rows. |
-| `receipt_completion_batches_*` | Compact physical terminal history for successful receipt-backed completions. Each row stores one completion batch and expands through `{schema}.terminal_jobs`. | Internal storage. Optimized for hot-path append and queue-ring truncate; not a public query surface. Claim-closure proof for these completions lives in `lease_claim_closure_batches_*`. |
+| `receipt_completion_batches_*` | Compact physical terminal history for successful receipt-backed completions. Each row stores one completion batch and expands through `{schema}.terminal_jobs`. | Internal storage. Optimized for hot-path append and queue-ring truncate; not a public query surface. Claim-closure proof for these completions lives in claim-slot-local `lease_claim_closure_batches_*` rows. |
 | `receipt_completion_tombstones_*` | Cold deletion ledger for completed rows synthesized from `receipt_completion_batches_*`. | Internal storage. SQL compatibility delete writes here so `terminal_jobs` can hide a compact completed row without mutating the compact batch. |
 | `queue_terminal_count_deltas_*` | Append-only signed terminal-count ledger. Terminal inserts append positive deltas; retry, discard, DLQ move, and compatibility delete append negative deltas. | Internal derived storage. Exact count reads include pending deltas; maintenance folds sealed-slot deltas into `queue_terminal_live_counts` and prune truncates the matching delta segment. |
 | `queue_terminal_live_counts`, `queue_terminal_rollups` | Folded terminal counters for retained and pruned queue segments. | Internal derived storage. Rebuild from `{schema}.terminal_jobs` if the trust marker is cleared or after a counter incident. |
@@ -199,7 +199,7 @@ Queue storage has three independent rings, each advanced by the elected maintena
 
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 | --- | --- | --: | --- | --- |
-| Queue | `ready_entries_*`, `ready_tombstones_*`, `ready_segments`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/terminal/tombstone/delta slot is empty | oldest non-current slot has no active leases, no retained ready rows at or ahead of their lane claim cursors, and no receipt claims without closure evidence; terminal rows, compact completion batches, tombstones, ready-segment metadata, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
+| Queue | `ready_entries_*`, `ready_tombstones_*`, `ready_segments`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/terminal/tombstone/delta slot is empty | oldest non-current slot has no active leases, no retained ready rows at or ahead of their lane claim cursors, and no receipt claims without closure evidence; pending-ready and active-lease gates are checked before expensive closure-proof and exclusive-lock work; terminal rows, compact completion batches, tombstones, ready-segment metadata, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `1000ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*`, `lease_claim_closure_batches_*` | matches queue ring | incoming claims/closures/closure-batches slot is empty | every claim in the oldest non-current slot has durable closure evidence; count proofs use compact closure-batch ready-segment metadata before falling back to per-claim membership checks; stale-rescue cursors are reset when the slot is truncated |
 
@@ -209,9 +209,10 @@ The common safety pattern is:
 
 1. Lock the ring-state row with `FOR UPDATE`.
 2. Choose the incoming or oldest initialized slot.
-3. Take child-table `ACCESS EXCLUSIVE` locks with `NOWAIT` in automatic prune paths so maintenance gives up immediately under contention.
-4. Recheck liveness after acquiring the partition lock.
-5. `TRUNCATE` only partitions that are proven inactive.
+3. Prove cheap skip gates before the exclusive-lock path where the target slot is already sealed by the ring lock. Queue prune checks active leases and pending ready lanes before receipt-closure proof; claim prune proves open-claim closure before child locks.
+4. Take child-table `ACCESS EXCLUSIVE` locks with `NOWAIT` in automatic prune paths so maintenance gives up immediately under contention.
+5. Recheck liveness after acquiring the partition lock.
+6. `TRUNCATE` only partitions that are proven inactive.
 
 This is why queue storage's hot-path reclamation is a rotation-and-prune discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the canonical compatibility path.
 
