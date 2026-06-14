@@ -8749,6 +8749,7 @@ impl QueueStorage {
                 FROM {claim_child} AS claims
                 CROSS JOIN cursor_row
                 WHERE claims.claim_slot = $1
+                  AND claims.claimed_at < $2
                   AND (claims.claimed_at, claims.job_id, claims.run_lease)
                       > (
                           cursor_row.rescue_cursor_claimed_at,
@@ -8774,6 +8775,7 @@ impl QueueStorage {
                 CROSS JOIN after_count
                 WHERE after_count.count < $3
                   AND claims.claim_slot = $1
+                  AND claims.claimed_at < $2
                   AND (claims.claimed_at, claims.job_id, claims.run_lease)
                       <= (
                           cursor_row.rescue_cursor_claimed_at,
@@ -9055,6 +9057,7 @@ impl QueueStorage {
                 CROSS JOIN cursor_row
                 WHERE claims.claim_slot = $1
                   AND claims.deadline_at IS NOT NULL
+                  AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       > (
                           cursor_row.deadline_cursor_deadline_at,
@@ -9081,6 +9084,7 @@ impl QueueStorage {
                 WHERE after_count.count < $2
                   AND claims.claim_slot = $1
                   AND claims.deadline_at IS NOT NULL
+                  AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       <= (
                           cursor_row.deadline_cursor_deadline_at,

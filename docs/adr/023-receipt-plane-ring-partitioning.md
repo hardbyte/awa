@@ -63,11 +63,11 @@ Apply ADR-019's rotation-and-prune pattern to the receipt plane. Remove `open_re
 Every read that currently targets `open_receipt_claims` becomes a bounded read over the active `lease_claims` child partitions, anti-joined with durable closure evidence. Evidence can be an explicit `lease_claim_closures` row, a matching compact `lease_claim_closure_batches` item, or durable disposition rows retained for older rows:
 
 - "Is `(job_id, run_lease)` still open?" — PK lookup into active claim partitions, anti-join durable closure evidence. Used by the completion guard and by `load_job` on receipt-backed attempts.
-- "Scan stale receipt claims for rescue." — per-slot cursor scan ordered by `(claimed_at, job_id, run_lease)`, anti-join durable closure evidence and materialized leases, and close stale candidates by appending rescue closures.
-- "Scan expired receipt deadlines for rescue." — independent per-slot cursor scan ordered by `(deadline_at, job_id, run_lease)`, anti-join durable closure evidence and materialized leases, close expired open receipt claims by appending `deadline_expired` closures, and stop before the first open future-deadline claim.
+- "Scan stale receipt claims for rescue." — per-slot cursor scan ordered by `(claimed_at, job_id, run_lease)`, limited to claims old enough to be rescue candidates, anti-join durable closure evidence and materialized leases, and close stale candidates by appending rescue closures.
+- "Scan expired receipt deadlines for rescue." — independent per-slot cursor scan ordered by `(deadline_at, job_id, run_lease)`, limited to claims whose deadline has already passed, anti-join durable closure evidence and materialized leases, and close expired open receipt claims by appending `deadline_expired` closures.
 - "Count in-flight receipt-backed attempts." — count active-partition rows minus matching closure or durable disposition evidence.
 
-Both rescue cursors are bounded cyclic sweeps. Each pass scans forward from the cursor and wraps to the start of the partition when it reaches the end. Stale rescue can advance over closed claims, materialized lease-plane claims, fresh claims, and claims it closes in the current rescue transaction; it stops before a stale open claim that it did not close. Deadline rescue can advance over closed claims, materialized lease-plane claims, and claims it closes in the current rescue transaction; it stops before an open future-deadline claim because earlier deadlines must be resolved before later deadlines matter. These cursors keep liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune, without reintroducing a mutable open-receipt frontier.
+Both rescue cursors are bounded cyclic sweeps. Each pass scans forward from the cursor and wraps to the start of the partition when it reaches the end, but it does not visit rows that are too new to be candidates for that rescue class. Stale rescue can advance over closed claims, materialized lease-plane claims, old claims with fresh heartbeat evidence, and claims it closes in the current rescue transaction; it stops before a stale open claim that it did not close. Deadline rescue can advance over closed claims, materialized lease-plane claims, and claims it closes in the current rescue transaction. These cursors keep liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune, without making every tick re-prove claims that are not yet old or expired enough to rescue.
 
 ### Rotation and prune
 
@@ -78,7 +78,7 @@ Both rescue cursors are bounded cyclic sweeps. Each pass scans forward from the 
   1. `FOR UPDATE` on `claim_ring_state`.
   2. `FOR UPDATE` on the target `claim_ring_slots` row.
   3. `ACCESS EXCLUSIVE NOWAIT` on all claim-ring partitions for that slot (claims, explicit closures, and compact closure batches).
-  4. Liveness recheck: every claim must have a closure, then reset the slot's rescue cursor and `TRUNCATE`.
+  4. Liveness recheck: every claim must have durable closure evidence, then reset the slot's rescue cursor and `TRUNCATE`.
 - Partition truncation never races with claim because claim always writes to the ring's current slot and rotation advances the current slot atomically under the same lock order.
 
 ### Invariants preserved
@@ -157,7 +157,7 @@ This ADR has been implemented for 0.6:
 
 - `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` are partitioned by `claim_slot`.
 - `claim_ring_state` and `claim_ring_slots` control rotation and prune.
-- `claim_ring_slots` stores per-slot stale-rescue and deadline-rescue sweep cursors so maintenance walks receipt history in bounded cyclic windows without reintroducing a per-claim mutable frontier. The stale sweep can pass fresh claims and revisit them after wrap; stale open claims stop advancement until rescue closes them. The deadline sweep is ordered by `deadline_at`, closes expired receipt-only claims, and stops before the first open future-deadline claim.
+- `claim_ring_slots` stores per-slot stale-rescue and deadline-rescue sweep cursors so maintenance walks receipt history in bounded cyclic windows without reintroducing a per-claim mutable frontier. The stale sweep visits only claims old enough for the rescue cutoff; within that window it can pass claims whose heartbeat evidence is fresh and revisit them after wrap. Stale open claims stop advancement until rescue closes them. The deadline sweep visits only expired receipt deadlines and closes expired receipt-only claims.
 - `open_receipt_claims` is removed from fresh installs and is no longer a hot path table.
 - `lease_claim_receipts` defaults to `true`.
 - Successful compact receipt completion writes compact terminal history plus compact claim-local closure evidence. SQL compatibility delete hides compact completed rows by writing `receipt_completion_tombstones`, without mutating the compact terminal batch or reopening the receipt.
