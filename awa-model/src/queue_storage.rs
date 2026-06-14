@@ -1461,7 +1461,66 @@ struct ReadySegmentInsert {
     enqueue_shard: i16,
     first_lane_seq: i64,
     next_lane_seq: i64,
+    /// `run_at` for every row in this segment. Segment construction splits on
+    /// `run_at` so claim-time priority aging stays exact after the claim cursor
+    /// advances inside a multi-row segment.
     first_run_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod ready_segment_tests {
+    use super::{QueueStorage, RuntimeReadyInsert};
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn ready_row(lane_seq: i64, run_at: chrono::DateTime<Utc>) -> RuntimeReadyInsert {
+        RuntimeReadyInsert {
+            job_id: lane_seq,
+            kind: "segment_test".to_string(),
+            queue: "segment-q".to_string(),
+            args: serde_json::json!({}),
+            priority: 2,
+            attempt: 0,
+            run_lease: 0,
+            max_attempts: 25,
+            run_at,
+            attempted_at: None,
+            lane_seq,
+            enqueue_shard: 0,
+            created_at: run_at,
+            unique_key: None,
+            unique_states: None,
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn ready_segments_split_on_run_at_boundaries() {
+        let first = Utc
+            .with_ymd_and_hms(2026, 6, 14, 12, 0, 0)
+            .single()
+            .expect("valid test timestamp");
+        let second = first + Duration::seconds(1);
+        let rows = vec![
+            ready_row(1, first),
+            ready_row(2, first),
+            ready_row(3, second),
+            ready_row(4, first),
+        ];
+
+        let segments = QueueStorage::ready_segments_from_rows(&rows);
+        let ranges: Vec<_> = segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.first_lane_seq,
+                    segment.next_lane_seq,
+                    segment.first_run_at,
+                )
+            })
+            .collect();
+
+        assert_eq!(ranges, vec![(1, 3, first), (3, 4, second), (4, 5, first)]);
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -3534,6 +3593,7 @@ impl QueueStorage {
                     || previous.priority != current.priority
                     || previous.enqueue_shard != current.enqueue_shard
                     || previous.lane_seq + 1 != current.lane_seq
+                    || previous.run_at != current.run_at
             };
 
             if split {

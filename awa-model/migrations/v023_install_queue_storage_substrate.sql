@@ -440,6 +440,12 @@ BEGIN
     );
 
     EXECUTE format(
+        'COMMENT ON COLUMN %I.ready_segments.first_run_at IS %L',
+        p_schema,
+        'run_at timestamp shared by rows in this segment; segment construction splits on run_at so claim-time priority aging remains exact as the claim cursor advances inside the segment.'
+    );
+
+    EXECUTE format(
         'CREATE INDEX IF NOT EXISTS idx_%s_ready_segments_lane_next ON %I.ready_segments (queue, priority, enqueue_shard, next_lane_seq, first_lane_seq)',
         p_schema, p_schema
     );
@@ -1856,10 +1862,13 @@ BEGIN
     END LOOP;
 
     -- Backfill ready segment metadata for existing committed ready rows.
-    -- Runtime enqueue writes one segment per contiguous lane range, but
-    -- upgraded schemas can already contain ready rows before the table
-    -- existed. Segment rows are compact control-plane metadata; they are
-    -- deleted when the owning ready slot is pruned.
+    -- Runtime enqueue writes one segment per contiguous lane range with the
+    -- same run_at. Claim computes priority aging from this compact metadata,
+    -- so splitting on run_at keeps the lane-head aging timestamp exact even
+    -- after the claim cursor advances inside a multi-row segment. Upgraded
+    -- schemas can already contain ready rows before the table existed.
+    -- Segment rows are compact control-plane metadata; they are deleted when
+    -- the owning ready slot is pruned.
     EXECUTE format(
         $ddl$
         WITH ordered AS (
@@ -1872,7 +1881,7 @@ BEGIN
                 lane_seq,
                 run_at,
                 lane_seq - row_number() OVER (
-                    PARTITION BY ready_slot, ready_generation, queue, priority, enqueue_shard
+                    PARTITION BY ready_slot, ready_generation, queue, priority, enqueue_shard, run_at
                     ORDER BY lane_seq
                 )::bigint AS contiguous_group
             FROM %1$I.ready_entries
@@ -1886,7 +1895,7 @@ BEGIN
                 enqueue_shard,
                 min(lane_seq)::bigint AS first_lane_seq,
                 (max(lane_seq) + 1)::bigint AS next_lane_seq,
-                (array_agg(run_at ORDER BY lane_seq))[1] AS first_run_at
+                run_at AS first_run_at
             FROM ordered
             GROUP BY
                 ready_slot,
@@ -1894,6 +1903,7 @@ BEGIN
                 queue,
                 priority,
                 enqueue_shard,
+                run_at,
                 contiguous_group
         )
         INSERT INTO %1$I.ready_segments (
