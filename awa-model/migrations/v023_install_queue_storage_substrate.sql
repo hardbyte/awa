@@ -1339,8 +1339,8 @@ BEGIN
     );
 
     --------------------------------------------------------------------
-    -- Attempt state, ready_entries, ready_tombstones, done_entries,
-    -- deferred_jobs, dlq_entries.
+    -- Attempt state, ready_entries, ready_claim_attempts,
+    -- ready_tombstones, done_entries, deferred_jobs, dlq_entries.
     --------------------------------------------------------------------
 
     EXECUTE format(
@@ -1422,6 +1422,42 @@ BEGIN
         ) PARTITION BY LIST (ready_slot)
         $ddl$,
         p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.ready_claim_attempts (
+            ready_slot       INT NOT NULL,
+            ready_generation BIGINT NOT NULL,
+            queue            TEXT NOT NULL,
+            priority         SMALLINT NOT NULL,
+            enqueue_shard    SMALLINT NOT NULL DEFAULT 0,
+            lane_seq         BIGINT NOT NULL,
+            job_id           BIGINT NOT NULL,
+            run_lease        BIGINT NOT NULL,
+            claim_slot       INT,
+            claimed_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq, ready_generation, run_lease)
+        ) PARTITION BY LIST (ready_slot)
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.ready_claim_attempts ALTER COLUMN claim_slot DROP NOT NULL',
+        p_schema
+    );
+
+    EXECUTE format(
+        'COMMENT ON TABLE %I.ready_claim_attempts IS %L',
+        p_schema,
+        'Append-only queue-slot-local ledger of emitted attempts. Claim cursor recovery checks this ledger instead of scanning claim-ring partitions, and queue prune reclaims it with the matching ready segment.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.ready_claim_attempts.claim_slot IS %L',
+        p_schema,
+        'Claim-ring slot that owns the full lease_claims receipt row for this emitted attempt, when known. Upgrade backfills from terminal/deferred evidence may leave it NULL.'
     );
 
     EXECUTE format(
@@ -1801,9 +1837,9 @@ BEGIN
     );
 
     --------------------------------------------------------------------
-    -- ready_entries / ready_tombstones / receipt_completion_batches /
-    -- receipt_completion_tombstones / done_entries /
-    -- queue_terminal_count_deltas partitions + lane indexes.
+    -- ready_entries / ready_claim_attempts / ready_tombstones /
+    -- receipt_completion_batches / receipt_completion_tombstones /
+    -- done_entries / queue_terminal_count_deltas partitions + lane indexes.
     --------------------------------------------------------------------
 
     FOR v_slot IN 0..(p_queue_slot_count - 1) LOOP
@@ -1827,6 +1863,26 @@ BEGIN
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.ready_tombstones FOR VALUES IN (%s)',
             p_schema, format('ready_tombstones_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.ready_claim_attempts FOR VALUES IN (%s)',
+            p_schema, format('ready_claim_attempts_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'ALTER TABLE %I.%I ALTER COLUMN claim_slot DROP NOT NULL',
+            p_schema, format('ready_claim_attempts_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_ready_claim_attempts_%s_lane ON %I.%I (ready_generation, queue, priority, enqueue_shard, lane_seq, run_lease)',
+            p_schema, v_slot, p_schema, format('ready_claim_attempts_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_ready_claim_attempts_%s_job_run ON %I.%I (job_id, run_lease)',
+            p_schema, v_slot, p_schema, format('ready_claim_attempts_%s', v_slot)
         );
 
         EXECUTE format(
@@ -1889,6 +1945,140 @@ BEGIN
             p_schema, format('queue_terminal_count_deltas_%s', v_slot), p_schema, v_slot
         );
     END LOOP;
+
+    -- Backfill queue-slot-local claim evidence for schemas upgraded while
+    -- receipts were already in flight. New claims write this ledger in the
+    -- same transaction as lease_claims. Existing schemas can already have
+    -- live claim rows, compact receipt batches, terminal rows, lease rows,
+    -- deferred rows, DLQ rows, or re-appended ready rows proving that a
+    -- retained ready lane emitted run_lease+1 before this ledger existed.
+    EXECUTE format(
+        $ddl$
+        INSERT INTO %1$I.ready_claim_attempts (
+            ready_slot,
+            ready_generation,
+            queue,
+            priority,
+            enqueue_shard,
+            lane_seq,
+            job_id,
+            run_lease,
+            claim_slot,
+            claimed_at
+        )
+        SELECT
+            ready_slot,
+            ready_generation,
+            queue,
+            priority,
+            enqueue_shard,
+            lane_seq,
+            job_id,
+            run_lease,
+            claim_slot,
+            claimed_at
+        FROM %1$I.lease_claims
+        ON CONFLICT DO NOTHING
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        INSERT INTO %1$I.ready_claim_attempts (
+            ready_slot,
+            ready_generation,
+            queue,
+            priority,
+            enqueue_shard,
+            lane_seq,
+            job_id,
+            run_lease,
+            claim_slot,
+            claimed_at
+        )
+        SELECT
+            batch.ready_slot,
+            batch.ready_generation,
+            batch.queue,
+            batch.priority,
+            batch.enqueue_shard,
+            completed.lane_seq,
+            completed.job_id,
+            completed.run_lease,
+            batch.claim_slot,
+            batch.finalized_at
+        FROM %1$I.receipt_completion_batches AS batch
+        CROSS JOIN LATERAL unnest(
+            batch.job_ids,
+            batch.run_leases,
+            batch.lane_seqs
+        ) AS completed(job_id, run_lease, lane_seq)
+        ON CONFLICT DO NOTHING
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        INSERT INTO %1$I.ready_claim_attempts (
+            ready_slot,
+            ready_generation,
+            queue,
+            priority,
+            enqueue_shard,
+            lane_seq,
+            job_id,
+            run_lease,
+            claim_slot,
+            claimed_at
+        )
+        SELECT
+            ready.ready_slot,
+            ready.ready_generation,
+            ready.queue,
+            ready.priority,
+            ready.enqueue_shard,
+            ready.lane_seq,
+            ready.job_id,
+            ready.run_lease + 1,
+            NULL::int,
+            clock_timestamp()
+        FROM %1$I.ready_entries AS ready
+        WHERE EXISTS (
+                SELECT 1
+                FROM %1$I.leases AS leases
+                WHERE leases.job_id = ready.job_id
+                  AND leases.run_lease = ready.run_lease + 1
+            )
+           OR EXISTS (
+                SELECT 1
+                FROM %1$I.done_entries AS done
+                WHERE done.job_id = ready.job_id
+                  AND done.run_lease = ready.run_lease + 1
+            )
+           OR EXISTS (
+                SELECT 1
+                FROM %1$I.deferred_jobs AS deferred
+                WHERE deferred.job_id = ready.job_id
+                  AND deferred.run_lease = ready.run_lease + 1
+            )
+           OR EXISTS (
+                SELECT 1
+                FROM %1$I.dlq_entries AS dlq
+                WHERE dlq.job_id = ready.job_id
+                  AND dlq.run_lease = ready.run_lease + 1
+            )
+           OR EXISTS (
+                SELECT 1
+                FROM %1$I.ready_entries AS newer_ready
+                WHERE newer_ready.job_id = ready.job_id
+                  AND newer_ready.run_lease = ready.run_lease + 1
+            )
+        ON CONFLICT DO NOTHING
+        $ddl$,
+        p_schema
+    );
 
     -- Backfill ready segment metadata for existing committed ready rows.
     -- Runtime enqueue writes one segment per contiguous lane range with the
@@ -2173,6 +2363,45 @@ BEGIN
                 FROM %1$I.claim_ring_state
                 WHERE singleton = TRUE
             ),
+            claim_attempts AS (
+                INSERT INTO %1$I.ready_claim_attempts AS attempt_rows (
+                    ready_slot,
+                    ready_generation,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    lane_seq,
+                    job_id,
+                    run_lease,
+                    claim_slot,
+                    claimed_at
+                )
+                SELECT
+                    selected.ready_slot,
+                    selected.ready_generation,
+                    selected.queue,
+                    selected.lane_priority,
+                    v_lane_shard,
+                    selected.lane_seq,
+                    selected.job_id,
+                    selected.run_lease + 1,
+                    claim_ring.claim_slot,
+                    v_claimed_at
+                FROM selected_with_spent AS selected
+                CROSS JOIN claim_ring
+                WHERE NOT selected.attempt_spent
+                ON CONFLICT DO NOTHING
+                RETURNING
+                    attempt_rows.claim_slot,
+                    attempt_rows.ready_slot,
+                    attempt_rows.ready_generation,
+                    attempt_rows.job_id,
+                    attempt_rows.queue,
+                    attempt_rows.priority AS lane_priority,
+                    attempt_rows.enqueue_shard,
+                    attempt_rows.lane_seq,
+                    attempt_rows.run_lease
+            ),
             claimed AS (
                 INSERT INTO %1$I.lease_claims AS claim_rows (
                     claim_slot,
@@ -2189,9 +2418,9 @@ BEGIN
                     deadline_at
                 )
                 SELECT
-                    claim_ring.claim_slot,
+                    attempts.claim_slot,
                     selected.job_id,
-                    selected.run_lease + 1,
+                    attempts.run_lease,
                     selected.ready_slot,
                     selected.ready_generation,
                     selected.queue,
@@ -2202,8 +2431,15 @@ BEGIN
                     v_lane_shard,
                     v_deadline_at
                 FROM selected_with_spent AS selected
-                CROSS JOIN claim_ring
-                WHERE NOT selected.attempt_spent
+                JOIN claim_attempts AS attempts
+                  ON attempts.ready_slot = selected.ready_slot
+                 AND attempts.ready_generation = selected.ready_generation
+                 AND attempts.queue = selected.queue
+                 AND attempts.lane_priority = selected.lane_priority
+                 AND attempts.enqueue_shard = v_lane_shard
+                 AND attempts.lane_seq = selected.lane_seq
+                 AND attempts.job_id = selected.job_id
+                 AND attempts.run_lease = selected.run_lease + 1
                 RETURNING
                     claim_rows.claim_slot,
                     claim_rows.ready_slot,
@@ -2469,102 +2705,118 @@ BEGIN
             IF NOT v_head_attempt_spent THEN
                 SELECT EXISTS (
                     SELECT 1
+                    FROM %1$I.ready_claim_attempts AS existing_attempts
+                    WHERE existing_attempts.ready_slot = v_target_slot
+                      AND existing_attempts.ready_generation = v_target_generation
+                      AND existing_attempts.queue = p_queue
+                      AND existing_attempts.priority = v_lane_priority
+                      AND existing_attempts.enqueue_shard = v_lane_shard
+                      AND existing_attempts.lane_seq = v_head_lane_seq
+                      AND existing_attempts.run_lease = v_head_run_lease + 1
+                    LIMIT 1
+                )
+                INTO v_head_attempt_spent;
+            END IF;
+
+            IF NOT v_head_attempt_spent AND NOT %3$L::boolean THEN
+                SELECT EXISTS (
+                    SELECT 1
                     FROM %1$I.lease_claims AS existing_claims
                     WHERE existing_claims.job_id = v_head_job_id
                       AND existing_claims.run_lease = v_head_run_lease + 1
                     LIMIT 1
                 )
                 INTO v_head_attempt_spent;
-            END IF;
 
-            IF NOT v_head_attempt_spent THEN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM %1$I.lease_claim_closures AS existing_closures
-                    WHERE existing_closures.job_id = v_head_job_id
-                      AND existing_closures.run_lease = v_head_run_lease + 1
-                    LIMIT 1
-                )
-                INTO v_head_attempt_spent;
-            END IF;
+                IF NOT v_head_attempt_spent THEN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM %1$I.lease_claim_closures AS existing_closures
+                        WHERE existing_closures.job_id = v_head_job_id
+                          AND existing_closures.run_lease = v_head_run_lease + 1
+                        LIMIT 1
+                    )
+                    INTO v_head_attempt_spent;
+                END IF;
 
-            IF NOT v_head_attempt_spent THEN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM %1$I.receipt_completion_batches AS existing_batches
-                    WHERE existing_batches.ready_slot = v_target_slot
-                      AND existing_batches.ready_generation = v_target_generation
-                      AND existing_batches.queue = p_queue
-                      AND existing_batches.priority = v_lane_priority
-                      AND existing_batches.enqueue_shard = v_lane_shard
-                      AND existing_batches.job_ids @> ARRAY[v_head_job_id]::bigint[]
-                      AND EXISTS (
-                          SELECT 1
-                          FROM unnest(
-                              existing_batches.job_ids,
-                              existing_batches.run_leases
-                          ) AS completed(job_id, run_lease)
-                          WHERE completed.job_id = v_head_job_id
-                            AND completed.run_lease = v_head_run_lease + 1
-                      )
-                    LIMIT 1
-                )
-                INTO v_head_attempt_spent;
-            END IF;
+                IF NOT v_head_attempt_spent THEN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM %1$I.receipt_completion_batches AS existing_batches
+                        WHERE existing_batches.ready_slot = v_target_slot
+                          AND existing_batches.ready_generation = v_target_generation
+                          AND existing_batches.queue = p_queue
+                          AND existing_batches.priority = v_lane_priority
+                          AND existing_batches.enqueue_shard = v_lane_shard
+                          AND existing_batches.job_ids @> ARRAY[v_head_job_id]::bigint[]
+                          AND EXISTS (
+                              SELECT 1
+                              FROM unnest(
+                                  existing_batches.job_ids,
+                                  existing_batches.run_leases
+                              ) AS completed(job_id, run_lease)
+                              WHERE completed.job_id = v_head_job_id
+                                AND completed.run_lease = v_head_run_lease + 1
+                          )
+                        LIMIT 1
+                    )
+                    INTO v_head_attempt_spent;
+                END IF;
 
-            IF NOT v_head_attempt_spent THEN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM %1$I.leases AS existing_leases
-                    WHERE existing_leases.job_id = v_head_job_id
-                      AND existing_leases.run_lease = v_head_run_lease + 1
-                    LIMIT 1
-                )
-                INTO v_head_attempt_spent;
-            END IF;
+                IF NOT v_head_attempt_spent THEN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM %1$I.leases AS existing_leases
+                        WHERE existing_leases.job_id = v_head_job_id
+                          AND existing_leases.run_lease = v_head_run_lease + 1
+                        LIMIT 1
+                    )
+                    INTO v_head_attempt_spent;
+                END IF;
 
-            IF NOT v_head_attempt_spent THEN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM %1$I.done_entries AS existing_done
-                    WHERE existing_done.job_id = v_head_job_id
-                      AND existing_done.run_lease = v_head_run_lease + 1
-                    LIMIT 1
-                )
-                INTO v_head_attempt_spent;
-            END IF;
+                IF NOT v_head_attempt_spent THEN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM %1$I.done_entries AS existing_done
+                        WHERE existing_done.job_id = v_head_job_id
+                          AND existing_done.run_lease = v_head_run_lease + 1
+                        LIMIT 1
+                    )
+                    INTO v_head_attempt_spent;
+                END IF;
 
-            IF NOT v_head_attempt_spent THEN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM %1$I.deferred_jobs AS existing_deferred
-                    WHERE existing_deferred.job_id = v_head_job_id
-                      AND existing_deferred.run_lease = v_head_run_lease + 1
-                    LIMIT 1
-                )
-                INTO v_head_attempt_spent;
-            END IF;
+                IF NOT v_head_attempt_spent THEN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM %1$I.deferred_jobs AS existing_deferred
+                        WHERE existing_deferred.job_id = v_head_job_id
+                          AND existing_deferred.run_lease = v_head_run_lease + 1
+                        LIMIT 1
+                    )
+                    INTO v_head_attempt_spent;
+                END IF;
 
-            IF NOT v_head_attempt_spent THEN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM %1$I.dlq_entries AS existing_dlq
-                    WHERE existing_dlq.job_id = v_head_job_id
-                      AND existing_dlq.run_lease = v_head_run_lease + 1
-                    LIMIT 1
-                )
-                INTO v_head_attempt_spent;
-            END IF;
+                IF NOT v_head_attempt_spent THEN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM %1$I.dlq_entries AS existing_dlq
+                        WHERE existing_dlq.job_id = v_head_job_id
+                          AND existing_dlq.run_lease = v_head_run_lease + 1
+                        LIMIT 1
+                    )
+                    INTO v_head_attempt_spent;
+                END IF;
 
-            IF NOT v_head_attempt_spent THEN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM %1$I.ready_entries AS existing_ready
-                    WHERE existing_ready.job_id = v_head_job_id
-                      AND existing_ready.run_lease = v_head_run_lease + 1
-                    LIMIT 1
-                )
-                INTO v_head_attempt_spent;
+                IF NOT v_head_attempt_spent THEN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM %1$I.ready_entries AS existing_ready
+                        WHERE existing_ready.job_id = v_head_job_id
+                          AND existing_ready.run_lease = v_head_run_lease + 1
+                        LIMIT 1
+                    )
+                    INTO v_head_attempt_spent;
+                END IF;
             END IF;
 
             IF COALESCE(v_head_attempt_spent, FALSE) THEN
@@ -2599,64 +2851,80 @@ BEGIN
                         selected.is_tombstone
                         OR EXISTS (
                             SELECT 1
-                            FROM %1$I.lease_claims AS existing_claims
-                            WHERE existing_claims.job_id = selected.job_id
-                              AND existing_claims.run_lease = selected.run_lease + 1
+                            FROM %1$I.ready_claim_attempts AS existing_attempts
+                            WHERE existing_attempts.ready_slot = v_target_slot
+                              AND existing_attempts.ready_generation = v_target_generation
+                              AND existing_attempts.queue = p_queue
+                              AND existing_attempts.priority = v_lane_priority
+                              AND existing_attempts.enqueue_shard = v_lane_shard
+                              AND existing_attempts.lane_seq = selected.lane_seq
+                              AND existing_attempts.run_lease = selected.run_lease + 1
                         )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.lease_claim_closures AS existing_closures
-                            WHERE existing_closures.job_id = selected.job_id
-                              AND existing_closures.run_lease = selected.run_lease + 1
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.receipt_completion_batches AS existing_batches
-                            WHERE existing_batches.ready_slot = v_target_slot
-                              AND existing_batches.ready_generation = v_target_generation
-                              AND existing_batches.queue = p_queue
-                              AND existing_batches.priority = v_lane_priority
-                              AND existing_batches.enqueue_shard = v_lane_shard
-                              AND existing_batches.job_ids @> ARRAY[selected.job_id]::bigint[]
-                              AND EXISTS (
-                                  SELECT 1
-                                  FROM unnest(
-                                      existing_batches.job_ids,
-                                      existing_batches.run_leases
-                                  ) AS completed(job_id, run_lease)
-                                  WHERE completed.job_id = selected.job_id
-                                    AND completed.run_lease = selected.run_lease + 1
-                              )
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.leases AS existing_leases
-                            WHERE existing_leases.job_id = selected.job_id
-                              AND existing_leases.run_lease = selected.run_lease + 1
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.done_entries AS existing_done
-                            WHERE existing_done.job_id = selected.job_id
-                              AND existing_done.run_lease = selected.run_lease + 1
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.deferred_jobs AS existing_deferred
-                            WHERE existing_deferred.job_id = selected.job_id
-                              AND existing_deferred.run_lease = selected.run_lease + 1
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.dlq_entries AS existing_dlq
-                            WHERE existing_dlq.job_id = selected.job_id
-                              AND existing_dlq.run_lease = selected.run_lease + 1
-                        )
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.ready_entries AS existing_ready
-                            WHERE existing_ready.job_id = selected.job_id
-                              AND existing_ready.run_lease = selected.run_lease + 1
+                        OR (
+                            NOT %3$L::boolean
+                            AND (
+                                EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.lease_claims AS existing_claims
+                                    WHERE existing_claims.job_id = selected.job_id
+                                      AND existing_claims.run_lease = selected.run_lease + 1
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.lease_claim_closures AS existing_closures
+                                    WHERE existing_closures.job_id = selected.job_id
+                                      AND existing_closures.run_lease = selected.run_lease + 1
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.receipt_completion_batches AS existing_batches
+                                    WHERE existing_batches.ready_slot = v_target_slot
+                                      AND existing_batches.ready_generation = v_target_generation
+                                      AND existing_batches.queue = p_queue
+                                      AND existing_batches.priority = v_lane_priority
+                                      AND existing_batches.enqueue_shard = v_lane_shard
+                                      AND existing_batches.job_ids @> ARRAY[selected.job_id]::bigint[]
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM unnest(
+                                              existing_batches.job_ids,
+                                              existing_batches.run_leases
+                                          ) AS completed(job_id, run_lease)
+                                          WHERE completed.job_id = selected.job_id
+                                            AND completed.run_lease = selected.run_lease + 1
+                                      )
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.leases AS existing_leases
+                                    WHERE existing_leases.job_id = selected.job_id
+                                      AND existing_leases.run_lease = selected.run_lease + 1
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.done_entries AS existing_done
+                                    WHERE existing_done.job_id = selected.job_id
+                                      AND existing_done.run_lease = selected.run_lease + 1
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.deferred_jobs AS existing_deferred
+                                    WHERE existing_deferred.job_id = selected.job_id
+                                      AND existing_deferred.run_lease = selected.run_lease + 1
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.dlq_entries AS existing_dlq
+                                    WHERE existing_dlq.job_id = selected.job_id
+                                      AND existing_dlq.run_lease = selected.run_lease + 1
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.ready_entries AS existing_ready
+                                    WHERE existing_ready.job_id = selected.job_id
+                                      AND existing_ready.run_lease = selected.run_lease + 1
+                                )
+                            )
                         )
                     ) AS attempt_spent
                 FROM selected
@@ -2747,7 +3015,20 @@ BEGIN
             selected_with_spent AS (
                 SELECT
                     selected.*,
-                    selected.is_tombstone AS attempt_spent
+                    (
+                        selected.is_tombstone
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.ready_claim_attempts AS existing_attempts
+                            WHERE existing_attempts.ready_slot = v_target_slot
+                              AND existing_attempts.ready_generation = v_target_generation
+                              AND existing_attempts.queue = p_queue
+                              AND existing_attempts.priority = v_lane_priority
+                              AND existing_attempts.enqueue_shard = v_lane_shard
+                              AND existing_attempts.lane_seq = selected.lane_seq
+                              AND existing_attempts.run_lease = selected.run_lease + 1
+                        )
+                    ) AS attempt_spent
                 FROM selected
             ),
             %2$s
@@ -2807,7 +3088,7 @@ BEGIN
         END;
         $func$
         $create_runtime$,
-        p_schema, v_claimed_cte
+        p_schema, v_claimed_cte, p_lease_claim_receipts
     );
 
     EXECUTE format(

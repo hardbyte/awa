@@ -117,6 +117,7 @@ LeaseChildResource(s) == [k |-> "lease_child", s |-> s]
 QueueRingStateResource == [k |-> "queue_ring_state"]
 QueueRingSlotResource(s) == [k |-> "queue_ring_slot", s |-> s]
 ReadyChildResource(s) == [k |-> "ready_child", s |-> s]
+ReadyClaimAttemptChildResource(s) == [k |-> "ready_claim_attempt_child", s |-> s]
 ReadyTombstoneChildResource(s) == [k |-> "ready_tombstone_child", s |-> s]
 DoneChildResource(s) == [k |-> "done_child", s |-> s]
 ReceiptBatchChildResource(s) == [k |-> "receipt_batch_child", s |-> s]
@@ -134,6 +135,7 @@ LeaseRingSlotResources == { LeaseRingSlotResource(s) : s \in LeaseSlots }
 LeaseChildResources == { LeaseChildResource(s) : s \in LeaseSlots }
 QueueRingSlotResources == { QueueRingSlotResource(s) : s \in ReadySlots }
 ReadyChildResources == { ReadyChildResource(s) : s \in ReadySlots }
+ReadyClaimAttemptChildResources == { ReadyClaimAttemptChildResource(s) : s \in ReadySlots }
 ReadyTombstoneChildResources == { ReadyTombstoneChildResource(s) : s \in ReadySlots }
 DoneChildResources == { DoneChildResource(s) : s \in ReadySlots }
 ReceiptBatchChildResources == { ReceiptBatchChildResource(s) : s \in ReadySlots }
@@ -152,6 +154,7 @@ Resources ==
     {QueueRingStateResource} \cup
     QueueRingSlotResources \cup
     ReadyChildResources \cup
+    ReadyClaimAttemptChildResources \cup
     ReadyTombstoneChildResources \cup
     DoneChildResources \cup
     ReceiptBatchChildResources \cup
@@ -204,6 +207,7 @@ EnqueueTwoStripePlan(p) ==
 \*     the rotator's CAS UPDATE on (current_slot, generation), not a
 \*     row lock here, so these reads are NOT modelled as plan steps.
 \*   plain SELECT of ready_entries_<slot> (implicit AccessShare on child)
+\*   INSERT INTO ready_claim_attempts_<ready_slot> (receipts mode)
 \*   INSERT INTO lease_claims_<claim_slot> (receipts mode) OR
 \*   INSERT INTO leases_<lease_slot> (legacy mode)
 \*   UPDATE queue_claim_heads (already locked, no new acquire)
@@ -218,6 +222,7 @@ EnqueueTwoStripePlan(p) ==
 ClaimReceiptsPlan(q, p, readySlot, claimSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared),
+       Step(ReadyClaimAttemptChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared) >>
 
 ClaimLegacyPlan(q, p, readySlot, leaseSlot) ==
@@ -404,7 +409,7 @@ RotateReadyPlan(nextSlot) ==
 \*   prove sealed-slot skip gates before child exclusive locks:
 \*     active leases (leases parent), unclosed receipt claims, and pending
 \*     retained ready rows at or beyond the lane cursor
-\*   LOCK TABLE ready/done/tombstone/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
+\*   LOCK TABLE ready/claim-attempt/done/tombstone/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
 \*   skip-gate success returns before the exclusive lock path; the plan
 \*     below models the successful truncate path after those proofs pass
 PruneReadyPlan(slot) ==
@@ -413,6 +418,7 @@ PruneReadyPlan(slot) ==
        Step(LeasesParentResource, ModeShared),
        Step(ReadyChildResource(slot), ModeShared),
        Step(ReadyChildResource(slot), ModeExclusive),
+       Step(ReadyClaimAttemptChildResource(slot), ModeExclusive),
        Step(DoneChildResource(slot), ModeExclusive),
        Step(ReadyTombstoneChildResource(slot), ModeExclusive),
        Step(ReceiptBatchChildResource(slot), ModeExclusive),

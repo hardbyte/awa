@@ -274,6 +274,8 @@ pub enum RotateOutcome {
 pub struct BusyCounts {
     /// Queue ring: rows in the next `ready_entries` child.
     pub queue_ready: i64,
+    /// Queue ring: rows in the next `ready_claim_attempts` child.
+    pub queue_claim_attempts: i64,
     /// Queue ring: rows in the next `done_entries` child.
     pub queue_done: i64,
     /// Queue ring: rows in the next `ready_tombstones` child.
@@ -427,6 +429,10 @@ fn validate_ident(ident: &str) -> Result<(), AwaError> {
 
 fn ready_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.ready_entries_{slot}")
+}
+
+fn ready_claim_attempt_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.ready_claim_attempts_{slot}")
 }
 
 fn done_child_name(schema: &str, slot: usize) -> String {
@@ -2896,6 +2902,7 @@ impl QueueStorage {
             r#"
             TRUNCATE
                 {schema}.ready_entries,
+                {schema}.ready_claim_attempts,
                 {schema}.ready_tombstones,
                 {schema}.ready_segments,
                 {schema}.done_entries,
@@ -11951,6 +11958,11 @@ impl QueueStorage {
         let ready_busy =
             Self::relation_has_rows_tx(&mut tx, &ready_child_name(schema, next_slot as usize))
                 .await?;
+        let claim_attempt_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &ready_claim_attempt_child_name(schema, next_slot as usize),
+        )
+        .await?;
         let done_busy =
             Self::relation_has_rows_tx(&mut tx, &done_child_name(schema, next_slot as usize))
                 .await?;
@@ -11976,6 +11988,7 @@ impl QueueStorage {
         .await?;
 
         if ready_busy
+            || claim_attempt_busy
             || done_busy
             || tombstone_busy
             || receipt_batch_busy
@@ -11987,6 +12000,7 @@ impl QueueStorage {
                 slot: next_slot,
                 busy: BusyCounts {
                     queue_ready: busy_indicator(ready_busy),
+                    queue_claim_attempts: busy_indicator(claim_attempt_busy),
                     queue_done: busy_indicator(done_busy),
                     queue_tombstones: busy_indicator(tombstone_busy),
                     queue_receipt_completion_batches: busy_indicator(receipt_batch_busy),
@@ -12747,6 +12761,7 @@ impl QueueStorage {
         };
 
         let ready_child = ready_child_name(schema, slot as usize);
+        let claim_attempt_child = ready_claim_attempt_child_name(schema, slot as usize);
         let done_child = done_child_name(schema, slot as usize);
         let tomb_child = ready_tombstone_child_name(schema, slot as usize);
         let receipt_batch_child = receipt_completion_batch_child_name(schema, slot as usize);
@@ -12898,7 +12913,7 @@ impl QueueStorage {
         set_prune_lock_timeout_tx(&mut tx).await?;
 
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -13123,7 +13138,7 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         let truncate = sqlx::query(&format!(
-            "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
+            "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
         ))
         .execute(tx.as_mut())
         .await;

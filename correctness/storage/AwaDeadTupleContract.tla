@@ -97,6 +97,7 @@ TableSpec == [
     \* All partitioned by their respective ring slot, reclaimed by
     \* TRUNCATE on partition prune.
     ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    ready_claim_attempts   |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     ready_tombstones       |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     \* One row per committed ready lane range, not per completion. The
     \* live row count is bounded by the retained queue-ring slots times
@@ -221,6 +222,7 @@ EnqueueReadyTx == <<
 
 \* claim_runtime_batch (receipts mode) — queue_storage.rs claim CTE
 ClaimReceiptsTx == <<
+    Mut("Insert", "ready_claim_attempts"),
     Mut("Insert", "lease_claims"),
     Mut("Update", "queue_claim_heads")
 >>
@@ -462,6 +464,7 @@ RotateReadyTx == << Mut("Update", "queue_ring_state") >>
 PruneReadyTx  == <<
     Mut("Update", "queue_ring_slots"),
     Mut("Truncate", "ready_entries"),
+    Mut("Truncate", "ready_claim_attempts"),
     Mut("Truncate", "done_entries"),
     Mut("Truncate", "receipt_completion_batches"),
     Mut("Truncate", "receipt_completion_tombstones"),
