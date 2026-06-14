@@ -2021,15 +2021,6 @@ BEGIN
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
                   AND ready.lane_seq >= cursors.claim_seq
-                  AND NOT EXISTS (
-                      SELECT 1 FROM %1$I.ready_tombstones AS tomb
-                      WHERE tomb.ready_slot = ready.ready_slot
-                        AND tomb.ready_generation = ready.ready_generation
-                        AND tomb.queue = ready.queue
-                        AND tomb.priority = ready.priority
-                        AND tomb.enqueue_shard = ready.enqueue_shard
-                        AND tomb.lane_seq = ready.lane_seq
-                  )
                 ORDER BY ready.lane_seq ASC
                 LIMIT 1
             ) AS candidate ON TRUE
@@ -2192,8 +2183,8 @@ BEGIN
                     ready.lane_seq,
                     EXISTS (
                         SELECT 1 FROM %1$I.ready_tombstones AS tomb
-                        WHERE tomb.ready_slot = ready.ready_slot
-                          AND tomb.ready_generation = ready.ready_generation
+                        WHERE tomb.ready_slot = v_target_slot
+                          AND tomb.ready_generation = v_target_generation
                           AND tomb.queue = ready.queue
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard
@@ -2317,8 +2308,8 @@ BEGIN
                     COALESCE(ready.payload, '{}'::jsonb) AS payload,
                     EXISTS (
                         SELECT 1 FROM %1$I.ready_tombstones AS tomb
-                        WHERE tomb.ready_slot = ready.ready_slot
-                          AND tomb.ready_generation = ready.ready_generation
+                        WHERE tomb.ready_slot = v_target_slot
+                          AND tomb.ready_generation = v_target_generation
                           AND tomb.queue = ready.queue
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard

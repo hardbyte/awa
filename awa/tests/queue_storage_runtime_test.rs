@@ -6672,6 +6672,11 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
         "fused receipt fast path must append pending deltas"
     );
     assert_eq!(
+        terminal_delta_row_count(&pool, schema, queue).await,
+        1,
+        "compact receipt completion should append one count delta per batch group"
+    );
+    assert_eq!(
         terminal_sum, terminal_count,
         "fused receipt fast path must preserve exact public terminal count"
     );
@@ -8180,6 +8185,17 @@ async fn terminal_delta_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i
     .fetch_one(pool)
     .await
     .expect("sum terminal_delta")
+}
+
+async fn terminal_delta_row_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint \
+         FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count terminal deltas")
 }
 
 async fn terminal_counter_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {

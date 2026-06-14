@@ -59,7 +59,7 @@ The implementation and migrations use these physical names:
 2. `ready_tombstones`
 
 - Unclaimed cancellation, priority aging, and similar ready-lane mutations append a tombstone keyed by ready segment generation and lane identity.
-- Claim and exact-count paths anti-join tombstones and treat a tombstoned head lane as committed spent evidence for safe claim-cursor advancement.
+- Claim treats tombstones as committed spent evidence for safe claim-cursor advancement; exact-count paths skip tombstoned lanes.
 - Tombstones are reclaimed by truncating the matching ready segment; they do not create row-vacuum work on the hot ready table.
 
 3. `active_leases`
@@ -110,7 +110,7 @@ The implementation and migrations use these physical names:
 ### Lifecycle mapping
 
 - Enqueue immediate job: append to `ready_entries`.
-- Claim: lock the queue's `queue_claim_heads` row, join the matching `queue_enqueue_heads` row, select the next ready entries anti-joined with `ready_tombstones`, increment `run_lease`, append a receipt into `lease_claims` by default, and advance the claim cursor based on committed spent evidence plus the rows actually selected after commit.
+- Claim: lock the queue's `queue_claim_heads` row, join the matching `queue_enqueue_heads` row, select the next ready entries, treat any matching `ready_tombstones` rows as spent lane evidence, increment `run_lease`, append a receipt into `lease_claims` by default, and advance the claim cursor based on committed spent evidence plus the rows actually selected after commit.
 - Receipt-backed deadlines: per-queue deadlines live on `lease_claims.deadline_at` until the attempt materializes into the lease plane for callbacks, progress, or other mutable state.
 - Receipt rescue before materialization: close the stale receipt append-only and requeue it without first materializing a mutable `leases` row.
 - Runtime reads that need the current live receipt-backed set (`queue_counts`, receipt rescue, and receipt-backed `load_job`) consult only the active claim-ring partitions, not the full append-only claim history. **historical:** ADR-019 used a bounded `open_receipt_claims` table for this; ADR-023 derives the same set as an anti-join over partitioned `lease_claims` / `lease_claim_closures`.
