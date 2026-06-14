@@ -6153,6 +6153,14 @@ async fn test_queue_storage_prune_waits_until_ready_tombstone_cursor_spent() {
         "unexpected rotate outcome: {rotated:?}"
     );
 
+    let mut reader_tx = pool.begin().await.expect("begin ready reader tx");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.ready_entries_0, {schema}.done_entries_0, {schema}.ready_tombstones_0, {schema}.receipt_completion_batches_0, {schema}.receipt_completion_tombstones_0, {schema}.queue_terminal_count_deltas_0 IN ACCESS SHARE MODE"
+    ))
+    .execute(reader_tx.as_mut())
+    .await
+    .expect("lock queue prune children in access share mode");
+
     let prune_before_cursor_advance = store
         .prune_oldest(&pool, Duration::ZERO)
         .await
@@ -6168,6 +6176,11 @@ async fn test_queue_storage_prune_waits_until_ready_tombstone_cursor_spent() {
         ),
         "tombstoned ready rows remain cursor evidence until the lane cursor passes them: {prune_before_cursor_advance:?}"
     );
+
+    reader_tx
+        .rollback()
+        .await
+        .expect("release ready reader lock");
 
     let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
