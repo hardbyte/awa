@@ -4590,10 +4590,11 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
                 lease_claim_receipts: true,
                 claim_slot_count: 2,
             },
-            Duration::from_millis(1_000),
+            Duration::from_secs(60),
             Duration::from_millis(50),
         )
         .register_worker(gate.worker())
+        .claim_rotate_interval(Duration::from_secs(60))
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(50))
@@ -4673,17 +4674,21 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     )
     .await;
     assert_eq!(completed.state, JobState::Completed);
+    client.shutdown(Duration::from_secs(5)).await;
+
     assert_eq!(lease_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         0,
-        "attempt-state-only compact success closes through receipt_completion_batches"
+        "compact success should not write per-job completed closure rows"
     );
-
-    client.shutdown(Duration::from_secs(5)).await;
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1,
+        "attempt-state-only compact success should keep terminal history in receipt_completion_batches"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
