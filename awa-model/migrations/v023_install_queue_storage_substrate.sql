@@ -1180,6 +1180,8 @@ BEGIN
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.lease_claim_closure_batches (
             claim_slot   INT NOT NULL,
+            ready_slot   INT,
+            ready_generation BIGINT,
             batch_id     BIGINT NOT NULL DEFAULT nextval('%I.lease_claim_closure_batch_id_seq'::regclass),
             outcome      TEXT NOT NULL,
             closed_count INT NOT NULL,
@@ -1224,6 +1226,16 @@ BEGIN
 
     EXECUTE format(
         'ALTER TABLE %I.lease_claim_closure_batches ADD COLUMN IF NOT EXISTS receipt_ranges INT8MULTIRANGE',
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.lease_claim_closure_batches ADD COLUMN IF NOT EXISTS ready_slot INT',
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.lease_claim_closure_batches ADD COLUMN IF NOT EXISTS ready_generation BIGINT',
         p_schema
     );
 
@@ -1282,6 +1294,18 @@ BEGIN
         'Compact multirange derived from receipt_ids for exact indexed closure membership checks. Membership is exact because receipt_id is assigned once per lease_claims row from a global sequence.'
     );
 
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claim_closure_batches.ready_slot IS %L',
+        p_schema,
+        'Ready segment slot closed by this compact batch when all claims in the batch came from one ready segment. New compact completion batches populate this so prune can prove sealed segments by counts before falling back to per-claim closure membership checks.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claim_closure_batches.ready_generation IS %L',
+        p_schema,
+        'Ready segment generation paired with ready_slot for exact count-based prune proofs.'
+    );
+
     FOR v_slot IN 0..(p_claim_slot_count - 1) LOOP
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.lease_claim_closures FOR VALUES IN (%s)',
@@ -1295,6 +1319,11 @@ BEGIN
 
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_closure_batches_%s_receipt_ranges ON %I.%I USING GIST (receipt_ranges)',
+            p_schema, v_slot, p_schema, format('lease_claim_closure_batches_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_closure_batches_%s_ready_ref ON %I.%I (ready_slot, ready_generation) WHERE ready_slot IS NOT NULL',
             p_schema, v_slot, p_schema, format('lease_claim_closure_batches_%s', v_slot)
         );
 

@@ -5758,6 +5758,8 @@ impl QueueStorage {
             claim_closure_batches AS (
                 INSERT INTO {schema}.lease_claim_closure_batches (
                     claim_slot,
+                    ready_slot,
+                    ready_generation,
                     outcome,
                     closed_count,
                     receipt_ids,
@@ -5766,14 +5768,19 @@ impl QueueStorage {
                 )
                 SELECT
                     completed.claim_slot,
+                    completed.ready_slot,
+                    completed.ready_generation,
                     'completed',
                     count(*)::int AS closed_count,
                     array_agg(completed.receipt_id ORDER BY completed.lane_seq, completed.job_id),
                     range_agg(int8range(completed.receipt_id, completed.receipt_id + 1, '[)') ORDER BY completed.receipt_id),
                     max(completed.finalized_at)
                 FROM completed_rows AS completed
-                GROUP BY completed.claim_slot
-                RETURNING claim_slot, receipt_ids
+                GROUP BY
+                    completed.claim_slot,
+                    completed.ready_slot,
+                    completed.ready_generation
+                RETURNING claim_slot, ready_slot, ready_generation, receipt_ids
             ),
             terminal AS (
                 INSERT INTO {schema}.receipt_completion_batches (
@@ -6119,9 +6126,17 @@ impl QueueStorage {
             }
 
             if !materialized_claimed.is_empty() {
-                let lease_slots: Vec<i32> = materialized_claimed
+                let ready_slots: Vec<i32> = materialized_claimed
                     .iter()
-                    .map(|entry| entry.claim.lease_slot)
+                    .map(|entry| entry.claim.ready_slot)
+                    .collect();
+                let ready_generations: Vec<i64> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.claim.ready_generation)
+                    .collect();
+                let job_ids: Vec<i64> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.job.id)
                     .collect();
                 let queues: Vec<String> = materialized_claimed
                     .iter()
@@ -6145,17 +6160,21 @@ impl QueueStorage {
                     .collect();
 
                 // CTE-as-DML: delete the leases and the matching attempt_state
-                // rows in one round-trip. See the receipt-disabled branch
-                // below for the same pattern.
+                // rows in one round-trip. Receipt claims may materialize a
+                // lease after the original claim, so the materialized lease can
+                // live in a newer lease slot than the claim carried. Match on
+                // the stable ready-lane and attempt identity instead.
                 let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                     r#"
-                    WITH completed(lease_slot, queue, priority, enqueue_shard, lane_seq, run_lease) AS (
-                        SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[], $6::bigint[])
+                    WITH completed(ready_slot, ready_generation, job_id, queue, priority, enqueue_shard, lane_seq, run_lease) AS (
+                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::text[], $5::smallint[], $6::smallint[], $7::bigint[], $8::bigint[])
                     ),
                     deleted AS (
                         DELETE FROM {schema}.leases AS leases
                         USING completed
-                        WHERE leases.lease_slot = completed.lease_slot
+                        WHERE leases.ready_slot = completed.ready_slot
+                          AND leases.ready_generation = completed.ready_generation
+                          AND leases.job_id = completed.job_id
                           AND leases.queue = completed.queue
                           AND leases.priority = completed.priority
                           AND leases.enqueue_shard = completed.enqueue_shard
@@ -6206,7 +6225,9 @@ impl QueueStorage {
                     FROM deleted
                     "#
                 ))
-                .bind(&lease_slots)
+                .bind(&ready_slots)
+                .bind(&ready_generations)
+                .bind(&job_ids)
                 .bind(&queues)
                 .bind(&priorities)
                 .bind(&enqueue_shards)
@@ -12647,16 +12668,32 @@ impl QueueStorage {
         let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
-        let unclosed_claim_refs: bool = sqlx::query_scalar(&format!(
+        let count_proves_claim_refs_closed: bool = sqlx::query_scalar(&format!(
             r#"
-            SELECT EXISTS (
-                SELECT 1
+            WITH claim_count AS (
+                SELECT count(*)::bigint AS total
                 FROM {schema}.lease_claims AS claims
                 WHERE claims.ready_slot = $1
                   AND claims.ready_generation = $2
-                  AND NOT {closed_evidence}
-                LIMIT 1
+            ),
+            explicit_count AS (
+                SELECT count(*)::bigint AS total
+                FROM {schema}.lease_claims AS claims
+                JOIN {schema}.lease_claim_closures AS closures
+                  ON closures.claim_slot = claims.claim_slot
+                 AND closures.job_id = claims.job_id
+                 AND closures.run_lease = claims.run_lease
+                WHERE claims.ready_slot = $1
+                  AND claims.ready_generation = $2
+            ),
+            compact_count AS (
+                SELECT COALESCE(sum(closed_count), 0)::bigint AS total
+                FROM {schema}.lease_claim_closure_batches AS batches
+                WHERE batches.ready_slot = $1
+                  AND batches.ready_generation = $2
             )
+            SELECT claim_count.total = explicit_count.total + compact_count.total
+            FROM claim_count, explicit_count, compact_count
             "#
         ))
         .bind(slot)
@@ -12664,6 +12701,27 @@ impl QueueStorage {
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        let unclosed_claim_refs: bool = if count_proves_claim_refs_closed {
+            false
+        } else {
+            sqlx::query_scalar(&format!(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {schema}.lease_claims AS claims
+                    WHERE claims.ready_slot = $1
+                      AND claims.ready_generation = $2
+                      AND NOT {closed_evidence}
+                    LIMIT 1
+                )
+                "#
+            ))
+            .bind(slot)
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+        };
 
         if unclosed_claim_refs {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -13315,19 +13373,42 @@ impl QueueStorage {
         // exclusive-lock attempt.
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_child, &closure_batch_child, "claims");
-        let open_claims: bool = sqlx::query_scalar(&format!(
+        let count_proves_claims_closed: bool = sqlx::query_scalar(&format!(
             r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM {claim_child} AS claims
-                WHERE NOT {closed_evidence}
-                LIMIT 1
+            WITH claim_count AS (
+                SELECT count(*)::bigint AS total FROM {claim_child}
+            ),
+            explicit_count AS (
+                SELECT count(*)::bigint AS total FROM {closure_child}
+            ),
+            compact_count AS (
+                SELECT COALESCE(sum(closed_count), 0)::bigint AS total
+                FROM {closure_batch_child}
             )
+            SELECT claim_count.total = explicit_count.total + compact_count.total
+            FROM claim_count, explicit_count, compact_count
             "#
         ))
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        let open_claims: bool = if count_proves_claims_closed {
+            false
+        } else {
+            sqlx::query_scalar(&format!(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {claim_child} AS claims
+                    WHERE NOT {closed_evidence}
+                    LIMIT 1
+                )
+                "#
+            ))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+        };
 
         if open_claims {
             tx.commit().await.map_err(map_sqlx_error)?;

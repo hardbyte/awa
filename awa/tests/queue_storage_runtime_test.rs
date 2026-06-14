@@ -4795,6 +4795,105 @@ async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receip
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rotation() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_materialized_rotated";
+    let schema = "awa_qs_receipt_materialized_rotated";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue receipt-materialized job");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim receipt-materialized job");
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].claim.lease_claim_receipt);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+
+    let claim_lease_slot = claimed[0].claim.lease_slot;
+    match store.rotate_leases(&pool).await.expect("rotate lease ring") {
+        RotateOutcome::Rotated { slot, .. } => assert_ne!(
+            slot, claim_lease_slot,
+            "test must materialize into a different lease slot than the original claim carried"
+        ),
+        other => panic!("expected lease ring rotation before materialization, got {other:?}"),
+    }
+
+    let callback_id = store
+        .register_callback(
+            &pool,
+            claimed[0].job.id,
+            claimed[0].job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback and materialize receipt claim");
+    let materialized_lease_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT lease_slot FROM {schema}.leases WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(claimed[0].job.id)
+    .bind(claimed[0].job.run_lease)
+    .fetch_one(&pool)
+    .await
+    .expect("read materialized lease slot");
+    assert_ne!(
+        materialized_lease_slot, claim_lease_slot,
+        "regression setup must prove the materialized lease slot differs"
+    );
+
+    let resumed = store
+        .complete_external(
+            &pool,
+            callback_id,
+            Some(serde_json::json!({"answer": 42})),
+            Some(claimed[0].job.run_lease),
+            true,
+        )
+        .await
+        .expect("resume materialized callback");
+    assert_eq!(resumed.state, JobState::Running);
+
+    let updated = store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete original receipt claim after materialization");
+    assert_eq!(
+        updated,
+        vec![(claimed[0].job.id, claimed[0].job.run_lease)],
+        "completion must find the materialized lease by stable attempt identity"
+    );
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "materialized receipt completion should close through explicit receipt evidence"
+    );
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
+
+    let loaded = store
+        .load_job(&pool, claimed[0].job.id)
+        .await
+        .expect("load completed materialized receipt")
+        .expect("completed materialized receipt row");
+    assert_eq!(loaded.state, JobState::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_retry_successfully() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_retry";
@@ -7114,6 +7213,24 @@ async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_clo
         lease_claim_closure_batch_count(&pool, &store).await,
         1,
         "idempotent compact success should keep one claim-closure batch"
+    );
+    let closure_batch_segment: (i32, i64, i32) = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, closed_count
+         FROM {schema}.lease_claim_closure_batches
+         WHERE claim_slot = $1"
+    ))
+    .bind(claimed[0].claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read compact closure batch segment metadata");
+    assert_eq!(
+        closure_batch_segment,
+        (
+            claimed[0].claim.ready_slot,
+            claimed[0].claim.ready_generation,
+            1
+        ),
+        "compact closure batches must carry ready segment metadata for prune count proofs"
     );
     assert_eq!(
         receipt_completion_batch_count(&pool, &store, queue).await,
