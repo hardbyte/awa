@@ -245,7 +245,9 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
 \*   evidence to stay idempotent, writes compact claim-local closure evidence,
 \*   compact receipt completion history, and the terminal-count delta.
 \*   It also anti-joins the leases parent so materialized receipt claims
-\*   fall back to the lease-deleting completion path.
+\*   fall back to the lease-deleting completion path. That fallback matches
+\*   materialized receipt leases by stable ready-lane / attempt identity
+\*   because the lease ring can rotate after the original receipt claim.
 \*   Rust first takes per-(job_id, run_lease) advisory transaction locks in
 \*   deterministic key order. Known-key materialization and explicit
 \*   close paths use the same advisory key before row locks. Those locks
@@ -433,7 +435,9 @@ RotateClaimsPlan(nextSlot) ==
 \*   SELECT ... FROM claim_ring_state FOR UPDATE
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   prove every claim in the sealed slot has durable closure evidence
-\*     with plain SELECT / AccessShare on the claim children
+\*     with plain SELECT / AccessShare on the claim children. The Rust
+\*     implementation first tries an exact count proof and falls back to
+\*     the per-claim anti-join when counts do not prove closure.
 \*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 \*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 \*   LOCK TABLE closure_batch_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
