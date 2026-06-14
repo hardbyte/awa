@@ -719,6 +719,16 @@ fn is_empty_json_object(value: &serde_json::Value) -> bool {
     value.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
+fn is_compact_receipt_completion_metadata(value: &serde_json::Value) -> bool {
+    let Some(metadata) = value.as_object() else {
+        return false;
+    };
+
+    metadata
+        .keys()
+        .all(|key| key == "_awa_original_priority" || key == "_awa_original_queue")
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RuntimePayload {
     #[serde(
@@ -789,7 +799,10 @@ impl RuntimePayload {
 
 #[cfg(test)]
 mod runtime_payload_tests {
-    use super::{storage_payload, terminal_storage_payload, RuntimePayload};
+    use super::{
+        is_compact_receipt_completion_metadata, storage_payload, terminal_storage_payload,
+        RuntimePayload,
+    };
 
     #[test]
     fn default_runtime_payload_serializes_compactly() {
@@ -824,6 +837,26 @@ mod runtime_payload_tests {
         assert!(payload.errors.is_empty());
         assert_eq!(payload.progress, None);
         assert_eq!(storage_payload(&payload.into_json()), None);
+    }
+
+    #[test]
+    fn compact_receipt_completion_metadata_only_allows_awa_provenance() {
+        assert!(is_compact_receipt_completion_metadata(&serde_json::json!(
+            {}
+        )));
+        assert!(is_compact_receipt_completion_metadata(
+            &serde_json::json!({ "_awa_original_priority": 4 })
+        ));
+        assert!(is_compact_receipt_completion_metadata(&serde_json::json!({
+            "_awa_original_queue": "default",
+            "_awa_original_priority": 4
+        })));
+        assert!(!is_compact_receipt_completion_metadata(
+            &serde_json::json!({ "tenant": "acme" })
+        ));
+        assert!(!is_compact_receipt_completion_metadata(&serde_json::json!(
+            null
+        )));
     }
 
     #[test]
@@ -5395,7 +5428,7 @@ impl QueueStorage {
     fn receipt_fast_complete_candidate(entry: &ClaimedRuntimeJob) -> bool {
         entry.claim.lease_claim_receipt
             && entry.job.unique_key.is_none()
-            && is_empty_json_object(&entry.job.metadata)
+            && is_compact_receipt_completion_metadata(&entry.job.metadata)
             && entry.job.tags.is_empty()
             && entry.job.errors.as_ref().is_none_or(Vec::is_empty)
     }
@@ -12273,15 +12306,27 @@ impl QueueStorage {
 
         let pending: bool = sqlx::query_scalar(&format!(
             r#"
+            WITH claim_cursors AS MATERIALIZED (
+                SELECT
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    {schema}.sequence_next_value(seq_name) AS claim_seq
+                FROM {schema}.queue_claim_heads
+            )
             SELECT EXISTS (
                 SELECT 1
-                FROM {schema}.queue_claim_heads AS claims
-                JOIN {ready_child} AS ready
-                  ON ready.queue = claims.queue
-                 AND ready.priority = claims.priority
-                 AND ready.enqueue_shard = claims.enqueue_shard
-                 AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-                WHERE ready.ready_generation = $1
+                FROM claim_cursors AS claims
+                CROSS JOIN LATERAL (
+                    SELECT 1
+                    FROM {ready_child} AS ready
+                    WHERE ready.ready_generation = $1
+                      AND ready.queue = claims.queue
+                      AND ready.priority = claims.priority
+                      AND ready.enqueue_shard = claims.enqueue_shard
+                      AND ready.lane_seq >= claims.claim_seq
+                    LIMIT 1
+                ) AS pending_ready
                 LIMIT 1
             )
             "#

@@ -3737,6 +3737,69 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_custom_metadata_completion_uses_wide_terminal_row() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_custom_metadata_wide";
+    let schema = "awa_qs_receipt_custom_metadata_wide";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 22 },
+        InsertOpts {
+            queue: queue.to_string(),
+            metadata: serde_json::json!({ "tenant": "acme" }),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim custom-metadata job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete custom-metadata job");
+
+    assert_eq!(
+        done_entries_count(&pool, schema, queue).await,
+        1,
+        "custom metadata needs a wide terminal row"
+    );
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        0,
+        "custom metadata must not use compact receipt batches"
+    );
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
+
+    let metadata: serde_json::Value = sqlx::query_scalar(&format!(
+        "SELECT payload->'metadata' FROM {schema}.terminal_jobs WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read completed custom metadata");
+    assert_eq!(metadata, serde_json::json!({ "tenant": "acme" }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_completion() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_delete_compat_closure";
@@ -8346,7 +8409,7 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_aged_completion_keeps_lane_priority_for_done_key() {
+async fn test_queue_storage_aged_completion_stays_compact_and_keeps_lane_priority() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_aged_completion_lane_priority";
     let schema = "awa_qs_aged_completion_lane_priority";
@@ -8420,13 +8483,24 @@ async fn test_queue_storage_aged_completion_keeps_lane_priority_for_done_key() {
         .await
         .expect("Failed to complete aged low-priority job");
 
+    assert_eq!(
+        done_entries_count(&pool, schema, queue).await,
+        0,
+        "aged successful receipt completions should stay on the compact path"
+    );
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        2,
+        "both successful completions should use compact receipt batches"
+    );
+
     let stored_priority: i16 = sqlx::query_scalar(&format!(
-        "SELECT priority FROM {schema}.done_entries WHERE job_id = $1"
+        "SELECT priority FROM {schema}.terminal_jobs WHERE job_id = $1"
     ))
     .bind(low_id)
     .fetch_one(&pool)
     .await
-    .expect("Failed to read aged done entry");
+    .expect("Failed to read aged terminal entry");
     assert_eq!(stored_priority, 4);
 }
 

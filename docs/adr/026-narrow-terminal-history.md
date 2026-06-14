@@ -36,6 +36,8 @@ Reads that materialize a `JobRow` or move a terminal row to another storage fami
 
 For successful receipt-backed completions that do not need wide terminal body fields, write compact rows to `receipt_completion_batches` instead of one `done_entries` row per completed job. Each compact batch stores arrays of `(job_id, run_lease, lane_seq, attempt, attempted_at)` plus the shared ready segment, queue, priority, shard, and finalized timestamp. Completion also writes explicit `completed` rows to `lease_claim_closures`, so claim-ring prune no longer depends on terminal history as receipt closure evidence.
 
+The compact path is only for receipt-backed jobs with no unique key, no tags, no terminal errors, and no custom metadata. Awa-owned provenance metadata (`_awa_original_priority` and `_awa_original_queue`) remains compact-safe: it is either already present on the retained ready payload, or it is claim-time priority-aging provenance that does not require duplicating the whole terminal body in `done_entries`.
+
 Schema preparation creates a read-only `{schema}.terminal_jobs` view with the hydrated terminal shape. It is the preferred SQL surface for inspection, reporting, and external read-only tooling. The view expands compact completion batches and joins both physical terminal families back to retained `ready_entries`. The physical `done_entries` table remains the write/transition surface for terminal rows that can be retried, moved to DLQ, discarded, or carried forward by failed-retention pruning. Compact completed rows are not retryable; SQL compatibility delete hides them by writing `receipt_completion_tombstones`.
 
 The retained ready backing row remains immutable and inert until queue prune reclaims the segment.
