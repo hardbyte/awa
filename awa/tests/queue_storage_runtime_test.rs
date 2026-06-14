@@ -5505,6 +5505,80 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         "raw claim intentionally leaves the post-commit claim cursor advance unsent"
     );
 
+    let claim_attempt_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint
+         FROM {schema}.ready_claim_attempts
+         WHERE ready_slot = $1
+           AND ready_generation = $2
+           AND queue = $3
+           AND priority = $4
+           AND enqueue_shard = $5
+           AND lane_seq = $6
+           AND job_id = $7
+           AND run_lease = $8"
+    ))
+    .bind(first[0].ready_slot)
+    .bind(first[0].ready_generation)
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .bind(first[0].lane_seq)
+    .bind(job_id)
+    .bind(first[0].run_lease)
+    .fetch_one(&pool)
+    .await
+    .expect("count ready claim-attempt evidence");
+    assert_eq!(
+        claim_attempt_rows, 1,
+        "claim must durably write queue-slot-local attempt evidence"
+    );
+
+    let mut locked_claim_child = pool.begin().await.expect("begin claim child lock");
+    let claim_child = format!("{schema}.lease_claims_{}", first[0].claim_slot);
+    sqlx::query(&format!(
+        "LOCK TABLE {claim_child} IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(locked_claim_child.as_mut())
+    .await
+    .expect("lock old claim child");
+
+    let recovered_while_claim_child_locked = tokio::time::timeout(Duration::from_secs(2), async {
+        sqlx::query_as::<_, (i64, i64, i64, i32)>(&format!(
+            "SELECT job_id, run_lease, lane_seq, claim_slot
+                 FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+        ))
+        .bind(queue)
+        .bind(1_i64)
+        .bind(0.0_f64)
+        .bind(0.0_f64)
+        .fetch_all(&pool)
+        .await
+    })
+    .await
+    .expect("stale cursor recovery must not block on old claim child")
+    .expect("stale cursor recovery while old claim child is locked");
+    assert!(
+        recovered_while_claim_child_locked.is_empty(),
+        "queue-slot-local attempt evidence must prevent duplicate claim without reading the claim child"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        2,
+        "queue-slot-local attempt evidence should advance the stale claim cursor"
+    );
+    locked_claim_child
+        .rollback()
+        .await
+        .expect("release claim child lock");
+    sqlx::query("SELECT setval(format('%I.%I', $1, $2)::regclass, $3, $4)")
+        .bind(schema)
+        .bind(&claim_seq_name)
+        .bind(1_i64)
+        .bind(false)
+        .execute(&pool)
+        .await
+        .expect("reset claim cursor after locked-child recovery phase");
+
     match store.rotate_claims(&pool).await.expect("rotate claims") {
         RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
         other => panic!("expected claim ring to rotate to slot 1, got {other:?}"),

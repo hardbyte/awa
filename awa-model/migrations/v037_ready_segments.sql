@@ -1,10 +1,11 @@
--- #352: ready segment ledger for claim routing.
+-- #352: ready segment and claim-attempt ledgers for claim routing.
 --
 -- v023 owns the queue-storage substrate helper. The migration runner reapplies
 -- the helper definition before this file, then this migration refreshes every
 -- installed queue-storage schema so ready_segments is created, existing
--- committed ready rows are backfilled, claim_ready_runtime() routes through
--- the compact segment control plane before reading ready_entries, and
+-- committed ready rows and in-flight receipt claims are backfilled,
+-- claim_ready_runtime() routes through the compact segment and
+-- claim-attempt control planes before reading ready_entries, and
 -- insert_job_compat() writes segment metadata for SQL compatibility producers.
 
 DO $$
@@ -138,6 +139,7 @@ BEGIN
             EXECUTE format(
                 'SELECT
                     (SELECT count(*)::bigint FROM %1$I.ready_entries)
+                  + (SELECT count(*)::bigint FROM %1$I.ready_claim_attempts)
                   + (SELECT count(*)::bigint FROM %1$I.ready_tombstones)
                   + (SELECT count(*)::bigint FROM %1$I.ready_segments)
                   + (SELECT count(*)::bigint FROM %1$I.deferred_jobs)
@@ -188,5 +190,5 @@ END
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (37, 'Add ready_segments claim-routing ledger for queue storage')
+VALUES (37, 'Add ready_segments and ready_claim_attempts ledgers for queue storage')
 ON CONFLICT (version) DO NOTHING;
