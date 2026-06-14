@@ -196,7 +196,7 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                        AND dlq.run_lease = lc.run_lease \
                    ) \
                  UNION ALL \
-                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
                  UNION ALL \
                  SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
              ) AS jobs \
@@ -270,7 +270,7 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                        AND dlq.run_lease = lc.run_lease \
                    ) \
                  UNION ALL \
-                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
                  UNION ALL \
                  SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
              ) AS jobs \

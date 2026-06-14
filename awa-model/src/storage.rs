@@ -142,6 +142,8 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
             AND to_regclass(format('%I.%I', $1, 'ready_entries')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_tombstones')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'done_entries')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'receipt_completion_batches')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'receipt_completion_tombstones')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'queue_terminal_count_deltas')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'leases')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'deferred_jobs')) IS NOT NULL

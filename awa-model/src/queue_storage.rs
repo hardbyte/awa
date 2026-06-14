@@ -75,9 +75,10 @@ pub struct QueueStorageConfig {
     pub queue_stripe_count: usize,
     /// Use the receipt-plane short path for zero-deadline jobs:
     /// claim writes a row into `lease_claims`; successful completion
-    /// writes the terminal fact to `done_entries`, while non-success
-    /// exits and cold terminal-delete paths materialize explicit
-    /// closures in `lease_claim_closures`. Both receipt tables are
+    /// writes explicit closure evidence and durable terminal history
+    /// through `receipt_completion_batches` or `done_entries`, while
+    /// non-success exits and cold terminal-delete paths materialize
+    /// explicit closures in `lease_claim_closures`. Both receipt tables are
     /// reclaimed by claim-ring rotation + TRUNCATE. Default `true`.
     /// Set to `false` to force every claim through the legacy
     /// `leases` materialization path.
@@ -107,10 +108,9 @@ pub struct ClaimedEntry {
     pub lease_slot: i32,
     pub lease_generation: i64,
     /// ADR-023: the `claim_slot` partition this attempt's
-    /// `lease_claims` receipt landed in. Explicit receipt-closure
-    /// paths use this to co-locate `lease_claim_closures`; the
-    /// successful receipt completion path uses the terminal
-    /// `done_entries` row as closure evidence instead.
+    /// `lease_claims` receipt landed in. Receipt-closure paths use this
+    /// to co-locate `lease_claim_closures`, including successful compact
+    /// receipt completions.
     pub claim_slot: i32,
     pub lease_claim_receipt: bool,
     /// The enqueue shard the row was claimed from. Routes the
@@ -271,6 +271,10 @@ pub struct BusyCounts {
     pub queue_done: i64,
     /// Queue ring: rows in the next `ready_tombstones` child.
     pub queue_tombstones: i64,
+    /// Queue ring: rows in the next `receipt_completion_batches` child.
+    pub queue_receipt_completion_batches: i64,
+    /// Queue ring: rows in the next `receipt_completion_tombstones` child.
+    pub queue_receipt_completion_tombstones: i64,
     /// Queue ring: rows in the next `queue_terminal_count_deltas` child.
     pub queue_terminal_deltas: i64,
     /// Lease ring: rows in the next `leases` child.
@@ -412,6 +416,14 @@ fn done_child_name(schema: &str, slot: usize) -> String {
 
 fn ready_tombstone_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.ready_tombstones_{slot}")
+}
+
+fn receipt_completion_batch_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.receipt_completion_batches_{slot}")
+}
+
+fn receipt_completion_tombstone_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.receipt_completion_tombstones_{slot}")
 }
 
 fn terminal_delta_child_name(schema: &str, slot: usize) -> String {
@@ -3983,7 +3995,7 @@ impl QueueStorage {
     /// The exact invariant is:
     ///
     /// `SUM(queue_terminal_live_counts) + SUM(queue_terminal_count_deltas)
-    /// == count(*) FROM done_entries`.
+    /// == count(*) FROM terminal_jobs`.
     ///
     /// Maintenance asynchronously folds delta rows into the live-counter table
     /// and truncates the delta segment. The hot path therefore performs only
@@ -5347,6 +5359,13 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(&mut tx, &completed_pairs, "completed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
 
         let finalized_at = Utc::now();
@@ -5399,7 +5418,6 @@ impl QueueStorage {
             .map(|entry| entry.claim.ready_generation)
             .collect();
         let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
-        let kinds: Vec<String> = claimed.iter().map(|entry| entry.job.kind.clone()).collect();
         let queues: Vec<String> = claimed
             .iter()
             .map(|entry| entry.job.queue.clone())
@@ -5415,7 +5433,6 @@ impl QueueStorage {
         let attempted_ats: Vec<Option<DateTime<Utc>>> =
             claimed.iter().map(|entry| entry.job.attempted_at).collect();
         let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; claimed.len()];
-        let payloads: Vec<Option<serde_json::Value>> = vec![None; claimed.len()];
         let closure_rel = format!("{schema}.lease_claim_closures");
         let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
 
@@ -5426,7 +5443,6 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
                 priority,
                 attempt,
@@ -5434,8 +5450,7 @@ impl QueueStorage {
                 lane_seq,
                 enqueue_shard,
                 attempted_at,
-                finalized_at,
-                payload
+                finalized_at
             ) AS (
                 SELECT *
                 FROM unnest(
@@ -5444,15 +5459,13 @@ impl QueueStorage {
                     $3::bigint[],
                     $4::bigint[],
                     $5::text[],
-                    $6::text[],
+                    $6::smallint[],
                     $7::smallint[],
-                    $8::smallint[],
+                    $8::bigint[],
                     $9::bigint[],
-                    $10::bigint[],
-                    $11::smallint[],
-                    $12::timestamptz[],
-                    $13::timestamptz[],
-                    $14::jsonb[]
+                    $10::smallint[],
+                    $11::timestamptz[],
+                    $12::timestamptz[]
                 )
             ),
             locked_claims AS (
@@ -5472,43 +5485,102 @@ impl QueueStorage {
                   AND attempt.run_lease = locked_claims.run_lease
                 RETURNING attempt.job_id
             ),
+            closed_claims AS (
+                INSERT INTO {schema}.lease_claim_closures (
+                    claim_slot,
+                    job_id,
+                    run_lease,
+                    outcome,
+                    closed_at
+                )
+                SELECT
+                    locked_claims.claim_slot,
+                    locked_claims.job_id,
+                    locked_claims.run_lease,
+                    'completed',
+                    clock_timestamp()
+                FROM locked_claims
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                RETURNING claim_slot, job_id, run_lease
+            ),
+            completed_rows AS (
+                SELECT completed.*
+                FROM completed
+                JOIN closed_claims
+                  ON closed_claims.claim_slot = completed.claim_slot
+                 AND closed_claims.job_id = completed.job_id
+                 AND closed_claims.run_lease = completed.run_lease
+            ),
             terminal AS (
-                INSERT INTO {schema}.done_entries (
+                INSERT INTO {schema}.receipt_completion_batches (
                     ready_slot,
                     ready_generation,
-                    job_id,
-                    kind,
+                    claim_slot,
                     queue,
-                    state,
                     priority,
-                    attempt,
-                    run_lease,
-                    lane_seq,
                     enqueue_shard,
-                    attempted_at,
-                    finalized_at,
-                    payload
+                    completed_count,
+                    job_ids,
+                    run_leases,
+                    lane_seqs,
+                    attempts,
+                    attempted_ats,
+                    finalized_at
                 )
                 SELECT
                     completed.ready_slot,
                     completed.ready_generation,
-                    completed.job_id,
-                    completed.kind,
+                    completed.claim_slot,
                     completed.queue,
-                    'completed'::awa.job_state,
                     completed.priority,
-                    completed.attempt,
-                    completed.run_lease,
-                    completed.lane_seq,
                     completed.enqueue_shard,
-                    completed.attempted_at,
-                    completed.finalized_at,
-                    completed.payload
-                FROM completed
-                JOIN locked_claims
-                  ON locked_claims.job_id = completed.job_id
-                 AND locked_claims.run_lease = completed.run_lease
-                RETURNING ready_slot, ready_generation, queue, priority, enqueue_shard, job_id, run_lease
+                    count(*)::int AS completed_count,
+                    array_agg(completed.job_id ORDER BY completed.lane_seq, completed.job_id),
+                    array_agg(completed.run_lease ORDER BY completed.lane_seq, completed.job_id),
+                    array_agg(completed.lane_seq ORDER BY completed.lane_seq, completed.job_id),
+                    array_agg(completed.attempt ORDER BY completed.lane_seq, completed.job_id),
+                    array_agg(completed.attempted_at ORDER BY completed.lane_seq, completed.job_id),
+                    max(completed.finalized_at)
+                FROM completed_rows AS completed
+                GROUP BY
+                    completed.ready_slot,
+                    completed.ready_generation,
+                    completed.claim_slot,
+                    completed.queue,
+                    completed.priority,
+                    completed.enqueue_shard
+                RETURNING
+                    ready_slot,
+                    ready_generation,
+                    claim_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    job_ids,
+                    run_leases
+            ),
+            terminal_rows AS (
+                SELECT completed_rows.*
+                FROM completed_rows
+            ),
+            counted AS (
+                SELECT
+                    terminal_rows.ready_slot,
+                    terminal_rows.ready_generation,
+                    terminal_rows.job_id,
+                    terminal_rows.run_lease,
+                    terminal_rows.queue,
+                    terminal_rows.priority,
+                    terminal_rows.enqueue_shard
+                FROM terminal_rows
+                JOIN terminal
+                  ON terminal.ready_slot = terminal_rows.ready_slot
+                 AND terminal.ready_generation = terminal_rows.ready_generation
+                 AND terminal.claim_slot = terminal_rows.claim_slot
+                 AND terminal.queue = terminal_rows.queue
+                 AND terminal.priority = terminal_rows.priority
+                 AND terminal.enqueue_shard = terminal_rows.enqueue_shard
+                 AND terminal.job_ids @> ARRAY[terminal_rows.job_id]
             ),
             -- Terminal counts use an append-only delta ledger on the hot
             -- completion path. Maintenance folds these rows into
@@ -5533,38 +5605,37 @@ impl QueueStorage {
                     delta
                 FROM (
                     SELECT
-                        terminal.ready_slot,
-                        terminal.ready_generation,
-                        terminal.queue,
-                        terminal.priority,
-                        terminal.enqueue_shard,
+                        counted.ready_slot,
+                        counted.ready_generation,
+                        counted.queue,
+                        counted.priority,
+                        counted.enqueue_shard,
                         mod(
-                            mod(terminal.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
+                            mod(counted.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
                                 + {TERMINAL_COUNTER_BUCKETS}::bigint,
                             {TERMINAL_COUNTER_BUCKETS}::bigint
                         )::smallint AS counter_bucket,
                         count(*)::bigint AS delta
-                    FROM terminal
+                    FROM counted
                     GROUP BY
-                        terminal.ready_slot,
-                        terminal.ready_generation,
-                        terminal.queue,
-                        terminal.priority,
-                        terminal.enqueue_shard,
+                        counted.ready_slot,
+                        counted.ready_generation,
+                        counted.queue,
+                        counted.priority,
+                        counted.enqueue_shard,
                         counter_bucket
                 ) AS grouped
                 ORDER BY ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket
                 RETURNING 1
             )
             SELECT job_id, run_lease
-            FROM terminal
+            FROM counted
             "#
         ))
         .bind(&claim_slots)
         .bind(&ready_slots)
         .bind(&ready_generations)
         .bind(&job_ids)
-        .bind(&kinds)
         .bind(&queues)
         .bind(&priorities)
         .bind(&attempts)
@@ -5573,7 +5644,6 @@ impl QueueStorage {
         .bind(&enqueue_shards)
         .bind(&attempted_ats)
         .bind(&finalized_ats)
-        .bind(&payloads)
         .fetch_all(pool)
         .await
         .map_err(map_sqlx_error)
@@ -5660,10 +5730,8 @@ impl QueueStorage {
 
             if !receipt_claimed.is_empty() {
                 // claim_slot rides along on `ClaimedEntry`, so receipt
-                // completion can lock the exact claim row without an
-                // extra lookup. Successful completion uses the terminal
-                // row as closure evidence; non-success paths still use
-                // this triplet to route explicit closures.
+                // completion can lock the exact claim row and route the
+                // explicit completed closure without an extra lookup.
                 let receipt_claim_slots: Vec<i32> = receipt_claimed
                     .iter()
                     .map(|entry| entry.claim.claim_slot)
@@ -5697,9 +5765,27 @@ impl QueueStorage {
                         WHERE attempt.job_id = locked_claims.job_id
                           AND attempt.run_lease = locked_claims.run_lease
                         RETURNING attempt.job_id
+                    ),
+                    closed_claims AS (
+                        INSERT INTO {schema}.lease_claim_closures (
+                            claim_slot,
+                            job_id,
+                            run_lease,
+                            outcome,
+                            closed_at
+                        )
+                        SELECT
+                            locked_claims.claim_slot,
+                            locked_claims.job_id,
+                            locked_claims.run_lease,
+                            'completed',
+                            clock_timestamp()
+                        FROM locked_claims
+                        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                        RETURNING job_id, run_lease
                     )
                     SELECT job_id, run_lease
-                    FROM locked_claims
+                    FROM closed_claims
                     "#
                 ))
                 .bind(&receipt_claim_slots)
@@ -5833,6 +5919,13 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
 
                 if !deleted.is_empty() {
+                    let completed_pairs: Vec<(i64, i64)> = deleted
+                        .iter()
+                        .map(|row| (row.job_id, row.run_lease))
+                        .collect();
+                    self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+                        .await?;
+
                     let finalized_at = Utc::now();
                     let mut done_rows = Vec::with_capacity(deleted.len());
                     for deleted_row in deleted {
@@ -5945,6 +6038,13 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+            .await?;
+
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(deleted.len());
         let mut updated = Vec::with_capacity(deleted.len());
@@ -6042,6 +6142,13 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
 
         let finalized_at = Utc::now();
@@ -6076,7 +6183,7 @@ impl QueueStorage {
     /// The live-terminal portion reads from folded
     /// `queue_terminal_live_counts` plus unrolled
     /// `queue_terminal_count_deltas` when [`Self::terminal_counter_trusted`]
-    /// returns true, and falls back to a `count(*) FROM done_entries` scan
+    /// returns true, and falls back to a `count(*) FROM terminal_jobs` scan
     /// when not. The fallback exists for the rolling-upgrade window: older
     /// binaries may have written terminal rows without maintaining the
     /// counter/delta contract, so reads stay honest until the operator runs
@@ -6116,7 +6223,7 @@ impl QueueStorage {
             format!(
                 "live_terminal AS (
                     SELECT count(*)::bigint AS terminal
-                    FROM {schema}.done_entries
+                    FROM {schema}.terminal_jobs
                     WHERE queue = ANY($1)
                 )"
             )
@@ -6282,13 +6389,14 @@ impl QueueStorage {
     /// - **terminal** is read from the persisted
     ///   `queue_terminal_rollups` denormaliser
     ///   (`pruned_completed_count + pruned_failed_count`).
-    ///   Rows currently in `done_entries` that have not yet rolled up
-    ///   are not included. Strictly a lower bound; converges to the
-    ///   exact count when rotation prunes the live `done_entries`
-    ///   segment. (The name `terminal` is honest — this number counts
-    ///   `completed`, `failed`, and `cancelled` rows in done_entries,
-    ///   the same semantics as [`Self::queue_counts_exact`]; renamed
-    ///   from `completed` in #290.)
+    ///   Rows currently in `done_entries` or
+    ///   `receipt_completion_batches` that have not yet rolled up are
+    ///   not included. Strictly a lower bound; converges to the exact
+    ///   count when rotation prunes the live queue segment. (The name
+    ///   `terminal` is honest — this number counts `completed`,
+    ///   `failed`, and `cancelled` terminal facts with the same
+    ///   semantics as [`Self::queue_counts_exact`]; renamed from
+    ///   `completed` in #290.)
     ///
     /// All three counters are O(num shards) lookups against small head
     /// tables and `leases` index probes. Use this for high-cadence
@@ -6626,6 +6734,67 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    async fn close_receipt_pairs_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        pairs: &[(i64, i64)],
+        outcome: &str,
+    ) -> Result<(), AwaError> {
+        if pairs.is_empty() || !self.lease_claim_receipts() {
+            return Ok(());
+        }
+
+        let unique_pairs: BTreeSet<(i64, i64)> = pairs.iter().copied().collect();
+        let job_ids: Vec<i64> = unique_pairs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = unique_pairs
+            .iter()
+            .map(|(_, run_lease)| *run_lease)
+            .collect();
+        let schema = self.schema();
+        let closure_rel = format!("{schema}.lease_claim_closures");
+        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+
+        sqlx::query(&format!(
+            r#"
+            WITH refs(job_id, run_lease) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            ),
+            locked_claims AS (
+                SELECT claims.claim_slot, claims.job_id, claims.run_lease
+                FROM {schema}.lease_claims AS claims
+                JOIN refs
+                  ON refs.job_id = claims.job_id
+                 AND refs.run_lease = claims.run_lease
+                WHERE NOT {closed_evidence}
+                FOR UPDATE OF claims
+            )
+            INSERT INTO {schema}.lease_claim_closures (
+                claim_slot,
+                job_id,
+                run_lease,
+                outcome,
+                closed_at
+            )
+            SELECT
+                locked_claims.claim_slot,
+                locked_claims.job_id,
+                locked_claims.run_lease,
+                $3,
+                clock_timestamp()
+            FROM locked_claims
+            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+            "#
+        ))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .bind(outcome)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         Ok(())
     }
 
@@ -9775,6 +9944,13 @@ impl QueueStorage {
             });
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
@@ -9870,6 +10046,13 @@ impl QueueStorage {
             });
         }
 
+        let failed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &failed_pairs, "failed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
@@ -9961,6 +10144,13 @@ impl QueueStorage {
                 callback_id: callback_id.to_string(),
             });
         }
+
+        let retryable_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &retryable_pairs, "retryable")
+            .await?;
 
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
@@ -11309,13 +11499,29 @@ impl QueueStorage {
             &ready_tombstone_child_name(schema, next_slot as usize),
         )
         .await?;
+        let receipt_batch_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &receipt_completion_batch_child_name(schema, next_slot as usize),
+        )
+        .await?;
+        let receipt_tombstone_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &receipt_completion_tombstone_child_name(schema, next_slot as usize),
+        )
+        .await?;
         let terminal_delta_busy = Self::relation_has_rows_tx(
             &mut tx,
             &terminal_delta_child_name(schema, next_slot as usize),
         )
         .await?;
 
-        if ready_busy || done_busy || tombstone_busy || terminal_delta_busy {
+        if ready_busy
+            || done_busy
+            || tombstone_busy
+            || receipt_batch_busy
+            || receipt_tombstone_busy
+            || terminal_delta_busy
+        {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
@@ -11323,6 +11529,8 @@ impl QueueStorage {
                     queue_ready: busy_indicator(ready_busy),
                     queue_done: busy_indicator(done_busy),
                     queue_tombstones: busy_indicator(tombstone_busy),
+                    queue_receipt_completion_batches: busy_indicator(receipt_batch_busy),
+                    queue_receipt_completion_tombstones: busy_indicator(receipt_tombstone_busy),
                     queue_terminal_deltas: busy_indicator(terminal_delta_busy),
                     ..Default::default()
                 },
@@ -11445,12 +11653,12 @@ impl QueueStorage {
     }
 
     /// Rebuild terminal counters from scratch by truncating folded live counts
-    /// and pending deltas, then re-aggregating `done_entries`. Run this when:
+    /// and pending deltas, then re-aggregating terminal history. Run this when:
     ///
     /// - upgrading from a pre-#290 fleet, where in-flight binaries wrote
-    ///   `done_entries` without maintaining the counter,
+    ///   terminal history without maintaining the counter,
     /// - after any incident that may have left the counter inconsistent
-    ///   with `done_entries`, or
+    ///   with terminal history, or
     /// - as a routine drift-recovery step before relying on counter-fed
     ///   reads for billing-grade accuracy.
     ///
@@ -11463,7 +11671,7 @@ impl QueueStorage {
     /// **Operator note:** this is best run on a quiesced fleet (workers
     /// paused or fully drained). Concurrent inserts during the rebuild
     /// will block on the lock; long-held locks can stall the fleet. The
-    /// rebuild itself is O(rows in `done_entries`).
+    /// rebuild itself is O(rows in `{schema}.terminal_jobs`).
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rebuild_terminal_counters")]
     pub async fn rebuild_terminal_counters(&self, pool: &PgPool) -> Result<i64, AwaError> {
         let schema = self.schema();
@@ -11478,6 +11686,8 @@ impl QueueStorage {
 
         sqlx::query(&format!(
             "LOCK TABLE {schema}.done_entries, \
+             {schema}.receipt_completion_batches, \
+             {schema}.receipt_completion_tombstones, \
              {schema}.queue_terminal_count_deltas, \
              {schema}.queue_terminal_live_counts \
              IN ACCESS EXCLUSIVE MODE"
@@ -11510,7 +11720,7 @@ impl QueueStorage {
                         {TERMINAL_COUNTER_BUCKETS}::bigint
                     )::smallint AS counter_bucket,
                     count(*)::bigint
-                FROM {schema}.done_entries
+                FROM {schema}.terminal_jobs
                 GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
                 RETURNING 1
             )
@@ -11523,7 +11733,7 @@ impl QueueStorage {
 
         // Flip the trust marker. From this point the read path
         // (queue_counts_exact) uses the counter directly; before this
-        // call, it falls back to scanning done_entries.
+        // call, it falls back to scanning terminal_jobs.
         sqlx::query(&format!(
             r#"
             UPDATE {schema}.queue_ring_state
@@ -11984,10 +12194,12 @@ impl QueueStorage {
         let ready_child = ready_child_name(schema, slot as usize);
         let done_child = done_child_name(schema, slot as usize);
         let tomb_child = ready_tombstone_child_name(schema, slot as usize);
+        let receipt_batch_child = receipt_completion_batch_child_name(schema, slot as usize);
+        let receipt_tomb_child = receipt_completion_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
 
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12063,25 +12275,18 @@ impl QueueStorage {
             r#"
             SELECT EXISTS (
                 SELECT 1
-                FROM {ready_child} AS ready
-                LEFT JOIN {done_child} AS done
-                  ON done.ready_generation = ready.ready_generation
-                 AND done.queue = ready.queue
-                 AND done.priority = ready.priority
-                 AND done.enqueue_shard = ready.enqueue_shard
-                 AND done.lane_seq = ready.lane_seq
-                LEFT JOIN {tomb_child} AS tomb
-                  ON tomb.ready_generation = ready.ready_generation
-                 AND tomb.queue = ready.queue
-                 AND tomb.priority = ready.priority
-                 AND tomb.enqueue_shard = ready.enqueue_shard
-                 AND tomb.lane_seq = ready.lane_seq
-                WHERE done.lane_seq IS NULL
-                  AND tomb.lane_seq IS NULL
+                FROM {schema}.queue_claim_heads AS claims
+                JOIN {ready_child} AS ready
+                  ON ready.queue = claims.queue
+                 AND ready.priority = claims.priority
+                 AND ready.enqueue_shard = claims.enqueue_shard
+                 AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+                WHERE ready.ready_generation = $1
                 LIMIT 1
             )
             "#
         ))
+        .bind(generation)
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -12237,29 +12442,77 @@ impl QueueStorage {
         // permanent rollup would double-count them.
         let pruned_terminal_counts: Vec<(String, i16, i64, i64)> = sqlx::query_as(&format!(
             r#"
+            WITH done_counts AS (
+                SELECT
+                    queue,
+                    priority,
+                    (count(*) FILTER (WHERE state <> 'failed'))::bigint AS completed,
+                    (count(*) FILTER (
+                        WHERE state = 'failed'
+                          AND (
+                              $2::boolean IS FALSE
+                              OR finalized_at < now() - make_interval(secs => $1::bigint)
+                          )
+                    ))::bigint AS failed
+                FROM {done_child}
+                GROUP BY queue, priority
+            ),
+            batch_rows AS (
+                SELECT
+                    batch.ready_generation,
+                    batch.queue,
+                    batch.priority,
+                    item.job_id,
+                    item.run_lease
+                FROM {receipt_batch_child} AS batch
+                CROSS JOIN LATERAL unnest(
+                    batch.job_ids,
+                    batch.run_leases
+                ) AS item(job_id, run_lease)
+                WHERE batch.ready_generation = $3
+            ),
+            batch_counts AS (
+                SELECT
+                    batch_rows.queue,
+                    batch_rows.priority,
+                    count(*)::bigint AS completed
+                FROM batch_rows
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {receipt_tomb_child} AS tomb
+                    WHERE tomb.ready_generation = batch_rows.ready_generation
+                      AND tomb.job_id = batch_rows.job_id
+                      AND tomb.run_lease = batch_rows.run_lease
+                )
+                GROUP BY batch_rows.queue, batch_rows.priority
+            ),
+            keys AS (
+                SELECT queue, priority FROM done_counts
+                UNION
+                SELECT queue, priority FROM batch_counts
+            )
             SELECT
-                queue,
-                priority,
-                (count(*) FILTER (WHERE state <> 'failed'))::bigint AS pruned_completed_count,
-                (count(*) FILTER (
-                    WHERE state = 'failed'
-                      AND (
-                          $2::boolean IS FALSE
-                          OR finalized_at < now() - make_interval(secs => $1::bigint)
-                      )
-                ))::bigint AS pruned_failed_count
-            FROM {done_child}
-            GROUP BY queue, priority
+                keys.queue,
+                keys.priority,
+                (
+                    COALESCE(done_counts.completed, 0)
+                    + COALESCE(batch_counts.completed, 0)
+                )::bigint AS pruned_completed_count,
+                COALESCE(done_counts.failed, 0)::bigint AS pruned_failed_count
+            FROM keys
+            LEFT JOIN done_counts USING (queue, priority)
+            LEFT JOIN batch_counts USING (queue, priority)
             "#
         ))
         .bind(failed_retention_secs)
         .bind(retention_floor)
+        .bind(generation)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
         let truncate = sqlx::query(&format!(
-            "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child}"
+            "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12632,8 +12885,8 @@ impl QueueStorage {
         }
 
         // `PartitionTruncateSafety`: every claim in this partition must
-        // have explicit closure evidence or durable terminal/deferred/DLQ
-        // evidence. Any open claim means a worker is
+        // have explicit closure evidence, with durable terminal/deferred/DLQ
+        // evidence accepted for compatibility with older rows. Any open claim means a worker is
         // still running (or a rescue hasn't fired yet); we bail and let
         // normal lifecycle drain the partition.
         let closed_evidence = receipt_closed_evidence_sql(schema, &closure_child, "claims");

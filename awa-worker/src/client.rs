@@ -2730,7 +2730,7 @@ mod tests {
         timeout: Duration,
     ) {
         let sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM {schema}.done_entries WHERE job_id = $1 AND state = 'completed')"
+            "SELECT EXISTS(SELECT 1 FROM {schema}.terminal_jobs WHERE job_id = $1 AND state = 'completed')"
         );
         let start = Instant::now();
         loop {

@@ -99,6 +99,10 @@ TableSpec == [
     ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     ready_tombstones       |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    receipt_completion_batches
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    receipt_completion_tombstones
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     queue_terminal_count_deltas
                            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
@@ -214,13 +218,13 @@ ClaimLegacyTx == <<
 >>
 
 \* complete_runtime_batch (receipts mode)
-\* Successful receipt completion uses the synchronous done_entries row as
-\* durable receipt-closure evidence and does not append a duplicate
-\* lease_claim_closures row on the hot path. Cold terminal-delete paths
-\* materialize an explicit closure if they remove that done evidence before
-\* claim prune.
+\* Successful receipt completion appends a compact terminal batch plus an
+\* explicit completed receipt closure. The public terminal fact is exposed by
+\* terminal_jobs, while claim prune depends on lease_claim_closures instead of
+\* terminal history.
 CompleteReceiptsTx == <<
-    Mut("Insert", "done_entries"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "receipt_completion_batches"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Delete", "attempt_state")
 >>
@@ -377,6 +381,11 @@ DeleteTerminalCompatTx == <<
     Mut("Insert", "queue_terminal_count_deltas")
 >>
 
+DeleteCompactReceiptTerminalCompatTx == <<
+    Mut("Insert", "receipt_completion_tombstones"),
+    Mut("Insert", "queue_terminal_count_deltas")
+>>
+
 RetryFromTerminalTx == <<
     Mut("Insert", "lease_claim_closures"),
     Mut("Delete", "done_entries"),
@@ -421,6 +430,8 @@ PruneReadyTx  == <<
     Mut("Update", "queue_ring_slots"),
     Mut("Truncate", "ready_entries"),
     Mut("Truncate", "done_entries"),
+    Mut("Truncate", "receipt_completion_batches"),
+    Mut("Truncate", "receipt_completion_tombstones"),
     Mut("Truncate", "ready_tombstones"),
     Mut("Truncate", "queue_terminal_count_deltas")
 >>
@@ -451,7 +462,8 @@ Transactions == {
     FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,
     EnterCallbackWaitTx, ResumeWaitingTx, ResolveExternalTerminalTx,
     RetryExternalTx, MoveFailedToDlqTx, DiscardTerminalTx,
-    DeleteTerminalCompatTx, RetryFromTerminalTx, RetryFromDlqTx, PurgeDlqTx,
+    DeleteTerminalCompatTx, DeleteCompactReceiptTerminalCompatTx,
+    RetryFromTerminalTx, RetryFromDlqTx, PurgeDlqTx,
     HeartbeatTx, ProgressFlushTx,
     RotateLeasesTx, PruneLeasesTx,
     RotateReadyTx, PruneReadyTx, TerminalDeltaRollupTx, TerminalDeltaRollupPinnedTx,

@@ -115,7 +115,11 @@ LeaseChildResource(s) == [k |-> "lease_child", s |-> s]
 QueueRingStateResource == [k |-> "queue_ring_state"]
 QueueRingSlotResource(s) == [k |-> "queue_ring_slot", s |-> s]
 ReadyChildResource(s) == [k |-> "ready_child", s |-> s]
+ReadyTombstoneChildResource(s) == [k |-> "ready_tombstone_child", s |-> s]
 DoneChildResource(s) == [k |-> "done_child", s |-> s]
+ReceiptBatchChildResource(s) == [k |-> "receipt_batch_child", s |-> s]
+ReceiptTombstoneChildResource(s) == [k |-> "receipt_tombstone_child", s |-> s]
+TerminalDeltaChildResource(s) == [k |-> "terminal_delta_child", s |-> s]
 LeasesParentResource == [k |-> "leases_parent"]
 ClaimRingStateResource == [k |-> "claim_ring_state"]
 ClaimRingSlotResource(s) == [k |-> "claim_ring_slot", s |-> s]
@@ -127,7 +131,11 @@ LeaseRingSlotResources == { LeaseRingSlotResource(s) : s \in LeaseSlots }
 LeaseChildResources == { LeaseChildResource(s) : s \in LeaseSlots }
 QueueRingSlotResources == { QueueRingSlotResource(s) : s \in ReadySlots }
 ReadyChildResources == { ReadyChildResource(s) : s \in ReadySlots }
+ReadyTombstoneChildResources == { ReadyTombstoneChildResource(s) : s \in ReadySlots }
 DoneChildResources == { DoneChildResource(s) : s \in ReadySlots }
+ReceiptBatchChildResources == { ReceiptBatchChildResource(s) : s \in ReadySlots }
+ReceiptTombstoneChildResources == { ReceiptTombstoneChildResource(s) : s \in ReadySlots }
+TerminalDeltaChildResources == { TerminalDeltaChildResource(s) : s \in ReadySlots }
 ClaimRingSlotResources == { ClaimRingSlotResource(s) : s \in ClaimSlots }
 ClaimChildResources == { ClaimChildResource(s) : s \in ClaimSlots }
 ClosureChildResources == { ClosureChildResource(s) : s \in ClaimSlots }
@@ -140,7 +148,11 @@ Resources ==
     {QueueRingStateResource} \cup
     QueueRingSlotResources \cup
     ReadyChildResources \cup
+    ReadyTombstoneChildResources \cup
     DoneChildResources \cup
+    ReceiptBatchChildResources \cup
+    ReceiptTombstoneChildResources \cup
+    TerminalDeltaChildResources \cup
     {LeasesParentResource} \cup
     {ClaimRingStateResource} \cup
     ClaimRingSlotResources \cup
@@ -223,12 +235,16 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
 
 \* complete_runtime_batch receipt branch (ADR-023/026)
 \*   No queue_lanes lock (completion does not gate on a lane row)
-\*   Successful receipt completion uses done_entries as durable closure
-\*   evidence and does not insert lease_claim_closures on the hot path.
+\*   Successful receipt completion locks the claim, writes an explicit
+\*   completed closure, writes compact receipt completion history, and
+\*   appends the terminal-count delta.
 \*   Non-success close paths are modelled by CloseReceiptPlan /
 \*   CancelReceiptOnlyPlan / CancelRunningPlan.
 CompletePlan(claimSlot, readySlot) ==
-    << Step(DoneChildResource(readySlot), ModeShared) >>
+    << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ReceiptBatchChildResource(readySlot), ModeShared),
+       Step(TerminalDeltaChildResource(readySlot), ModeShared) >>
 
 \* close_receipt_tx (queue_storage.rs:6517, called from cancel_job_tx)
 \*   WITH locked_claim AS (SELECT ... FROM lease_claims FOR UPDATE)
@@ -285,6 +301,7 @@ EnsureRunningPlan(claimSlot, leaseSlot) ==
 CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared),
+       Step(TerminalDeltaChildResource(readySlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
@@ -296,6 +313,7 @@ CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
 CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
     << Step(LeaseChildResource(leaseSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared),
+       Step(TerminalDeltaChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
@@ -305,6 +323,7 @@ CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
 \* retry-from-terminal, DLQ move, discard, and SQL compatibility delete.
 TerminalDeletePlan(readySlot, claimSlot) ==
     << Step(DoneChildResource(readySlot), ModeShared),
+       Step(TerminalDeltaChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
@@ -344,18 +363,27 @@ PruneLeasesPlan(slot) ==
 \* rotate_ready similar to rotate_leases (approximated)
 RotateReadyPlan(nextSlot) ==
     << Step(QueueRingStateResource, ModeExclusive),
-       Step(ReadyChildResource(nextSlot), ModeShared) >>
+       Step(ReadyChildResource(nextSlot), ModeShared),
+       Step(ReadyTombstoneChildResource(nextSlot), ModeShared),
+       Step(DoneChildResource(nextSlot), ModeShared),
+       Step(ReceiptBatchChildResource(nextSlot), ModeShared),
+       Step(ReceiptTombstoneChildResource(nextSlot), ModeShared),
+       Step(TerminalDeltaChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest
 \*   SELECT ... FROM queue_ring_state FOR UPDATE
 \*   SELECT ... FROM queue_ring_slots FOR UPDATE
-\*   LOCK TABLE ready_child[slot], done_child[slot] ACCESS EXCLUSIVE NOWAIT
+\*   LOCK TABLE ready/done/tombstone/compact/delta children ACCESS EXCLUSIVE NOWAIT
 \*   SELECT count FROM leases WHERE ready_slot = $1 (AccessShare on leases parent)
 PruneReadyPlan(slot) ==
     << Step(QueueRingStateResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
        Step(ReadyChildResource(slot), ModeExclusive),
        Step(DoneChildResource(slot), ModeExclusive),
+       Step(ReadyTombstoneChildResource(slot), ModeExclusive),
+       Step(ReceiptBatchChildResource(slot), ModeExclusive),
+       Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
+       Step(TerminalDeltaChildResource(slot), ModeExclusive),
        Step(LeasesParentResource, ModeShared) >>
 
 \* rotate_claims (ADR-023)

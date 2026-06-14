@@ -1241,6 +1241,36 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
 
     prepare_queue_storage_schema(&pool, schema).await;
     sqlx::query(&format!(
+        "DROP TABLE {schema}.receipt_completion_batches CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test receipt_completion_batches drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after compact batch table drop"),
+        "schema without receipt_completion_batches must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
+        "DROP TABLE {schema}.receipt_completion_tombstones CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test receipt_completion_tombstones drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after compact tombstone table drop"),
+        "schema without receipt_completion_tombstones must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
         "DROP TABLE {schema}.queue_terminal_count_deltas CASCADE"
     ))
     .execute(&pool)
@@ -1710,6 +1740,85 @@ async fn test_storage_abort_from_mixed_transition_rejects_queue_storage_rows() {
         "#,
     )
     .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let err = storage::abort(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("queue storage contains"),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_storage_abort_from_mixed_transition_rejects_compact_terminal_rows() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'mixed_transition',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            entered_at = now(),
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at) VALUES ('queue_storage', 'awa_queue_storage', now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa_queue_storage.receipt_completion_batches (
+            ready_slot,
+            ready_generation,
+            claim_slot,
+            queue,
+            priority,
+            enqueue_shard,
+            completed_count,
+            job_ids,
+            run_leases,
+            lane_seqs,
+            attempts,
+            attempted_ats,
+            finalized_at
+        )
+        VALUES (
+            0,
+            1,
+            0,
+            'abort_compact_terminal_queue',
+            2,
+            0,
+            1,
+            ARRAY[9000001]::bigint[],
+            ARRAY[1]::bigint[],
+            ARRAY[1]::bigint[],
+            ARRAY[1]::smallint[],
+            ARRAY[now()]::timestamptz[],
+            now()
+        )
+        "#,
+    )
+    .execute(&pool)
     .await
     .unwrap();
 
