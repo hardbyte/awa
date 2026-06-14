@@ -1114,6 +1114,7 @@ struct CompleteJob {
 #[derive(Clone)]
 struct BlockingCompleteWorkerGate {
     release: Arc<Notify>,
+    released: Arc<AtomicBool>,
     entered: Arc<AtomicBool>,
     entered_wake: Arc<Notify>,
 }
@@ -1122,6 +1123,7 @@ impl BlockingCompleteWorkerGate {
     fn new() -> Self {
         Self {
             release: Arc::new(Notify::new()),
+            released: Arc::new(AtomicBool::new(false)),
             entered: Arc::new(AtomicBool::new(false)),
             entered_wake: Arc::new(Notify::new()),
         }
@@ -1149,6 +1151,7 @@ impl BlockingCompleteWorkerGate {
     }
 
     fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
         self.release.notify_waiters();
     }
 }
@@ -1166,7 +1169,13 @@ impl Worker for BlockingCompleteWorker {
     async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         self.gate.entered.store(true, Ordering::SeqCst);
         self.gate.entered_wake.notify_waiters();
-        self.gate.release.notified().await;
+        loop {
+            let notified = self.gate.release.notified();
+            if self.gate.released.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
         Ok(JobResult::Completed)
     }
 }
