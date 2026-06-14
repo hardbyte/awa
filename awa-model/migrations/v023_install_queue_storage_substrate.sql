@@ -1194,7 +1194,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON TABLE %I.receipt_completion_batches IS %L',
         p_schema,
-        'Append-only compact history for successful receipt-backed completions. Each row stores one completion batch and expands through terminal_jobs; reclaimed with the matching ready-slot partition.'
+        'Append-only compact history for successful receipt-backed completions. Each row stores one completion batch, expands through terminal_jobs, and acts as durable closure evidence for the matching receipt claims; reclaimed with the matching ready-slot partition.'
     );
 
     EXECUTE format(

@@ -56,7 +56,7 @@ Key safety checks include:
 - DLQ rows hold no live runtime (no lease, attempt_state, etc.)
 - `dlq_entries` and `terminal_entries` are disjoint (a job is in exactly one terminal family at a time)
 - pruned terminal segments hold no live terminal rows; terminal rotation is deadlock-free and respects the same open/sealed/pruned lifecycle as the other families
-- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have explicit closure evidence or durable terminal/deferred/DLQ evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while a claim row still depends on it.
+- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have durable closure evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while a claim row still depends on it.
 
 What it intentionally does not model:
 

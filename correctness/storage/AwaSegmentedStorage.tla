@@ -48,9 +48,9 @@ EXTENDS TLC, Naturals, FiniteSets
 \* (FailToDlq / RetryToDeferred / RescueToReady /
 \* CancelWaitingToTerminal / TimeoutWaitingToDlq /
 \* TimeoutWaitingToReady) write an explicit closure row in that same
-\* segment. Successful receipt completion also writes an explicit
-\* completed closure row and records the public terminal fact in compact
-\* terminal history. ParkToWaiting does NOT close the receipt:
+\* segment. Successful compact receipt completion records the public
+\* terminal fact in compact terminal history, and that compact history is
+\* treated as closure evidence. ParkToWaiting does NOT close the receipt:
 \* waiting_external remains a row in `leases`, so the attempt is still
 \* alive in callback wait and its receipt stays open.
 \* ResumeWaitingToRunning also keeps the receipt open because the handler
@@ -71,8 +71,8 @@ EXTENDS TLC, Naturals, FiniteSets
 \* force-closed, and the first open future-deadline claim stops
 \* advancement until it expires or closes through normal completion.
 \* Both cursors refine the same storage facts modelled here: an open
-\* claim is removed from claimOpen and a matching closure evidence row is
-\* represented in claimClosed.
+\* claim is removed from claimOpen and matching durable closure evidence
+\* is represented in claimClosed.
 \*
 \* Enqueue-shard modelling (ADR-025): `laneState` here represents one
 \* `(queue, priority, enqueue_shard)` triple. The Rust implementation
@@ -261,7 +261,8 @@ UnchangedSegmentState ==
 
 \* Receipt-plane data variables (claim-ring). Claim() opens a receipt.
 \* Explicit non-success exits append closure rows in claimClosed. Successful
-\* receipt completion also appends an explicit completed closure row.
+\* compact receipt completion appends terminal-history evidence that also
+\* closes the claim.
 UnchangedClaimData ==
     UNCHANGED <<claimSegmentOf, claimOpen, claimClosed>>
 
@@ -1364,11 +1365,11 @@ PruneTerminalSegment(seg) ==
 \* ADR-023 prune of the claim ring. The precondition
 \* `\A k : claimSegmentOf[k] = seg => k \notin claimOpen` captures
 \* rescue-before-truncate: every claim row in the partition must be
-\* closed by explicit closure evidence
+\* closed by durable closure evidence
 \* before `prune_oldest_claims` can TRUNCATE the lease_claims /
 \* lease_claim_closures children for that slot. Ready prune is separately
-\* guarded so it cannot remove terminal history before the matching explicit
-\* closure exists. Note this iterates over ClaimKeys, so an old (j, r)
+\* guarded so it cannot remove terminal history before matching closure
+\* evidence exists. Note this iterates over ClaimKeys, so an old (j, r)
 \* receipt left behind by a previous attempt is correctly counted even
 \* when the same job has been re-claimed under (j, r+1) into a newer
 \* partition.

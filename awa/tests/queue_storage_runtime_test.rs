@@ -548,6 +548,26 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
               AND closures.run_lease = claims.run_lease
         )
           AND NOT EXISTS (
+            SELECT 1
+            FROM {schema}.receipt_completion_batches AS batch
+            WHERE batch.ready_slot = claims.ready_slot
+              AND batch.ready_generation = claims.ready_generation
+              AND batch.claim_slot = claims.claim_slot
+              AND batch.queue = claims.queue
+              AND batch.priority = claims.priority
+              AND batch.enqueue_shard = claims.enqueue_shard
+              AND batch.job_ids @> ARRAY[claims.job_id]::bigint[]
+              AND EXISTS (
+                  SELECT 1
+                  FROM unnest(
+                      batch.job_ids,
+                      batch.run_leases
+                  ) AS receipt_item(job_id, run_lease)
+                  WHERE receipt_item.job_id = claims.job_id
+                    AND receipt_item.run_lease = claims.run_lease
+              )
+        )
+          AND NOT EXISTS (
             SELECT 1 FROM {schema}.leases AS lease
             WHERE lease.job_id = claims.job_id
               AND lease.run_lease = claims.run_lease
@@ -1929,10 +1949,10 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
 /// Wave-1 regression test for the claim-ring rotate+prune pair.
 ///
 /// Exercises the full cycle: claim a job (populates
-/// `lease_claims_<current>`), complete it (populates
-/// `lease_claim_closures_<current>`), rotate the ring (must NOT flip
-/// onto a slot that still has rows), prune the oldest slot (must
-/// `TRUNCATE` both children because every claim has a closure), rotate
+/// `lease_claims_<current>`), complete it (populates compact terminal
+/// history), rotate the ring (must NOT flip onto a slot that still has
+/// rows), prune the oldest slot (must `TRUNCATE` both children because
+/// every claim has closure evidence), rotate
 /// again (now succeeds because the target slot is empty).
 ///
 /// This locks in two ADR-023 invariants that were broken before this
@@ -1963,8 +1983,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
 
     // Claim + complete a receipt-backed job. Without prune, this leaves
-    // one row in lease_claims_0 and one completed closure row in
-    // lease_claim_closures_0.
+    // one row in lease_claims_0 and one compact receipt completion batch.
     let job_id = enqueue_job(
         &pool,
         &store,
@@ -2001,7 +2020,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
     client.shutdown(Duration::from_secs(5)).await;
 
-    // Sanity: the claim and its compact completed closure landed in slot 0.
+    // Sanity: the claim landed in slot 0 and the compact batch supplies
+    // closure evidence without an explicit closure row.
     let slot0_claims: i64 =
         sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
             .fetch_one(&pool)
@@ -2015,8 +2035,13 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .expect("count lease_claim_closures_0");
     assert_eq!(slot0_claims, 1, "completed claim must live in slot 0");
     assert_eq!(
-        slot0_closures, 1,
-        "successful completion uses explicit compact receipt closure evidence"
+        slot0_closures, 0,
+        "compact successful completion must not write explicit closure rows"
+    );
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1,
+        "compact receipt completion batch is the closure evidence"
     );
 
     // Rotate from slot 0 → slot 1. Slot 1 is empty, so busy-check
@@ -2067,9 +2092,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     );
 
     // Prune the oldest initialized slot. The completed claim has a
-    // matching done_entries row, so PartitionTruncateSafety holds even
-    // without a duplicate completed-closure row, and prune TRUNCATEs
-    // both children.
+    // compact receipt batch, so PartitionTruncateSafety holds even
+    // without a completed-closure row, and prune TRUNCATEs both children.
     sqlx::query(&format!(
         r#"
         UPDATE {schema}.claim_ring_slots
@@ -2487,8 +2511,13 @@ async fn test_open_receipt_claims_is_absent_after_install() {
     );
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "compact successful completion uses receipt_completion_batches as closure evidence"
+    );
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
         1,
-        "successful completion uses explicit compact receipt closure evidence"
+        "successful receipt completion should write compact terminal/closure evidence"
     );
     assert!(
         !open_receipt_claims_present(&pool, schema).await,
@@ -2499,8 +2528,9 @@ async fn test_open_receipt_claims_is_absent_after_install() {
 }
 
 /// Partition-routing smoke test for the ADR-023 receipt plane: a
-/// receipt-backed claim + completion cycle lands the claim and explicit
-/// completed closure rows in the expected child partitions.
+/// receipt-backed claim + completion cycle lands the claim in the
+/// expected claim child and records the claim slot on compact terminal
+/// history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_partition_routing() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -2608,8 +2638,24 @@ async fn test_lease_claim_partition_routing() {
     .await
     .expect("count in lease_claim_closures_2");
     assert_eq!(
-        closure_in_child, 1,
-        "successful completion must write compact completed closure evidence"
+        closure_in_child, 0,
+        "compact successful completion should not write an explicit closure row"
+    );
+
+    let compact_batch_claim_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT claim_slot
+         FROM {schema}.receipt_completion_batches
+         WHERE job_ids @> ARRAY[$1]::bigint[]
+         ORDER BY batch_id DESC
+         LIMIT 1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read compact batch claim_slot");
+    assert_eq!(
+        compact_batch_claim_slot, current_slot,
+        "compact receipt batch must retain the originating claim slot"
     );
 }
 
@@ -3718,8 +3764,8 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        1,
-        "successful receipt completion closes the receipt claim"
+        0,
+        "compact successful completion closes the receipt through receipt_completion_batches"
     );
     assert_eq!(completed_done_count(&pool, &store, queue).await, 0);
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
@@ -3850,8 +3896,8 @@ async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_complet
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        1,
-        "successful completion should write explicit compact receipt closure evidence"
+        0,
+        "compact successful completion should not write explicit closure evidence"
     );
 
     let deleted: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
@@ -3866,8 +3912,8 @@ async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_complet
     assert_eq!(receipt_completion_tombstone_count(&pool, &store).await, 1);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        1,
-        "compat delete must preserve explicit closure evidence for claim pruning"
+        0,
+        "compat delete must not add explicit closure rows for compact batches"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
 
@@ -4265,8 +4311,8 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
     .await
     .expect("count receipt closures");
     assert_eq!(
-        closures, 2,
-        "successful completion and rescued open claim both write explicit closures"
+        closures, 1,
+        "rescued open claim writes explicit closure; compact success does not"
     );
 }
 
@@ -4579,8 +4625,8 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        1,
-        "successful materialized receipt completion closes the receipt claim"
+        0,
+        "attempt-state-only compact success closes through receipt_completion_batches"
     );
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -4732,7 +4778,11 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "retryable failure closes explicitly; compact final success closes through receipt_completion_batches"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4921,7 +4971,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         2,
-        "rescue closes the stale receipt and successful completion closes the retry receipt"
+        "rescue closes the stale receipt and this worker's retry success uses the general closure path"
     );
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -5371,7 +5421,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         2,
-        "rescue closes the stale receipt and successful completion closes the retry receipt"
+        "rescue closes the stale receipt and this worker's retry success uses the general closure path"
     );
 
     release.notify_waiters();
@@ -6664,6 +6714,16 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
         1
     );
     assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        0,
+        "compact successful completions must not write per-job closure rows"
+    );
+    assert_eq!(
+        open_receipt_claim_count(&pool, &store).await,
+        0,
+        "compact receipt batch must close the claim logically"
+    );
+    assert_eq!(
         live_sum, 0,
         "fused receipt fast path must not update folded counters"
     );
@@ -6680,6 +6740,65 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
         terminal_sum, terminal_count,
         "fused receipt fast path must preserve exact public terminal count"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_closure_rows() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_compact_receipt_idempotent";
+    let schema = "awa_qs_compact_receipt_idempotent";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].claim.lease_claim_receipt);
+
+    let claimed_a = claimed.clone();
+    let claimed_b = claimed.clone();
+    let (first, second) = tokio::join!(
+        store.complete_runtime_batch(&pool, &claimed_a),
+        store.complete_runtime_batch(&pool, &claimed_b)
+    );
+    let first = first.expect("first complete");
+    let second = second.expect("second complete");
+    assert_eq!(
+        first.len() + second.len(),
+        1,
+        "duplicate compact completions must have a single winner"
+    );
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        0,
+        "idempotent compact success must not rely on explicit closure rows"
+    );
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1,
+        "duplicate completion must not create duplicate compact batches"
+    );
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 1);
+    assert_eq!(
+        terminal_delta_row_count(&pool, schema, queue).await,
+        1,
+        "duplicate completion must not duplicate terminal-count deltas"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
 }
 
 /// ADR-026: every terminal-delete path keeps the exact counter invariant tight

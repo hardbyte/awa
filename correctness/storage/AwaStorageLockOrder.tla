@@ -235,9 +235,13 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
 
 \* complete_runtime_batch receipt branch (ADR-023/026)
 \*   No queue_lanes lock (completion does not gate on a lane row)
-\*   Successful receipt completion locks the claim, writes an explicit
-\*   completed closure, writes compact receipt completion history, and
-\*   appends the terminal-count delta.
+\*   Successful compact receipt completion locks the claim, reads closure
+\*   evidence to stay idempotent, writes compact receipt completion history,
+\*   and appends the terminal-count delta.
+\*   Rust first takes per-(job_id, run_lease) advisory transaction locks in
+\*   deterministic key order. Those locks serialize duplicate completion
+\*   attempts but do not participate in table-lock waits-for cycles modelled
+\*   here.
 \*   Non-success close paths are modelled by CloseReceiptPlan /
 \*   CancelReceiptOnlyPlan / CancelRunningPlan.
 CompletePlan(claimSlot, readySlot) ==
