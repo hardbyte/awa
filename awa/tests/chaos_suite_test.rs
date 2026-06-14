@@ -102,8 +102,7 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
-                     WHERE cb.claim_slot = lc.claim_slot \
-                       AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
+                     WHERE cb.receipt_ranges @> lc.receipt_id \
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.leases AS lease \
@@ -279,8 +278,7 @@ async fn kind_state_count(pool: &sqlx::PgPool, queue: &str, kind: &str, state: &
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
-                        WHERE closure_batches.claim_slot = claims.claim_slot
-                          AND closure_batches.receipt_ids @> ARRAY[claims.receipt_id]::bigint[]
+                        WHERE closure_batches.receipt_ranges @> claims.receipt_id
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM {schema}.leases AS lease
@@ -350,8 +348,7 @@ async fn backdate_running_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> 
               )
               AND NOT EXISTS (
                 SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
-                WHERE closure_batches.claim_slot = claims.claim_slot
-                  AND closure_batches.receipt_ids @> ARRAY[claims.receipt_id]::bigint[]
+                WHERE closure_batches.receipt_ranges @> claims.receipt_id
               )
               AND NOT EXISTS (
                 SELECT 1 FROM {schema}.leases AS lease
@@ -443,8 +440,7 @@ async fn backdate_running_jobs(pool: &sqlx::PgPool, queue: &str) -> u64 {
               )
               AND NOT EXISTS (
                 SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
-                WHERE closure_batches.claim_slot = claims.claim_slot
-                  AND closure_batches.receipt_ids @> ARRAY[claims.receipt_id]::bigint[]
+                WHERE closure_batches.receipt_ranges @> claims.receipt_id
               )
               AND NOT EXISTS (
                 SELECT 1 FROM {schema}.leases AS lease

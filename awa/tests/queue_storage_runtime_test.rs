@@ -551,8 +551,7 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
           AND NOT EXISTS (
             SELECT 1
             FROM {schema}.lease_claim_closure_batches AS closure_batches
-            WHERE closure_batches.claim_slot = claims.claim_slot
-              AND closure_batches.receipt_ids @> ARRAY[claims.receipt_id]::bigint[]
+            WHERE closure_batches.receipt_ranges @> claims.receipt_id
         )
           AND NOT EXISTS (
             SELECT 1 FROM {schema}.leases AS lease
@@ -2664,6 +2663,28 @@ async fn test_lease_claim_partition_routing() {
     assert_eq!(
         compact_batch_claim_slot, current_slot,
         "compact receipt batch must retain the originating claim slot"
+    );
+
+    let compact_batch_closes_receipt: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM {schema}.lease_claims AS claims
+             JOIN {schema}.lease_claim_closure_batches AS batches
+               ON batches.receipt_ranges @> claims.receipt_id
+             WHERE claims.job_id = $1
+               AND claims.run_lease = $2
+               AND batches.claim_slot = $3
+         )"
+    ))
+    .bind(job_id)
+    .bind(claimed[0].job.run_lease)
+    .bind(current_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read compact closure batch receipt range");
+    assert!(
+        compact_batch_closes_receipt,
+        "compact closure batch must close the exact receipt through receipt_ranges"
     );
 }
 

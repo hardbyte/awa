@@ -11,9 +11,9 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* The claim/rotate/prune race against the lease ring is mitigated by:
 \*   - the rotators taking FOR UPDATE on lease_ring_state and the
 \*     target slot row (so two rotators serialise),
-\*   - LOCK TABLE ACCESS EXCLUSIVE NOWAIT on the partition child (so prune
-\*     fails fast under contention instead of queueing ahead of worker
-\*     traffic before truncating).
+\*   - LOCK TABLE ACCESS EXCLUSIVE on the partition child under a bounded
+\*     lock_timeout (so prune can break starvation without queueing
+\*     indefinitely ahead of worker traffic before truncating).
 \* Note: the claim CTE reads lease_ring_state with a plain SELECT, NOT
 \* a FOR SHARE. The conflict detection between claim and rotate is the
 \* rotator's CAS UPDATE (`WHERE current_slot=$ AND generation=$`) plus
@@ -52,7 +52,7 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* What it intentionally does not model:
 \* - MVCC / snapshot isolation — we only care about lock-order safety
 \* - the actual data under the locks — AwaSegmentedStorage covers that
-\* - Postgres's NOWAIT or deadlock detector abort choice — we
+\* - Postgres's lock-timeout or deadlock detector abort choice — we
 \*   flag cycles as safety violations so the spec fails fast rather
 \*   than modelling the race-to-abort
 \* - implicit table-level locks beyond what is explicitly named in each
@@ -379,7 +379,7 @@ RotateLeasesPlan(nextSlot) ==
 \* prune_oldest_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
 \*   SELECT ... FROM lease_ring_slots[slot] FOR UPDATE
-\*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE NOWAIT
+\*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 PruneLeasesPlan(slot) ==
     << Step(LeaseRingStateResource, ModeExclusive),
        Step(LeaseRingSlotResource(slot), ModeExclusive),
@@ -398,7 +398,7 @@ RotateReadyPlan(nextSlot) ==
 \* prune_oldest
 \*   SELECT ... FROM queue_ring_state FOR UPDATE
 \*   SELECT ... FROM queue_ring_slots FOR UPDATE
-\*   LOCK TABLE ready/done/tombstone/compact/delta children ACCESS EXCLUSIVE NOWAIT
+\*   LOCK TABLE ready/done/tombstone/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
 \*   SELECT count FROM leases WHERE ready_slot = $1 (AccessShare on leases parent)
 PruneReadyPlan(slot) ==
     << Step(QueueRingStateResource, ModeExclusive),
@@ -426,9 +426,9 @@ RotateClaimsPlan(nextSlot) ==
 \* prune_oldest_claims (ADR-023)
 \*   SELECT ... FROM claim_ring_state FOR UPDATE
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
-\*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE NOWAIT
-\*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE NOWAIT
-\*   LOCK TABLE closure_batch_child[slot] ACCESS EXCLUSIVE NOWAIT
+\*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
+\*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
+\*   LOCK TABLE closure_batch_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 \*   rescue-before-truncate: close any still-open claims via the
 \*     existing receipt-rescue path (modelled at the data-spec level, no
 \*     extra locks here because the rescue uses the same child AccessExclusive)

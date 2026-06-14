@@ -65,8 +65,7 @@ WHERE NOT EXISTS (
 )
 AND NOT EXISTS (
     SELECT 1 FROM awa.lease_claim_closure_batches cb
-    WHERE cb.claim_slot = c.claim_slot
-      AND cb.receipt_ids @> ARRAY[c.receipt_id]::bigint[]
+    WHERE cb.receipt_ranges @> c.receipt_id
 )
 ORDER BY c.claimed_at ASC;
 ```

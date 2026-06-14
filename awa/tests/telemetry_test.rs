@@ -178,8 +178,7 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
-                     WHERE cb.claim_slot = lc.claim_slot \
-                       AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
+                     WHERE cb.receipt_ranges @> lc.receipt_id \
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.leases AS lease \
@@ -258,8 +257,7 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
-                     WHERE cb.claim_slot = lc.claim_slot \
-                       AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
+                     WHERE cb.receipt_ranges @> lc.receipt_id \
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.leases AS lease \

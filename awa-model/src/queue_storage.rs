@@ -26,6 +26,7 @@ const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
+const PRUNE_LOCK_TIMEOUT: &str = "10ms";
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -394,6 +395,16 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
+async fn set_prune_lock_timeout_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<(), AwaError> {
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{PRUNE_LOCK_TIMEOUT}'"))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(())
+}
+
 fn validate_ident(ident: &str) -> Result<(), AwaError> {
     let mut chars = ident.chars();
     match chars.next() {
@@ -501,6 +512,10 @@ fn receipt_closed_evidence_sql(
     closure_batch_rel: &str,
     claims_alias: &str,
 ) -> String {
+    // `receipt_id` is allocated from a global sequence, so it identifies a
+    // claim without a `claim_slot` predicate. Compact closure batches retain
+    // the raw receipt array for audit/debugging, but hot membership checks use
+    // the per-child GiST index on the derived multirange.
     format!(
         r#"
         (
@@ -514,8 +529,7 @@ fn receipt_closed_evidence_sql(
             OR EXISTS (
                 SELECT 1
                 FROM {closure_batch_rel} AS closure_batches
-                WHERE closure_batches.claim_slot = {claims_alias}.claim_slot
-                  AND closure_batches.receipt_ids @> ARRAY[{claims_alias}.receipt_id]::bigint[]
+                WHERE closure_batches.receipt_ranges @> {claims_alias}.receipt_id
             )
             OR EXISTS (
                 SELECT 1 FROM {schema}.done_entries AS done
@@ -5598,6 +5612,7 @@ impl QueueStorage {
                     outcome,
                     closed_count,
                     receipt_ids,
+                    receipt_ranges,
                     closed_at
                 )
                 SELECT
@@ -5605,6 +5620,7 @@ impl QueueStorage {
                     'completed',
                     count(*)::int AS closed_count,
                     array_agg(completed.receipt_id ORDER BY completed.lane_seq, completed.job_id),
+                    range_agg(int8range(completed.receipt_id, completed.receipt_id + 1, '[)') ORDER BY completed.receipt_id),
                     max(completed.finalized_at)
                 FROM completed_rows AS completed
                 GROUP BY completed.claim_slot
@@ -12221,8 +12237,10 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
+        set_prune_lock_timeout_tx(&mut tx).await?;
+
         let lock_delta = sqlx::query(&format!(
-            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12443,8 +12461,10 @@ impl QueueStorage {
         let receipt_tomb_child = receipt_completion_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
 
+        set_prune_lock_timeout_tx(&mut tx).await?;
+
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12825,10 +12845,11 @@ impl QueueStorage {
         // `correctness/storage/AwaStorageLockOrder.tla` requires the
         // sequence `lease_ring_state FOR UPDATE` →
         // `lease_ring_slots[slot] FOR UPDATE` → `ACCESS EXCLUSIVE` on
-        // the child. The child lock is NOWAIT because prune is
-        // best-effort; a long reader must not put maintenance at the
-        // head of the relation-lock queue and stall normal
-        // claim/complete traffic. Without these locks a concurrent
+        // the child. The child lock is bounded by a short
+        // transaction-local lock_timeout because pure NOWAIT can starve
+        // under continuous parent-partition readers, while an unbounded
+        // wait would put maintenance at the head of the relation-lock
+        // queue indefinitely. Without these locks a concurrent
         // rotator can flip the cursor under the prune's liveness check
         // (current_slot recheck races a CAS update) and prune what
         // should be the active partition.
@@ -12869,8 +12890,10 @@ impl QueueStorage {
 
         let lease_child = lease_child_name(schema, slot as usize);
 
+        set_prune_lock_timeout_tx(&mut tx).await?;
+
         let lock_table = sqlx::query(&format!(
-            "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -13056,9 +13079,10 @@ impl QueueStorage {
     ///
     /// 1. `FOR UPDATE` on `claim_ring_state` (serialises with rotate).
     /// 2. `FOR UPDATE` on the target `claim_ring_slots` row.
-    /// 3. `LOCK TABLE ACCESS EXCLUSIVE NOWAIT` on all claim-ring children
-    ///    (serialises with in-flight claim/complete/rescue writers;
-    ///    gives up immediately under contention).
+    /// 3. `LOCK TABLE ACCESS EXCLUSIVE` on all claim-ring children with a
+    ///    short transaction-local `lock_timeout` (serialises with in-flight
+    ///    claim/complete/rescue writers; gives up under sustained
+    ///    contention).
     /// 4. Verifies the slot is not the current one, and that every
     ///    claim in the partition has closure evidence.
     /// 5. `TRUNCATE` all claim-ring children in a single statement.
@@ -13114,8 +13138,10 @@ impl QueueStorage {
         let closure_child = closure_child_name(schema, slot as usize);
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
 
+        set_prune_lock_timeout_tx(&mut tx).await?;
+
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {claim_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {claim_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
