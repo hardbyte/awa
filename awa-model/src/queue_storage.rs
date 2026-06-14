@@ -13237,13 +13237,13 @@ impl QueueStorage {
     ///
     /// 1. `FOR UPDATE` on `claim_ring_state` (serialises with rotate).
     /// 2. `FOR UPDATE` on the target `claim_ring_slots` row.
-    /// 3. `LOCK TABLE ACCESS EXCLUSIVE` on all claim-ring children with a
+    /// 3. Proves every claim in the sealed partition has closure evidence.
+    /// 4. `LOCK TABLE ACCESS EXCLUSIVE` on all claim-ring children with a
     ///    short transaction-local `lock_timeout` (serialises with in-flight
     ///    claim/complete/rescue writers; gives up under sustained
     ///    contention).
-    /// 4. Verifies the slot is not the current one, and that every
-    ///    claim in the partition has closure evidence.
-    /// 5. `TRUNCATE` all claim-ring children in a single statement.
+    /// 5. Rechecks the slot is not the current one.
+    /// 6. `TRUNCATE` all claim-ring children in a single statement.
     ///
     /// The "every claim has closure evidence" precondition is what ADR-023
     /// calls `PartitionTruncateSafety`. If an open claim remains in the
@@ -13296,47 +13296,16 @@ impl QueueStorage {
         let closure_child = closure_child_name(schema, slot as usize);
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
 
-        set_prune_lock_timeout_tx(&mut tx).await?;
-
-        let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {claim_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
-        ))
-        .execute(tx.as_mut())
-        .await;
-
-        if let Err(err) = lock_tables {
-            let _ = tx.rollback().await;
-            if is_lock_contention_error(&err) {
-                return Ok(PruneOutcome::Blocked { slot });
-            }
-            return Err(map_sqlx_error(err));
-        }
-
-        // After taking ACCESS EXCLUSIVE, recheck that the slot is not
-        // the current one (rotate may have won the ring-state lock
-        // earlier).
-        let current_slot: i32 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if current_slot == slot {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::ClaimCurrent,
-                count: 0,
-            });
-        }
-
-        // `PartitionTruncateSafety`: every claim in this partition must
-        // have durable closure evidence. Any open claim means a worker is
-        // still running (or a rescue hasn't fired yet); we bail and let
-        // normal lifecycle drain the partition.
+        // Before taking ACCESS EXCLUSIVE on the child partitions, prove
+        // the sealed slot is actually reclaimable. Claim rotation only
+        // hands out `claim_ring_state.current_slot`; once this target is
+        // the oldest initialized non-current slot and we hold the
+        // ring-state/slot-row locks, no new claim can be inserted into it.
+        // Closure evidence is monotonic until this same prune path
+        // truncates the slot. A negative open-claim proof therefore
+        // remains true through the truncate lock; a positive proof can
+        // skip without blocking claim/complete traffic behind a doomed
+        // exclusive-lock attempt.
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_child, &closure_batch_child, "claims");
         let open_claims: bool = sqlx::query_scalar(&format!(
@@ -13359,6 +13328,44 @@ impl QueueStorage {
                 slot,
                 reason: SkipReason::ClaimOpen,
                 count: busy_indicator(open_claims),
+            });
+        }
+
+        set_prune_lock_timeout_tx(&mut tx).await?;
+
+        let lock_tables = sqlx::query(&format!(
+            "LOCK TABLE {claim_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(tx.as_mut())
+        .await;
+
+        if let Err(err) = lock_tables {
+            let _ = tx.rollback().await;
+            if is_lock_contention_error(&err) {
+                return Ok(PruneOutcome::Blocked { slot });
+            }
+            return Err(map_sqlx_error(err));
+        }
+
+        // After taking ACCESS EXCLUSIVE, recheck that the slot is still
+        // not the current one. The ring-state lock should already make
+        // this stable, but keeping the explicit gate documents the
+        // truncate precondition.
+        let current_slot: i32 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if current_slot == slot {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::ClaimCurrent,
+                count: 0,
             });
         }
 
