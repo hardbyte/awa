@@ -2210,9 +2210,25 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
     .fetch_one(&pool)
     .await
     .unwrap();
+    assert!(
+        row.id > 0,
+        "insert_job_compat must return the queue-storage job id"
+    );
     assert_eq!(row.kind, "compat_refusal_test");
     assert_eq!(row.queue, "compat_refusal_queue");
     assert_eq!(row.state, awa::JobState::Available);
+
+    let lane_seq: i64 = sqlx::query_scalar(&format!(
+        "SELECT lane_seq FROM {schema}.ready_entries WHERE job_id = $1"
+    ))
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lane_seq, 1,
+        "insert_job_compat must reserve queue-storage lanes through the sequence allocator"
+    );
 
     let ready_segments: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.ready_segments WHERE queue = $1"

@@ -25,6 +25,8 @@ async def main() -> None:
     await client.migrate()
 
     if mode == "worker_chaos_probe":
+        worker_count = int(os.environ.get("MIXED_QUEUE_WORKERS", "1"))
+
         @client.task(ChaosProbe, queue=queue)
         async def handle(job):
             if job.args.marker.startswith("rust-"):
@@ -43,7 +45,7 @@ async def main() -> None:
             return None
 
         await client.start(
-            [(queue, 1)],
+            [(queue, worker_count)],
             leader_election_interval_ms=100,
             heartbeat_interval_ms=50,
             promote_interval_ms=50,
