@@ -2213,6 +2213,18 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
     assert_eq!(row.kind, "compat_refusal_test");
     assert_eq!(row.queue, "compat_refusal_queue");
     assert_eq!(row.state, awa::JobState::Available);
+
+    let ready_segments: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_segments WHERE queue = $1"
+    ))
+    .bind("compat_refusal_queue")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ready_segments, 1,
+        "insert_job_compat must append ready segment metadata with the ready row"
+    );
 }
 
 #[tokio::test]

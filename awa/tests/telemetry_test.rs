@@ -127,10 +127,38 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
 }
 
 async fn reset_runtime_backend(pool: &sqlx::PgPool) {
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("Failed to start runtime backend reset transaction");
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to reset storage transition state");
     sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("Failed to reset active runtime backend");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(&mut *tx)
+        .await
+        .expect("Failed to reset runtime instances");
+    tx.commit()
+        .await
+        .expect("Failed to commit runtime backend reset");
 }
 
 async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {

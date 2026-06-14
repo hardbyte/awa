@@ -1454,6 +1454,16 @@ struct RuntimeReadyInsert {
     payload: serde_json::Value,
 }
 
+#[derive(Debug)]
+struct ReadySegmentInsert {
+    queue: String,
+    priority: i16,
+    enqueue_shard: i16,
+    first_lane_seq: i64,
+    next_lane_seq: i64,
+    first_run_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DoneJobRow {
     ready_slot: i32,
@@ -2814,6 +2824,7 @@ impl QueueStorage {
             TRUNCATE
                 {schema}.ready_entries,
                 {schema}.ready_tombstones,
+                {schema}.ready_segments,
                 {schema}.done_entries,
                 {schema}.dlq_entries,
                 {schema}.leases,
@@ -3465,6 +3476,7 @@ impl QueueStorage {
     async fn execute_ready_inserts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ring: (i32, i64),
         rows: &[RuntimeReadyInsert],
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
@@ -3472,7 +3484,6 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let ring = self.current_queue_ring(tx).await?;
         let mut builder = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) "
         ));
@@ -3505,9 +3516,82 @@ impl QueueStorage {
         Ok(rows.len())
     }
 
+    fn ready_segments_from_rows(rows: &[RuntimeReadyInsert]) -> Vec<ReadySegmentInsert> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        let mut segments = Vec::new();
+        let mut start_index = 0usize;
+
+        for index in 1..=rows.len() {
+            let split = if index == rows.len() {
+                true
+            } else {
+                let previous = &rows[index - 1];
+                let current = &rows[index];
+                previous.queue != current.queue
+                    || previous.priority != current.priority
+                    || previous.enqueue_shard != current.enqueue_shard
+                    || previous.lane_seq + 1 != current.lane_seq
+            };
+
+            if split {
+                let first = &rows[start_index];
+                let last = &rows[index - 1];
+                segments.push(ReadySegmentInsert {
+                    queue: first.queue.clone(),
+                    priority: first.priority,
+                    enqueue_shard: first.enqueue_shard,
+                    first_lane_seq: first.lane_seq,
+                    next_lane_seq: last.lane_seq + 1,
+                    first_run_at: first.run_at,
+                });
+                start_index = index;
+            }
+        }
+
+        segments
+    }
+
+    async fn insert_ready_segments_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ring: (i32, i64),
+        rows: &[RuntimeReadyInsert],
+    ) -> Result<usize, AwaError> {
+        let segments = Self::ready_segments_from_rows(rows);
+        if segments.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = self.schema();
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            "INSERT INTO {schema}.ready_segments (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq, next_lane_seq, first_run_at) "
+        ));
+        builder.push_values(segments.iter(), |mut b, segment| {
+            b.push_bind(ring.0)
+                .push_bind(ring.1)
+                .push_bind(&segment.queue)
+                .push_bind(segment.priority)
+                .push_bind(segment.enqueue_shard)
+                .push_bind(segment.first_lane_seq)
+                .push_bind(segment.next_lane_seq)
+                .push_bind(segment.first_run_at);
+        });
+        builder
+            .build()
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(segments.len())
+    }
+
     async fn execute_ready_copy_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ring: (i32, i64),
         rows: &[RuntimeReadyInsert],
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
@@ -3515,7 +3599,6 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let ring = self.current_queue_ring(tx).await?;
         let copy_sql = format!(
             "COPY {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
@@ -3610,7 +3693,9 @@ impl QueueStorage {
                 row.lane_seq = start_seq + offset as i64;
             }
         }
-        self.execute_ready_inserts_tx(tx, &ready_rows).await?;
+        let ring = self.current_queue_ring(tx).await?;
+        self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
+        self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok(total_rows)
     }
 
@@ -3750,7 +3835,9 @@ impl QueueStorage {
                 row.lane_seq = start_seq + offset as i64;
             }
         }
-        self.execute_ready_copy_tx(tx, &ready_rows).await?;
+        let ring = self.current_queue_ring(tx).await?;
+        self.execute_ready_copy_tx(tx, ring, &ready_rows).await?;
+        self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok(total_rows)
     }
 
@@ -3824,7 +3911,9 @@ impl QueueStorage {
             }
         }
 
-        self.execute_ready_inserts_tx(tx, &ready_rows).await?;
+        let ring = self.current_queue_ring(tx).await?;
+        self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
+        self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok(total_rows)
     }
 
@@ -12798,6 +12887,15 @@ impl QueueStorage {
                     self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
                         .await?;
                 }
+                sqlx::query(&format!(
+                    "DELETE FROM {schema}.ready_segments WHERE ready_slot = $1 AND ready_generation = $2"
+                ))
+                .bind(slot)
+                .bind(generation)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
                 // #290: the live counter rows for this slot are about to
                 // be orphans (their underlying done_entries rows just got
                 // truncated). Delete them in the same transaction. The
