@@ -11,7 +11,7 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -1539,12 +1539,13 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
     let queue = chaos_queue("chaos_mixed_lang");
     clean_queue(&pool, &queue).await;
 
+    let worker_count = 2_u32;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = Client::builder(pool.clone())
         .queue(
             &queue,
             QueueConfig {
-                max_workers: 1,
+                max_workers: worker_count,
                 poll_interval: Duration::from_millis(25),
                 ..QueueConfig::default()
             },
@@ -1564,9 +1565,16 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
         .await
         .expect("Failed to start mixed-fleet Rust client");
 
-    let mut python_worker = start_python_helper("worker_chaos_probe", &queue, &[]).await;
+    let mut python_worker = start_python_helper(
+        "worker_chaos_probe",
+        &queue,
+        &[("MIXED_QUEUE_WORKERS", worker_count.to_string())],
+    )
+    .await;
 
     let batch_size = 12_i64;
+    let expected_rust_markers = expected_mixed_fleet_markers("rust", batch_size);
+    let expected_python_markers = expected_mixed_fleet_markers("python", batch_size);
 
     let test_result = async {
         python_worker
@@ -1603,13 +1611,14 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
             .expect("Failed to insert Rust-enqueued ChaosProbe");
         }
 
-        let deadline = tokio::time::sleep(scaled_timeout(Duration::from_secs(20)));
+        let deadline = tokio::time::sleep(scaled_timeout(Duration::from_secs(30)));
         tokio::pin!(deadline);
-        let mut rust_completed = 0_i64;
-        let mut python_completed = 0_i64;
+        let mut rust_completed = HashSet::new();
+        let mut python_completed = HashSet::new();
 
         loop {
-            if rust_completed == batch_size && python_completed == batch_size {
+            if rust_completed == expected_rust_markers && python_completed == expected_python_markers
+            {
                 break;
             }
 
@@ -1620,21 +1629,37 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
                         marker.starts_with("rust-"),
                         "Unexpected marker processed by Rust worker: {marker}"
                     );
-                    rust_completed += 1;
+                    assert!(
+                        rust_completed.insert(marker.clone()),
+                        "Rust marker completed more than once: {marker}"
+                    );
                 }
                 line = python_worker.stdout_lines.recv() => {
                     let line = line.expect("Python mixed-fleet worker stdout closed unexpectedly");
                     if line.contains("COMPLETE mode=worker_chaos_probe") {
+                        let marker = mixed_fleet_marker_from_line(&line)
+                            .unwrap_or_else(|| panic!("Python completion line missing marker: {line}"))
+                            .to_string();
                         assert!(
-                            line.contains("marker=python-"),
+                            marker.starts_with("python-"),
                             "Unexpected python worker completion line: {line}"
                         );
-                        python_completed += 1;
+                        assert!(
+                            python_completed.insert(marker.clone()),
+                            "Python marker completed more than once: {marker}"
+                        );
                     }
                 }
                 () = &mut deadline => {
+                    let counts = queue_state_counts(&pool, &queue).await;
+                    let missing_rust =
+                        missing_mixed_fleet_markers(&expected_rust_markers, &rust_completed);
+                    let missing_python =
+                        missing_mixed_fleet_markers(&expected_python_markers, &python_completed);
                     panic!(
-                        "Timed out waiting for mixed-fleet completions; rust_completed={rust_completed}, python_completed={python_completed}, expected_per_language={batch_size}"
+                        "Timed out waiting for mixed-fleet completions; rust_completed={}, python_completed={}, missing_rust={missing_rust:?}, missing_python={missing_python:?}, state_counts={counts:?}",
+                        rust_completed.len(),
+                        python_completed.len(),
                     );
                 }
             }
@@ -1647,6 +1672,22 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
     client.shutdown(Duration::from_secs(5)).await;
 
     test_result
+}
+
+fn expected_mixed_fleet_markers(prefix: &str, count: i64) -> HashSet<String> {
+    (0..count).map(|idx| format!("{prefix}-{idx}")).collect()
+}
+
+fn missing_mixed_fleet_markers(expected: &HashSet<String>, seen: &HashSet<String>) -> Vec<String> {
+    let mut missing: Vec<_> = expected.difference(seen).cloned().collect();
+    missing.sort();
+    missing
+}
+
+fn mixed_fleet_marker_from_line(line: &str) -> Option<&str> {
+    line.split("marker=")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
