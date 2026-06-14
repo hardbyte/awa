@@ -5505,32 +5505,32 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         "raw claim intentionally leaves the post-commit claim cursor advance unsent"
     );
 
-    let claim_attempt_rows: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*)::bigint
-         FROM {schema}.ready_claim_attempts
+    let claim_attempt_batches: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum(claimed_count), 0)::bigint
+         FROM {schema}.ready_claim_attempt_batches
          WHERE ready_slot = $1
            AND ready_generation = $2
            AND queue = $3
            AND priority = $4
            AND enqueue_shard = $5
-           AND lane_seq = $6
-           AND job_id = $7
-           AND run_lease = $8"
+           AND claim_slot = $6
+           AND first_lane_seq <= $7
+           AND next_lane_seq > $7
+           AND lane_ranges @> int8range($7, $7 + 1, '[)')"
     ))
     .bind(first[0].ready_slot)
     .bind(first[0].ready_generation)
     .bind(queue)
     .bind(2_i16)
     .bind(0_i16)
+    .bind(first[0].claim_slot)
     .bind(first[0].lane_seq)
-    .bind(job_id)
-    .bind(first[0].run_lease)
     .fetch_one(&pool)
     .await
-    .expect("count ready claim-attempt evidence");
+    .expect("count ready claim-attempt batch evidence");
     assert_eq!(
-        claim_attempt_rows, 1,
-        "claim must durably write queue-slot-local attempt evidence"
+        claim_attempt_batches, 1,
+        "claim must durably write queue-slot-local attempt batch evidence"
     );
 
     let mut locked_claim_child = pool.begin().await.expect("begin claim child lock");

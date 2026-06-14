@@ -139,7 +139,7 @@ BEGIN
             EXECUTE format(
                 'SELECT
                     (SELECT count(*)::bigint FROM %1$I.ready_entries)
-                  + (SELECT count(*)::bigint FROM %1$I.ready_claim_attempts)
+                  + (SELECT count(*)::bigint FROM %1$I.ready_claim_attempt_batches)
                   + (SELECT count(*)::bigint FROM %1$I.ready_tombstones)
                   + (SELECT count(*)::bigint FROM %1$I.ready_segments)
                   + (SELECT count(*)::bigint FROM %1$I.deferred_jobs)
@@ -190,5 +190,5 @@ END
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (37, 'Add ready_segments and ready_claim_attempts ledgers for queue storage')
+VALUES (37, 'Add ready_segments and ready_claim_attempt_batches range ledgers for queue storage')
 ON CONFLICT (version) DO NOTHING;

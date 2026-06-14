@@ -1714,7 +1714,7 @@ impl MaintenanceService {
                         debug!(
                             slot,
                             ready_rows = busy.queue_ready,
-                            claim_attempt_rows = busy.queue_claim_attempts,
+                            claim_attempt_batches = busy.queue_claim_attempt_batches,
                             done_rows = busy.queue_done,
                             receipt_completion_batches = busy.queue_receipt_completion_batches,
                             receipt_completion_tombstones =

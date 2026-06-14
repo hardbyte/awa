@@ -5,7 +5,7 @@ EXTENDS TLC, Naturals, FiniteSets
 \*
 \* It checks the relationships behind:
 \* - ready_entries
-\* - ready_claim_attempts (as a Claim transition refinement)
+\* - ready_claim_attempt_batches (as a Claim transition refinement)
 \* - deferred_jobs
 \* - leases, including the waiting_external lease state
 \* - attempt_state
@@ -76,11 +76,12 @@ EXTENDS TLC, Naturals, FiniteSets
 \* Both cursors refine the same storage facts modelled here: an open
 \* claim is removed from claimOpen and matching durable closure evidence
 \* is represented in claimClosed.
-\* The Rust implementation also writes `ready_claim_attempts` in the
-\* ready row's queue-ring slot during Claim. That table is a cursor-recovery
-\* proof that the lane already emitted run_lease+1; in this lifecycle model
-\* the same fact is represented by the `claimOpen' = claimOpen \cup ...`
-\* transition in Claim. Queue prune reclaims that proof with readyEntries.
+\* The Rust implementation also writes `ready_claim_attempt_batches` in the
+\* ready row's queue-ring slot during Claim. Each SQL row stores a batch
+\* of covered lane_seq ranges as cursor-recovery proof that those lanes
+\* already emitted run_lease+1; in this lifecycle model the same fact is
+\* represented by the per-job `claimOpen' = claimOpen \cup ...` transition
+\* in Claim. Queue prune reclaims that proof with readyEntries.
 \*
 \* Enqueue-shard modelling (ADR-025): `laneState` here represents one
 \* `(queue, priority, enqueue_shard)` triple. The Rust implementation
