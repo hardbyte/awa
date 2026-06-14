@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 32;
+pub const CURRENT_VERSION: i32 = 35;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -142,7 +142,22 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         32,
         "Add pruned_failed_count to queue_terminal_rollups for the failed terminal retention floor",
-        &[V23_UP, V32_UP],
+        &[V32_UP],
+    ),
+    (
+        33,
+        "Add per-slot receipt-rescue cursors for queue storage",
+        &[V23_UP, V33_UP],
+    ),
+    (
+        34,
+        "Materialize receipt closures before terminal compatibility deletes",
+        &[V34_UP],
+    ),
+    (
+        35,
+        "Add per-slot receipt deadline-rescue cursors for queue storage",
+        &[V35_UP],
     ),
 ];
 
@@ -177,6 +192,9 @@ const V29_UP: &str = include_str!("../migrations/v029_batch_operations.sql");
 const V30_UP: &str = include_str!("../migrations/v030_terminal_count_deltas.sql");
 const V31_UP: &str = include_str!("../migrations/v031_queue_storage_failed_done_indexes.sql");
 const V32_UP: &str = include_str!("../migrations/v032_failed_terminal_retention.sql");
+const V33_UP: &str = include_str!("../migrations/v033_receipt_rescue_cursors.sql");
+const V34_UP: &str = include_str!("../migrations/v034_receipt_terminal_delete_closures.sql");
+const V35_UP: &str = include_str!("../migrations/v035_receipt_deadline_rescue_cursors.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

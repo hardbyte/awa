@@ -395,13 +395,13 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 3: prune's ACCESS EXCLUSIVE blocks against a concurrent reader
+// Test 3: prune's ACCESS EXCLUSIVE fails fast against a concurrent reader
 // ────────────────────────────────────────────────────────────────────
 
-/// `prune_oldest_claims` takes `LOCK TABLE ACCESS EXCLUSIVE` on both
-/// child partitions after `SET LOCAL lock_timeout = '50ms'`. If a
-/// concurrent transaction holds `ACCESS SHARE` on the same partition,
-/// prune must return `Blocked` rather than silently proceed. Mirrors
+/// `prune_oldest_claims` takes `LOCK TABLE ACCESS EXCLUSIVE NOWAIT` on
+/// both child partitions. If a concurrent transaction holds
+/// `ACCESS SHARE` on the same partition, prune must return `Blocked`
+/// immediately rather than queueing behind the reader. Mirrors
 /// `test_queue_storage_prune_oldest_blocks_on_reader_lock` for the
 /// queue ring, applied to the claim ring.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -409,12 +409,12 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
 async fn test_prune_claims_blocked_by_concurrent_reader() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
-    let schema = "awa_qs_chaos_prune_lock_timeout";
+    let schema = "awa_qs_chaos_prune_nowait";
     let store = create_store(&pool, schema, 4).await;
 
     // Seed a claim + closure pair so PartitionTruncateSafety holds —
     // otherwise prune would return SkippedActive for that reason and
-    // we'd never reach the lock_timeout path.
+    // we'd never reach the child lock path.
     insert_synthetic_open_claim(
         &pool,
         schema,
@@ -449,7 +449,7 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
         .expect("prune while reader holds ACCESS SHARE");
     assert!(
         matches!(blocked, PruneOutcome::Blocked { slot: 0 }),
-        "prune must time out (Blocked) while ACCESS SHARE is held, got {blocked:?}"
+        "prune must fail fast (Blocked) while ACCESS SHARE is held, got {blocked:?}"
     );
 
     reader_tx.rollback().await.expect("release reader lock");

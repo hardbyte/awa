@@ -167,19 +167,15 @@ pub struct ClientBuilder {
 
 impl ClientBuilder {
     pub fn new(pool: PgPool) -> Self {
-        // #169: lease_rotate_interval bumped from 50ms to 250ms. The
-        // 50ms default was over-spec'd — prune backoff (#316) already
-        // throttles the heavy ACCESS-EXCLUSIVE + count(*) work, so
-        // faster rotation just produced loop noise without doing
-        // useful reclamation under pinned MVCC. 250ms keeps rotation
-        // responsive enough that the lease ring still cycles through
-        // its 8 partitions in ~2s, but stops the maintenance loop
-        // flapping at the 50ms boundary that bench evidence on #316
-        // surfaced.
+        // #169: keep lease rotation on the same conservative cadence as
+        // queue / claim rotation. Faster lease rotation only advances a
+        // one-row metadata cursor more often; under a pinned MVCC horizon
+        // that metadata churn can dominate the otherwise append-only queue
+        // path without improving job safety.
         let (storage, storage_error) = match QueueStorageRuntime::new(
             QueueStorageConfig::default(),
             Duration::from_millis(1_000),
-            Duration::from_millis(250),
+            Duration::from_millis(1_000),
         ) {
             Ok(runtime) => (RuntimeStorage::QueueStorage(runtime), None),
             Err(err) => (
