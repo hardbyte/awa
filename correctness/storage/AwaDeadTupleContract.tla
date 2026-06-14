@@ -218,12 +218,12 @@ ClaimLegacyTx == <<
 >>
 
 \* complete_runtime_batch (receipts mode)
-\* Successful receipt completion appends a compact terminal batch plus an
-\* explicit completed receipt closure. The public terminal fact is exposed by
-\* terminal_jobs, while claim prune depends on lease_claim_closures instead of
-\* terminal history.
+\* Successful compact receipt completion appends a compact terminal batch and a
+\* terminal-count delta. The compact batch is both public terminal history
+\* through terminal_jobs and durable closure evidence for claim prune / rescue.
+\* Non-success, cancellation, rescue, and wide terminal paths still use
+\* explicit lease_claim_closures.
 CompleteReceiptsTx == <<
-    Mut("Insert", "lease_claim_closures"),
     Mut("Insert", "receipt_completion_batches"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Delete", "attempt_state")

@@ -1,10 +1,11 @@
 -- Compact successful receipt completions.
 --
--- Successful short-job completions no longer need a wide done_entries row as
--- receipt-closure evidence. The hot path writes a tiny completed closure into
--- lease_claim_closures and stores terminal history in receipt_completion_batches.
--- terminal_jobs expands those batches for public reads. Cold SQL-compatible
--- deletes of synthesized completed rows append receipt_completion_tombstones.
+-- Successful short-job completions no longer need a wide done_entries row or
+-- per-job lease_claim_closures row as receipt-closure evidence. The hot path
+-- stores terminal history in receipt_completion_batches, and those compact
+-- batches also close the matching receipt claims. terminal_jobs expands those
+-- batches for public reads. Cold SQL-compatible deletes of synthesized
+-- completed rows append receipt_completion_tombstones.
 
 DO $$
 DECLARE
