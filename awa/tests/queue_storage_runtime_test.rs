@@ -8764,6 +8764,63 @@ async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock(
         .expect("Failed to release lease ring lock");
 }
 
+async fn backdate_one_lane_ready_job_run_at(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    job_id: i64,
+    run_at: DateTime<Utc>,
+) {
+    let updated_ready = sqlx::query(&format!(
+        "UPDATE {schema}.ready_entries SET run_at = $1 WHERE job_id = $2"
+    ))
+    .bind(run_at)
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate queue-storage ready row");
+    assert_eq!(
+        updated_ready.rows_affected(),
+        1,
+        "expected exactly one ready row for manual aging backdate"
+    );
+
+    let updated_segment = sqlx::query(&format!(
+        r#"
+        WITH target AS (
+            SELECT
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                lane_seq
+            FROM {schema}.ready_entries
+            WHERE job_id = $2
+        )
+        UPDATE {schema}.ready_segments AS segment
+        SET first_run_at = $1
+        FROM target
+        WHERE segment.ready_slot = target.ready_slot
+          AND segment.ready_generation = target.ready_generation
+          AND segment.queue = target.queue
+          AND segment.priority = target.priority
+          AND segment.enqueue_shard = target.enqueue_shard
+          AND segment.first_lane_seq = target.lane_seq
+          AND segment.next_lane_seq = target.lane_seq + 1
+        "#
+    ))
+    .bind(run_at)
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate queue-storage ready segment");
+    assert_eq!(
+        updated_segment.rows_affected(),
+        1,
+        "manual aging backdate expects a single-lane ready segment"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
     let (_db_guard, pool) = setup_pool(10).await;
@@ -8795,14 +8852,13 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
     )
     .await;
 
-    sqlx::query(&format!(
-        "UPDATE {schema}.ready_entries SET run_at = $1 WHERE job_id = $2"
-    ))
-    .bind(Utc::now() - chrono::Duration::seconds(aging_interval.as_secs() as i64 * 4))
-    .bind(aged_job_id)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate aged queue storage job");
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        aged_job_id,
+        Utc::now() - chrono::Duration::seconds(aging_interval.as_secs() as i64 * 4),
+    )
+    .await;
 
     let fresh_high_priority_job_id = enqueue_job(
         &pool,
@@ -8889,14 +8945,13 @@ async fn test_queue_storage_aged_completion_stays_compact_and_keeps_lane_priorit
         .await
         .expect("Failed to complete high-priority job");
 
-    sqlx::query(&format!(
-        "UPDATE {schema}.ready_entries SET run_at = $1 WHERE job_id = $2"
-    ))
-    .bind(Utc::now() - chrono::Duration::seconds(aging_interval.as_secs() as i64 * 4))
-    .bind(low_id)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate low-priority queue storage job");
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        low_id,
+        Utc::now() - chrono::Duration::seconds(aging_interval.as_secs() as i64 * 4),
+    )
+    .await;
 
     let aged_claimed = store
         .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, aging_interval)
@@ -10161,12 +10216,20 @@ async fn test_priority_aging_lifts_effective_priority_and_records_original() {
     // Backdate past two aging windows so floor(elapsed / interval) = 2,
     // i.e. a priority-4 row's effective priority becomes 2.
     let aging_interval = Duration::from_millis(100);
-    sqlx::query(&format!(
-        "UPDATE {schema}.ready_entries SET run_at = clock_timestamp() - interval '250 milliseconds'"
+    let job_id = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT job_id FROM {schema}.ready_entries WHERE queue = $1"
     ))
-    .execute(&pool)
+    .bind(queue)
+    .fetch_one(&pool)
     .await
-    .expect("Failed to backdate ready row for priority aging test");
+    .expect("Failed to load ready row for priority aging test");
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::milliseconds(250),
+    )
+    .await;
 
     let claimed = store
         .claim_runtime_batch_with_aging_for_instance(
