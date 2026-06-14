@@ -2,9 +2,9 @@
 --
 -- Successful short-job completions no longer need a wide done_entries row or
 -- per-job lease_claim_closures row as receipt-closure evidence. The hot path
--- stores terminal history in receipt_completion_batches, and those compact
--- batches also close the matching receipt claims. terminal_jobs expands those
--- batches for public reads. Cold SQL-compatible deletes of synthesized
+-- stores terminal history in receipt_completion_batches and claim-local
+-- closure evidence in lease_claim_closure_batches. terminal_jobs expands the
+-- terminal batches for public reads. Cold SQL-compatible deletes of synthesized
 -- completed rows append receipt_completion_tombstones.
 
 DO $$
@@ -140,6 +140,9 @@ BEGIN
                     (SELECT count(*)::bigint FROM %1$I.ready_entries)
                   + (SELECT count(*)::bigint FROM %1$I.deferred_jobs)
                   + (SELECT count(*)::bigint FROM %1$I.leases)
+                  + (SELECT count(*)::bigint FROM %1$I.lease_claims)
+                  + (SELECT count(*)::bigint FROM %1$I.lease_claim_closures)
+                  + (SELECT count(*)::bigint FROM %1$I.lease_claim_closure_batches)
                   + (SELECT count(*)::bigint FROM %1$I.attempt_state)
                   + (SELECT count(*)::bigint FROM %1$I.done_entries)
                   + (SELECT count(*)::bigint FROM %1$I.receipt_completion_batches)
@@ -355,23 +358,36 @@ BEGIN
 
     IF v_rows > 0 THEN
         EXECUTE format(
-            'INSERT INTO %1$I.lease_claim_closures (
-                 claim_slot,
-                 job_id,
-                 run_lease,
-                 outcome,
-                 closed_at
+            'WITH inserted AS (
+                 INSERT INTO %1$I.lease_claim_closures (
+                     claim_slot,
+                     job_id,
+                     run_lease,
+                     outcome,
+                     closed_at
+                 )
+                 SELECT
+                     claims.claim_slot,
+                     claims.job_id,
+                     claims.run_lease,
+                     ''terminal_removed'',
+                     clock_timestamp()
+                 FROM %1$I.lease_claims AS claims
+                 WHERE claims.job_id = $1
+                   AND claims.run_lease = $2
+                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                 RETURNING claim_slot, job_id, run_lease, closed_at
+             ),
+             marked AS (
+                 UPDATE %1$I.lease_claims AS claims
+                 SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                 FROM inserted
+                 WHERE claims.claim_slot = inserted.claim_slot
+                   AND claims.job_id = inserted.job_id
+                   AND claims.run_lease = inserted.run_lease
+                 RETURNING claims.job_id
              )
-             SELECT
-                 claims.claim_slot,
-                 claims.job_id,
-                 claims.run_lease,
-                 ''terminal_removed'',
-                 clock_timestamp()
-             FROM %1$I.lease_claims AS claims
-             WHERE claims.job_id = $1
-               AND claims.run_lease = $2
-             ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING',
+             SELECT count(*) FROM marked',
             v_schema
         )
         USING p_id, v_run_lease;
@@ -521,7 +537,7 @@ BEGIN
                      $3,
                      $4,
                      $5,
-                     0::smallint,
+                     mod(mod($6, 256::bigint) + 256::bigint, 256::bigint)::smallint,
                      -1
                  )',
                 v_schema

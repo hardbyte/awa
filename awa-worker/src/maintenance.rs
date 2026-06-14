@@ -1860,6 +1860,7 @@ impl MaintenanceService {
                             slot,
                             claim_rows = busy.claims,
                             closure_rows = busy.closures,
+                            closure_batch_rows = busy.closure_batches,
                             "Skipped busy queue storage claim segment",
                         );
                     }
@@ -2781,7 +2782,7 @@ mod tests {
             .await
             .expect("begin receipt lock transaction");
         sqlx::query(
-            "LOCK TABLE awa.lease_claims, awa.lease_claim_closures IN ACCESS EXCLUSIVE MODE",
+            "LOCK TABLE awa.lease_claims, awa.lease_claim_closures, awa.lease_claim_closure_batches IN ACCESS EXCLUSIVE MODE",
         )
         .execute(receipt_lock_tx.as_mut())
         .await

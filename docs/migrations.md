@@ -205,7 +205,7 @@ Current `0.5.x` fail-safe behavior if someone forces the state forward without `
 
 #### `0.6` Receipt-plane partition migration (ADR-023)
 
-The `0.6` queue-storage engine partitions the receipt plane: `lease_claims` and `lease_claim_closures` are `PARTITIONED BY LIST (claim_slot)` parents with one child per claim-ring slot. Upgrading from a 0.5.x deploy where these were regular (non-partitioned) tables runs an in-place migration inside `prepare_schema()`:
+The `0.6` queue-storage engine partitions the receipt plane: `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` are `PARTITIONED BY LIST (claim_slot)` parents with one child per claim-ring slot. Upgrading from a 0.5.x deploy where the legacy claim and closure tables were regular (non-partitioned) tables runs an in-place migration inside `prepare_schema()`:
 
 1. The legacy tables are renamed in place to `lease_claims_legacy` / `lease_claim_closures_legacy`.
 2. The new partitioned parents are created alongside the legacy tables.
@@ -216,7 +216,7 @@ Steps 3 and 4 run inside a single Postgres transaction so a crash mid-migration 
 
 If the migration is partially applied at the time of a `reset()` call, the legacy tables are dropped explicitly before the main `TRUNCATE`. Without that, `reset()` would TRUNCATE the partitioned parents but leave the legacy data intact, and the next `prepare_schema()` would re-run the migration on top and silently re-insert old rows. Operators should not normally call `reset()` during an upgrade — it's a test fixture rather than a recovery primitive — but the safety net is there.
 
-**Reverse migration** (only relevant if a production rollback fires between an ADR-023 deploy and the older runtime catching up): create unpartitioned `lease_claims` and `lease_claim_closures` tables, `INSERT ... SELECT * FROM` each partitioned parent, drop the partitioned parents. This is not committed to source — the forward path is the only supported one — but operators are expected to keep this recipe in their runbook for the rollout window.
+**Reverse migration** (only relevant if a production rollback fires between an ADR-023 deploy and the older runtime catching up): create unpartitioned `lease_claims` and `lease_claim_closures` tables, `INSERT ... SELECT * FROM` each partitioned parent, drop the partitioned parents, and treat `lease_claim_closure_batches` as compact closure evidence that older runtimes cannot consume. This is not committed to source — the forward path is the only supported one — but operators are expected to keep this recipe in their runbook for the rollout window.
 
 ### Why This Exists
 

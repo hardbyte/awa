@@ -29,7 +29,8 @@
 --   v012 migration. Activation/finalization paths seed or update the
 --   `queue_storage` row.
 -- - The non-additive legacy upgrade edge cases (open_receipt_claims drop,
---   lease_claims / lease_claim_closures rename-and-rebuild from a
+--   lease_claims / lease_claim_closures / lease_claim_closure_batches
+--   rename-and-rebuild from a
 --   non-partitioned shape, queue_count_snapshots drop) — these are
 --   one-shot upgrade fixups that don't belong in a forward-only DDL
 --   function. They remain in `prepare_schema()` for custom schemas; the
@@ -915,7 +916,7 @@ BEGIN
     );
 
     --------------------------------------------------------------------
-    -- Partitioned leases / lease_claims / lease_claim_closures tables.
+    -- Partitioned leases / lease_claims / receipt closure evidence tables.
     --------------------------------------------------------------------
 
     EXECUTE format(
@@ -961,8 +962,23 @@ BEGIN
 
     EXECUTE format(
         $ddl$
+        CREATE SEQUENCE IF NOT EXISTS %I.lease_claim_receipt_id_seq
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE SEQUENCE IF NOT EXISTS %I.lease_claim_closure_batch_id_seq
+        $ddl$,
+            p_schema
+        );
+
+    EXECUTE format(
+        $ddl$
         CREATE TABLE IF NOT EXISTS %I.lease_claims (
             claim_slot       INT NOT NULL,
+            receipt_id       BIGINT NOT NULL DEFAULT nextval('%I.lease_claim_receipt_id_seq'::regclass),
             job_id           BIGINT NOT NULL,
             run_lease        BIGINT NOT NULL,
             ready_slot       INT NOT NULL,
@@ -975,9 +991,38 @@ BEGIN
             enqueue_shard    SMALLINT NOT NULL DEFAULT 0,
             claimed_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             materialized_at  TIMESTAMPTZ,
+            closed_at        TIMESTAMPTZ,
             deadline_at      TIMESTAMPTZ,
             PRIMARY KEY (claim_slot, job_id, run_lease)
         ) PARTITION BY LIST (claim_slot)
+        $ddl$,
+        p_schema,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        DO $inner$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %1$L
+                  AND table_name = 'lease_claims'
+                  AND column_name = 'claim_seq'
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %1$L
+                  AND table_name = 'lease_claims'
+                  AND column_name = 'receipt_id'
+            ) THEN
+                ALTER TABLE %1$I.lease_claims
+                    RENAME COLUMN claim_seq TO receipt_id;
+            END IF;
+        END
+        $inner$
         $ddl$,
         p_schema
     );
@@ -987,9 +1032,28 @@ BEGIN
     EXECUTE format(
         $ddl$
         ALTER TABLE %I.lease_claims
+            ADD COLUMN IF NOT EXISTS receipt_id BIGINT,
             ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ
         $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'UPDATE %I.lease_claims SET receipt_id = nextval(%L::regclass) WHERE receipt_id IS NULL',
+        p_schema,
+        format('%I.lease_claim_receipt_id_seq', p_schema)
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.lease_claims ALTER COLUMN receipt_id SET DEFAULT nextval(%L::regclass)',
+        p_schema,
+        format('%I.lease_claim_receipt_id_seq', p_schema)
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.lease_claims ALTER COLUMN receipt_id SET NOT NULL',
         p_schema
     );
 
@@ -1044,10 +1108,89 @@ BEGIN
         p_schema
     );
 
+    EXECUTE format(
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.lease_claim_closure_batches (
+            claim_slot   INT NOT NULL,
+            batch_id     BIGINT NOT NULL DEFAULT nextval('%I.lease_claim_closure_batch_id_seq'::regclass),
+            outcome      TEXT NOT NULL,
+            closed_count INT NOT NULL,
+            receipt_ids  BIGINT[] NOT NULL,
+            closed_at    TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            PRIMARY KEY (claim_slot, batch_id),
+            CHECK (closed_count > 0),
+            CHECK (closed_count = cardinality(receipt_ids))
+        ) PARTITION BY LIST (claim_slot)
+        $ddl$,
+        p_schema,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        DO $inner$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %1$L
+                  AND table_name = 'lease_claim_closure_batches'
+                  AND column_name = 'claim_seqs'
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %1$L
+                  AND table_name = 'lease_claim_closure_batches'
+                  AND column_name = 'receipt_ids'
+            ) THEN
+                ALTER TABLE %1$I.lease_claim_closure_batches
+                    RENAME COLUMN claim_seqs TO receipt_ids;
+            END IF;
+        END
+        $inner$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'COMMENT ON TABLE %I.lease_claim_closure_batches IS %L',
+        p_schema,
+        'Append-only compact closure evidence for high-volume receipt completions. Each row closes a batch of immutable lease_claims rows by receipt_id and is reclaimed with the matching claim-slot partition.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claims.receipt_id IS %L',
+        p_schema,
+        'Stable exact identity for one immutable receipt claim. Compact closure batches store receipt_id values so open-claim proofs do not need to unnest terminal history arrays.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claims.closed_at IS %L',
+        p_schema,
+        'Row-local closure fence set by explicit and rescue closure paths. Compact successful completions do not update this column; they close claims through lease_claim_closure_batches.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claim_closure_batches.receipt_ids IS %L',
+        p_schema,
+        'Receipt identities closed by this compact batch. Membership is exact because receipt_id is assigned once per lease_claims row.'
+    );
+
     FOR v_slot IN 0..(p_claim_slot_count - 1) LOOP
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.lease_claim_closures FOR VALUES IN (%s)',
             p_schema, format('lease_claim_closures_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.lease_claim_closure_batches FOR VALUES IN (%s)',
+            p_schema, format('lease_claim_closure_batches_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_closure_batches_%s_receipt_ids ON %I.%I USING GIN (receipt_ids)',
+            p_schema, v_slot, p_schema, format('lease_claim_closure_batches_%s', v_slot)
         );
     END LOOP;
 
@@ -1194,7 +1337,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON TABLE %I.receipt_completion_batches IS %L',
         p_schema,
-        'Append-only compact history for successful receipt-backed completions. Each row stores one completion batch, expands through terminal_jobs, and acts as durable closure evidence for the matching receipt claims; reclaimed with the matching ready-slot partition.'
+        'Append-only compact history for successful receipt-backed completions. Each row stores one completion batch and expands through terminal_jobs; matching receipt claims are closed through lease_claim_closure_batches in the claim ring.'
     );
 
     EXECUTE format(
@@ -2123,6 +2266,25 @@ BEGIN
             IF NOT v_head_attempt_spent THEN
                 SELECT EXISTS (
                     SELECT 1
+                    FROM %1$I.receipt_completion_batches AS existing_batches
+                    WHERE existing_batches.job_ids @> ARRAY[v_head_job_id]::bigint[]
+                      AND EXISTS (
+                          SELECT 1
+                          FROM unnest(
+                              existing_batches.job_ids,
+                              existing_batches.run_leases
+                          ) AS completed(job_id, run_lease)
+                          WHERE completed.job_id = v_head_job_id
+                            AND completed.run_lease = v_head_run_lease + 1
+                      )
+                    LIMIT 1
+                )
+                INTO v_head_attempt_spent;
+            END IF;
+
+            IF NOT v_head_attempt_spent THEN
+                SELECT EXISTS (
+                    SELECT 1
                     FROM %1$I.leases AS existing_leases
                     WHERE existing_leases.job_id = v_head_job_id
                       AND existing_leases.run_lease = v_head_run_lease + 1
@@ -2216,6 +2378,20 @@ BEGIN
                             FROM %1$I.lease_claim_closures AS existing_closures
                             WHERE existing_closures.job_id = selected.job_id
                               AND existing_closures.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.receipt_completion_batches AS existing_batches
+                            WHERE existing_batches.job_ids @> ARRAY[selected.job_id]::bigint[]
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM unnest(
+                                      existing_batches.job_ids,
+                                      existing_batches.run_leases
+                                  ) AS completed(job_id, run_lease)
+                                  WHERE completed.job_id = selected.job_id
+                                    AND completed.run_lease = selected.run_lease + 1
+                              )
                         )
                         OR EXISTS (
                             SELECT 1
@@ -2360,6 +2536,20 @@ BEGIN
                                     FROM %1$I.lease_claim_closures AS existing_closures
                                     WHERE existing_closures.job_id = selected.job_id
                                       AND existing_closures.run_lease = selected.run_lease + 1
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM %1$I.receipt_completion_batches AS existing_batches
+                                    WHERE existing_batches.job_ids @> ARRAY[selected.job_id]::bigint[]
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM unnest(
+                                              existing_batches.job_ids,
+                                              existing_batches.run_leases
+                                          ) AS completed(job_id, run_lease)
+                                          WHERE completed.job_id = selected.job_id
+                                            AND completed.run_lease = selected.run_lease + 1
+                                      )
                                 )
                                 OR EXISTS (
                                     SELECT 1
@@ -2524,7 +2714,7 @@ BEGIN
             RAISE EXCEPTION 'awa.open_receipt_claims has % rows but the runtime no longer reads or writes this table',
                 v_open_receipt_claims_count
                 USING ERRCODE = '22023',
-                      HINT = 'Run the ADR-023 reverse migration (recreate from lease_claims minus lease_claim_closures) to drain it, then re-run awa migrate.';
+                      HINT = 'Run the ADR-023 reverse migration (recreate from lease_claims minus durable closure evidence) to drain it, then re-run awa migrate.';
         END IF;
 
         DROP TABLE IF EXISTS awa.open_receipt_claims CASCADE;
