@@ -44,7 +44,7 @@ Apply ADR-019's rotation-and-prune pattern to the receipt plane. Remove `open_re
 
 1. `lease_claims` becomes `PARTITIONED BY LIST (claim_slot)` with a small fixed set of child partitions (`lease_claims_0..N-1`).
 2. `lease_claim_closures` becomes `PARTITIONED BY LIST (claim_slot)` with matching children. A closure row lives in the same `claim_slot` as its originating claim.
-3. `lease_claim_closure_batches` is partitioned by `claim_slot` with matching children. Compact successful completions write receipt identities here so open-claim proofs stay local to the claim ring.
+3. `lease_claim_closure_batches` is partitioned by `claim_slot` with matching children. Compact successful completions write globally allocated receipt identities here, plus a derived `int8multirange`, so open-claim proofs can use an indexed `receipt_ranges @> receipt_id` membership check while prune still truncates the matching claim and closure partitions together.
 4. A new control-plane pair `claim_ring_state` and `claim_ring_slots` coordinates rotation, mirroring the existing `lease_ring_state` and `lease_ring_slots`. `claim_ring_slots` also stores per-slot rescue cursors: stale rescue sweeps `(claimed_at, job_id, run_lease)`, while deadline rescue sweeps `(deadline_at, job_id, run_lease)`.
 5. `open_receipt_claims` is deleted. Its indexes and the schema-install backfill are dropped.
 
@@ -77,7 +77,7 @@ Both rescue cursors are bounded cyclic sweeps. Each pass scans forward from the 
 - Prune order mirrors `prune_oldest` and `prune_oldest_leases`:
   1. `FOR UPDATE` on `claim_ring_state`.
   2. `FOR UPDATE` on the target `claim_ring_slots` row.
-  3. `ACCESS EXCLUSIVE NOWAIT` on all claim-ring partitions for that slot (claims, explicit closures, and compact closure batches).
+  3. Bounded `ACCESS EXCLUSIVE` on all claim-ring partitions for that slot (claims, explicit closures, and compact closure batches).
   4. Liveness recheck: every claim must have durable closure evidence, then reset the slot's rescue cursor and `TRUNCATE`.
 - Partition truncation never races with claim because claim always writes to the ring's current slot and rotation advances the current slot atomically under the same lock order.
 
@@ -120,7 +120,7 @@ Success criteria for this redesign, measured on the long-horizon portable harnes
 
 - This is a breaking schema migration.
 - "Currently open" queries move from a single bounded-frontier lookup to a bounded anti-join across a small number of active partitions. Query planning needs spot-checking once the partition count is chosen.
-- Rescue gains a partition-aware variant and must run before prune takes `ACCESS EXCLUSIVE NOWAIT`. The interaction point is small but adds a prune-path precondition not present for `ready` / `done`.
+- Rescue gains a partition-aware variant and must run before prune takes bounded `ACCESS EXCLUSIVE`. The interaction point is small but adds a prune-path precondition not present for `ready` / `done`.
 - The default-success path now writes one compact completion-batch row and one compact claim-closure batch row for the worker completion batch. ADR-026 explains how compact terminal history is exposed through `{schema}.terminal_jobs`, how claim-local closure evidence protects receipt pruning, and how exact counts and segment-level retention are preserved.
 
 ## Alternatives Considered

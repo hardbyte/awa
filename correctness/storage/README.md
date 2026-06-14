@@ -157,7 +157,7 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ```
 
-Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE NOWAIT` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's NOWAIT / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
+Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
 
 ## Race-exposure companion spec
 

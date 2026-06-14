@@ -1116,6 +1116,7 @@ BEGIN
             outcome      TEXT NOT NULL,
             closed_count INT NOT NULL,
             receipt_ids  BIGINT[] NOT NULL,
+            receipt_ranges INT8MULTIRANGE NOT NULL,
             closed_at    TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             PRIMARY KEY (claim_slot, batch_id),
             CHECK (closed_count > 0),
@@ -1154,6 +1155,36 @@ BEGIN
     );
 
     EXECUTE format(
+        'ALTER TABLE %I.lease_claim_closure_batches ADD COLUMN IF NOT EXISTS receipt_ranges INT8MULTIRANGE',
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        UPDATE %1$I.lease_claim_closure_batches AS batch
+        SET receipt_ranges = ranges.receipt_ranges
+        FROM (
+            SELECT
+                source.claim_slot,
+                source.batch_id,
+                range_agg(int8range(receipts.receipt_id, receipts.receipt_id + 1, '[)') ORDER BY receipts.receipt_id) AS receipt_ranges
+            FROM %1$I.lease_claim_closure_batches AS source
+            CROSS JOIN LATERAL unnest(source.receipt_ids) AS receipts(receipt_id)
+            GROUP BY source.claim_slot, source.batch_id
+        ) AS ranges
+        WHERE batch.claim_slot = ranges.claim_slot
+          AND batch.batch_id = ranges.batch_id
+          AND batch.receipt_ranges IS DISTINCT FROM ranges.receipt_ranges
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.lease_claim_closure_batches ALTER COLUMN receipt_ranges SET NOT NULL',
+        p_schema
+    );
+
+    EXECUTE format(
         'COMMENT ON TABLE %I.lease_claim_closure_batches IS %L',
         p_schema,
         'Append-only compact closure evidence for high-volume receipt completions. Each row closes a batch of immutable lease_claims rows by receipt_id and is reclaimed with the matching claim-slot partition.'
@@ -1174,7 +1205,13 @@ BEGIN
     EXECUTE format(
         'COMMENT ON COLUMN %I.lease_claim_closure_batches.receipt_ids IS %L',
         p_schema,
-        'Receipt identities closed by this compact batch. Membership is exact because receipt_id is assigned once per lease_claims row.'
+        'Receipt identities closed by this compact batch. Kept as audit/debug data; hot closure proofs use receipt_ranges.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claim_closure_batches.receipt_ranges IS %L',
+        p_schema,
+        'Compact multirange derived from receipt_ids for exact indexed closure membership checks. Membership is exact because receipt_id is assigned once per lease_claims row from a global sequence.'
     );
 
     FOR v_slot IN 0..(p_claim_slot_count - 1) LOOP
@@ -1189,8 +1226,13 @@ BEGIN
         );
 
         EXECUTE format(
-            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_closure_batches_%s_receipt_ids ON %I.%I USING GIN (receipt_ids)',
+            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_closure_batches_%s_receipt_ranges ON %I.%I USING GIST (receipt_ranges)',
             p_schema, v_slot, p_schema, format('lease_claim_closure_batches_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'DROP INDEX IF EXISTS %I.%I',
+            p_schema, format('idx_%s_lease_claim_closure_batches_%s_receipt_ids', p_schema, v_slot)
         );
     END LOOP;
 

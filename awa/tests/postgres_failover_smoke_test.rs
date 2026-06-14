@@ -286,8 +286,7 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                        ) \
                        AND NOT EXISTS ( \
                          SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
-                         WHERE cb.claim_slot = lc.claim_slot \
-                           AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
+                         WHERE cb.receipt_ranges @> lc.receipt_id \
                        ) \
                        AND NOT EXISTS ( \
                          SELECT 1 FROM {schema}.leases AS lease \
@@ -440,8 +439,7 @@ async fn storage_debug(pool: &sqlx::PgPool, queue: &str) -> String {
                   WHERE lc.queue = $1) + \
                  (SELECT count(*)::bigint FROM {schema}.lease_claim_closure_batches AS cb \
                    JOIN {schema}.lease_claims AS lc \
-                     ON lc.claim_slot = cb.claim_slot \
-                    AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
+                     ON cb.receipt_ranges @> lc.receipt_id \
                   WHERE lc.queue = $1) + \
                  (SELECT count(*)::bigint FROM {schema}.terminal_jobs WHERE queue = $1) + \
                  (SELECT COALESCE( \

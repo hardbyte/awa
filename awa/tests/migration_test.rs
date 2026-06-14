@@ -1286,6 +1286,21 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
 
     prepare_queue_storage_schema(&pool, schema).await;
     sqlx::query(&format!(
+        "ALTER TABLE {schema}.lease_claim_closure_batches DROP COLUMN receipt_ranges"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test receipt_ranges drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after receipt_ranges drop"),
+        "schema without receipt_ranges must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
         "DROP FUNCTION {schema}.claim_ready_runtime(text, bigint, double precision, double precision)"
     ))
         .execute(&pool)
