@@ -520,7 +520,7 @@ BEGIN
                      $3,
                      $4,
                      $5,
-                     mod(mod($6, 256::bigint) + 256::bigint, 256::bigint)::smallint,
+                     0::smallint,
                      -1
                  )',
                 v_schema

@@ -60,7 +60,7 @@ Terminal mutations append a narrow delta row in the same transaction as the phys
 - retry, purge, discard, DLQ move, and compatibility delete write a negative delta;
 - the delta key includes `ready_generation`, so reused `ready_slot` partitions cannot inherit stale deltas.
 
-Completion batches keep the existing grouping step, but append grouped deltas instead of `UPSERT`ing the live counter. A 512-job batch that touches one queue/priority/shard/bucket group appends one delta row, not 512.
+Compact receipt completion batches keep the existing grouping step, but append grouped deltas instead of `UPSERT`ing the live counter. A 512-job compact batch that touches one queue/priority/shard group appends one positive delta row, not 512. Wide `done_entries` terminal rows keep job-id counter bucketing so later terminal deletes cancel their original positive bucket exactly.
 
 `queue_counts_exact` computes the live terminal component as `queue_terminal_live_counts + SUM(queue_terminal_count_deltas)`, then adds pruned rollups from `queue_terminal_rollups` / `queue_lanes`. The exact read remains honest while maintenance is behind. If the terminal-counter trust marker is not set, the read path falls back to scanning `{schema}.terminal_jobs` so rolling upgrades and recovery windows stay honest.
 

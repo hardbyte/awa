@@ -5643,11 +5643,7 @@ impl QueueStorage {
                         counted.queue,
                         counted.priority,
                         counted.enqueue_shard,
-                        mod(
-                            mod(counted.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                                + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                            {TERMINAL_COUNTER_BUCKETS}::bigint
-                        )::smallint AS counter_bucket,
+                        0::smallint AS counter_bucket,
                         count(*)::bigint AS delta
                     FROM counted
                     GROUP BY
