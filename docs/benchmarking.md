@@ -163,7 +163,7 @@ ADR-026 terminal-count deltas remove hot-path `queue_terminal_live_counts` updat
 
 The offered-rate benchmark exercises absorption directly and samples WAL. With one claimer, `claim_batch_size = 512`, `AWA_COMPLETION_BATCH_SIZE = 512`, the fused receipt completion path, and `max_workers = 1024`, a 10-second no-op run at `10k/s` offered load keeps durable completions at the offered rate, drains to zero backlog, and writes `1.80 KiB` WAL per completed job. `max_workers = 512` is close but does not consistently meet the 10k offered target, because no-op handlers hold permits while waiting for durable completion acknowledgement.
 
-First-principles WAL accounting then compared the production path, a narrow `done_entries` row, and a deliberately non-production path that skipped `done_entries` entirely:
+First-principles WAL accounting compared the production path, a narrow `done_entries` row, and a deliberately non-production path that skipped durable terminal history entirely:
 
 | Shape                          | Completed jobs/s |  p99 e2e |   WAL/job |
 | ------------------------------ | ---------------: | -------: | --------: |
@@ -171,7 +171,7 @@ First-principles WAL accounting then compared the production path, a narrow `don
 | Narrow terminal history        |        `8,337/s` | `205 ms` | `1,932 B` |
 | Skip `done_entries` entirely   |        `8,402/s` | `230 ms` | `1,441 B` |
 
-The shipped design is the middle row: keep the durable terminal fact, but avoid duplicating immutable ready-body fields on ready-backed terminal rows. The skip-`done_entries` experiment remains rejected because it weakens the terminal-history contract, and its small throughput gain over narrow terminal history points at durable WAL write/sync pressure rather than a hidden per-job query loop as the next ceiling.
+The adopted design keeps the durable terminal fact and public `{schema}.terminal_jobs` surface while avoiding duplicated ready-body fields. Successful receipt completions can now write compact `receipt_completion_batches_*` rows instead of one `done_entries_*` row per job. The skip-durable-history experiment remains rejected because it weakens the terminal-history contract.
 
 ### Queue-storage striping reference
 

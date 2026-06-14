@@ -1715,6 +1715,9 @@ impl MaintenanceService {
                             slot,
                             ready_rows = busy.queue_ready,
                             done_rows = busy.queue_done,
+                            receipt_completion_batches = busy.queue_receipt_completion_batches,
+                            receipt_completion_tombstones =
+                                busy.queue_receipt_completion_tombstones,
                             "Skipped busy queue storage queue segment",
                         );
                     }

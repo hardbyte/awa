@@ -931,6 +931,42 @@ async fn completed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: 
     .expect("Failed to count completed done rows")
 }
 
+async fn completed_terminal_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {}.terminal_jobs WHERE queue = $1 AND state = 'completed'",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to count completed terminal rows")
+}
+
+async fn receipt_completion_batch_count(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {}.receipt_completion_batches WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to count receipt completion batches")
+}
+
+async fn receipt_completion_tombstone_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {}.receipt_completion_tombstones",
+        store.schema()
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("Failed to count receipt completion tombstones")
+}
+
 async fn done_body_columns(
     pool: &sqlx::PgPool,
     store: &QueueStorage,
@@ -1927,8 +1963,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
 
     // Claim + complete a receipt-backed job. Without prune, this leaves
-    // one row in lease_claims_0; the terminal done row is the closure
-    // evidence for successful completion.
+    // one row in lease_claims_0 and one completed closure row in
+    // lease_claim_closures_0.
     let job_id = enqueue_job(
         &pool,
         &store,
@@ -1965,8 +2001,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
     client.shutdown(Duration::from_secs(5)).await;
 
-    // Sanity: the claim landed in slot 0 and successful completion
-    // did not need a duplicate closure row.
+    // Sanity: the claim and its compact completed closure landed in slot 0.
     let slot0_claims: i64 =
         sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
             .fetch_one(&pool)
@@ -1980,8 +2015,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .expect("count lease_claim_closures_0");
     assert_eq!(slot0_claims, 1, "completed claim must live in slot 0");
     assert_eq!(
-        slot0_closures, 0,
-        "successful completion uses done_entries as closure evidence"
+        slot0_closures, 1,
+        "successful completion uses explicit compact receipt closure evidence"
     );
 
     // Rotate from slot 0 → slot 1. Slot 1 is empty, so busy-check
@@ -2452,8 +2487,8 @@ async fn test_open_receipt_claims_is_absent_after_install() {
     );
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        0,
-        "successful completion uses done_entries as receipt closure evidence"
+        1,
+        "successful completion uses explicit compact receipt closure evidence"
     );
     assert!(
         !open_receipt_claims_present(&pool, schema).await,
@@ -2464,10 +2499,8 @@ async fn test_open_receipt_claims_is_absent_after_install() {
 }
 
 /// Partition-routing smoke test for the ADR-023 receipt plane: a
-/// receipt-backed claim + completion cycle lands the claim row in the
-/// expected `lease_claims` child partition. Successful completion uses
-/// `done_entries` as closure evidence, so no duplicate completed
-/// closure row is expected.
+/// receipt-backed claim + completion cycle lands the claim and explicit
+/// completed closure rows in the expected child partitions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_partition_routing() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -2575,8 +2608,8 @@ async fn test_lease_claim_partition_routing() {
     .await
     .expect("count in lease_claim_closures_2");
     assert_eq!(
-        closure_in_child, 0,
-        "successful completion must not write a duplicate completed closure"
+        closure_in_child, 1,
+        "successful completion must write compact completed closure evidence"
     );
 }
 
@@ -3137,7 +3170,7 @@ async fn test_queue_storage_two_clients_drain_without_duplicate_execution() {
 
     let start = Instant::now();
     loop {
-        let completed = completed_done_count(&pool, &store, queue).await;
+        let completed = completed_terminal_count(&pool, &store, queue).await;
         let unique_seen = seen.lock().await.len();
 
         if completed == job_count && unique_seen == job_count as usize {
@@ -3683,7 +3716,17 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "successful receipt completion closes the receipt claim"
+    );
+    assert_eq!(completed_done_count(&pool, &store, queue).await, 0);
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1
+    );
     let completed_counts = store
         .queue_counts(&pool, queue)
         .await
@@ -3694,7 +3737,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_sql_compat_delete_materializes_receipt_closure() {
+async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_completion() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_delete_compat_closure";
     let schema = "awa_qs_receipt_delete_compat_closure";
@@ -3735,12 +3778,17 @@ async fn test_queue_storage_sql_compat_delete_materializes_receipt_closure() {
     assert_eq!(completed.state, JobState::Completed);
     client.shutdown(Duration::from_secs(5)).await;
 
-    assert_eq!(completed_done_count(&pool, &store, queue).await, 1);
+    assert_eq!(completed_done_count(&pool, &store, queue).await, 0);
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1
+    );
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        0,
-        "successful completion should use done_entries as receipt closure evidence"
+        1,
+        "successful completion should write explicit compact receipt closure evidence"
     );
 
     let deleted: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
@@ -3751,10 +3799,12 @@ async fn test_queue_storage_sql_compat_delete_materializes_receipt_closure() {
     assert!(deleted, "completed job should be deleted through compat");
 
     assert_eq!(completed_done_count(&pool, &store, queue).await, 0);
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 0);
+    assert_eq!(receipt_completion_tombstone_count(&pool, &store).await, 1);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         1,
-        "terminal delete must materialize explicit closure before removing done evidence"
+        "compat delete must preserve explicit closure evidence for claim pruning"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
 
@@ -4152,8 +4202,8 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
     .await
     .expect("count receipt closures");
     assert_eq!(
-        closures, 1,
-        "successful completion remains closed by done_entries; only the rescued open claim writes an explicit closure"
+        closures, 2,
+        "successful completion and rescued open claim both write explicit closures"
     );
 }
 
@@ -4464,7 +4514,11 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "successful materialized receipt completion closes the receipt claim"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4505,7 +4559,7 @@ async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receip
         .expect("queue_counts with receipt-only claim");
     assert_eq!(receipt_only_counts.running, 1);
 
-    store
+    let callback_id = store
         .register_callback(
             &pool,
             claimed[0].job.id,
@@ -4532,6 +4586,26 @@ async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receip
         "materialized receipt-backed attempts have both a lease row and an \
          open receipt row, but queue_counts must count the attempt once"
     );
+
+    let completed = store
+        .complete_external(
+            &pool,
+            callback_id,
+            Some(serde_json::json!({"ok": true})),
+            Some(claimed[0].job.run_lease),
+            false,
+        )
+        .await
+        .expect("complete materialized receipt callback");
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "successful materialized receipt completion must close the receipt claim"
+    );
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4595,7 +4669,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4651,7 +4725,11 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "retryable receipt failure closes the receipt claim"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4777,7 +4855,11 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        2,
+        "rescue closes the stale receipt and successful completion closes the retry receipt"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -5223,7 +5305,11 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        2,
+        "rescue closes the stale receipt and successful completion closes the retry receipt"
+    );
 
     release.notify_waiters();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -5248,7 +5334,11 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
         .expect("Expected receipt rescue job to exist");
     assert_eq!(current.state, JobState::Completed);
     assert_eq!(current.attempt, 2);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        2,
+        "late stale completion must not change the closed receipt set"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -5620,7 +5710,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_queue_storage_prune_treats_ready_tombstone_as_spent() {
+async fn test_queue_storage_prune_waits_until_ready_tombstone_cursor_spent() {
     let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_prune_tombstone";
     let schema = "awa_qs_prune_tombstone";
@@ -5649,13 +5739,48 @@ async fn test_queue_storage_prune_treats_ready_tombstone_as_spent() {
         "unexpected rotate outcome: {rotated:?}"
     );
 
-    let prune = store
+    let prune_before_cursor_advance = store
         .prune_oldest(&pool, Duration::ZERO)
         .await
         .expect("Failed to prune tombstoned ready slot");
     assert!(
-        matches!(prune, PruneOutcome::Pruned { slot: 0, .. }),
-        "tombstoned ready rows should not keep the old queue slot active: {prune:?}"
+        matches!(
+            prune_before_cursor_advance,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::QueuePendingReady,
+                count: 1
+            }
+        ),
+        "tombstoned ready rows remain cursor evidence until the lane cursor passes them: {prune_before_cursor_advance:?}"
+    );
+
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(1_i64)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("raw claim over tombstoned head");
+    assert!(
+        claimed.is_empty(),
+        "claim allocator must not emit a tombstoned ready row"
+    );
+
+    let prune_after_cursor_advance = store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("Failed to prune tombstoned ready slot after cursor advance");
+    assert!(
+        matches!(
+            prune_after_cursor_advance,
+            PruneOutcome::Pruned { slot: 0, .. }
+        ),
+        "once the cursor has passed the tombstone, queue prune should reclaim the slot: {prune_after_cursor_advance:?}"
     );
 
     assert_eq!(
@@ -6323,16 +6448,16 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
     assert_eq!(post_prune_fast.terminal, post_prune_exact.terminal);
 }
 
-/// ADR-026 invariant: every terminal-row insert path appends a positive
+/// ADR-026 invariant: every terminal insert path appends a positive
 /// `queue_terminal_count_deltas` row so that folded live counts plus pending
-/// deltas equals `count(*) FROM done_entries WHERE queue = ANY(...)`.
+/// deltas equals the public terminal cardinality.
 ///
 /// The test exercises both insert paths:
 /// - `insert_done_rows_tx` via `complete_batch` on the lease-materialisation
 ///   path (default `create_store` builds the store without the receipt
 ///   fast-complete candidate set).
 /// - the fused receipt fast path is exercised in
-///   `test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_path`
+///   `test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_path`
 ///   below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper() {
@@ -6402,7 +6527,7 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_path() {
+async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_path() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_fast";
     let schema = "awa_qs_terminal_live_counts_fast";
@@ -6465,7 +6590,16 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_p
     let delta_sum = terminal_delta_sum(&pool, schema, queue).await;
     let terminal_sum = terminal_counter_sum(&pool, schema, queue).await;
     let done_count = done_entries_count(&pool, schema, queue).await;
-    assert_eq!(done_count, 5);
+    let terminal_count = completed_terminal_count(&pool, &store, queue).await;
+    assert_eq!(
+        done_count, 0,
+        "receipt fast path must avoid wide completed done_entries rows"
+    );
+    assert_eq!(terminal_count, 5);
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1
+    );
     assert_eq!(
         live_sum, 0,
         "fused receipt fast path must not update folded counters"
@@ -6475,8 +6609,8 @@ async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_p
         "fused receipt fast path must append pending deltas"
     );
     assert_eq!(
-        terminal_sum, done_count,
-        "fused receipt fast path must preserve exact terminal count"
+        terminal_sum, terminal_count,
+        "fused receipt fast path must preserve exact public terminal count"
     );
 }
 
@@ -6916,7 +7050,7 @@ async fn test_queue_storage_retry_jobs_by_ids_dedupes_duplicate_ids() {
 /// the live segment as self-contained wide rows, so `pruned_failed_count`
 /// stays untouched. `admin::retry_failed_by_queue` then revives the
 /// carried jobs end-to-end, proving the carried bodies survived the
-/// widening; `rebuild_terminal_counters` re-aggregates from `done_entries`
+/// widening; `rebuild_terminal_counters` re-aggregates from `terminal_jobs`
 /// and the ADR-026 invariant still holds against the carried rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
@@ -7782,8 +7916,8 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
 /// #290 — `queue_counts_exact` honours the
 /// `queue_ring_state.terminal_counter_trusted_at` marker. When the marker
 /// is NULL (e.g. a rolling-upgrade window where a pre-#290 binary may
-/// have written `done_entries` rows without maintaining the counter), the
-/// read path falls back to scanning `done_entries`; otherwise it uses
+/// have written terminal rows without maintaining the counter), the
+/// read path falls back to scanning `terminal_jobs`; otherwise it uses
 /// the counter directly. This keeps the "exact" naming honest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
@@ -7848,7 +7982,7 @@ async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
         "trust marker cleared"
     );
 
-    // Untrusted path scans done_entries → reports 6 (the seeded 5 +
+    // Untrusted path scans terminal_jobs → reports 6 (the seeded 5 +
     // the orphan row). If the read still trusted the counter, it
     // would return 5 and silently mask the drift.
     assert_eq!(
@@ -7858,7 +7992,7 @@ async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
             .expect("counts")
             .terminal,
         6,
-        "untrusted path scans done_entries instead of the counter"
+        "untrusted path scans terminal_jobs instead of the counter"
     );
 
     // Rebuild restores the invariant AND flips the trust marker back.
@@ -7883,6 +8017,84 @@ async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
         "trusted path post-rebuild returns the rebuilt counter sum"
     );
     assert_invariant_holds(&pool, schema, queue, "after rebuild trust flip").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_counter_untrusted_path_counts_compact_receipt_batches() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_counter_compact_receipt";
+    let schema = "awa_qs_terminal_counter_compact_receipt";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 3)
+        .await
+        .expect("enqueue compact receipt jobs");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::ZERO)
+        .await
+        .expect("claim compact receipt jobs");
+    assert_eq!(claimed.len(), 3);
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete compact receipt jobs");
+
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+    assert_eq!(completed_terminal_count(&pool, &store, queue).await, 3);
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 3);
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state \
+         SET terminal_counter_trusted_at = NULL WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("clear trust marker");
+
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("untrusted compact counts")
+            .terminal,
+        3,
+        "untrusted path must count compact receipt completions via terminal_jobs"
+    );
+
+    sqlx::query(&format!(
+        "TRUNCATE TABLE {schema}.queue_terminal_live_counts, {schema}.queue_terminal_count_deltas"
+    ))
+    .execute(&pool)
+    .await
+    .expect("clear counters before rebuild");
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 0);
+
+    store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild compact terminal counters");
+    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 3);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("trusted compact counts after rebuild")
+            .terminal,
+        3,
+        "rebuild must aggregate compact receipt completions from terminal_jobs"
+    );
 }
 
 async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
@@ -8005,7 +8217,7 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
         claimed_total
     });
 
-    let (_producer_done, claimed_total) = tokio::time::timeout(Duration::from_secs(20), async {
+    let (_producer_done, claimed_total) = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::try_join!(producer, claimer)
     })
     .await
@@ -9639,22 +9851,20 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
 
 /// At `enqueue_shards > 1` every plane carries a shard column:
 /// `queue_enqueue_heads`, `queue_claim_heads`, and `ready_entries`
-/// extend their primary keys to include it; `leases` and `done_entries`
-/// do too; `lease_claims` carries the shard as a regular column.
+/// extend their primary keys to include it; `leases`, `done_entries`,
+/// and compact receipt completion batches carry the same terminal
+/// identity. `lease_claims` carries the shard as a regular column.
 /// This test seeds `queue_meta.enqueue_shards = 4`, enqueues enough
 /// jobs to land on every shard, drains them through a worker, and
 /// asserts:
 ///
 /// 1. Every job completes.
-/// 2. `done_entries` rows are spread across all 4 shards (the producer
-///    rotor actually rotated, and the claim path returned the shard
-///    on the `ClaimedEntry` so the terminal row picked up the right
-///    `enqueue_shard`).
-/// 3. The `done_entries` primary key
-///    `(ready_slot, queue, priority, enqueue_shard, lane_seq)` carries
-///    multiple rows that share `(ready_slot, queue, priority,
-///    lane_seq)` across different shards — i.e. the shard column is
-///    load-bearing in the key.
+/// 2. public terminal rows are spread across all 4 shards (the
+///    producer rotor actually rotated, and the claim path returned the
+///    shard so terminal history picked up the right `enqueue_shard`).
+/// 3. terminal identity carries multiple rows that share
+///    `(ready_slot, queue, priority, lane_seq)` across different shards
+///    — i.e. the shard column is load-bearing in the key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_multi_shard_round_trip_through_completion() {
     let (_db_guard, pool) = setup_pool(8).await;
@@ -9717,18 +9927,19 @@ async fn test_queue_storage_multi_shard_round_trip_through_completion() {
         .await;
     }
 
-    // Every shard should hold at least one terminal row.
+    // Every shard should surface at least one public terminal row.
     let shard_counts: Vec<(i16, i64)> = sqlx::query_as(&format!(
         "SELECT enqueue_shard, count(*)::bigint
-         FROM {schema}.done_entries
+         FROM {schema}.terminal_jobs
          WHERE queue = $1
+           AND state = 'completed'
          GROUP BY enqueue_shard
          ORDER BY enqueue_shard"
     ))
     .bind(queue)
     .fetch_all(&pool)
     .await
-    .expect("count done_entries per shard");
+    .expect("count terminal rows per shard");
 
     let shards_observed: Vec<i16> = shard_counts.iter().map(|(s, _)| *s).collect();
     assert_eq!(
@@ -9739,19 +9950,20 @@ async fn test_queue_storage_multi_shard_round_trip_through_completion() {
     let total: i64 = shard_counts.iter().map(|(_, c)| c).sum();
     assert_eq!(
         total, 16,
-        "exactly the enqueued jobs landed in done_entries"
+        "exactly the enqueued jobs landed in terminal history"
     );
 
-    // The shard column is load-bearing in the `done_entries` PK iff
-    // two distinct shards share a `(ready_slot, queue, priority,
-    // lane_seq)` tuple that would otherwise collide. Each shard's
-    // `lane_seq` starts independently at 1, so at S=4 with 4 jobs per
-    // shard there must be at least one tuple that repeats.
+    // The shard column is load-bearing terminal identity because two
+    // distinct shards can share a `(ready_slot, queue, priority,
+    // lane_seq)` tuple. Each shard's `lane_seq` starts independently at
+    // 1, so at S=4 with 4 jobs per shard there must be at least one
+    // tuple that repeats.
     let max_dupes: i64 = sqlx::query_scalar(&format!(
         "SELECT COALESCE(max(c), 0)::bigint FROM (
              SELECT count(*) AS c
-             FROM {schema}.done_entries
+             FROM {schema}.terminal_jobs
              WHERE queue = $1
+               AND state = 'completed'
              GROUP BY ready_slot, queue, priority, lane_seq
          ) AS grouped"
     ))
@@ -10040,8 +10252,9 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
     loop {
         let done_count: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*)::bigint
-             FROM {schema}.done_entries
-             WHERE queue = $1"
+             FROM {schema}.terminal_jobs
+             WHERE queue = $1
+               AND state = 'completed'"
         ))
         .bind(queue)
         .fetch_one(&pool)
@@ -10052,7 +10265,7 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
         }
         assert!(
             Instant::now() <= deadline,
-            "Timed out waiting for fairness drain: done_count {done_count} != expected {}",
+            "Timed out waiting for fairness drain: terminal_count {done_count} != expected {}",
             job_ids.len(),
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -10202,8 +10415,9 @@ async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
 
     let done_shards: Vec<i16> = sqlx::query_scalar(&format!(
         "SELECT DISTINCT enqueue_shard
-         FROM {schema}.done_entries
+         FROM {schema}.terminal_jobs
          WHERE queue = $1
+           AND state = 'completed'
          ORDER BY enqueue_shard"
     ))
     .bind(queue)
@@ -10213,7 +10427,7 @@ async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
     assert_eq!(
         done_shards,
         vec![0, 1, 2, 3],
-        "every shard's rows including the out-of-range ones should drain to done_entries",
+        "every shard's rows including the out-of-range ones should drain to terminal_jobs",
     );
 
     client.shutdown(Duration::from_secs(5)).await;

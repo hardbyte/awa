@@ -962,6 +962,14 @@ impl AwaMetrics {
                     ("queue.ready_rows", busy.queue_ready),
                     ("queue.done_rows", busy.queue_done),
                     ("queue.tombstone_rows", busy.queue_tombstones),
+                    (
+                        "queue.receipt_completion_batch_rows",
+                        busy.queue_receipt_completion_batches,
+                    ),
+                    (
+                        "queue.receipt_completion_tombstone_rows",
+                        busy.queue_receipt_completion_tombstones,
+                    ),
                     ("queue.terminal_delta_rows", busy.queue_terminal_deltas),
                     ("lease.rows", busy.leases),
                     ("claim.rows", busy.claims),
