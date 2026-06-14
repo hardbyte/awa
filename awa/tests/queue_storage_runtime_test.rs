@@ -2253,8 +2253,9 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
 
 /// Wave-1 regression test for the prune safety predicate. If a claim
 /// is still open (no matching closure), prune must return
-/// `SkippedActive` instead of TRUNCATE-ing the partition and losing
-/// the claim.
+/// `SkippedActive` before taking child-table `ACCESS EXCLUSIVE` locks
+/// instead of blocking behind readers or truncating the partition and
+/// losing the claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -2293,14 +2294,31 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
             .expect("rotate away from slot 0");
     }
 
+    let mut reader_tx = pool.begin().await.expect("begin claim reader tx");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.lease_claims_0, {schema}.lease_claim_closures_0, {schema}.lease_claim_closure_batches_0 IN ACCESS SHARE MODE"
+    ))
+    .execute(reader_tx.as_mut())
+    .await
+    .expect("lock claim children in access share mode");
+
     let outcome = store
         .prune_oldest_claims(&pool)
         .await
         .expect("prune_oldest_claims with open claim");
     assert!(
-        matches!(outcome, PruneOutcome::SkippedActive { slot: 0, .. }),
-        "prune must refuse to truncate a partition with an open claim, got {outcome:?}"
+        matches!(
+            outcome,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::ClaimOpen,
+                count: 1
+            }
+        ),
+        "prune must prove the open claim before trying exclusive child locks, got {outcome:?}"
     );
+
+    reader_tx.rollback().await.expect("release reader lock");
 
     // The claim is still there — not lost.
     let survived: i64 = sqlx::query_scalar(&format!(

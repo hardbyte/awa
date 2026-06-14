@@ -427,16 +427,20 @@ RotateClaimsPlan(nextSlot) ==
 \* prune_oldest_claims (ADR-023)
 \*   SELECT ... FROM claim_ring_state FOR UPDATE
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
+\*   prove every claim in the sealed slot has durable closure evidence
+\*     with plain SELECT / AccessShare on the claim children
 \*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 \*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 \*   LOCK TABLE closure_batch_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
-\*   rescue-before-truncate: close any still-open claims via the
-\*     existing receipt-rescue path (modelled at the data-spec level, no
-\*     extra locks here because the rescue uses the same child AccessExclusive)
+\*   open-claim slots skip before the exclusive lock path; the plan below
+\*     models the successful truncate path after the proof has passed
 \*   TRUNCATE claim_child[slot] + closure_child[slot] + closure_batch_child[slot]
 PruneClaimsPlan(slot) ==
     << Step(ClaimRingStateResource, ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive),
+       Step(ClaimChildResource(slot), ModeShared),
+       Step(ClosureChildResource(slot), ModeShared),
+       Step(ClosureBatchChildResource(slot), ModeShared),
        Step(ClaimChildResource(slot), ModeExclusive),
        Step(ClosureChildResource(slot), ModeExclusive),
        Step(ClosureBatchChildResource(slot), ModeExclusive) >>
