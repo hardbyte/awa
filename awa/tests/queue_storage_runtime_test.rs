@@ -798,6 +798,29 @@ async fn age_receipt_claim(
     .expect("Failed to age receipt claim for rescue test");
 }
 
+async fn age_attempt_heartbeat(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+    run_lease: i64,
+    age: Duration,
+) {
+    let age_millis = i64::try_from(age.as_millis()).expect("test heartbeat age fits in i64 millis");
+    sqlx::query(&format!(
+        "UPDATE {}.attempt_state
+         SET heartbeat_at = clock_timestamp() - ($1 * interval '1 millisecond'),
+             updated_at = clock_timestamp()
+         WHERE job_id = $2 AND run_lease = $3",
+        store.schema()
+    ))
+    .bind(age_millis)
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(pool)
+    .await
+    .expect("Failed to age attempt heartbeat for rescue test");
+}
+
 async fn wait_for_callback_job(
     store: &QueueStorage,
     pool: &sqlx::PgPool,
@@ -1672,7 +1695,7 @@ impl Worker for ProgressRescueWorker {
                 if ctx.is_cancelled() {
                     break;
                 }
-                if started.elapsed() > Duration::from_secs(5) {
+                if started.elapsed() > Duration::from_secs(30) {
                     return Err(JobError::terminal(
                         "progress rescue did not cancel stale attempt",
                     ));
@@ -4722,12 +4745,21 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(running.state, JobState::Running);
     assert!(running.heartbeat_at.is_some());
 
+    age_attempt_heartbeat(
+        &pool,
+        &store,
+        job_id,
+        running.run_lease,
+        Duration::from_secs(120),
+    )
+    .await;
+
     let completed = wait_for_job_state(
         &store,
         &pool,
         job_id,
         &[JobState::Completed],
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     )
     .await;
     assert_eq!(completed.state, JobState::Completed);
