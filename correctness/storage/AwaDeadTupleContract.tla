@@ -108,6 +108,8 @@ TableSpec == [
     leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claim_closures   |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    lease_claim_closure_batches
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
 
     \* ---- Backlog / retention tables ----
     \* deferred_jobs and dlq_entries are unpartitioned in the current Rust
@@ -218,13 +220,14 @@ ClaimLegacyTx == <<
 >>
 
 \* complete_runtime_batch (receipts mode)
-\* Successful compact receipt completion appends a compact terminal batch and a
-\* terminal-count delta. The compact batch is both public terminal history
-\* through terminal_jobs and durable closure evidence for claim prune / rescue.
+\* Successful compact receipt completion appends a compact terminal batch, a
+\* compact claim-local closure batch, and a terminal-count delta. Terminal
+\* history and claim-closure evidence are separate partition-truncated ledgers.
 \* Non-success, cancellation, rescue, and wide terminal paths still use
 \* explicit lease_claim_closures.
 CompleteReceiptsTx == <<
     Mut("Insert", "receipt_completion_batches"),
+    Mut("Insert", "lease_claim_closure_batches"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Delete", "attempt_state")
 >>
@@ -243,7 +246,8 @@ CompleteLegacyTx == <<
 \* close_receipt_tx — queue_storage.rs:6517
 \* Used by cancel_job_tx and the rescue path.
 CloseReceiptTx == <<
-    Mut("Insert", "lease_claim_closures")
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims")
 >>
 
 \* rescue_stale_receipt_claims_tx — queue_storage.rs:8195
@@ -255,6 +259,7 @@ CloseReceiptTx == <<
 \* cursor until a later pass.
 RescueReceiptsTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Update", "claim_ring_slots")
 >>
 
@@ -267,6 +272,7 @@ RescueReceiptsTx == <<
 \* updated or deleted.
 RescueReceiptDeadlinesTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Update", "claim_ring_slots")
 >>
 
@@ -285,6 +291,7 @@ CancelReceiptOnlyTx == <<
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "leases")
 >>
 
@@ -293,7 +300,8 @@ CancelRunningTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
-    Mut("Insert", "lease_claim_closures")
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims")
 >>
 
 \* cancel_job_tx ready branch (append-only ready segments)
@@ -351,6 +359,8 @@ ResumeWaitingTx == <<
 \* complete_external / fail_external — terminal callback resolution.
 ResolveExternalTerminalTx == <<
     Mut("Delete", "leases"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
@@ -358,12 +368,15 @@ ResolveExternalTerminalTx == <<
 \* retry_external — delete the waiting lease and park in deferred_jobs.
 RetryExternalTx == <<
     Mut("Delete", "leases"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Insert", "deferred_jobs")
 >>
 
 \* DLQ admin lifecycle.
 MoveFailedToDlqTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "dlq_entries")
@@ -371,12 +384,14 @@ MoveFailedToDlqTx == <<
 
 DiscardTerminalTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
 
 DeleteTerminalCompatTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
@@ -388,6 +403,7 @@ DeleteCompactReceiptTerminalCompatTx == <<
 
 RetryFromTerminalTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "ready_entries")
@@ -450,7 +466,8 @@ RotateClaimsTx == << Mut("Update", "claim_ring_state") >>
 PruneClaimsTx  == <<
     Mut("Update", "claim_ring_slots"),
     Mut("Truncate", "lease_claims"),
-    Mut("Truncate", "lease_claim_closures")
+    Mut("Truncate", "lease_claim_closures"),
+    Mut("Truncate", "lease_claim_closure_batches")
 >>
 
 Transactions == {

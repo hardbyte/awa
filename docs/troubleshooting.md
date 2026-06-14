@@ -46,7 +46,8 @@ ORDER BY heartbeat_at ASC;
 -- Receipt-mode short-job claims that haven't materialized yet. No
 -- heartbeat row; deadline_at lives on the claim if deadline_duration > 0
 -- and the receipt-side deadline rescue (`rescue_expired_receipt_deadlines_tx`)
--- is what kicks in here. Anti-join with closures to filter "still open".
+-- is what kicks in here. Anti-join with closure evidence to filter
+-- "still open".
 SELECT
     c.job_id,
     c.queue,
@@ -61,6 +62,11 @@ WHERE NOT EXISTS (
     WHERE cx.claim_slot = c.claim_slot
       AND cx.job_id = c.job_id
       AND cx.run_lease = c.run_lease
+)
+AND NOT EXISTS (
+    SELECT 1 FROM awa.lease_claim_closure_batches cb
+    WHERE cb.claim_slot = c.claim_slot
+      AND cb.receipt_ids @> ARRAY[c.receipt_id]::bigint[]
 )
 ORDER BY c.claimed_at ASC;
 ```

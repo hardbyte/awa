@@ -541,7 +541,8 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
         r#"
         SELECT count(*)::bigint
         FROM {schema}.lease_claims AS claims
-        WHERE NOT EXISTS (
+        WHERE claims.closed_at IS NULL
+          AND NOT EXISTS (
             SELECT 1 FROM {schema}.lease_claim_closures AS closures
             WHERE closures.claim_slot = claims.claim_slot
               AND closures.job_id = claims.job_id
@@ -549,23 +550,9 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
         )
           AND NOT EXISTS (
             SELECT 1
-            FROM {schema}.receipt_completion_batches AS batch
-            WHERE batch.ready_slot = claims.ready_slot
-              AND batch.ready_generation = claims.ready_generation
-              AND batch.claim_slot = claims.claim_slot
-              AND batch.queue = claims.queue
-              AND batch.priority = claims.priority
-              AND batch.enqueue_shard = claims.enqueue_shard
-              AND batch.job_ids @> ARRAY[claims.job_id]::bigint[]
-              AND EXISTS (
-                  SELECT 1
-                  FROM unnest(
-                      batch.job_ids,
-                      batch.run_leases
-                  ) AS receipt_item(job_id, run_lease)
-                  WHERE receipt_item.job_id = claims.job_id
-                    AND receipt_item.run_lease = claims.run_lease
-              )
+            FROM {schema}.lease_claim_closure_batches AS closure_batches
+            WHERE closure_batches.claim_slot = claims.claim_slot
+              AND closure_batches.receipt_ids @> ARRAY[claims.receipt_id]::bigint[]
         )
           AND NOT EXISTS (
             SELECT 1 FROM {schema}.leases AS lease
@@ -578,9 +565,9 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
               AND deferred.run_lease = claims.run_lease
         )
           AND NOT EXISTS (
-            SELECT 1 FROM {schema}.done_entries AS done
-            WHERE done.job_id = claims.job_id
-              AND done.run_lease = claims.run_lease
+            SELECT 1 FROM {schema}.terminal_jobs AS terminal
+            WHERE terminal.job_id = claims.job_id
+              AND terminal.run_lease = claims.run_lease
         )
           AND NOT EXISTS (
             SELECT 1 FROM {schema}.dlq_entries AS dlq
@@ -604,6 +591,17 @@ async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) ->
         .fetch_one(pool)
         .await
         .expect("Failed to count lease_claim_closures")
+}
+
+async fn lease_claim_closure_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.lease_claim_closure_batches",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count lease_claim_closure_batches")
 }
 
 async fn ready_tombstone_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
@@ -2020,8 +2018,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
     client.shutdown(Duration::from_secs(5)).await;
 
-    // Sanity: the claim landed in slot 0 and the compact batch supplies
-    // closure evidence without an explicit closure row.
+    // Sanity: the claim landed in slot 0 and compact claim-local batch
+    // evidence closes it without an explicit per-job closure row.
     let slot0_claims: i64 =
         sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
             .fetch_one(&pool)
@@ -2041,7 +2039,12 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     assert_eq!(
         receipt_completion_batch_count(&pool, &store, queue).await,
         1,
-        "compact receipt completion batch is the closure evidence"
+        "compact receipt completion batch is terminal history"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "compact claim-closure batch is the closure evidence"
     );
 
     // Rotate from slot 0 → slot 1. Slot 1 is empty, so busy-check
@@ -2512,12 +2515,17 @@ async fn test_open_receipt_claims_is_absent_after_install() {
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         0,
-        "compact successful completion uses receipt_completion_batches as closure evidence"
+        "compact successful completion must not write per-job closure rows"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "compact successful completion uses claim-local batch closure evidence"
     );
     assert_eq!(
         receipt_completion_batch_count(&pool, &store, queue).await,
         1,
-        "successful receipt completion should write compact terminal/closure evidence"
+        "successful receipt completion should write compact terminal history"
     );
     assert!(
         !open_receipt_claims_present(&pool, schema).await,
@@ -2866,7 +2874,7 @@ async fn test_legacy_zero_deadline_claim_without_receipts_succeeds() {
 /// a schema that still has the legacy regular (non-partitioned)
 /// `lease_claims` + `lease_claim_closures`, seed some rows in them,
 /// run `prepare_schema`, and assert:
-/// - both parents are now partitioned (`relkind = 'p'`)
+/// - receipt claim/closure parents are now partitioned (`relkind = 'p'`)
 /// - all pre-existing rows landed in the current `claim_ring_state` slot
 /// - the legacy tables are dropped
 /// Validates the rename → create partitioned → copy → drop path.
@@ -2972,8 +2980,12 @@ async fn test_lease_claim_migration_preserves_rows() {
         .await
         .expect("prepare_schema with legacy data");
 
-    // Both parents are partitioned now.
-    for name in ["lease_claims", "lease_claim_closures"] {
+    // Receipt claim/closure parents are partitioned now.
+    for name in [
+        "lease_claims",
+        "lease_claim_closures",
+        "lease_claim_closure_batches",
+    ] {
         let relkind: String = sqlx::query_scalar(
             r#"
             SELECT c.relkind::text FROM pg_class c
@@ -3765,7 +3777,12 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         0,
-        "compact successful completion closes the receipt through receipt_completion_batches"
+        "compact successful completion must not write per-job closure rows"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "compact successful completion closes the receipt through claim-local batch evidence"
     );
     assert_eq!(completed_done_count(&pool, &store, queue).await, 0);
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
@@ -5233,45 +5250,78 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         "closed receipt evidence should also advance the stale claim cursor"
     );
 
+    let compact_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let compact_claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim compact completion candidate");
+    assert_eq!(compact_claimed.len(), 1);
+    assert_eq!(compact_claimed[0].job.id, compact_job_id);
+    assert!(
+        compact_claimed[0].claim.lease_claim_receipt,
+        "test setup must use receipt claim fast path"
+    );
+    let compact_claim_slot = compact_claimed[0].claim.claim_slot;
+    let compact_lane_seq = compact_claimed[0].claim.lane_seq;
+    let compact_run_lease = compact_claimed[0].job.run_lease;
+    store
+        .complete_runtime_batch(&pool, &compact_claimed)
+        .await
+        .expect("complete through compact receipt batch");
+
+    let compact_terminal_batches: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint
+         FROM {schema}.receipt_completion_batches
+         WHERE job_ids @> ARRAY[$1]::bigint[]"
+    ))
+    .bind(compact_job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count compact terminal batches");
+    assert_eq!(
+        compact_terminal_batches, 1,
+        "regression must exercise compact receipt terminal history"
+    );
+
     sqlx::query("SELECT setval(format('%I.%I', $1, $2)::regclass, $3, $4)")
         .bind(schema)
         .bind(&claim_seq_name)
-        .bind(1_i64)
+        .bind(compact_lane_seq)
         .bind(false)
         .execute(&pool)
         .await
-        .expect("reset claim cursor for terminal-evidence phase");
+        .expect("reset claim cursor for compact terminal-evidence phase");
 
     sqlx::query(&format!(
-        "INSERT INTO {schema}.done_entries (
-            ready_slot, ready_generation, job_id, kind, queue, state,
-            priority, attempt, run_lease, lane_seq, enqueue_shard,
-            attempted_at, finalized_at, payload
-        ) VALUES (
-            0, 0, $1, 'heartbeat_rescue_job', $2, 'completed'::awa.job_state,
-            2::smallint, 1::smallint, 1::bigint, 1::bigint, 0::smallint,
-            now(), now(), '{{}}'::jsonb
-        )"
+        "DELETE FROM {schema}.lease_claim_closure_batches
+         WHERE claim_slot = $1"
     ))
-    .bind(job_id)
-    .bind(queue)
+    .bind(compact_claim_slot)
     .execute(&pool)
     .await
-    .expect("seed terminal evidence");
-
+    .expect("remove compact claim-ring closure evidence");
     sqlx::query(&format!(
         "DELETE FROM {schema}.lease_claim_closures WHERE job_id = $1 AND run_lease = $2"
     ))
-    .bind(job_id)
-    .bind(1_i64)
+    .bind(compact_job_id)
+    .bind(compact_run_lease)
     .execute(&pool)
     .await
-    .expect("remove closure evidence");
+    .expect("remove explicit closure evidence");
     sqlx::query(&format!(
         "DELETE FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2"
     ))
-    .bind(job_id)
-    .bind(1_i64)
+    .bind(compact_job_id)
+    .bind(compact_run_lease)
     .execute(&pool)
     .await
     .expect("remove claim evidence");
@@ -5290,12 +5340,12 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
 
     assert!(
         after_receipt_prune.is_empty(),
-        "terminal evidence must also prevent re-emitting a spent attempt after receipt partitions are pruned"
+        "compact terminal evidence must prevent re-emitting a spent attempt after claim partitions are pruned"
     );
     assert_eq!(
         claim_cursor().await,
-        2,
-        "terminal evidence should advance the stale claim cursor after receipt evidence is gone"
+        compact_lane_seq + 1,
+        "compact terminal evidence should advance the stale claim cursor after claim evidence is gone"
     );
 }
 
@@ -6698,6 +6748,11 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
         .await
         .expect("complete");
     assert_eq!(completed.len(), 5);
+    let expected_delta_rows = claimed
+        .iter()
+        .map(|entry| entry.job.id.rem_euclid(256))
+        .collect::<HashSet<_>>()
+        .len() as i64;
 
     let live_sum = live_count_sum(&pool, schema, queue).await;
     let delta_sum = terminal_delta_sum(&pool, schema, queue).await;
@@ -6719,6 +6774,11 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
         "compact successful completions must not write per-job closure rows"
     );
     assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "compact successful completions must write one claim-closure batch"
+    );
+    assert_eq!(
         open_receipt_claim_count(&pool, &store).await,
         0,
         "compact receipt batch must close the claim logically"
@@ -6733,8 +6793,8 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
     );
     assert_eq!(
         terminal_delta_row_count(&pool, schema, queue).await,
-        1,
-        "compact receipt completion should append one count delta per batch group"
+        expected_delta_rows,
+        "compact receipt completion should append one count delta per touched counter bucket"
     );
     assert_eq!(
         terminal_sum, terminal_count,
@@ -6785,6 +6845,11 @@ async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_clo
         lease_claim_closure_count(&pool, &store).await,
         0,
         "idempotent compact success must not rely on explicit closure rows"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "idempotent compact success should keep one claim-closure batch"
     );
     assert_eq!(
         receipt_completion_batch_count(&pool, &store, queue).await,

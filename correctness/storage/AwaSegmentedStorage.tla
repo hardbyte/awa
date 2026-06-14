@@ -13,7 +13,8 @@ EXTENDS TLC, Naturals, FiniteSets
 \* - dlq_entries
 \* - lane_state
 \* - ready / lease / terminal segment families
-\* - claim segment family (ADR-023): lease_claims + lease_claim_closures
+\* - claim segment family (ADR-023/026): lease_claims +
+\*   lease_claim_closures + lease_claim_closure_batches
 \*   partitioned BY LIST (claim_slot), reclaimed by rotation + TRUNCATE
 \*   instead of the earlier open_receipt_claims INSERT+DELETE frontier
 \*
@@ -49,8 +50,9 @@ EXTENDS TLC, Naturals, FiniteSets
 \* CancelWaitingToTerminal / TimeoutWaitingToDlq /
 \* TimeoutWaitingToReady) write an explicit closure row in that same
 \* segment. Successful compact receipt completion records the public
-\* terminal fact in compact terminal history, and that compact history is
-\* treated as closure evidence. ParkToWaiting does NOT close the receipt:
+\* terminal fact in compact terminal history and separately appends compact
+\* claim-local closure evidence in that same claim segment. ParkToWaiting
+\* does NOT close the receipt:
 \* waiting_external remains a row in `leases`, so the attempt is still
 \* alive in callback wait and its receipt stays open.
 \* ResumeWaitingToRunning also keeps the receipt open because the handler
@@ -1367,7 +1369,8 @@ PruneTerminalSegment(seg) ==
 \* rescue-before-truncate: every claim row in the partition must be
 \* closed by durable closure evidence
 \* before `prune_oldest_claims` can TRUNCATE the lease_claims /
-\* lease_claim_closures children for that slot. Ready prune is separately
+\* lease_claim_closures / lease_claim_closure_batches children for that
+\* slot. Ready prune is separately
 \* guarded so it cannot remove terminal history before matching closure
 \* evidence exists. Note this iterates over ClaimKeys, so an old (j, r)
 \* receipt left behind by a previous attempt is correctly counted even

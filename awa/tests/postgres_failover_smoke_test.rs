@@ -277,11 +277,17 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                      SELECT 'running'::awa.job_state AS state \
                      FROM {schema}.lease_claims AS lc \
                      WHERE lc.queue = $1 \
+                       AND lc.closed_at IS NULL \
                        AND NOT EXISTS ( \
                          SELECT 1 FROM {schema}.lease_claim_closures AS cx \
                          WHERE cx.claim_slot = lc.claim_slot \
                            AND cx.job_id = lc.job_id \
                            AND cx.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+                         WHERE cb.claim_slot = lc.claim_slot \
+                           AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
                        ) \
                        AND NOT EXISTS ( \
                          SELECT 1 FROM {schema}.leases AS lease \
@@ -294,9 +300,9 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                            AND deferred.run_lease = lc.run_lease \
                        ) \
                        AND NOT EXISTS ( \
-                         SELECT 1 FROM {schema}.done_entries AS done \
-                         WHERE done.job_id = lc.job_id \
-                           AND done.run_lease = lc.run_lease \
+                         SELECT 1 FROM {schema}.terminal_jobs AS terminal \
+                         WHERE terminal.job_id = lc.job_id \
+                           AND terminal.run_lease = lc.run_lease \
                        ) \
                        AND NOT EXISTS ( \
                          SELECT 1 FROM {schema}.dlq_entries AS dlq \
@@ -304,21 +310,7 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                            AND dlq.run_lease = lc.run_lease \
                        ) \
                      UNION ALL \
-                     SELECT 'completed'::awa.job_state AS state \
-                     FROM {schema}.lease_claims AS lc \
-                     JOIN {schema}.lease_claim_closures AS cx \
-                       ON cx.claim_slot = lc.claim_slot \
-                      AND cx.job_id = lc.job_id \
-                      AND cx.run_lease = lc.run_lease \
-                     WHERE lc.queue = $1 \
-                       AND cx.outcome = 'completed' \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM {schema}.done_entries AS done \
-                         WHERE done.job_id = lc.job_id \
-                           AND done.run_lease = lc.run_lease \
-                       ) \
-                     UNION ALL \
-                     SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                     SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
                      UNION ALL \
                      SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
                  ) AS jobs \
@@ -446,7 +438,12 @@ async fn storage_debug(pool: &sqlx::PgPool, queue: &str) -> String {
                     AND lc.job_id = cx.job_id \
                     AND lc.run_lease = cx.run_lease \
                   WHERE lc.queue = $1) + \
-                 (SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1) + \
+                 (SELECT count(*)::bigint FROM {schema}.lease_claim_closure_batches AS cb \
+                   JOIN {schema}.lease_claims AS lc \
+                     ON lc.claim_slot = cb.claim_slot \
+                    AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
+                  WHERE lc.queue = $1) + \
+                 (SELECT count(*)::bigint FROM {schema}.terminal_jobs WHERE queue = $1) + \
                  (SELECT COALESCE( \
                      sum( \
                          GREATEST( \

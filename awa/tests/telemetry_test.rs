@@ -169,11 +169,17 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                  SELECT 'running'::awa.job_state AS state \
                  FROM {schema}.lease_claims AS lc \
                  WHERE lc.queue = $1 \
+                   AND lc.closed_at IS NULL \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.lease_claim_closures AS cx \
                      WHERE cx.claim_slot = lc.claim_slot \
                        AND cx.job_id = lc.job_id \
                        AND cx.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+                     WHERE cb.claim_slot = lc.claim_slot \
+                       AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.leases AS lease \
@@ -243,11 +249,17 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                  SELECT 'running'::awa.job_state AS state \
                  FROM {schema}.lease_claims AS lc \
                  WHERE lc.queue = $1 \
+                   AND lc.closed_at IS NULL \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.lease_claim_closures AS cx \
                      WHERE cx.claim_slot = lc.claim_slot \
                        AND cx.job_id = lc.job_id \
                        AND cx.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+                     WHERE cb.claim_slot = lc.claim_slot \
+                       AND cb.receipt_ids @> ARRAY[lc.receipt_id]::bigint[] \
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.leases AS lease \

@@ -974,6 +974,7 @@ impl AwaMetrics {
                     ("lease.rows", busy.leases),
                     ("claim.rows", busy.claims),
                     ("claim.closure_rows", busy.closures),
+                    ("claim.closure_batch_rows", busy.closure_batches),
                 ];
                 let mut emitted_any = false;
                 for (label, count) in blockers {
