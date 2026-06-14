@@ -12,8 +12,8 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \*   - the rotators taking FOR UPDATE on lease_ring_state and the
 \*     target slot row (so two rotators serialise),
 \*   - LOCK TABLE ACCESS EXCLUSIVE NOWAIT on the partition child (so prune
-\*     waits for in-flight claim/complete writes to commit before
-\*     truncating).
+\*     fails fast under contention instead of queueing ahead of worker
+\*     traffic before truncating).
 \* Note: the claim CTE reads lease_ring_state with a plain SELECT, NOT
 \* a FOR SHARE. The conflict detection between claim and rotate is the
 \* rotator's CAS UPDATE (`WHERE current_slot=$ AND generation=$`) plus

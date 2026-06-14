@@ -59,6 +59,11 @@ BEGIN
             v_schema
         ));
         v_claim_runtime_def := pg_get_functiondef(v_claim_runtime::oid);
+        -- Custom schemas created before receipt claims may still have
+        -- a generated claim function without lease_claims writes. The
+        -- function-text check is deliberately a one-run upgrade
+        -- heuristic: the default schema always upgrades, and custom
+        -- schemas were installed from Awa's generated SQL.
         v_lease_claim_receipts := v_schema = 'awa'
             OR position(format('INSERT INTO %I.lease_claims', v_schema) IN v_claim_runtime_def) > 0;
 

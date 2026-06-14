@@ -8267,24 +8267,9 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         cutoff: DateTime<Utc>,
     ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
-        let schema = self.schema();
         let mut rescued = Vec::new();
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
-        let preferred_slot: Option<i32> = sqlx::query_as::<_, (i32, i64, i32)>(&format!(
-            r#"
-            SELECT current_slot, generation, slot_count
-            FROM {schema}.claim_ring_state
-            WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_optional(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?
-        .and_then(|(current_slot, generation, slot_count)| {
-            oldest_initialized_ring_slot(current_slot, generation, slot_count)
-                .map(|(slot, _generation)| slot)
-                .filter(|slot| *slot >= 0 && (*slot as usize) < self.claim_slot_count())
-        });
+        let preferred_slot = self.oldest_initialized_claim_slot_tx(tx).await?;
 
         if let Some(slot) = preferred_slot {
             let mut slot_rescued = self
@@ -8551,9 +8536,27 @@ impl QueueStorage {
     ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
         let mut rescued = Vec::new();
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
-        for slot in 0..self.claim_slot_count() {
+        let preferred_slot = self.oldest_initialized_claim_slot_tx(tx).await?;
+
+        if let Some(slot) = preferred_slot {
             let mut slot_rescued = self
-                .rescue_expired_receipt_deadlines_for_slot_tx(tx, slot as i32, remaining)
+                .rescue_expired_receipt_deadlines_for_slot_tx(tx, slot, remaining)
+                .await?;
+            remaining = remaining.saturating_sub(slot_rescued.len() as i64);
+            rescued.append(&mut slot_rescued);
+            if remaining == 0 {
+                return Ok(rescued);
+            }
+        }
+
+        for slot in 0..self.claim_slot_count() {
+            let slot = slot as i32;
+            if Some(slot) == preferred_slot {
+                continue;
+            }
+
+            let mut slot_rescued = self
+                .rescue_expired_receipt_deadlines_for_slot_tx(tx, slot, remaining)
                 .await?;
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
             rescued.append(&mut slot_rescued);
@@ -8564,6 +8567,30 @@ impl QueueStorage {
         }
 
         Ok(rescued)
+    }
+
+    async fn oldest_initialized_claim_slot_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    ) -> Result<Option<i32>, AwaError> {
+        let schema = self.schema();
+        let preferred_slot = sqlx::query_as::<_, (i32, i64, i32)>(&format!(
+            r#"
+            SELECT current_slot, generation, slot_count
+            FROM {schema}.claim_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?
+        .and_then(|(current_slot, generation, slot_count)| {
+            oldest_initialized_ring_slot(current_slot, generation, slot_count)
+                .map(|(slot, _generation)| slot)
+                .filter(|slot| *slot >= 0 && (*slot as usize) < self.claim_slot_count())
+        });
+
+        Ok(preferred_slot)
     }
 
     async fn rescue_expired_receipt_deadlines_for_slot_tx<'a>(
