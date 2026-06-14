@@ -960,7 +960,10 @@ impl AwaMetrics {
             awa_model::RotateOutcome::SkippedBusy { slot: _, busy } => {
                 let blockers: &[(&str, i64)] = &[
                     ("queue.ready_rows", busy.queue_ready),
-                    ("queue.claim_attempt_rows", busy.queue_claim_attempts),
+                    (
+                        "queue.claim_attempt_batches",
+                        busy.queue_claim_attempt_batches,
+                    ),
                     ("queue.done_rows", busy.queue_done),
                     ("queue.tombstone_rows", busy.queue_tombstones),
                     (

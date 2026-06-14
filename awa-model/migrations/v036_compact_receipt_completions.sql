@@ -138,7 +138,6 @@ BEGIN
             EXECUTE format(
                 'SELECT
                     (SELECT count(*)::bigint FROM %1$I.ready_entries)
-                  + (SELECT count(*)::bigint FROM %1$I.ready_claim_attempts)
                   + (SELECT count(*)::bigint FROM %1$I.deferred_jobs)
                   + (SELECT count(*)::bigint FROM %1$I.leases)
                   + (SELECT count(*)::bigint FROM %1$I.lease_claims)
