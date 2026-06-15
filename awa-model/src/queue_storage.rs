@@ -6071,28 +6071,10 @@ impl QueueStorage {
                         job_ids,
                         run_leases
                 ),
-                terminal_rows AS (
+                counted AS (
                     SELECT completed_rows.*
                     FROM completed_rows
-                ),
-                counted AS (
-                    SELECT
-                        terminal_rows.ready_slot,
-                        terminal_rows.ready_generation,
-                        terminal_rows.job_id,
-                        terminal_rows.run_lease,
-                        terminal_rows.queue,
-                        terminal_rows.priority,
-                        terminal_rows.enqueue_shard
-                    FROM terminal_rows
-                    JOIN terminal
-                      ON terminal.ready_slot = terminal_rows.ready_slot
-                     AND terminal.ready_generation = terminal_rows.ready_generation
-                     AND terminal.claim_slot = terminal_rows.claim_slot
-                     AND terminal.queue = terminal_rows.queue
-                     AND terminal.priority = terminal_rows.priority
-                     AND terminal.enqueue_shard = terminal_rows.enqueue_shard
-                     AND terminal.job_ids @> ARRAY[terminal_rows.job_id]
+                    CROSS JOIN (SELECT count(*) FROM terminal) AS terminal_write
                 ),
                 -- Terminal counts use an append-only delta ledger on the hot
                 -- completion path. Maintenance folds these rows into

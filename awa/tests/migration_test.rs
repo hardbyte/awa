@@ -1044,6 +1044,26 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
         has_done_failed_index,
         "done_entries failed-row metric probe should have a partial index"
     );
+    let has_receipt_batch_lane_index: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa_queue_storage_prepared.idx_awa_queue_storage_prepared_receipt_completion_batches_0_lane') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("receipt completion batch lane index probe should succeed");
+    assert!(
+        has_receipt_batch_lane_index,
+        "receipt_completion_batches should keep the segment-routing index"
+    );
+    let has_receipt_batch_job_ids_gin: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa_queue_storage_prepared.idx_awa_queue_storage_prepared_receipt_completion_batches_0_job_ids') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("receipt completion batch job_ids index probe should succeed");
+    assert!(
+        !has_receipt_batch_job_ids_gin,
+        "receipt_completion_batches must not maintain a hot-path GIN index for cold job-id deletes"
+    );
     assert!(
         relation_exists(&pool, "awa_queue_storage_prepared.leases").await,
         "prepared queue-storage schema should materialize leases"

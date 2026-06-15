@@ -1974,9 +1974,13 @@ BEGIN
             p_schema, format('receipt_completion_batches_%s', v_slot), p_schema, v_slot
         );
 
+        -- Compatibility deletion can find a job by expanding retained compact
+        -- batches. Keep that cold path off the completion hot path: a GIN
+        -- index on job_ids was larger than the retained batch table during
+        -- soak tests and had to be maintained for every successful completion.
         EXECUTE format(
-            'CREATE INDEX IF NOT EXISTS idx_%s_receipt_completion_batches_%s_job_ids ON %I.%I USING GIN (job_ids)',
-            p_schema, v_slot, p_schema, format('receipt_completion_batches_%s', v_slot)
+            'DROP INDEX IF EXISTS %I.%I',
+            p_schema, format('idx_%s_receipt_completion_batches_%s_job_ids', p_schema, v_slot)
         );
 
         EXECUTE format(
