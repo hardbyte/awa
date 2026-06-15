@@ -5969,6 +5969,36 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .await
     .expect("remove claim evidence");
 
+    let remaining_attempt_batches: i64 = sqlx::query_scalar(&format!(
+        r#"
+        SELECT count(*)::bigint
+        FROM {schema}.ready_claim_attempt_batches
+        WHERE ready_slot = $1
+          AND ready_generation = $2
+          AND queue = $3
+          AND priority = $4
+          AND enqueue_shard = $5
+          AND claim_slot = $6
+          AND first_lane_seq <= $7
+          AND next_lane_seq > $7
+          AND lane_ranges @> int8range($7, $7 + 1, '[)')
+        "#
+    ))
+    .bind(compact_claimed[0].claim.ready_slot)
+    .bind(compact_claimed[0].claim.ready_generation)
+    .bind(queue)
+    .bind(compact_claimed[0].claim.priority)
+    .bind(compact_claimed[0].claim.enqueue_shard)
+    .bind(compact_claim_slot)
+    .bind(compact_lane_seq)
+    .fetch_one(&pool)
+    .await
+    .expect("count queue-slot-local attempt evidence");
+    assert_eq!(
+        remaining_attempt_batches, 1,
+        "ready-claim-attempt evidence must remain until the ready slot is pruned with ready_entries"
+    );
+
     let after_receipt_prune: Vec<(i64, i64, i64, i32)> = sqlx::query_as(&format!(
         "SELECT job_id, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
@@ -5979,7 +6009,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .bind(0.0_f64)
     .fetch_all(&pool)
     .await
-    .expect("raw receipt claim after receipt evidence is gone");
+    .expect("raw receipt claim after claim-ring evidence is gone");
 
     assert!(
         after_receipt_prune.is_empty(),
