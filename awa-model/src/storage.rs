@@ -173,9 +173,19 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
                       'ready_segment_next_lane_seq'
                   ])
             )
-            AND to_regprocedure(
-                format('%I.%I(text,bigint,double precision,double precision)', $1, 'claim_ready_runtime')
-            ) IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM pg_proc AS p
+                JOIN pg_namespace AS n
+                  ON n.oid = p.pronamespace
+                WHERE n.nspname = $1
+                  AND p.oid = to_regprocedure(
+                      format('%I.%I(text,bigint,double precision,double precision)', $1, 'claim_ready_runtime')
+                  )::oid
+                  AND position('receipt_id' IN pg_get_function_result(p.oid)) > 0
+                  AND position('claim_batch_id' IN pg_get_function_result(p.oid)) > 0
+                  AND position('claim_batch_index' IN pg_get_function_result(p.oid)) > 0
+            )
         "#,
     )
     .bind(schema)

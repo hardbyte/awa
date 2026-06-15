@@ -2766,7 +2766,17 @@ BEGIN
                     (selected.attempt + 1)::smallint AS attempt,
                     (selected.run_lease + 1)::bigint AS run_lease,
                     selected.max_attempts::smallint AS max_attempts,
-                    nextval('%1$I.lease_claim_receipt_id_seq'::regclass)::bigint AS receipt_id
+                    nextval('%1$I.lease_claim_receipt_id_seq'::regclass)::bigint AS receipt_id,
+                    row_number() OVER (
+                        PARTITION BY
+                            attempts.claim_slot,
+                            selected.ready_slot,
+                            selected.ready_generation,
+                            selected.queue,
+                            selected.effective_priority,
+                            v_lane_shard
+                        ORDER BY selected.lane_seq, selected.job_id
+                    )::int AS claim_batch_index
                 FROM selected_with_spent AS selected
                 JOIN claim_attempt_batches AS attempts
                   ON attempts.ready_slot = selected.ready_slot
@@ -2826,7 +2836,12 @@ BEGIN
                     claim_items.enqueue_shard
                 RETURNING
                     claim_batches.claim_slot,
-                    claim_batches.receipt_ranges
+                    claim_batches.batch_id,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    claim_batches.queue,
+                    claim_batches.priority,
+                    claim_batches.enqueue_shard
             ),
             row_claims AS (
                 INSERT INTO %1$I.lease_claims AS claim_rows (
@@ -2871,12 +2886,16 @@ BEGIN
                     claim_rows.lane_seq,
                     claim_rows.attempt,
                     claim_rows.run_lease,
-                    claim_rows.max_attempts
+                    claim_rows.max_attempts,
+                    NULL::bigint AS claim_batch_id,
+                    NULL::int AS claim_batch_index
             ),
             claimed AS (
                 SELECT
                     row_claims.claim_slot,
                     row_claims.receipt_id,
+                    row_claims.claim_batch_id,
+                    row_claims.claim_batch_index,
                     row_claims.ready_slot,
                     row_claims.ready_generation,
                     row_claims.job_id,
@@ -2891,6 +2910,8 @@ BEGIN
                 SELECT
                     claim_items.claim_slot,
                     claim_items.receipt_id,
+                    batches.batch_id AS claim_batch_id,
+                    claim_items.claim_batch_index,
                     claim_items.ready_slot,
                     claim_items.ready_generation,
                     claim_items.job_id,
@@ -2903,7 +2924,11 @@ BEGIN
                 FROM claim_items
                 JOIN compact_claim_batches AS batches
                   ON batches.claim_slot = claim_items.claim_slot
-                 AND batches.receipt_ranges @> int8range(claim_items.receipt_id, claim_items.receipt_id + 1, '[)')
+                 AND batches.ready_slot = claim_items.ready_slot
+                 AND batches.ready_generation = claim_items.ready_generation
+                 AND batches.queue = claim_items.queue
+                 AND batches.priority = claim_items.priority
+                 AND batches.enqueue_shard = claim_items.enqueue_shard
             )
             $cte$,
             p_schema
@@ -2953,6 +2978,8 @@ BEGIN
                 RETURNING
                     0::int AS claim_slot,
                     NULL::bigint AS receipt_id,
+                    NULL::bigint AS claim_batch_id,
+                    NULL::int AS claim_batch_index,
                     lease_rows.ready_slot,
                     lease_rows.ready_generation,
                     lease_rows.lease_slot,
@@ -2977,7 +3004,11 @@ BEGIN
         p_schema
     ));
     IF v_claim_runtime IS NOT NULL
-       AND position('receipt_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0 THEN
+       AND (
+           position('receipt_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0
+           OR position('claim_batch_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0
+           OR position('claim_batch_index' IN pg_get_function_result(v_claim_runtime::oid)) = 0
+       ) THEN
         EXECUTE format(
             'DROP FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION)',
             p_schema
@@ -3001,6 +3032,8 @@ BEGIN
             lease_generation BIGINT,
             claim_slot INT,
             receipt_id BIGINT,
+            claim_batch_id BIGINT,
+            claim_batch_index INT,
             job_id BIGINT,
             kind TEXT,
             queue TEXT,
@@ -3610,6 +3643,8 @@ BEGIN
                 lease_ring.lease_generation,
                 claimed.claim_slot,
                 claimed.receipt_id,
+                claimed.claim_batch_id,
+                claimed.claim_batch_index,
                 selected.job_id,
                 selected.kind,
                 selected.queue,

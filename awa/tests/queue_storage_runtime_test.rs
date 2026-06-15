@@ -2167,6 +2167,15 @@ async fn test_queue_storage_reset_truncates_compact_receipt_evidence() {
         claimed[0].claim.lease_claim_receipt,
         "test must exercise receipt-backed compact completion"
     );
+    assert!(
+        claimed[0].claim.claim_batch_id.is_some(),
+        "compact receipt claims should carry direct claim-batch identity"
+    );
+    assert_eq!(
+        claimed[0].claim.claim_batch_index,
+        Some(1),
+        "single-item compact claim batch should return a one-based item index"
+    );
     store
         .complete_runtime_batch(&pool, &claimed)
         .await

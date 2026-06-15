@@ -440,6 +440,8 @@ mod tests {
                 lease_generation: 0,
                 claim_slot,
                 receipt_id: Some(job_id),
+                claim_batch_id: None,
+                claim_batch_index: None,
                 lease_claim_receipt: true,
                 enqueue_shard: 0,
             }),

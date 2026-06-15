@@ -1376,6 +1376,39 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
             .expect("schema readiness should be queryable after function drop"),
         "schema without claim_ready_runtime must not be reported as ready"
     );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
+        "DROP FUNCTION {schema}.claim_ready_runtime(text, bigint, double precision, double precision)"
+    ))
+        .execute(&pool)
+        .await
+        .expect("test claim function drop before stub should succeed");
+    sqlx::query(&format!(
+        r#"
+        CREATE FUNCTION {schema}.claim_ready_runtime(
+            p_queue TEXT,
+            p_max_batch BIGINT,
+            p_deadline_secs DOUBLE PRECISION,
+            p_aging_secs DOUBLE PRECISION
+        )
+        RETURNS TABLE(receipt_id BIGINT)
+        LANGUAGE sql
+        AS $$
+            SELECT NULL::bigint WHERE FALSE
+        $$;
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("test stale claim function create should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after stale function replacement"),
+        "schema with old claim_ready_runtime return shape must not be reported as ready"
+    );
 }
 
 #[tokio::test]

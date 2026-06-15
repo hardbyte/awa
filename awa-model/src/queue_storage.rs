@@ -126,6 +126,12 @@ pub struct ClaimedEntry {
     /// receipt-backed claims and used by the compact completion path to
     /// validate the exact claim attempt without row-locking it.
     pub receipt_id: Option<i64>,
+    /// Compact claim batch row identity for zero-deadline receipt claims.
+    /// Row-local receipt claims leave this unset.
+    pub claim_batch_id: Option<i64>,
+    /// One-based item position inside `lease_claim_batches.*_ids` arrays.
+    /// Present with `claim_batch_id` and used as an O(1) compact proof.
+    pub claim_batch_index: Option<i32>,
     pub lease_claim_receipt: bool,
     /// The enqueue shard the row was claimed from. Routes the
     /// terminal `done_entries` write onto the correct shard's
@@ -1521,6 +1527,8 @@ struct ReadyJobLeaseRow {
     lease_generation: i64,
     claim_slot: i32,
     receipt_id: Option<i64>,
+    claim_batch_id: Option<i64>,
+    claim_batch_index: Option<i32>,
     job_id: i64,
     kind: String,
     queue: String,
@@ -1552,6 +1560,8 @@ impl ReadyJobLeaseRow {
             lease_generation: self.lease_generation,
             claim_slot: self.claim_slot,
             receipt_id: self.receipt_id,
+            claim_batch_id: self.claim_batch_id,
+            claim_batch_index: self.claim_batch_index,
             lease_claim_receipt,
             enqueue_shard: self.enqueue_shard,
         }
@@ -3581,6 +3591,8 @@ impl QueueStorage {
                 lease_generation,
                 claim_slot,
                 receipt_id,
+                claim_batch_id,
+                claim_batch_index,
                 job_id,
                 kind,
                 queue,
@@ -5943,6 +5955,14 @@ impl QueueStorage {
                         .expect("receipt fast completion requires receipt_id")
                 })
                 .collect();
+            let claim_batch_ids: Vec<Option<i64>> = group
+                .iter()
+                .map(|entry| entry.claim.claim_batch_id)
+                .collect();
+            let claim_batch_indices: Vec<Option<i32>> = group
+                .iter()
+                .map(|entry| entry.claim.claim_batch_index)
+                .collect();
             let lane_seqs: Vec<i64> = group.iter().map(|entry| entry.claim.lane_seq).collect();
             let enqueue_shards: Vec<i16> = group
                 .iter()
@@ -5964,6 +5984,8 @@ impl QueueStorage {
                     attempt,
                     run_lease,
                     receipt_id,
+                    claim_batch_id,
+                    claim_batch_index,
                     lane_seq,
                     enqueue_shard,
                     attempted_at,
@@ -5981,9 +6003,11 @@ impl QueueStorage {
                         $8::bigint[],
                         $9::bigint[],
                         $10::bigint[],
-                        $11::smallint[],
-                        $12::timestamptz[],
-                        $13::timestamptz[]
+                        $11::int[],
+                        $12::bigint[],
+                        $13::smallint[],
+                        $14::timestamptz[],
+                        $15::timestamptz[]
                     )
                 ),
                 row_claim_refs AS (
@@ -5994,6 +6018,7 @@ impl QueueStorage {
                      AND completed.job_id = claims.job_id
                      AND completed.run_lease = claims.run_lease
                      AND completed.receipt_id = claims.receipt_id
+                     AND completed.claim_batch_id IS NULL
                     WHERE NOT {closed_evidence}
                       AND NOT EXISTS (
                           SELECT 1
@@ -6011,19 +6036,19 @@ impl QueueStorage {
                     FROM completed
                     JOIN {claim_batch_rel} AS claim_batches
                       ON claim_batches.claim_slot = completed.claim_slot
-                     AND claim_batches.receipt_ranges @> completed.receipt_id
+                     AND claim_batches.batch_id = completed.claim_batch_id
                     CROSS JOIN LATERAL (
-                        SELECT items.job_id, items.run_lease, items.receipt_id
-                        FROM unnest(
-                            claim_batches.job_ids,
-                            claim_batches.run_leases,
-                            claim_batches.receipt_ids
-                        ) AS items(job_id, run_lease, receipt_id)
-                        WHERE items.receipt_id = completed.receipt_id
-                        LIMIT 1
+                        SELECT
+                            claim_batches.job_ids[completed.claim_batch_index] AS job_id,
+                            claim_batches.run_leases[completed.claim_batch_index] AS run_lease,
+                            claim_batches.receipt_ids[completed.claim_batch_index] AS receipt_id
                     ) AS items
-                    WHERE completed.job_id = items.job_id
+                    WHERE completed.claim_batch_id IS NOT NULL
+                      AND completed.claim_batch_index IS NOT NULL
+                      AND completed.claim_batch_index BETWEEN 1 AND claim_batches.claimed_count
+                      AND completed.job_id = items.job_id
                       AND completed.run_lease = items.run_lease
+                      AND completed.receipt_id = items.receipt_id
                       AND NOT EXISTS (
                           SELECT 1
                           FROM {closure_rel} AS closures
@@ -6173,6 +6198,8 @@ impl QueueStorage {
             .bind(&attempts)
             .bind(&run_leases)
             .bind(&receipt_ids)
+            .bind(&claim_batch_ids)
+            .bind(&claim_batch_indices)
             .bind(&lane_seqs)
             .bind(&enqueue_shards)
             .bind(&attempted_ats)
