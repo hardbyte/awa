@@ -132,7 +132,7 @@ This ADR changes the batching defaults that determine whether lower WAL turns in
 
 - `enqueue_shards = 1` remains the strict-FIFO default; use more shards only when partitioned FIFO is acceptable.
 - `claimers = 1` and `claim_batch_size = 512` remain the queue defaults.
-- `AWA_COMPLETION_BATCH_SIZE = 512` and `AWA_COMPLETION_FLUSH_MS = 1` remain the completion defaults. Queue storage uses `AWA_COMPLETION_SHARDS = 1` for ordinary runtimes and `2` when the configured runtime worker capacity is at least `512`; canonical storage keeps `8`.
+- `AWA_COMPLETION_BATCH_SIZE = 512` and `AWA_COMPLETION_FLUSH_MS = 1` remain the completion defaults. Queue storage uses `AWA_COMPLETION_SHARDS = 1` for ordinary runtimes and `4` when the configured runtime worker capacity is at least `512`; canonical storage keeps `8`.
 - `queue_slot_count = 16`, `lease_slot_count = 8`, `claim_slot_count = 8`, and `lease_claim_receipts = true` remain the queue-storage defaults.
 - `terminal_count_rollup_interval = 30s` folds pending `done_entries` terminal-count deltas for sealed queue slots. Each tick processes at most four sealed slots. Exact reads include pending deltas and retained compact batches, so this cadence affects compaction pressure, not correctness.
 

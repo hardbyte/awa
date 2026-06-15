@@ -102,7 +102,7 @@ First beta of the 0.6 line. Frames the user-facing diff between `0.5.x` and `0.6
 - **Direct queue-storage COPY producer path** as the documented high-volume entry point. Rust: `QueueStorage::enqueue_params_copy(pool, &jobs)`. Python: `Client.enqueue_many_copy(jobs)`. The compat-friendly `insert_many_copy_from_pool` / `client.insert_many_copy` routes through `awa.insert_job_compat()` once per row — fine for ad-hoc inserts but ~100–150 ms per row through a real DB proxy, not what you want for bursts.
 - **`InsertOpts::ordering_key: Option<Vec<u8>>`** pins related jobs to the same shard at `enqueue_shards > 1`. Kafka-partition-key analogue: jobs sharing a key inherit that shard's strict FIFO. `None` rotates batches across shards.
 - **`awa.queue_meta.enqueue_shards` per-queue semantic switch** ([ADR-025](docs/adr/025-sharded-enqueue-heads.md)). Default `1` preserves strict `(queue, priority)` FIFO. Setting `≥ 2` switches that queue to partitioned FIFO (strict within `(queue, priority, enqueue_shard)`, no order across shards) — comparable to choosing SQS Standard over FIFO.
-- **Queue-storage completion-batcher defaults tuned** to `(batch=512, flush=1ms)`, with adaptive queue-storage completion shards: ordinary runtimes use `1`; runtimes configured for at least `512` workers use `2`. Tunable via `AWA_COMPLETION_BATCH_SIZE`, `AWA_COMPLETION_FLUSH_MS`, and `AWA_COMPLETION_SHARDS`.
+- **Queue-storage completion-batcher defaults tuned** to `(batch=512, flush=1ms)`, with adaptive queue-storage completion shards: ordinary runtimes use `1`; runtimes configured for at least `512` workers use `4`. Tunable via `AWA_COMPLETION_BATCH_SIZE`, `AWA_COMPLETION_FLUSH_MS`, and `AWA_COMPLETION_SHARDS`.
 
 **Telemetry**
 

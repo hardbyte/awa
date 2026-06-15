@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 // completion uses a fused receipt-close + terminal-insert statement, so the
 // default can keep finalization latency low while still batching enough work
 // to amortise the durable completion path. Queue storage starts with one
-// completion shard for ordinary runtimes, then adds one more shard for very
+// completion shard for ordinary runtimes, then uses four shards for very
 // large single-runtime worker pools where one serialized flusher cannot keep
 // permits full. Extra flushers can multiply fleet-wide contention in
 // multi-process deployments. Tunable per-deployment via
@@ -29,7 +29,7 @@ fn default_completion_shards(storage: &RuntimeStorage, runtime_worker_capacity: 
         RuntimeStorage::Canonical => 8,
         RuntimeStorage::QueueStorage(_) => {
             if runtime_worker_capacity >= QUEUE_STORAGE_COMPLETION_SHARD_WORKER_THRESHOLD {
-                2
+                4
             } else {
                 1
             }
@@ -506,7 +506,7 @@ mod tests {
                 &crate::storage::RuntimeStorage::QueueStorage(high_capacity_runtime),
                 QUEUE_STORAGE_COMPLETION_SHARD_WORKER_THRESHOLD,
             ),
-            2
+            4
         );
     }
 
