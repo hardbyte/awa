@@ -132,7 +132,7 @@ This ADR changes the batching defaults that determine whether lower WAL turns in
 
 - `enqueue_shards = 1` remains the strict-FIFO default; use more shards only when partitioned FIFO is acceptable.
 - `claimers = 1` and `claim_batch_size = 512` remain the queue defaults.
-- `AWA_COMPLETION_BATCH_SIZE = 512`, `AWA_COMPLETION_FLUSH_MS = 1`, and queue-storage `AWA_COMPLETION_SHARDS = 1` remain the completion defaults.
+- `AWA_COMPLETION_BATCH_SIZE = 512` and `AWA_COMPLETION_FLUSH_MS = 1` remain the completion defaults. Queue storage uses `AWA_COMPLETION_SHARDS = 1` for ordinary runtimes and `2` when the configured runtime worker capacity is at least `512`; canonical storage keeps `8`.
 - `queue_slot_count = 16`, `lease_slot_count = 8`, `claim_slot_count = 8`, and `lease_claim_receipts = true` remain the queue-storage defaults.
 - `terminal_count_rollup_interval = 30s` folds pending `done_entries` terminal-count deltas for sealed queue slots. Each tick processes at most four sealed slots. Exact reads include pending deltas and retained compact batches, so this cadence affects compaction pressure, not correctness.
 
@@ -140,7 +140,7 @@ The queue-storage short-job completion path also uses one fused statement for th
 
 If a later retry, DLQ move, discard, or SQL compatibility delete removes a `done_entries` terminal row before claim prune has reclaimed the originating receipt, the terminal-delete path first materializes an explicit `lease_claim_closures` row. Compact successful completions keep their closure evidence in `lease_claim_closure_batches`; SQL compatibility delete hides them from public terminal reads by writing `receipt_completion_tombstones` and does not reopen the receipt.
 
-The offered-rate benchmark turns that lower write budget into an explicit capacity check. With one queue shard, one claimer, `claim_batch_size = 512`, queue-storage completion shards at `1`, and `max_workers = 1024`, a 10-second `10k/s` no-op workload keeps durable completions at the offered rate, drains to zero backlog, and writes `1.8 KiB` WAL per completed job. A `12k/s` offered workload exceeds that reference configuration and accumulates backlog during the offer window before draining afterward.
+The offered-rate benchmark turns that lower write budget into an explicit capacity check. With one queue shard, one claimer, `claim_batch_size = 512`, adaptive queue-storage completion shards, and `max_workers = 1024`, a 10-second `10k/s` no-op workload keeps durable completions at the offered rate, drains to zero backlog, and writes `1.8 KiB` WAL per completed job. A `12k/s` offered workload exceeds that reference configuration and accumulates backlog during the offer window before draining afterward.
 
 ## Relationship to Rejected ADR-024
 

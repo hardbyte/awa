@@ -12,19 +12,28 @@ use tracing::{debug, warn};
 // Default completion batch size and flush cadence. Queue storage short-job
 // completion uses a fused receipt-close + terminal-insert statement, so the
 // default can keep finalization latency low while still batching enough work
-// to amortise the durable completion path. Queue storage defaults to one
-// completion shard: extra flushers can multiply fleet-wide contention in
+// to amortise the durable completion path. Queue storage starts with one
+// completion shard for ordinary runtimes, then adds one more shard for very
+// large single-runtime worker pools where one serialized flusher cannot keep
+// permits full. Extra flushers can multiply fleet-wide contention in
 // multi-process deployments. Tunable per-deployment via
 // `AWA_COMPLETION_BATCH_SIZE`, `AWA_COMPLETION_FLUSH_MS`, and
 // `AWA_COMPLETION_SHARDS`.
 const COMPLETION_BATCH_SIZE: usize = 512;
 const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
+const QUEUE_STORAGE_COMPLETION_SHARD_WORKER_THRESHOLD: u32 = 512;
 
-fn default_completion_shards(storage: &RuntimeStorage) -> usize {
+fn default_completion_shards(storage: &RuntimeStorage, runtime_worker_capacity: u32) -> usize {
     match storage {
         RuntimeStorage::Canonical => 8,
-        RuntimeStorage::QueueStorage(_) => 1,
+        RuntimeStorage::QueueStorage(_) => {
+            if runtime_worker_capacity >= QUEUE_STORAGE_COMPLETION_SHARD_WORKER_THRESHOLD {
+                2
+            } else {
+                1
+            }
+        }
     }
 }
 
@@ -45,12 +54,12 @@ fn completion_flush_interval() -> Duration {
         .unwrap_or(COMPLETION_FLUSH_INTERVAL)
 }
 
-fn completion_shards(storage: &RuntimeStorage) -> usize {
+fn completion_shards(storage: &RuntimeStorage, runtime_worker_capacity: u32) -> usize {
     env::var("AWA_COMPLETION_SHARDS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| default_completion_shards(storage))
+        .unwrap_or_else(|| default_completion_shards(storage, runtime_worker_capacity))
 }
 const COMPLETE_BATCH_SQL: &str = r#"
     WITH completed (id, run_lease) AS (
@@ -152,8 +161,9 @@ impl CompletionBatcher {
         cancel: CancellationToken,
         metrics: crate::metrics::AwaMetrics,
         storage: RuntimeStorage,
+        runtime_worker_capacity: u32,
     ) -> (Self, CompletionBatcherHandle) {
-        let shard_count = completion_shards(&storage);
+        let shard_count = completion_shards(&storage, runtime_worker_capacity);
         let batch_size = completion_batch_size();
         let flush_interval = completion_flush_interval();
         let mut shards = Vec::with_capacity(shard_count);
@@ -474,21 +484,29 @@ mod tests {
     }
 
     #[test]
-    fn queue_storage_defaults_to_one_completion_shard() {
+    fn queue_storage_completion_shards_scale_with_runtime_capacity() {
         let runtime = crate::storage::QueueStorageRuntime::new(
             awa_model::QueueStorageConfig::default(),
             Duration::from_millis(1_000),
             Duration::from_millis(50),
         )
         .expect("queue storage runtime config should be valid");
+        let high_capacity_runtime = runtime.clone();
 
         assert_eq!(
-            default_completion_shards(&crate::storage::RuntimeStorage::Canonical),
+            default_completion_shards(&crate::storage::RuntimeStorage::Canonical, 50),
             8
         );
         assert_eq!(
-            default_completion_shards(&crate::storage::RuntimeStorage::QueueStorage(runtime)),
+            default_completion_shards(&crate::storage::RuntimeStorage::QueueStorage(runtime), 50),
             1
+        );
+        assert_eq!(
+            default_completion_shards(
+                &crate::storage::RuntimeStorage::QueueStorage(high_capacity_runtime),
+                QUEUE_STORAGE_COMPLETION_SHARD_WORKER_THRESHOLD,
+            ),
+            2
         );
     }
 
@@ -725,6 +743,7 @@ mod tests {
             CancellationToken::new(),
             crate::metrics::AwaMetrics::from_global(),
             crate::storage::RuntimeStorage::Canonical,
+            2,
         );
         let workers = batcher.spawn();
 
@@ -887,6 +906,7 @@ mod tests {
             CancellationToken::new(),
             crate::metrics::AwaMetrics::from_global(),
             crate::storage::RuntimeStorage::Canonical,
+            2,
         );
         let workers = batcher.spawn();
 

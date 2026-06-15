@@ -1527,11 +1527,18 @@ impl Client {
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
+        let runtime_worker_capacity = self.global_max_workers.unwrap_or_else(|| {
+            self.queues
+                .iter()
+                .map(|(_, config)| config.max_workers)
+                .sum()
+        });
         let (completion_batcher, completion_handle) = CompletionBatcher::new(
             self.pool.clone(),
             self.service_cancel.clone(),
             self.metrics.clone(),
             effective_storage.clone(),
+            runtime_worker_capacity,
         );
 
         // Create executor with metrics
