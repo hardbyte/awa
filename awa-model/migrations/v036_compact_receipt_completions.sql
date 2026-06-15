@@ -506,31 +506,6 @@ BEGIN
     GET DIAGNOSTICS v_rows = ROW_COUNT;
 
     IF v_rows > 0 THEN
-        IF to_regclass(format('%I.queue_terminal_count_deltas', v_schema)) IS NOT NULL THEN
-            EXECUTE format(
-                'INSERT INTO %I.queue_terminal_count_deltas (
-                     ready_slot,
-                     ready_generation,
-                     queue,
-                     priority,
-                     enqueue_shard,
-                     counter_bucket,
-                     terminal_delta
-                 )
-                 VALUES (
-                     $1,
-                     $2,
-                     $3,
-                     $4,
-                     $5,
-                     mod(mod($6, 256::bigint) + 256::bigint, 256::bigint)::smallint,
-                     -1
-                 )',
-                v_schema
-            )
-            USING v_ready_slot, v_ready_generation, v_queue, v_priority, v_enqueue_shard, p_id;
-        END IF;
-
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,

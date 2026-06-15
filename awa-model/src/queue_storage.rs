@@ -4436,12 +4436,17 @@ impl QueueStorage {
         Ok(rows.len())
     }
 
-    /// Append positive terminal-count deltas for newly inserted terminal rows.
+    /// Append positive terminal-count deltas for newly inserted `done_entries`
+    /// terminal rows.
     ///
-    /// The exact invariant is:
+    /// For done-entry terminal rows, the exact invariant is:
     ///
     /// `SUM(queue_terminal_live_counts) + SUM(queue_terminal_count_deltas)
-    /// == count(*) FROM terminal_jobs`.
+    /// == count(*) FROM done_entries`.
+    ///
+    /// Compact receipt completions are already append-only batches, so
+    /// `queue_counts_exact` counts retained `receipt_completion_batches`
+    /// directly instead of adding another hot-path count-delta write.
     ///
     /// Maintenance asynchronously folds delta rows into the live-counter table
     /// and truncates the delta segment. The hot path therefore performs only
@@ -4469,7 +4474,8 @@ impl QueueStorage {
         self.append_terminal_count_deltas_tx(tx, by_group).await
     }
 
-    /// Append negative terminal-count deltas for deleted terminal rows.
+    /// Append negative terminal-count deltas for deleted `done_entries`
+    /// terminal rows.
     ///
     /// This is used by retry-from-terminal, DLQ moves, discard paths, and the
     /// SQL compatibility delete function. The negative row may cancel a
@@ -5909,7 +5915,6 @@ impl QueueStorage {
             let closure_rel = closure_child_name(schema, claim_slot_index);
             let closure_batch_rel = claim_closure_batch_child_name(schema, claim_slot_index);
             let receipt_batch_rel = format!("{schema}.receipt_completion_batches");
-            let delta_rel = format!("{schema}.queue_terminal_count_deltas");
             let closed_evidence =
                 receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
 
@@ -6070,61 +6075,11 @@ impl QueueStorage {
                         enqueue_shard,
                         job_ids,
                         run_leases
-                ),
-                counted AS (
-                    SELECT completed_rows.*
-                    FROM completed_rows
-                    CROSS JOIN (SELECT count(*) FROM terminal) AS terminal_write
-                ),
-                -- Terminal counts use an append-only delta ledger on the hot
-                -- completion path. Maintenance folds these rows into
-                -- queue_terminal_live_counts later; exact reads sum both sources.
-                counter_delta AS (
-                    INSERT INTO {delta_rel} (
-                        ready_slot,
-                        ready_generation,
-                        queue,
-                        priority,
-                        enqueue_shard,
-                        counter_bucket,
-                        terminal_delta
-                    )
-                    SELECT
-                        ready_slot,
-                        ready_generation,
-                        queue,
-                        priority,
-                        enqueue_shard,
-                        counter_bucket,
-                        delta
-                    FROM (
-                        SELECT
-                            counted.ready_slot,
-                            counted.ready_generation,
-                            counted.queue,
-                            counted.priority,
-                            counted.enqueue_shard,
-                            mod(
-                                mod(counted.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                                    + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                                {TERMINAL_COUNTER_BUCKETS}::bigint
-                            )::smallint AS counter_bucket,
-                            count(*)::bigint AS delta
-                        FROM counted
-                        GROUP BY
-                            counted.ready_slot,
-                            counted.ready_generation,
-                            counted.queue,
-                            counted.priority,
-                            counted.enqueue_shard,
-                            counter_bucket
-                    ) AS grouped
-                    ORDER BY ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket
-                    RETURNING 1
                 )
-                SELECT job_id, run_lease
-                FROM counted
+                SELECT completed_rows.job_id, completed_rows.run_lease
+                FROM completed_rows
                 CROSS JOIN (SELECT count(*) FROM claim_closure_batches) AS closure_batch_write
+                CROSS JOIN (SELECT count(*) FROM terminal) AS terminal_write
                 "#
             ))
             .bind(&claim_slots)
@@ -6724,10 +6679,11 @@ impl QueueStorage {
     /// still-claimable ready rows. Use [`Self::queue_claimer_signal`] for the
     /// dispatcher hot path.
     ///
-    /// The live-terminal portion reads from folded
+    /// The live-terminal portion reads retained compact receipt batches
+    /// directly. Done-entry terminal rows read from folded
     /// `queue_terminal_live_counts` plus unrolled
     /// `queue_terminal_count_deltas` when [`Self::terminal_counter_trusted`]
-    /// returns true, and falls back to a `count(*) FROM terminal_jobs` scan
+    /// returns true, and fall back to a `count(*) FROM terminal_jobs` scan
     /// when not. The fallback exists for the rolling-upgrade window: older
     /// binaries may have written terminal rows without maintaining the
     /// counter/delta contract, so reads stay honest until the operator runs
@@ -6762,6 +6718,18 @@ impl QueueStorage {
                         COALESCE((
                             SELECT SUM(terminal_delta)
                             FROM {schema}.queue_terminal_count_deltas
+                            WHERE queue = ANY($1)
+                        ), 0)
+                        +
+                        COALESCE((
+                            SELECT SUM(completed_count)
+                            FROM {schema}.receipt_completion_batches
+                            WHERE queue = ANY($1)
+                        ), 0)
+                        -
+                        COALESCE((
+                            SELECT count(*)::bigint
+                            FROM {schema}.receipt_completion_tombstones
                             WHERE queue = ANY($1)
                         ), 0)
                     )::bigint AS terminal
@@ -12339,7 +12307,10 @@ impl QueueStorage {
     /// **Operator note:** this is best run on a quiesced fleet (workers
     /// paused or fully drained). Concurrent inserts during the rebuild
     /// will block on the lock; long-held locks can stall the fleet. The
-    /// rebuild itself is O(rows in `{schema}.terminal_jobs`).
+    /// rebuild itself is O(rows in `{schema}.done_entries`). Compact receipt
+    /// completions remain counted directly from retained
+    /// `receipt_completion_batches` until queue prune folds them into
+    /// permanent rollups.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rebuild_terminal_counters")]
     pub async fn rebuild_terminal_counters(&self, pool: &PgPool) -> Result<i64, AwaError> {
         let schema = self.schema();
@@ -12388,7 +12359,7 @@ impl QueueStorage {
                         {TERMINAL_COUNTER_BUCKETS}::bigint
                     )::smallint AS counter_bucket,
                     count(*)::bigint
-                FROM {schema}.terminal_jobs
+                FROM {schema}.done_entries
                 GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
                 RETURNING 1
             )
@@ -12400,8 +12371,8 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         // Flip the trust marker. From this point the read path
-        // (queue_counts_exact) uses the counter directly; before this
-        // call, it falls back to scanning terminal_jobs.
+        // (queue_counts_exact) uses the counter for done-entry terminal rows;
+        // before this call, it falls back to scanning terminal_jobs.
         sqlx::query(&format!(
             r#"
             UPDATE {schema}.queue_ring_state
@@ -12443,13 +12414,15 @@ impl QueueStorage {
         Ok(trusted.unwrap_or(false))
     }
 
-    /// Fold append-only terminal-count deltas into
+    /// Fold append-only `done_entries` terminal-count deltas into
     /// `queue_terminal_live_counts` for sealed queue slots.
     ///
-    /// Completions and terminal deletes append signed rows into
+    /// `done_entries` terminal inserts and deletes append signed rows into
     /// `queue_terminal_count_deltas` instead of updating the live counter on
-    /// the user-facing hot path. Exact reads sum folded live counts plus
-    /// pending deltas, so this rollup can run asynchronously. It intentionally
+    /// the user-facing hot path. Compact receipt completions are counted from
+    /// retained batch rows directly. Exact reads sum folded live counts plus
+    /// pending deltas and retained compact batches, so this rollup can run
+    /// asynchronously. It intentionally
     /// skips the current queue slot and any slot with active leases or open
     /// receipt claims; that keeps rollup away from the segment receiving hot
     /// completions and avoids racing future terminal deltas for the same
