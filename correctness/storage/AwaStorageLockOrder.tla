@@ -259,7 +259,9 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
 \*   No queue_lanes lock (completion does not gate on a lane row)
 \*   Successful compact receipt completion locks the claim, reads closure
 \*   evidence to stay idempotent, writes compact claim-local closure evidence,
-\*   compact receipt completion history, and the terminal-count delta.
+\*   and compact receipt completion history. Compact counts are read from
+\*   retained receipt batches, so this path does not touch the terminal-count
+\*   delta children.
 \*   It also anti-joins the leases parent so materialized receipt claims
 \*   fall back to the lease-deleting completion path. That fallback matches
 \*   materialized receipt leases by stable ready-lane / attempt identity
@@ -276,8 +278,7 @@ CompletePlan(claimSlot, readySlot) ==
        Step(ClosureChildResource(claimSlot), ModeShared),
        Step(ClosureBatchChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
-       Step(ReceiptBatchChildResource(readySlot), ModeShared),
-       Step(TerminalDeltaChildResource(readySlot), ModeShared) >>
+       Step(ReceiptBatchChildResource(readySlot), ModeShared) >>
 
 \* close_receipt_tx (called from cancel_job_tx)
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first

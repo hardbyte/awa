@@ -7369,15 +7369,16 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
     assert_eq!(post_prune_fast.terminal, post_prune_exact.terminal);
 }
 
-/// ADR-026 invariant: every terminal insert path appends a positive
-/// `queue_terminal_count_deltas` row so that folded live counts plus pending
-/// deltas equals the public terminal cardinality.
+/// ADR-026 invariant: wide terminal insert paths append positive
+/// `queue_terminal_count_deltas` rows so that folded live counts plus pending
+/// deltas equals the `done_entries` cardinality. Compact receipt completions
+/// are counted directly from retained `receipt_completion_batches` instead.
 ///
 /// The test exercises both insert paths:
 /// - `insert_done_rows_tx` via `complete_batch` on the lease-materialisation
 ///   path (default `create_store` builds the store without the receipt
 ///   fast-complete candidate set).
-/// - the fused receipt fast path is exercised in
+/// - the fused receipt fast path's compact batch counting is exercised in
 ///   `test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_path`
 ///   below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7506,12 +7507,6 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
         .await
         .expect("complete");
     assert_eq!(completed.len(), 5);
-    let expected_delta_rows = claimed
-        .iter()
-        .map(|entry| entry.job.id.rem_euclid(256))
-        .collect::<HashSet<_>>()
-        .len() as i64;
-
     let live_sum = live_count_sum(&pool, schema, queue).await;
     let delta_sum = terminal_delta_sum(&pool, schema, queue).await;
     let terminal_sum = terminal_counter_sum(&pool, schema, queue).await;
@@ -7546,17 +7541,26 @@ async fn test_queue_terminal_live_counts_matches_terminal_jobs_via_receipt_fast_
         "fused receipt fast path must not update folded counters"
     );
     assert_eq!(
-        delta_sum, 5,
-        "fused receipt fast path must append pending deltas"
+        delta_sum, 0,
+        "fused receipt fast path must not append derived terminal-count deltas"
     );
     assert_eq!(
         terminal_delta_row_count(&pool, schema, queue).await,
-        expected_delta_rows,
-        "compact receipt completion should append one count delta per touched counter bucket"
+        0,
+        "compact receipt completion should not write count-delta rows"
     );
     assert_eq!(
-        terminal_sum, terminal_count,
-        "fused receipt fast path must preserve exact public terminal count"
+        terminal_sum, 0,
+        "folded counters plus deltas track done_entries only for compact receipt completions"
+    );
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("exact counts")
+            .terminal,
+        terminal_count,
+        "exact public terminal count must include retained compact receipt batches"
     );
 }
 
@@ -7633,11 +7637,11 @@ async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_clo
         "duplicate completion must not create duplicate compact batches"
     );
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
-    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 1);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
     assert_eq!(
         terminal_delta_row_count(&pool, schema, queue).await,
-        1,
-        "duplicate completion must not duplicate terminal-count deltas"
+        0,
+        "duplicate compact completion must not write terminal-count deltas"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
 }
@@ -8078,7 +8082,7 @@ async fn test_queue_storage_retry_jobs_by_ids_dedupes_duplicate_ids() {
 /// the live segment as self-contained wide rows, so `pruned_failed_count`
 /// stays untouched. `admin::retry_failed_by_queue` then revives the
 /// carried jobs end-to-end, proving the carried bodies survived the
-/// widening; `rebuild_terminal_counters` re-aggregates from `terminal_jobs`
+/// widening; `rebuild_terminal_counters` re-aggregates from `done_entries`
 /// and the ADR-026 invariant still holds against the carried rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
@@ -9048,7 +9052,7 @@ async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_terminal_counter_untrusted_path_counts_compact_receipt_batches() {
+async fn test_queue_terminal_counts_include_compact_receipt_batches() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_terminal_counter_compact_receipt";
     let schema = "awa_qs_terminal_counter_compact_receipt";
@@ -9081,7 +9085,20 @@ async fn test_queue_terminal_counter_untrusted_path_counts_compact_receipt_batch
 
     assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 3);
-    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 3);
+    assert_eq!(
+        terminal_counter_sum(&pool, schema, queue).await,
+        0,
+        "compact receipt completions do not write done-entry terminal counters"
+    );
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("trusted compact counts")
+            .terminal,
+        3,
+        "trusted exact counts include retained compact receipt batches directly"
+    );
 
     sqlx::query(&format!(
         "UPDATE {schema}.queue_ring_state \
@@ -9113,7 +9130,11 @@ async fn test_queue_terminal_counter_untrusted_path_counts_compact_receipt_batch
         .rebuild_terminal_counters(&pool)
         .await
         .expect("rebuild compact terminal counters");
-    assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 3);
+    assert_eq!(
+        terminal_counter_sum(&pool, schema, queue).await,
+        0,
+        "rebuild aggregates done_entries only; compact batches stay direct-counted"
+    );
     assert_eq!(
         store
             .queue_counts(&pool, queue)
@@ -9121,7 +9142,7 @@ async fn test_queue_terminal_counter_untrusted_path_counts_compact_receipt_batch
             .expect("trusted compact counts after rebuild")
             .terminal,
         3,
-        "rebuild must aggregate compact receipt completions from terminal_jobs"
+        "trusted path after rebuild still counts compact receipt completions directly"
     );
 }
 

@@ -244,15 +244,16 @@ ClaimLegacyTx == <<
 >>
 
 \* complete_runtime_batch (receipts mode)
-\* Successful compact receipt completion appends a compact terminal batch, a
-\* compact claim-local closure batch, and a terminal-count delta. Terminal
-\* history and claim-closure evidence are separate partition-truncated ledgers.
+\* Successful compact receipt completion appends a compact terminal batch and a
+\* compact claim-local closure batch. Compact terminal counts are read from the
+\* retained batch ledger directly; terminal-count deltas are reserved for
+\* done_entries terminal mutations. Terminal history and claim-closure evidence
+\* are separate partition-truncated ledgers.
 \* Non-success, cancellation, rescue, and wide terminal paths still use
 \* explicit lease_claim_closures.
 CompleteReceiptsTx == <<
     Mut("Insert", "receipt_completion_batches"),
     Mut("Insert", "lease_claim_closure_batches"),
-    Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Delete", "attempt_state")
 >>
 
@@ -423,8 +424,7 @@ DeleteTerminalCompatTx == <<
 >>
 
 DeleteCompactReceiptTerminalCompatTx == <<
-    Mut("Insert", "receipt_completion_tombstones"),
-    Mut("Insert", "queue_terminal_count_deltas")
+    Mut("Insert", "receipt_completion_tombstones")
 >>
 
 RetryFromTerminalTx == <<

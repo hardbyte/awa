@@ -490,7 +490,7 @@ DLQ rows are different: `dlq_entries` is a separate hold table and the maintenan
 | `cleanup_interval` | `60s` | How often the cleanup pass runs. |
 | `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
 | `dlq_cleanup_batch_size` | `1000` | DLQ-specific batch size. |
-| `ClientBuilder::terminal_count_rollup_interval` (Rust) / `terminal_count_rollup_interval_ms` (Python kwarg) | `30s` | Queue storage only: how often maintenance folds pending terminal-count deltas for sealed queue slots into compact live counters. Exact reads include pending deltas, so this affects compaction/WAL pressure rather than correctness. |
+| `ClientBuilder::terminal_count_rollup_interval` (Rust) / `terminal_count_rollup_interval_ms` (Python kwarg) | `30s` | Queue storage only: how often maintenance folds pending `done_entries` terminal-count deltas for sealed queue slots into compact live counters. Exact reads include pending deltas and retained compact receipt batches, so this affects compaction/WAL pressure rather than correctness. |
 
 ## Queue storage tuning
 
@@ -506,13 +506,13 @@ Direct-copy producers must use the same queue-storage routing config as the work
 
 ### Terminal count rollup
 
-Queue storage keeps exact terminal counts without updating mutable counter rows on the completion hot path. Terminal inserts append positive rows to `queue_terminal_count_deltas_*`; retry, discard, DLQ move, and compatibility delete append negative rows. Exact count reads sum those pending deltas with folded `queue_terminal_live_counts`.
+Queue storage keeps exact terminal counts without updating mutable counter rows on the completion hot path. `done_entries` terminal inserts append positive rows to `queue_terminal_count_deltas_*`; retry, discard, DLQ move, and compatibility delete of `done_entries` rows append negative rows. Compact receipt completions do not write count deltas: exact count reads add retained `receipt_completion_batches_*` counts and subtract retained `receipt_completion_tombstones_*`.
 
 A queue slot is one partition in queue storage's rotating ready/done ring. A sealed slot is no longer the current write slot, so maintenance can fold its terminal-count deltas without touching the active completion segment.
 
-The maintenance leader folds pending deltas from sealed queue slots every `terminal_count_rollup_interval` (default `30s`) and processes at most four slots per tick. Rollup is MVCC-horizon aware: if another backend is holding a visible snapshot open, or is idle in a transaction with an assigned transaction id, maintenance leaves pending delta rows append-only and tries again on a later tick. Exact counts remain correct because they read folded counters plus pending deltas.
+The maintenance leader folds pending `done_entries` deltas from sealed queue slots every `terminal_count_rollup_interval` (default `30s`) and processes at most four slots per tick. Rollup is MVCC-horizon aware: if another backend is holding a visible snapshot open, or is idle in a transaction with an assigned transaction id, maintenance leaves pending delta rows append-only and tries again on a later tick. Exact counts remain correct because they read folded counters, pending deltas, retained compact batches, compact tombstones, and permanent rollups.
 
-Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the delta ledger is growing faster than maintenance drains it. Under long reader transactions, lowering the interval does not force rollup; the useful fix is to release the pinned snapshot or let queue prune reclaim the whole sealed segment.
+Raising the interval reduces folded-counter churn but leaves more pending delta rows for exact reads to sum. Lowering it folds counters sooner, which can help if exact-count reads are frequent and the `done_entries` delta ledger is growing faster than maintenance drains it. Under long reader transactions, lowering the interval does not force rollup; the useful fix is to release the pinned snapshot or let queue prune reclaim the whole sealed segment. Compact receipt successes are already retained as compact batch rows, so this interval does not change their hot-path write count.
 
 ### Rust
 

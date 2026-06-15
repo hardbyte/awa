@@ -113,7 +113,7 @@ The orchestration (start new-mode workers, stop old-mode workers, wait for drain
 The split between migration-owned default substrate and helper-installed custom substrate exists for three reasons:
 
 - **`awa migrate --sql` / `--extract-to` must reproduce the full default runtime schema** for external migration tools to be useful. All substrate DDL is reachable from the migration through the SQL helper, so the extracted SQL is complete.
-- **Migrations that depend on queue-storage tables can write unconditional DDL.** Operations like the terminal-count delta append inside `awa.delete_job_compat()` need the delta table to exist. Migration ordering guarantees it.
+- **Migrations that depend on queue-storage tables can write unconditional DDL.** Operations like the `done_entries` terminal-count delta append inside `awa.delete_job_compat()` need the delta table to exist. Migration ordering guarantees it.
 - **The default schema cannot be accidentally destroyed.** The reset guard above protects operators from a `DROP SCHEMA awa CASCADE` that would take the canonical migration tables with it.
 
 The helper is `SECURITY INVOKER` so callers need their own DDL privileges on the target schema; the runtime role does not gain DDL through the helper, which keeps the principle-of-least-privilege role model intact.
