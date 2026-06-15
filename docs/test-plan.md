@@ -235,7 +235,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA6 | AwaDispatchClaim with NewClaim config | Dispatch claim safety |
 | TLA7 | AwaSegmentedStorage | Segmented storage safety, waiting flow, optional attempt-state, prune safety |
 | TLA8 | AwaSegmentedStorageInterleavings | Two-worker segmented-storage interleavings |
-| TLA9 | AwaShardedPrune | Cross-shard ready/done prune matching by `enqueue_shard` |
+| TLA9 | AwaShardedPrune | Cross-shard ready/terminal prune matching by `enqueue_shard` |
 | TLA10 | AwaSegmentedStorageRaces | Claim-vs-rotate/prune race exposure and checked-commit safety |
 | TLA11 | AwaSegmentedStorageTrace | Runtime trace acceptance for snooze, receipt rescue, cancel, callback wait, DLQ retry, and DLQ purge paths |
 | TLA12 | AwaStorageLockOrder | Postgres lock ordering across claim, complete, cancel, rescue, rotate, and prune |

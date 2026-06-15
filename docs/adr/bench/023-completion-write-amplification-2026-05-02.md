@@ -13,7 +13,7 @@ This note records a focused completion-path follow-up to [ADR-023](../023-receip
 - Merge receipt closure insertion and `attempt_state` cleanup into one data-modifying CTE.
 - Sort completion batches by `claim_slot`, then `(job_id, run_lease)`, before dispatching them to queue storage.
 
-The changes preserve ADR-023's correctness shape: receipt-backed completion still closes the exact `(claim_slot, job_id, run_lease)` claim and stale writers still lose via the closure conflict / materialized lease fallback. The default successful path still appends a `done_entries` row, so terminal history, retention, and queue-count semantics do not change.
+The changes preserved ADR-023's correctness shape for that branch: receipt-backed completion still closed the exact `(claim_slot, job_id, run_lease)` claim and stale writers still lost via the closure conflict / materialized lease fallback. At the time of this artifact, the default successful path still appended a `done_entries` row. ADR-026 later superseded that physical detail for compact successful receipt completions while keeping synchronous terminal history and exact queue counts.
 
 ## Focused Harness Runs
 

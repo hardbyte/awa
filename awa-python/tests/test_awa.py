@@ -346,6 +346,7 @@ async def test_enqueue_many_copy_queue_storage(client):
         queue,
     )
     await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     await tx.commit()
 
     assert row["ready_count"] == 2
@@ -403,6 +404,7 @@ async def test_copy_batch_per_job_opts_route_mixed_queues(client):
         queue.queue_for_index(1),
     )
     await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     await tx.commit()
 
     assert [(row["queue"], row["count"]) for row in rows] == [
@@ -480,6 +482,7 @@ async def test_ordering_key_routes_all_async_python_insert_paths(client):
         queue,
     )
     await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     await tx.commit()
 
     assert len(rows) == len(expected_jobs) + count

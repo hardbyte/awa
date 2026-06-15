@@ -39,6 +39,7 @@ async fn test_cron_api_includes_next_fire_at() {
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
+    let request_started_at = chrono::Utc::now();
     let resp = app
         .oneshot(
             Request::builder()
@@ -77,7 +78,7 @@ async fn test_cron_api_includes_next_fire_at() {
     let next_fire_dt = chrono::DateTime::parse_from_rfc3339(next_fire_str)
         .expect("next_fire_at should be valid RFC3339");
     assert!(
-        next_fire_dt >= chrono::Utc::now() - chrono::Duration::seconds(1),
+        next_fire_dt >= request_started_at - chrono::Duration::seconds(1),
         "next_fire_at should not be stale, got {next_fire_dt}"
     );
 

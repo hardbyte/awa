@@ -46,7 +46,8 @@ ORDER BY heartbeat_at ASC;
 -- Receipt-mode short-job claims that haven't materialized yet. No
 -- heartbeat row; deadline_at lives on the claim if deadline_duration > 0
 -- and the receipt-side deadline rescue (`rescue_expired_receipt_deadlines_tx`)
--- is what kicks in here. Anti-join with closures to filter "still open".
+-- is what kicks in here. Anti-join with closure evidence to filter
+-- "still open".
 SELECT
     c.job_id,
     c.queue,
@@ -61,6 +62,10 @@ WHERE NOT EXISTS (
     WHERE cx.claim_slot = c.claim_slot
       AND cx.job_id = c.job_id
       AND cx.run_lease = c.run_lease
+)
+AND NOT EXISTS (
+    SELECT 1 FROM awa.lease_claim_closure_batches cb
+    WHERE cb.receipt_ranges @> c.receipt_id
 )
 ORDER BY c.claimed_at ASC;
 ```
@@ -297,6 +302,7 @@ WHERE schemaname = '<schema>'
       relname = 'attempt_state'
       OR relname = 'deferred_jobs'
       OR relname = 'dlq_entries'
+      OR relname LIKE 'ready_segments_%'
       OR relname LIKE 'ready_entries%'
       OR relname LIKE 'ready_tombstones%'
       OR relname LIKE 'done_entries%'
@@ -309,6 +315,7 @@ ORDER BY n_dead_tup DESC, relname;
 Interpretation:
 
 - `ready_entries%`, `ready_tombstones%`, and `queue_terminal_count_deltas%` should usually stay at or near zero dead tuples
+- `ready_segments_*` is compact control-plane metadata; live rows should track retained ready lane ranges, and queue prune truncates reclaimed slot children with the rest of the ready family
 - `leases%` can rise within the current rotation window, but should fall again after prune
 - `attempt_state` should roughly match live long-running attempts, not total queue depth, and should return close to zero after drain
 - `autovacuum_count` staying flat for a long time can indicate vacuum is not keeping up on churn-heavy lease partitions

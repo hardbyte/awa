@@ -437,7 +437,7 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
 
     let mut reader_tx = pool.begin().await.expect("begin reader tx");
     sqlx::query(&format!(
-        "LOCK TABLE {schema}.lease_claims_0, {schema}.lease_claim_closures_0 IN ACCESS SHARE MODE"
+        "LOCK TABLE {schema}.lease_claims_0, {schema}.lease_claim_closures_0, {schema}.lease_claim_closure_batches_0 IN ACCESS SHARE MODE"
     ))
     .execute(reader_tx.as_mut())
     .await

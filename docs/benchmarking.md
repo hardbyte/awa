@@ -159,11 +159,11 @@ Queue-storage e2e sweeps separate tuning from storage design. For the hot single
 
 When the application can accept partitioned ordering at the logical workload level, routing through several physical queues with `PartitionedQueue` is the preferred throughput lever: it creates independent claim and completion coordination streams rather than adding more claimers to one queue head.
 
-ADR-026 terminal-count deltas remove hot-path `queue_terminal_live_counts` updates. Completion and terminal-delete paths append signed deltas, exact reads include pending deltas, and maintenance folds sealed slots into compact counters only when the MVCC horizon is not pinned by another backend snapshot or idle transaction id. Benchmark runs should therefore sample `queue_terminal_count_deltas_*` alongside `queue_terminal_live_counts` so regressions distinguish pending append-only rows from mutable-counter dead tuples.
+ADR-026 terminal-count deltas remove hot-path `queue_terminal_live_counts` updates. `done_entries` terminal paths append signed deltas, compact receipt completions are counted from retained `receipt_completion_batches_*` minus `receipt_completion_tombstones_*`, and exact reads include all retained evidence plus permanent rollups. Maintenance folds sealed `done_entries` delta slots into compact counters only when the MVCC horizon is not pinned by another backend snapshot or idle transaction id. Benchmark runs should therefore sample `queue_terminal_count_deltas_*`, `receipt_completion_batches_*`, and `queue_terminal_live_counts` so regressions distinguish pending append-only rows from mutable-counter dead tuples.
 
 The offered-rate benchmark exercises absorption directly and samples WAL. With one claimer, `claim_batch_size = 512`, `AWA_COMPLETION_BATCH_SIZE = 512`, the fused receipt completion path, and `max_workers = 1024`, a 10-second no-op run at `10k/s` offered load keeps durable completions at the offered rate, drains to zero backlog, and writes `1.80 KiB` WAL per completed job. `max_workers = 512` is close but does not consistently meet the 10k offered target, because no-op handlers hold permits while waiting for durable completion acknowledgement.
 
-First-principles WAL accounting then compared the production path, a narrow `done_entries` row, and a deliberately non-production path that skipped `done_entries` entirely:
+First-principles WAL accounting compared the production path, a narrow `done_entries` row, and a deliberately non-production path that skipped durable terminal history entirely:
 
 | Shape                          | Completed jobs/s |  p99 e2e |   WAL/job |
 | ------------------------------ | ---------------: | -------: | --------: |
@@ -171,7 +171,7 @@ First-principles WAL accounting then compared the production path, a narrow `don
 | Narrow terminal history        |        `8,337/s` | `205 ms` | `1,932 B` |
 | Skip `done_entries` entirely   |        `8,402/s` | `230 ms` | `1,441 B` |
 
-The shipped design is the middle row: keep the durable terminal fact, but avoid duplicating immutable ready-body fields on ready-backed terminal rows. The skip-`done_entries` experiment remains rejected because it weakens the terminal-history contract, and its small throughput gain over narrow terminal history points at durable WAL write/sync pressure rather than a hidden per-job query loop as the next ceiling.
+The adopted design keeps the durable terminal fact and public `{schema}.terminal_jobs` surface while avoiding duplicated ready-body fields. Successful receipt completions can now write compact `receipt_completion_batches_*` rows instead of one `done_entries_*` row per job. The skip-durable-history experiment remains rejected because it weakens the terminal-history contract.
 
 ### Queue-storage striping reference
 
@@ -340,7 +340,7 @@ This rate was previously a documented scaling limit (only 20-57k of 60k promoted
 
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `AWA_COMPLETION_FLUSH_MS` (default `1 ms`): completion batcher flush interval
-- `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher flush. Queue-storage short-job completion uses a fused receipt-claim lock, terminal-insert, and count-delta statement, so the default keeps finalization latency low while still amortising durable completion work under load.
+- `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher flush. Queue-storage short-job completion uses a fused receipt-claim lock, compact terminal insert, and compact claim-closure insert, so the default keeps finalization latency low while still amortising durable completion work under load.
 - `AWA_COMPLETION_SHARDS`: number of parallel completion flushers. The runtime default is storage-dependent: `8` for canonical storage and `1` for queue storage. Queue storage starts conservative because the terminal / receipt path already batches heavily and the effective fleet-wide flusher count is `processes × AWA_COMPLETION_SHARDS`. Increase only after measuring end-to-end throughput, p99 latency, WAL bytes/job, and dead tuples for the target worker-process topology.
 
 Internal promotion constants are fixed in the runtime: `PROMOTE_BATCH_SIZE = 4,096` rows per promotion batch and `PROMOTE_MAX_BATCHES_PER_TICK = 32` batches per maintenance tick. They are not environment variables or builder options.

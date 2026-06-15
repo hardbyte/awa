@@ -318,8 +318,11 @@ async def test_heartbeat_invalid_timeout_rejected(client):
 async def test_heartbeat_invalid_timeout_sync_rejected(client):
     """Sync heartbeat_callback rejects invalid timeout values."""
     sync_client = awa.Client(DATABASE_URL)
-    with pytest.raises(awa.ValidationError):
-        sync_client.heartbeat_callback(str(uuid.uuid4()), timeout_seconds=float("nan"))
+    try:
+        with pytest.raises(awa.ValidationError):
+            sync_client.heartbeat_callback(str(uuid.uuid4()), timeout_seconds=float("nan"))
+    finally:
+        sync_client.close()
 
 
 # ── wait_for_callback (in-handler sequential) ────────────────────────

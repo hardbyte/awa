@@ -203,6 +203,10 @@ def sync_client():
     try:
         yield client
     finally:
+        tx = client.transaction()
+        tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        tx.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+        tx.commit()
         client.close()
 
 
@@ -451,4 +455,8 @@ async def test_async_dlq_flow():
         assert str(revived.state) == "available"
         assert await client.dlq_depth(queue="pydlq_async") == 0
     finally:
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+        await tx.commit()
         await client.close()

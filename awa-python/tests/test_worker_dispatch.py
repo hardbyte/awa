@@ -256,4 +256,7 @@ async def test_logging_bridge():
     # If the bridge is working, Rust tracing events will show up
     # in Python's logging. We just verify no crash occurs.
     c = awa.AsyncClient(DATABASE_URL)
-    await c.migrate()  # This triggers Rust tracing logs
+    try:
+        await c.migrate()  # This triggers Rust tracing logs
+    finally:
+        await c.close()

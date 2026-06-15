@@ -127,10 +127,38 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
 }
 
 async fn reset_runtime_backend(pool: &sqlx::PgPool) {
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("Failed to start runtime backend reset transaction");
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to reset storage transition state");
     sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("Failed to reset active runtime backend");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(&mut *tx)
+        .await
+        .expect("Failed to reset runtime instances");
+    tx.commit()
+        .await
+        .expect("Failed to commit runtime backend reset");
 }
 
 async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
@@ -169,11 +197,16 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                  SELECT 'running'::awa.job_state AS state \
                  FROM {schema}.lease_claims AS lc \
                  WHERE lc.queue = $1 \
+                   AND lc.closed_at IS NULL \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.lease_claim_closures AS cx \
                      WHERE cx.claim_slot = lc.claim_slot \
                        AND cx.job_id = lc.job_id \
                        AND cx.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+                     WHERE cb.receipt_ranges @> lc.receipt_id \
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.leases AS lease \
@@ -196,7 +229,7 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                        AND dlq.run_lease = lc.run_lease \
                    ) \
                  UNION ALL \
-                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
                  UNION ALL \
                  SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
              ) AS jobs \
@@ -243,11 +276,16 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                  SELECT 'running'::awa.job_state AS state \
                  FROM {schema}.lease_claims AS lc \
                  WHERE lc.queue = $1 \
+                   AND lc.closed_at IS NULL \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.lease_claim_closures AS cx \
                      WHERE cx.claim_slot = lc.claim_slot \
                        AND cx.job_id = lc.job_id \
                        AND cx.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+                     WHERE cb.receipt_ranges @> lc.receipt_id \
                    ) \
                    AND NOT EXISTS ( \
                      SELECT 1 FROM {schema}.leases AS lease \
@@ -270,7 +308,7 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                        AND dlq.run_lease = lc.run_lease \
                    ) \
                  UNION ALL \
-                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
                  UNION ALL \
                  SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
              ) AS jobs \

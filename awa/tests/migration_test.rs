@@ -1044,6 +1044,26 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
         has_done_failed_index,
         "done_entries failed-row metric probe should have a partial index"
     );
+    let has_receipt_batch_lane_index: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa_queue_storage_prepared.idx_awa_queue_storage_prepared_receipt_completion_batches_0_lane') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("receipt completion batch lane index probe should succeed");
+    assert!(
+        has_receipt_batch_lane_index,
+        "receipt_completion_batches should keep the segment-routing index"
+    );
+    let has_receipt_batch_job_ids_gin: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa_queue_storage_prepared.idx_awa_queue_storage_prepared_receipt_completion_batches_0_job_ids') IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("receipt completion batch job_ids index probe should succeed");
+    assert!(
+        !has_receipt_batch_job_ids_gin,
+        "receipt_completion_batches must not maintain a hot-path GIN index for cold job-id deletes"
+    );
     assert!(
         relation_exists(&pool, "awa_queue_storage_prepared.leases").await,
         "prepared queue-storage schema should materialize leases"
@@ -1241,6 +1261,36 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
 
     prepare_queue_storage_schema(&pool, schema).await;
     sqlx::query(&format!(
+        "DROP TABLE {schema}.receipt_completion_batches CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test receipt_completion_batches drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after compact batch table drop"),
+        "schema without receipt_completion_batches must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
+        "DROP TABLE {schema}.receipt_completion_tombstones CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test receipt_completion_tombstones drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after compact tombstone table drop"),
+        "schema without receipt_completion_tombstones must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
         "DROP TABLE {schema}.queue_terminal_count_deltas CASCADE"
     ))
     .execute(&pool)
@@ -1252,6 +1302,21 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
             .await
             .expect("schema readiness should be queryable after terminal delta table drop"),
         "schema without queue_terminal_count_deltas must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
+        "ALTER TABLE {schema}.lease_claim_closure_batches DROP COLUMN receipt_ranges"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test receipt_ranges drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after receipt_ranges drop"),
+        "schema without receipt_ranges must not be reported as ready"
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
@@ -1722,6 +1787,85 @@ async fn test_storage_abort_from_mixed_transition_rejects_queue_storage_rows() {
 }
 
 #[tokio::test]
+async fn test_storage_abort_from_mixed_transition_rejects_compact_terminal_rows() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'mixed_transition',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            entered_at = now(),
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at) VALUES ('queue_storage', 'awa_queue_storage', now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa_queue_storage.receipt_completion_batches (
+            ready_slot,
+            ready_generation,
+            claim_slot,
+            queue,
+            priority,
+            enqueue_shard,
+            completed_count,
+            job_ids,
+            run_leases,
+            lane_seqs,
+            attempts,
+            attempted_ats,
+            finalized_at
+        )
+        VALUES (
+            0,
+            1,
+            0,
+            'abort_compact_terminal_queue',
+            2,
+            0,
+            1,
+            ARRAY[9000001]::bigint[],
+            ARRAY[1]::bigint[],
+            ARRAY[1]::bigint[],
+            ARRAY[1]::smallint[],
+            ARRAY[now()]::timestamptz[],
+            now()
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = storage::abort(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("queue storage contains"),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_runtime() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
@@ -2086,9 +2230,90 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
     .fetch_one(&pool)
     .await
     .unwrap();
+    assert!(
+        row.id > 0,
+        "insert_job_compat must return the queue-storage job id"
+    );
     assert_eq!(row.kind, "compat_refusal_test");
     assert_eq!(row.queue, "compat_refusal_queue");
     assert_eq!(row.state, awa::JobState::Available);
+
+    let lane_seq: i64 = sqlx::query_scalar(&format!(
+        "SELECT lane_seq FROM {schema}.ready_entries WHERE job_id = $1"
+    ))
+    .bind(row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lane_seq, 1,
+        "insert_job_compat must reserve queue-storage lanes through the sequence allocator"
+    );
+
+    let ready_segments: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_segments WHERE queue = $1"
+    ))
+    .bind("compat_refusal_queue")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ready_segments, 1,
+        "insert_job_compat must append ready segment metadata with the ready row"
+    );
+
+    let ready_segments_partitioned: bool = sqlx::query_scalar(
+        r#"
+        SELECT c.relkind = 'p'
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1
+          AND c.relname = 'ready_segments'
+        "#,
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        ready_segments_partitioned,
+        "ready_segments must be a partitioned queue-ring parent"
+    );
+
+    let ready_segment_child_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass(format('%I.%I', $1, 'ready_segments_0')) IS NOT NULL",
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        ready_segment_child_exists,
+        "ready_segments_0 child must exist for queue-ring prune"
+    );
+
+    let claim_head_cache_columns: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)::bigint
+        FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = 'queue_claim_heads'
+          AND column_name = ANY($2)
+        "#,
+    )
+    .bind(schema)
+    .bind([
+        "ready_segment_slot",
+        "ready_segment_generation",
+        "ready_segment_next_lane_seq",
+    ])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        claim_head_cache_columns, 3,
+        "queue_claim_heads must expose the ready-segment cache columns used by claim routing"
+    );
 }
 
 #[tokio::test]
