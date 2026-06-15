@@ -52,6 +52,7 @@ DECLARE
     v_slot           INT;
     v_initial_gen    BIGINT;
     v_claimed_cte    TEXT;
+    v_claim_runtime  REGPROCEDURE;
 BEGIN
     IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
         RAISE EXCEPTION 'install_queue_storage_substrate: schema name must match ^[a-z_][a-z0-9_]*$; got %',
@@ -2706,6 +2707,7 @@ BEGIN
                 WHERE NOT selected.attempt_spent
                 RETURNING
                     claim_rows.claim_slot,
+                    claim_rows.receipt_id,
                     claim_rows.ready_slot,
                     claim_rows.ready_generation,
                     claim_rows.job_id,
@@ -2763,6 +2765,7 @@ BEGIN
                 WHERE NOT selected.attempt_spent
                 RETURNING
                     0::int AS claim_slot,
+                    NULL::bigint AS receipt_id,
                     lease_rows.ready_slot,
                     lease_rows.ready_generation,
                     lease_rows.lease_slot,
@@ -2778,6 +2781,18 @@ BEGIN
                     lease_rows.attempted_at
             )
             $cte$,
+            p_schema
+        );
+    END IF;
+
+    v_claim_runtime := to_regprocedure(format(
+        '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+        p_schema
+    ));
+    IF v_claim_runtime IS NOT NULL
+       AND position('receipt_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0 THEN
+        EXECUTE format(
+            'DROP FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION)',
             p_schema
         );
     END IF;
@@ -2798,6 +2813,7 @@ BEGIN
             lease_slot INT,
             lease_generation BIGINT,
             claim_slot INT,
+            receipt_id BIGINT,
             job_id BIGINT,
             kind TEXT,
             queue TEXT,
@@ -3406,6 +3422,7 @@ BEGIN
                 lease_ring.lease_slot,
                 lease_ring.lease_generation,
                 claimed.claim_slot,
+                claimed.receipt_id,
                 selected.job_id,
                 selected.kind,
                 selected.queue,

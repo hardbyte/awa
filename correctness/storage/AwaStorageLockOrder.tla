@@ -257,9 +257,10 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
 
 \* complete_runtime_batch receipt branch (ADR-023/026)
 \*   No queue_lanes lock (completion does not gate on a lane row)
-\*   Successful compact receipt completion locks the claim, reads closure
-\*   evidence to stay idempotent, writes compact claim-local closure evidence,
-\*   and compact receipt completion history. Compact counts are read from
+\*   Successful compact receipt completion validates the exact claim by
+\*   receipt_id, reads closure evidence to stay idempotent, writes compact
+\*   claim-local closure evidence, and compact receipt completion history.
+\*   Compact counts are read from
 \*   retained receipt batches, so this path does not touch the terminal-count
 \*   delta children.
 \*   It also anti-joins the leases parent so materialized receipt claims
@@ -267,8 +268,9 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
 \*   materialized receipt leases by stable ready-lane / attempt identity
 \*   because the lease ring can rotate after the original receipt claim.
 \*   Rust first takes per-(job_id, run_lease) advisory transaction locks in
-\*   deterministic key order. Known-key materialization and explicit
-\*   close paths use the same advisory key before row locks. Those locks
+\*   deterministic key order. Known-key materialization, explicit close,
+\*   and receipt rescue paths use the same advisory key before row locks.
+\*   Those locks
 \*   serialize same-attempt state changes but do not participate in the
 \*   table-lock waits-for cycles modelled here.
 \*   Non-success close paths are modelled by CloseReceiptPlan /
@@ -294,6 +296,7 @@ CloseReceiptPlan(claimSlot) ==
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
 \*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)
+\*     pg_try_advisory_xact_lock per (job_id, run_lease)
 \*     FOR UPDATE OF claims SKIP LOCKED
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
 \*   UPDATE claim_ring_slots[slot] rescue cursor
@@ -310,6 +313,7 @@ RescueReceiptsPlan(claimSlot) ==
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   bounded scan of lease_claims_<slot> ordered by deadline_at
 \*   anti-join lease_claim_closures_<slot> and leases parent
+\*   pg_try_advisory_xact_lock per (job_id, run_lease)
 \*   FOR UPDATE OF expired claim rows SKIP LOCKED
 \*   INSERT INTO lease_claim_closures ... deadline_expired
 \*   UPDATE claim_ring_slots[slot] deadline cursor

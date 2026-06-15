@@ -15,7 +15,7 @@ It uses the storage naming set:
 - `ready_segments` / `ready_segment_cursor`
 - `lease_segments` / `lease_segment_cursor`
 - `terminal_segments` / `terminal_segment_cursor`
-- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier; implementation stale-rescue and deadline-rescue scans use separate per-slot cursors over this history)
+- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier; compact completion validates immutable `receipt_id` values returned by claim, and implementation stale-rescue and deadline-rescue scans use the same per-attempt advisory key plus separate per-slot cursors over this history)
 
 Terminal-count derived state (`queue_terminal_count_deltas`, `queue_terminal_live_counts`, and `queue_terminal_rollups`) is not lifecycle state and is not part of `AwaSegmentedStorage`. The append/truncate contract for those tables is covered by `AwaDeadTupleContract`, while Rust integration tests assert that exact reads include folded counters plus pending deltas.
 
@@ -42,7 +42,7 @@ What it models:
 - stale completion rejection via per-worker lease snapshots
 - segment rotation and prune safety for ready, tombstone, lease, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
 - unpartitioned backlog row-vacuum handling for `deferred_jobs` and `dlq_entries`
-- receipt-plane append-only receipts with explicit closures for non-success exits and compact claim-local closure batches for successful completions. `RescueStaleReceipt` models Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction. The deadline-rescue cursor is a sibling implementation refinement ordered by `deadline_at`: it advances over closed or lease-managed claims, closes expired open receipts, and stops before the first open future-deadline claim.
+- receipt-plane append-only receipts with explicit closures for non-success exits and compact claim-local closure batches for successful completions. `RescueStaleReceipt` models Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, uses the same per-attempt advisory key as completion before writing rescue closure evidence, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction. The deadline-rescue cursor is a sibling implementation refinement ordered by `deadline_at`: it advances over closed or lease-managed claims, closes expired open receipts, and stops before the first open future-deadline claim.
 - a second config with two workers to exercise interleavings on the same storage invariants
 
 Heartbeat freshness is tracked at the lease level (not `attempt_state`) to match the Rust implementation. `ParkToWaiting` clears heartbeat freshness while keeping the lease row live; `ResumeWaitingToRunning` restores a running lease on the same `run_lease`.

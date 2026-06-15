@@ -117,6 +117,10 @@ pub struct ClaimedEntry {
     /// receipt completions keep claim-local evidence in
     /// `lease_claim_closure_batches` instead.
     pub claim_slot: i32,
+    /// Stable identity for the immutable receipt claim row. Present for
+    /// receipt-backed claims and used by the compact completion path to
+    /// validate the exact claim attempt without row-locking it.
+    pub receipt_id: Option<i64>,
     pub lease_claim_receipt: bool,
     /// The enqueue shard the row was claimed from. Routes the
     /// terminal `done_entries` write onto the correct shard's
@@ -1521,6 +1525,7 @@ struct ReadyJobLeaseRow {
     lease_slot: i32,
     lease_generation: i64,
     claim_slot: i32,
+    receipt_id: Option<i64>,
     job_id: i64,
     kind: String,
     queue: String,
@@ -1551,6 +1556,7 @@ impl ReadyJobLeaseRow {
             lease_slot: self.lease_slot,
             lease_generation: self.lease_generation,
             claim_slot: self.claim_slot,
+            receipt_id: self.receipt_id,
             lease_claim_receipt,
             enqueue_shard: self.enqueue_shard,
         }
@@ -3578,6 +3584,7 @@ impl QueueStorage {
                 lease_slot,
                 lease_generation,
                 claim_slot,
+                receipt_id,
                 job_id,
                 kind,
                 queue,
@@ -5863,6 +5870,7 @@ impl QueueStorage {
 
     fn receipt_fast_complete_candidate(entry: &ClaimedRuntimeJob) -> bool {
         entry.claim.lease_claim_receipt
+            && entry.claim.receipt_id.is_some()
             && entry.job.unique_key.is_none()
             && is_compact_receipt_completion_metadata(&entry.job.metadata)
             && entry.job.tags.is_empty()
@@ -5929,6 +5937,15 @@ impl QueueStorage {
             let priorities: Vec<i16> = group.iter().map(|entry| entry.claim.priority).collect();
             let attempts: Vec<i16> = group.iter().map(|entry| entry.job.attempt).collect();
             let run_leases: Vec<i64> = group.iter().map(|entry| entry.job.run_lease).collect();
+            let receipt_ids: Vec<i64> = group
+                .iter()
+                .map(|entry| {
+                    entry
+                        .claim
+                        .receipt_id
+                        .expect("receipt fast completion requires receipt_id")
+                })
+                .collect();
             let lane_seqs: Vec<i64> = group.iter().map(|entry| entry.claim.lane_seq).collect();
             let enqueue_shards: Vec<i16> = group
                 .iter()
@@ -5949,6 +5966,7 @@ impl QueueStorage {
                     priority,
                     attempt,
                     run_lease,
+                    receipt_id,
                     lane_seq,
                     enqueue_shard,
                     attempted_at,
@@ -5965,18 +5983,20 @@ impl QueueStorage {
                         $7::smallint[],
                         $8::bigint[],
                         $9::bigint[],
-                        $10::smallint[],
-                        $11::timestamptz[],
-                        $12::timestamptz[]
+                        $10::bigint[],
+                        $11::smallint[],
+                        $12::timestamptz[],
+                        $13::timestamptz[]
                     )
                 ),
-                locked_claims AS (
+                claim_refs AS (
                     SELECT claims.claim_slot, claims.job_id, claims.run_lease, claims.receipt_id
                     FROM {claim_rel} AS claims
                     JOIN completed
                       ON completed.claim_slot = claims.claim_slot
                      AND completed.job_id = claims.job_id
                      AND completed.run_lease = claims.run_lease
+                     AND completed.receipt_id = claims.receipt_id
                     WHERE NOT {closed_evidence}
                       AND NOT EXISTS (
                           SELECT 1
@@ -5984,22 +6004,22 @@ impl QueueStorage {
                           WHERE lease.job_id = claims.job_id
                             AND lease.run_lease = claims.run_lease
                       )
-                    FOR UPDATE OF claims
                 ),
                 deleted_attempts AS (
                     DELETE FROM {schema}.attempt_state AS attempt
-                    USING locked_claims
-                    WHERE attempt.job_id = locked_claims.job_id
-                      AND attempt.run_lease = locked_claims.run_lease
+                    USING claim_refs
+                    WHERE attempt.job_id = claim_refs.job_id
+                      AND attempt.run_lease = claim_refs.run_lease
                     RETURNING attempt.job_id
                 ),
                 completed_rows AS (
-                    SELECT completed.*, locked_claims.receipt_id
+                    SELECT completed.*
                     FROM completed
-                    JOIN locked_claims
-                      ON locked_claims.claim_slot = completed.claim_slot
-                     AND locked_claims.job_id = completed.job_id
-                     AND locked_claims.run_lease = completed.run_lease
+                    JOIN claim_refs
+                      ON claim_refs.claim_slot = completed.claim_slot
+                     AND claim_refs.job_id = completed.job_id
+                     AND claim_refs.run_lease = completed.run_lease
+                     AND claim_refs.receipt_id = completed.receipt_id
                 ),
                 claim_closure_batches AS (
                     INSERT INTO {closure_batch_rel} (
@@ -6090,6 +6110,7 @@ impl QueueStorage {
             .bind(&priorities)
             .bind(&attempts)
             .bind(&run_leases)
+            .bind(&receipt_ids)
             .bind(&lane_seqs)
             .bind(&enqueue_shards)
             .bind(&attempted_ats)
@@ -9217,6 +9238,12 @@ impl QueueStorage {
                  AND claims.job_id = stale_candidates.job_id
                  AND claims.run_lease = stale_candidates.run_lease
                 WHERE NOT {closed_evidence}
+                  AND pg_catalog.pg_try_advisory_xact_lock(
+                      pg_catalog.hashtextextended(
+                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
+                          0
+                      )
+                  )
                   -- A claim that already materialized into `leases` is
                   -- on the lease-side heartbeat-rescue path (see
                   -- `rescue_stale_heartbeats`). Rescuing it again here
@@ -9526,6 +9553,12 @@ impl QueueStorage {
                  AND claims.run_lease = expired_candidates.run_lease
                 WHERE NOT {closed_evidence}
                   AND claims.deadline_at < clock_timestamp()
+                  AND pg_catalog.pg_try_advisory_xact_lock(
+                      pg_catalog.hashtextextended(
+                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
+                          0
+                      )
+                  )
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
                       WHERE lease.job_id = claims.job_id

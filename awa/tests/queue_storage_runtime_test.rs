@@ -3337,6 +3337,10 @@ async fn test_legacy_zero_deadline_claim_without_receipts_succeeds() {
         !claimed[0].claim.lease_claim_receipt,
         "legacy non-receipts claim should materialize into leases"
     );
+    assert_eq!(
+        claimed[0].claim.receipt_id, None,
+        "legacy non-receipts claims must not carry receipt identities"
+    );
 
     let deadline_at: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
         "SELECT deadline_at FROM {schema}.leases WHERE job_id = $1"
@@ -5008,6 +5012,106 @@ async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_w
         (cursor.1, cursor.2),
         (job_c, claim_c.job.run_lease),
         "cursor should advance through the rescued blocker and already-closed tail"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_rescue_skips_attempt_locked_for_completion() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_rescue_advisory";
+    let schema = "awa_qs_receipt_rescue_advisory";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 77 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim receipt-backed job");
+    assert_eq!(claimed.len(), 1);
+    let claim = claimed.into_iter().next().expect("claimed job");
+    assert!(claim.claim.lease_claim_receipt);
+    assert!(
+        claim.claim.receipt_id.is_some(),
+        "receipt rescue interlock depends on exact receipt identity being available"
+    );
+
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_id,
+        claim.job.run_lease,
+        Duration::from_secs(300),
+    )
+    .await;
+
+    let mut completion_lock = pool.begin().await.expect("begin completion lock tx");
+    sqlx::query(
+        r#"
+        SELECT pg_catalog.pg_advisory_xact_lock(
+            pg_catalog.hashtextextended(
+                format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint),
+                0
+            )
+        )
+        "#,
+    )
+    .bind(job_id)
+    .bind(claim.job.run_lease)
+    .execute(completion_lock.as_mut())
+    .await
+    .expect("hold receipt completion advisory lock");
+
+    let rescued_while_locked = store
+        .rescue_stale_heartbeats(&pool, Duration::from_secs(90))
+        .await
+        .expect("receipt rescue while completion lock is held");
+    assert!(
+        rescued_while_locked.is_empty(),
+        "receipt rescue must skip attempts currently held by worker completion"
+    );
+    assert_eq!(
+        open_receipt_claim_count(&pool, &store).await,
+        1,
+        "skipped receipt claim must stay open for a later rescue or completion"
+    );
+
+    completion_lock
+        .rollback()
+        .await
+        .expect("release completion advisory lock");
+
+    let rescued_after_release = store
+        .rescue_stale_heartbeats(&pool, Duration::from_secs(90))
+        .await
+        .expect("receipt rescue after completion lock release");
+    assert_eq!(
+        rescued_after_release
+            .iter()
+            .map(|job| job.id)
+            .collect::<Vec<_>>(),
+        vec![job_id],
+        "receipt rescue should close the stale claim once the completion lock is free"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
 }
@@ -7739,6 +7843,10 @@ async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_clo
         .expect("claim");
     assert_eq!(claimed.len(), 1);
     assert!(claimed[0].claim.lease_claim_receipt);
+    let receipt_id = claimed[0]
+        .claim
+        .receipt_id
+        .expect("receipt-backed claims must carry receipt_id");
 
     let claimed_a = claimed.clone();
     let claimed_b = claimed.clone();
@@ -7780,6 +7888,20 @@ async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_clo
             1
         ),
         "compact closure batches must carry ready segment metadata for prune count proofs"
+    );
+    let closure_receipt_ids: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT receipt_ids
+         FROM {schema}.lease_claim_closure_batches
+         WHERE claim_slot = $1"
+    ))
+    .bind(claimed[0].claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read compact closure receipt ids");
+    assert_eq!(
+        closure_receipt_ids,
+        vec![receipt_id],
+        "compact completion should close the exact receipt identity returned by claim"
     );
     assert_eq!(
         receipt_completion_batch_count(&pool, &store, queue).await,
