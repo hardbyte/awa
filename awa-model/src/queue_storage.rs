@@ -280,6 +280,8 @@ pub struct BusyCounts {
     pub queue_done: i64,
     /// Queue ring: rows in the next `ready_tombstones` child.
     pub queue_tombstones: i64,
+    /// Queue ring: rows in the next `ready_segments` child.
+    pub queue_ready_segments: i64,
     /// Queue ring: rows in the next `receipt_completion_batches` child.
     pub queue_receipt_completion_batches: i64,
     /// Queue ring: rows in the next `receipt_completion_tombstones` child.
@@ -441,6 +443,10 @@ fn done_child_name(schema: &str, slot: usize) -> String {
 
 fn ready_tombstone_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.ready_tombstones_{slot}")
+}
+
+fn ready_segment_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.ready_segments_{slot}")
 }
 
 fn receipt_completion_batch_child_name(schema: &str, slot: usize) -> String {
@@ -3839,6 +3845,9 @@ impl QueueStorage {
                 .push_bind(segment.next_lane_seq)
                 .push_bind(segment.first_run_at);
         });
+        builder.push(
+            " ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING",
+        );
         builder
             .build()
             .execute(tx.as_mut())
@@ -12150,6 +12159,11 @@ impl QueueStorage {
             &ready_tombstone_child_name(schema, next_slot as usize),
         )
         .await?;
+        let segment_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &ready_segment_child_name(schema, next_slot as usize),
+        )
+        .await?;
         let receipt_batch_busy = Self::relation_has_rows_tx(
             &mut tx,
             &receipt_completion_batch_child_name(schema, next_slot as usize),
@@ -12170,6 +12184,7 @@ impl QueueStorage {
             || claim_attempt_batch_busy
             || done_busy
             || tombstone_busy
+            || segment_busy
             || receipt_batch_busy
             || receipt_tombstone_busy
             || terminal_delta_busy
@@ -12182,6 +12197,7 @@ impl QueueStorage {
                     queue_claim_attempt_batches: busy_indicator(claim_attempt_batch_busy),
                     queue_done: busy_indicator(done_busy),
                     queue_tombstones: busy_indicator(tombstone_busy),
+                    queue_ready_segments: busy_indicator(segment_busy),
                     queue_receipt_completion_batches: busy_indicator(receipt_batch_busy),
                     queue_receipt_completion_tombstones: busy_indicator(receipt_tombstone_busy),
                     queue_terminal_deltas: busy_indicator(terminal_delta_busy),
@@ -12929,6 +12945,7 @@ impl QueueStorage {
         let claim_attempt_child = ready_claim_attempt_batch_child_name(schema, slot as usize);
         let done_child = done_child_name(schema, slot as usize);
         let tomb_child = ready_tombstone_child_name(schema, slot as usize);
+        let segment_child = ready_segment_child_name(schema, slot as usize);
         let receipt_batch_child = receipt_completion_batch_child_name(schema, slot as usize);
         let receipt_tomb_child = receipt_completion_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
@@ -12977,7 +12994,7 @@ impl QueueStorage {
         set_prune_lock_timeout_tx(&mut tx).await?;
 
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -13238,7 +13255,7 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         let truncate = sqlx::query(&format!(
-            "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
+            "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
         ))
         .execute(tx.as_mut())
         .await;
@@ -13249,14 +13266,6 @@ impl QueueStorage {
                     self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
                         .await?;
                 }
-                sqlx::query(&format!(
-                    "DELETE FROM {schema}.ready_segments WHERE ready_slot = $1 AND ready_generation = $2"
-                ))
-                .bind(slot)
-                .bind(generation)
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
 
                 // #290: the live counter rows for this slot are about to
                 // be orphans (their underlying done_entries rows just got

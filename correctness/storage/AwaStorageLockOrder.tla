@@ -119,11 +119,15 @@ QueueRingSlotResource(s) == [k |-> "queue_ring_slot", s |-> s]
 ReadyChildResource(s) == [k |-> "ready_child", s |-> s]
 ReadyClaimAttemptBatchChildResource(s) == [k |-> "ready_claim_attempt_batch_child", s |-> s]
 ReadyTombstoneChildResource(s) == [k |-> "ready_tombstone_child", s |-> s]
+ReadySegmentChildResource(s) == [k |-> "ready_segment_child", s |-> s]
 DoneChildResource(s) == [k |-> "done_child", s |-> s]
 ReceiptBatchChildResource(s) == [k |-> "receipt_batch_child", s |-> s]
 ReceiptTombstoneChildResource(s) == [k |-> "receipt_tombstone_child", s |-> s]
 TerminalDeltaChildResource(s) == [k |-> "terminal_delta_child", s |-> s]
 LeasesParentResource == [k |-> "leases_parent"]
+ClaimProofResource == [k |-> "claim_proof_children"]
+ClosureProofResource == [k |-> "closure_proof_children"]
+ClosureBatchProofResource == [k |-> "closure_batch_proof_children"]
 ClaimRingStateResource == [k |-> "claim_ring_state"]
 ClaimRingSlotResource(s) == [k |-> "claim_ring_slot", s |-> s]
 ClaimChildResource(s) == [k |-> "claim_child", s |-> s]
@@ -137,6 +141,7 @@ QueueRingSlotResources == { QueueRingSlotResource(s) : s \in ReadySlots }
 ReadyChildResources == { ReadyChildResource(s) : s \in ReadySlots }
 ReadyClaimAttemptBatchChildResources == { ReadyClaimAttemptBatchChildResource(s) : s \in ReadySlots }
 ReadyTombstoneChildResources == { ReadyTombstoneChildResource(s) : s \in ReadySlots }
+ReadySegmentChildResources == { ReadySegmentChildResource(s) : s \in ReadySlots }
 DoneChildResources == { DoneChildResource(s) : s \in ReadySlots }
 ReceiptBatchChildResources == { ReceiptBatchChildResource(s) : s \in ReadySlots }
 ReceiptTombstoneChildResources == { ReceiptTombstoneChildResource(s) : s \in ReadySlots }
@@ -156,11 +161,15 @@ Resources ==
     ReadyChildResources \cup
     ReadyClaimAttemptBatchChildResources \cup
     ReadyTombstoneChildResources \cup
+    ReadySegmentChildResources \cup
     DoneChildResources \cup
     ReceiptBatchChildResources \cup
     ReceiptTombstoneChildResources \cup
     TerminalDeltaChildResources \cup
     {LeasesParentResource} \cup
+    {ClaimProofResource} \cup
+    {ClosureProofResource} \cup
+    {ClosureBatchProofResource} \cup
     {ClaimRingStateResource} \cup
     ClaimRingSlotResources \cup
     ClaimChildResources \cup
@@ -397,7 +406,9 @@ PruneLeasesPlan(slot) ==
 RotateReadyPlan(nextSlot) ==
     << Step(QueueRingStateResource, ModeExclusive),
        Step(ReadyChildResource(nextSlot), ModeShared),
+       Step(ReadyClaimAttemptBatchChildResource(nextSlot), ModeShared),
        Step(ReadyTombstoneChildResource(nextSlot), ModeShared),
+       Step(ReadySegmentChildResource(nextSlot), ModeShared),
        Step(DoneChildResource(nextSlot), ModeShared),
        Step(ReceiptBatchChildResource(nextSlot), ModeShared),
        Step(ReceiptTombstoneChildResource(nextSlot), ModeShared),
@@ -407,23 +418,33 @@ RotateReadyPlan(nextSlot) ==
 \*   SELECT ... FROM queue_ring_state FOR UPDATE
 \*   SELECT ... FROM queue_ring_slots FOR UPDATE
 \*   prove sealed-slot skip gates before child exclusive locks:
-\*     active leases (leases parent), unclosed receipt claims, and pending
-\*     retained ready rows at or beyond the lane cursor
-\*   LOCK TABLE ready/claim-attempt/done/tombstone/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
-\*   skip-gate success returns before the exclusive lock path; the plan
-\*     below models the successful truncate path after those proofs pass
+\*     active leases (leases parent), unclosed receipt claims
+\*     (claim/closure proof resources), and pending retained ready rows
+\*     at or beyond the lane cursor
+\*   LOCK TABLE ready/claim-attempt/done/tombstone/segment/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
+\*   repeat the active/pending/unclosed proofs after the exclusive child
+\*     locks before TRUNCATE
 PruneReadyPlan(slot) ==
     << Step(QueueRingStateResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
        Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
        Step(ReadyChildResource(slot), ModeShared),
        Step(ReadyChildResource(slot), ModeExclusive),
        Step(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
        Step(DoneChildResource(slot), ModeExclusive),
        Step(ReadyTombstoneChildResource(slot), ModeExclusive),
+       Step(ReadySegmentChildResource(slot), ModeExclusive),
        Step(ReceiptBatchChildResource(slot), ModeExclusive),
        Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
-       Step(TerminalDeltaChildResource(slot), ModeExclusive) >>
+       Step(TerminalDeltaChildResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared) >>
 
 \* rotate_claims (ADR-023)
 \*   SELECT ... FROM claim_ring_state FOR UPDATE

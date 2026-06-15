@@ -17,7 +17,6 @@ DECLARE
     v_claim_runtime REGPROCEDURE;
     v_claim_runtime_def TEXT;
     v_lease_claim_receipts BOOLEAN;
-    v_terminal_counter_trusted BOOLEAN;
 BEGIN
     FOR v_schema IN
         SELECT n.nspname
@@ -63,12 +62,6 @@ BEGIN
         v_lease_claim_receipts := v_schema = 'awa'
             OR position(format('INSERT INTO %I.lease_claims', v_schema) IN v_claim_runtime_def) > 0;
 
-        EXECUTE format(
-            'SELECT terminal_counter_trusted_at IS NOT NULL FROM %I.queue_ring_state WHERE singleton = TRUE',
-            v_schema
-        )
-        INTO v_terminal_counter_trusted;
-
         PERFORM awa.install_queue_storage_substrate(
             v_schema,
             v_queue_slots,
@@ -76,15 +69,8 @@ BEGIN
             v_claim_slots,
             v_lease_claim_receipts
         );
-
-        IF COALESCE(v_terminal_counter_trusted, FALSE) THEN
-            EXECUTE format(
-                'UPDATE %I.queue_ring_state SET terminal_counter_trusted_at = COALESCE(terminal_counter_trusted_at, now()) WHERE singleton = TRUE',
-                v_schema
-            );
-        END IF;
     END LOOP;
-END
+END;
 $$;
 
 CREATE OR REPLACE FUNCTION awa.storage_abort()
@@ -186,7 +172,7 @@ BEGIN
 
     RETURN QUERY
     SELECT * FROM awa.storage_status();
-END
+END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)

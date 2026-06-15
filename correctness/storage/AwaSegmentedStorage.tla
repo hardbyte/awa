@@ -1372,9 +1372,9 @@ PruneTerminalSegment(seg) ==
     /\ UnchangedClaimData
 
 \* ADR-023 prune of the claim ring. The precondition
-\* `\A k : claimSegmentOf[k] = seg => k \notin claimOpen` captures
-\* rescue-before-truncate: every claim row in the partition must be
-\* closed by durable closure evidence
+\* `\A k : claimSegmentOf[k] = seg => k \in claimClosed` captures
+\* rescue-before-truncate: every claim row in the partition must have
+\* durable closure evidence
 \* before `prune_oldest_claims` can TRUNCATE the lease_claims /
 \* lease_claim_closures / lease_claim_closure_batches children for that
 \* slot. Ready prune is separately
@@ -1387,7 +1387,7 @@ PruneClaimSegment(seg) ==
     /\ seg \in ClaimSegments
     /\ claimSegments[seg] = "sealed"
     /\ seg # claimSegmentCursor
-    /\ \A k \in ClaimKeys : claimSegmentOf[k] = seg => k \notin claimOpen
+    /\ \A k \in ClaimKeys : claimSegmentOf[k] = seg => k \in claimClosed
     /\ claimSegmentOf' = [k \in ClaimKeys |-> IF claimSegmentOf[k] = seg THEN NoClaimSegment ELSE claimSegmentOf[k]]
     /\ claimClosed' = claimClosed \ KeysInClaimSegment(seg)
     /\ claimSegments' = [claimSegments EXCEPT ![seg] = "pruned"]

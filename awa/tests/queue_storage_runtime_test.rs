@@ -4083,6 +4083,11 @@ async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_complet
 
     assert_eq!(completed_done_count(&pool, &store, queue).await, 0);
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 0);
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1,
+        "compat delete should tombstone compact completions without removing the batch row"
+    );
     assert_eq!(receipt_completion_tombstone_count(&pool, &store).await, 1);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
@@ -5866,12 +5871,12 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
 
     assert!(
         after_receipt_prune.is_empty(),
-        "compact terminal evidence must prevent re-emitting a spent attempt after claim partitions are pruned"
+        "queue-slot-local attempt evidence must prevent re-emitting a spent attempt after claim partitions are pruned"
     );
     assert_eq!(
         claim_cursor().await,
         compact_lane_seq + 1,
-        "compact terminal evidence should advance the stale claim cursor after claim evidence is gone"
+        "queue-slot-local attempt evidence should advance the stale claim cursor after claim evidence is gone"
     );
 }
 

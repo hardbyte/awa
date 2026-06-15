@@ -162,12 +162,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         36,
         "Compact successful receipt completions into batch terminal history",
-        &[V23_UP, V36_UP],
+        &[V18_UP, V23_UP, V36_UP],
     ),
     (
         37,
         "Add ready_segments claim-routing ledger for queue storage",
-        &[V23_UP, V18_UP, V37_UP],
+        &[V18_UP, V23_UP, V37_UP],
     ),
 ];
 

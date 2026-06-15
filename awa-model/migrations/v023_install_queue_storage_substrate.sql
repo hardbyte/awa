@@ -402,6 +402,36 @@ BEGIN
         p_schema
     );
 
+    IF to_regclass(format('%I.%I', p_schema, 'ready_segments')) IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM pg_partitioned_table
+           WHERE partrelid = to_regclass(format('%I.%I', p_schema, 'ready_segments'))
+       ) THEN
+        IF to_regclass(format('%I.%I', p_schema, 'ready_segments_unpartitioned')) IS NOT NULL THEN
+            RAISE EXCEPTION 'install_queue_storage_substrate: cannot convert %.ready_segments while %.ready_segments_unpartitioned already exists',
+                p_schema, p_schema
+                USING ERRCODE = '55000';
+        END IF;
+
+        EXECUTE format(
+            'ALTER TABLE %I.ready_segments RENAME TO ready_segments_unpartitioned',
+            p_schema
+        );
+        EXECUTE format(
+            'ALTER TABLE %I.ready_segments_unpartitioned DROP CONSTRAINT IF EXISTS ready_segments_pkey',
+            p_schema
+        );
+        EXECUTE format(
+            'DROP INDEX IF EXISTS %I.%I',
+            p_schema, format('idx_%s_ready_segments_lane_next', p_schema)
+        );
+        EXECUTE format(
+            'DROP INDEX IF EXISTS %I.%I',
+            p_schema, format('idx_%s_ready_segments_slot', p_schema)
+        );
+    END IF;
+
     EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.ready_segments (
@@ -415,8 +445,9 @@ BEGIN
             first_run_at     TIMESTAMPTZ NOT NULL,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             CHECK (first_lane_seq < next_lane_seq),
-            PRIMARY KEY (queue, priority, enqueue_shard, first_lane_seq)
+            PRIMARY KEY (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq)
         )
+        PARTITION BY LIST (ready_slot)
         $ddl$,
         p_schema
     );
@@ -424,7 +455,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON TABLE %I.ready_segments IS %L',
         p_schema,
-        'Append-only lane segment map from committed ready lane ranges to queue ring slot/generation. Claim uses this compact control plane to target a ready slot/generation before validating ready_entries; prune deletes segment rows with the matching ready slot.'
+        'Append-only lane segment map from committed ready lane ranges to queue ring slot/generation. Claim uses this compact control plane to target a ready slot/generation before validating ready_entries; queue-ring prune truncates segment children with the matching ready slot.'
     );
 
     EXECUTE format(
@@ -453,19 +484,6 @@ BEGIN
     EXECUTE format(
         'CREATE INDEX IF NOT EXISTS idx_%s_ready_segments_slot ON %I.ready_segments (ready_slot, ready_generation)',
         p_schema, p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        ALTER TABLE %I.ready_segments SET (
-            fillfactor = 90,
-            autovacuum_vacuum_scale_factor = 0.0,
-            autovacuum_vacuum_threshold = 200,
-            autovacuum_vacuum_cost_limit = 2000,
-            autovacuum_vacuum_cost_delay = 2
-        )
-        $ddl$,
-        p_schema
     );
 
     EXECUTE format(
@@ -1851,6 +1869,7 @@ BEGIN
 
     --------------------------------------------------------------------
     -- ready_entries / ready_claim_attempt_batches / ready_tombstones /
+    -- ready_segments /
     -- receipt_completion_batches / receipt_completion_tombstones /
     -- done_entries / queue_terminal_count_deltas partitions + lane indexes.
     --------------------------------------------------------------------
@@ -1881,6 +1900,24 @@ BEGIN
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.ready_claim_attempt_batches FOR VALUES IN (%s)',
             p_schema, format('ready_claim_attempt_batches_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.ready_segments FOR VALUES IN (%s)',
+            p_schema, format('ready_segments_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            $ddl$
+            ALTER TABLE %I.%I SET (
+                fillfactor = 90,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 200,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            $ddl$,
+            p_schema, format('ready_segments_%s', v_slot)
         );
 
         EXECUTE format(
@@ -1953,6 +1990,39 @@ BEGIN
             p_schema, format('queue_terminal_count_deltas_%s', v_slot), p_schema, v_slot
         );
     END LOOP;
+
+    IF to_regclass(format('%I.%I', p_schema, 'ready_segments_unpartitioned')) IS NOT NULL THEN
+        EXECUTE format(
+            $ddl$
+            INSERT INTO %1$I.ready_segments (
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                first_lane_seq,
+                next_lane_seq,
+                first_run_at,
+                created_at
+            )
+            SELECT
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                first_lane_seq,
+                next_lane_seq,
+                first_run_at,
+                created_at
+            FROM %1$I.ready_segments_unpartitioned
+            ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING
+            $ddl$,
+            p_schema
+        );
+
+        EXECUTE format('DROP TABLE %I.ready_segments_unpartitioned', p_schema);
+    END IF;
 
     -- Backfill queue-slot-local claim evidence for schemas upgraded while
     -- receipts were already in flight. New claims write this ledger in the
@@ -2239,8 +2309,8 @@ BEGIN
     -- so splitting on run_at keeps the lane-head aging timestamp exact even
     -- after the claim cursor advances inside a multi-row segment. Upgraded
     -- schemas can already contain ready rows before the table existed.
-    -- Segment rows are compact control-plane metadata; they are deleted when
-    -- the owning ready slot is pruned.
+    -- Segment rows are compact control-plane metadata; the owning ready-slot
+    -- child is truncated with the rest of the queue-ring family.
     EXECUTE format(
         $ddl$
         WITH ordered AS (
@@ -2298,7 +2368,7 @@ BEGIN
             next_lane_seq,
             first_run_at
         FROM segments
-        ON CONFLICT (queue, priority, enqueue_shard, first_lane_seq) DO NOTHING
+        ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING
         $ddl$,
         p_schema
     );
