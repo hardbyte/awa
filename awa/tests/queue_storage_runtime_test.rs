@@ -2437,6 +2437,118 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
     assert_eq!(survived, 1, "open claim must survive SkippedActive prune");
 }
 
+/// Regression for the post-lock claim-prune proof. The claim row is
+/// inserted but left uncommitted while prune performs its optimistic
+/// pre-lock proof, so the proof sees an empty slot. The writer transaction
+/// keeps a relation lock that makes prune wait for `ACCESS EXCLUSIVE`; once
+/// the writer commits, the post-lock proof must see the now-visible open
+/// claim and skip instead of truncating it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_claim_ring_post_lock";
+    let store = Arc::new(
+        create_store_with_config(
+            &pool,
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                claim_slot_count: 4,
+                lease_claim_receipts: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .with_prune_lock_timeout(Duration::from_secs(2))
+        .expect("test prune lock timeout"),
+    );
+
+    store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate away from claim slot 0");
+
+    let mut writer_tx = pool.begin().await.expect("begin claim writer tx");
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.lease_claims (
+            claim_slot, job_id, run_lease, ready_slot, ready_generation,
+            queue, priority, attempt, max_attempts, lane_seq
+        ) VALUES (0, 1001, 1, 0, 0, 'synthetic', 2, 1, 25, 1001)
+        "#
+    ))
+    .execute(writer_tx.as_mut())
+    .await
+    .expect("seed uncommitted open claim");
+
+    let prune_store = Arc::clone(&store);
+    let prune_pool = pool.clone();
+    let prune_task =
+        tokio::spawn(async move { prune_store.prune_oldest_claims(&prune_pool).await });
+
+    let needle = format!("{schema}.lease_claims_0");
+    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    let mut saw_lock_wait = false;
+    while Instant::now() < wait_deadline {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND wait_event_type = 'Lock'
+                  AND position($1 in query) > 0
+            )
+            "#,
+        )
+        .bind(&needle)
+        .fetch_one(&pool)
+        .await
+        .expect("poll prune lock wait");
+        if waiting {
+            saw_lock_wait = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        saw_lock_wait,
+        "prune should wait on the claim child before the writer commits"
+    );
+
+    writer_tx.commit().await.expect("commit open claim");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), prune_task)
+        .await
+        .expect("prune task timed out")
+        .expect("prune task panicked")
+        .expect("prune_oldest_claims");
+    assert!(
+        matches!(
+            outcome,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::ClaimOpen,
+                count: 1
+            }
+        ),
+        "post-lock proof must see the committed open claim, got {outcome:?}"
+    );
+
+    let survived: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claims_0 WHERE job_id = 1001"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count post-lock survivor");
+    assert_eq!(
+        survived, 1,
+        "claim committed during the lock wait must survive SkippedActive prune"
+    );
+}
+
 /// Admin-cancel wakes an in-flight handler via the `awa:cancel`
 /// NOTIFY channel. A slow handler checks `ctx.is_cancelled()` and exits
 /// with a cancel result as soon as the flag flips. The test enqueues a

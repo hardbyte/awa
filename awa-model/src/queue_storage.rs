@@ -26,7 +26,7 @@ const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
-const PRUNE_LOCK_TIMEOUT: &str = "10ms";
+const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -401,8 +401,12 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
 
 async fn set_prune_lock_timeout_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    timeout: Duration,
 ) -> Result<(), AwaError> {
-    sqlx::query(&format!("SET LOCAL lock_timeout = '{PRUNE_LOCK_TIMEOUT}'"))
+    let millis = timeout.as_millis().max(1).min(i64::MAX as u128);
+    let timeout = format!("{millis}ms");
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(timeout)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -2271,6 +2275,7 @@ pub struct QueueStorage {
     /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
     /// (head row gone after a rolled-back ensure_lane).
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
+    prune_lock_timeout: Duration,
 }
 
 impl QueueStorage {
@@ -2314,7 +2319,19 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
+            prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn with_prune_lock_timeout(mut self, timeout: Duration) -> Result<Self, AwaError> {
+        if timeout.is_zero() {
+            return Err(AwaError::Validation(
+                "queue storage prune lock timeout must be greater than zero".into(),
+            ));
+        }
+        self.prune_lock_timeout = timeout;
+        Ok(self)
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {
@@ -12685,7 +12702,7 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedActive);
         }
 
-        set_prune_lock_timeout_tx(&mut tx).await?;
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_delta = sqlx::query(&format!(
             "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
@@ -12991,7 +13008,7 @@ impl QueueStorage {
             });
         }
 
-        set_prune_lock_timeout_tx(&mut tx).await?;
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_tables = sqlx::query(&format!(
             "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
@@ -13359,7 +13376,7 @@ impl QueueStorage {
 
         let lease_child = lease_child_name(schema, slot as usize);
 
-        set_prune_lock_timeout_tx(&mut tx).await?;
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_table = sqlx::query(&format!(
             "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
@@ -13633,7 +13650,7 @@ impl QueueStorage {
             });
         }
 
-        set_prune_lock_timeout_tx(&mut tx).await?;
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_tables = sqlx::query(&format!(
             "LOCK TABLE {claim_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
