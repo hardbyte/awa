@@ -101,12 +101,11 @@ TableSpec == [
     ready_claim_attempt_batches
                            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     ready_tombstones       |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
-    \* One row per committed ready lane range, not per completion. The
-    \* live row count is bounded by the retained queue-ring slots times
-    \* producer/reroute batch ranges per slot; prune deletes the segment
-    \* rows when it truncates the owning ready slot.
-    ready_segments         |-> [kind |-> "Warm", hot |-> "hot",
-                                bounded_by |-> "retained_ready_slot_lane_ranges"],
+    \* One row per committed ready lane range, not per completion.
+    \* Prune truncates the segment child when it truncates the owning
+    \* ready slot.
+    ready_segments         |-> [kind |-> "PartitionTruncate", hot |-> "hot",
+                                bounded_by |-> ""],
     done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     receipt_completion_batches
                            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
@@ -472,7 +471,7 @@ PruneReadyTx  == <<
     Mut("Truncate", "receipt_completion_tombstones"),
     Mut("Truncate", "ready_tombstones"),
     Mut("Truncate", "queue_terminal_count_deltas"),
-    Mut("Delete", "ready_segments")
+    Mut("Truncate", "ready_segments")
 >>
 
 TerminalDeltaRollupTx == <<

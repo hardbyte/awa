@@ -2241,6 +2241,36 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
         ready_segments, 1,
         "insert_job_compat must append ready segment metadata with the ready row"
     );
+
+    let ready_segments_partitioned: bool = sqlx::query_scalar(
+        r#"
+        SELECT c.relkind = 'p'
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1
+          AND c.relname = 'ready_segments'
+        "#,
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        ready_segments_partitioned,
+        "ready_segments must be a partitioned queue-ring parent"
+    );
+
+    let ready_segment_child_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass(format('%I.%I', $1, 'ready_segments_0')) IS NOT NULL",
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        ready_segment_child_exists,
+        "ready_segments_0 child must exist for queue-ring prune"
+    );
 }
 
 #[tokio::test]

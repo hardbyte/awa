@@ -138,6 +138,7 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
         r#"
         SELECT
             to_regclass(format('%I.%I', $1, 'job_id_seq')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_receipt_id_seq')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'queue_ring_state')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_entries')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_claim_attempt_batches')) IS NOT NULL

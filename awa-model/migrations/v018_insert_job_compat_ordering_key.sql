@@ -274,26 +274,28 @@ BEGIN
             v_payload
         );
 
-        INSERT INTO ready_segments (
-            ready_slot,
-            ready_generation,
-            queue,
-            priority,
-            enqueue_shard,
-            first_lane_seq,
-            next_lane_seq,
-            first_run_at
-        ) VALUES (
-            v_ready_slot,
-            v_ready_generation,
-            v_queue,
-            v_priority,
-            v_enqueue_shard,
-            v_lane_seq,
-            v_lane_seq + 1,
-            v_run_at
-        )
-        ON CONFLICT (queue, priority, enqueue_shard, first_lane_seq) DO NOTHING;
+        IF to_regclass(format('%I.%I', v_schema, 'ready_segments')) IS NOT NULL THEN
+            INSERT INTO ready_segments (
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                first_lane_seq,
+                next_lane_seq,
+                first_run_at
+            ) VALUES (
+                v_ready_slot,
+                v_ready_generation,
+                v_queue,
+                v_priority,
+                v_enqueue_shard,
+                v_lane_seq,
+                v_lane_seq + 1,
+                v_run_at
+            )
+            ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING;
+        END IF;
 
         PERFORM set_config('search_path', v_old_search_path, true);
 

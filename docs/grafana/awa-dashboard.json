@@ -611,7 +611,7 @@
           "id": 702,
           "type": "timeseries",
           "title": "Rotation skip blockers (queue ring)",
-          "description": "When queue rotation is SkippedBusy, which side held it: ready_entries rows or done_entries rows on the next slot? These are bounded presence signals, not exact row counts.",
+          "description": "When queue rotation is SkippedBusy, which queue/lease/claim partition family held it. These are bounded presence signals, not exact row counts.",
           "gridPos": {
             "x": 12,
             "y": 42,

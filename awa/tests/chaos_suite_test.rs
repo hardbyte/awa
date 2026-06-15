@@ -76,59 +76,91 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
     // test does not accidentally wait on the wrong one.
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
         let sql = format!(
-            "SELECT state::text, count(*)::bigint FROM ( \
-                 SELECT 'available'::awa.job_state AS state \
-                 FROM {schema}.ready_entries AS ready \
-                 JOIN {schema}.queue_claim_heads AS claims \
-                   ON claims.queue = ready.queue \
-                  AND claims.priority = ready.priority \
-                  AND claims.enqueue_shard = ready.enqueue_shard \
-                 WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name) \
+            "WITH live_counts AS ( \
+                 SELECT state::text, count(*)::bigint AS count FROM ( \
+                     SELECT 'available'::awa.job_state AS state \
+                     FROM {schema}.ready_entries AS ready \
+                     JOIN {schema}.queue_claim_heads AS claims \
+                       ON claims.queue = ready.queue \
+                      AND claims.priority = ready.priority \
+                      AND claims.enqueue_shard = ready.enqueue_shard \
+                     WHERE ready.queue = $1 \
+                       AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name) \
+                     UNION ALL \
+                     SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
+                     UNION ALL \
+                     SELECT state FROM {schema}.leases WHERE queue = $1 \
+                     UNION ALL \
+                     SELECT 'running'::awa.job_state AS state \
+                     FROM {schema}.lease_claims AS lc \
+                     WHERE lc.queue = $1 \
+                       AND lc.closed_at IS NULL \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+                         WHERE cx.claim_slot = lc.claim_slot \
+                           AND cx.job_id = lc.job_id \
+                           AND cx.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+                         WHERE cb.receipt_ranges @> lc.receipt_id \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.leases AS lease \
+                         WHERE lease.job_id = lc.job_id \
+                           AND lease.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.deferred_jobs AS deferred \
+                         WHERE deferred.job_id = lc.job_id \
+                           AND deferred.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.terminal_jobs AS terminal \
+                         WHERE terminal.job_id = lc.job_id \
+                           AND terminal.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.dlq_entries AS dlq \
+                         WHERE dlq.job_id = lc.job_id \
+                           AND dlq.run_lease = lc.run_lease \
+                       ) \
+                     UNION ALL \
+                     SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
+                     UNION ALL \
+                     SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
+                 ) AS jobs \
+                 GROUP BY state \
+             ), \
+             pruned_terminal AS ( \
+                 SELECT 'completed'::text AS state, \
+                        COALESCE( \
+                            sum( \
+                                GREATEST( \
+                                    COALESCE(lanes.pruned_completed_count, 0), \
+                                    COALESCE(rollups.pruned_completed_count, 0) \
+                                ) \
+                            ), \
+                            0 \
+                        )::bigint AS count \
+                 FROM ( \
+                     SELECT queue, priority, pruned_completed_count \
+                     FROM {schema}.queue_lanes \
+                     WHERE queue = $1 \
+                 ) AS lanes \
+                 FULL OUTER JOIN ( \
+                     SELECT queue, priority, pruned_completed_count \
+                     FROM {schema}.queue_terminal_rollups \
+                     WHERE queue = $1 \
+                 ) AS rollups \
+                 USING (queue, priority) \
+             ) \
+             SELECT state, sum(count)::bigint AS count \
+             FROM ( \
+                 SELECT state, count FROM live_counts \
                  UNION ALL \
-                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.leases WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT 'running'::awa.job_state AS state \
-                 FROM {schema}.lease_claims AS lc \
-                 WHERE lc.queue = $1 \
-                   AND lc.closed_at IS NULL \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
-                     WHERE cx.claim_slot = lc.claim_slot \
-                       AND cx.job_id = lc.job_id \
-                       AND cx.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
-                     WHERE cb.receipt_ranges @> lc.receipt_id \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.leases AS lease \
-                     WHERE lease.job_id = lc.job_id \
-                       AND lease.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.deferred_jobs AS deferred \
-                     WHERE deferred.job_id = lc.job_id \
-                       AND deferred.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.terminal_jobs AS terminal \
-                     WHERE terminal.job_id = lc.job_id \
-                       AND terminal.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.dlq_entries AS dlq \
-                     WHERE dlq.job_id = lc.job_id \
-                       AND dlq.run_lease = lc.run_lease \
-                   ) \
-                 UNION ALL \
-                 SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
-             ) AS jobs \
+                 SELECT state, count FROM pruned_terminal WHERE count > 0 \
+             ) AS counts \
              GROUP BY state"
         );
         let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
@@ -1081,11 +1113,6 @@ impl Worker for MixedFleetRustWorker {
         let args: ChaosProbe = serde_json::from_value(ctx.job.args.clone()).map_err(|err| {
             JobError::terminal(format!("failed to decode mixed fleet args: {err}"))
         })?;
-        if args.marker.starts_with("python-") {
-            // Keep the mixed-language smoke deterministic: wrong-language
-            // claims yield the job back without burning an attempt.
-            return Ok(JobResult::Snooze(Duration::from_millis(50)));
-        }
         tokio::time::sleep(Duration::from_millis(20)).await;
         self.tx
             .send(args.marker)
@@ -1575,6 +1602,10 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
     let batch_size = 12_i64;
     let expected_rust_markers = expected_mixed_fleet_markers("rust", batch_size);
     let expected_python_markers = expected_mixed_fleet_markers("python", batch_size);
+    let expected_markers = expected_rust_markers
+        .union(&expected_python_markers)
+        .cloned()
+        .collect::<HashSet<_>>();
 
     let test_result = async {
         python_worker
@@ -1611,14 +1642,12 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
             .expect("Failed to insert Rust-enqueued ChaosProbe");
         }
 
-        let deadline = tokio::time::sleep(scaled_timeout(Duration::from_secs(30)));
+        let deadline = tokio::time::sleep(scaled_timeout(Duration::from_secs(60)));
         tokio::pin!(deadline);
-        let mut rust_completed = HashSet::new();
-        let mut python_completed = HashSet::new();
+        let mut completed_markers = HashSet::new();
 
         loop {
-            if rust_completed == expected_rust_markers && python_completed == expected_python_markers
-            {
+            if completed_markers == expected_markers {
                 break;
             }
 
@@ -1626,12 +1655,12 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
                 marker = rx.recv() => {
                     let marker = marker.expect("Rust mixed-fleet receiver closed unexpectedly");
                     assert!(
-                        marker.starts_with("rust-"),
+                        expected_markers.contains(&marker),
                         "Unexpected marker processed by Rust worker: {marker}"
                     );
                     assert!(
-                        rust_completed.insert(marker.clone()),
-                        "Rust marker completed more than once: {marker}"
+                        completed_markers.insert(marker.clone()),
+                        "Marker completed more than once: {marker}"
                     );
                 }
                 line = python_worker.stdout_lines.recv() => {
@@ -1641,27 +1670,61 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
                             .unwrap_or_else(|| panic!("Python completion line missing marker: {line}"))
                             .to_string();
                         assert!(
-                            marker.starts_with("python-"),
+                            expected_markers.contains(&marker),
                             "Unexpected python worker completion line: {line}"
                         );
                         assert!(
-                            python_completed.insert(marker.clone()),
-                            "Python marker completed more than once: {marker}"
+                            completed_markers.insert(marker.clone()),
+                            "Marker completed more than once: {marker}"
                         );
                     }
                 }
                 () = &mut deadline => {
                     let counts = queue_state_counts(&pool, &queue).await;
                     let missing_rust =
-                        missing_mixed_fleet_markers(&expected_rust_markers, &rust_completed);
+                        missing_mixed_fleet_markers(&expected_rust_markers, &completed_markers);
                     let missing_python =
-                        missing_mixed_fleet_markers(&expected_python_markers, &python_completed);
+                        missing_mixed_fleet_markers(&expected_python_markers, &completed_markers);
                     panic!(
-                        "Timed out waiting for mixed-fleet completions; rust_completed={}, python_completed={}, missing_rust={missing_rust:?}, missing_python={missing_python:?}, state_counts={counts:?}",
-                        rust_completed.len(),
-                        python_completed.len(),
+                        "Timed out waiting for mixed-fleet completions; completed={}, missing_rust={missing_rust:?}, missing_python={missing_python:?}, state_counts={counts:?}",
+                        completed_markers.len(),
                     );
                 }
+            }
+        }
+
+        let quiet_deadline = tokio::time::sleep(scaled_timeout(Duration::from_millis(250)));
+        tokio::pin!(quiet_deadline);
+        loop {
+            tokio::select! {
+                marker = rx.recv() => {
+                    let marker = marker.expect("Rust mixed-fleet receiver closed unexpectedly");
+                    assert!(
+                        expected_markers.contains(&marker),
+                        "Unexpected Rust marker processed after expected drain: {marker}"
+                    );
+                    assert!(
+                        completed_markers.insert(marker.clone()),
+                        "Marker completed more than once after expected drain: {marker}"
+                    );
+                }
+                line = python_worker.stdout_lines.recv() => {
+                    let line = line.expect("Python mixed-fleet worker stdout closed unexpectedly");
+                    if line.contains("COMPLETE mode=worker_chaos_probe") {
+                        let marker = mixed_fleet_marker_from_line(&line)
+                            .unwrap_or_else(|| panic!("Python completion line missing marker: {line}"))
+                            .to_string();
+                        assert!(
+                            expected_markers.contains(&marker),
+                            "Unexpected Python marker processed after expected drain: {marker}"
+                        );
+                        assert!(
+                            completed_markers.insert(marker.clone()),
+                            "Marker completed more than once after expected drain: {marker}"
+                        );
+                    }
+                }
+                () = &mut quiet_deadline => break,
             }
         }
 

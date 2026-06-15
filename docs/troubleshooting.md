@@ -302,7 +302,7 @@ WHERE schemaname = '<schema>'
       relname = 'attempt_state'
       OR relname = 'deferred_jobs'
       OR relname = 'dlq_entries'
-      OR relname = 'ready_segments'
+      OR relname LIKE 'ready_segments_%'
       OR relname LIKE 'ready_entries%'
       OR relname LIKE 'ready_tombstones%'
       OR relname LIKE 'done_entries%'
@@ -315,7 +315,7 @@ ORDER BY n_dead_tup DESC, relname;
 Interpretation:
 
 - `ready_entries%`, `ready_tombstones%`, and `queue_terminal_count_deltas%` should usually stay at or near zero dead tuples
-- `ready_segments` is compact control-plane metadata; live rows should track retained ready lane ranges, and dead rows should clear under ordinary vacuum after queue prune deletes reclaimed slot ranges
+- `ready_segments_*` is compact control-plane metadata; live rows should track retained ready lane ranges, and queue prune truncates reclaimed slot children with the rest of the ready family
 - `leases%` can rise within the current rotation window, but should fall again after prune
 - `attempt_state` should roughly match live long-running attempts, not total queue depth, and should return close to zero after drain
 - `autovacuum_count` staying flat for a long time can indicate vacuum is not keeping up on churn-heavy lease partitions

@@ -1716,6 +1716,7 @@ impl MaintenanceService {
                             ready_rows = busy.queue_ready,
                             claim_attempt_batches = busy.queue_claim_attempt_batches,
                             done_rows = busy.queue_done,
+                            ready_segments = busy.queue_ready_segments,
                             receipt_completion_batches = busy.queue_receipt_completion_batches,
                             receipt_completion_tombstones =
                                 busy.queue_receipt_completion_tombstones,
