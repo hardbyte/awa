@@ -530,48 +530,82 @@ async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
         .expect("Failed to count lease_claims")
 }
 
+async fn lease_claim_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.lease_claim_batches",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count lease_claim_batches")
+}
+
 /// Count of receipt-backed attempts that are currently "open" — claimed
 /// but not yet closed, materialized into a live lease row, or moved to
 /// another state table. The runtime derives this set from the partitioned
-/// `lease_claims` table with anti-joins; this helper mirrors that query so
+/// claim ledgers with anti-joins; this helper mirrors that query so
 /// test assertions read the same definition the runtime does.
 async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     let schema = store.schema();
     let sql = format!(
         r#"
+        WITH claim_items AS (
+            SELECT
+                claims.claim_slot,
+                claims.job_id,
+                claims.run_lease,
+                claims.receipt_id,
+                claims.closed_at
+            FROM {schema}.lease_claims AS claims
+            UNION ALL
+            SELECT
+                claim_batches.claim_slot,
+                items.job_id,
+                items.run_lease,
+                items.receipt_id,
+                NULL::timestamptz AS closed_at
+            FROM {schema}.lease_claim_batches AS claim_batches
+            CROSS JOIN LATERAL unnest(
+                claim_batches.job_ids,
+                claim_batches.run_leases,
+                claim_batches.receipt_ids
+            ) AS items(job_id, run_lease, receipt_id)
+        )
         SELECT count(*)::bigint
-        FROM {schema}.lease_claims AS claims
+        FROM claim_items AS claims
         WHERE claims.closed_at IS NULL
           AND NOT EXISTS (
-            SELECT 1 FROM {schema}.lease_claim_closures AS closures
-            WHERE closures.claim_slot = claims.claim_slot
-              AND closures.job_id = claims.job_id
-              AND closures.run_lease = claims.run_lease
-        )
+              SELECT 1 FROM {schema}.lease_claim_closures AS closures
+              WHERE closures.claim_slot = claims.claim_slot
+                AND closures.job_id = claims.job_id
+                AND closures.run_lease = claims.run_lease
+          )
           AND NOT EXISTS (
-            SELECT 1
-            FROM {schema}.lease_claim_closure_batches AS closure_batches
-            WHERE closure_batches.receipt_ranges @> claims.receipt_id
-        )
+              SELECT 1
+              FROM {schema}.lease_claim_closure_batches AS closure_batches
+              WHERE closure_batches.claim_slot = claims.claim_slot
+                AND closure_batches.receipt_ranges @> claims.receipt_id
+          )
           AND NOT EXISTS (
-            SELECT 1 FROM {schema}.leases AS lease
-            WHERE lease.job_id = claims.job_id
-              AND lease.run_lease = claims.run_lease
-        )
+              SELECT 1 FROM {schema}.leases AS lease
+              WHERE lease.job_id = claims.job_id
+                AND lease.run_lease = claims.run_lease
+          )
           AND NOT EXISTS (
-            SELECT 1 FROM {schema}.deferred_jobs AS deferred
-            WHERE deferred.job_id = claims.job_id
-              AND deferred.run_lease = claims.run_lease
-        )
+              SELECT 1 FROM {schema}.deferred_jobs AS deferred
+              WHERE deferred.job_id = claims.job_id
+                AND deferred.run_lease = claims.run_lease
+          )
           AND NOT EXISTS (
-            SELECT 1 FROM {schema}.terminal_jobs AS terminal
-            WHERE terminal.job_id = claims.job_id
-              AND terminal.run_lease = claims.run_lease
-        )
+              SELECT 1 FROM {schema}.terminal_jobs AS terminal
+              WHERE terminal.job_id = claims.job_id
+                AND terminal.run_lease = claims.run_lease
+          )
           AND NOT EXISTS (
-            SELECT 1 FROM {schema}.dlq_entries AS dlq
-            WHERE dlq.job_id = claims.job_id
-              AND dlq.run_lease = claims.run_lease
+              SELECT 1 FROM {schema}.dlq_entries AS dlq
+              WHERE dlq.job_id = claims.job_id
+                AND dlq.run_lease = claims.run_lease
         )
         "#,
     );
@@ -579,6 +613,60 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
         .fetch_one(pool)
         .await
         .expect("Failed to count open receipt claims (derived)")
+}
+
+async fn receipt_claim_slot_for_job(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) -> i32 {
+    let schema = store.schema();
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT claim_slot
+        FROM (
+            SELECT claims.claim_slot, claims.job_id, claims.run_lease
+            FROM {schema}.lease_claims AS claims
+            UNION ALL
+            SELECT claim_batches.claim_slot, items.job_id, items.run_lease
+            FROM {schema}.lease_claim_batches AS claim_batches
+            CROSS JOIN LATERAL unnest(
+                claim_batches.job_ids,
+                claim_batches.run_leases
+            ) AS items(job_id, run_lease)
+        ) AS claim_items
+        WHERE job_id = $1
+        ORDER BY run_lease DESC
+        LIMIT 1
+        "#
+    ))
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("read claim_slot from receipt claim evidence")
+}
+
+async fn receipt_claim_count_in_child(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    claim_slot: i32,
+    job_id: i64,
+) -> i64 {
+    let claim_child = format!("{schema}.lease_claims_{claim_slot}");
+    let claim_batch_child = format!("{schema}.lease_claim_batches_{claim_slot}");
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT
+            (SELECT count(*)::bigint FROM {claim_child} WHERE job_id = $1)
+            +
+            COALESCE((
+                SELECT count(*)::bigint
+                FROM {claim_batch_child} AS claim_batches
+                CROSS JOIN LATERAL unnest(claim_batches.job_ids) AS items(job_id)
+                WHERE items.job_id = $1
+            ), 0)
+        "#
+    ))
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("count receipt claim evidence in child")
 }
 
 async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
@@ -813,15 +901,31 @@ async fn age_receipt_claim(
 ) {
     let age_millis = i64::try_from(age.as_millis()).expect("test receipt age fits in i64 millis");
     sqlx::query(&format!(
-        "UPDATE {}.lease_claims
-         SET claimed_at = clock_timestamp() - ($1 * interval '1 millisecond')
-         WHERE job_id = $2 AND run_lease = $3",
-        store.schema()
+        r#"
+        WITH aged_rows AS (
+            UPDATE {schema}.lease_claims
+            SET claimed_at = clock_timestamp() - ($1 * interval '1 millisecond')
+            WHERE job_id = $2 AND run_lease = $3
+            RETURNING job_id
+        ),
+        aged_batches AS (
+            UPDATE {schema}.lease_claim_batches AS claim_batches
+            SET claimed_at = clock_timestamp() - ($1 * interval '1 millisecond')
+            WHERE EXISTS (
+                SELECT 1
+                FROM unnest(claim_batches.job_ids, claim_batches.run_leases) AS items(job_id, run_lease)
+                WHERE items.job_id = $2 AND items.run_lease = $3
+            )
+            RETURNING batch_id
+        )
+        SELECT (SELECT count(*) FROM aged_rows) + (SELECT count(*) FROM aged_batches)
+        "#,
+        schema = store.schema()
     ))
     .bind(age_millis)
     .bind(job_id)
     .bind(run_lease)
-    .execute(pool)
+    .fetch_one(pool)
     .await
     .expect("Failed to age receipt claim for rescue test");
 }
@@ -2165,7 +2269,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
 
     // Claim + complete a receipt-backed job. Without prune, this leaves
-    // one row in lease_claims_0 and one compact receipt completion batch.
+    // compact claim evidence in lease_claim_batches_0 and one compact receipt
+    // completion batch.
     let job_id = enqueue_job(
         &pool,
         &store,
@@ -2204,18 +2309,17 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
 
     // Sanity: the claim landed in slot 0 and compact claim-local batch
     // evidence closes it without an explicit per-job closure row.
-    let slot0_claims: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
-            .fetch_one(&pool)
-            .await
-            .expect("count lease_claims_0");
+    let slot0_claims = receipt_claim_count_in_child(&pool, schema, 0, job_id).await;
     let slot0_closures: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures_0"
     ))
     .fetch_one(&pool)
     .await
     .expect("count lease_claim_closures_0");
-    assert_eq!(slot0_claims, 1, "completed claim must live in slot 0");
+    assert_eq!(
+        slot0_claims, 1,
+        "completed claim evidence must live in slot 0"
+    );
     assert_eq!(
         slot0_closures, 0,
         "compact successful completion must not write explicit closure rows"
@@ -2304,12 +2408,18 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         other => panic!("expected Pruned {{ slot: 0 }}, got {other:?}"),
     }
 
-    // Both children of slot 0 are now empty.
+    // Claim-ring children for slot 0 are now empty.
     let post_prune_claims: i64 =
         sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
             .fetch_one(&pool)
             .await
             .expect("count lease_claims_0 after prune");
+    let post_prune_claim_batches: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claim_batches_0"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count lease_claim_batches_0 after prune");
     let post_prune_closures: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures_0"
     ))
@@ -2319,6 +2429,10 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     assert_eq!(
         post_prune_claims, 0,
         "lease_claims_0 must be empty post-prune"
+    );
+    assert_eq!(
+        post_prune_claim_batches, 0,
+        "lease_claim_batches_0 must be empty post-prune"
     );
     assert_eq!(
         post_prune_closures, 0,
@@ -2973,8 +3087,13 @@ async fn test_open_receipt_claims_is_absent_after_install() {
 
     assert_eq!(
         lease_claim_count(&pool, &store).await,
+        0,
+        "zero-deadline receipts should not write per-job lease_claim rows"
+    );
+    assert_eq!(
+        lease_claim_batch_count(&pool, &store).await,
         1,
-        "the single receipt must live in lease_claims"
+        "the single receipt should live in a compact claim batch"
     );
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
@@ -3078,29 +3197,20 @@ async fn test_lease_claim_partition_routing() {
         .expect("completed job row");
     assert_eq!(completed.state, JobState::Completed);
 
-    // Assert the claim lives in the current claim slot and matching
+    // Assert the claim evidence lives in the current claim slot and matching
     // physical child partition.
-    let claim_slot: i32 = sqlx::query_scalar(&format!(
-        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 ORDER BY run_lease DESC LIMIT 1"
-    ))
-    .bind(job_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read claim_slot from lease_claims");
+    let claim_slot = receipt_claim_slot_for_job(&pool, &store, job_id).await;
     assert_eq!(
         claim_slot, current_slot,
-        "claim row should land in current slot"
+        "claim evidence should land in current slot"
     );
 
-    // Physically: the claim row must be addressable via its child-partition name.
-    let claim_in_child: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM {schema}.lease_claims_2 WHERE job_id = $1"
-    ))
-    .bind(job_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count in lease_claims_2");
-    assert!(claim_in_child >= 1, "claim row must be in lease_claims_2");
+    // Physically: the claim evidence must be addressable via its child partition.
+    let claim_in_child = receipt_claim_count_in_child(&pool, schema, current_slot, job_id).await;
+    assert!(
+        claim_in_child >= 1,
+        "claim evidence must be in claim slot child"
+    );
 
     let closure_in_child: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures_2 WHERE job_id = $1"
@@ -3130,20 +3240,20 @@ async fn test_lease_claim_partition_routing() {
         "compact receipt batch must retain the originating claim slot"
     );
 
+    let receipt_id = claimed[0]
+        .claim
+        .receipt_id
+        .expect("receipt claim should carry receipt_id");
     let compact_batch_closes_receipt: bool = sqlx::query_scalar(&format!(
         "SELECT EXISTS (
              SELECT 1
-             FROM {schema}.lease_claims AS claims
-             JOIN {schema}.lease_claim_closure_batches AS batches
-               ON batches.receipt_ranges @> claims.receipt_id
-             WHERE claims.job_id = $1
-               AND claims.run_lease = $2
-               AND batches.claim_slot = $3
+             FROM {schema}.lease_claim_closure_batches AS batches
+             WHERE batches.claim_slot = $1
+               AND batches.receipt_ranges @> $2
          )"
     ))
-    .bind(job_id)
-    .bind(claimed[0].job.run_lease)
     .bind(current_slot)
+    .bind(receipt_id)
     .fetch_one(&pool)
     .await
     .expect("read compact closure batch receipt range");
@@ -3244,13 +3354,7 @@ async fn test_lease_claim_rotation_isolation() {
 
     // Job A is still exactly where it was written — rotation didn't
     // mutate existing rows.
-    let job_a_slot_still: i32 = sqlx::query_scalar(&format!(
-        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 LIMIT 1"
-    ))
-    .bind(job_a)
-    .fetch_one(&pool)
-    .await
-    .expect("read slot_a still");
+    let job_a_slot_still = receipt_claim_slot_for_job(&pool, &store, job_a).await;
     assert_eq!(
         slot_a, job_a_slot_still,
         "rotation must not move existing claim rows across partitions"
@@ -4239,7 +4343,8 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(running.state, JobState::Running);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
     let running_counts = store
@@ -4262,7 +4367,8 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
@@ -4400,7 +4506,8 @@ async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_complet
         receipt_completion_batch_count(&pool, &store, queue).await,
         1
     );
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         0,
@@ -5199,7 +5306,8 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     .await;
     assert_eq!(running.state, JobState::Running);
     assert_eq!(lease_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
 
     let materialization_deadline = Instant::now() + Duration::from_secs(2);
@@ -5220,7 +5328,8 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
         .expect("Expected receipt-backed running job after heartbeat");
     assert_eq!(running.state, JobState::Running);
     assert!(running.heartbeat_at.is_some());
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
@@ -5300,7 +5409,8 @@ async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receip
         .await
         .expect("register callback and materialize receipt claim");
     assert_eq!(lease_count(&pool, &store).await, 1);
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         0,
@@ -5498,7 +5608,8 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 2);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
         1,
@@ -5687,7 +5798,8 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(completed.attempt, 2);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 2);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
@@ -6080,8 +6192,9 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
 
     let mut locked_claim_child = pool.begin().await.expect("begin claim child lock");
     let claim_child = format!("{schema}.lease_claims_{}", first[0].claim_slot);
+    let claim_batch_child = format!("{schema}.lease_claim_batches_{}", first[0].claim_slot);
     sqlx::query(&format!(
-        "LOCK TABLE {claim_child} IN ACCESS EXCLUSIVE MODE"
+        "LOCK TABLE {claim_child}, {claim_batch_child} IN ACCESS EXCLUSIVE MODE"
     ))
     .execute(locked_claim_child.as_mut())
     .await
@@ -6152,9 +6265,22 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     );
 
     let receipt_rows: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*)::bigint
-         FROM {schema}.lease_claims
-         WHERE job_id = $1 AND run_lease = $2"
+        r#"
+        WITH claim_items AS (
+            SELECT job_id, run_lease
+            FROM {schema}.lease_claims
+            WHERE job_id = $1 AND run_lease = $2
+            UNION ALL
+            SELECT items.job_id, items.run_lease
+            FROM {schema}.lease_claim_batches AS claim_batches
+            CROSS JOIN LATERAL unnest(
+                claim_batches.job_ids,
+                claim_batches.run_leases
+            ) AS items(job_id, run_lease)
+            WHERE items.job_id = $1 AND items.run_lease = $2
+        )
+        SELECT count(*)::bigint FROM claim_items
+        "#
     ))
     .bind(job_id)
     .bind(1_i64)
@@ -6163,7 +6289,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .expect("count receipt rows");
     assert_eq!(
         receipt_rows, 1,
-        "there must be only one receipt row for the claimed attempt across claim partitions"
+        "there must be only one logical receipt claim for the attempt across claim partitions"
     );
 
     assert_eq!(
@@ -6289,6 +6415,21 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .execute(&pool)
     .await
     .expect("remove claim evidence");
+    sqlx::query(&format!(
+        r#"
+        DELETE FROM {schema}.lease_claim_batches AS claim_batches
+        WHERE EXISTS (
+            SELECT 1
+            FROM unnest(claim_batches.job_ids, claim_batches.run_leases) AS items(job_id, run_lease)
+            WHERE items.job_id = $1 AND items.run_lease = $2
+        )
+        "#
+    ))
+    .bind(compact_job_id)
+    .bind(compact_run_lease)
+    .execute(&pool)
+    .await
+    .expect("remove compact claim evidence");
 
     let remaining_attempt_batches: i64 = sqlx::query_scalar(&format!(
         r#"
@@ -6442,7 +6583,8 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(running.attempt, 1);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
 
@@ -6460,7 +6602,8 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(completed.attempt, 2);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 2);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,

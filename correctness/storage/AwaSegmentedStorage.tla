@@ -15,7 +15,8 @@ EXTENDS TLC, Naturals, FiniteSets
 \* - lane_state
 \* - ready / lease / terminal segment families
 \* - claim segment family (ADR-023/026): lease_claims +
-\*   lease_claim_closures + lease_claim_closure_batches
+\*   lease_claim_batches + lease_claim_closures +
+\*   lease_claim_closure_batches
 \*   partitioned BY LIST (claim_slot), reclaimed by rotation + TRUNCATE
 \*   instead of the earlier open_receipt_claims INSERT+DELETE frontier
 \*
@@ -46,7 +47,9 @@ EXTENDS TLC, Naturals, FiniteSets
 \* re-appending to DLQ.
 \*
 \* Claim family modelling (ADR-023/026): every Claim action opens an
-\* append-only receipt in the current claim segment. Non-success exits
+\* append-only receipt in the current claim segment. In Rust, that receipt
+\* can be a row-local lease_claims entry or an item in lease_claim_batches;
+\* this model represents both as `claimOpen`. Non-success exits
 \* (FailToDlq / RetryToDeferred / RescueToReady /
 \* CancelWaitingToTerminal / TimeoutWaitingToDlq /
 \* TimeoutWaitingToReady) write an explicit closure row in that same
@@ -1373,10 +1376,11 @@ PruneTerminalSegment(seg) ==
 
 \* ADR-023 prune of the claim ring. The precondition
 \* `\A k : claimSegmentOf[k] = seg => k \in claimClosed` captures
-\* rescue-before-truncate: every claim row in the partition must have
+\* rescue-before-truncate: every claim evidence item in the partition must have
 \* durable closure evidence
 \* before `prune_oldest_claims` can TRUNCATE the lease_claims /
-\* lease_claim_closures / lease_claim_closure_batches children for that
+\* lease_claim_batches / lease_claim_closures /
+\* lease_claim_closure_batches children for that
 \* slot. Ready prune is separately
 \* guarded so it cannot remove terminal history before matching closure
 \* evidence exists. Note this iterates over ClaimKeys, so an old (j, r)

@@ -29,7 +29,7 @@
 --   v012 migration. Activation/finalization paths seed or update the
 --   `queue_storage` row.
 -- - The non-additive legacy upgrade edge cases (open_receipt_claims drop,
---   lease_claims / lease_claim_closures / lease_claim_closure_batches
+--   lease_claims / lease_claim_batches / lease_claim_closures / lease_claim_closure_batches
 --   rename-and-rebuild from a
 --   non-partitioned shape, queue_count_snapshots drop) — these are
 --   one-shot upgrade fixups that don't belong in a forward-only DDL
@@ -1085,10 +1085,17 @@ BEGIN
 
     EXECUTE format(
         $ddl$
+        CREATE SEQUENCE IF NOT EXISTS %I.lease_claim_batch_id_seq
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
         CREATE SEQUENCE IF NOT EXISTS %I.lease_claim_closure_batch_id_seq
         $ddl$,
-            p_schema
-        );
+        p_schema
+    );
 
     EXECUTE format(
         $ddl$
@@ -1114,6 +1121,64 @@ BEGIN
         $ddl$,
         p_schema,
         p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.lease_claim_batches (
+            claim_slot       INT NOT NULL,
+            batch_id         BIGINT NOT NULL DEFAULT nextval('%I.lease_claim_batch_id_seq'::regclass),
+            ready_slot       INT NOT NULL,
+            ready_generation BIGINT NOT NULL,
+            queue            TEXT NOT NULL,
+            priority         SMALLINT NOT NULL,
+            enqueue_shard    SMALLINT NOT NULL DEFAULT 0,
+            claimed_count    INT NOT NULL,
+            job_ids          BIGINT[] NOT NULL,
+            run_leases       BIGINT[] NOT NULL,
+            receipt_ids      BIGINT[] NOT NULL,
+            receipt_ranges   INT8MULTIRANGE NOT NULL,
+            lane_seqs        BIGINT[] NOT NULL,
+            attempts         SMALLINT[] NOT NULL,
+            max_attempts     SMALLINT[] NOT NULL,
+            deadline_at      TIMESTAMPTZ,
+            claimed_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            PRIMARY KEY (claim_slot, batch_id),
+            CHECK (claimed_count > 0),
+            CHECK (claimed_count = cardinality(job_ids)),
+            CHECK (claimed_count = cardinality(run_leases)),
+            CHECK (claimed_count = cardinality(receipt_ids)),
+            CHECK (claimed_count = cardinality(lane_seqs)),
+            CHECK (claimed_count = cardinality(attempts)),
+            CHECK (claimed_count = cardinality(max_attempts))
+        ) PARTITION BY LIST (claim_slot)
+        $ddl$,
+        p_schema,
+        p_schema
+    );
+
+    EXECUTE format(
+        'COMMENT ON TABLE %I.lease_claim_batches IS %L',
+        p_schema,
+        'Append-only compact receipt-claim ledger. Zero-deadline receipt claims can store one row per claim batch here instead of one lease_claims row per job; cold paths expand by receipt_id and materialize only when needed.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claim_batches.receipt_ids IS %L',
+        p_schema,
+        'Stable receipt identities assigned from lease_claim_receipt_id_seq for each claimed attempt in this batch. The worker handle carries these IDs through compact completion.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claim_batches.receipt_ranges IS %L',
+        p_schema,
+        'Compact multirange derived from receipt_ids for exact indexed membership checks without unnested terminal history.'
+    );
+
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.lease_claim_batches.deadline_at IS %L',
+        p_schema,
+        'Reserved for future compact deadline support. The initial compact claim path only uses this ledger when deadline_at is NULL; deadline-backed claims continue to write row-local lease_claims.'
     );
 
     EXECUTE format(
@@ -1315,7 +1380,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON TABLE %I.lease_claim_closure_batches IS %L',
         p_schema,
-        'Append-only compact closure evidence for high-volume receipt completions. Each row closes a batch of immutable lease_claims rows by receipt_id and is reclaimed with the matching claim-slot partition.'
+        'Append-only compact closure evidence for high-volume receipt completions. Each row closes a batch of immutable receipt claims by receipt_id, whether those claims live as row-local lease_claims rows or compact lease_claim_batches items, and is reclaimed with the matching claim-slot partition.'
     );
 
     EXECUTE format(
@@ -1339,7 +1404,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON COLUMN %I.lease_claim_closure_batches.receipt_ranges IS %L',
         p_schema,
-        'Compact multirange derived from receipt_ids for exact indexed closure membership checks. Membership is exact because receipt_id is assigned once per lease_claims row from a global sequence.'
+        'Compact multirange derived from receipt_ids for exact indexed closure membership checks. Membership is exact because receipt_id is assigned once per receipt claim from a global sequence.'
     );
 
     EXECUTE format(
@@ -1358,6 +1423,26 @@ BEGIN
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.lease_claim_closures FOR VALUES IN (%s)',
             p_schema, format('lease_claim_closures_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.lease_claim_batches FOR VALUES IN (%s)',
+            p_schema, format('lease_claim_batches_%s', v_slot), p_schema, v_slot
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_batches_%s_receipt_ranges ON %I.%I USING GIST (receipt_ranges)',
+            p_schema, v_slot, p_schema, format('lease_claim_batches_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_batches_%s_ready_ref ON %I.%I (ready_slot, ready_generation)',
+            p_schema, v_slot, p_schema, format('lease_claim_batches_%s', v_slot)
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_batches_%s_rescue_cursor ON %I.%I (claimed_at, batch_id)',
+            p_schema, v_slot, p_schema, format('lease_claim_batches_%s', v_slot)
         );
 
         EXECUTE format(
@@ -2608,8 +2693,10 @@ BEGIN
 
     --------------------------------------------------------------------
     -- claim_ready_runtime() function. The claim CTE branches on the
-    -- receipts mode: receipts=TRUE writes into lease_claims (ADR-023),
-    -- receipts=FALSE writes directly into the partitioned leases table.
+    -- receipts mode: receipts=TRUE writes compact zero-deadline claims into
+    -- lease_claim_batches or deadline-backed claims into lease_claims
+    -- (ADR-023); receipts=FALSE writes directly into the partitioned leases
+    -- table.
     --------------------------------------------------------------------
 
     IF p_lease_claim_receipts THEN
@@ -2666,9 +2753,85 @@ BEGIN
                     attempt_rows.next_lane_seq,
                     attempt_rows.lane_ranges
             ),
-            claimed AS (
+            claim_items AS MATERIALIZED (
+                SELECT
+                    attempts.claim_slot,
+                    selected.ready_slot,
+                    selected.ready_generation,
+                    selected.job_id,
+                    selected.queue,
+                    selected.effective_priority AS priority,
+                    selected.lane_seq,
+                    v_lane_shard AS enqueue_shard,
+                    (selected.attempt + 1)::smallint AS attempt,
+                    (selected.run_lease + 1)::bigint AS run_lease,
+                    selected.max_attempts::smallint AS max_attempts,
+                    nextval('%1$I.lease_claim_receipt_id_seq'::regclass)::bigint AS receipt_id
+                FROM selected_with_spent AS selected
+                JOIN claim_attempt_batches AS attempts
+                  ON attempts.ready_slot = selected.ready_slot
+                 AND attempts.ready_generation = selected.ready_generation
+                 AND attempts.queue = selected.queue
+                 AND attempts.lane_priority = selected.lane_priority
+                 AND attempts.enqueue_shard = v_lane_shard
+                 AND attempts.first_lane_seq <= selected.lane_seq
+                 AND attempts.next_lane_seq > selected.lane_seq
+                 AND attempts.lane_ranges @> int8range(selected.lane_seq, selected.lane_seq + 1, '[)')
+                WHERE NOT selected.attempt_spent
+            ),
+            compact_claim_batches AS (
+                INSERT INTO %1$I.lease_claim_batches AS claim_batches (
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    claimed_count,
+                    job_ids,
+                    run_leases,
+                    receipt_ids,
+                    receipt_ranges,
+                    lane_seqs,
+                    attempts,
+                    max_attempts,
+                    deadline_at,
+                    claimed_at
+                )
+                SELECT
+                    claim_items.claim_slot,
+                    claim_items.ready_slot,
+                    claim_items.ready_generation,
+                    claim_items.queue,
+                    claim_items.priority,
+                    claim_items.enqueue_shard,
+                    count(*)::int AS claimed_count,
+                    array_agg(claim_items.job_id ORDER BY claim_items.lane_seq, claim_items.job_id),
+                    array_agg(claim_items.run_lease ORDER BY claim_items.lane_seq, claim_items.job_id),
+                    array_agg(claim_items.receipt_id ORDER BY claim_items.lane_seq, claim_items.job_id),
+                    range_agg(int8range(claim_items.receipt_id, claim_items.receipt_id + 1, '[)') ORDER BY claim_items.receipt_id),
+                    array_agg(claim_items.lane_seq ORDER BY claim_items.lane_seq, claim_items.job_id),
+                    array_agg(claim_items.attempt ORDER BY claim_items.lane_seq, claim_items.job_id),
+                    array_agg(claim_items.max_attempts ORDER BY claim_items.lane_seq, claim_items.job_id),
+                    NULL::timestamptz,
+                    v_claimed_at
+                FROM claim_items
+                WHERE p_deadline_secs <= 0
+                GROUP BY
+                    claim_items.claim_slot,
+                    claim_items.ready_slot,
+                    claim_items.ready_generation,
+                    claim_items.queue,
+                    claim_items.priority,
+                    claim_items.enqueue_shard
+                RETURNING
+                    claim_batches.claim_slot,
+                    claim_batches.receipt_ranges
+            ),
+            row_claims AS (
                 INSERT INTO %1$I.lease_claims AS claim_rows (
                     claim_slot,
+                    receipt_id,
                     job_id,
                     run_lease,
                     ready_slot,
@@ -2682,29 +2845,21 @@ BEGIN
                     deadline_at
                 )
                 SELECT
-                    attempts.claim_slot,
-                    selected.job_id,
-                    selected.run_lease + 1,
-                    selected.ready_slot,
-                    selected.ready_generation,
-                    selected.queue,
-                    selected.effective_priority,
-                    selected.attempt + 1,
-                    selected.max_attempts,
-                    selected.lane_seq,
-                    v_lane_shard,
+                    claim_items.claim_slot,
+                    claim_items.receipt_id,
+                    claim_items.job_id,
+                    claim_items.run_lease,
+                    claim_items.ready_slot,
+                    claim_items.ready_generation,
+                    claim_items.queue,
+                    claim_items.priority,
+                    claim_items.attempt,
+                    claim_items.max_attempts,
+                    claim_items.lane_seq,
+                    claim_items.enqueue_shard,
                     v_deadline_at
-                FROM selected_with_spent AS selected
-                JOIN claim_attempt_batches AS attempts
-                  ON attempts.ready_slot = selected.ready_slot
-                 AND attempts.ready_generation = selected.ready_generation
-                 AND attempts.queue = selected.queue
-                 AND attempts.lane_priority = selected.lane_priority
-                 AND attempts.enqueue_shard = v_lane_shard
-                 AND attempts.first_lane_seq <= selected.lane_seq
-                 AND attempts.next_lane_seq > selected.lane_seq
-                 AND attempts.lane_ranges @> int8range(selected.lane_seq, selected.lane_seq + 1, '[)')
-                WHERE NOT selected.attempt_spent
+                FROM claim_items
+                WHERE p_deadline_secs > 0
                 RETURNING
                     claim_rows.claim_slot,
                     claim_rows.receipt_id,
@@ -2717,6 +2872,38 @@ BEGIN
                     claim_rows.attempt,
                     claim_rows.run_lease,
                     claim_rows.max_attempts
+            ),
+            claimed AS (
+                SELECT
+                    row_claims.claim_slot,
+                    row_claims.receipt_id,
+                    row_claims.ready_slot,
+                    row_claims.ready_generation,
+                    row_claims.job_id,
+                    row_claims.queue,
+                    row_claims.priority,
+                    row_claims.lane_seq,
+                    row_claims.attempt,
+                    row_claims.run_lease,
+                    row_claims.max_attempts
+                FROM row_claims
+                UNION ALL
+                SELECT
+                    claim_items.claim_slot,
+                    claim_items.receipt_id,
+                    claim_items.ready_slot,
+                    claim_items.ready_generation,
+                    claim_items.job_id,
+                    claim_items.queue,
+                    claim_items.priority,
+                    claim_items.lane_seq,
+                    claim_items.attempt,
+                    claim_items.run_lease,
+                    claim_items.max_attempts
+                FROM claim_items
+                JOIN compact_claim_batches AS batches
+                  ON batches.claim_slot = claim_items.claim_slot
+                 AND batches.receipt_ranges @> int8range(claim_items.receipt_id, claim_items.receipt_id + 1, '[)')
             )
             $cte$,
             p_schema

@@ -139,6 +139,7 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
         SELECT
             to_regclass(format('%I.%I', $1, 'job_id_seq')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'lease_claim_receipt_id_seq')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_batch_id_seq')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'queue_ring_state')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_entries')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_claim_attempt_batches')) IS NOT NULL
@@ -151,6 +152,7 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
             AND to_regclass(format('%I.%I', $1, 'leases')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'deferred_jobs')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'lease_claims')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_batches')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'lease_claim_closures')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'lease_claim_closure_batches')) IS NOT NULL
             AND EXISTS (

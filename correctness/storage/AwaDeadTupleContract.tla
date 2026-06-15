@@ -56,8 +56,9 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 \* invariants at TLC time. The historical case in point: the original
 \* `open_receipt_claims` design — flat, RowVacuum, hot, unbounded
 \* row count — would fire `HotTablesAreNotRowVacuum`. The fix
-\* (ADR-023) replaces it with partition-rotated `lease_claims` +
-\* `lease_claim_closures`, which satisfies the contract.
+\* (ADR-023) replaces it with partition-rotated `lease_claims` /
+\* `lease_claim_batches` plus `lease_claim_closures`, which satisfies
+\* the contract.
 \*
 \* The spec only catches what is ENCODED in `TableSpec` and
 \* `Transactions`. Drift between the spec and the Rust source is the
@@ -115,6 +116,7 @@ TableSpec == [
                            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    lease_claim_batches    |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claim_closures   |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claim_closure_batches
                            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
@@ -233,6 +235,7 @@ EnqueueReadyTx == <<
 ClaimReceiptsTx == <<
     Mut("Insert", "ready_claim_attempt_batches"),
     Mut("Insert", "lease_claims"),
+    Mut("Insert", "lease_claim_batches"),
     Mut("Update", "queue_claim_heads")
 >>
 
@@ -496,6 +499,7 @@ RotateClaimsTx == << Mut("Update", "claim_ring_state") >>
 PruneClaimsTx  == <<
     Mut("Update", "claim_ring_slots"),
     Mut("Truncate", "lease_claims"),
+    Mut("Truncate", "lease_claim_batches"),
     Mut("Truncate", "lease_claim_closures"),
     Mut("Truncate", "lease_claim_closure_batches")
 >>

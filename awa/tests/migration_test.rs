@@ -1247,6 +1247,36 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
+        "DROP SEQUENCE {schema}.lease_claim_receipt_id_seq CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test receipt sequence drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after receipt sequence drop"),
+        "schema without lease_claim_receipt_id_seq must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
+        "DROP SEQUENCE {schema}.lease_claim_batch_id_seq CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("test compact claim batch sequence drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after compact claim sequence drop"),
+        "schema without lease_claim_batch_id_seq must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
     sqlx::query(&format!("DROP TABLE {schema}.ready_tombstones CASCADE"))
         .execute(&pool)
         .await
@@ -1272,6 +1302,19 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
             .await
             .expect("schema readiness should be queryable after compact batch table drop"),
         "schema without receipt_completion_batches must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!("DROP TABLE {schema}.lease_claim_batches CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("test lease_claim_batches drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after compact claim batch table drop"),
+        "schema without lease_claim_batches must not be reported as ready"
     );
 
     prepare_queue_storage_schema(&pool, schema).await;

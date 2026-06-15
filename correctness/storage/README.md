@@ -15,7 +15,7 @@ It uses the storage naming set:
 - `ready_segments` / `ready_segment_cursor`
 - `lease_segments` / `lease_segment_cursor`
 - `terminal_segments` / `terminal_segment_cursor`
-- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier; compact completion validates immutable `receipt_id` values returned by claim, and implementation stale-rescue and deadline-rescue scans use the same per-attempt advisory key plus separate per-slot cursors over this history)
+- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims`, `lease_claim_batches`, `lease_claim_closures`, and `lease_claim_closure_batches` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier; compact completion validates immutable `receipt_id` values returned by row-local or compact-batch claims, and implementation stale-rescue and deadline-rescue scans use the same per-attempt advisory key plus separate per-slot cursors over this history)
 
 Terminal-count derived state (`queue_terminal_count_deltas`, `queue_terminal_live_counts`, and `queue_terminal_rollups`) is not lifecycle state and is not part of `AwaSegmentedStorage`. The append/truncate contract for those tables is covered by `AwaDeadTupleContract`, while Rust integration tests assert that exact reads include folded counters plus pending deltas.
 
@@ -56,7 +56,7 @@ Key safety checks include:
 - DLQ rows hold no live runtime (no lease, attempt_state, etc.)
 - `dlq_entries` and `terminal_entries` are disjoint (a job is in exactly one terminal family at a time)
 - pruned terminal segments hold no live terminal rows; terminal rotation is deadlock-free and respects the same open/sealed/pruned lifecycle as the other families
-- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have durable closure evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while a claim row still depends on it.
+- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every row-local claim or compact claim-batch item in the partition to have durable closure evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while claim evidence still depends on it.
 
 What it intentionally does not model:
 
