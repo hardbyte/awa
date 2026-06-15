@@ -211,6 +211,8 @@ EnqueueTwoStripePlan(p) ==
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
 \*   FOR UPDATE OF queue_claim_heads SKIP LOCKED (per-(queue,priority) row)
+\*   refresh queue_claim_heads.ready_segment_* on the already-locked row
+\*     when the cached ready-slot hint no longer validates
 \*   plain SELECT of lease_ring_state and claim_ring_state — no
 \*     FOR SHARE / FOR UPDATE; serialisation against rotate is via
 \*     the rotator's CAS UPDATE on (current_slot, generation), not a

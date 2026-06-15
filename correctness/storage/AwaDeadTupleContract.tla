@@ -152,6 +152,11 @@ TableSpec == [
     attempt_state |->
         [kind |-> "Warm", hot |-> "hot",
          bounded_by |-> "worker_fleet_size"],
+    \* queue_claim_heads stores the sequence-backed claim cursor plus a
+    \* nullable ready-segment routing cache. The cache is overwritten on
+    \* the same bounded per-lane row and is not claim evidence; it only
+    \* avoids scanning all ready-segment partitions while the cursor stays
+    \* inside the cached ready slot/generation.
     queue_claim_heads |->
         [kind |-> "Warm", hot |-> "hot",
          bounded_by |-> "queue_lane_count"],
@@ -221,7 +226,10 @@ EnqueueReadyTx == <<
     Mut("Insert", "ready_segments")
 >>
 
-\* claim_runtime_batch (receipts mode) — queue_storage.rs claim CTE
+\* claim_runtime_batch (receipts mode) — queue_storage.rs claim CTE.
+\* The queue_claim_heads UPDATE covers both the sequence-backed claim cursor
+\* advancement and the ready-segment routing-cache refresh on that same
+\* bounded lane row.
 ClaimReceiptsTx == <<
     Mut("Insert", "ready_claim_attempt_batches"),
     Mut("Insert", "lease_claims"),

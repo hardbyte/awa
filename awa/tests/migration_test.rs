@@ -2271,6 +2271,29 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
         ready_segment_child_exists,
         "ready_segments_0 child must exist for queue-ring prune"
     );
+
+    let claim_head_cache_columns: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)::bigint
+        FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = 'queue_claim_heads'
+          AND column_name = ANY($2)
+        "#,
+    )
+    .bind(schema)
+    .bind([
+        "ready_segment_slot",
+        "ready_segment_generation",
+        "ready_segment_next_lane_seq",
+    ])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        claim_head_cache_columns, 3,
+        "queue_claim_heads must expose the ready-segment cache columns used by claim routing"
+    );
 }
 
 #[tokio::test]
