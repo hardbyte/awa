@@ -487,6 +487,29 @@ BEGIN
     );
 
     EXECUTE format(
+        'ALTER TABLE %I.queue_enqueue_heads ADD COLUMN IF NOT EXISTS seq_name TEXT',
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS seq_name TEXT',
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS ready_segment_slot INT',
+        p_schema
+    );
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS ready_segment_generation BIGINT',
+        p_schema
+    );
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS ready_segment_next_lane_seq BIGINT',
+        p_schema
+    );
+
+    EXECUTE format(
         $ddl$
         ALTER TABLE %I.queue_claim_heads SET (
             fillfactor = 50,
@@ -500,13 +523,19 @@ BEGIN
     );
 
     EXECUTE format(
-        'ALTER TABLE %I.queue_enqueue_heads ADD COLUMN IF NOT EXISTS seq_name TEXT',
-        p_schema
+        'COMMENT ON COLUMN %I.queue_claim_heads.ready_segment_slot IS %L',
+        p_schema,
+        'Nullable claim-routing cache: ready slot that currently contains the lane claim cursor. This is a performance hint only; claim_ready_runtime revalidates ready rows before emitting work.'
     );
-
     EXECUTE format(
-        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS seq_name TEXT',
-        p_schema
+        'COMMENT ON COLUMN %I.queue_claim_heads.ready_segment_generation IS %L',
+        p_schema,
+        'Nullable claim-routing cache: ready generation paired with ready_segment_slot.'
+    );
+    EXECUTE format(
+        'COMMENT ON COLUMN %I.queue_claim_heads.ready_segment_next_lane_seq IS %L',
+        p_schema,
+        'Nullable claim-routing cache: exclusive upper lane_seq for the cached ready slot/generation. When claim_seq reaches this value, claim_ready_runtime refreshes from ready_segments.'
     );
 
     --------------------------------------------------------------------
@@ -2792,10 +2821,14 @@ BEGIN
             v_claim_seq_name TEXT;
             v_lane_claim_seq BIGINT;
             v_lane_next_seq BIGINT;
+            v_cached_target_slot INT;
+            v_cached_target_generation BIGINT;
+            v_cached_target_next_lane_seq BIGINT;
             v_claim_limit BIGINT;
             v_claimed_count BIGINT;
             v_target_slot INT;
             v_target_generation BIGINT;
+            v_target_next_lane_seq BIGINT;
             v_head_job_id BIGINT;
             v_head_run_lease BIGINT;
             v_head_lane_seq BIGINT;
@@ -2809,8 +2842,25 @@ BEGIN
                 claims.enqueue_shard,
                 claims.seq_name,
                 cursors.claim_seq,
-                cursors.next_seq
-            INTO v_lane_priority, v_lane_shard, v_claim_seq_name, v_lane_claim_seq, v_lane_next_seq
+                cursors.next_seq,
+                claims.ready_segment_slot,
+                claims.ready_segment_generation,
+                claims.ready_segment_next_lane_seq,
+                candidate.ready_slot,
+                candidate.ready_generation,
+                candidate.next_lane_seq
+            INTO
+                v_lane_priority,
+                v_lane_shard,
+                v_claim_seq_name,
+                v_lane_claim_seq,
+                v_lane_next_seq,
+                v_cached_target_slot,
+                v_cached_target_generation,
+                v_cached_target_next_lane_seq,
+                v_target_slot,
+                v_target_generation,
+                v_target_next_lane_seq
             FROM %1$I.queue_claim_heads AS claims
             JOIN %1$I.queue_enqueue_heads AS enqueues
               ON enqueues.queue = claims.queue
@@ -2823,26 +2873,63 @@ BEGIN
             ) AS cursors
             LEFT JOIN LATERAL (
                 SELECT
-                    segment.ready_slot,
-                    segment.ready_generation,
-                    segment.first_run_at AS run_at,
-                    CASE
-                        WHEN p_aging_secs > 0 THEN GREATEST(
-                            1,
-                            claims.priority - FLOOR(
-                                EXTRACT(EPOCH FROM (clock_timestamp() - segment.first_run_at)) / p_aging_secs
-                            )::smallint
-                        )::smallint
-                        ELSE claims.priority
-                    END AS effective_priority
-                FROM %1$I.ready_segments AS segment
-                WHERE segment.queue = p_queue
-                  AND segment.priority = claims.priority
-                  AND segment.enqueue_shard = claims.enqueue_shard
-                  AND segment.next_lane_seq > cursors.claim_seq
-                ORDER BY segment.first_lane_seq ASC
+                    ready.ready_slot,
+                    ready.ready_generation,
+                    claims.ready_segment_next_lane_seq AS next_lane_seq,
+                    ready.run_at
+                FROM %1$I.ready_entries AS ready
+                WHERE claims.ready_segment_slot IS NOT NULL
+                  AND claims.ready_segment_generation IS NOT NULL
+                  AND claims.ready_segment_next_lane_seq IS NOT NULL
+                  AND claims.ready_segment_next_lane_seq > cursors.claim_seq
+                  AND ready.ready_slot = claims.ready_segment_slot
+                  AND ready.ready_generation = claims.ready_segment_generation
+                  AND ready.queue = p_queue
+                  AND ready.priority = claims.priority
+                  AND ready.enqueue_shard = claims.enqueue_shard
+                  AND ready.lane_seq >= cursors.claim_seq
+                  AND ready.lane_seq < claims.ready_segment_next_lane_seq
+                ORDER BY ready.lane_seq ASC
                 LIMIT 1
-            ) AS candidate ON TRUE
+            ) AS cached_candidate ON TRUE
+            LEFT JOIN LATERAL (
+                WITH first_segment AS MATERIALIZED (
+                    SELECT
+                        segment.ready_slot,
+                        segment.ready_generation,
+                        segment.first_run_at
+                    FROM %1$I.ready_segments AS segment
+                    WHERE cached_candidate.ready_slot IS NULL
+                      AND segment.queue = p_queue
+                      AND segment.priority = claims.priority
+                      AND segment.enqueue_shard = claims.enqueue_shard
+                      AND segment.next_lane_seq > cursors.claim_seq
+                    ORDER BY segment.first_lane_seq ASC
+                    LIMIT 1
+                )
+                SELECT
+                    first_segment.ready_slot,
+                    first_segment.ready_generation,
+                    slot_bound.next_lane_seq,
+                    first_segment.first_run_at AS run_at
+                FROM first_segment
+                CROSS JOIN LATERAL (
+                    SELECT max(segment.next_lane_seq)::bigint AS next_lane_seq
+                    FROM %1$I.ready_segments AS segment
+                    WHERE segment.ready_slot = first_segment.ready_slot
+                      AND segment.ready_generation = first_segment.ready_generation
+                      AND segment.queue = p_queue
+                      AND segment.priority = claims.priority
+                      AND segment.enqueue_shard = claims.enqueue_shard
+                ) AS slot_bound
+            ) AS segment_candidate ON TRUE
+            CROSS JOIN LATERAL (
+                SELECT
+                    COALESCE(cached_candidate.ready_slot, segment_candidate.ready_slot) AS ready_slot,
+                    COALESCE(cached_candidate.ready_generation, segment_candidate.ready_generation) AS ready_generation,
+                    COALESCE(cached_candidate.next_lane_seq, segment_candidate.next_lane_seq) AS next_lane_seq,
+                    COALESCE(cached_candidate.run_at, segment_candidate.run_at) AS run_at
+            ) AS candidate
             WHERE claims.queue = p_queue
               AND NOT EXISTS (
                   SELECT 1
@@ -2852,7 +2939,16 @@ BEGIN
               )
               AND cursors.claim_seq < cursors.next_seq
             ORDER BY
-                candidate.effective_priority ASC NULLS LAST,
+                CASE
+                    WHEN candidate.run_at IS NULL THEN NULL::smallint
+                    WHEN p_aging_secs > 0 THEN GREATEST(
+                        1,
+                        claims.priority - FLOOR(
+                            EXTRACT(EPOCH FROM (clock_timestamp() - candidate.run_at)) / p_aging_secs
+                        )::smallint
+                    )::smallint
+                    ELSE claims.priority
+                END ASC NULLS LAST,
                 candidate.run_at ASC NULLS LAST,
                 claims.priority ASC
             LIMIT 1
@@ -2862,21 +2958,40 @@ BEGIN
                 RETURN;
             END IF;
 
-            SELECT
-                segment.ready_slot,
-                segment.ready_generation
-            INTO
-                v_target_slot,
-                v_target_generation
-            FROM %1$I.ready_segments AS segment
-            WHERE segment.queue = p_queue
-              AND segment.priority = v_lane_priority
-              AND segment.enqueue_shard = v_lane_shard
-              AND segment.next_lane_seq > v_lane_claim_seq
-            ORDER BY segment.first_lane_seq ASC
-            LIMIT 1;
+            IF v_target_slot IS NULL THEN
+                SELECT
+                    segment.ready_slot,
+                    segment.ready_generation,
+                    slot_bound.next_lane_seq
+                INTO
+                    v_target_slot,
+                    v_target_generation,
+                    v_target_next_lane_seq
+                FROM (
+                    SELECT
+                        segment.ready_slot,
+                        segment.ready_generation,
+                        segment.first_lane_seq
+                    FROM %1$I.ready_segments AS segment
+                    WHERE segment.queue = p_queue
+                      AND segment.priority = v_lane_priority
+                      AND segment.enqueue_shard = v_lane_shard
+                      AND segment.next_lane_seq > v_lane_claim_seq
+                    ORDER BY segment.first_lane_seq ASC
+                    LIMIT 1
+                ) AS segment
+                CROSS JOIN LATERAL (
+                    SELECT max(later_segment.next_lane_seq)::bigint AS next_lane_seq
+                    FROM %1$I.ready_segments AS later_segment
+                    WHERE later_segment.ready_slot = segment.ready_slot
+                      AND later_segment.ready_generation = segment.ready_generation
+                      AND later_segment.queue = p_queue
+                      AND later_segment.priority = v_lane_priority
+                      AND later_segment.enqueue_shard = v_lane_shard
+                ) AS slot_bound;
+            END IF;
 
-            IF NOT FOUND THEN
+            IF v_target_slot IS NULL THEN
                 -- No committed ready segment is visible yet. The enqueue
                 -- sequence may include uncommitted reservations, so do not
                 -- advance the claim cursor.
@@ -2907,6 +3022,19 @@ BEGIN
                 -- upgrade or after manual catalog damage. Keep the claim
                 -- cursor conservative rather than advancing over unseen work.
                 RETURN;
+            END IF;
+
+            IF v_cached_target_slot IS DISTINCT FROM v_target_slot
+               OR v_cached_target_generation IS DISTINCT FROM v_target_generation
+               OR v_cached_target_next_lane_seq IS DISTINCT FROM v_target_next_lane_seq THEN
+                UPDATE %1$I.queue_claim_heads AS claims
+                SET
+                    ready_segment_slot = v_target_slot,
+                    ready_segment_generation = v_target_generation,
+                    ready_segment_next_lane_seq = v_target_next_lane_seq
+                WHERE claims.queue = p_queue
+                  AND claims.priority = v_lane_priority
+                  AND claims.enqueue_shard = v_lane_shard;
             END IF;
 
             v_claim_limit := LEAST(GREATEST(v_lane_next_seq - v_lane_claim_seq, 0), p_max_batch);
