@@ -487,8 +487,9 @@ RotateClaimsPlan(nextSlot) ==
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   prove every claim in the sealed slot has durable closure evidence
 \*     with plain SELECT / AccessShare on the claim children. The Rust
-\*     implementation first tries an exact count proof and falls back to
-\*     the per-claim anti-join when counts do not prove closure.
+\*     implementation uses an exact count proof; if counts do not prove
+\*     closure, it conservatively skips the truncate instead of running
+\*     an unbounded per-claim anti-join over retained compact batches.
 \*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 \*   LOCK TABLE claim_batch_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 \*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout

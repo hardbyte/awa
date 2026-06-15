@@ -671,10 +671,6 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
     slot: i32,
     generation: i64,
 ) -> Result<bool, AwaError> {
-    let closure_rel = format!("{schema}.lease_claim_closures");
-    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-    let closed_evidence =
-        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
     let count_proves_claim_refs_closed: bool = sqlx::query_scalar(&format!(
         r#"
         WITH claim_count AS (
@@ -699,20 +695,6 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
             WHERE claims.ready_slot = $1
               AND claims.ready_generation = $2
         ),
-        compact_explicit_count AS (
-            SELECT count(*)::bigint AS total
-            FROM {schema}.lease_claim_batches AS batches
-            CROSS JOIN LATERAL unnest(
-                batches.job_ids,
-                batches.run_leases
-            ) AS items(job_id, run_lease)
-            JOIN {schema}.lease_claim_closures AS closures
-              ON closures.claim_slot = batches.claim_slot
-             AND closures.job_id = items.job_id
-             AND closures.run_lease = items.run_lease
-            WHERE batches.ready_slot = $1
-              AND batches.ready_generation = $2
-        ),
         compact_count AS (
             SELECT COALESCE(sum(closed_count), 0)::bigint AS total
             FROM {schema}.lease_claim_closure_batches AS batches
@@ -720,8 +702,8 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
               AND batches.ready_generation = $2
         )
         SELECT claim_count.total + compact_claim_count.total =
-               explicit_count.total + compact_explicit_count.total + compact_count.total
-        FROM claim_count, compact_claim_count, explicit_count, compact_explicit_count, compact_count
+               explicit_count.total + compact_count.total
+        FROM claim_count, compact_claim_count, explicit_count, compact_count
         "#
     ))
     .bind(slot)
@@ -733,75 +715,21 @@ async fn queue_prune_has_unclosed_claim_refs_tx(
         return Ok(false);
     }
 
-    sqlx::query_scalar(&format!(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM {schema}.lease_claims AS claims
-            WHERE claims.ready_slot = $1
-              AND claims.ready_generation = $2
-              AND NOT {closed_evidence}
-            LIMIT 1
-        )
-        OR EXISTS (
-            SELECT 1
-            FROM {schema}.lease_claim_batches AS batches
-            CROSS JOIN LATERAL unnest(
-                batches.job_ids,
-                batches.run_leases,
-                batches.receipt_ids
-            ) AS items(job_id, run_lease, receipt_id)
-            WHERE batches.ready_slot = $1
-              AND batches.ready_generation = $2
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM {schema}.lease_claim_closures AS closures
-                  WHERE closures.claim_slot = batches.claim_slot
-                    AND closures.job_id = items.job_id
-                    AND closures.run_lease = items.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM {schema}.lease_claim_closure_batches AS closure_batches
-                  WHERE closure_batches.claim_slot = batches.claim_slot
-                    AND closure_batches.receipt_ranges @> items.receipt_id
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.done_entries AS done
-                  WHERE done.job_id = items.job_id
-                    AND done.run_lease = items.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
-                  WHERE deferred.job_id = items.job_id
-                    AND deferred.run_lease = items.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.dlq_entries AS dlq
-                  WHERE dlq.job_id = items.job_id
-                    AND dlq.run_lease = items.run_lease
-              )
-            LIMIT 1
-        )
-        "#
-    ))
-    .bind(slot)
-    .bind(generation)
-    .fetch_one(tx.as_mut())
-    .await
-    .map_err(map_sqlx_error)
+    // The exact anti-join over compact claim batches requires unnesting
+    // retained claim history. Under a hot MVCC horizon that proof can become
+    // more expensive than the prune it guards. A count mismatch is enough to
+    // make truncate unsafe, so skip and try again after closures catch up.
+    Ok(true)
 }
 
 async fn claim_prune_has_open_claims_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
-    schema: &str,
+    _schema: &str,
     claim_child: &str,
     claim_batch_child: &str,
     closure_child: &str,
     closure_batch_child: &str,
 ) -> Result<bool, AwaError> {
-    let closed_evidence =
-        receipt_closed_evidence_sql(schema, closure_child, closure_batch_child, "claims");
     let count_proves_claims_closed: bool = sqlx::query_scalar(&format!(
         r#"
         WITH claim_count AS (
@@ -830,57 +758,10 @@ async fn claim_prune_has_open_claims_tx(
         return Ok(false);
     }
 
-    sqlx::query_scalar(&format!(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM {claim_child} AS claims
-            WHERE NOT {closed_evidence}
-            LIMIT 1
-        )
-        OR EXISTS (
-            SELECT 1
-            FROM {claim_batch_child} AS batches
-            CROSS JOIN LATERAL unnest(
-                batches.job_ids,
-                batches.run_leases,
-                batches.receipt_ids
-            ) AS items(job_id, run_lease, receipt_id)
-            WHERE NOT EXISTS (
-                  SELECT 1
-                  FROM {closure_child} AS closures
-                  WHERE closures.claim_slot = batches.claim_slot
-                    AND closures.job_id = items.job_id
-                    AND closures.run_lease = items.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM {closure_batch_child} AS closure_batches
-                  WHERE closure_batches.claim_slot = batches.claim_slot
-                    AND closure_batches.receipt_ranges @> items.receipt_id
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.done_entries AS done
-                  WHERE done.job_id = items.job_id
-                    AND done.run_lease = items.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
-                  WHERE deferred.job_id = items.job_id
-                    AND deferred.run_lease = items.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.dlq_entries AS dlq
-                  WHERE dlq.job_id = items.job_id
-                    AND dlq.run_lease = items.run_lease
-              )
-            LIMIT 1
-        )
-        "#
-    ))
-    .fetch_one(tx.as_mut())
-    .await
-    .map_err(map_sqlx_error)
+    // A count mismatch means at least one claim is not proven closed by the
+    // append-only closure ledgers. Returning SkippedActive is conservative and
+    // avoids an unbounded anti-join over retained compact claim batches.
+    Ok(true)
 }
 
 fn oldest_initialized_ring_slot(
@@ -6127,18 +6008,23 @@ impl QueueStorage {
                         items.job_id,
                         items.run_lease,
                         items.receipt_id
-                    FROM {claim_batch_rel} AS claim_batches
-                    CROSS JOIN LATERAL unnest(
-                        claim_batches.job_ids,
-                        claim_batches.run_leases,
-                        claim_batches.receipt_ids
-                    ) AS items(job_id, run_lease, receipt_id)
-                    JOIN completed
-                      ON completed.claim_slot = claim_batches.claim_slot
-                     AND completed.job_id = items.job_id
-                     AND completed.run_lease = items.run_lease
-                     AND completed.receipt_id = items.receipt_id
-                    WHERE NOT EXISTS (
+                    FROM completed
+                    JOIN {claim_batch_rel} AS claim_batches
+                      ON claim_batches.claim_slot = completed.claim_slot
+                     AND claim_batches.receipt_ranges @> completed.receipt_id
+                    CROSS JOIN LATERAL (
+                        SELECT items.job_id, items.run_lease, items.receipt_id
+                        FROM unnest(
+                            claim_batches.job_ids,
+                            claim_batches.run_leases,
+                            claim_batches.receipt_ids
+                        ) AS items(job_id, run_lease, receipt_id)
+                        WHERE items.receipt_id = completed.receipt_id
+                        LIMIT 1
+                    ) AS items
+                    WHERE completed.job_id = items.job_id
+                      AND completed.run_lease = items.run_lease
+                      AND NOT EXISTS (
                           SELECT 1
                           FROM {closure_rel} AS closures
                           WHERE closures.claim_slot = claim_batches.claim_slot
@@ -13637,65 +13523,8 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedActive);
         }
 
-        let count_proves_claim_refs_closed: bool = sqlx::query_scalar(&format!(
-            r#"
-            WITH claim_count AS (
-                SELECT count(*)::bigint AS total
-                FROM {schema}.lease_claims AS claims
-                WHERE claims.ready_slot = $1
-                  AND claims.ready_generation = $2
-            ),
-            explicit_count AS (
-                SELECT count(*)::bigint AS total
-                FROM {schema}.lease_claims AS claims
-                JOIN {schema}.lease_claim_closures AS closures
-                  ON closures.claim_slot = claims.claim_slot
-                 AND closures.job_id = claims.job_id
-                 AND closures.run_lease = claims.run_lease
-                WHERE claims.ready_slot = $1
-                  AND claims.ready_generation = $2
-            ),
-            compact_count AS (
-                SELECT COALESCE(sum(closed_count), 0)::bigint AS total
-                FROM {schema}.lease_claim_closure_batches AS batches
-                WHERE batches.ready_slot = $1
-                  AND batches.ready_generation = $2
-            )
-            SELECT claim_count.total = explicit_count.total + compact_count.total
-            FROM claim_count, explicit_count, compact_count
-            "#
-        ))
-        .bind(slot)
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-        let closed_evidence =
-            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
-        let unclosed_claim_refs: bool = if count_proves_claim_refs_closed {
-            false
-        } else {
-            sqlx::query_scalar(&format!(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM {schema}.lease_claims AS claims
-                    WHERE claims.ready_slot = $1
-                      AND claims.ready_generation = $2
-                      AND NOT {closed_evidence}
-                    LIMIT 1
-                )
-                "#
-            ))
-            .bind(slot)
-            .bind(generation)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?
-        };
+        let unclosed_claim_refs =
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
 
         if unclosed_claim_refs {
             tx.commit().await.map_err(map_sqlx_error)?;
