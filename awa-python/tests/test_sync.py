@@ -151,6 +151,7 @@ def test_retry_failed_sync_queue_storage_reports_pruned_count(client):
         tx.execute(
             "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
         )
+        tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         tx.commit()
 
 
@@ -354,6 +355,7 @@ def test_enqueue_many_copy_sync_queue_storage(client):
         queue,
     )
     tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     tx.commit()
 
     assert row["ready_count"] == 3
@@ -428,6 +430,7 @@ def test_ordering_key_routes_all_sync_python_insert_paths(client):
         queue,
     )
     tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     tx.commit()
 
     assert len(rows) == len(expected_jobs) + count
@@ -484,13 +487,16 @@ async def test_worker_decorator_deprecated():
     # Use AsyncClient since worker/task is on that class
     c = awa.AsyncClient(DATABASE_URL)
 
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
+    try:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
 
-        @c.worker(SyncEmail, queue="deprecated_test")
-        async def handle(job):
-            return None
+            @c.worker(SyncEmail, queue="deprecated_test")
+            async def handle(job):
+                return None
 
-        assert len(w) == 1
-        assert issubclass(w[0].category, DeprecationWarning)
-        assert "client.task()" in str(w[0].message)
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "client.task()" in str(w[0].message)
+    finally:
+        await c.close()

@@ -47,85 +47,96 @@ class AdvJob:
     value: str
 
 
+@pytest.fixture
+async def async_client():
+    client = awa.AsyncClient(DATABASE_URL)
+    try:
+        yield client
+    finally:
+        await client.shutdown()
+        await client.close()
+
+
+@pytest.fixture
+def sync_client():
+    client = awa.Client(DATABASE_URL)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
 # ─── Client/AsyncClient confusion ────────────────────────────────
 
 
-async def test_sync_client_methods_are_truly_sync():
+async def test_sync_client_methods_are_truly_sync(sync_client):
     """Client methods must not return coroutines."""
-    client = awa.Client(DATABASE_URL)
-    client.migrate()
+    sync_client.migrate()
 
-    job = client.insert(AdvJob(value="sync_check"), queue="adv_sync")
+    job = sync_client.insert(AdvJob(value="sync_check"), queue="adv_sync")
     # If this were a coroutine, accessing .id would fail
     assert isinstance(job.id, int), f"Expected int id, got {type(job.id)}"
     assert str(job.state) == "available"
 
 
-async def test_async_client_methods_are_truly_async():
+async def test_async_client_methods_are_truly_async(async_client):
     """AsyncClient methods must return awaitables."""
-    client = awa.AsyncClient(DATABASE_URL)
-    await client.migrate()
+    await async_client.migrate()
 
-    job = await client.insert(AdvJob(value="async_check"), queue="adv_async")
+    job = await async_client.insert(AdvJob(value="async_check"), queue="adv_async")
     assert isinstance(job.id, int)
     assert str(job.state) == "available"
 
 
-async def test_sync_and_async_clients_coexist():
+async def test_sync_and_async_clients_coexist(sync_client, async_client):
     """Both clients connected to the same DB work simultaneously."""
-    sync = awa.Client(DATABASE_URL)
-    async_client = awa.AsyncClient(DATABASE_URL)
-    sync.migrate()
+    sync_client.migrate()
 
     # Insert via sync, read via async
-    job = sync.insert(AdvJob(value="cross_client"), queue="adv_coexist")
+    job = sync_client.insert(AdvJob(value="cross_client"), queue="adv_coexist")
     fetched = await async_client.get_job(job.id)
     assert fetched.id == job.id
     assert str(fetched.state) == "available"
 
 
-async def test_sync_client_has_no_worker_methods():
+async def test_sync_client_has_no_worker_methods(sync_client):
     """Sync Client should not have task/start/shutdown/worker methods."""
-    client = awa.Client(DATABASE_URL)
-    assert not hasattr(client, "task"), "Sync Client should not have task()"
-    assert not hasattr(client, "start"), "Sync Client should not have start()"
-    assert not hasattr(client, "shutdown"), "Sync Client should not have shutdown()"
+    assert not hasattr(sync_client, "task"), "Sync Client should not have task()"
+    assert not hasattr(sync_client, "start"), "Sync Client should not have start()"
+    assert not hasattr(sync_client, "shutdown"), "Sync Client should not have shutdown()"
 
 
 # ─── @client.task() decorator ─────────────────────────────────────
 
 
-async def test_task_decorator_registers_handler():
+async def test_task_decorator_registers_handler(async_client):
     """@client.task() registers a handler that processes jobs."""
-    client = awa.AsyncClient(DATABASE_URL)
-    await client.migrate()
-    await enable_queue_storage(client)
+    await async_client.migrate()
+    await enable_queue_storage(async_client)
     results = []
 
-    @client.task(AdvJob, queue="adv_task_reg")
+    @async_client.task(AdvJob, queue="adv_task_reg")
     async def handle(job):
         results.append(job.args.value)
         return None
 
-    await client.insert(AdvJob(value="task_test"), queue="adv_task_reg")
-    await client.start([("adv_task_reg", 2)])
+    await async_client.insert(AdvJob(value="task_test"), queue="adv_task_reg")
+    await async_client.start([("adv_task_reg", 2)])
     for _ in range(20):
         await asyncio.sleep(0.1)
         if results:
             break
-    await client.shutdown()
+    await async_client.shutdown()
 
     assert results == ["task_test"]
 
 
-async def test_worker_decorator_emits_deprecation():
+async def test_worker_decorator_emits_deprecation(async_client):
     """@client.worker() still works but warns."""
-    client = awa.AsyncClient(DATABASE_URL)
-
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
 
-        @client.worker(AdvJob, queue="adv_deprecated")
+        @async_client.worker(AdvJob, queue="adv_deprecated")
         async def handle(job):
             return None
 
@@ -134,13 +145,12 @@ async def test_worker_decorator_emits_deprecation():
         assert "task()" in str(w[0].message)
 
 
-async def test_task_with_invalid_args_type():
+async def test_task_with_invalid_args_type(async_client):
     """Passing a non-class as args_type registers but fails at job processing time.
     The decorator doesn't validate eagerly — this is a known limitation."""
-    client = awa.AsyncClient(DATABASE_URL)
 
     # Registration succeeds (lazy validation)
-    @client.task("not_a_class", queue="adv_bad_type")
+    @async_client.task("not_a_class", queue="adv_bad_type")
     async def handle(job):
         return None
 
@@ -150,13 +160,12 @@ async def test_task_with_invalid_args_type():
 # ─── Typed returns ─────────────────────────────────────────────────
 
 
-async def test_queue_stats_returns_typed_objects():
+async def test_queue_stats_returns_typed_objects(async_client):
     """queue_stats returns QueueStat with attribute access, not dicts."""
-    client = awa.AsyncClient(DATABASE_URL)
-    await client.migrate()
-    await client.insert(AdvJob(value="typed"), queue="adv_typed_stats")
+    await async_client.migrate()
+    await async_client.insert(AdvJob(value="typed"), queue="adv_typed_stats")
 
-    stats = await client.queue_stats()
+    stats = await async_client.queue_stats()
     assert len(stats) > 0
 
     stat = stats[0]
@@ -179,13 +188,12 @@ async def test_queue_stats_returns_typed_objects():
         _ = stat["queue"]
 
 
-async def test_sync_queue_stats_also_typed():
+async def test_sync_queue_stats_also_typed(sync_client):
     """Sync Client.queue_stats() also returns QueueStat objects."""
-    client = awa.Client(DATABASE_URL)
-    client.migrate()
-    client.insert(AdvJob(value="sync_typed"), queue="adv_sync_typed")
+    sync_client.migrate()
+    sync_client.insert(AdvJob(value="sync_typed"), queue="adv_sync_typed")
 
-    stats = client.queue_stats()
+    stats = sync_client.queue_stats()
     assert len(stats) > 0
     assert isinstance(stats[0], awa.QueueStat)
 
@@ -225,27 +233,26 @@ def test_job_state_repr():
 # ─── Structured error logging ─────────────────────────────────────
 
 
-async def test_handler_exception_preserves_type():
+async def test_handler_exception_preserves_type(async_client):
     """A Python exception in a handler surfaces with the correct type."""
-    client = awa.AsyncClient(DATABASE_URL)
-    await client.migrate()
-    await enable_queue_storage(client)
+    await async_client.migrate()
+    await enable_queue_storage(async_client)
 
-    @client.task(AdvJob, queue="adv_error_type")
+    @async_client.task(AdvJob, queue="adv_error_type")
     async def handle(job):
         raise ValueError(f"bad value: {job.args.value}")
 
-    job = await client.insert(
+    job = await async_client.insert(
         AdvJob(value="error_test"),
         queue="adv_error_type",
         max_attempts=1,
     )
-    await client.start(
+    await async_client.start(
         [("adv_error_type", 1)],
         queue_storage_queue_rotate_interval_ms=60_000,
     )
-    stored = await wait_for_job_state(client, job.id, awa.JobState.Failed)
-    await client.shutdown()
+    stored = await wait_for_job_state(async_client, job.id, awa.JobState.Failed)
+    await async_client.shutdown()
 
     assert str(stored.state) == "failed"
 
@@ -260,30 +267,29 @@ async def test_handler_exception_preserves_type():
     assert "bad value" in last_error["error"]
 
 
-async def test_terminal_error_in_handler():
+async def test_terminal_error_in_handler(async_client):
     """TerminalError immediately fails without retry."""
-    client = awa.AsyncClient(DATABASE_URL)
-    await client.migrate()
-    await enable_queue_storage(client)
+    await async_client.migrate()
+    await enable_queue_storage(async_client)
     call_count = 0
 
-    @client.task(AdvJob, queue="adv_terminal")
+    @async_client.task(AdvJob, queue="adv_terminal")
     async def handle(job):
         nonlocal call_count
         call_count += 1
         raise awa.TerminalError("permanent failure")
 
-    job = await client.insert(
+    job = await async_client.insert(
         AdvJob(value="terminal_test"),
         queue="adv_terminal",
         max_attempts=5,
     )
-    await client.start(
+    await async_client.start(
         [("adv_terminal", 1)],
         queue_storage_queue_rotate_interval_ms=60_000,
     )
-    stored = await wait_for_job_state(client, job.id, awa.JobState.Failed)
-    await client.shutdown()
+    stored = await wait_for_job_state(async_client, job.id, awa.JobState.Failed)
+    await async_client.shutdown()
 
     assert str(stored.state) == "failed"
     assert call_count == 1, f"Terminal error should not retry, but ran {call_count} times"
@@ -292,44 +298,41 @@ async def test_terminal_error_in_handler():
 # ─── Explicit signatures reject bad kwargs ─────────────────────────
 
 
-async def test_insert_rejects_unknown_kwargs():
+async def test_insert_rejects_unknown_kwargs(async_client):
     """Passing unknown kwargs to insert raises TypeError."""
-    client = awa.AsyncClient(DATABASE_URL)
-    await client.migrate()
+    await async_client.migrate()
 
     with pytest.raises(TypeError):
-        await client.insert(AdvJob(value="bad"), queu="typo_queue")
+        await async_client.insert(AdvJob(value="bad"), queu="typo_queue")
 
 
-def test_sync_insert_rejects_unknown_kwargs():
+def test_sync_insert_rejects_unknown_kwargs(sync_client):
     """Sync Client also rejects unknown kwargs."""
-    client = awa.Client(DATABASE_URL)
-    client.migrate()
+    sync_client.migrate()
 
     with pytest.raises(TypeError):
-        client.insert(AdvJob(value="bad"), queu="typo_queue")
+        sync_client.insert(AdvJob(value="bad"), queu="typo_queue")
 
 
 # ─── Concurrent processing safety ─────────────────────────────────
 
 
-async def test_no_duplicate_processing_with_task_decorator():
+async def test_no_duplicate_processing_with_task_decorator(async_client):
     """Jobs registered via @task are processed exactly once."""
-    client = awa.AsyncClient(DATABASE_URL)
-    await client.migrate()
-    await enable_queue_storage(client)
+    await async_client.migrate()
+    await enable_queue_storage(async_client)
     results = []
 
-    @client.task(AdvJob, queue="adv_dedup")
+    @async_client.task(AdvJob, queue="adv_dedup")
     async def handle(job):
         await asyncio.sleep(0.02)
         results.append(job.args.value)
         return None
 
     for i in range(30):
-        await client.insert(AdvJob(value=f"job_{i}"), queue="adv_dedup")
+        await async_client.insert(AdvJob(value=f"job_{i}"), queue="adv_dedup")
 
-    await client.start(
+    await async_client.start(
         [{"name": "adv_dedup", "max_workers": 10}],
         poll_interval_ms=50,
         leader_election_interval_ms=500,
@@ -340,7 +343,7 @@ async def test_no_duplicate_processing_with_task_decorator():
         if len(results) >= 30:
             break
 
-    await client.shutdown(timeout_ms=5000)
+    await async_client.shutdown(timeout_ms=5000)
 
     counts = Counter(results)
     duplicates = {k: v for k, v in counts.items() if v > 1}
