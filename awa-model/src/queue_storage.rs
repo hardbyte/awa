@@ -6056,35 +6056,21 @@ impl QueueStorage {
                             AND closures.job_id = items.job_id
                             AND closures.run_lease = items.run_lease
                       )
+                      -- Compact successful completion treats receipt closure
+                      -- evidence as the same-attempt disposition fence. The
+                      -- non-success paths write explicit closure rows before
+                      -- moving the job to done/deferred/DLQ, so probing those
+                      -- terminal ledgers here only adds hot-path work.
                       AND NOT EXISTS (
                           SELECT 1
                           FROM {closure_batch_rel} AS closure_batches
-                          WHERE closure_batches.claim_slot = claim_batches.claim_slot
-                            AND closure_batches.receipt_ranges @> items.receipt_id
+                          WHERE closure_batches.receipt_ranges @> items.receipt_id
                       )
                       AND NOT EXISTS (
                           SELECT 1
                           FROM {schema}.leases AS lease
                           WHERE lease.job_id = items.job_id
                             AND lease.run_lease = items.run_lease
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.done_entries AS done
-                          WHERE done.job_id = items.job_id
-                            AND done.run_lease = items.run_lease
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.deferred_jobs AS deferred
-                          WHERE deferred.job_id = items.job_id
-                            AND deferred.run_lease = items.run_lease
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.dlq_entries AS dlq
-                          WHERE dlq.job_id = items.job_id
-                            AND dlq.run_lease = items.run_lease
                       )
                 ),
                 claim_refs AS (
