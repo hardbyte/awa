@@ -261,6 +261,10 @@ def sync_client_qs():
     try:
         yield client
     finally:
+        tx = client.transaction()
+        tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        tx.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+        tx.commit()
         client.close()
 
 
