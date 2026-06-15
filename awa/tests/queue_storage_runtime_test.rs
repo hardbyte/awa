@@ -2616,6 +2616,156 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_ready_ring_post_lock";
+    let schema = "awa_qs_ready_ring_post_lock";
+    let store = Arc::new(
+        create_store(&pool, schema)
+            .await
+            .with_prune_lock_timeout(Duration::from_secs(2))
+            .expect("test prune lock timeout"),
+    );
+
+    let seed_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 91 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.ready_segments WHERE ready_slot = 0 AND queue = $1"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("remove seed ready segment");
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.ready_entries WHERE job_id = $1"
+    ))
+    .bind(seed_job_id)
+    .execute(&pool)
+    .await
+    .expect("remove seed ready row");
+
+    let rotated = store
+        .rotate(&pool)
+        .await
+        .expect("rotate away from ready slot 0");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let post_lock_job_id = 1_000_091_i64;
+    let mut writer_tx = pool.begin().await.expect("begin ready writer tx");
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.ready_entries (
+            ready_slot, ready_generation, job_id, kind, queue, args, priority,
+            attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at,
+            attempted_at, created_at, unique_key, unique_states, payload
+        ) VALUES (
+            0, 0, $1, 'complete_job', $2, '{{}}'::jsonb, 2,
+            0, 0, 25, 1, 0, clock_timestamp(),
+            NULL, clock_timestamp(), NULL, NULL, '{{}}'::jsonb
+        )
+        "#
+    ))
+    .bind(post_lock_job_id)
+    .bind(queue)
+    .execute(writer_tx.as_mut())
+    .await
+    .expect("seed uncommitted ready row");
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.ready_segments (
+            ready_slot, ready_generation, queue, priority, enqueue_shard,
+            first_lane_seq, next_lane_seq, first_run_at
+        ) VALUES (0, 0, $1, 2, 0, 1, 2, clock_timestamp())
+        ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq)
+        DO NOTHING
+        "#
+    ))
+    .bind(queue)
+    .execute(writer_tx.as_mut())
+    .await
+    .expect("seed uncommitted ready segment");
+
+    let prune_store = Arc::clone(&store);
+    let prune_pool = pool.clone();
+    let prune_task =
+        tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
+
+    let needle = format!("{schema}.ready_entries_0");
+    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    let mut saw_lock_wait = false;
+    while Instant::now() < wait_deadline {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND wait_event_type = 'Lock'
+                  AND position($1 in query) > 0
+            )
+            "#,
+        )
+        .bind(&needle)
+        .fetch_one(&pool)
+        .await
+        .expect("poll ready prune lock wait");
+        if waiting {
+            saw_lock_wait = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        saw_lock_wait,
+        "queue prune should wait on the ready child before the writer commits"
+    );
+
+    writer_tx.commit().await.expect("commit pending ready row");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), prune_task)
+        .await
+        .expect("queue prune task timed out")
+        .expect("queue prune task panicked")
+        .expect("prune_oldest");
+    assert!(
+        matches!(
+            outcome,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::QueuePendingReady,
+                count: 1
+            }
+        ),
+        "post-lock proof must see the committed pending ready row, got {outcome:?}"
+    );
+
+    let survived: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_entries_0 WHERE job_id = $1"
+    ))
+    .bind(post_lock_job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count post-lock ready survivor");
+    assert_eq!(
+        survived, 1,
+        "ready row committed during the lock wait must survive SkippedActive prune"
+    );
+}
+
 /// Admin-cancel wakes an in-flight handler via the `awa:cancel`
 /// NOTIFY channel. A slow handler checks `ctx.is_cancelled()` and exits
 /// with a cancel result as soon as the flag flips. The test enqueues a
