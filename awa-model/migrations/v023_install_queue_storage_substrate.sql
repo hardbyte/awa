@@ -3616,21 +3616,7 @@ BEGIN
             selected_with_spent AS (
                 SELECT
                     selected.*,
-                    (
-                        selected.is_tombstone
-                        OR EXISTS (
-                            SELECT 1
-                            FROM %1$I.ready_claim_attempt_batches AS existing_attempts
-                            WHERE existing_attempts.ready_slot = v_target_slot
-                              AND existing_attempts.ready_generation = v_target_generation
-                              AND existing_attempts.queue = p_queue
-                              AND existing_attempts.priority = v_lane_priority
-                              AND existing_attempts.enqueue_shard = v_lane_shard
-                              AND existing_attempts.first_lane_seq <= selected.lane_seq
-                              AND existing_attempts.next_lane_seq > selected.lane_seq
-                              AND existing_attempts.lane_ranges @> int8range(selected.lane_seq, selected.lane_seq + 1, '[)')
-                        )
-                    ) AS attempt_spent
+                    selected.is_tombstone AS attempt_spent
                 FROM selected
             ),
             %2$s
