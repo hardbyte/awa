@@ -200,9 +200,9 @@ Queue storage has three independent rings, each advanced by the elected maintena
 
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 | --- | --- | --: | --- | --- |
-| Queue | `ready_entries_*`, `ready_claim_attempt_batches_*`, `ready_tombstones_*`, `ready_segments`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/attempt/terminal/tombstone/delta slot is empty | oldest non-current slot has no active leases, no retained ready rows at or ahead of their lane claim cursors, and no receipt claims without closure evidence; pending-ready and active-lease gates are checked before expensive closure-proof and exclusive-lock work; terminal rows, compact completion batches, emitted-attempt evidence, tombstones, ready-segment metadata, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
+| Queue | `ready_entries_*`, `ready_claim_attempt_batches_*`, `ready_tombstones_*`, `ready_segments`, `done_entries_*`, `receipt_completion_batches_*`, `receipt_completion_tombstones_*`, `queue_terminal_count_deltas_*` | `1000ms` | incoming ready/attempt/terminal/tombstone/delta slot is empty | oldest non-current slot has no active leases, no retained ready rows at or ahead of their lane claim cursors, and no receipt claims without closure evidence; pending-ready, active-lease, and closure gates are checked before and after the bounded exclusive-lock path; terminal rows, compact completion batches, emitted-attempt evidence, tombstones, ready-segment metadata, and pending count deltas in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `1000ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
-| Claim | `lease_claims_*`, `lease_claim_closures_*`, `lease_claim_closure_batches_*` | matches queue ring | incoming claims/closures/closure-batches slot is empty | every claim in the oldest non-current slot has durable closure evidence; count proofs use compact closure-batch ready-segment metadata before falling back to per-claim membership checks; stale-rescue cursors are reset when the slot is truncated |
+| Claim | `lease_claims_*`, `lease_claim_closures_*`, `lease_claim_closure_batches_*` | matches queue ring | incoming claims/closures/closure-batches slot is empty | every claim in the oldest non-current slot has durable closure evidence; count proofs use compact closure-batch ready-segment metadata before falling back to per-claim membership checks, and the open-claim proof is repeated after the bounded exclusive-lock path; stale-rescue cursors are reset when the slot is truncated |
 
 The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.
 
@@ -210,9 +210,9 @@ The common safety pattern is:
 
 1. Lock the ring-state row with `FOR UPDATE`.
 2. Choose the incoming or oldest initialized slot.
-3. Prove cheap skip gates before the exclusive-lock path where the target slot is already sealed by the ring lock. Queue prune checks active leases and pending ready lanes before receipt-closure proof; claim prune proves open-claim closure before child locks.
-4. Take child-table `ACCESS EXCLUSIVE` locks with `NOWAIT` in automatic prune paths so maintenance gives up immediately under contention.
-5. Recheck liveness after acquiring the partition lock.
+3. Prove cheap skip gates before the exclusive-lock path. Queue prune checks active leases and pending ready lanes before receipt-closure proof; claim prune proves open-claim closure before child locks.
+4. Take child-table `ACCESS EXCLUSIVE` locks with a short transaction-local `lock_timeout` so maintenance gives up promptly under contention.
+5. Recheck the skip gates after acquiring the partition locks so rows that committed while the lock waited are visible before truncate.
 6. `TRUNCATE` only partitions that are proven inactive.
 
 This is why queue storage's hot-path reclamation is a rotation-and-prune discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the canonical compatibility path.

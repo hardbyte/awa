@@ -1954,6 +1954,113 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .expect("prepare_schema should be idempotent");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_reset_truncates_compact_receipt_evidence() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_reset_compact_receipts";
+    let schema = "awa_qs_reset_compact_receipts";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let original_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 44 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        original_job_id, 1,
+        "fresh schema should allocate the first job id"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim compact completion candidate");
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        claimed[0].claim.lease_claim_receipt,
+        "test must exercise receipt-backed compact completion"
+    );
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete compact receipt job");
+
+    assert_eq!(
+        completed_done_count(&pool, &store, queue).await,
+        0,
+        "compact receipt success should not write a completed done_entries row"
+    );
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        1,
+        "compact terminal history must exist before reset"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "compact claim closure evidence must exist before reset"
+    );
+    assert_eq!(
+        completed_terminal_count(&pool, &store, queue).await,
+        1,
+        "terminal view should see the compact completion before reset"
+    );
+
+    store
+        .reset(&pool)
+        .await
+        .expect("standalone reset should succeed");
+
+    assert_eq!(
+        receipt_completion_batch_count(&pool, &store, queue).await,
+        0
+    );
+    assert_eq!(receipt_completion_tombstone_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 0);
+
+    let reset_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 45 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        reset_job_id, 1,
+        "reset restarts job ids, so stale compact evidence would collide"
+    );
+
+    let claimed_after_reset = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim reused job id after reset");
+    assert_eq!(
+        claimed_after_reset.len(),
+        1,
+        "stale compact evidence must not skip a reused job id after reset"
+    );
+    assert_eq!(claimed_after_reset[0].job.id, reset_job_id);
+}
+
 /// Wave-1 regression test for the claim-ring rotate+prune pair.
 ///
 /// Exercises the full cycle: claim a job (populates

@@ -157,11 +157,11 @@ All prune paths remain best-effort and take their child-table locks with a short
 
 - claim takes `FOR UPDATE OF claims SKIP LOCKED` on `queue_claim_heads` while it advances the claim cursor and inserts the claim
 - rotate publishes the next lease slot with a compare-and-swap update on `lease_ring_state`
-- prune-ready takes `FOR UPDATE` on `queue_ring_state` and on the target `queue_ring_slots` row, proves the sealed slot has no active leases, no receipt claims without durable closure evidence, and no retained ready rows still at or ahead of their lane cursor, then takes bounded `ACCESS EXCLUSIVE` on the child partitions before it truncates
+- prune-ready takes `FOR UPDATE` on `queue_ring_state` and on the target `queue_ring_slots` row, proves the sealed slot has no active leases, no receipt claims without durable closure evidence, and no retained ready rows still at or ahead of their lane cursor, then takes bounded `ACCESS EXCLUSIVE` on the child partitions, rechecks those gates, and only then truncates
 - prune-leases derives the oldest initialized slot from `lease_ring_state`, locks the child partition with bounded `ACCESS EXCLUSIVE`, rechecks that the slot is not current, then truncates if it is empty
-- prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state` and on the target `claim_ring_slots` row, proves every claim in the sealed slot has durable closure evidence, then takes bounded `ACCESS EXCLUSIVE` on the matching `lease_claims_*`, `lease_claim_closures_*`, and `lease_claim_closure_batches_*` partitions before `TRUNCATE`ing them in lockstep. Open claims make prune skip before the exclusive child-lock path until normal completion, normal non-success closure, or the separate receipt-rescue scans close them.
+- prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state` and on the target `claim_ring_slots` row, proves every visible claim in the sealed slot has durable closure evidence, then takes bounded `ACCESS EXCLUSIVE` on the matching `lease_claims_*`, `lease_claim_closures_*`, and `lease_claim_closure_batches_*` partitions, rechecks for open claims, and only then `TRUNCATE`s them in lockstep. Open claims make prune skip until normal completion, normal non-success closure, or the separate receipt-rescue scans close them.
 
-That order is deliberate. The TLA+ storage race / lock-order models exist to prove that claim, rotate, and prune cannot interleave into “claim lands in a pruned segment” behavior.
+That order is deliberate. The TLA+ storage race / lock-order models cross-check the abstract claim, rotate, and prune ordering. The Rust prune paths also recheck their liveness gates after taking partition locks, which covers the MVCC visibility window that the lock-order model abstracts away.
 
 Rotation and prune policy is also part of this decision:
 

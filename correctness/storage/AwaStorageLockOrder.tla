@@ -268,7 +268,7 @@ CompletePlan(claimSlot, readySlot) ==
        Step(ReceiptBatchChildResource(readySlot), ModeShared),
        Step(TerminalDeltaChildResource(readySlot), ModeShared) >>
 
-\* close_receipt_tx (queue_storage.rs:6517, called from cancel_job_tx)
+\* close_receipt_tx (called from cancel_job_tx)
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first
 \*   WITH locked_claim AS (SELECT ... FROM lease_claims FOR UPDATE)
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
@@ -277,7 +277,7 @@ CloseReceiptPlan(claimSlot) ==
        Step(ClosureChildResource(claimSlot), ModeShared),
        Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
-\* rescue_stale_receipt_claims_tx (queue_storage.rs:8195)
+\* rescue_stale_receipt_claims_tx
 \*   plain SELECT of claim_ring_state to prefer the oldest initialized slot
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
@@ -310,7 +310,7 @@ RescueReceiptDeadlinesPlan(claimSlot) ==
        Step(ClosureChildResource(claimSlot), ModeShared),
        Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
-\* ensure_running_leases_from_receipts_tx (queue_storage.rs:7574)
+\* ensure_running_leases_from_receipts_tx
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first
 \*   CTE claim_refs: SELECT ... FROM lease_claims FOR UPDATE OF claims
 \*   anti-join explicit and compact closure evidence
@@ -322,7 +322,7 @@ EnsureRunningPlan(claimSlot, leaseSlot) ==
        Step(ClosureBatchChildResource(claimSlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
-\* cancel_job_tx receipt-only branch (queue_storage.rs:6568)
+\* cancel_job_tx receipt-only branch
 \*   SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED
 \*   insert_done_rows_tx → INSERT INTO done_entries
 \*   INSERT INTO lease_claim_closures
@@ -336,7 +336,7 @@ CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
        Step(ClosureBatchChildResource(claimSlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
-\* cancel_job_tx running-lease branch (queue_storage.rs ~:5581)
+\* cancel_job_tx running-lease branch
 \*   DELETE FROM leases ... RETURNING
 \*   insert_done_rows_tx → INSERT INTO done_entries
 \*   close_receipt_tx (claim child + closure child)

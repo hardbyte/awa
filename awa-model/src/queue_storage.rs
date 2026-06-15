@@ -579,6 +579,182 @@ fn busy_indicator(has_rows: bool) -> i64 {
     }
 }
 
+async fn queue_prune_has_active_leases_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    slot: i32,
+    generation: i64,
+) -> Result<bool, AwaError> {
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM {schema}.leases
+            WHERE ready_slot = $1
+              AND ready_generation = $2
+            LIMIT 1
+        )
+        "#
+    ))
+    .bind(slot)
+    .bind(generation)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)
+}
+
+async fn queue_prune_has_pending_ready_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    ready_child: &str,
+    generation: i64,
+) -> Result<bool, AwaError> {
+    sqlx::query_scalar(&format!(
+        r#"
+        WITH claim_cursors AS MATERIALIZED (
+            SELECT
+                queue,
+                priority,
+                enqueue_shard,
+                {schema}.sequence_next_value(seq_name) AS claim_seq
+            FROM {schema}.queue_claim_heads
+        )
+        SELECT EXISTS (
+            SELECT 1
+            FROM claim_cursors AS claims
+            CROSS JOIN LATERAL (
+                SELECT 1
+                FROM {ready_child} AS ready
+                WHERE ready.ready_generation = $1
+                  AND ready.queue = claims.queue
+                  AND ready.priority = claims.priority
+                  AND ready.enqueue_shard = claims.enqueue_shard
+                  AND ready.lane_seq >= claims.claim_seq
+                LIMIT 1
+            ) AS pending_ready
+            LIMIT 1
+        )
+        "#
+    ))
+    .bind(generation)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)
+}
+
+async fn queue_prune_has_unclosed_claim_refs_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    slot: i32,
+    generation: i64,
+) -> Result<bool, AwaError> {
+    let closure_rel = format!("{schema}.lease_claim_closures");
+    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+    let closed_evidence =
+        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    let count_proves_claim_refs_closed: bool = sqlx::query_scalar(&format!(
+        r#"
+        WITH claim_count AS (
+            SELECT count(*)::bigint AS total
+            FROM {schema}.lease_claims AS claims
+            WHERE claims.ready_slot = $1
+              AND claims.ready_generation = $2
+        ),
+        explicit_count AS (
+            SELECT count(*)::bigint AS total
+            FROM {schema}.lease_claims AS claims
+            JOIN {schema}.lease_claim_closures AS closures
+              ON closures.claim_slot = claims.claim_slot
+             AND closures.job_id = claims.job_id
+             AND closures.run_lease = claims.run_lease
+            WHERE claims.ready_slot = $1
+              AND claims.ready_generation = $2
+        ),
+        compact_count AS (
+            SELECT COALESCE(sum(closed_count), 0)::bigint AS total
+            FROM {schema}.lease_claim_closure_batches AS batches
+            WHERE batches.ready_slot = $1
+              AND batches.ready_generation = $2
+        )
+        SELECT claim_count.total = explicit_count.total + compact_count.total
+        FROM claim_count, explicit_count, compact_count
+        "#
+    ))
+    .bind(slot)
+    .bind(generation)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)?;
+    if count_proves_claim_refs_closed {
+        return Ok(false);
+    }
+
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM {schema}.lease_claims AS claims
+            WHERE claims.ready_slot = $1
+              AND claims.ready_generation = $2
+              AND NOT {closed_evidence}
+            LIMIT 1
+        )
+        "#
+    ))
+    .bind(slot)
+    .bind(generation)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)
+}
+
+async fn claim_prune_has_open_claims_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    claim_child: &str,
+    closure_child: &str,
+    closure_batch_child: &str,
+) -> Result<bool, AwaError> {
+    let closed_evidence =
+        receipt_closed_evidence_sql(schema, closure_child, closure_batch_child, "claims");
+    let count_proves_claims_closed: bool = sqlx::query_scalar(&format!(
+        r#"
+        WITH claim_count AS (
+            SELECT count(*)::bigint AS total FROM {claim_child}
+        ),
+        explicit_count AS (
+            SELECT count(*)::bigint AS total FROM {closure_child}
+        ),
+        compact_count AS (
+            SELECT COALESCE(sum(closed_count), 0)::bigint AS total
+            FROM {closure_batch_child}
+        )
+        SELECT claim_count.total = explicit_count.total + compact_count.total
+        FROM claim_count, explicit_count, compact_count
+        "#
+    ))
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)?;
+    if count_proves_claims_closed {
+        return Ok(false);
+    }
+
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM {claim_child} AS claims
+            WHERE NOT {closed_evidence}
+            LIMIT 1
+        )
+        "#
+    ))
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)
+}
+
 fn oldest_initialized_ring_slot(
     current_slot: i32,
     generation: i64,
@@ -2906,10 +3082,13 @@ impl QueueStorage {
                 {schema}.ready_tombstones,
                 {schema}.ready_segments,
                 {schema}.done_entries,
+                {schema}.receipt_completion_batches,
+                {schema}.receipt_completion_tombstones,
                 {schema}.dlq_entries,
                 {schema}.leases,
                 {schema}.lease_claims,
                 {schema}.lease_claim_closures,
+                {schema}.lease_claim_closure_batches,
                 {schema}.attempt_state,
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
@@ -12510,22 +12689,8 @@ impl QueueStorage {
             }
         }
 
-        let active_leases: bool = sqlx::query_scalar(&format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM {schema}.leases
-                WHERE ready_slot = $1
-                  AND ready_generation = $2
-                LIMIT 1
-            )
-            "#
-        ))
-        .bind(slot)
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let active_leases =
+            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
 
         if active_leases {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -12768,29 +12933,13 @@ impl QueueStorage {
         let receipt_tomb_child = receipt_completion_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
 
-        // Queue prune has three common skip gates. Prove them before
-        // taking ACCESS EXCLUSIVE on the ready/terminal child tables:
-        // the target slot is sealed under the queue ring lock, and any
-        // in-flight producer/claimer that already saw this slot must
-        // still hold a conflicting child-table lock. If a gate fires,
-        // skipping here avoids blocking hot claim reads behind a prune
-        // attempt that cannot truncate anyway.
-        let active_leases: bool = sqlx::query_scalar(&format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM {schema}.leases
-                WHERE ready_slot = $1
-                  AND ready_generation = $2
-                LIMIT 1
-            )
-            "#
-        ))
-        .bind(slot)
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // Queue prune has three common skip gates. Check them before
+        // taking ACCESS EXCLUSIVE on the ready/terminal child tables so
+        // a known-busy slot does not block hot claim reads behind a
+        // doomed truncate attempt. These are only MVCC snapshots; the
+        // same gates are checked again after the exclusive locks.
+        let active_leases =
+            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
 
         if active_leases {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -12801,37 +12950,8 @@ impl QueueStorage {
             });
         }
 
-        let pending: bool = sqlx::query_scalar(&format!(
-            r#"
-            WITH claim_cursors AS MATERIALIZED (
-                SELECT
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    {schema}.sequence_next_value(seq_name) AS claim_seq
-                FROM {schema}.queue_claim_heads
-            )
-            SELECT EXISTS (
-                SELECT 1
-                FROM claim_cursors AS claims
-                CROSS JOIN LATERAL (
-                    SELECT 1
-                    FROM {ready_child} AS ready
-                    WHERE ready.ready_generation = $1
-                      AND ready.queue = claims.queue
-                      AND ready.priority = claims.priority
-                      AND ready.enqueue_shard = claims.enqueue_shard
-                      AND ready.lane_seq >= claims.claim_seq
-                    LIMIT 1
-                ) AS pending_ready
-                LIMIT 1
-            )
-            "#
-        ))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let pending =
+            queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
 
         if pending {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -12842,64 +12962,8 @@ impl QueueStorage {
             });
         }
 
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-        let closed_evidence =
-            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
-        let count_proves_claim_refs_closed: bool = sqlx::query_scalar(&format!(
-            r#"
-            WITH claim_count AS (
-                SELECT count(*)::bigint AS total
-                FROM {schema}.lease_claims AS claims
-                WHERE claims.ready_slot = $1
-                  AND claims.ready_generation = $2
-            ),
-            explicit_count AS (
-                SELECT count(*)::bigint AS total
-                FROM {schema}.lease_claims AS claims
-                JOIN {schema}.lease_claim_closures AS closures
-                  ON closures.claim_slot = claims.claim_slot
-                 AND closures.job_id = claims.job_id
-                 AND closures.run_lease = claims.run_lease
-                WHERE claims.ready_slot = $1
-                  AND claims.ready_generation = $2
-            ),
-            compact_count AS (
-                SELECT COALESCE(sum(closed_count), 0)::bigint AS total
-                FROM {schema}.lease_claim_closure_batches AS batches
-                WHERE batches.ready_slot = $1
-                  AND batches.ready_generation = $2
-            )
-            SELECT claim_count.total = explicit_count.total + compact_count.total
-            FROM claim_count, explicit_count, compact_count
-            "#
-        ))
-        .bind(slot)
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        let unclosed_claim_refs: bool = if count_proves_claim_refs_closed {
-            false
-        } else {
-            sqlx::query_scalar(&format!(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM {schema}.lease_claims AS claims
-                    WHERE claims.ready_slot = $1
-                      AND claims.ready_generation = $2
-                      AND NOT {closed_evidence}
-                    LIMIT 1
-                )
-                "#
-            ))
-            .bind(slot)
-            .bind(generation)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?
-        };
+        let unclosed_claim_refs =
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
 
         if unclosed_claim_refs {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -12924,6 +12988,42 @@ impl QueueStorage {
                 return Ok(PruneOutcome::Blocked { slot });
             }
             return Err(map_sqlx_error(err));
+        }
+
+        // The pre-lock gates are only an MVCC snapshot. If an in-flight
+        // producer or claimer committed while the exclusive partition
+        // lock waited, these post-lock gates see it before TRUNCATE.
+        let active_leases =
+            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+        if active_leases {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueueActiveLeases,
+                count: busy_indicator(active_leases),
+            });
+        }
+
+        let pending =
+            queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
+        if pending {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueuePendingReady,
+                count: busy_indicator(pending),
+            });
+        }
+
+        let unclosed_claim_refs =
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+        if unclosed_claim_refs {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueueUnclosedClaimRefs,
+                count: busy_indicator(unclosed_claim_refs),
+            });
         }
 
         let failed_retention_secs = i64::try_from(failed_retention.as_secs()).unwrap_or(i64::MAX);
@@ -13444,7 +13544,8 @@ impl QueueStorage {
     ///    short transaction-local `lock_timeout` (serialises with in-flight
     ///    claim/complete/rescue writers; gives up under sustained
     ///    contention).
-    /// 5. Rechecks the slot is not the current one.
+    /// 5. Rechecks the slot is not the current one and that every
+    ///    claim still has closure evidence.
     /// 6. `TRUNCATE` all claim-ring children in a single statement.
     ///
     /// The "every claim has closure evidence" precondition is what ADR-023
@@ -13499,53 +13600,20 @@ impl QueueStorage {
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
 
         // Before taking ACCESS EXCLUSIVE on the child partitions, prove
-        // the sealed slot is actually reclaimable. Claim rotation only
-        // hands out `claim_ring_state.current_slot`; once this target is
-        // the oldest initialized non-current slot and we hold the
-        // ring-state/slot-row locks, no new claim can be inserted into it.
-        // Closure evidence is monotonic until this same prune path
-        // truncates the slot. A negative open-claim proof therefore
-        // remains true through the truncate lock; a positive proof can
-        // skip without blocking claim/complete traffic behind a doomed
-        // exclusive-lock attempt.
-        let closed_evidence =
-            receipt_closed_evidence_sql(schema, &closure_child, &closure_batch_child, "claims");
-        let count_proves_claims_closed: bool = sqlx::query_scalar(&format!(
-            r#"
-            WITH claim_count AS (
-                SELECT count(*)::bigint AS total FROM {claim_child}
-            ),
-            explicit_count AS (
-                SELECT count(*)::bigint AS total FROM {closure_child}
-            ),
-            compact_count AS (
-                SELECT COALESCE(sum(closed_count), 0)::bigint AS total
-                FROM {closure_batch_child}
-            )
-            SELECT claim_count.total = explicit_count.total + compact_count.total
-            FROM claim_count, explicit_count, compact_count
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        let open_claims: bool = if count_proves_claims_closed {
-            false
-        } else {
-            sqlx::query_scalar(&format!(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM {claim_child} AS claims
-                    WHERE NOT {closed_evidence}
-                    LIMIT 1
-                )
-                "#
-            ))
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?
-        };
+        // the sealed slot is actually reclaimable. This optimistic proof
+        // avoids blocking claim/complete traffic behind a prune attempt
+        // that is already known to be doomed. A claimer that read the
+        // old current slot before rotation may still commit while the
+        // exclusive lock waits, so the open-claim proof is repeated once
+        // the child locks are held.
+        let open_claims = claim_prune_has_open_claims_tx(
+            &mut tx,
+            schema,
+            &claim_child,
+            &closure_child,
+            &closure_batch_child,
+        )
+        .await?;
 
         if open_claims {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -13591,6 +13659,23 @@ impl QueueStorage {
                 slot,
                 reason: SkipReason::ClaimCurrent,
                 count: 0,
+            });
+        }
+
+        let open_claims = claim_prune_has_open_claims_tx(
+            &mut tx,
+            schema,
+            &claim_child,
+            &closure_child,
+            &closure_batch_child,
+        )
+        .await?;
+        if open_claims {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::ClaimOpen,
+                count: busy_indicator(open_claims),
             });
         }
 

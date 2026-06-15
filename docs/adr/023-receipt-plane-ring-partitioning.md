@@ -75,14 +75,14 @@ Both rescue cursors are bounded cyclic sweeps. Each pass scans forward from the 
 
 - The maintenance leader owns `claim_ring_state` rotation on a cadence chosen to keep the active scan surface bounded. Initial target: rotate at the same cadence as the queue ring so claim partitions age out roughly in step with the ready / done partitions they reference.
 - A claim-slot partition may be truncated only when every claim in it is represented by durable closure evidence. If open claims remain, prune skips the partition until normal completion, normal non-success closure, or the separate receipt-rescue scans close those claims.
-- Queue-ring prune must not remove terminal history for a segment before matching receipt claims have durable closure evidence. It also must not remove retained ready or tombstone rows that are still at or ahead of their lane's claim cursor, because those rows are the cursor's proof that the prefix has been spent. These sealed-slot skip proofs run before the ready/terminal child-table exclusive locks so maintenance skips active slots without blocking hot claim reads. Current successful compact completions write terminal/closure evidence synchronously, and compatibility/cold paths preserve or create closure evidence before hiding terminal history.
-- Prune order mirrors `prune_oldest` and `prune_oldest_leases`, except the open-claim proof intentionally runs before the child-table exclusive locks:
+- Queue-ring prune must not remove terminal history for a segment before matching receipt claims have durable closure evidence. It also must not remove retained ready or tombstone rows that are still at or ahead of their lane's claim cursor, because those rows are the cursor's proof that the prefix has been spent. These sealed-slot skip proofs run before the ready/terminal child-table exclusive locks so maintenance skips active slots without blocking hot claim reads, then run again after the locks so rows that committed while the lock waited are visible before truncate. Current successful compact completions write terminal/closure evidence synchronously, and compatibility/cold paths preserve or create closure evidence before hiding terminal history.
+- Prune order mirrors `prune_oldest` and `prune_oldest_leases`, except the open-claim proof intentionally runs both before and after the child-table exclusive locks:
   1. `FOR UPDATE` on `claim_ring_state`.
   2. `FOR UPDATE` on the target `claim_ring_slots` row.
-  3. Prove every claim in the sealed slot has durable closure evidence. The target is non-current and the ring/slot locks serialize rotate and prune, so new claims cannot enter it; closure evidence can only grow until this same prune truncates the slot.
+  3. Prove every visible claim in the sealed slot has durable closure evidence.
   4. Bounded `ACCESS EXCLUSIVE` on all claim-ring partitions for that slot (claims, explicit closures, and compact closure batches).
-  5. Recheck not-current, then reset the slot's rescue cursor and `TRUNCATE`.
-- Partition truncation never races with claim because claim always writes to the ring's current slot and rotation advances the current slot atomically under the same lock order.
+  5. Recheck not-current and re-prove no open claims under the partition locks, then reset the slot's rescue cursor and `TRUNCATE`.
+- Partition truncation never races with claim because claim writes to the ring's current slot and the prune path rechecks the sealed partition after taking the exclusive child locks.
 
 ### Invariants preserved
 
