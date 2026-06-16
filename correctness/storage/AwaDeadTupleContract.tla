@@ -303,7 +303,7 @@ RescueReceiptsTx == <<
     Mut("Update", "claim_ring_slots")
 >>
 
-\* rescue_expired_receipt_deadlines_tx — queue_storage.rs:8597
+\* rescue_expired_receipt_deadlines_tx
 \* Uses a second per-slot claim_ring_slots cursor ordered by deadline_at.
 \* Closed / lease-managed claims advance the cursor, expired open receipt
 \* claims are closed by appending deadline_expired closure rows, and the
@@ -316,7 +316,7 @@ RescueReceiptDeadlinesTx == <<
     Mut("Update", "claim_ring_slots")
 >>
 
-\* ensure_running_leases_from_receipts_tx — queue_storage.rs:7574
+\* ensure_running_leases_from_receipts_tx
 \* Materialize a receipt into a real lease row. INSERTs the lease,
 \* UPDATEs the claim's materialized_at column.
 EnsureRunningTx == <<
@@ -371,14 +371,14 @@ DeleteReadyCompatTx == <<
     Mut("Insert", "ready_tombstones")
 >>
 
-\* fail_to_dlq / fail_terminal — queue_storage.rs:10081, 10126
+\* fail_to_dlq / fail_terminal
 FailToDlqTx == <<
     Mut("Delete", "leases"),
     Mut("Delete", "attempt_state"),
     Mut("Insert", "dlq_entries")
 >>
 
-\* retry_after / snooze — queue_storage.rs:9947, 9997
+\* retry_after / snooze
 RetryToDeferredTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "deferred_jobs")

@@ -174,6 +174,7 @@ impl CompletionBatcher {
             shards.push(tx);
             workers.push(CompletionWorker {
                 shard_id,
+                shard_count,
                 pool: pool.clone(),
                 rx,
                 cancel: cancel.clone(),
@@ -197,6 +198,7 @@ impl CompletionBatcher {
 
 struct CompletionWorker {
     shard_id: usize,
+    shard_count: usize,
     pool: PgPool,
     rx: mpsc::Receiver<CompletionRequest>,
     cancel: CancellationToken,
@@ -269,6 +271,18 @@ impl CompletionWorker {
         let mut batch: Vec<_> = std::mem::take(pending);
         batch.sort_unstable_by_key(completion_sort_key);
         let job_ids: Vec<i64> = batch.iter().map(|request| request.job_id).collect();
+        // Completion is routed to a shard by job_id, and each shard completes
+        // its batch independently, so a misrouted job would let two shards race
+        // the same job's terminal write. The routing is a pure function of
+        // job_id, so this can only fire on a routing-logic regression.
+        debug_assert!(
+            job_ids
+                .iter()
+                .all(|id| id.rem_euclid(self.shard_count as i64) as usize == self.shard_id),
+            "completion shard {} received a job routed to another shard (shard_count {})",
+            self.shard_id,
+            self.shard_count,
+        );
         let run_leases: Vec<i64> = batch.iter().map(|request| request.run_lease).collect();
         let flush_start = std::time::Instant::now();
 

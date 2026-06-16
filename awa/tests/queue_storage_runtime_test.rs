@@ -6751,6 +6751,140 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     );
 }
 
+/// The live-head claim fast path drops the per-row `ready_claim_attempt_batches`
+/// probe and relies on the head-row probe plus the durable attempt-ledger range
+/// to dedup. This pins that a MULTI-row claim batch is fully deduped after a lost
+/// post-commit cursor advance: the head probe catches the head and the recovery
+/// path advances the stale cursor across the whole contiguous claimed range, so
+/// no lane in the batch is re-emitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_multi_row_claim_dedupes_when_cursor_advance_is_lost() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_multi_row_lost_cursor_advance";
+    let schema = "awa_qs_receipt_multi_row_lost_cursor_advance";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let batch_len = 3_i64;
+    for id in 0..batch_len {
+        enqueue_job(
+            &pool,
+            &store,
+            &HeartbeatRescueJob { id: 20 + id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    let claim_cursor = || async {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT {schema}.sequence_next_value(seq_name)
+             FROM {schema}.queue_claim_heads
+             WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
+        ))
+        .bind(queue)
+        .bind(2_i16)
+        .bind(0_i16)
+        .fetch_one(&pool)
+        .await
+        .expect("claim cursor")
+    };
+
+    // Raw claim of the whole lane in one batch; calling the SQL function
+    // directly leaves the post-commit claim cursor advance unsent, exactly
+    // as a worker crash between commit and advance would.
+    let first: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(batch_len)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("first multi-row receipt claim");
+
+    let mut claimed_lanes: Vec<i64> = first.iter().map(|row| row.lane_seq).collect();
+    claimed_lanes.sort_unstable();
+    assert_eq!(
+        claimed_lanes,
+        vec![1, 2, 3],
+        "the whole contiguous lane must be claimed in one batch"
+    );
+    assert!(
+        first.iter().all(|row| row.run_lease == 1),
+        "every lane in the batch is a first attempt"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        1,
+        "raw claim intentionally leaves the post-commit claim cursor advance unsent"
+    );
+
+    // The whole claimed range is durably recorded as attempt-ledger evidence,
+    // so recovery can dedup every lane without the per-row probe.
+    let attempt_batch_total: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum(claimed_count), 0)::bigint
+         FROM {schema}.ready_claim_attempt_batches
+         WHERE ready_slot = $1
+           AND ready_generation = $2
+           AND queue = $3
+           AND priority = $4
+           AND enqueue_shard = $5
+           AND lane_ranges @> int8range(1, $6 + 1, '[)')"
+    ))
+    .bind(first[0].ready_slot)
+    .bind(first[0].ready_generation)
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .bind(batch_len)
+    .fetch_one(&pool)
+    .await
+    .expect("count attempt-ledger evidence over the claimed range");
+    assert_eq!(
+        attempt_batch_total, batch_len,
+        "the claim must durably record attempt evidence spanning the whole claimed range"
+    );
+
+    // Re-claim with the stale cursor: every lane in the batch must be deduped,
+    // and the cursor must advance past the whole spent range.
+    let second: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(batch_len)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("second multi-row receipt claim with stale cursor");
+    assert!(
+        second.is_empty(),
+        "the head probe plus attempt-ledger range must dedup every lane in a multi-row batch"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        batch_len + 1,
+        "recovery must advance the stale claim cursor past the whole spent range"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     let (_db_guard, pool) = setup_pool(10).await;
