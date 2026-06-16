@@ -6,7 +6,7 @@ Accepted. The "Queue-prune logic must continue treating ready and terminal rows 
 
 ## Context
 
-The queue-storage runtime intentionally keeps the runnable row immutable in `ready_entries` and writes a durable terminal fact to `done_entries` when an attempt completes, fails, or is cancelled. That shape is safe and easy to inspect, but it duplicates the immutable job body on the hottest successful completion path: `args`, `max_attempts`, `run_at`, `created_at`, uniqueness metadata, and often an unchanged runtime payload are written once in `ready_entries` and then again in `done_entries`.
+The queue-storage runtime intentionally keeps the runnable row immutable in `ready_entries` and records durable terminal history when an attempt completes, fails, or is cancelled. The first queue-storage shape wrote every terminal fact to `done_entries`. That shape was safe and easy to inspect, but it duplicated the immutable job body on the hottest successful completion path: `args`, `max_attempts`, `run_at`, `created_at`, uniqueness metadata, and often an unchanged runtime payload were written once in `ready_entries` and then again in `done_entries`.
 
 The duplication is visible in the WAL and row-size budget. Reference queue-storage runs showed this shape:
 
@@ -16,11 +16,13 @@ The duplication is visible in the WAL and row-size budget. Reference queue-stora
 | Narrow terminal history        |        `8,337/s` | `205 ms` | `1,932 B` |
 | Skip `done_entries` entirely   |        `8,402/s` | `230 ms` | `1,441 B` |
 
-Skipping `done_entries` is not acceptable: it weakens the durable terminal history contract and removes the operator/API source of truth. The useful signal is that most of the safe gain comes from avoiding duplicated terminal body bytes, not from deleting the terminal fact.
+Skipping durable terminal history is not acceptable: it weakens the operator/API source of truth. The useful signal is that most of the safe gain comes from avoiding duplicated terminal body bytes, not from deleting the terminal fact.
 
 ## Decision
 
-For terminal rows whose source attempt still has a retained ready row, write a narrow `done_entries` row:
+For terminal rows whose source attempt still has a retained ready row, avoid copying immutable ready-body fields into terminal history.
+
+For failed, cancelled, non-receipt, and wide terminal rows, write a narrow `done_entries` row:
 
 - keep terminal identity and ordering fields: `ready_slot`, `ready_generation`, `job_id`, `kind`, `queue`, `state`, `priority`, `attempt`, `run_lease`, `lane_seq`, `enqueue_shard`, `attempted_at`, and `finalized_at`
 - keep `payload` only when the terminal runtime payload differs from the ready-row payload
@@ -32,44 +34,53 @@ Reads that materialize a `JobRow` or move a terminal row to another storage fami
 (ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq)
 ```
 
-Schema preparation also creates a read-only `{schema}.terminal_jobs` view with the hydrated terminal shape. It is the preferred SQL surface for inspection, reporting, and external read-only tooling. The physical `done_entries` table remains the write/transition surface because retry, DLQ move, and discard paths must delete or move the terminal fact. The retained ready backing row remains immutable and inert until queue prune reclaims the segment.
+For successful receipt-backed completions that do not need wide terminal body fields, write compact rows to `receipt_completion_batches` instead of one `done_entries` row per completed job. Each compact terminal batch stores arrays of `(job_id, run_lease, lane_seq, attempt, attempted_at)` plus the shared ready segment, queue, priority, shard, finalized timestamp, and originating claim slot. The same completion transaction also writes a compact claim-local row to `lease_claim_closure_batches`, keyed by immutable receipt ids allocated from `lease_claim_receipt_id_seq` and stored either on row-local `lease_claims` rows or inside compact `lease_claim_batches.receipt_ids`. The closure batch also stores a derived `int8multirange` for indexed membership checks. The claim transaction returns `receipt_id` to the worker for every receipt claim; compact `lease_claim_batches` claims also return the inserted `batch_id` and a one-based item index. Compact completion validates row-local claims by `(claim_slot, job_id, run_lease, receipt_id)` and compact batch claims by direct `(claim_slot, batch_id, index)` plus the expected `(job_id, run_lease, receipt_id)` after taking the per-attempt advisory lock. Receipt rescue uses the same advisory key before writing rescue closures, so successful completion and rescue serialize without making compact success `FOR UPDATE` every claim row. The claim transaction writes compact `ready_claim_attempt_batches` range evidence in the ready row's queue slot before writing receipt claims, so stale claim-cursor recovery can prove that covered lanes already emitted attempts without reading claim-ring parent tables. Zero-deadline claims also use compact `lease_claim_batches`; deadline-backed claims remain row-local in `lease_claims` so deadline rescue can stay index-backed on `deadline_at`. The runtime routes claim lookup and compact closure writes to the originating `claim_slot` child partitions, while compact terminal history and claim-attempt evidence remain queue-slot routed. Compact terminal batches are counted directly while retained; the terminal-count delta ledger is reserved for `done_entries` terminal mutations. The compact closure batch carries the ready slot and generation for the completed group, so queue and claim prune can compare exact row counts for a sealed segment and skip conservatively when counts do not prove closure. Terminal history and claim-closure proof are therefore separate append-only ledgers, so successful completions do not need per-job `lease_claim_closures` rows and stale receipt scans do not need to unnest terminal-history arrays.
+
+Receipt stale-rescue and deadline-rescue cursors scan only claims that are old or expired enough to be rescue candidates, so long-lived retained claim partitions do not make each maintenance tick re-prove fresh claims.
+
+The compact path is only for receipt-backed jobs with no unique key, no tags, no terminal errors, and no custom metadata. Awa-owned provenance metadata (`_awa_original_priority` and `_awa_original_queue`) remains compact-safe: it is either already present on the retained ready payload, or it is claim-time priority-aging provenance that does not require duplicating the whole terminal body in `done_entries`.
+
+Schema preparation creates a read-only `{schema}.terminal_jobs` view with the hydrated terminal shape. It is the preferred SQL surface for inspection, reporting, and external read-only tooling. The view expands compact completion batches and joins both physical terminal families back to retained `ready_entries`. The physical `done_entries` table remains the write/transition surface for terminal rows that can be retried, moved to DLQ, discarded, or carried forward by failed-retention pruning. Compact completed rows are not retryable; SQL compatibility delete hides them by writing `receipt_completion_tombstones`. That compatibility delete expands retained compact batches to find the target job; Awa does not maintain a `job_ids` GIN index because that would add WAL to every successful compact completion for a cold administrative path.
+
+The retained ready backing row remains immutable and inert until queue prune reclaims the segment.
 
 Terminal rows are narrow only for claimed attempts whose immutable body is already represented by a retained ready row: `running` and `waiting_external` attempts. Cancelling an unclaimed `available` job tombstones the ready lane and writes a wide `done_entries` row because the job never had a claimed attempt snapshot. Scheduled/deferred cancellation also remains wide because there is no ready backing row in the ready ring.
 
 When a terminal row is deleted, the retained ready backing row is not deleted and does not become live again. A ready-backed terminal row was already claimed, so the lane is behind the claim cursor; retry or queue-move paths append a fresh ready row at a new lane position. Ready-row cleanup remains segment-level work owned by queue prune.
 
-Queue-ring prune reclaims retained ready bodies, ready tombstones, pending terminal-count deltas, and any remaining terminal facts for the segment together. The TLA+ model records this as `TerminalHasRetainedReadyBody`: every modelled ready-backed terminal row has a retained ready body until the terminal fact is moved/deleted or queue prune removes the segment.
+Queue-ring prune reclaims retained ready bodies, ready tombstones, compact completion batches, compact completion tombstones, pending `done_entries` terminal-count deltas, and any remaining terminal facts for the segment together. The TLA+ model records this as `TerminalHasRetainedReadyBody`: every modelled ready-backed public terminal row has a retained ready body until the terminal fact is moved/deleted or queue prune removes the segment.
 
-Exact terminal counts are part of this terminal-history contract. Awa keeps them exact with three derived stores:
+Exact terminal counts are part of this terminal-history contract. Awa keeps them exact with retained compact batches plus three derived stores:
 
 - `queue_terminal_live_counts`, keyed by `(ready_slot, queue, priority, enqueue_shard, counter_bucket)`, stores folded counts for retained queue segments.
-- `queue_terminal_count_deltas_*`, partitioned with the queue ring, stores pending signed deltas for terminal mutations that have not been folded yet.
+- `queue_terminal_count_deltas_*`, partitioned with the queue ring, stores pending signed deltas for `done_entries` terminal mutations that have not been folded yet.
+- `receipt_completion_batches_*` and `receipt_completion_tombstones_*` provide the retained compact completion count directly, without another hot-path derived write.
 - `queue_terminal_rollups` stores permanent counts for pruned queue segments.
 
-Terminal mutations append a narrow delta row in the same transaction as the `done_entries` insert/delete:
+`done_entries` terminal mutations append a narrow delta row in the same transaction as the physical terminal mutation:
 
-- completion / terminal insertion writes a positive delta;
-- retry, purge, discard, DLQ move, and compatibility delete write a negative delta;
+- `done_entries` terminal insertion writes a positive delta;
+- retry, purge, discard, DLQ move, and compatibility delete of `done_entries` rows write a negative delta;
 - the delta key includes `ready_generation`, so reused `ready_slot` partitions cannot inherit stale deltas.
 
-Completion batches keep the existing grouping step, but append grouped deltas instead of `UPSERT`ing the live counter. A 512-job batch that touches one queue/priority/shard/bucket group appends one delta row, not 512.
+Compact receipt completion batches do not append terminal-count deltas. A 512-job compact batch writes one compact terminal-history row for a queue/priority/shard group and is counted from its retained `completed_count` until queue prune folds that segment into permanent rollups. SQL compatibility delete of a compact completed row writes `receipt_completion_tombstones`, and exact counts subtract retained compact tombstones. Wide `done_entries` terminal rows keep job-id counter bucketing so later terminal deletes cancel their original positive bucket exactly.
 
-`queue_counts_exact` computes the live terminal component as `queue_terminal_live_counts + SUM(queue_terminal_count_deltas)`, then adds pruned rollups from `queue_terminal_rollups` / `queue_lanes`. The exact read remains honest while maintenance is behind. If the terminal-counter trust marker is not set, the read path falls back to scanning `done_entries` so rolling upgrades and recovery windows stay honest.
+`queue_counts_exact` computes the live terminal component as `queue_terminal_live_counts + SUM(queue_terminal_count_deltas) + SUM(receipt_completion_batches.completed_count) - COUNT(receipt_completion_tombstones)`, then adds pruned rollups from `queue_terminal_rollups` / `queue_lanes`. The exact read remains honest while maintenance is behind. If the terminal-counter trust marker is not set, the read path falls back to scanning `{schema}.terminal_jobs` so rolling upgrades and recovery windows stay honest.
 
-The maintenance leader rolls sealed delta segments into `queue_terminal_live_counts` in deterministic key order, then truncates the matching delta child in the same transaction. Candidate selection is driven by sealed slots that actually contain pending deltas, so an empty old prefix cannot hide a later sealed slot that needs rollup. Rollup skips the current queue slot and any slot with active leases or open receipt claims.
+The maintenance leader rolls sealed delta segments into `queue_terminal_live_counts` in deterministic key order, then truncates the matching delta child in the same transaction. Candidate selection is driven by sealed slots that actually contain pending deltas, so an empty old prefix cannot hide a later sealed slot that needs rollup. Rollup skips the current queue slot and any slot with active leases, retained ready rows at or beyond their lane claim cursors, or open receipt claims. The retained-ready check runs before the exclusive delta-child lock and before the receipt-closure proof, because a slot with pending ready rows cannot be rolled up or pruned yet. Once the delta child is locked, rollup proves receipt claims are closed with the same exact-count proof queue prune uses and skips conservatively when counts do not prove closure.
 
 Rollup is also MVCC-horizon aware. If PostgreSQL reports another backend with an open snapshot in the current database, or an idle transaction with an assigned transaction id, maintenance returns before mutating `queue_terminal_live_counts` or locking the delta child. The pending deltas remain append-only and exact reads remain honest because they include the delta sum. When the horizon clears, a later maintenance tick folds the sealed deltas. Queue prune also truncates the delta child after folding terminal history into permanent rollups, so a lagging counter rollup cannot block retention.
 
-The trust marker remains meaningful: it means the folded counter plus all unrolled deltas is complete for the active schema. Rebuild recomputes the folded counter from `done_entries` and clears the delta ledger.
+The trust marker remains meaningful: it means the folded counter plus all unrolled deltas is complete for retained `done_entries` rows in the active schema. Compact completion batches are direct-counted in both trusted and untrusted modes. Rebuild recomputes the folded counter from `{schema}.done_entries` and clears the delta ledger.
 
 Correctness requirements for the delta ledger:
 
 - The delta append must commit atomically with the terminal mutation it describes. If the state transition rolls back, the delta rolls back.
-- Exact reads must include every committed terminal mutation exactly once: either in the rolled-up counter or in the unrolled delta sum.
+- Exact reads must include every committed terminal mutation exactly once: `done_entries` rows through the rolled-up counter or unrolled delta sum, compact receipt completions through retained batches minus retained compact tombstones, and pruned segments through rollups.
 - Rollup must be crash-safe and idempotent. Applying deltas and truncating the delta segment must commit together.
 - Rollup must acquire counter rows in deterministic order.
 - Rollup may defer while the MVCC horizon is pinned, but the deferral must happen before mutating folded counters or truncating pending deltas.
-- Segment prune may truncate pending delta rows only because it first folds terminal history from `done_entries` into permanent rollups; exact reads no longer need those pending deltas after the terminal segment is pruned.
+- Segment prune may truncate pending delta rows and retained compact batches only because it first folds terminal history from `terminal_jobs` into permanent rollups; exact reads no longer need that retained segment evidence after the terminal segment is pruned.
 - The storage TLA+ models track terminal deltas as append-only, partition-truncated derived state; they do not make job safety depend on counter rollup timing.
 
 ## Consequences
@@ -78,16 +89,16 @@ Correctness requirements for the delta ledger:
 
 - Keeps the durable terminal fact and all existing public API semantics.
 - Reduces WAL and row bytes on the dominant completion path.
-- Preserves `attempted_at` and `finalized_at` in `done_entries`, so terminal attempt timing remains directly inspectable without reconstructing it from a ready row.
-- Keeps the ring-prune safety story unchanged: `ready_entries` and `done_entries` are still reclaimed by queue-slot truncation.
+- Preserves `attempted_at` and `finalized_at` in terminal history, so terminal attempt timing remains inspectable through `{schema}.terminal_jobs`.
+- Keeps the ring-prune safety story unchanged: ready rows, terminal rows, compact completion batches, compact tombstones, and `done_entries` terminal deltas are still reclaimed by queue-slot truncation after the queue slot is proven inactive.
 
 ### Negative
 
-- Direct SQL against `done_entries.args`, `max_attempts`, `run_at`, `created_at`, `unique_key`, `unique_states`, or `payload` must tolerate `NULL` on ready-backed terminal rows. Use `{schema}.terminal_jobs` unless code intentionally needs the physical storage representation.
-- Terminal delete paths have one more responsibility: append the matching negative terminal-count delta before re-enqueuing, moving to DLQ, or discarding.
+- Direct SQL against `done_entries.args`, `max_attempts`, `run_at`, `created_at`, `unique_key`, `unique_states`, or `payload` must tolerate `NULL` on ready-backed terminal rows. Direct SQL against `done_entries` must also tolerate successful receipt-backed completed jobs being absent from that table. Use `{schema}.terminal_jobs` unless code intentionally needs the physical storage representation.
+- `done_entries` terminal delete paths have one more responsibility: append the matching negative terminal-count delta before re-enqueuing, moving to DLQ, or discarding.
 - Queue-prune logic must continue treating ready and terminal rows as one retention unit. ([ADR-032](032-failed-terminal-retention.md) amends this for `failed` rows inside the `failed_retention` floor, which prune carries forward as wide self-contained terminal rows.)
-- Exact terminal-count reads must include both folded counters and pending deltas. Operational SQL that reads only `queue_terminal_live_counts` sees folded state, not the full exact count.
-- Pending delta rows can accumulate while long reader transactions pin the MVCC horizon. That is intentional: it trades a larger append-only ledger for near-zero dead tuples in `queue_terminal_live_counts` during the pin.
+- Exact terminal-count reads must include folded counters, pending `done_entries` deltas, retained compact batches minus compact tombstones, and permanent rollups. Operational SQL that reads only `queue_terminal_live_counts` sees folded `done_entries` state, not the full exact count.
+- Pending delta rows can accumulate while long reader transactions pin the MVCC horizon. That is intentional: it trades a larger append-only `done_entries` ledger for near-zero dead tuples in `queue_terminal_live_counts` during the pin. Compact receipt successes do not add to this ledger.
 
 ## Alternatives Considered
 
@@ -95,13 +106,13 @@ Correctness requirements for the delta ledger:
 
 This is the pre-ADR behavior. It is simple for direct SQL users but spends extra WAL and heap bytes on every terminal transition.
 
-### Remove `done_entries` for successful completions
+### Remove durable terminal history for successful completions
 
 This produced the lowest WAL/job result in experiment, but it removes the durable terminal fact that queue counts, `load_job`, admin inspection, and retention rely on. It is rejected.
 
-### Store a separate success-receipt table
+### Store compact successful receipt completions synchronously
 
-A success-receipt table would make successful completions even narrower, but it would add another terminal source for counts, admin reads, retry/replay tools, and prune. The retained-ready design gets most of the safe benefit while keeping one durable terminal family.
+This is the chosen design. It adds another physical terminal family, but keeps one public terminal surface (`terminal_jobs`), one exact-count contract, and one queue-ring prune boundary. It deliberately does not add a background materializer or make completion visible before durable terminal history commits.
 
 ### Drop terminal counters and scan `done_entries`
 
@@ -121,15 +132,15 @@ This ADR changes the batching defaults that determine whether lower WAL turns in
 
 - `enqueue_shards = 1` remains the strict-FIFO default; use more shards only when partitioned FIFO is acceptable.
 - `claimers = 1` and `claim_batch_size = 512` remain the queue defaults.
-- `AWA_COMPLETION_BATCH_SIZE = 512`, `AWA_COMPLETION_FLUSH_MS = 1`, and queue-storage `AWA_COMPLETION_SHARDS = 1` remain the completion defaults.
+- `AWA_COMPLETION_BATCH_SIZE = 512` and `AWA_COMPLETION_FLUSH_MS = 1` remain the completion defaults. Queue storage uses `AWA_COMPLETION_SHARDS = 1` for ordinary runtimes and `4` when the configured runtime worker capacity is at least `512`; canonical storage keeps `8`.
 - `queue_slot_count = 16`, `lease_slot_count = 8`, `claim_slot_count = 8`, and `lease_claim_receipts = true` remain the queue-storage defaults.
-- `terminal_count_rollup_interval = 30s` folds pending terminal-count deltas for sealed queue slots. Each tick processes at most four sealed slots. Exact reads include pending deltas, so this cadence affects compaction pressure, not correctness.
+- `terminal_count_rollup_interval = 30s` folds pending `done_entries` terminal-count deltas for sealed queue slots. Each tick processes at most four sealed slots. Exact reads include pending deltas and retained compact batches, so this cadence affects compaction pressure, not correctness.
 
-The queue-storage short-job completion path also uses one fused statement for the common receipt-backed, payload-empty terminal transition: insert the narrow `done_entries` fact and the matching terminal-count delta from the claimed runtime snapshot. That `done_entries` row is the durable closure evidence for successful receipt completion, so the hot path does not write a duplicate `lease_claim_closures` row. Jobs with unique-key transitions, terminal payload metadata, materialized heartbeat/progress state, or missed receipt evidence keep the general transaction path.
+The queue-storage short-job completion path also uses one fused statement for the common receipt-backed, payload-empty terminal transition: insert compact completion batch rows, insert compact claim-closure batch rows, and delete any matching `attempt_state`. Before that statement, the transaction takes per-`(job_id, run_lease)` advisory locks in deterministic key order so duplicate completion attempts and known-key materialization or close paths serialize and observe the winning evidence. The fused statement validates row-local `lease_claims` by the immutable receipt tuple and compact `lease_claim_batches` by the claim-returned batch id and one-based item index, and skips claims that already have a materialized `leases` row; those attempts keep the general lease-deleting transaction path. A materialized receipt can be in a newer lease-ring slot than the original claim carried, so the general receipt fallback matches the lease by stable ready-lane identity and `(job_id, run_lease)`. Jobs with unique-key transitions, terminal payload metadata, materialized lease state, or missed receipt evidence also keep the general transaction path.
 
-If a later retry, DLQ move, discard, or SQL compatibility delete removes a terminal row before claim prune has reclaimed the originating receipt, the terminal-delete path first materializes an explicit `lease_claim_closures` row. This keeps claim-ring prune independent of terminal retention timing without adding a closure insert to the common successful completion path.
+If a later retry, DLQ move, discard, or SQL compatibility delete removes a `done_entries` terminal row before claim prune has reclaimed the originating receipt, the terminal-delete path first materializes an explicit `lease_claim_closures` row. Compact successful completions keep their closure evidence in `lease_claim_closure_batches`; SQL compatibility delete hides them from public terminal reads by writing `receipt_completion_tombstones` and does not reopen the receipt.
 
-The offered-rate benchmark turns that lower write budget into an explicit capacity check. With one queue shard, one claimer, `claim_batch_size = 512`, queue-storage completion shards at `1`, and `max_workers = 1024`, a 10-second `10k/s` no-op workload keeps durable completions at the offered rate, drains to zero backlog, and writes `1.8 KiB` WAL per completed job. A `12k/s` offered workload exceeds that reference configuration and accumulates backlog during the offer window before draining afterward.
+The offered-rate benchmark turns that lower write budget into an explicit capacity check. With one queue shard, one claimer, `claim_batch_size = 512`, adaptive queue-storage completion shards, and `max_workers = 1024`, a 10-second `10k/s` no-op workload keeps durable completions at the offered rate, drains to zero backlog, and writes `1.8 KiB` WAL per completed job. A `12k/s` offered workload exceeds that reference configuration and accumulates backlog during the offer window before draining afterward.
 
 ## Relationship to Rejected ADR-024
 
@@ -137,23 +148,25 @@ The relevant historical ADR-024 was **Deferred `done_entries` Materialisation**.
 
 ADR-026 deliberately keeps the opposite contract:
 
-- completion still writes the durable terminal fact synchronously;
-- `done_entries` remains the terminal source of truth for counts, admin reads, retries, DLQ moves, discard, and retention;
+- completion still writes durable terminal history synchronously;
+- `{schema}.terminal_jobs` is the terminal source of truth for counts and admin reads; `done_entries` remains the transition surface for retryable/movable terminal rows;
 - there is no materializer, no lag window, and no extra prune precondition;
-- the fast path is an implementation detail of the same logical transition: only claims that can be closed by durable evidence are inserted into `done_entries`; successful completion uses that `done_entries` row as the evidence, while non-success and cold terminal-delete paths use `lease_claim_closures`.
+- the fast path is an implementation detail of the same logical transition: successful completion writes compact terminal history plus compact claim-local closure evidence atomically, while non-success and cold terminal-delete paths use `lease_claim_closures` with `done_entries`.
 
-The overlap with ADR-024 is the insight that duplicating ready-body JSONB is wasteful. The difference is where the system draws the safety boundary: ADR-024 deferred the terminal fact; ADR-026 keeps the terminal fact durable and only narrows its payload, then fuses receipt-claim locking, terminal insert, and count-delta append so the synchronous contract is cheap enough to hit the throughput target.
+The overlap with ADR-024 is the insight that duplicating ready-body JSONB is wasteful. The difference is where the system draws the safety boundary: ADR-024 deferred the terminal fact; ADR-026 keeps the terminal fact durable and only narrows or compacts its payload, then fuses receipt-claim locking, compact terminal insert, and compact claim-closure insert so the synchronous contract is cheap enough to hit the throughput target.
 
 The first tuning move for overload remains semantic enqueue sharding when the workload can accept partitioned FIFO. This ADR lowers the durable completion write budget underneath those defaults.
 
 ## Validation
 
 - Runtime tests assert that completed and failed ready-backed terminal rows are narrow, hydrate correctly through `load_job`, and can retry without resurrecting the retained ready backing row.
-- Runtime tests assert that the `{schema}.terminal_jobs` compatibility view hydrates ready-backed terminal rows while the physical `done_entries` row remains narrow.
+- Runtime tests assert that the `{schema}.terminal_jobs` compatibility view hydrates ready-backed terminal rows while physical terminal rows remain narrow or compact.
+- Runtime tests assert that successful compact receipt-backed completions write no completed `done_entries` row, appear in `terminal_jobs`, write no per-job completed receipt closures, write compact `lease_claim_closure_batches` evidence for row-local and compact claim-batch receipts, write no terminal-count deltas, can be hidden by SQL compatibility delete through `receipt_completion_tombstones`, remain closed from the receipt plane, and are counted by trusted direct-batch reads, untrusted fallback scans, and rebuild paths.
+- Runtime tests assert that receipt claims materialized into `leases` after lease-ring rotation still complete through the general receipt fallback and delete the materialized lease by stable identity.
 - Runtime tests assert that cancelling an unclaimed available job tombstones the ready lane and writes a wide terminal row because the job never had a claimed attempt snapshot.
 - Existing DLQ move, bulk move, retry, and discard flows hydrate terminal rows before moving them, remove the terminal fact, and leave retained ready backing rows inert until queue prune.
-- Runtime tests assert that terminal mutations append signed deltas, exact counts include folded counters plus pending deltas, maintenance rolls sealed deltas into `queue_terminal_live_counts`, prune folds terminal history into permanent rollups, and rebuild restores counters from `done_entries`.
-- `correctness/storage/AwaSegmentedStorage.tla` models retained terminal ready bodies, terminal-to-DLQ terminal-fact deletion, and queue prune reclaiming retained ready bodies with any remaining terminal facts.
+- Runtime tests assert that `done_entries` terminal mutations append signed deltas, exact counts include folded counters plus pending deltas plus retained compact batches minus compact tombstones, maintenance rolls sealed deltas into `queue_terminal_live_counts`, prune folds terminal history into permanent rollups, and rebuild restores counters from `done_entries`.
+- `correctness/storage/AwaSegmentedStorage.tla` models retained terminal ready bodies, compact receipt closure evidence, terminal-to-DLQ terminal-fact deletion, and queue prune reclaiming retained ready bodies with any remaining terminal facts.
 
 ## Relationship to Other ADRs
 

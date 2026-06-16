@@ -11,9 +11,9 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* The claim/rotate/prune race against the lease ring is mitigated by:
 \*   - the rotators taking FOR UPDATE on lease_ring_state and the
 \*     target slot row (so two rotators serialise),
-\*   - LOCK TABLE ACCESS EXCLUSIVE NOWAIT on the partition child (so prune
-\*     fails fast under contention instead of queueing ahead of worker
-\*     traffic before truncating).
+\*   - LOCK TABLE ACCESS EXCLUSIVE on the partition child under a bounded
+\*     lock_timeout (so prune can break starvation without queueing
+\*     indefinitely ahead of worker traffic before truncating).
 \* Note: the claim CTE reads lease_ring_state with a plain SELECT, NOT
 \* a FOR SHARE. The conflict detection between claim and rotate is the
 \* rotator's CAS UPDATE (`WHERE current_slot=$ AND generation=$`) plus
@@ -21,14 +21,16 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* The plans below treat the ring-state read as a no-lock step (it is
 \* simply elided from the plan).
 \*
-\* ADR-023 extends the locked resources with the claim ring
-\* (claim_ring_state, claim_ring_slots, lease_claims child partitions,
-\* lease_claim_closures child partitions) and the parallel rotate/prune
+\* ADR-023/026 extends the locked resources with the claim ring
+\* (claim_ring_state, claim_ring_slots, lease_claims / lease_claim_batches
+\* child partitions, lease_claim_closures child partitions, compact
+\* closure-batch child partitions) and the parallel rotate/prune
 \* plans for the claim ring. The claim path takes a RowExclusive on
-\* the lease_claims child partition (receipts mode) or the leases child
-\* partition (legacy mode). Closure writes on terminal transitions take
-\* a RowExclusive on the lease_claim_closures child partition matching
-\* the originating claim.
+\* the lease_claims or lease_claim_batches child partition (receipts mode)
+\* or the leases child partition (legacy mode). Closure writes on terminal transitions take
+\* a RowExclusive on the lease_claim_closures or
+\* lease_claim_closure_batches child partition matching the originating
+\* claim.
 \*
 \* What it models:
 \* - each transaction as an ordered sequence of (resource, mode) lock
@@ -50,7 +52,7 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* What it intentionally does not model:
 \* - MVCC / snapshot isolation — we only care about lock-order safety
 \* - the actual data under the locks — AwaSegmentedStorage covers that
-\* - Postgres's NOWAIT or deadlock detector abort choice — we
+\* - Postgres's lock-timeout or deadlock detector abort choice — we
 \*   flag cycles as safety violations so the spec fails fast rather
 \*   than modelling the race-to-abort
 \* - implicit table-level locks beyond what is explicitly named in each
@@ -115,22 +117,41 @@ LeaseChildResource(s) == [k |-> "lease_child", s |-> s]
 QueueRingStateResource == [k |-> "queue_ring_state"]
 QueueRingSlotResource(s) == [k |-> "queue_ring_slot", s |-> s]
 ReadyChildResource(s) == [k |-> "ready_child", s |-> s]
+ReadyClaimAttemptBatchChildResource(s) == [k |-> "ready_claim_attempt_batch_child", s |-> s]
+ReadyTombstoneChildResource(s) == [k |-> "ready_tombstone_child", s |-> s]
+ReadySegmentChildResource(s) == [k |-> "ready_segment_child", s |-> s]
 DoneChildResource(s) == [k |-> "done_child", s |-> s]
+ReceiptBatchChildResource(s) == [k |-> "receipt_batch_child", s |-> s]
+ReceiptTombstoneChildResource(s) == [k |-> "receipt_tombstone_child", s |-> s]
+TerminalDeltaChildResource(s) == [k |-> "terminal_delta_child", s |-> s]
 LeasesParentResource == [k |-> "leases_parent"]
+ClaimProofResource == [k |-> "claim_proof_children"]
+ClosureProofResource == [k |-> "closure_proof_children"]
+ClosureBatchProofResource == [k |-> "closure_batch_proof_children"]
 ClaimRingStateResource == [k |-> "claim_ring_state"]
 ClaimRingSlotResource(s) == [k |-> "claim_ring_slot", s |-> s]
 ClaimChildResource(s) == [k |-> "claim_child", s |-> s]
+ClaimBatchChildResource(s) == [k |-> "claim_batch_child", s |-> s]
 ClosureChildResource(s) == [k |-> "closure_child", s |-> s]
+ClosureBatchChildResource(s) == [k |-> "closure_batch_child", s |-> s]
 
 LaneResources == { LaneResource(q, p) : q \in Queues, p \in Priorities }
 LeaseRingSlotResources == { LeaseRingSlotResource(s) : s \in LeaseSlots }
 LeaseChildResources == { LeaseChildResource(s) : s \in LeaseSlots }
 QueueRingSlotResources == { QueueRingSlotResource(s) : s \in ReadySlots }
 ReadyChildResources == { ReadyChildResource(s) : s \in ReadySlots }
+ReadyClaimAttemptBatchChildResources == { ReadyClaimAttemptBatchChildResource(s) : s \in ReadySlots }
+ReadyTombstoneChildResources == { ReadyTombstoneChildResource(s) : s \in ReadySlots }
+ReadySegmentChildResources == { ReadySegmentChildResource(s) : s \in ReadySlots }
 DoneChildResources == { DoneChildResource(s) : s \in ReadySlots }
+ReceiptBatchChildResources == { ReceiptBatchChildResource(s) : s \in ReadySlots }
+ReceiptTombstoneChildResources == { ReceiptTombstoneChildResource(s) : s \in ReadySlots }
+TerminalDeltaChildResources == { TerminalDeltaChildResource(s) : s \in ReadySlots }
 ClaimRingSlotResources == { ClaimRingSlotResource(s) : s \in ClaimSlots }
 ClaimChildResources == { ClaimChildResource(s) : s \in ClaimSlots }
+ClaimBatchChildResources == { ClaimBatchChildResource(s) : s \in ClaimSlots }
 ClosureChildResources == { ClosureChildResource(s) : s \in ClaimSlots }
+ClosureBatchChildResources == { ClosureBatchChildResource(s) : s \in ClaimSlots }
 
 Resources ==
     LaneResources \cup
@@ -140,12 +161,23 @@ Resources ==
     {QueueRingStateResource} \cup
     QueueRingSlotResources \cup
     ReadyChildResources \cup
+    ReadyClaimAttemptBatchChildResources \cup
+    ReadyTombstoneChildResources \cup
+    ReadySegmentChildResources \cup
     DoneChildResources \cup
+    ReceiptBatchChildResources \cup
+    ReceiptTombstoneChildResources \cup
+    TerminalDeltaChildResources \cup
     {LeasesParentResource} \cup
+    {ClaimProofResource} \cup
+    {ClosureProofResource} \cup
+    {ClosureBatchProofResource} \cup
     {ClaimRingStateResource} \cup
     ClaimRingSlotResources \cup
     ClaimChildResources \cup
-    ClosureChildResources
+    ClaimBatchChildResources \cup
+    ClosureChildResources \cup
+    ClosureBatchChildResources
 
 \* A plan step is [res, mode].
 Step(res, mode) == [res |-> res, mode |-> mode]
@@ -166,11 +198,12 @@ TwoStripeQueuesOK ==
 \* awa-model/src/queue_storage.rs as noted inline.
 
 \* insert_ready_rows_tx / insert_ready_rows_copy_tx
-\*   UPDATE queue_enqueue_heads for each grouped physical queue
+\*   reserve_enqueue_seq takes a transaction-scoped lane lock for each
+\*   grouped physical queue
 \*   INSERT / COPY ready rows
-\*   UPDATE queue_lanes for each grouped physical queue
+\*   INSERT ready_segments for each grouped physical queue
 \*
-\* The model collapses the queue_enqueue_heads and queue_lanes rows
+\* The model collapses the reserve_enqueue_seq advisory lock and lane rows
 \* into LaneResource, because the deadlock class we care about is
 \* multi-stripe transactions taking lane-family locks in different
 \* physical-queue orders. Enqueue keeps a stable physical-stripe order.
@@ -181,12 +214,16 @@ EnqueueTwoStripePlan(p) ==
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
 \*   FOR UPDATE OF queue_claim_heads SKIP LOCKED (per-(queue,priority) row)
+\*   refresh queue_claim_heads.ready_segment_* on the already-locked row
+\*     when the cached ready-slot hint no longer validates
 \*   plain SELECT of lease_ring_state and claim_ring_state — no
 \*     FOR SHARE / FOR UPDATE; serialisation against rotate is via
 \*     the rotator's CAS UPDATE on (current_slot, generation), not a
 \*     row lock here, so these reads are NOT modelled as plan steps.
 \*   plain SELECT of ready_entries_<slot> (implicit AccessShare on child)
-\*   INSERT INTO lease_claims_<claim_slot> (receipts mode) OR
+\*   INSERT INTO ready_claim_attempt_batches_<ready_slot> (receipts mode)
+\*   INSERT INTO lease_claim_batches_<claim_slot> or
+\*     lease_claims_<claim_slot> (receipts mode) OR
 \*   INSERT INTO leases_<lease_slot> (legacy mode)
 \*   UPDATE queue_claim_heads (already locked, no new acquire)
 \*
@@ -200,7 +237,9 @@ EnqueueTwoStripePlan(p) ==
 ClaimReceiptsPlan(q, p, readySlot, claimSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared),
-       Step(ClaimChildResource(claimSlot), ModeShared) >>
+       Step(ReadyClaimAttemptBatchChildResource(readySlot), ModeShared),
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared) >>
 
 ClaimLegacyPlan(q, p, readySlot, leaseSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
@@ -217,31 +256,58 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
     << Step(LaneResource(StripeB, p), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
        Step(LaneResource(StripeA, p), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared),
-       Step(ClaimChildResource(claimSlot), ModeShared) >>
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared) >>
 
 \* complete_runtime_batch receipt branch (ADR-023/026)
 \*   No queue_lanes lock (completion does not gate on a lane row)
-\*   Successful receipt completion uses done_entries as durable closure
-\*   evidence and does not insert lease_claim_closures on the hot path.
+\*   Successful compact receipt completion validates the exact claim by
+\*   receipt_id, reads closure evidence to stay idempotent, writes compact
+\*   claim-local closure evidence, and compact receipt completion history.
+\*   Compact counts are read from
+\*   retained receipt batches, so this path does not touch the terminal-count
+\*   delta children.
+\*   It also anti-joins the leases parent so materialized receipt claims
+\*   fall back to the lease-deleting completion path. That fallback matches
+\*   materialized receipt leases by stable ready-lane / attempt identity
+\*   because the lease ring can rotate after the original receipt claim.
+\*   Rust first takes per-(job_id, run_lease) advisory transaction locks in
+\*   deterministic key order. Known-key materialization, explicit close,
+\*   and receipt rescue paths use the same advisory key before row locks.
+\*   Those locks
+\*   serialize same-attempt state changes but do not participate in the
+\*   table-lock waits-for cycles modelled here.
 \*   Non-success close paths are modelled by CloseReceiptPlan /
 \*   CancelReceiptOnlyPlan / CancelRunningPlan.
 CompletePlan(claimSlot, readySlot) ==
-    << Step(DoneChildResource(readySlot), ModeShared) >>
+    << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared),
+       Step(LeasesParentResource, ModeShared),
+       Step(ReceiptBatchChildResource(readySlot), ModeShared) >>
 
-\* close_receipt_tx (queue_storage.rs:6517, called from cancel_job_tx)
-\*   WITH locked_claim AS (SELECT ... FROM lease_claims FOR UPDATE)
+\* close_receipt_tx (called from cancel_job_tx)
+\*   transaction-scoped per-(job_id, run_lease) advisory lock first
+\*   WITH locked_claim AS (SELECT ... FROM lease_claims /
+\*     lease_claim_batches FOR UPDATE)
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
 CloseReceiptPlan(claimSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
-       Step(ClosureChildResource(claimSlot), ModeShared) >>
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
-\* rescue_stale_receipt_claims_tx (queue_storage.rs:8195)
+\* rescue_stale_receipt_claims_tx
 \*   plain SELECT of claim_ring_state to prefer the oldest initialized slot
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
-\*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
+\*   SELECT ... FROM lease_claims / lease_claim_batches claims LEFT JOIN
+\*     attempt_state ...
 \*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)
+\*     pg_try_advisory_xact_lock per (job_id, run_lease)
 \*     FOR UPDATE OF claims SKIP LOCKED
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
 \*   UPDATE claim_ring_slots[slot] rescue cursor
@@ -250,13 +316,16 @@ CloseReceiptPlan(claimSlot) ==
 RescueReceiptsPlan(claimSlot) ==
     << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
        Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
-       Step(ClosureChildResource(claimSlot), ModeShared) >>
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
 \* rescue_expired_receipt_deadlines_tx
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   bounded scan of lease_claims_<slot> ordered by deadline_at
 \*   anti-join lease_claim_closures_<slot> and leases parent
+\*   pg_try_advisory_xact_lock per (job_id, run_lease)
 \*   FOR UPDATE OF expired claim rows SKIP LOCKED
 \*   INSERT INTO lease_claim_closures ... deadline_expired
 \*   UPDATE claim_ring_slots[slot] deadline cursor
@@ -266,29 +335,38 @@ RescueReceiptDeadlinesPlan(claimSlot) ==
     << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
-       Step(ClosureChildResource(claimSlot), ModeShared) >>
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
-\* ensure_running_leases_from_receipts_tx (queue_storage.rs:7574)
+\* ensure_running_leases_from_receipts_tx
+\*   transaction-scoped per-(job_id, run_lease) advisory lock first
 \*   CTE claim_refs: SELECT ... FROM lease_claims FOR UPDATE OF claims
+\*   anti-join explicit and compact closure evidence
 \*   INSERT INTO leases ...
 \*   UPDATE lease_claims SET materialized_at = ...
 EnsureRunningPlan(claimSlot, leaseSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
-\* cancel_job_tx receipt-only branch (queue_storage.rs:6568)
-\*   SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED
+\* cancel_job_tx receipt-only branch
+\*   SELECT ... FROM lease_claims / lease_claim_batches FOR UPDATE SKIP LOCKED
 \*   insert_done_rows_tx → INSERT INTO done_entries
 \*   INSERT INTO lease_claim_closures
 \*   defensive DELETE FROM leases (sweeps any concurrent materialization)
 \*   pg_notify('awa:cancel', ...)
 CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared),
+       Step(TerminalDeltaChildResource(readySlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
-\* cancel_job_tx running-lease branch (queue_storage.rs ~:5581)
+\* cancel_job_tx running-lease branch
 \*   DELETE FROM leases ... RETURNING
 \*   insert_done_rows_tx → INSERT INTO done_entries
 \*   close_receipt_tx (claim child + closure child)
@@ -296,8 +374,11 @@ CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
 CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
     << Step(LeaseChildResource(leaseSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared),
+       Step(TerminalDeltaChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
-       Step(ClosureChildResource(claimSlot), ModeShared) >>
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
 \* terminal-delete paths that remove done_entries evidence before claim prune
 \* can consume the corresponding receipt. Rust materializes an explicit
@@ -305,8 +386,10 @@ CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
 \* retry-from-terminal, DLQ move, discard, and SQL compatibility delete.
 TerminalDeletePlan(readySlot, claimSlot) ==
     << Step(DoneChildResource(readySlot), ModeShared),
+       Step(TerminalDeltaChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
-       Step(ClosureChildResource(claimSlot), ModeShared) >>
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
 \* batch set_priority / move_queue ready-row lane move
 \*   SELECT source ready row FOR UPDATE after reading the source claim-head
@@ -335,7 +418,7 @@ RotateLeasesPlan(nextSlot) ==
 \* prune_oldest_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
 \*   SELECT ... FROM lease_ring_slots[slot] FOR UPDATE
-\*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE NOWAIT
+\*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 PruneLeasesPlan(slot) ==
     << Step(LeaseRingStateResource, ModeExclusive),
        Step(LeaseRingSlotResource(slot), ModeExclusive),
@@ -344,44 +427,88 @@ PruneLeasesPlan(slot) ==
 \* rotate_ready similar to rotate_leases (approximated)
 RotateReadyPlan(nextSlot) ==
     << Step(QueueRingStateResource, ModeExclusive),
-       Step(ReadyChildResource(nextSlot), ModeShared) >>
+       Step(ReadyChildResource(nextSlot), ModeShared),
+       Step(ReadyClaimAttemptBatchChildResource(nextSlot), ModeShared),
+       Step(ReadyTombstoneChildResource(nextSlot), ModeShared),
+       Step(ReadySegmentChildResource(nextSlot), ModeShared),
+       Step(DoneChildResource(nextSlot), ModeShared),
+       Step(ReceiptBatchChildResource(nextSlot), ModeShared),
+       Step(ReceiptTombstoneChildResource(nextSlot), ModeShared),
+       Step(TerminalDeltaChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest
 \*   SELECT ... FROM queue_ring_state FOR UPDATE
 \*   SELECT ... FROM queue_ring_slots FOR UPDATE
-\*   LOCK TABLE ready_child[slot], done_child[slot] ACCESS EXCLUSIVE NOWAIT
-\*   SELECT count FROM leases WHERE ready_slot = $1 (AccessShare on leases parent)
+\*   prove sealed-slot skip gates before child exclusive locks:
+\*     active leases (leases parent), unclosed receipt claims
+\*     (claim/closure proof resources), and pending retained ready rows
+\*     at or beyond the lane cursor
+\*   LOCK TABLE ready/claim-attempt/done/tombstone/segment/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
+\*   repeat the active/pending/unclosed proofs after the exclusive child
+\*     locks before TRUNCATE
 PruneReadyPlan(slot) ==
     << Step(QueueRingStateResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared),
        Step(ReadyChildResource(slot), ModeExclusive),
+       Step(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
        Step(DoneChildResource(slot), ModeExclusive),
-       Step(LeasesParentResource, ModeShared) >>
+       Step(ReadyTombstoneChildResource(slot), ModeExclusive),
+       Step(ReadySegmentChildResource(slot), ModeExclusive),
+       Step(ReceiptBatchChildResource(slot), ModeExclusive),
+       Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
+       Step(TerminalDeltaChildResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared) >>
 
 \* rotate_claims (ADR-023)
 \*   SELECT ... FROM claim_ring_state FOR UPDATE
 \*   SELECT count(*) FROM claim_child[next_slot]
+\*   SELECT count(*) FROM claim_batch_child[next_slot]
 \*   SELECT count(*) FROM closure_child[next_slot]
+\*   SELECT count(*) FROM closure_batch_child[next_slot]
 \*   UPDATE claim_ring_state
 RotateClaimsPlan(nextSlot) ==
     << Step(ClaimRingStateResource, ModeExclusive),
        Step(ClaimChildResource(nextSlot), ModeShared),
-       Step(ClosureChildResource(nextSlot), ModeShared) >>
+       Step(ClaimBatchChildResource(nextSlot), ModeShared),
+       Step(ClosureChildResource(nextSlot), ModeShared),
+       Step(ClosureBatchChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest_claims (ADR-023)
 \*   SELECT ... FROM claim_ring_state FOR UPDATE
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
-\*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE NOWAIT
-\*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE NOWAIT
-\*   rescue-before-truncate: close any still-open claims via the
-\*     existing receipt-rescue path (modelled at the data-spec level, no
-\*     extra locks here because the rescue uses the same child AccessExclusive)
-\*   TRUNCATE claim_child[slot] + closure_child[slot]
+\*   prove every claim in the sealed slot has durable closure evidence
+\*     with plain SELECT / AccessShare on the claim children. The Rust
+\*     implementation uses an exact count proof; if counts do not prove
+\*     closure, it conservatively skips the truncate instead of running
+\*     an unbounded per-claim anti-join over retained compact batches.
+\*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
+\*   LOCK TABLE claim_batch_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
+\*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
+\*   LOCK TABLE closure_batch_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
+\*   open-claim slots skip before the exclusive lock path; the plan below
+\*     models the successful truncate path after the proof has passed
+\*   TRUNCATE claim_child[slot] + claim_batch_child[slot] +
+\*     closure_child[slot] + closure_batch_child[slot]
 PruneClaimsPlan(slot) ==
     << Step(ClaimRingStateResource, ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive),
+       Step(ClaimChildResource(slot), ModeShared),
+       Step(ClaimBatchChildResource(slot), ModeShared),
+       Step(ClosureChildResource(slot), ModeShared),
+       Step(ClosureBatchChildResource(slot), ModeShared),
        Step(ClaimChildResource(slot), ModeExclusive),
-       Step(ClosureChildResource(slot), ModeExclusive) >>
+       Step(ClaimBatchChildResource(slot), ModeExclusive),
+       Step(ClosureChildResource(slot), ModeExclusive),
+       Step(ClosureBatchChildResource(slot), ModeExclusive) >>
 
 VARIABLES
     heldLocks,     \* [resource -> set of <<tx, mode>>]

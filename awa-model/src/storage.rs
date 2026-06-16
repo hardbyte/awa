@@ -138,18 +138,54 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
         r#"
         SELECT
             to_regclass(format('%I.%I', $1, 'job_id_seq')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_receipt_id_seq')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_batch_id_seq')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'queue_ring_state')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_entries')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'ready_claim_attempt_batches')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_tombstones')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'ready_segments')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'done_entries')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'receipt_completion_batches')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'receipt_completion_tombstones')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'queue_terminal_count_deltas')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'leases')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'deferred_jobs')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'lease_claims')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_batches')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'lease_claim_closures')) IS NOT NULL
-            AND to_regprocedure(
-                format('%I.%I(text,bigint,double precision,double precision)', $1, 'claim_ready_runtime')
-            ) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_closure_batches')) IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = $1
+                  AND table_name = 'lease_claim_closure_batches'
+                  AND column_name = 'receipt_ranges'
+            )
+            AND (
+                SELECT count(*) = 3
+                FROM information_schema.columns
+                WHERE table_schema = $1
+                  AND table_name = 'queue_claim_heads'
+                  AND column_name = ANY(ARRAY[
+                      'ready_segment_slot',
+                      'ready_segment_generation',
+                      'ready_segment_next_lane_seq'
+                  ])
+            )
+            AND EXISTS (
+                SELECT 1
+                FROM pg_proc AS p
+                JOIN pg_namespace AS n
+                  ON n.oid = p.pronamespace
+                WHERE n.nspname = $1
+                  AND p.oid = to_regprocedure(
+                      format('%I.%I(text,bigint,double precision,double precision)', $1, 'claim_ready_runtime')
+                  )::oid
+                  AND position('receipt_id' IN pg_get_function_result(p.oid)) > 0
+                  AND position('claim_batch_id' IN pg_get_function_result(p.oid)) > 0
+                  AND position('claim_batch_index' IN pg_get_function_result(p.oid)) > 0
+            )
         "#,
     )
     .bind(schema)

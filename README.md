@@ -12,6 +12,7 @@ Awa (Māori: river) fills the gap between Postgres event queues that are too nar
 - A **queue** is the operational boundary workers subscribe to; use separate queues when workloads need different capacity, ownership, or failure policy.
 - A **scheduled job** has a future `run_at`. Awa stores scheduled jobs outside the ready claim path and promotes them when due. Retry backoff and snooze use the same deferred backlog.
 - A worker **claims** a job before running it. The claim increments `run_lease`, which guards completion so stale workers cannot finish a newer attempt.
+- A **receipt** is the lightweight claim record used for short attempts. Successful receipt completions store compact terminal history and compact claim-local closure evidence.
 - A **lease** is the durable execution record for a live attempt. Short jobs usually stay on the receipt path; jobs that need heartbeat, progress, callbacks, or mutable attempt state materialize a lease row.
 - A **lane** is the ordered stream for one `(queue, priority, enqueue_shard)`. FIFO is strict inside a lane; raising shard count creates partitioned FIFO.
 - A **partitioned queue** maps one hot logical workload to several physical queues so workers can drain independent claim/completion streams while preserving normal Awa durability and rescue semantics.
@@ -35,7 +36,7 @@ Awa (Māori: river) fills the gap between Postgres event queues that are too nar
 - **Rust and Python workers** — same queues, same storage engine, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
 - **Runtime-owned maintenance** — dispatch, rescue, queue/lease/claim ring rotation, pruning, and cleanup run in the worker fleet; no `pg_cron` ticker required.
-- **Segmented queue storage** — append-first ready/terminal partitions, small ready-tombstone and terminal-count delta ledgers, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
+- **Segmented queue storage** — append-first ready/terminal partitions, compact receipt completion and closure batches, small ready-tombstone ledgers, `done_entries` terminal-count deltas, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
 - **LISTEN/NOTIFY wakeup** — millisecond-scale pickup latency.
 - **HTTP Worker** — feature-gated worker that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with BLAKE3-signed callback auth.
 - **Weighted concurrency + rate limiting** — global worker pool with per-queue guarantees; per-queue token bucket.

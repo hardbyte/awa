@@ -321,7 +321,7 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
              AND ready.lane_seq = leases.lane_seq
             UNION ALL
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
-            FROM {schema}.done_entries
+            FROM {schema}.terminal_jobs
             UNION ALL
             SELECT
                 job_id,
@@ -2373,7 +2373,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                       )
                 ), 0) AS available,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,
-                COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'), 0) AS completed,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.terminal_jobs WHERE state = 'completed'), 0) AS completed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'retryable'), 0) AS retryable,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'failed'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,

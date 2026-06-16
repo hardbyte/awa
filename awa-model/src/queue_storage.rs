@@ -26,6 +26,7 @@ const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
+const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
@@ -67,18 +68,27 @@ pub struct QueueStorageConfig {
     pub queue_slot_count: usize,
     pub lease_slot_count: usize,
     /// Number of child partitions the receipt ring splits
-    /// `lease_claims` / `lease_claim_closures` across (ADR-023).
+    /// `lease_claims`, `lease_claim_batches`, and receipt-closure evidence
+    /// across (ADR-023).
     /// Mirrors `lease_slot_count`: a small fixed set of slots
     /// reclaimed by rotation + TRUNCATE rather than by row-level
     /// DELETE.
     pub claim_slot_count: usize,
     pub queue_stripe_count: usize,
     /// Use the receipt-plane short path for zero-deadline jobs:
-    /// claim writes a row into `lease_claims`; successful completion
-    /// writes the terminal fact to `done_entries`, while non-success
-    /// exits and cold terminal-delete paths materialize explicit
-    /// closures in `lease_claim_closures`. Both receipt tables are
-    /// reclaimed by claim-ring rotation + TRUNCATE. Default `true`.
+    /// claim writes compact batches into `lease_claim_batches` for the
+    /// zero-deadline hot path, while deadline-backed attempts keep row-local
+    /// evidence in `lease_claims` for indexed deadline rescue. Compact claims
+    /// can still materialize into `leases` when the worker later needs mutable
+    /// attempt state. Successful compact
+    /// completion writes durable terminal history through
+    /// `receipt_completion_batches` and compact claim-local closure evidence
+    /// in `lease_claim_closure_batches`, or falls back to `done_entries`, while
+    /// non-success exits and cold terminal-delete paths materialize explicit
+    /// closures in `lease_claim_closures`.
+    /// Receipt claim evidence is reclaimed by claim-ring rotation +
+    /// TRUNCATE.
+    /// Default `true`.
     /// Set to `false` to force every claim through the legacy
     /// `leases` materialization path.
     pub lease_claim_receipts: bool,
@@ -106,12 +116,22 @@ pub struct ClaimedEntry {
     pub ready_generation: i64,
     pub lease_slot: i32,
     pub lease_generation: i64,
-    /// ADR-023: the `claim_slot` partition this attempt's
-    /// `lease_claims` receipt landed in. Explicit receipt-closure
-    /// paths use this to co-locate `lease_claim_closures`; the
-    /// successful receipt completion path uses the terminal
-    /// `done_entries` row as closure evidence instead.
+    /// ADR-023: the `claim_slot` partition this attempt's receipt
+    /// evidence landed in. Receipt-closure paths use this to co-locate
+    /// explicit `lease_claim_closures`; compact successful receipt
+    /// completions keep claim-local evidence in
+    /// `lease_claim_closure_batches` instead.
     pub claim_slot: i32,
+    /// Stable identity for immutable receipt claim evidence. Present for
+    /// receipt-backed claims and used by the compact completion path to
+    /// validate the exact claim attempt without row-locking it.
+    pub receipt_id: Option<i64>,
+    /// Compact claim batch row identity for zero-deadline receipt claims.
+    /// Row-local receipt claims leave this unset.
+    pub claim_batch_id: Option<i64>,
+    /// One-based item position inside `lease_claim_batches.*_ids` arrays.
+    /// Present with `claim_batch_id` and used as an O(1) compact proof.
+    pub claim_batch_index: Option<i32>,
     pub lease_claim_receipt: bool,
     /// The enqueue shard the row was claimed from. Routes the
     /// terminal `done_entries` write onto the correct shard's
@@ -213,11 +233,13 @@ pub struct QueueCounts {
     pub running: i64,
     /// Count of rows in *any* terminal state (`completed`, `failed`, or
     /// `cancelled`) for the queue. The name reflects what the field
-    /// actually counts: it is `count(*) FROM done_entries` semantics, not
-    /// `count(*) WHERE state = 'completed'`. The historical name
-    /// `completed` was a misnomer — `queue_counts_exact` has always
-    /// included failed and cancelled terminals; renamed in #290 along
-    /// with the counter-backed read path.
+    /// actually counts: it is `{schema}.terminal_jobs` semantics, not
+    /// `count(*) WHERE state = 'completed'`. Physical terminal facts may
+    /// live in `done_entries` or compact receipt completion batches.
+    /// The historical name `completed` was a misnomer —
+    /// `queue_counts_exact` has always included failed and cancelled
+    /// terminals; renamed in #290 along with the counter-backed read
+    /// path.
     pub terminal: i64,
     /// Cumulative count of `failed` terminal rows pruned past the
     /// failed-retention floor, summed from
@@ -267,10 +289,18 @@ pub enum RotateOutcome {
 pub struct BusyCounts {
     /// Queue ring: rows in the next `ready_entries` child.
     pub queue_ready: i64,
+    /// Queue ring: rows in the next `ready_claim_attempt_batches` child.
+    pub queue_claim_attempt_batches: i64,
     /// Queue ring: rows in the next `done_entries` child.
     pub queue_done: i64,
     /// Queue ring: rows in the next `ready_tombstones` child.
     pub queue_tombstones: i64,
+    /// Queue ring: rows in the next `ready_segments` child.
+    pub queue_ready_segments: i64,
+    /// Queue ring: rows in the next `receipt_completion_batches` child.
+    pub queue_receipt_completion_batches: i64,
+    /// Queue ring: rows in the next `receipt_completion_tombstones` child.
+    pub queue_receipt_completion_tombstones: i64,
     /// Queue ring: rows in the next `queue_terminal_count_deltas` child.
     pub queue_terminal_deltas: i64,
     /// Lease ring: rows in the next `leases` child.
@@ -279,6 +309,8 @@ pub struct BusyCounts {
     pub claims: i64,
     /// Claim ring: rows in the next `lease_claim_closures` child.
     pub closures: i64,
+    /// Claim ring: rows in the next compact closure-batch child.
+    pub closure_batches: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +414,20 @@ fn is_lock_contention_error(err: &sqlx::Error) -> bool {
     )
 }
 
+async fn set_prune_lock_timeout_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    timeout: Duration,
+) -> Result<(), AwaError> {
+    let millis = timeout.as_millis().max(1).min(i64::MAX as u128);
+    let timeout = format!("{millis}ms");
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(timeout)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(())
+}
+
 fn validate_ident(ident: &str) -> Result<(), AwaError> {
     let mut chars = ident.chars();
     match chars.next() {
@@ -406,12 +452,28 @@ fn ready_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.ready_entries_{slot}")
 }
 
+fn ready_claim_attempt_batch_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.ready_claim_attempt_batches_{slot}")
+}
+
 fn done_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.done_entries_{slot}")
 }
 
 fn ready_tombstone_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.ready_tombstones_{slot}")
+}
+
+fn ready_segment_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.ready_segments_{slot}")
+}
+
+fn receipt_completion_batch_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.receipt_completion_batches_{slot}")
+}
+
+fn receipt_completion_tombstone_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.receipt_completion_tombstones_{slot}")
 }
 
 fn terminal_delta_child_name(schema: &str, slot: usize) -> String {
@@ -467,19 +529,56 @@ fn claim_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claims_{slot}")
 }
 
+fn claim_batch_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.lease_claim_batches_{slot}")
+}
+
 fn closure_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closures_{slot}")
 }
 
-fn receipt_closed_evidence_sql(schema: &str, closure_rel: &str, claims_alias: &str) -> String {
+fn claim_closure_batch_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.lease_claim_closure_batches_{slot}")
+}
+
+fn ring_slot_index(slot: i32, slot_count: usize, ring: &str) -> Result<usize, AwaError> {
+    let index = usize::try_from(slot).map_err(|_| {
+        AwaError::Validation(format!(
+            "invalid {ring} ring slot {slot}: slot must be non-negative"
+        ))
+    })?;
+    if index >= slot_count {
+        return Err(AwaError::Validation(format!(
+            "invalid {ring} ring slot {slot}: configured slot count is {slot_count}"
+        )));
+    }
+    Ok(index)
+}
+
+fn receipt_closed_evidence_sql(
+    schema: &str,
+    closure_rel: &str,
+    closure_batch_rel: &str,
+    claims_alias: &str,
+) -> String {
+    // `receipt_id` is allocated from a global sequence, so it identifies a
+    // claim without a `claim_slot` predicate. Compact closure batches retain
+    // the raw receipt array for audit/debugging, but hot membership checks use
+    // the per-child GiST index on the derived multirange.
     format!(
         r#"
         (
-            EXISTS (
+            {claims_alias}.closed_at IS NOT NULL
+            OR EXISTS (
                 SELECT 1 FROM {closure_rel} AS closures
                 WHERE closures.claim_slot = {claims_alias}.claim_slot
                   AND closures.job_id = {claims_alias}.job_id
                   AND closures.run_lease = {claims_alias}.run_lease
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM {closure_batch_rel} AS closure_batches
+                WHERE closure_batches.receipt_ranges @> {claims_alias}.receipt_id
             )
             OR EXISTS (
                 SELECT 1 FROM {schema}.done_entries AS done
@@ -507,6 +606,168 @@ fn busy_indicator(has_rows: bool) -> i64 {
     } else {
         0
     }
+}
+
+async fn queue_prune_has_active_leases_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    slot: i32,
+    generation: i64,
+) -> Result<bool, AwaError> {
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM {schema}.leases
+            WHERE ready_slot = $1
+              AND ready_generation = $2
+            LIMIT 1
+        )
+        "#
+    ))
+    .bind(slot)
+    .bind(generation)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)
+}
+
+async fn queue_prune_has_pending_ready_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    ready_child: &str,
+    generation: i64,
+) -> Result<bool, AwaError> {
+    sqlx::query_scalar(&format!(
+        r#"
+        WITH claim_cursors AS MATERIALIZED (
+            SELECT
+                queue,
+                priority,
+                enqueue_shard,
+                {schema}.sequence_next_value(seq_name) AS claim_seq
+            FROM {schema}.queue_claim_heads
+        )
+        SELECT EXISTS (
+            SELECT 1
+            FROM claim_cursors AS claims
+            CROSS JOIN LATERAL (
+                SELECT 1
+                FROM {ready_child} AS ready
+                WHERE ready.ready_generation = $1
+                  AND ready.queue = claims.queue
+                  AND ready.priority = claims.priority
+                  AND ready.enqueue_shard = claims.enqueue_shard
+                  AND ready.lane_seq >= claims.claim_seq
+                LIMIT 1
+            ) AS pending_ready
+            LIMIT 1
+        )
+        "#
+    ))
+    .bind(generation)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)
+}
+
+async fn queue_prune_has_unclosed_claim_refs_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    schema: &str,
+    slot: i32,
+    generation: i64,
+) -> Result<bool, AwaError> {
+    let count_proves_claim_refs_closed: bool = sqlx::query_scalar(&format!(
+        r#"
+        WITH claim_count AS (
+            SELECT count(*)::bigint AS total
+            FROM {schema}.lease_claims AS claims
+            WHERE claims.ready_slot = $1
+              AND claims.ready_generation = $2
+        ),
+        compact_claim_count AS (
+            SELECT COALESCE(sum(claimed_count), 0)::bigint AS total
+            FROM {schema}.lease_claim_batches AS batches
+            WHERE batches.ready_slot = $1
+              AND batches.ready_generation = $2
+        ),
+        explicit_count AS (
+            SELECT count(*)::bigint AS total
+            FROM {schema}.lease_claims AS claims
+            JOIN {schema}.lease_claim_closures AS closures
+              ON closures.claim_slot = claims.claim_slot
+             AND closures.job_id = claims.job_id
+             AND closures.run_lease = claims.run_lease
+            WHERE claims.ready_slot = $1
+              AND claims.ready_generation = $2
+        ),
+        compact_count AS (
+            SELECT COALESCE(sum(closed_count), 0)::bigint AS total
+            FROM {schema}.lease_claim_closure_batches AS batches
+            WHERE batches.ready_slot = $1
+              AND batches.ready_generation = $2
+        )
+        SELECT claim_count.total + compact_claim_count.total =
+               explicit_count.total + compact_count.total
+        FROM claim_count, compact_claim_count, explicit_count, compact_count
+        "#
+    ))
+    .bind(slot)
+    .bind(generation)
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)?;
+    if count_proves_claim_refs_closed {
+        return Ok(false);
+    }
+
+    // The exact anti-join over compact claim batches requires unnesting
+    // retained claim history. Under a hot MVCC horizon that proof can become
+    // more expensive than the prune it guards. A count mismatch is enough to
+    // make truncate unsafe, so skip and try again after closures catch up.
+    Ok(true)
+}
+
+async fn claim_prune_has_open_claims_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    _schema: &str,
+    claim_child: &str,
+    claim_batch_child: &str,
+    closure_child: &str,
+    closure_batch_child: &str,
+) -> Result<bool, AwaError> {
+    let count_proves_claims_closed: bool = sqlx::query_scalar(&format!(
+        r#"
+        WITH claim_count AS (
+            SELECT count(*)::bigint AS total FROM {claim_child}
+        ),
+        compact_claim_count AS (
+            SELECT COALESCE(sum(claimed_count), 0)::bigint AS total
+            FROM {claim_batch_child}
+        ),
+        explicit_count AS (
+            SELECT count(*)::bigint AS total FROM {closure_child}
+        ),
+        compact_count AS (
+            SELECT COALESCE(sum(closed_count), 0)::bigint AS total
+            FROM {closure_batch_child}
+        )
+        SELECT claim_count.total + compact_claim_count.total =
+               explicit_count.total + compact_count.total
+        FROM claim_count, compact_claim_count, explicit_count, compact_count
+        "#
+    ))
+    .fetch_one(tx.as_mut())
+    .await
+    .map_err(map_sqlx_error)?;
+    if count_proves_claims_closed {
+        return Ok(false);
+    }
+
+    // A count mismatch means at least one claim is not proven closed by the
+    // append-only closure ledgers. Returning SkippedActive is conservative and
+    // avoids an unbounded anti-join over retained compact claim batches.
+    Ok(true)
 }
 
 fn oldest_initialized_ring_slot(
@@ -707,6 +968,16 @@ fn is_empty_json_object(value: &serde_json::Value) -> bool {
     value.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
+fn is_compact_receipt_completion_metadata(value: &serde_json::Value) -> bool {
+    let Some(metadata) = value.as_object() else {
+        return false;
+    };
+
+    metadata
+        .keys()
+        .all(|key| key == "_awa_original_priority" || key == "_awa_original_queue")
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RuntimePayload {
     #[serde(
@@ -777,7 +1048,10 @@ impl RuntimePayload {
 
 #[cfg(test)]
 mod runtime_payload_tests {
-    use super::{storage_payload, terminal_storage_payload, RuntimePayload};
+    use super::{
+        is_compact_receipt_completion_metadata, storage_payload, terminal_storage_payload,
+        RuntimePayload,
+    };
 
     #[test]
     fn default_runtime_payload_serializes_compactly() {
@@ -812,6 +1086,26 @@ mod runtime_payload_tests {
         assert!(payload.errors.is_empty());
         assert_eq!(payload.progress, None);
         assert_eq!(storage_payload(&payload.into_json()), None);
+    }
+
+    #[test]
+    fn compact_receipt_completion_metadata_only_allows_awa_provenance() {
+        assert!(is_compact_receipt_completion_metadata(&serde_json::json!(
+            {}
+        )));
+        assert!(is_compact_receipt_completion_metadata(
+            &serde_json::json!({ "_awa_original_priority": 4 })
+        ));
+        assert!(is_compact_receipt_completion_metadata(&serde_json::json!({
+            "_awa_original_queue": "default",
+            "_awa_original_priority": 4
+        })));
+        assert!(!is_compact_receipt_completion_metadata(
+            &serde_json::json!({ "tenant": "acme" })
+        ));
+        assert!(!is_compact_receipt_completion_metadata(&serde_json::json!(
+            null
+        )));
     }
 
     #[test]
@@ -1232,6 +1526,9 @@ struct ReadyJobLeaseRow {
     lease_slot: i32,
     lease_generation: i64,
     claim_slot: i32,
+    receipt_id: Option<i64>,
+    claim_batch_id: Option<i64>,
+    claim_batch_index: Option<i32>,
     job_id: i64,
     kind: String,
     queue: String,
@@ -1262,6 +1559,9 @@ impl ReadyJobLeaseRow {
             lease_slot: self.lease_slot,
             lease_generation: self.lease_generation,
             claim_slot: self.claim_slot,
+            receipt_id: self.receipt_id,
+            claim_batch_id: self.claim_batch_id,
+            claim_batch_index: self.claim_batch_index,
             lease_claim_receipt,
             enqueue_shard: self.enqueue_shard,
         }
@@ -1369,6 +1669,75 @@ struct RuntimeReadyInsert {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ReadySegmentInsert {
+    queue: String,
+    priority: i16,
+    enqueue_shard: i16,
+    first_lane_seq: i64,
+    next_lane_seq: i64,
+    /// `run_at` for every row in this segment. Segment construction splits on
+    /// `run_at` so claim-time priority aging stays exact after the claim cursor
+    /// advances inside a multi-row segment.
+    first_run_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod ready_segment_tests {
+    use super::{QueueStorage, RuntimeReadyInsert};
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn ready_row(lane_seq: i64, run_at: chrono::DateTime<Utc>) -> RuntimeReadyInsert {
+        RuntimeReadyInsert {
+            job_id: lane_seq,
+            kind: "segment_test".to_string(),
+            queue: "segment-q".to_string(),
+            args: serde_json::json!({}),
+            priority: 2,
+            attempt: 0,
+            run_lease: 0,
+            max_attempts: 25,
+            run_at,
+            attempted_at: None,
+            lane_seq,
+            enqueue_shard: 0,
+            created_at: run_at,
+            unique_key: None,
+            unique_states: None,
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn ready_segments_split_on_run_at_boundaries() {
+        let first = Utc
+            .with_ymd_and_hms(2026, 6, 14, 12, 0, 0)
+            .single()
+            .expect("valid test timestamp");
+        let second = first + Duration::seconds(1);
+        let rows = vec![
+            ready_row(1, first),
+            ready_row(2, first),
+            ready_row(3, second),
+            ready_row(4, first),
+        ];
+
+        let segments = QueueStorage::ready_segments_from_rows(&rows);
+        let ranges: Vec<_> = segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.first_lane_seq,
+                    segment.next_lane_seq,
+                    segment.first_run_at,
+                )
+            })
+            .collect();
+
+        assert_eq!(ranges, vec![(1, 3, first), (3, 4, second), (4, 5, first)]);
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1606,10 +1975,10 @@ struct DeletedLeaseRow {
 struct ReadySnapshotRow {
     ready_slot: i32,
     ready_generation: i64,
+    job_id: i64,
     kind: String,
     queue: String,
     args: serde_json::Value,
-    priority: i16,
     lane_seq: i64,
     enqueue_shard: i16,
     run_at: DateTime<Utc>,
@@ -1917,6 +2286,7 @@ pub struct QueueStorage {
     /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
     /// (head row gone after a rolled-back ensure_lane).
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
+    prune_lock_timeout: Duration,
 }
 
 impl QueueStorage {
@@ -1960,7 +2330,19 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
+            prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn with_prune_lock_timeout(mut self, timeout: Duration) -> Result<Self, AwaError> {
+        if timeout.is_zero() {
+            return Err(AwaError::Validation(
+                "queue storage prune lock timeout must be greater than zero".into(),
+            ));
+        }
+        self.prune_lock_timeout = timeout;
+        Ok(self)
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {
@@ -2379,7 +2761,7 @@ impl QueueStorage {
                     return Err(AwaError::Validation(format!(
                         "{schema}.open_receipt_claims has {row_count} rows but the runtime no \
                          longer reads or writes this table. Run the ADR-023 reverse migration \
-                         (recreate from lease_claims minus lease_claim_closures) to drain it, \
+                         (recreate from lease_claims minus durable closure evidence) to drain it, \
                          then re-run prepare_schema."
                     )));
                 }
@@ -2391,7 +2773,7 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
-            // Detect the current shape of lease_claims / lease_claim_closures.
+            // Detect the current shape of the legacy claim/closure parents.
             // The partitioned parents have relkind 'p'; regular tables have
             // 'r' and need to be renamed aside so the helper can create the
             // partitioned parents under the canonical name. Copying the data
@@ -2730,12 +3112,18 @@ impl QueueStorage {
             r#"
             TRUNCATE
                 {schema}.ready_entries,
+                {schema}.ready_claim_attempt_batches,
                 {schema}.ready_tombstones,
+                {schema}.ready_segments,
                 {schema}.done_entries,
+                {schema}.receipt_completion_batches,
+                {schema}.receipt_completion_tombstones,
                 {schema}.dlq_entries,
                 {schema}.leases,
                 {schema}.lease_claims,
+                {schema}.lease_claim_batches,
                 {schema}.lease_claim_closures,
+                {schema}.lease_claim_closure_batches,
                 {schema}.attempt_state,
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
@@ -3202,6 +3590,9 @@ impl QueueStorage {
                 lease_slot,
                 lease_generation,
                 claim_slot,
+                receipt_id,
+                claim_batch_id,
+                claim_batch_index,
                 job_id,
                 kind,
                 queue,
@@ -3382,6 +3773,7 @@ impl QueueStorage {
     async fn execute_ready_inserts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ring: (i32, i64),
         rows: &[RuntimeReadyInsert],
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
@@ -3389,7 +3781,6 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let ring = self.current_queue_ring(tx).await?;
         let mut builder = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) "
         ));
@@ -3422,9 +3813,86 @@ impl QueueStorage {
         Ok(rows.len())
     }
 
+    fn ready_segments_from_rows(rows: &[RuntimeReadyInsert]) -> Vec<ReadySegmentInsert> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        let mut segments = Vec::new();
+        let mut start_index = 0usize;
+
+        for index in 1..=rows.len() {
+            let split = if index == rows.len() {
+                true
+            } else {
+                let previous = &rows[index - 1];
+                let current = &rows[index];
+                previous.queue != current.queue
+                    || previous.priority != current.priority
+                    || previous.enqueue_shard != current.enqueue_shard
+                    || previous.lane_seq + 1 != current.lane_seq
+                    || previous.run_at != current.run_at
+            };
+
+            if split {
+                let first = &rows[start_index];
+                let last = &rows[index - 1];
+                segments.push(ReadySegmentInsert {
+                    queue: first.queue.clone(),
+                    priority: first.priority,
+                    enqueue_shard: first.enqueue_shard,
+                    first_lane_seq: first.lane_seq,
+                    next_lane_seq: last.lane_seq + 1,
+                    first_run_at: first.run_at,
+                });
+                start_index = index;
+            }
+        }
+
+        segments
+    }
+
+    async fn insert_ready_segments_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ring: (i32, i64),
+        rows: &[RuntimeReadyInsert],
+    ) -> Result<usize, AwaError> {
+        let segments = Self::ready_segments_from_rows(rows);
+        if segments.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = self.schema();
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            "INSERT INTO {schema}.ready_segments (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq, next_lane_seq, first_run_at) "
+        ));
+        builder.push_values(segments.iter(), |mut b, segment| {
+            b.push_bind(ring.0)
+                .push_bind(ring.1)
+                .push_bind(&segment.queue)
+                .push_bind(segment.priority)
+                .push_bind(segment.enqueue_shard)
+                .push_bind(segment.first_lane_seq)
+                .push_bind(segment.next_lane_seq)
+                .push_bind(segment.first_run_at);
+        });
+        builder.push(
+            " ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING",
+        );
+        builder
+            .build()
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(segments.len())
+    }
+
     async fn execute_ready_copy_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        ring: (i32, i64),
         rows: &[RuntimeReadyInsert],
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
@@ -3432,7 +3900,6 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let ring = self.current_queue_ring(tx).await?;
         let copy_sql = format!(
             "COPY {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
@@ -3527,7 +3994,9 @@ impl QueueStorage {
                 row.lane_seq = start_seq + offset as i64;
             }
         }
-        self.execute_ready_inserts_tx(tx, &ready_rows).await?;
+        let ring = self.current_queue_ring(tx).await?;
+        self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
+        self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok(total_rows)
     }
 
@@ -3667,7 +4136,9 @@ impl QueueStorage {
                 row.lane_seq = start_seq + offset as i64;
             }
         }
-        self.execute_ready_copy_tx(tx, &ready_rows).await?;
+        let ring = self.current_queue_ring(tx).await?;
+        self.execute_ready_copy_tx(tx, ring, &ready_rows).await?;
+        self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok(total_rows)
     }
 
@@ -3741,7 +4212,9 @@ impl QueueStorage {
             }
         }
 
-        self.execute_ready_inserts_tx(tx, &ready_rows).await?;
+        let ring = self.current_queue_ring(tx).await?;
+        self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
+        self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok(total_rows)
     }
 
@@ -3978,12 +4451,17 @@ impl QueueStorage {
         Ok(rows.len())
     }
 
-    /// Append positive terminal-count deltas for newly inserted terminal rows.
+    /// Append positive terminal-count deltas for newly inserted `done_entries`
+    /// terminal rows.
     ///
-    /// The exact invariant is:
+    /// For done-entry terminal rows, the exact invariant is:
     ///
     /// `SUM(queue_terminal_live_counts) + SUM(queue_terminal_count_deltas)
     /// == count(*) FROM done_entries`.
+    ///
+    /// Compact receipt completions are already append-only batches, so
+    /// `queue_counts_exact` counts retained `receipt_completion_batches`
+    /// directly instead of adding another hot-path count-delta write.
     ///
     /// Maintenance asynchronously folds delta rows into the live-counter table
     /// and truncates the delta segment. The hot path therefore performs only
@@ -4011,7 +4489,8 @@ impl QueueStorage {
         self.append_terminal_count_deltas_tx(tx, by_group).await
     }
 
-    /// Append negative terminal-count deltas for deleted terminal rows.
+    /// Append negative terminal-count deltas for deleted `done_entries`
+    /// terminal rows.
     ///
     /// This is used by retry-from-terminal, DLQ moves, discard paths, and the
     /// SQL compatibility delete function. The negative row may cancel a
@@ -4152,6 +4631,10 @@ impl QueueStorage {
             return Ok(());
         }
 
+        let receipt_pairs: Vec<(i64, i64)> =
+            rows.iter().map(|row| (row.job_id, row.run_lease)).collect();
+        self.lock_receipt_attempts_tx(tx, &receipt_pairs).await?;
+
         let schema = self.schema();
         let job_ids: Vec<i64> = rows.iter().map(|row| row.job_id).collect();
         let run_leases: Vec<i64> = rows.iter().map(|row| row.run_lease).collect();
@@ -4159,25 +4642,38 @@ impl QueueStorage {
             r#"
             WITH refs(job_id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            ),
+            inserted AS (
+                INSERT INTO {schema}.lease_claim_closures (
+                    claim_slot,
+                    job_id,
+                    run_lease,
+                    outcome,
+                    closed_at
+                )
+                SELECT
+                    claims.claim_slot,
+                    claims.job_id,
+                    claims.run_lease,
+                    'terminal_removed',
+                    clock_timestamp()
+                FROM {schema}.lease_claims AS claims
+                JOIN refs
+                  ON refs.job_id = claims.job_id
+                 AND refs.run_lease = claims.run_lease
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                RETURNING claim_slot, job_id, run_lease, closed_at
+            ),
+            marked AS (
+                UPDATE {schema}.lease_claims AS claims
+                SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                FROM inserted
+                WHERE claims.claim_slot = inserted.claim_slot
+                  AND claims.job_id = inserted.job_id
+                  AND claims.run_lease = inserted.run_lease
+                RETURNING claims.job_id
             )
-            INSERT INTO {schema}.lease_claim_closures (
-                claim_slot,
-                job_id,
-                run_lease,
-                outcome,
-                closed_at
-            )
-            SELECT
-                claims.claim_slot,
-                claims.job_id,
-                claims.run_lease,
-                'terminal_removed',
-                clock_timestamp()
-            FROM {schema}.lease_claims AS claims
-            JOIN refs
-              ON refs.job_id = claims.job_id
-             AND refs.run_lease = claims.run_lease
-            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+            SELECT count(*) FROM marked
             "#
         ))
         .bind(&job_ids)
@@ -5347,6 +5843,13 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(&mut tx, &completed_pairs, "completed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
 
         let finalized_at = Utc::now();
@@ -5375,8 +5878,9 @@ impl QueueStorage {
 
     fn receipt_fast_complete_candidate(entry: &ClaimedRuntimeJob) -> bool {
         entry.claim.lease_claim_receipt
+            && entry.claim.receipt_id.is_some()
             && entry.job.unique_key.is_none()
-            && is_empty_json_object(&entry.job.metadata)
+            && is_compact_receipt_completion_metadata(&entry.job.metadata)
             && entry.job.tags.is_empty()
             && entry.job.errors.as_ref().is_none_or(Vec::is_empty)
     }
@@ -5392,191 +5896,315 @@ impl QueueStorage {
 
         let schema = self.schema();
         let finalized_at = Utc::now();
-        let claim_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.claim_slot).collect();
-        let ready_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.ready_slot).collect();
-        let ready_generations: Vec<i64> = claimed
-            .iter()
-            .map(|entry| entry.claim.ready_generation)
-            .collect();
         let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
-        let kinds: Vec<String> = claimed.iter().map(|entry| entry.job.kind.clone()).collect();
-        let queues: Vec<String> = claimed
-            .iter()
-            .map(|entry| entry.job.queue.clone())
-            .collect();
-        let priorities: Vec<i16> = claimed.iter().map(|entry| entry.claim.priority).collect();
-        let attempts: Vec<i16> = claimed.iter().map(|entry| entry.job.attempt).collect();
         let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
-        let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.claim.lane_seq).collect();
-        let enqueue_shards: Vec<i16> = claimed
-            .iter()
-            .map(|entry| entry.claim.enqueue_shard)
-            .collect();
-        let attempted_ats: Vec<Option<DateTime<Utc>>> =
-            claimed.iter().map(|entry| entry.job.attempted_at).collect();
-        let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; claimed.len()];
-        let payloads: Vec<Option<serde_json::Value>> = vec![None; claimed.len()];
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+        let mut by_partition: BTreeMap<usize, Vec<&ClaimedRuntimeJob>> = BTreeMap::new();
+        for entry in claimed {
+            let claim_slot_index =
+                ring_slot_index(entry.claim.claim_slot, self.claim_slot_count(), "claim")?;
+            by_partition
+                .entry(claim_slot_index)
+                .or_default()
+                .push(entry);
+        }
 
-        sqlx::query_as(&format!(
-            r#"
-            WITH completed(
-                claim_slot,
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                priority,
-                attempt,
-                run_lease,
-                lane_seq,
-                enqueue_shard,
-                attempted_at,
-                finalized_at,
-                payload
-            ) AS (
-                SELECT *
-                FROM unnest(
-                    $1::int[],
-                    $2::int[],
-                    $3::bigint[],
-                    $4::bigint[],
-                    $5::text[],
-                    $6::text[],
-                    $7::smallint[],
-                    $8::smallint[],
-                    $9::bigint[],
-                    $10::bigint[],
-                    $11::smallint[],
-                    $12::timestamptz[],
-                    $13::timestamptz[],
-                    $14::jsonb[]
-                )
-            ),
-            locked_claims AS (
-                SELECT claims.claim_slot, claims.job_id, claims.run_lease
-                FROM {schema}.lease_claims AS claims
-                JOIN completed
-                  ON completed.claim_slot = claims.claim_slot
-                 AND completed.job_id = claims.job_id
-                 AND completed.run_lease = claims.run_lease
-                WHERE NOT {closed_evidence}
-                FOR UPDATE OF claims
-            ),
-            deleted_attempts AS (
-                DELETE FROM {schema}.attempt_state AS attempt
-                USING locked_claims
-                WHERE attempt.job_id = locked_claims.job_id
-                  AND attempt.run_lease = locked_claims.run_lease
-                RETURNING attempt.job_id
-            ),
-            terminal AS (
-                INSERT INTO {schema}.done_entries (
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        // Without the per-job closure-row insert,
+        // lease_claim_closure_batches become the idempotence evidence.
+        // Serialize duplicate completion attempts before the main statement
+        // so a waiter takes its statement snapshot after the first
+        // transaction commits and sees that evidence.
+        let receipt_pairs: Vec<(i64, i64)> = job_ids
+            .iter()
+            .zip(run_leases.iter())
+            .map(|(job_id, run_lease)| (*job_id, *run_lease))
+            .collect();
+        if let Err(err) = self.lock_receipt_attempts_tx(&mut tx, &receipt_pairs).await {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+
+        let mut rows = Vec::with_capacity(claimed.len());
+        for (claim_slot_index, group) in by_partition {
+            let claim_rel = claim_child_name(schema, claim_slot_index);
+            let claim_batch_rel = claim_batch_child_name(schema, claim_slot_index);
+            let closure_rel = closure_child_name(schema, claim_slot_index);
+            let closure_batch_rel = claim_closure_batch_child_name(schema, claim_slot_index);
+            let receipt_batch_rel = format!("{schema}.receipt_completion_batches");
+            let closed_evidence =
+                receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+
+            let claim_slots: Vec<i32> = group.iter().map(|entry| entry.claim.claim_slot).collect();
+            let ready_slots: Vec<i32> = group.iter().map(|entry| entry.claim.ready_slot).collect();
+            let ready_generations: Vec<i64> = group
+                .iter()
+                .map(|entry| entry.claim.ready_generation)
+                .collect();
+            let job_ids: Vec<i64> = group.iter().map(|entry| entry.job.id).collect();
+            let queues: Vec<String> = group.iter().map(|entry| entry.job.queue.clone()).collect();
+            let priorities: Vec<i16> = group.iter().map(|entry| entry.claim.priority).collect();
+            let attempts: Vec<i16> = group.iter().map(|entry| entry.job.attempt).collect();
+            let run_leases: Vec<i64> = group.iter().map(|entry| entry.job.run_lease).collect();
+            let receipt_ids: Vec<i64> = group
+                .iter()
+                .map(|entry| {
+                    entry
+                        .claim
+                        .receipt_id
+                        .expect("receipt fast completion requires receipt_id")
+                })
+                .collect();
+            let claim_batch_ids: Vec<Option<i64>> = group
+                .iter()
+                .map(|entry| entry.claim.claim_batch_id)
+                .collect();
+            let claim_batch_indices: Vec<Option<i32>> = group
+                .iter()
+                .map(|entry| entry.claim.claim_batch_index)
+                .collect();
+            let lane_seqs: Vec<i64> = group.iter().map(|entry| entry.claim.lane_seq).collect();
+            let enqueue_shards: Vec<i16> = group
+                .iter()
+                .map(|entry| entry.claim.enqueue_shard)
+                .collect();
+            let attempted_ats: Vec<Option<DateTime<Utc>>> =
+                group.iter().map(|entry| entry.job.attempted_at).collect();
+            let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; group.len()];
+
+            let completed: Vec<(i64, i64)> = match sqlx::query_as(&format!(
+                r#"
+                WITH completed(
+                    claim_slot,
                     ready_slot,
                     ready_generation,
                     job_id,
-                    kind,
                     queue,
-                    state,
                     priority,
                     attempt,
                     run_lease,
+                    receipt_id,
+                    claim_batch_id,
+                    claim_batch_index,
                     lane_seq,
                     enqueue_shard,
                     attempted_at,
-                    finalized_at,
-                    payload
-                )
-                SELECT
-                    completed.ready_slot,
-                    completed.ready_generation,
-                    completed.job_id,
-                    completed.kind,
-                    completed.queue,
-                    'completed'::awa.job_state,
-                    completed.priority,
-                    completed.attempt,
-                    completed.run_lease,
-                    completed.lane_seq,
-                    completed.enqueue_shard,
-                    completed.attempted_at,
-                    completed.finalized_at,
-                    completed.payload
-                FROM completed
-                JOIN locked_claims
-                  ON locked_claims.job_id = completed.job_id
-                 AND locked_claims.run_lease = completed.run_lease
-                RETURNING ready_slot, ready_generation, queue, priority, enqueue_shard, job_id, run_lease
-            ),
-            -- Terminal counts use an append-only delta ledger on the hot
-            -- completion path. Maintenance folds these rows into
-            -- queue_terminal_live_counts later; exact reads sum both sources.
-            counter_delta AS (
-                INSERT INTO {schema}.queue_terminal_count_deltas (
-                    ready_slot,
-                    ready_generation,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    counter_bucket,
-                    terminal_delta
-                )
-                SELECT
-                    ready_slot,
-                    ready_generation,
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    counter_bucket,
-                    delta
-                FROM (
+                    finalized_at
+                ) AS (
+                    SELECT *
+                    FROM unnest(
+                        $1::int[],
+                        $2::int[],
+                        $3::bigint[],
+                        $4::bigint[],
+                        $5::text[],
+                        $6::smallint[],
+                        $7::smallint[],
+                        $8::bigint[],
+                        $9::bigint[],
+                        $10::bigint[],
+                        $11::int[],
+                        $12::bigint[],
+                        $13::smallint[],
+                        $14::timestamptz[],
+                        $15::timestamptz[]
+                    )
+                ),
+                row_claim_refs AS (
+                    SELECT claims.claim_slot, claims.job_id, claims.run_lease, claims.receipt_id
+                    FROM {claim_rel} AS claims
+                    JOIN completed
+                      ON completed.claim_slot = claims.claim_slot
+                     AND completed.job_id = claims.job_id
+                     AND completed.run_lease = claims.run_lease
+                     AND completed.receipt_id = claims.receipt_id
+                     AND completed.claim_batch_id IS NULL
+                    WHERE NOT {closed_evidence}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.leases AS lease
+                        WHERE lease.job_id = claims.job_id
+                            AND lease.run_lease = claims.run_lease
+                      )
+                ),
+                batch_claim_refs AS (
                     SELECT
-                        terminal.ready_slot,
-                        terminal.ready_generation,
-                        terminal.queue,
-                        terminal.priority,
-                        terminal.enqueue_shard,
-                        mod(
-                            mod(terminal.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                                + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                            {TERMINAL_COUNTER_BUCKETS}::bigint
-                        )::smallint AS counter_bucket,
-                        count(*)::bigint AS delta
-                    FROM terminal
+                        claim_batches.claim_slot,
+                        items.job_id,
+                        items.run_lease,
+                        items.receipt_id
+                    FROM completed
+                    JOIN {claim_batch_rel} AS claim_batches
+                      ON claim_batches.claim_slot = completed.claim_slot
+                     AND claim_batches.batch_id = completed.claim_batch_id
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            claim_batches.job_ids[completed.claim_batch_index] AS job_id,
+                            claim_batches.run_leases[completed.claim_batch_index] AS run_lease,
+                            claim_batches.receipt_ids[completed.claim_batch_index] AS receipt_id
+                    ) AS items
+                    WHERE completed.claim_batch_id IS NOT NULL
+                      AND completed.claim_batch_index IS NOT NULL
+                      AND completed.claim_batch_index BETWEEN 1 AND claim_batches.claimed_count
+                      AND completed.job_id = items.job_id
+                      AND completed.run_lease = items.run_lease
+                      AND completed.receipt_id = items.receipt_id
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {closure_rel} AS closures
+                          WHERE closures.claim_slot = claim_batches.claim_slot
+                            AND closures.job_id = items.job_id
+                            AND closures.run_lease = items.run_lease
+                      )
+                      -- Compact successful completion treats receipt closure
+                      -- evidence as the same-attempt disposition fence. The
+                      -- non-success paths write explicit closure rows before
+                      -- moving the job to done/deferred/DLQ, so probing those
+                      -- terminal ledgers here only adds hot-path work.
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {closure_batch_rel} AS closure_batches
+                          WHERE closure_batches.receipt_ranges @> items.receipt_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.leases AS lease
+                          WHERE lease.job_id = items.job_id
+                            AND lease.run_lease = items.run_lease
+                      )
+                ),
+                claim_refs AS (
+                    SELECT claim_slot, job_id, run_lease, receipt_id FROM row_claim_refs
+                    UNION ALL
+                    SELECT claim_slot, job_id, run_lease, receipt_id FROM batch_claim_refs
+                ),
+                deleted_attempts AS (
+                    DELETE FROM {schema}.attempt_state AS attempt
+                    USING claim_refs
+                    WHERE attempt.job_id = claim_refs.job_id
+                      AND attempt.run_lease = claim_refs.run_lease
+                    RETURNING attempt.job_id
+                ),
+                completed_rows AS (
+                    SELECT completed.*
+                    FROM completed
+                    JOIN claim_refs
+                      ON claim_refs.claim_slot = completed.claim_slot
+                     AND claim_refs.job_id = completed.job_id
+                     AND claim_refs.run_lease = completed.run_lease
+                     AND claim_refs.receipt_id = completed.receipt_id
+                ),
+                claim_closure_batches AS (
+                    INSERT INTO {closure_batch_rel} (
+                        claim_slot,
+                        ready_slot,
+                        ready_generation,
+                        outcome,
+                        closed_count,
+                        receipt_ids,
+                        receipt_ranges,
+                        closed_at
+                    )
+                    SELECT
+                        completed.claim_slot,
+                        completed.ready_slot,
+                        completed.ready_generation,
+                        'completed',
+                        count(*)::int AS closed_count,
+                        array_agg(completed.receipt_id ORDER BY completed.lane_seq, completed.job_id),
+                        range_agg(int8range(completed.receipt_id, completed.receipt_id + 1, '[)') ORDER BY completed.receipt_id),
+                        max(completed.finalized_at)
+                    FROM completed_rows AS completed
                     GROUP BY
-                        terminal.ready_slot,
-                        terminal.ready_generation,
-                        terminal.queue,
-                        terminal.priority,
-                        terminal.enqueue_shard,
-                        counter_bucket
-                ) AS grouped
-                ORDER BY ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket
-                RETURNING 1
-            )
-            SELECT job_id, run_lease
-            FROM terminal
-            "#
-        ))
-        .bind(&claim_slots)
-        .bind(&ready_slots)
-        .bind(&ready_generations)
-        .bind(&job_ids)
-        .bind(&kinds)
-        .bind(&queues)
-        .bind(&priorities)
-        .bind(&attempts)
-        .bind(&run_leases)
-        .bind(&lane_seqs)
-        .bind(&enqueue_shards)
-        .bind(&attempted_ats)
-        .bind(&finalized_ats)
-        .bind(&payloads)
-        .fetch_all(pool)
-        .await
-        .map_err(map_sqlx_error)
+                        completed.claim_slot,
+                        completed.ready_slot,
+                        completed.ready_generation
+                    RETURNING claim_slot, ready_slot, ready_generation, receipt_ids
+                ),
+                terminal AS (
+                    INSERT INTO {receipt_batch_rel} (
+                        ready_slot,
+                        ready_generation,
+                        claim_slot,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        completed_count,
+                        job_ids,
+                        run_leases,
+                        lane_seqs,
+                        attempts,
+                        attempted_ats,
+                        finalized_at
+                    )
+                    SELECT
+                        completed.ready_slot,
+                        completed.ready_generation,
+                        completed.claim_slot,
+                        completed.queue,
+                        completed.priority,
+                        completed.enqueue_shard,
+                        count(*)::int AS completed_count,
+                        array_agg(completed.job_id ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.run_lease ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.lane_seq ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.attempt ORDER BY completed.lane_seq, completed.job_id),
+                        array_agg(completed.attempted_at ORDER BY completed.lane_seq, completed.job_id),
+                        max(completed.finalized_at)
+                    FROM completed_rows AS completed
+                    GROUP BY
+                        completed.ready_slot,
+                        completed.ready_generation,
+                        completed.claim_slot,
+                        completed.queue,
+                        completed.priority,
+                        completed.enqueue_shard
+                    RETURNING
+                        ready_slot,
+                        ready_generation,
+                        claim_slot,
+                        queue,
+                        priority,
+                        enqueue_shard,
+                        job_ids,
+                        run_leases
+                )
+                SELECT completed_rows.job_id, completed_rows.run_lease
+                FROM completed_rows
+                CROSS JOIN (SELECT count(*) FROM claim_closure_batches) AS closure_batch_write
+                CROSS JOIN (SELECT count(*) FROM terminal) AS terminal_write
+                "#
+            ))
+            .bind(&claim_slots)
+            .bind(&ready_slots)
+            .bind(&ready_generations)
+            .bind(&job_ids)
+            .bind(&queues)
+            .bind(&priorities)
+            .bind(&attempts)
+            .bind(&run_leases)
+            .bind(&receipt_ids)
+            .bind(&claim_batch_ids)
+            .bind(&claim_batch_indices)
+            .bind(&lane_seqs)
+            .bind(&enqueue_shards)
+            .bind(&attempted_ats)
+            .bind(&finalized_ats)
+            .fetch_all(tx.as_mut())
+            .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(map_sqlx_error(err));
+                }
+            };
+
+            rows.extend(completed);
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(rows)
     }
 
     #[tracing::instrument(
@@ -5659,11 +6287,15 @@ impl QueueStorage {
             let mut updated_all = Vec::new();
 
             if !receipt_claimed.is_empty() {
+                let receipt_pairs: Vec<(i64, i64)> = receipt_claimed
+                    .iter()
+                    .map(|entry| (entry.job.id, entry.job.run_lease))
+                    .collect();
+                self.lock_receipt_attempts_tx(tx, &receipt_pairs).await?;
+
                 // claim_slot rides along on `ClaimedEntry`, so receipt
-                // completion can lock the exact claim row without an
-                // extra lookup. Successful completion uses the terminal
-                // row as closure evidence; non-success paths still use
-                // this triplet to route explicit closures.
+                // completion can validate exact claim evidence and route the
+                // explicit completed closure without an extra lookup.
                 let receipt_claim_slots: Vec<i32> = receipt_claimed
                     .iter()
                     .map(|entry| entry.claim.claim_slot)
@@ -5674,22 +6306,103 @@ impl QueueStorage {
                     .iter()
                     .map(|entry| entry.job.run_lease)
                     .collect();
+                let receipt_receipt_ids: Vec<i64> = receipt_claimed
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .claim
+                            .receipt_id
+                            .expect("receipt-backed slow completion requires receipt_id")
+                    })
+                    .collect();
                 let closure_rel = format!("{schema}.lease_claim_closures");
-                let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+                let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+                let closed_evidence =
+                    receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
                 let updated: Vec<(i64, i64)> = sqlx::query_as(&format!(
                     r#"
-                    WITH completed(claim_slot, job_id, run_lease) AS (
-                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[])
+                    WITH completed(claim_slot, job_id, run_lease, receipt_id) AS (
+                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bigint[])
                     ),
-                    locked_claims AS (
+                    locked_row_claims AS (
                         SELECT claims.claim_slot, claims.job_id, claims.run_lease
                         FROM {schema}.lease_claims AS claims
                         JOIN completed
                           ON completed.claim_slot = claims.claim_slot
                          AND completed.job_id = claims.job_id
                          AND completed.run_lease = claims.run_lease
+                         AND completed.receipt_id = claims.receipt_id
                         WHERE NOT {closed_evidence}
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.leases AS lease
+                              WHERE lease.job_id = claims.job_id
+                                AND lease.run_lease = claims.run_lease
+                              )
                         FOR UPDATE OF claims
+                    ),
+                    locked_batch_claims AS (
+                        SELECT
+                            claim_batches.claim_slot,
+                            claim_batches.ready_slot,
+                            claim_batches.ready_generation,
+                            items.job_id,
+                            items.run_lease,
+                            items.receipt_id
+                        FROM {schema}.lease_claim_batches AS claim_batches
+                        CROSS JOIN LATERAL unnest(
+                            claim_batches.job_ids,
+                            claim_batches.run_leases,
+                            claim_batches.receipt_ids
+                        ) AS items(job_id, run_lease, receipt_id)
+                        JOIN completed
+                          ON completed.claim_slot = claim_batches.claim_slot
+                         AND completed.job_id = items.job_id
+                         AND completed.run_lease = items.run_lease
+                         AND completed.receipt_id = items.receipt_id
+                        WHERE NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.lease_claim_closures AS closures
+                              WHERE closures.claim_slot = claim_batches.claim_slot
+                                AND closures.job_id = items.job_id
+                                AND closures.run_lease = items.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.lease_claim_closure_batches AS closure_batches
+                              WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                                AND closure_batches.receipt_ranges @> items.receipt_id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.leases AS lease
+                              WHERE lease.job_id = items.job_id
+                                AND lease.run_lease = items.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.done_entries AS done
+                              WHERE done.job_id = items.job_id
+                                AND done.run_lease = items.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.deferred_jobs AS deferred
+                              WHERE deferred.job_id = items.job_id
+                                AND deferred.run_lease = items.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.dlq_entries AS dlq
+                              WHERE dlq.job_id = items.job_id
+                                AND dlq.run_lease = items.run_lease
+                          )
+                        FOR UPDATE OF claim_batches
+                    ),
+                    locked_claims AS (
+                        SELECT claim_slot, job_id, run_lease FROM locked_row_claims
+                        UNION ALL
+                        SELECT claim_slot, job_id, run_lease FROM locked_batch_claims
                     ),
                     deleted_attempts AS (
                         DELETE FROM {schema}.attempt_state AS attempt
@@ -5697,14 +6410,85 @@ impl QueueStorage {
                         WHERE attempt.job_id = locked_claims.job_id
                           AND attempt.run_lease = locked_claims.run_lease
                         RETURNING attempt.job_id
+                    ),
+                    -- Row-sourced (deadline lease) claims close into the
+                    -- explicit ledger so the prune gates balance them
+                    -- against the lease_claims row via the closure JOIN.
+                    closed_claims AS (
+                        INSERT INTO {schema}.lease_claim_closures (
+                            claim_slot,
+                            job_id,
+                            run_lease,
+                            outcome,
+                            closed_at
+                        )
+                        SELECT
+                            locked_row_claims.claim_slot,
+                            locked_row_claims.job_id,
+                            locked_row_claims.run_lease,
+                            'completed',
+                            clock_timestamp()
+                        FROM locked_row_claims
+                        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                        RETURNING claim_slot, job_id, run_lease, closed_at
+                    ),
+                    -- Compact batch-sourced claims have no lease_claims row
+                    -- to JOIN, so close them into the batch ledger that the
+                    -- queue prune gate counts via compact_count.
+                    closed_batches AS (
+                        INSERT INTO {schema}.lease_claim_closure_batches (
+                            claim_slot,
+                            ready_slot,
+                            ready_generation,
+                            outcome,
+                            closed_count,
+                            receipt_ids,
+                            receipt_ranges,
+                            closed_at
+                        )
+                        SELECT
+                            locked_batch_claims.claim_slot,
+                            locked_batch_claims.ready_slot,
+                            locked_batch_claims.ready_generation,
+                            'completed',
+                            count(*)::int,
+                            array_agg(locked_batch_claims.receipt_id ORDER BY locked_batch_claims.receipt_id),
+                            range_agg(int8range(locked_batch_claims.receipt_id, locked_batch_claims.receipt_id + 1, '[)') ORDER BY locked_batch_claims.receipt_id),
+                            clock_timestamp()
+                        FROM locked_batch_claims
+                        GROUP BY
+                            locked_batch_claims.claim_slot,
+                            locked_batch_claims.ready_slot,
+                            locked_batch_claims.ready_generation
+                        RETURNING claim_slot
+                    ),
+                    marked_claims AS (
+                        UPDATE {schema}.lease_claims AS claims
+                        SET closed_at = COALESCE(claims.closed_at, closed_claims.closed_at)
+                        FROM closed_claims
+                        WHERE claims.claim_slot = closed_claims.claim_slot
+                          AND claims.job_id = closed_claims.job_id
+                          AND claims.run_lease = closed_claims.run_lease
+                        RETURNING claims.job_id
+                    ),
+                    -- Force the batch insert to run and report the compact
+                    -- claims it closed so the caller finalizes them too.
+                    closed_batch_pairs AS (
+                        SELECT locked_batch_claims.job_id, locked_batch_claims.run_lease
+                        FROM locked_batch_claims
+                        WHERE EXISTS (SELECT 1 FROM closed_batches)
                     )
                     SELECT job_id, run_lease
-                    FROM locked_claims
+                    FROM closed_claims
+                    UNION ALL
+                    SELECT job_id, run_lease
+                    FROM closed_batch_pairs
                     "#
                 ))
                 .bind(&receipt_claim_slots)
                 .bind(&receipt_job_ids)
                 .bind(&receipt_run_leases)
+                .bind(&receipt_receipt_ids)
                 .fetch_all(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
@@ -5735,9 +6519,17 @@ impl QueueStorage {
             }
 
             if !materialized_claimed.is_empty() {
-                let lease_slots: Vec<i32> = materialized_claimed
+                let ready_slots: Vec<i32> = materialized_claimed
                     .iter()
-                    .map(|entry| entry.claim.lease_slot)
+                    .map(|entry| entry.claim.ready_slot)
+                    .collect();
+                let ready_generations: Vec<i64> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.claim.ready_generation)
+                    .collect();
+                let job_ids: Vec<i64> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.job.id)
                     .collect();
                 let queues: Vec<String> = materialized_claimed
                     .iter()
@@ -5761,17 +6553,21 @@ impl QueueStorage {
                     .collect();
 
                 // CTE-as-DML: delete the leases and the matching attempt_state
-                // rows in one round-trip. See the receipt-disabled branch
-                // below for the same pattern.
+                // rows in one round-trip. Receipt claims may materialize a
+                // lease after the original claim, so the materialized lease can
+                // live in a newer lease slot than the claim carried. Match on
+                // the stable ready-lane and attempt identity instead.
                 let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                     r#"
-                    WITH completed(lease_slot, queue, priority, enqueue_shard, lane_seq, run_lease) AS (
-                        SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[], $6::bigint[])
+                    WITH completed(ready_slot, ready_generation, job_id, queue, priority, enqueue_shard, lane_seq, run_lease) AS (
+                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::text[], $5::smallint[], $6::smallint[], $7::bigint[], $8::bigint[])
                     ),
                     deleted AS (
                         DELETE FROM {schema}.leases AS leases
                         USING completed
-                        WHERE leases.lease_slot = completed.lease_slot
+                        WHERE leases.ready_slot = completed.ready_slot
+                          AND leases.ready_generation = completed.ready_generation
+                          AND leases.job_id = completed.job_id
                           AND leases.queue = completed.queue
                           AND leases.priority = completed.priority
                           AND leases.enqueue_shard = completed.enqueue_shard
@@ -5822,7 +6618,9 @@ impl QueueStorage {
                     FROM deleted
                     "#
                 ))
-                .bind(&lease_slots)
+                .bind(&ready_slots)
+                .bind(&ready_generations)
+                .bind(&job_ids)
                 .bind(&queues)
                 .bind(&priorities)
                 .bind(&enqueue_shards)
@@ -5833,6 +6631,13 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
 
                 if !deleted.is_empty() {
+                    let completed_pairs: Vec<(i64, i64)> = deleted
+                        .iter()
+                        .map(|row| (row.job_id, row.run_lease))
+                        .collect();
+                    self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+                        .await?;
+
                     let finalized_at = Utc::now();
                     let mut done_rows = Vec::with_capacity(deleted.len());
                     for deleted_row in deleted {
@@ -5945,6 +6750,13 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+            .await?;
+
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(deleted.len());
         let mut updated = Vec::with_capacity(deleted.len());
@@ -6042,6 +6854,13 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
 
         let finalized_at = Utc::now();
@@ -6073,10 +6892,11 @@ impl QueueStorage {
     /// still-claimable ready rows. Use [`Self::queue_claimer_signal`] for the
     /// dispatcher hot path.
     ///
-    /// The live-terminal portion reads from folded
+    /// The live-terminal portion reads retained compact receipt batches
+    /// directly. Done-entry terminal rows read from folded
     /// `queue_terminal_live_counts` plus unrolled
     /// `queue_terminal_count_deltas` when [`Self::terminal_counter_trusted`]
-    /// returns true, and falls back to a `count(*) FROM done_entries` scan
+    /// returns true, and fall back to a `count(*) FROM terminal_jobs` scan
     /// when not. The fallback exists for the rolling-upgrade window: older
     /// binaries may have written terminal rows without maintaining the
     /// counter/delta contract, so reads stay honest until the operator runs
@@ -6088,6 +6908,10 @@ impl QueueStorage {
     ) -> Result<QueueCounts, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
+        let closure_rel = format!("{schema}.lease_claim_closures");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let counter_trusted = self.terminal_counter_trusted(pool).await?;
         // The live-terminal CTE swaps between counter-fed and
         // scan-fed depending on trust. Build it as a string so the
@@ -6109,6 +6933,18 @@ impl QueueStorage {
                             FROM {schema}.queue_terminal_count_deltas
                             WHERE queue = ANY($1)
                         ), 0)
+                        +
+                        COALESCE((
+                            SELECT SUM(completed_count)
+                            FROM {schema}.receipt_completion_batches
+                            WHERE queue = ANY($1)
+                        ), 0)
+                        -
+                        COALESCE((
+                            SELECT count(*)::bigint
+                            FROM {schema}.receipt_completion_tombstones
+                            WHERE queue = ANY($1)
+                        ), 0)
                     )::bigint AS terminal
                 )"
             )
@@ -6116,7 +6952,7 @@ impl QueueStorage {
             format!(
                 "live_terminal AS (
                     SELECT count(*)::bigint AS terminal
-                    FROM {schema}.done_entries
+                    FROM {schema}.terminal_jobs
                     WHERE queue = ANY($1)
                 )"
             )
@@ -6189,45 +7025,71 @@ impl QueueStorage {
                     ), 0)
                     +
                     -- Derive the receipt-backed running count from
-                    -- lease_claims anti-joined with
-                    -- lease_claim_closures.
+                    -- lease_claims anti-joined with every durable
+                    -- closure evidence shape.
                     COALESCE((
                         SELECT count(*)::bigint
                         FROM {schema}.lease_claims AS claims
                         WHERE claims.queue = ANY($1)
-                          AND NOT EXISTS (
-                              SELECT 1 FROM {schema}.lease_claim_closures AS closures
-                              WHERE closures.claim_slot = claims.claim_slot
-                                  AND closures.job_id = claims.job_id
-                                  AND closures.run_lease = claims.run_lease
-                          )
+                          AND NOT {closed_evidence}
                           AND NOT EXISTS (
                               SELECT 1
                               FROM {schema}.leases AS lease
-                              WHERE lease.job_id = claims.job_id
-                                AND lease.run_lease = claims.run_lease
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM {schema}.deferred_jobs AS deferred
-                              WHERE deferred.job_id = claims.job_id
-                                AND deferred.run_lease = claims.run_lease
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM {schema}.done_entries AS done
-                              WHERE done.job_id = claims.job_id
-                                AND done.run_lease = claims.run_lease
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM {schema}.dlq_entries AS dlq
-                              WHERE dlq.job_id = claims.job_id
-                                AND dlq.run_lease = claims.run_lease
-                          )
-                    ), 0)
-                )::bigint AS running
-            ),
+	                              WHERE lease.job_id = claims.job_id
+	                                AND lease.run_lease = claims.run_lease
+	                          )
+	                    ), 0)
+	                    +
+	                    -- Zero-deadline compact receipt claims live in
+	                    -- lease_claim_batches until they complete or a cold
+	                    -- path materializes them. Expand only for exact
+	                    -- admin-grade counts.
+	                    COALESCE((
+	                        SELECT count(*)::bigint
+	                        FROM {schema}.lease_claim_batches AS batches
+	                        CROSS JOIN LATERAL unnest(
+	                            batches.job_ids,
+	                            batches.run_leases,
+	                            batches.receipt_ids
+	                        ) AS items(job_id, run_lease, receipt_id)
+	                        WHERE batches.queue = ANY($1)
+	                          AND NOT EXISTS (
+	                              SELECT 1
+	                              FROM {schema}.lease_claim_closures AS closures
+	                              WHERE closures.claim_slot = batches.claim_slot
+	                                AND closures.job_id = items.job_id
+	                                AND closures.run_lease = items.run_lease
+	                          )
+	                          AND NOT EXISTS (
+	                              SELECT 1
+	                              FROM {schema}.lease_claim_closure_batches AS closure_batches
+	                              WHERE closure_batches.claim_slot = batches.claim_slot
+	                                AND closure_batches.receipt_ranges @> items.receipt_id
+	                          )
+	                          AND NOT EXISTS (
+	                              SELECT 1
+	                              FROM {schema}.leases AS lease
+	                              WHERE lease.job_id = items.job_id
+	                                AND lease.run_lease = items.run_lease
+	                          )
+	                          AND NOT EXISTS (
+	                              SELECT 1 FROM {schema}.done_entries AS done
+	                              WHERE done.job_id = items.job_id
+	                                AND done.run_lease = items.run_lease
+	                          )
+	                          AND NOT EXISTS (
+	                              SELECT 1 FROM {schema}.deferred_jobs AS deferred
+	                              WHERE deferred.job_id = items.job_id
+	                                AND deferred.run_lease = items.run_lease
+	                          )
+	                          AND NOT EXISTS (
+	                              SELECT 1 FROM {schema}.dlq_entries AS dlq
+	                              WHERE dlq.job_id = items.job_id
+	                                AND dlq.run_lease = items.run_lease
+	                          )
+	                    ), 0)
+	                )::bigint AS running
+	            ),
             {live_terminal_cte}
             SELECT
                 lane_counts.available,
@@ -6282,13 +7144,14 @@ impl QueueStorage {
     /// - **terminal** is read from the persisted
     ///   `queue_terminal_rollups` denormaliser
     ///   (`pruned_completed_count + pruned_failed_count`).
-    ///   Rows currently in `done_entries` that have not yet rolled up
-    ///   are not included. Strictly a lower bound; converges to the
-    ///   exact count when rotation prunes the live `done_entries`
-    ///   segment. (The name `terminal` is honest — this number counts
-    ///   `completed`, `failed`, and `cancelled` rows in done_entries,
-    ///   the same semantics as [`Self::queue_counts_exact`]; renamed
-    ///   from `completed` in #290.)
+    ///   Rows currently in `done_entries` or
+    ///   `receipt_completion_batches` that have not yet rolled up are
+    ///   not included. Strictly a lower bound; converges to the exact
+    ///   count when rotation prunes the live queue segment. (The name
+    ///   `terminal` is honest — this number counts `completed`,
+    ///   `failed`, and `cancelled` terminal facts with the same
+    ///   semantics as [`Self::queue_counts_exact`]; renamed from
+    ///   `completed` in #290.)
     ///
     /// All three counters are O(num shards) lookups against small head
     /// tables and `leases` index probes. Use this for high-cadence
@@ -6577,17 +7440,17 @@ impl QueueStorage {
     }
 
     /// Write a `<outcome>` closure row for any matching open receipt.
-    /// Idempotent: no-op if no lease_claims row exists for the
-    /// `(job_id, run_lease)` pair, or if a closure already exists. Used
+    /// Idempotent: no-op if no row-local claim or compact claim-batch item
+    /// exists for the `(job_id, run_lease)` pair, or if a closure already exists. Used
     /// by the admin cancel path to keep the receipt plane consistent
     /// with the job's new terminal state so rescue doesn't revive it.
     ///
     /// `FOR UPDATE` on the inner SELECT serialises the closure write
     /// against `ensure_running_leases_from_receipts_tx`
-    /// (which also takes `FOR UPDATE OF claims` on the same row) and
+    /// (which also takes `FOR UPDATE` on the same claim evidence) and
     /// against concurrent rescue / re-close paths that might race the
     /// same `(job_id, run_lease)`. Without it, materialization could
-    /// see the claim row, decide to materialize, and a concurrent
+    /// see the claim evidence, decide to materialize, and a concurrent
     /// admin cancel could write the closure between materialization's
     /// SELECT and the lease INSERT — leaving a `running` lease for a
     /// closed claim that admin cancel believes is fully shut down.
@@ -6598,34 +7461,179 @@ impl QueueStorage {
         run_lease: i64,
         outcome: &str,
     ) -> Result<(), AwaError> {
+        self.close_receipt_pairs_tx(tx, &[(job_id, run_lease)], outcome)
+            .await
+    }
+
+    async fn close_receipt_pairs_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        pairs: &[(i64, i64)],
+        outcome: &str,
+    ) -> Result<(), AwaError> {
+        if pairs.is_empty() || !self.lease_claim_receipts() {
+            return Ok(());
+        }
+
+        let unique_pairs: BTreeSet<(i64, i64)> = pairs.iter().copied().collect();
+        let unique_jobs: Vec<(i64, i64)> = unique_pairs.iter().copied().collect();
+        self.lock_receipt_attempts_tx(tx, &unique_jobs).await?;
+
+        let job_ids: Vec<i64> = unique_pairs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = unique_pairs
+            .iter()
+            .map(|(_, run_lease)| *run_lease)
+            .collect();
         let schema = self.schema();
+        let closure_rel = format!("{schema}.lease_claim_closures");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+
         sqlx::query(&format!(
             r#"
-            WITH locked_claim AS (
-                SELECT claim_slot, job_id, run_lease
+            WITH refs(job_id, run_lease) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            ),
+            locked_claims AS (
+                SELECT claims.claim_slot, claims.job_id, claims.run_lease
                 FROM {schema}.lease_claims AS claims
-                WHERE claims.job_id = $1 AND claims.run_lease = $2
-                  AND NOT EXISTS (
+                JOIN refs
+                  ON refs.job_id = claims.job_id
+                 AND refs.run_lease = claims.run_lease
+                WHERE NOT {closed_evidence}
+                FOR UPDATE OF claims
+            ),
+            locked_batch_claims AS (
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    items.job_id,
+                    items.run_lease,
+                    items.receipt_id
+                FROM {schema}.lease_claim_batches AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids
+                ) AS items(job_id, run_lease, receipt_id)
+                JOIN refs
+                  ON refs.job_id = items.job_id
+                 AND refs.run_lease = items.run_lease
+                WHERE NOT EXISTS (
                       SELECT 1
                       FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.claim_slot = claims.claim_slot
-                        AND closures.job_id = claims.job_id
-                        AND closures.run_lease = claims.run_lease
+                      WHERE closures.claim_slot = claim_batches.claim_slot
+                        AND closures.job_id = items.job_id
+                        AND closures.run_lease = items.run_lease
                   )
-                FOR UPDATE
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                        AND closure_batches.receipt_ranges @> items.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.done_entries AS done
+                      WHERE done.job_id = items.job_id
+                        AND done.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = items.job_id
+                        AND deferred.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = items.job_id
+                        AND dlq.run_lease = items.run_lease
+                  )
+                FOR UPDATE OF claim_batches
+            ),
+            -- Row-sourced (deadline lease) claims keep their explicit
+            -- closure: the queue/claim prune gates balance those against
+            -- the lease_claims row via the closure JOIN. Compact
+            -- batch-sourced claims have no lease_claims row to JOIN, so
+            -- they are closed into lease_claim_closure_batches below.
+            closing_claims AS (
+                SELECT
+                    locked_claims.claim_slot,
+                    locked_claims.job_id,
+                    locked_claims.run_lease,
+                    $3 AS outcome,
+                    clock_timestamp() AS closed_at
+                FROM locked_claims
+            ),
+            inserted AS (
+                INSERT INTO {schema}.lease_claim_closures (
+                    claim_slot,
+                    job_id,
+                    run_lease,
+                    outcome,
+                    closed_at
+                )
+                SELECT
+                    claim_slot,
+                    job_id,
+                    run_lease,
+                    outcome,
+                    closed_at
+                FROM closing_claims
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                RETURNING claim_slot, job_id, run_lease, closed_at
+            ),
+            inserted_batches AS (
+                INSERT INTO {schema}.lease_claim_closure_batches (
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    outcome,
+                    closed_count,
+                    receipt_ids,
+                    receipt_ranges,
+                    closed_at
+                )
+                SELECT
+                    locked_batch_claims.claim_slot,
+                    locked_batch_claims.ready_slot,
+                    locked_batch_claims.ready_generation,
+                    $3,
+                    count(*)::int,
+                    array_agg(locked_batch_claims.receipt_id ORDER BY locked_batch_claims.receipt_id),
+                    range_agg(int8range(locked_batch_claims.receipt_id, locked_batch_claims.receipt_id + 1, '[)') ORDER BY locked_batch_claims.receipt_id),
+                    clock_timestamp()
+                FROM locked_batch_claims
+                GROUP BY
+                    locked_batch_claims.claim_slot,
+                    locked_batch_claims.ready_slot,
+                    locked_batch_claims.ready_generation
+                RETURNING claim_slot
+            ),
+            marked AS (
+                UPDATE {schema}.lease_claims AS claims
+                SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                FROM inserted
+                WHERE claims.claim_slot = inserted.claim_slot
+                  AND claims.job_id = inserted.job_id
+                  AND claims.run_lease = inserted.run_lease
+                RETURNING claims.job_id
             )
-            INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
-            SELECT claim_slot, job_id, run_lease, $3, clock_timestamp()
-            FROM locked_claim
-            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+            SELECT
+                (SELECT count(*) FROM marked)
+                + (SELECT count(*) FROM inserted_batches)
             "#
         ))
-        .bind(job_id)
-        .bind(run_lease)
+        .bind(&job_ids)
+        .bind(&run_leases)
         .bind(outcome)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+
         Ok(())
     }
 
@@ -6806,7 +7814,9 @@ impl QueueStorage {
         // done row, and notify listening workers.
         if self.lease_claim_receipts() {
             let closure_rel = format!("{schema}.lease_claim_closures");
-            let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+            let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+            let closed_evidence =
+                receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
             type ReceiptCancelRow = (
                 i32,
                 i64,
@@ -6818,9 +7828,12 @@ impl QueueStorage {
                 i16,
                 i64,
                 DateTime<Utc>,
+                i64,
+                bool,
             );
             let receipt: Option<ReceiptCancelRow> = sqlx::query_as(&format!(
                 r#"
+                WITH row_receipt AS (
                     SELECT
                         claims.claim_slot,
                         claims.run_lease,
@@ -6831,14 +7844,87 @@ impl QueueStorage {
                         claims.attempt,
                         claims.max_attempts,
                         claims.lane_seq,
-                        claims.claimed_at
+                        claims.claimed_at,
+                        claims.receipt_id,
+                        false AS compact_batch
                     FROM {schema}.lease_claims AS claims
                     WHERE claims.job_id = $1
                       AND NOT {closed_evidence}
                     ORDER BY claims.run_lease DESC
                     LIMIT 1
                     FOR UPDATE OF claims SKIP LOCKED
-                    "#
+                ),
+                batch_receipt AS (
+                    SELECT
+                        claim_batches.claim_slot,
+                        items.run_lease,
+                        claim_batches.ready_slot,
+                        claim_batches.ready_generation,
+                        claim_batches.queue,
+                        claim_batches.priority,
+                        items.attempt,
+                        items.max_attempts,
+                        items.lane_seq,
+                        claim_batches.claimed_at,
+                        items.receipt_id,
+                        true AS compact_batch
+                    FROM {schema}.lease_claim_batches AS claim_batches
+                    CROSS JOIN LATERAL unnest(
+                        claim_batches.job_ids,
+                        claim_batches.run_leases,
+                        claim_batches.receipt_ids,
+                        claim_batches.lane_seqs,
+                        claim_batches.attempts,
+                        claim_batches.max_attempts
+                    ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+                    WHERE items.job_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.lease_claim_closures AS closures
+                          WHERE closures.claim_slot = claim_batches.claim_slot
+                            AND closures.job_id = items.job_id
+                            AND closures.run_lease = items.run_lease
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.lease_claim_closure_batches AS closure_batches
+                          WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                            AND closure_batches.receipt_ranges @> items.receipt_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.leases AS lease
+                          WHERE lease.job_id = items.job_id
+                            AND lease.run_lease = items.run_lease
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.done_entries AS done
+                          WHERE done.job_id = items.job_id
+                            AND done.run_lease = items.run_lease
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                          WHERE deferred.job_id = items.job_id
+                            AND deferred.run_lease = items.run_lease
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.dlq_entries AS dlq
+                          WHERE dlq.job_id = items.job_id
+                            AND dlq.run_lease = items.run_lease
+                      )
+                    ORDER BY items.run_lease DESC
+                    LIMIT 1
+                    FOR UPDATE OF claim_batches SKIP LOCKED
+                )
+                SELECT *
+                FROM (
+                    SELECT * FROM row_receipt
+                    UNION ALL
+                    SELECT * FROM batch_receipt
+                ) AS receipt
+                ORDER BY run_lease DESC
+                LIMIT 1
+                "#
             ))
             .bind(job_id)
             .fetch_optional(tx.as_mut())
@@ -6856,6 +7942,8 @@ impl QueueStorage {
                 max_attempts,
                 lane_seq,
                 claimed_at,
+                receipt_id,
+                compact_batch,
             )) = receipt
             {
                 // Hydrate the ready row so we can synthesize the done
@@ -6886,15 +7974,13 @@ impl QueueStorage {
                       AND ready_slot = $2
                       AND ready_generation = $3
                       AND queue = $4
-                      AND priority = $5
-                      AND lane_seq = $6
+                      AND lane_seq = $5
                     "#
                 ))
                 .bind(job_id)
                 .bind(ready_slot)
                 .bind(ready_generation)
                 .bind(&queue)
-                .bind(priority)
                 .bind(lane_seq)
                 .fetch_optional(tx.as_mut())
                 .await
@@ -6931,26 +8017,78 @@ impl QueueStorage {
                 };
                 self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Running))
                     .await?;
-                // Write the closure row into the same claim partition.
-                sqlx::query(&format!(
-                    r#"
-                    INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
-                    VALUES ($1, $2, $3, 'cancelled', clock_timestamp())
-                    ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                    "#
-                ))
-                .bind(claim_slot)
-                .bind(job_id)
-                .bind(run_lease)
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+                // Write the closure into the same claim partition. A
+                // compact batch-sourced claim has no lease_claims row, so
+                // it closes into the batch ledger the queue prune gate
+                // counts via compact_count; a deadline lease claim keeps
+                // its explicit closure so the gate balances it against the
+                // lease_claims row.
+                if compact_batch {
+                    sqlx::query(&format!(
+                        r#"
+                        INSERT INTO {schema}.lease_claim_closure_batches (
+                            claim_slot,
+                            ready_slot,
+                            ready_generation,
+                            outcome,
+                            closed_count,
+                            receipt_ids,
+                            receipt_ranges,
+                            closed_at
+                        )
+                        VALUES (
+                            $1,
+                            $2,
+                            $3,
+                            'cancelled',
+                            1,
+                            ARRAY[$4::bigint],
+                            int8multirange(int8range($4::bigint, $4::bigint + 1, '[)')),
+                            clock_timestamp()
+                        )
+                        "#
+                    ))
+                    .bind(claim_slot)
+                    .bind(ready_slot)
+                    .bind(ready_generation)
+                    .bind(receipt_id)
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                } else {
+                    sqlx::query(&format!(
+                        r#"
+                        WITH inserted AS (
+                            INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                            VALUES ($1, $2, $3, 'cancelled', clock_timestamp())
+                            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                            RETURNING claim_slot, job_id, run_lease, closed_at
+                        ),
+                        marked AS (
+                            UPDATE {schema}.lease_claims AS claims
+                            SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                            FROM inserted
+                            WHERE claims.claim_slot = inserted.claim_slot
+                              AND claims.job_id = inserted.job_id
+                              AND claims.run_lease = inserted.run_lease
+                            RETURNING claims.job_id
+                        )
+                        SELECT count(*) FROM marked
+                        "#
+                    ))
+                    .bind(claim_slot)
+                    .bind(job_id)
+                    .bind(run_lease)
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+                }
                 // Defensive: between the leases DELETE at the top of
                 // this function and the FOR UPDATE on claims above, a
                 // concurrent `ensure_running_leases_from_receipts_tx`
                 // can have materialized a `leases` row for this
                 // (job_id, run_lease). Materialize and we both lock the
-                // same claim row; whichever ran first commits, the
+                // same claim evidence; whichever ran first commits, the
                 // other replays under the new snapshot. If materialize
                 // committed first, that lease is now an orphan pointing
                 // at a job we're about to mark `cancelled`. Sweep it
@@ -7652,6 +8790,45 @@ impl QueueStorage {
         Ok(())
     }
 
+    async fn lock_receipt_attempts_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        jobs: &[(i64, i64)],
+    ) -> Result<(), AwaError> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+
+        let unique_jobs: BTreeSet<(i64, i64)> = jobs.iter().copied().collect();
+        let job_ids: Vec<i64> = unique_jobs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = unique_jobs
+            .iter()
+            .map(|(_, run_lease)| *run_lease)
+            .collect();
+
+        sqlx::query(
+            r#"
+            WITH locks AS MATERIALIZED (
+                SELECT DISTINCT pg_catalog.hashtextextended(
+                    format('awa.receipt.complete:%s:%s', job_id, run_lease),
+                    0
+                ) AS lock_key
+                FROM unnest($1::bigint[], $2::bigint[]) AS input(job_id, run_lease)
+                ORDER BY lock_key
+            )
+            SELECT pg_catalog.pg_advisory_xact_lock(lock_key)
+            FROM locks
+            "#,
+        )
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
     async fn ensure_running_leases_from_receipts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -7661,9 +8838,13 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        self.lock_receipt_attempts_tx(tx, jobs).await?;
+
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
         let inserted: i64 = sqlx::query_scalar(&format!(
@@ -7676,10 +8857,10 @@ impl QueueStorage {
                 FROM {schema}.lease_ring_state
                 WHERE singleton = TRUE
             ),
-            claim_refs AS (
+            row_claim_refs AS (
                 -- Source claim metadata directly from the partitioned
-                -- lease_claims table anti-joined against
-                -- lease_claim_closures.
+                -- lease_claims table anti-joined against every durable
+                -- closure evidence shape.
                 SELECT
                     claims.claim_slot,
                     claims.job_id,
@@ -7700,6 +8881,71 @@ impl QueueStorage {
                  AND inflight.run_lease = claims.run_lease
                 WHERE NOT {closed_evidence}
                 FOR UPDATE OF claims
+            ),
+            batch_claim_refs AS (
+                SELECT
+                    claim_batches.claim_slot,
+                    items.job_id,
+                    items.run_lease,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    claim_batches.queue,
+                    claim_batches.priority,
+                    items.attempt,
+                    items.max_attempts,
+                    items.lane_seq,
+                    claim_batches.enqueue_shard,
+                    claim_batches.claimed_at,
+                    claim_batches.deadline_at
+                FROM {schema}.lease_claim_batches AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids,
+                    claim_batches.lane_seqs,
+                    claim_batches.attempts,
+                    claim_batches.max_attempts
+                ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+                JOIN inflight
+                  ON inflight.job_id = items.job_id
+                 AND inflight.run_lease = items.run_lease
+                WHERE NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claim_batches.claim_slot
+                        AND closures.job_id = items.job_id
+                        AND closures.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                        AND closure_batches.receipt_ranges @> items.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.done_entries AS done
+                      WHERE done.job_id = items.job_id
+                        AND done.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = items.job_id
+                        AND deferred.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = items.job_id
+                        AND dlq.run_lease = items.run_lease
+                  )
+                FOR UPDATE OF claim_batches
+            ),
+            claim_refs AS (
+                SELECT * FROM row_claim_refs
+                UNION ALL
+                SELECT * FROM batch_claim_refs
             ),
             already_live AS (
                 SELECT claim_refs.job_id, claim_refs.run_lease
@@ -7774,7 +9020,12 @@ impl QueueStorage {
                   AND claims.run_lease = moved.run_lease
                 RETURNING claims.job_id
             )
-            SELECT count(*)::bigint FROM marked
+            SELECT count(*)::bigint
+            FROM (
+                SELECT job_id, run_lease FROM inserted
+                UNION
+                SELECT job_id, run_lease FROM already_live
+            ) AS moved
             "#
         ))
         .bind(&job_ids)
@@ -7807,9 +9058,13 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        self.lock_receipt_attempts_tx(tx, jobs).await?;
+
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
         let updated: i64 = sqlx::query_scalar(&format!(
@@ -7817,10 +9072,10 @@ impl QueueStorage {
             WITH inflight(job_id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
             ),
-            claim_refs AS (
+            row_claim_refs AS (
                 -- Source open-claim identity from lease_claims
-                -- anti-joined against explicit closures and durable
-                -- disposition rows.
+                -- anti-joined against every durable closure evidence
+                -- shape.
                 SELECT claims.job_id, claims.run_lease
                 FROM {schema}.lease_claims AS claims
                 JOIN inflight
@@ -7828,6 +9083,52 @@ impl QueueStorage {
                  AND inflight.run_lease = claims.run_lease
                 WHERE NOT {closed_evidence}
                 FOR UPDATE OF claims
+            ),
+            batch_claim_refs AS (
+                SELECT items.job_id, items.run_lease
+                FROM {schema}.lease_claim_batches AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids
+                ) AS items(job_id, run_lease, receipt_id)
+                JOIN inflight
+                  ON inflight.job_id = items.job_id
+                 AND inflight.run_lease = items.run_lease
+                WHERE NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claim_batches.claim_slot
+                        AND closures.job_id = items.job_id
+                        AND closures.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                        AND closure_batches.receipt_ranges @> items.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = items.job_id
+                        AND done.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = items.job_id
+                        AND deferred.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = items.job_id
+                        AND dlq.run_lease = items.run_lease
+                  )
+                FOR UPDATE OF claim_batches
+            ),
+            claim_refs AS (
+                SELECT * FROM row_claim_refs
+                UNION ALL
+                SELECT * FROM batch_claim_refs
             ),
             upserted AS (
                 INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
@@ -7842,9 +9143,9 @@ impl QueueStorage {
             marked AS (
                 UPDATE {schema}.lease_claims AS claims
                 SET materialized_at = COALESCE(claims.materialized_at, clock_timestamp())
-                FROM claim_refs
-                WHERE claims.job_id = claim_refs.job_id
-                  AND claims.run_lease = claim_refs.run_lease
+                FROM row_claim_refs
+                WHERE claims.job_id = row_claim_refs.job_id
+                  AND claims.run_lease = row_claim_refs.run_lease
                 RETURNING claims.job_id
             )
             SELECT count(*)::bigint FROM upserted
@@ -7867,9 +9168,17 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        let receipt_jobs: Vec<(i64, i64)> = jobs
+            .iter()
+            .map(|(job_id, run_lease, _)| (*job_id, *run_lease))
+            .collect();
+        self.lock_receipt_attempts_tx(tx, &receipt_jobs).await?;
+
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _, _)| *job_id).collect();
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease, _)| *run_lease).collect();
         let progress: Vec<serde_json::Value> = jobs
@@ -7881,7 +9190,7 @@ impl QueueStorage {
             WITH inflight(job_id, run_lease, progress) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[])
             ),
-            claim_refs AS (
+            row_claim_refs AS (
                 -- Same anti-join pattern as the heartbeat-only path
                 -- above.
                 SELECT claims.job_id, claims.run_lease, inflight.progress
@@ -7891,6 +9200,52 @@ impl QueueStorage {
                  AND inflight.run_lease = claims.run_lease
                 WHERE NOT {closed_evidence}
                 FOR UPDATE OF claims
+            ),
+            batch_claim_refs AS (
+                SELECT items.job_id, items.run_lease, inflight.progress
+                FROM {schema}.lease_claim_batches AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids
+                ) AS items(job_id, run_lease, receipt_id)
+                JOIN inflight
+                  ON inflight.job_id = items.job_id
+                 AND inflight.run_lease = items.run_lease
+                WHERE NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claim_batches.claim_slot
+                        AND closures.job_id = items.job_id
+                        AND closures.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                        AND closure_batches.receipt_ranges @> items.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = items.job_id
+                        AND done.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = items.job_id
+                        AND deferred.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = items.job_id
+                        AND dlq.run_lease = items.run_lease
+                  )
+                FOR UPDATE OF claim_batches
+            ),
+            claim_refs AS (
+                SELECT * FROM row_claim_refs
+                UNION ALL
+                SELECT * FROM batch_claim_refs
             ),
             upserted AS (
                 INSERT INTO {schema}.attempt_state (
@@ -7917,9 +9272,9 @@ impl QueueStorage {
             marked AS (
                 UPDATE {schema}.lease_claims AS claims
                 SET materialized_at = COALESCE(claims.materialized_at, clock_timestamp())
-                FROM claim_refs
-                WHERE claims.job_id = claim_refs.job_id
-                  AND claims.run_lease = claim_refs.run_lease
+                FROM row_claim_refs
+                WHERE claims.job_id = row_claim_refs.job_id
+                  AND claims.run_lease = row_claim_refs.run_lease
                 RETURNING claims.job_id
             )
             SELECT count(*)::bigint FROM upserted
@@ -7947,7 +9302,6 @@ impl QueueStorage {
         let ready_slots: Vec<i32> = deleted.iter().map(|row| row.ready_slot).collect();
         let ready_generations: Vec<i64> = deleted.iter().map(|row| row.ready_generation).collect();
         let queues: Vec<String> = deleted.iter().map(|row| row.queue.clone()).collect();
-        let priorities: Vec<i16> = deleted.iter().map(|row| row.priority).collect();
         let enqueue_shards: Vec<i16> = deleted.iter().map(|row| row.enqueue_shard).collect();
         let lane_seqs: Vec<i64> = deleted.iter().map(|row| row.lane_seq).collect();
         let job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
@@ -7955,8 +9309,8 @@ impl QueueStorage {
 
         let ready_rows: Vec<ReadySnapshotRow> = sqlx::query_as(&format!(
             r#"
-            WITH refs(ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq) AS (
-                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::smallint[], $6::bigint[])
+            WITH refs(ready_slot, ready_generation, queue, enqueue_shard, lane_seq, job_id) AS (
+                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[], $6::bigint[])
             )
             SELECT
                 ready.ready_slot,
@@ -7965,7 +9319,6 @@ impl QueueStorage {
                 ready.kind,
                 ready.queue,
                 ready.args,
-                ready.priority,
                 ready.lane_seq,
                 ready.enqueue_shard,
                 ready.run_at,
@@ -7978,17 +9331,17 @@ impl QueueStorage {
               ON ready.ready_slot = refs.ready_slot
              AND ready.ready_generation = refs.ready_generation
              AND ready.queue = refs.queue
-             AND ready.priority = refs.priority
              AND ready.enqueue_shard = refs.enqueue_shard
              AND ready.lane_seq = refs.lane_seq
+             AND ready.job_id = refs.job_id
             "#
         ))
         .bind(&ready_slots)
         .bind(&ready_generations)
         .bind(&queues)
-        .bind(&priorities)
         .bind(&enqueue_shards)
         .bind(&lane_seqs)
+        .bind(&job_ids)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -8037,16 +9390,98 @@ impl QueueStorage {
             r#"
             WITH refs(job_id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            ),
+            row_claims AS (
+                SELECT claims.claim_slot, claims.job_id, claims.run_lease,
+                       'rescue', clock_timestamp()
+                FROM {schema}.lease_claims AS claims
+                JOIN refs
+                  ON refs.job_id = claims.job_id
+                 AND refs.run_lease = claims.run_lease
+            ),
+            -- Compact batch-sourced claims (including those materialized
+            -- into `leases` without a lease_claims row) have no row to
+            -- JOIN, so they close into the batch ledger the queue prune
+            -- gate counts via compact_count. The double-close guards
+            -- below keep a re-hydrated rescued receipt from writing a
+            -- second batch closure.
+            batch_claims AS (
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    items.job_id,
+                    items.run_lease,
+                    items.receipt_id
+                FROM {schema}.lease_claim_batches AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids
+                ) AS items(job_id, run_lease, receipt_id)
+                JOIN refs
+                  ON refs.job_id = items.job_id
+                 AND refs.run_lease = items.run_lease
+                WHERE NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claim_batches.claim_slot
+                        AND closures.job_id = items.job_id
+                        AND closures.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                        AND closure_batches.receipt_ranges @> items.receipt_id
+                  )
+            ),
+            inserted AS (
+                INSERT INTO {schema}.lease_claim_closures
+                    (claim_slot, job_id, run_lease, outcome, closed_at)
+                SELECT * FROM row_claims
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                RETURNING claim_slot, job_id, run_lease, closed_at
+            ),
+            inserted_batches AS (
+                INSERT INTO {schema}.lease_claim_closure_batches (
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    outcome,
+                    closed_count,
+                    receipt_ids,
+                    receipt_ranges,
+                    closed_at
+                )
+                SELECT
+                    batch_claims.claim_slot,
+                    batch_claims.ready_slot,
+                    batch_claims.ready_generation,
+                    'rescue',
+                    count(*)::int,
+                    array_agg(batch_claims.receipt_id ORDER BY batch_claims.receipt_id),
+                    range_agg(int8range(batch_claims.receipt_id, batch_claims.receipt_id + 1, '[)') ORDER BY batch_claims.receipt_id),
+                    clock_timestamp()
+                FROM batch_claims
+                GROUP BY
+                    batch_claims.claim_slot,
+                    batch_claims.ready_slot,
+                    batch_claims.ready_generation
+                RETURNING claim_slot
+            ),
+            marked AS (
+                UPDATE {schema}.lease_claims AS claims
+                SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                FROM inserted
+                WHERE claims.claim_slot = inserted.claim_slot
+                  AND claims.job_id = inserted.job_id
+                  AND claims.run_lease = inserted.run_lease
+                RETURNING claims.job_id
             )
-            INSERT INTO {schema}.lease_claim_closures
-                (claim_slot, job_id, run_lease, outcome, closed_at)
-            SELECT claims.claim_slot, claims.job_id, claims.run_lease,
-                   'rescue', clock_timestamp()
-            FROM {schema}.lease_claims AS claims
-            JOIN refs
-              ON refs.job_id = claims.job_id
-             AND refs.run_lease = claims.run_lease
-            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+            SELECT
+                (SELECT count(*) FROM marked)
+                + (SELECT count(*) FROM inserted_batches)
             "#
         ))
         .bind(&job_ids)
@@ -8055,7 +9490,7 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let ready_map: BTreeMap<(i32, i64, String, i16, i16, i64), ReadySnapshotRow> = ready_rows
+        let ready_map: BTreeMap<(i32, i64, String, i16, i64, i64), ReadySnapshotRow> = ready_rows
             .into_iter()
             .map(|row| {
                 (
@@ -8063,9 +9498,9 @@ impl QueueStorage {
                         row.ready_slot,
                         row.ready_generation,
                         row.queue.clone(),
-                        row.priority,
                         row.enqueue_shard,
                         row.lane_seq,
+                        row.job_id,
                     ),
                     row,
                 )
@@ -8084,9 +9519,9 @@ impl QueueStorage {
                     deleted_row.ready_slot,
                     deleted_row.ready_generation,
                     deleted_row.queue.clone(),
-                    deleted_row.priority,
                     deleted_row.enqueue_shard,
                     deleted_row.lane_seq,
+                    deleted_row.job_id,
                 ))
                 .ok_or_else(|| {
                     AwaError::Validation(format!(
@@ -8134,17 +9569,20 @@ impl QueueStorage {
             return Ok(None);
         }
 
+        self.lock_receipt_attempts_tx(tx, &[(job_id, run_lease)])
+            .await?;
+
         let schema = self.schema();
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
-            WITH target AS (
+            WITH row_target AS (
                 -- Target is the open claim identified from the
                 -- partitioned lease_claims table anti-joined against
-                -- lease_claim_closures.
+                -- durable closure evidence.
                 SELECT
                     claims.claim_slot,
+                    NULL::bigint AS batch_id,
+                    claims.receipt_id,
                     claims.ready_slot,
                     claims.ready_generation,
                     claims.job_id,
@@ -8160,15 +9598,164 @@ impl QueueStorage {
                 FROM {schema}.lease_claims AS claims
                 WHERE claims.job_id = $1
                   AND claims.run_lease = $2
-                  AND NOT {closed_evidence}
+                  AND claims.closed_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claims.claim_slot
+                        AND closures.job_id = claims.job_id
+                        AND closures.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.receipt_ranges @> claims.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = claims.job_id
+                        AND done.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = claims.job_id
+                        AND deferred.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = claims.job_id
+                        AND dlq.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
+                      WHERE lease.job_id = claims.job_id
+                        AND lease.run_lease = claims.run_lease
+                  )
                 FOR UPDATE OF claims
             ),
+            batch_target AS (
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.batch_id,
+                    items.receipt_id,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    items.job_id,
+                    claim_batches.queue,
+                    'running'::awa.job_state AS state,
+                    claim_batches.priority,
+                    items.attempt,
+                    items.run_lease,
+                    items.max_attempts,
+                    items.lane_seq,
+                    claim_batches.enqueue_shard,
+                    claim_batches.claimed_at AS attempted_at
+                FROM {schema}.lease_claim_batches AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids,
+                    claim_batches.lane_seqs,
+                    claim_batches.attempts,
+                    claim_batches.max_attempts
+                ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+                WHERE items.job_id = $1
+                  AND items.run_lease = $2
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claim_batches.claim_slot
+                        AND closures.job_id = items.job_id
+                        AND closures.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                        AND closure_batches.receipt_ranges @> items.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = items.job_id
+                        AND done.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = items.job_id
+                        AND deferred.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = items.job_id
+                        AND dlq.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
+                      WHERE lease.job_id = items.job_id
+                        AND lease.run_lease = items.run_lease
+                  )
+                FOR UPDATE OF claim_batches
+            ),
+            target AS (
+                SELECT * FROM row_target
+                UNION ALL
+                SELECT * FROM batch_target
+                LIMIT 1
+            ),
+            -- A row target (batch_id IS NULL) is a deadline lease claim:
+            -- close it explicitly so the prune gates balance it against
+            -- the lease_claims row. A batch target has no lease_claims
+            -- row to JOIN, so it closes into the batch ledger below.
             inserted AS (
                 INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
                 SELECT target.claim_slot, target.job_id, target.run_lease, $3, clock_timestamp()
                 FROM target
+                WHERE target.batch_id IS NULL
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                RETURNING job_id, run_lease
+                RETURNING claim_slot, job_id, run_lease, closed_at
+            ),
+            inserted_batches AS (
+                INSERT INTO {schema}.lease_claim_closure_batches (
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    outcome,
+                    closed_count,
+                    receipt_ids,
+                    receipt_ranges,
+                    closed_at
+                )
+                SELECT
+                    target.claim_slot,
+                    target.ready_slot,
+                    target.ready_generation,
+                    $3,
+                    count(*)::int,
+                    array_agg(target.receipt_id ORDER BY target.receipt_id),
+                    range_agg(int8range(target.receipt_id, target.receipt_id + 1, '[)') ORDER BY target.receipt_id),
+                    clock_timestamp()
+                FROM target
+                WHERE target.batch_id IS NOT NULL
+                GROUP BY target.claim_slot, target.ready_slot, target.ready_generation
+                RETURNING claim_slot
+            ),
+            marked AS (
+                UPDATE {schema}.lease_claims AS claims
+                SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                FROM inserted
+                WHERE claims.claim_slot = inserted.claim_slot
+                  AND claims.job_id = inserted.job_id
+                  AND claims.run_lease = inserted.run_lease
+                RETURNING claims.job_id
+            ),
+            -- The batch ledger has no job_id/run_lease column to RETURN,
+            -- so derive the closed batch target from `target` gated on
+            -- the batch insert having fired (target is LIMIT 1).
+            closed_target AS (
+                SELECT claim_slot, job_id, run_lease FROM inserted
+                UNION ALL
+                SELECT target.claim_slot, target.job_id, target.run_lease
+                FROM target
+                WHERE target.batch_id IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM inserted_batches)
             )
             SELECT
                 target.ready_slot,
@@ -8188,9 +9775,10 @@ impl QueueStorage {
                 NULL::uuid AS callback_id,
                 NULL::timestamptz AS callback_timeout_at
             FROM target
-            JOIN inserted
-              ON inserted.job_id = target.job_id
-             AND inserted.run_lease = target.run_lease
+            JOIN closed_target
+              ON closed_target.claim_slot = target.claim_slot
+             AND closed_target.job_id = target.job_id
+             AND closed_target.run_lease = target.run_lease
             "#
         ))
         .bind(job_id)
@@ -8311,8 +9899,9 @@ impl QueueStorage {
     ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
         let schema = self.schema();
         let claim_child = claim_child_name(schema, slot as usize);
+        let claim_batch_child = claim_batch_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_child, "claims");
+        let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
         let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH cursor_row AS (
@@ -8324,59 +9913,10 @@ impl QueueStorage {
                 WHERE slot = $1
                 FOR UPDATE
             ),
-            after_cursor AS MATERIALIZED (
+            claim_source AS MATERIALIZED (
                 SELECT
                     claims.claim_slot,
-                    claims.job_id,
-                    claims.run_lease,
-                    row_number() OVER (
-                        ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
-                    ) AS rn
-                FROM {claim_child} AS claims
-                CROSS JOIN cursor_row
-                WHERE claims.claim_slot = $1
-                  AND (claims.claimed_at, claims.job_id, claims.run_lease)
-                      > (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
-                        )
-                ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
-                LIMIT $3
-            ),
-            after_count AS (
-                SELECT count(*)::bigint AS count FROM after_cursor
-            ),
-            before_cursor AS MATERIALIZED (
-                SELECT
-                    claims.claim_slot,
-                    claims.job_id,
-                    claims.run_lease,
-                    after_count.count + row_number() OVER (
-                        ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
-                    ) AS rn
-                FROM {claim_child} AS claims
-                CROSS JOIN cursor_row
-                CROSS JOIN after_count
-                WHERE after_count.count < $3
-                  AND claims.claim_slot = $1
-                  AND (claims.claimed_at, claims.job_id, claims.run_lease)
-                      <= (
-                          cursor_row.rescue_cursor_claimed_at,
-                          cursor_row.rescue_cursor_job_id,
-                          cursor_row.rescue_cursor_run_lease
-                        )
-                ORDER BY claims.claimed_at, claims.job_id, claims.run_lease
-                LIMIT (SELECT GREATEST($3 - count, 0) FROM after_count)
-            ),
-            candidate_keys AS MATERIALIZED (
-                SELECT claim_slot, job_id, run_lease, rn FROM after_cursor
-                UNION ALL
-                SELECT claim_slot, job_id, run_lease, rn FROM before_cursor
-            ),
-            candidates AS MATERIALIZED (
-                SELECT
-                    claims.claim_slot,
+                    NULL::bigint AS batch_id,
                     claims.ready_slot,
                     claims.ready_generation,
                     claims.job_id,
@@ -8387,23 +9927,153 @@ impl QueueStorage {
                     claims.max_attempts,
                     claims.lane_seq,
                     claims.enqueue_shard,
+                    claims.receipt_id,
                     claims.claimed_at,
-                    COALESCE(attempt.heartbeat_at, claims.claimed_at) < $2 AS is_stale,
-                    {closed_evidence} AS is_closed,
+                    claims.closed_at,
+                    false AS compact_batch
+                FROM {claim_child} AS claims
+                WHERE claims.claim_slot = $1
+                UNION ALL
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.batch_id,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    items.job_id,
+                    claim_batches.queue,
+                    claim_batches.priority,
+                    items.attempt,
+                    items.run_lease,
+                    items.max_attempts,
+                    items.lane_seq,
+                    claim_batches.enqueue_shard,
+                    items.receipt_id,
+                    claim_batches.claimed_at,
+                    NULL::timestamptz AS closed_at,
+                    true AS compact_batch
+                FROM {claim_batch_child} AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids,
+                    claim_batches.lane_seqs,
+                    claim_batches.attempts,
+                    claim_batches.max_attempts
+                ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+                WHERE claim_batches.claim_slot = $1
+            ),
+            after_cursor AS MATERIALIZED (
+                SELECT
+                    claim_source.claim_slot,
+                    claim_source.job_id,
+                    claim_source.run_lease,
+                    row_number() OVER (
+                        ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                    ) AS rn
+                FROM claim_source
+                CROSS JOIN cursor_row
+                WHERE claim_source.claimed_at < $2
+                  AND (claim_source.claimed_at, claim_source.job_id, claim_source.run_lease)
+                      > (
+                          cursor_row.rescue_cursor_claimed_at,
+                          cursor_row.rescue_cursor_job_id,
+                          cursor_row.rescue_cursor_run_lease
+                        )
+                ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                LIMIT $3
+            ),
+            after_count AS (
+                SELECT count(*)::bigint AS count FROM after_cursor
+            ),
+            before_cursor AS MATERIALIZED (
+                SELECT
+                    claim_source.claim_slot,
+                    claim_source.job_id,
+                    claim_source.run_lease,
+                    after_count.count + row_number() OVER (
+                        ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                    ) AS rn
+                FROM claim_source
+                CROSS JOIN cursor_row
+                CROSS JOIN after_count
+                WHERE after_count.count < $3
+                  AND claim_source.claimed_at < $2
+                  AND (claim_source.claimed_at, claim_source.job_id, claim_source.run_lease)
+                      <= (
+                          cursor_row.rescue_cursor_claimed_at,
+                          cursor_row.rescue_cursor_job_id,
+                          cursor_row.rescue_cursor_run_lease
+                        )
+                ORDER BY claim_source.claimed_at, claim_source.job_id, claim_source.run_lease
+                LIMIT (SELECT GREATEST($3 - count, 0) FROM after_count)
+            ),
+            candidate_keys AS MATERIALIZED (
+                SELECT claim_slot, job_id, run_lease, rn FROM after_cursor
+                UNION ALL
+                SELECT claim_slot, job_id, run_lease, rn FROM before_cursor
+            ),
+            candidates AS MATERIALIZED (
+                SELECT
+                    claim_source.claim_slot,
+                    claim_source.batch_id,
+                    claim_source.ready_slot,
+                    claim_source.ready_generation,
+                    claim_source.job_id,
+                    claim_source.queue,
+                    claim_source.priority,
+                    claim_source.attempt,
+                    claim_source.run_lease,
+                    claim_source.max_attempts,
+                    claim_source.lane_seq,
+                    claim_source.enqueue_shard,
+                    claim_source.receipt_id,
+                    claim_source.claimed_at,
+                    claim_source.closed_at,
+                    claim_source.compact_batch,
+                    COALESCE(attempt.heartbeat_at, claim_source.claimed_at) < $2 AS is_stale,
+                    (
+                        claim_source.closed_at IS NOT NULL
+                        OR EXISTS (
+                            SELECT 1 FROM {closure_child} AS closures
+                            WHERE closures.claim_slot = claim_source.claim_slot
+                              AND closures.job_id = claim_source.job_id
+                              AND closures.run_lease = claim_source.run_lease
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM {closure_batch_child} AS closure_batches
+                            WHERE closure_batches.receipt_ranges @> claim_source.receipt_id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {schema}.done_entries AS done
+                            WHERE done.job_id = claim_source.job_id
+                              AND done.run_lease = claim_source.run_lease
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                            WHERE deferred.job_id = claim_source.job_id
+                              AND deferred.run_lease = claim_source.run_lease
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {schema}.dlq_entries AS dlq
+                            WHERE dlq.job_id = claim_source.job_id
+                              AND dlq.run_lease = claim_source.run_lease
+                        )
+                    ) AS is_closed,
                     EXISTS (
                         SELECT 1 FROM {schema}.leases AS lease
-                        WHERE lease.job_id = claims.job_id
-                          AND lease.run_lease = claims.run_lease
+                        WHERE lease.job_id = claim_source.job_id
+                          AND lease.run_lease = claim_source.run_lease
                     ) AS is_lease_managed,
                     candidate_keys.rn
                 FROM candidate_keys
-                JOIN {claim_child} AS claims
-                  ON claims.claim_slot = candidate_keys.claim_slot
-                 AND claims.job_id = candidate_keys.job_id
-                 AND claims.run_lease = candidate_keys.run_lease
+                JOIN claim_source
+                  ON claim_source.claim_slot = candidate_keys.claim_slot
+                 AND claim_source.job_id = candidate_keys.job_id
+                 AND claim_source.run_lease = candidate_keys.run_lease
                 LEFT JOIN {schema}.attempt_state AS attempt
-                  ON attempt.job_id = claims.job_id
-                 AND attempt.run_lease = claims.run_lease
+                  ON attempt.job_id = claim_source.job_id
+                 AND attempt.run_lease = claim_source.run_lease
             ),
             stale_candidates AS (
                 SELECT candidates.*
@@ -8414,14 +10084,47 @@ impl QueueStorage {
                 ORDER BY rn
                 LIMIT $4
             ),
-            stale_locked AS (
+            stale_row_locked AS (
                 SELECT stale_candidates.*
                 FROM stale_candidates
                 JOIN {claim_child} AS claims
                   ON claims.claim_slot = stale_candidates.claim_slot
                  AND claims.job_id = stale_candidates.job_id
                  AND claims.run_lease = stale_candidates.run_lease
-                WHERE NOT {closed_evidence}
+                WHERE NOT stale_candidates.compact_batch
+                  AND claims.closed_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {closure_child} AS closures
+                      WHERE closures.claim_slot = claims.claim_slot
+                        AND closures.job_id = claims.job_id
+                        AND closures.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {closure_batch_child} AS closure_batches
+                      WHERE closure_batches.receipt_ranges @> claims.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = claims.job_id
+                        AND done.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = claims.job_id
+                        AND deferred.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = claims.job_id
+                        AND dlq.run_lease = claims.run_lease
+                  )
+                  AND pg_catalog.pg_try_advisory_xact_lock(
+                      pg_catalog.hashtextextended(
+                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
+                          0
+                      )
+                  )
                   -- A claim that already materialized into `leases` is
                   -- on the lease-side heartbeat-rescue path (see
                   -- `rescue_stale_heartbeats`). Rescuing it again here
@@ -8429,17 +10132,119 @@ impl QueueStorage {
                   -- runtime is still tracking via its lease row.
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
-                      WHERE lease.job_id = claims.job_id
-                        AND lease.run_lease = claims.run_lease
-                  )
+	                      WHERE lease.job_id = claims.job_id
+	                        AND lease.run_lease = claims.run_lease
+	                  )
                 FOR UPDATE OF claims SKIP LOCKED
             ),
+            stale_batch_locked AS (
+                SELECT stale_candidates.*
+                FROM stale_candidates
+                JOIN {claim_batch_child} AS claim_batches
+                  ON claim_batches.claim_slot = stale_candidates.claim_slot
+                 AND claim_batches.batch_id = stale_candidates.batch_id
+                WHERE stale_candidates.compact_batch
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {closure_child} AS closures
+                      WHERE closures.claim_slot = stale_candidates.claim_slot
+                        AND closures.job_id = stale_candidates.job_id
+                        AND closures.run_lease = stale_candidates.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {closure_batch_child} AS closure_batches
+                      WHERE closure_batches.receipt_ranges @> stale_candidates.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = stale_candidates.job_id
+                        AND done.run_lease = stale_candidates.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = stale_candidates.job_id
+                        AND deferred.run_lease = stale_candidates.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = stale_candidates.job_id
+                        AND dlq.run_lease = stale_candidates.run_lease
+                  )
+                  AND pg_catalog.pg_try_advisory_xact_lock(
+                      pg_catalog.hashtextextended(
+                          format('awa.receipt.complete:%s:%s', stale_candidates.job_id, stale_candidates.run_lease),
+                          0
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
+                      WHERE lease.job_id = stale_candidates.job_id
+                        AND lease.run_lease = stale_candidates.run_lease
+                  )
+                FOR UPDATE OF claim_batches SKIP LOCKED
+            ),
+            stale_locked AS (
+                SELECT * FROM stale_row_locked
+                UNION ALL
+                SELECT * FROM stale_batch_locked
+            ),
+            -- Row-sourced (deadline lease) claims close explicitly so the
+            -- prune gates balance them against the lease_claims row.
+            -- Compact batch-sourced claims have no lease_claims row to
+            -- JOIN, so they close into the batch ledger the queue prune
+            -- gate counts via compact_count.
             inserted AS (
                 INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
                 SELECT stale_locked.claim_slot, stale_locked.job_id, stale_locked.run_lease, 'rescued', clock_timestamp()
                 FROM stale_locked
+                WHERE NOT stale_locked.compact_batch
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                RETURNING claim_slot, job_id, run_lease
+                RETURNING claim_slot, job_id, run_lease, closed_at
+            ),
+            inserted_batches AS (
+                INSERT INTO {schema}.lease_claim_closure_batches (
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    outcome,
+                    closed_count,
+                    receipt_ids,
+                    receipt_ranges,
+                    closed_at
+                )
+                SELECT
+                    stale_locked.claim_slot,
+                    stale_locked.ready_slot,
+                    stale_locked.ready_generation,
+                    'rescued',
+                    count(*)::int,
+                    array_agg(stale_locked.receipt_id ORDER BY stale_locked.receipt_id),
+                    range_agg(int8range(stale_locked.receipt_id, stale_locked.receipt_id + 1, '[)') ORDER BY stale_locked.receipt_id),
+                    clock_timestamp()
+                FROM stale_locked
+                WHERE stale_locked.compact_batch
+                GROUP BY
+                    stale_locked.claim_slot,
+                    stale_locked.ready_slot,
+                    stale_locked.ready_generation
+                RETURNING claim_slot
+            ),
+            closed_locked AS (
+                SELECT claim_slot, job_id, run_lease FROM inserted
+                UNION ALL
+                SELECT stale_locked.claim_slot, stale_locked.job_id, stale_locked.run_lease
+                FROM stale_locked
+                WHERE stale_locked.compact_batch
+                  AND EXISTS (SELECT 1 FROM inserted_batches)
+            ),
+            marked AS (
+                UPDATE {schema}.lease_claims AS claims
+                SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                FROM inserted
+                WHERE claims.claim_slot = inserted.claim_slot
+                  AND claims.job_id = inserted.job_id
+                  AND claims.run_lease = inserted.run_lease
+                RETURNING claims.job_id
             ),
             annotated AS (
                 SELECT
@@ -8449,10 +10254,10 @@ impl QueueStorage {
                         OR candidates.is_lease_managed
                         OR NOT candidates.is_stale
                         OR EXISTS (
-                            SELECT 1 FROM inserted
-                            WHERE inserted.claim_slot = candidates.claim_slot
-                              AND inserted.job_id = candidates.job_id
-                              AND inserted.run_lease = candidates.run_lease
+                            SELECT 1 FROM closed_locked
+                            WHERE closed_locked.claim_slot = candidates.claim_slot
+                              AND closed_locked.job_id = candidates.job_id
+                              AND closed_locked.run_lease = candidates.run_lease
                         )
                     ) AS advanceable
                 FROM candidates
@@ -8496,10 +10301,10 @@ impl QueueStorage {
                 stale_locked.enqueue_shard,
                 stale_locked.claimed_at AS attempted_at
             FROM stale_locked
-            JOIN inserted
-              ON inserted.claim_slot = stale_locked.claim_slot
-             AND inserted.job_id = stale_locked.job_id
-             AND inserted.run_lease = stale_locked.run_lease
+            JOIN closed_locked
+              ON closed_locked.claim_slot = stale_locked.claim_slot
+             AND closed_locked.job_id = stale_locked.job_id
+             AND closed_locked.run_lease = stale_locked.run_lease
             CROSS JOIN cursor_advance
             "#
         ))
@@ -8606,7 +10411,9 @@ impl QueueStorage {
         let schema = self.schema();
         let claim_child = claim_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_child, "claims");
+        let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_child, &closure_batch_child, "claims");
         let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH cursor_row AS (
@@ -8630,6 +10437,7 @@ impl QueueStorage {
                 CROSS JOIN cursor_row
                 WHERE claims.claim_slot = $1
                   AND claims.deadline_at IS NOT NULL
+                  AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       > (
                           cursor_row.deadline_cursor_deadline_at,
@@ -8656,6 +10464,7 @@ impl QueueStorage {
                 WHERE after_count.count < $2
                   AND claims.claim_slot = $1
                   AND claims.deadline_at IS NOT NULL
+                  AND claims.deadline_at < clock_timestamp()
                   AND (claims.deadline_at, claims.job_id, claims.run_lease)
                       <= (
                           cursor_row.deadline_cursor_deadline_at,
@@ -8718,6 +10527,12 @@ impl QueueStorage {
                  AND claims.run_lease = expired_candidates.run_lease
                 WHERE NOT {closed_evidence}
                   AND claims.deadline_at < clock_timestamp()
+                  AND pg_catalog.pg_try_advisory_xact_lock(
+                      pg_catalog.hashtextextended(
+                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
+                          0
+                      )
+                  )
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
                       WHERE lease.job_id = claims.job_id
@@ -8735,7 +10550,16 @@ impl QueueStorage {
                     clock_timestamp()
                 FROM expired_locked
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                RETURNING claim_slot, job_id, run_lease
+                RETURNING claim_slot, job_id, run_lease, closed_at
+            ),
+            marked AS (
+                UPDATE {schema}.lease_claims AS claims
+                SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                FROM inserted
+                WHERE claims.claim_slot = inserted.claim_slot
+                  AND claims.job_id = inserted.job_id
+                  AND claims.run_lease = inserted.run_lease
+                RETURNING claims.job_id
             ),
             annotated AS (
                 SELECT
@@ -8809,6 +10633,10 @@ impl QueueStorage {
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
+        let closure_rel = format!("{schema}.lease_claim_closures");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let mut candidates = Vec::new();
 
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(&format!(
@@ -8928,7 +10756,7 @@ impl QueueStorage {
         }
 
         // Report receipt-backed attempts as running by anti-joining
-        // lease_claims against lease_claim_closures.
+        // lease_claims against every durable closure evidence shape.
         let lease_claim_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -8973,12 +10801,7 @@ impl QueueStorage {
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
             WHERE claims.job_id = $1
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
-                  WHERE closures.claim_slot = claims.claim_slot
-                    AND closures.job_id = claims.job_id
-                    AND closures.run_lease = claims.run_lease
-              )
+              AND NOT {closed_evidence}
               -- Exclude claims that have already been materialized into
               -- leases — the lease-backed branch above already reports
               -- those.
@@ -8986,31 +10809,6 @@ impl QueueStorage {
                   SELECT 1 FROM {schema}.leases AS lease
                   WHERE lease.job_id = claims.job_id
                     AND lease.run_lease = claims.run_lease
-              )
-              -- Exclude claims whose attempt has already been moved to
-              -- a non-running disposition. Rescue paths (callback
-              -- timeout, deadline, heartbeat) DELETE the materialised
-              -- lease and INSERT into `deferred_jobs` / `done_entries`
-              -- / `dlq_entries`, but they don't always write a
-              -- closure to `lease_claim_closures` — so the original
-              -- `lease_claims` row sits "open" until partition prune.
-              -- Without this guard, `load_job` returns the stale
-              -- 'running' projection and masks the actual retryable /
-              -- failed / completed state of the same attempt.
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
-                  WHERE deferred.job_id = claims.job_id
-                    AND deferred.run_lease = claims.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.done_entries AS done
-                  WHERE done.job_id = claims.job_id
-                    AND done.run_lease = claims.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.dlq_entries AS dlq
-                  WHERE dlq.job_id = claims.job_id
-                    AND dlq.run_lease = claims.run_lease
               )
             ORDER BY claims.run_lease DESC
             "#,
@@ -9020,6 +10818,107 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_rows {
+            candidates.push(row.into_job_row()?);
+        }
+
+        // Zero-deadline receipt claims are stored as compact batches. Expand
+        // them only for this admin read, and report still-open items as
+        // running until durable closure, terminal, or materialized-lease
+        // evidence supersedes the claim.
+        let lease_claim_batch_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                claim_batches.ready_slot,
+                claim_batches.ready_generation,
+                items.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                'running'::awa.job_state AS state,
+                claim_batches.priority,
+                items.attempt,
+                items.run_lease,
+                items.max_attempts,
+                items.lane_seq,
+                ready.run_at,
+                attempt.heartbeat_at,
+                claim_batches.deadline_at,
+                claim_batches.claimed_at AS attempted_at,
+                NULL::timestamptz AS finalized_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                NULL::uuid AS callback_id,
+                NULL::timestamptz AS callback_timeout_at,
+                attempt.callback_filter,
+                attempt.callback_on_complete,
+                attempt.callback_on_fail,
+                attempt.callback_transform,
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload,
+                attempt.progress,
+                attempt.callback_result
+            FROM {schema}.lease_claim_batches AS claim_batches
+            CROSS JOIN LATERAL unnest(
+                claim_batches.job_ids,
+                claim_batches.run_leases,
+                claim_batches.receipt_ids,
+                claim_batches.lane_seqs,
+                claim_batches.attempts,
+                claim_batches.max_attempts
+            ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = claim_batches.ready_slot
+             AND ready.ready_generation = claim_batches.ready_generation
+             AND ready.queue = claim_batches.queue
+             AND ready.enqueue_shard = claim_batches.enqueue_shard
+             AND ready.lane_seq = items.lane_seq
+             AND ready.job_id = items.job_id
+            LEFT JOIN {schema}.attempt_state AS attempt
+              ON attempt.job_id = items.job_id
+             AND attempt.run_lease = items.run_lease
+            WHERE items.job_id = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.claim_slot = claim_batches.claim_slot
+                    AND closures.job_id = items.job_id
+                    AND closures.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                    AND closure_batches.receipt_ranges @> items.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.leases AS lease
+                  WHERE lease.job_id = items.job_id
+                    AND lease.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = items.job_id
+                    AND done.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = items.job_id
+                    AND deferred.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = items.job_id
+                    AND dlq.run_lease = items.run_lease
+              )
+            ORDER BY items.run_lease DESC
+            "#,
+        ))
+        .bind(job_id)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        for row in lease_claim_batch_rows {
             candidates.push(row.into_job_row()?);
         }
 
@@ -9775,6 +11674,13 @@ impl QueueStorage {
             });
         }
 
+        let completed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
@@ -9870,6 +11776,13 @@ impl QueueStorage {
             });
         }
 
+        let failed_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &failed_pairs, "failed")
+            .await?;
+
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
@@ -9961,6 +11874,13 @@ impl QueueStorage {
                 callback_id: callback_id.to_string(),
             });
         }
+
+        let retryable_pairs: Vec<(i64, i64)> = deleted
+            .iter()
+            .map(|row| (row.job_id, row.run_lease))
+            .collect();
+        self.close_receipt_pairs_tx(tx, &retryable_pairs, "retryable")
+            .await?;
 
         let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
@@ -10143,8 +12063,8 @@ impl QueueStorage {
             // heartbeat_at` + nested `INSERT INTO attempt_state` CTE
             // is collapsed into the single attempt_state upsert. The
             // upsert sources open-claim identity from `lease_claims`
-            // anti-joined against `lease_claim_closures` so it picks
-            // up every claim regardless of whether
+            // anti-joined against durable closure evidence so it picks
+            // up every open claim regardless of whether
             // `materialize_claims` has fanned it out to `leases` yet.
             self.upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs)
                 .await?
@@ -11301,6 +13221,11 @@ impl QueueStorage {
         let ready_busy =
             Self::relation_has_rows_tx(&mut tx, &ready_child_name(schema, next_slot as usize))
                 .await?;
+        let claim_attempt_batch_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &ready_claim_attempt_batch_child_name(schema, next_slot as usize),
+        )
+        .await?;
         let done_busy =
             Self::relation_has_rows_tx(&mut tx, &done_child_name(schema, next_slot as usize))
                 .await?;
@@ -11309,20 +13234,47 @@ impl QueueStorage {
             &ready_tombstone_child_name(schema, next_slot as usize),
         )
         .await?;
+        let segment_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &ready_segment_child_name(schema, next_slot as usize),
+        )
+        .await?;
+        let receipt_batch_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &receipt_completion_batch_child_name(schema, next_slot as usize),
+        )
+        .await?;
+        let receipt_tombstone_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &receipt_completion_tombstone_child_name(schema, next_slot as usize),
+        )
+        .await?;
         let terminal_delta_busy = Self::relation_has_rows_tx(
             &mut tx,
             &terminal_delta_child_name(schema, next_slot as usize),
         )
         .await?;
 
-        if ready_busy || done_busy || tombstone_busy || terminal_delta_busy {
+        if ready_busy
+            || claim_attempt_batch_busy
+            || done_busy
+            || tombstone_busy
+            || segment_busy
+            || receipt_batch_busy
+            || receipt_tombstone_busy
+            || terminal_delta_busy
+        {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
                     queue_ready: busy_indicator(ready_busy),
+                    queue_claim_attempt_batches: busy_indicator(claim_attempt_batch_busy),
                     queue_done: busy_indicator(done_busy),
                     queue_tombstones: busy_indicator(tombstone_busy),
+                    queue_ready_segments: busy_indicator(segment_busy),
+                    queue_receipt_completion_batches: busy_indicator(receipt_batch_busy),
+                    queue_receipt_completion_tombstones: busy_indicator(receipt_tombstone_busy),
                     queue_terminal_deltas: busy_indicator(terminal_delta_busy),
                     ..Default::default()
                 },
@@ -11445,12 +13397,12 @@ impl QueueStorage {
     }
 
     /// Rebuild terminal counters from scratch by truncating folded live counts
-    /// and pending deltas, then re-aggregating `done_entries`. Run this when:
+    /// and pending deltas, then re-aggregating terminal history. Run this when:
     ///
     /// - upgrading from a pre-#290 fleet, where in-flight binaries wrote
-    ///   `done_entries` without maintaining the counter,
+    ///   terminal history without maintaining the counter,
     /// - after any incident that may have left the counter inconsistent
-    ///   with `done_entries`, or
+    ///   with terminal history, or
     /// - as a routine drift-recovery step before relying on counter-fed
     ///   reads for billing-grade accuracy.
     ///
@@ -11463,7 +13415,10 @@ impl QueueStorage {
     /// **Operator note:** this is best run on a quiesced fleet (workers
     /// paused or fully drained). Concurrent inserts during the rebuild
     /// will block on the lock; long-held locks can stall the fleet. The
-    /// rebuild itself is O(rows in `done_entries`).
+    /// rebuild itself is O(rows in `{schema}.done_entries`). Compact receipt
+    /// completions remain counted directly from retained
+    /// `receipt_completion_batches` until queue prune folds them into
+    /// permanent rollups.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rebuild_terminal_counters")]
     pub async fn rebuild_terminal_counters(&self, pool: &PgPool) -> Result<i64, AwaError> {
         let schema = self.schema();
@@ -11478,6 +13433,8 @@ impl QueueStorage {
 
         sqlx::query(&format!(
             "LOCK TABLE {schema}.done_entries, \
+             {schema}.receipt_completion_batches, \
+             {schema}.receipt_completion_tombstones, \
              {schema}.queue_terminal_count_deltas, \
              {schema}.queue_terminal_live_counts \
              IN ACCESS EXCLUSIVE MODE"
@@ -11522,8 +13479,8 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         // Flip the trust marker. From this point the read path
-        // (queue_counts_exact) uses the counter directly; before this
-        // call, it falls back to scanning done_entries.
+        // (queue_counts_exact) uses the counter for done-entry terminal rows;
+        // before this call, it falls back to scanning terminal_jobs.
         sqlx::query(&format!(
             r#"
             UPDATE {schema}.queue_ring_state
@@ -11565,13 +13522,15 @@ impl QueueStorage {
         Ok(trusted.unwrap_or(false))
     }
 
-    /// Fold append-only terminal-count deltas into
+    /// Fold append-only `done_entries` terminal-count deltas into
     /// `queue_terminal_live_counts` for sealed queue slots.
     ///
-    /// Completions and terminal deletes append signed rows into
+    /// `done_entries` terminal inserts and deletes append signed rows into
     /// `queue_terminal_count_deltas` instead of updating the live counter on
-    /// the user-facing hot path. Exact reads sum folded live counts plus
-    /// pending deltas, so this rollup can run asynchronously. It intentionally
+    /// the user-facing hot path. Compact receipt completions are counted from
+    /// retained batch rows directly. Exact reads sum folded live counts plus
+    /// pending deltas and retained compact batches, so this rollup can run
+    /// asynchronously. It intentionally
     /// skips the current queue slot and any slot with active leases or open
     /// receipt claims; that keeps rollup away from the segment receiving hot
     /// completions and avoids racing future terminal deltas for the same
@@ -11768,8 +13727,48 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
+        let ready_child = ready_child_name(schema, slot as usize);
+        let pending_ready: bool = sqlx::query_scalar(&format!(
+            r#"
+            WITH claim_cursors AS MATERIALIZED (
+                SELECT
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    {schema}.sequence_next_value(seq_name) AS claim_seq
+                FROM {schema}.queue_claim_heads
+            )
+            SELECT EXISTS (
+                SELECT 1
+                FROM claim_cursors AS claims
+                CROSS JOIN LATERAL (
+                    SELECT 1
+                    FROM {ready_child} AS ready
+                    WHERE ready.ready_generation = $1
+                      AND ready.queue = claims.queue
+                      AND ready.priority = claims.priority
+                      AND ready.enqueue_shard = claims.enqueue_shard
+                      AND ready.lane_seq >= claims.claim_seq
+                    LIMIT 1
+                ) AS pending_ready
+                LIMIT 1
+            )
+            "#
+        ))
+        .bind(generation)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if pending_ready {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::SkippedActive);
+        }
+
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+
         let lock_delta = sqlx::query(&format!(
-            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -11786,34 +13785,18 @@ impl QueueStorage {
             }
         }
 
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_rel, "claims");
-        let active_refs: i64 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT
-                COALESCE((
-                    SELECT count(*)::bigint
-                    FROM {schema}.leases
-                    WHERE ready_slot = $1
-                      AND ready_generation = $2
-                ), 0)
-                +
-                COALESCE((
-                    SELECT count(*)::bigint
-                    FROM {schema}.lease_claims AS claims
-                    WHERE claims.ready_slot = $1
-                      AND claims.ready_generation = $2
-                      AND NOT {closed_evidence}
-                ), 0)
-            "#
-        ))
-        .bind(slot)
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let active_leases =
+            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
 
-        if active_refs > 0 {
+        if active_leases {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::SkippedActive);
+        }
+
+        let unclosed_claim_refs =
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+
+        if unclosed_claim_refs {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(TerminalDeltaSlotRollup::SkippedActive);
         }
@@ -11982,12 +13965,59 @@ impl QueueStorage {
         };
 
         let ready_child = ready_child_name(schema, slot as usize);
+        let claim_attempt_child = ready_claim_attempt_batch_child_name(schema, slot as usize);
         let done_child = done_child_name(schema, slot as usize);
         let tomb_child = ready_tombstone_child_name(schema, slot as usize);
+        let segment_child = ready_segment_child_name(schema, slot as usize);
+        let receipt_batch_child = receipt_completion_batch_child_name(schema, slot as usize);
+        let receipt_tomb_child = receipt_completion_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
 
+        // Queue prune has three common skip gates. Check them before
+        // taking ACCESS EXCLUSIVE on the ready/terminal child tables so
+        // a known-busy slot does not block hot claim reads behind a
+        // doomed truncate attempt. These are only MVCC snapshots; the
+        // same gates are checked again after the exclusive locks.
+        let active_leases =
+            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
+
+        if active_leases {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueueActiveLeases,
+                count: busy_indicator(active_leases),
+            });
+        }
+
+        let pending =
+            queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
+
+        if pending {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueuePendingReady,
+                count: busy_indicator(pending),
+            });
+        }
+
+        let unclosed_claim_refs =
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+
+        if unclosed_claim_refs {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueueUnclosedClaimRefs,
+                count: busy_indicator(unclosed_claim_refs),
+            });
+        }
+
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12000,23 +14030,11 @@ impl QueueStorage {
             return Err(map_sqlx_error(err));
         }
 
-        let active_leases: bool = sqlx::query_scalar(&format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM {schema}.leases
-                WHERE ready_slot = $1
-                  AND ready_generation = $2
-                LIMIT 1
-            )
-            "#
-        ))
-        .bind(slot)
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
+        // The pre-lock gates are only an MVCC snapshot. If an in-flight
+        // producer or claimer committed while the exclusive partition
+        // lock waited, these post-lock gates see it before TRUNCATE.
+        let active_leases =
+            queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
         if active_leases {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {
@@ -12026,72 +14044,25 @@ impl QueueStorage {
             });
         }
 
-        let unclosed_claim_refs: bool = sqlx::query_scalar(&format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM {schema}.lease_claims AS claims
-                WHERE claims.ready_slot = $1
-                  AND claims.ready_generation = $2
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.claim_slot = claims.claim_slot
-                        AND closures.job_id = claims.job_id
-                        AND closures.run_lease = claims.run_lease
-                  )
-                LIMIT 1
-            )
-            "#
-        ))
-        .bind(slot)
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if unclosed_claim_refs {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive {
-                slot,
-                reason: SkipReason::QueueUnclosedClaimRefs,
-                count: busy_indicator(unclosed_claim_refs),
-            });
-        }
-
-        let pending: bool = sqlx::query_scalar(&format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM {ready_child} AS ready
-                LEFT JOIN {done_child} AS done
-                  ON done.ready_generation = ready.ready_generation
-                 AND done.queue = ready.queue
-                 AND done.priority = ready.priority
-                 AND done.enqueue_shard = ready.enqueue_shard
-                 AND done.lane_seq = ready.lane_seq
-                LEFT JOIN {tomb_child} AS tomb
-                  ON tomb.ready_generation = ready.ready_generation
-                 AND tomb.queue = ready.queue
-                 AND tomb.priority = ready.priority
-                 AND tomb.enqueue_shard = ready.enqueue_shard
-                 AND tomb.lane_seq = ready.lane_seq
-                WHERE done.lane_seq IS NULL
-                  AND tomb.lane_seq IS NULL
-                LIMIT 1
-            )
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
+        let pending =
+            queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
         if pending {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {
                 slot,
                 reason: SkipReason::QueuePendingReady,
                 count: busy_indicator(pending),
+            });
+        }
+
+        let unclosed_claim_refs =
+            queue_prune_has_unclosed_claim_refs_tx(&mut tx, schema, slot, generation).await?;
+        if unclosed_claim_refs {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueueUnclosedClaimRefs,
+                count: busy_indicator(unclosed_claim_refs),
             });
         }
 
@@ -12237,29 +14208,77 @@ impl QueueStorage {
         // permanent rollup would double-count them.
         let pruned_terminal_counts: Vec<(String, i16, i64, i64)> = sqlx::query_as(&format!(
             r#"
+            WITH done_counts AS (
+                SELECT
+                    queue,
+                    priority,
+                    (count(*) FILTER (WHERE state <> 'failed'))::bigint AS completed,
+                    (count(*) FILTER (
+                        WHERE state = 'failed'
+                          AND (
+                              $2::boolean IS FALSE
+                              OR finalized_at < now() - make_interval(secs => $1::bigint)
+                          )
+                    ))::bigint AS failed
+                FROM {done_child}
+                GROUP BY queue, priority
+            ),
+            batch_rows AS (
+                SELECT
+                    batch.ready_generation,
+                    batch.queue,
+                    batch.priority,
+                    item.job_id,
+                    item.run_lease
+                FROM {receipt_batch_child} AS batch
+                CROSS JOIN LATERAL unnest(
+                    batch.job_ids,
+                    batch.run_leases
+                ) AS item(job_id, run_lease)
+                WHERE batch.ready_generation = $3
+            ),
+            batch_counts AS (
+                SELECT
+                    batch_rows.queue,
+                    batch_rows.priority,
+                    count(*)::bigint AS completed
+                FROM batch_rows
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {receipt_tomb_child} AS tomb
+                    WHERE tomb.ready_generation = batch_rows.ready_generation
+                      AND tomb.job_id = batch_rows.job_id
+                      AND tomb.run_lease = batch_rows.run_lease
+                )
+                GROUP BY batch_rows.queue, batch_rows.priority
+            ),
+            keys AS (
+                SELECT queue, priority FROM done_counts
+                UNION
+                SELECT queue, priority FROM batch_counts
+            )
             SELECT
-                queue,
-                priority,
-                (count(*) FILTER (WHERE state <> 'failed'))::bigint AS pruned_completed_count,
-                (count(*) FILTER (
-                    WHERE state = 'failed'
-                      AND (
-                          $2::boolean IS FALSE
-                          OR finalized_at < now() - make_interval(secs => $1::bigint)
-                      )
-                ))::bigint AS pruned_failed_count
-            FROM {done_child}
-            GROUP BY queue, priority
+                keys.queue,
+                keys.priority,
+                (
+                    COALESCE(done_counts.completed, 0)
+                    + COALESCE(batch_counts.completed, 0)
+                )::bigint AS pruned_completed_count,
+                COALESCE(done_counts.failed, 0)::bigint AS pruned_failed_count
+            FROM keys
+            LEFT JOIN done_counts USING (queue, priority)
+            LEFT JOIN batch_counts USING (queue, priority)
             "#
         ))
         .bind(failed_retention_secs)
         .bind(retention_floor)
+        .bind(generation)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
         let truncate = sqlx::query(&format!(
-            "TRUNCATE TABLE {ready_child}, {done_child}, {tomb_child}, {delta_child}"
+            "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12270,6 +14289,7 @@ impl QueueStorage {
                     self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
                         .await?;
                 }
+
                 // #290: the live counter rows for this slot are about to
                 // be orphans (their underlying done_entries rows just got
                 // truncated). Delete them in the same transaction. The
@@ -12317,10 +14337,11 @@ impl QueueStorage {
         // `correctness/storage/AwaStorageLockOrder.tla` requires the
         // sequence `lease_ring_state FOR UPDATE` →
         // `lease_ring_slots[slot] FOR UPDATE` → `ACCESS EXCLUSIVE` on
-        // the child. The child lock is NOWAIT because prune is
-        // best-effort; a long reader must not put maintenance at the
-        // head of the relation-lock queue and stall normal
-        // claim/complete traffic. Without these locks a concurrent
+        // the child. The child lock is bounded by a short
+        // transaction-local lock_timeout because pure NOWAIT can starve
+        // under continuous parent-partition readers, while an unbounded
+        // wait would put maintenance at the head of the relation-lock
+        // queue indefinitely. Without these locks a concurrent
         // rotator can flip the cursor under the prune's liveness check
         // (current_slot recheck races a CAS update) and prune what
         // should be the active partition.
@@ -12361,8 +14382,10 @@ impl QueueStorage {
 
         let lease_child = lease_child_name(schema, slot as usize);
 
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
+
         let lock_table = sqlx::query(&format!(
-            "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12440,8 +14463,10 @@ impl QueueStorage {
     /// ADR-023 claim-ring rotation. Parallel of `rotate_leases`.
     ///
     /// Advances `claim_ring_state.current_slot` via compare-and-swap. Before
-    /// flipping the cursor the target partition must be drained: both the
-    /// `lease_claims_<next>` and `lease_claim_closures_<next>` child tables
+    /// flipping the cursor the target partition must be drained: the
+    /// `lease_claims_<next>`, `lease_claim_batches_<next>`,
+    /// `lease_claim_closures_<next>`, and
+    /// `lease_claim_closure_batches_<next>` child tables
     /// must be empty. This is what the `rotate → prune → rotate` ring
     /// invariant requires — we only hand out a slot to new claims when a
     /// prior prune has truncated it.
@@ -12464,26 +14489,37 @@ impl QueueStorage {
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
 
-        // Busy check: both children of the incoming slot must be empty.
+        // Busy check: all children of the incoming slot must be empty.
         // A non-empty `lease_claims_<next>` means the previous lap's
         // prune hasn't run (or didn't complete); rotating anyway would
         // mix fresh claims with legacy rows and defeat the point of
-        // partitioning. Non-empty `lease_claim_closures_<next>` means
-        // prune fell behind on closures specifically.
+        // partitioning. Non-empty closure children mean prune fell behind
+        // on receipt-closure evidence specifically.
         let claim_busy =
             Self::relation_has_rows_tx(&mut tx, &claim_child_name(schema, next_slot as usize))
                 .await?;
+        let claim_batch_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &claim_batch_child_name(schema, next_slot as usize),
+        )
+        .await?;
         let closure_busy =
             Self::relation_has_rows_tx(&mut tx, &closure_child_name(schema, next_slot as usize))
                 .await?;
+        let closure_batch_busy = Self::relation_has_rows_tx(
+            &mut tx,
+            &claim_closure_batch_child_name(schema, next_slot as usize),
+        )
+        .await?;
 
-        if claim_busy || closure_busy {
+        if claim_busy || claim_batch_busy || closure_busy || closure_batch_busy {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
-                    claims: busy_indicator(claim_busy),
+                    claims: busy_indicator(claim_busy || claim_batch_busy),
                     closures: busy_indicator(closure_busy),
+                    closure_batches: busy_indicator(closure_batch_busy),
                     ..Default::default()
                 },
             });
@@ -12516,8 +14552,9 @@ impl QueueStorage {
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
-                    claims: busy_indicator(claim_busy),
+                    claims: busy_indicator(claim_busy || claim_batch_busy),
                     closures: busy_indicator(closure_busy),
+                    closure_batches: busy_indicator(closure_batch_busy),
                     ..Default::default()
                 },
             });
@@ -12533,18 +14570,21 @@ impl QueueStorage {
     /// ADR-023 claim-ring prune. Parallel of `prune_oldest_leases`.
     ///
     /// Reclaims the oldest initialized (sealed) claim-ring slot by
-    /// `TRUNCATE`-ing both its `lease_claims_<slot>` and
-    /// `lease_claim_closures_<slot>` children. Takes the full ADR-023
+    /// `TRUNCATE`-ing its `lease_claims_<slot>`,
+    /// `lease_claim_batches_<slot>`, `lease_claim_closures_<slot>`, and
+    /// `lease_claim_closure_batches_<slot>` children. Takes the full ADR-023
     /// lock sequence:
     ///
     /// 1. `FOR UPDATE` on `claim_ring_state` (serialises with rotate).
     /// 2. `FOR UPDATE` on the target `claim_ring_slots` row.
-    /// 3. `LOCK TABLE ACCESS EXCLUSIVE NOWAIT` on both children
-    ///    (serialises with in-flight claim/complete/rescue writers;
-    ///    gives up immediately under contention).
-    /// 4. Verifies the slot is not the current one, and that every
-    ///    claim in the partition has closure evidence.
-    /// 5. `TRUNCATE` both children in a single statement.
+    /// 3. Proves every claim in the sealed partition has closure evidence.
+    /// 4. `LOCK TABLE ACCESS EXCLUSIVE` on all claim-ring children with a
+    ///    short transaction-local `lock_timeout` (serialises with in-flight
+    ///    claim/complete/rescue writers; gives up under sustained
+    ///    contention).
+    /// 5. Rechecks the slot is not the current one and that every
+    ///    claim still has closure evidence.
+    /// 6. `TRUNCATE` all claim-ring children in a single statement.
     ///
     /// The "every claim has closure evidence" precondition is what ADR-023
     /// calls `PartitionTruncateSafety`. If an open claim remains in the
@@ -12594,10 +14634,40 @@ impl QueueStorage {
         }
 
         let claim_child = claim_child_name(schema, slot as usize);
+        let claim_batch_child = claim_batch_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
+        let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
+
+        // Before taking ACCESS EXCLUSIVE on the child partitions, prove
+        // the sealed slot is actually reclaimable. This optimistic proof
+        // avoids blocking claim/complete traffic behind a prune attempt
+        // that is already known to be doomed. A claimer that read the
+        // old current slot before rotation may still commit while the
+        // exclusive lock waits, so the open-claim proof is repeated once
+        // the child locks are held.
+        let open_claims = claim_prune_has_open_claims_tx(
+            &mut tx,
+            schema,
+            &claim_child,
+            &claim_batch_child,
+            &closure_child,
+            &closure_batch_child,
+        )
+        .await?;
+
+        if open_claims {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::ClaimOpen,
+                count: busy_indicator(open_claims),
+            });
+        }
+
+        set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {claim_child}, {closure_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -12610,9 +14680,10 @@ impl QueueStorage {
             return Err(map_sqlx_error(err));
         }
 
-        // After taking ACCESS EXCLUSIVE, recheck that the slot is not
-        // the current one (rotate may have won the ring-state lock
-        // earlier).
+        // After taking ACCESS EXCLUSIVE, recheck that the slot is still
+        // not the current one. The ring-state lock should already make
+        // this stable, but keeping the explicit gate documents the
+        // truncate precondition.
         let current_slot: i32 = sqlx::query_scalar(&format!(
             r#"
             SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
@@ -12631,26 +14702,15 @@ impl QueueStorage {
             });
         }
 
-        // `PartitionTruncateSafety`: every claim in this partition must
-        // have explicit closure evidence or durable terminal/deferred/DLQ
-        // evidence. Any open claim means a worker is
-        // still running (or a rescue hasn't fired yet); we bail and let
-        // normal lifecycle drain the partition.
-        let closed_evidence = receipt_closed_evidence_sql(schema, &closure_child, "claims");
-        let open_claims: bool = sqlx::query_scalar(&format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM {claim_child} AS claims
-                WHERE NOT {closed_evidence}
-                LIMIT 1
-            )
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
+        let open_claims = claim_prune_has_open_claims_tx(
+            &mut tx,
+            schema,
+            &claim_child,
+            &claim_batch_child,
+            &closure_child,
+            &closure_batch_child,
+        )
+        .await?;
         if open_claims {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {
@@ -12660,9 +14720,11 @@ impl QueueStorage {
             });
         }
 
-        let truncate = sqlx::query(&format!("TRUNCATE TABLE {claim_child}, {closure_child}"))
-            .execute(tx.as_mut())
-            .await;
+        let truncate = sqlx::query(&format!(
+            "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
+        ))
+        .execute(tx.as_mut())
+        .await;
 
         match truncate {
             Ok(_) => {

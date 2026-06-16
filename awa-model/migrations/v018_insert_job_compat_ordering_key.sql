@@ -1,8 +1,8 @@
 -- v018: Ensure upgraded databases get the ordering-key aware
--- insert_job_compat signature. During PR review, some dev databases
--- recorded v017 before the p_ordering_key parameter was added; v018
--- re-applies the compatibility function so those databases upgrade
--- cleanly instead of keeping only the old 11-argument overload.
+-- insert_job_compat signature. Later queue-storage migrations re-apply this
+-- function too, so it also carries compatibility fixes for active queue-storage
+-- producers while preserving a fallback for historical migration replay before
+-- reserve_enqueue_seq exists.
 
 DROP FUNCTION IF EXISTS awa.insert_job_compat(
     TEXT, TEXT, JSONB, awa.job_state, SMALLINT, SMALLINT,
@@ -209,13 +209,25 @@ BEGIN
         VALUES (v_queue, v_priority, v_enqueue_shard)
         ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
 
-        UPDATE queue_enqueue_heads AS heads
-        SET next_seq = heads.next_seq + 1
-        WHERE heads.queue = v_queue
-          AND heads.priority = v_priority
-          AND heads.enqueue_shard = v_enqueue_shard
-        RETURNING heads.next_seq - 1
-        INTO v_lane_seq;
+        IF to_regprocedure(format(
+            '%I.reserve_enqueue_seq(text,smallint,smallint,bigint)',
+            v_schema
+        )) IS NOT NULL THEN
+            EXECUTE format(
+                'SELECT %I.reserve_enqueue_seq($1, $2, $3, $4)',
+                v_schema
+            )
+            INTO v_lane_seq
+            USING v_queue, v_priority, v_enqueue_shard, 1::bigint;
+        ELSE
+            UPDATE queue_enqueue_heads AS heads
+            SET next_seq = heads.next_seq + 1
+            WHERE heads.queue = v_queue
+              AND heads.priority = v_priority
+              AND heads.enqueue_shard = v_enqueue_shard
+            RETURNING heads.next_seq - 1
+            INTO v_lane_seq;
+        END IF;
 
         SELECT ring.current_slot, ring.generation
         INTO v_ready_slot, v_ready_generation
@@ -262,13 +274,62 @@ BEGIN
             v_payload
         );
 
-        PERFORM pg_notify('awa:' || v_queue, '');
+        IF to_regclass(format('%I.%I', v_schema, 'ready_segments')) IS NOT NULL THEN
+            INSERT INTO ready_segments (
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                enqueue_shard,
+                first_lane_seq,
+                next_lane_seq,
+                first_run_at
+            ) VALUES (
+                v_ready_slot,
+                v_ready_generation,
+                v_queue,
+                v_priority,
+                v_enqueue_shard,
+                v_lane_seq,
+                v_lane_seq + 1,
+                v_run_at
+            )
+            ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING;
+        END IF;
+
         PERFORM set_config('search_path', v_old_search_path, true);
 
-        SELECT * INTO inserted
-        FROM awa.jobs AS jobs
-        WHERE jobs.id = v_job_id;
+        SELECT
+            v_job_id,
+            p_kind,
+            v_queue,
+            v_args,
+            v_state,
+            v_priority,
+            0::smallint,
+            v_max_attempts,
+            v_run_at,
+            NULL::timestamptz,
+            NULL::timestamptz,
+            NULL::timestamptz,
+            NULL::timestamptz,
+            v_created_at,
+            ARRAY[]::jsonb[],
+            v_metadata,
+            v_tags,
+            p_unique_key,
+            p_unique_states,
+            NULL::uuid,
+            NULL::timestamptz,
+            NULL::text,
+            NULL::text,
+            NULL::text,
+            NULL::text,
+            0::bigint,
+            NULL::jsonb
+        INTO inserted;
 
+        PERFORM pg_notify('awa:' || v_queue, '');
         RETURN inserted;
     END IF;
 
@@ -310,9 +371,35 @@ BEGIN
 
     PERFORM set_config('search_path', v_old_search_path, true);
 
-    SELECT * INTO inserted
-    FROM awa.jobs AS jobs
-    WHERE jobs.id = v_job_id;
+    SELECT
+        v_job_id,
+        p_kind,
+        v_queue,
+        v_args,
+        v_state,
+        v_priority,
+        0::smallint,
+        v_max_attempts,
+        v_run_at,
+        NULL::timestamptz,
+        NULL::timestamptz,
+        NULL::timestamptz,
+        NULL::timestamptz,
+        v_created_at,
+        ARRAY[]::jsonb[],
+        v_metadata,
+        v_tags,
+        p_unique_key,
+        p_unique_states,
+        NULL::uuid,
+        NULL::timestamptz,
+        NULL::text,
+        NULL::text,
+        NULL::text,
+        NULL::text,
+        0::bigint,
+        NULL::jsonb
+    INTO inserted;
 
     RETURN inserted;
 END;

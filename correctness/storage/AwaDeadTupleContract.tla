@@ -56,8 +56,9 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 \* invariants at TLC time. The historical case in point: the original
 \* `open_receipt_claims` design — flat, RowVacuum, hot, unbounded
 \* row count — would fire `HotTablesAreNotRowVacuum`. The fix
-\* (ADR-023) replaces it with partition-rotated `lease_claims` +
-\* `lease_claim_closures`, which satisfies the contract.
+\* (ADR-023) replaces it with partition-rotated `lease_claims` /
+\* `lease_claim_batches` plus `lease_claim_closures`, which satisfies
+\* the contract.
 \*
 \* The spec only catches what is ENCODED in `TableSpec` and
 \* `Transactions`. Drift between the spec and the Rust source is the
@@ -97,13 +98,28 @@ TableSpec == [
     \* All partitioned by their respective ring slot, reclaimed by
     \* TRUNCATE on partition prune.
     ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    \* One row per claim batch, storing lane-range evidence.
+    ready_claim_attempt_batches
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     ready_tombstones       |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    \* One row per committed ready lane range, not per completion.
+    \* Prune truncates the segment child when it truncates the owning
+    \* ready slot.
+    ready_segments         |-> [kind |-> "PartitionTruncate", hot |-> "hot",
+                                bounded_by |-> ""],
     done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    receipt_completion_batches
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    receipt_completion_tombstones
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     queue_terminal_count_deltas
                            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    lease_claim_batches    |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claim_closures   |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    lease_claim_closure_batches
+                           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
 
     \* ---- Backlog / retention tables ----
     \* deferred_jobs and dlq_entries are unpartitioned in the current Rust
@@ -138,6 +154,11 @@ TableSpec == [
     attempt_state |->
         [kind |-> "Warm", hot |-> "hot",
          bounded_by |-> "worker_fleet_size"],
+    \* queue_claim_heads stores the sequence-backed claim cursor plus a
+    \* nullable ready-segment routing cache. The cache is overwritten on
+    \* the same bounded per-lane row and is not claim evidence; it only
+    \* avoids scanning all ready-segment partitions while the cursor stays
+    \* inside the cached ready slot/generation.
     queue_claim_heads |->
         [kind |-> "Warm", hot |-> "hot",
          bounded_by |-> "queue_lane_count"],
@@ -200,9 +221,21 @@ Tables == DOMAIN TableSpec
 
 Mut(op, tbl) == [op |-> op, table |-> tbl]
 
-\* claim_runtime_batch (receipts mode) — queue_storage.rs claim CTE
+\* enqueue_params_batch / enqueue_params_copy immediate-ready path.
+\* Ready rows and compact ready segment metadata commit together.
+EnqueueReadyTx == <<
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
+>>
+
+\* claim_runtime_batch (receipts mode) — queue_storage.rs claim CTE.
+\* The queue_claim_heads UPDATE covers both the sequence-backed claim cursor
+\* advancement and the ready-segment routing-cache refresh on that same
+\* bounded lane row.
 ClaimReceiptsTx == <<
+    Mut("Insert", "ready_claim_attempt_batches"),
     Mut("Insert", "lease_claims"),
+    Mut("Insert", "lease_claim_batches"),
     Mut("Update", "queue_claim_heads")
 >>
 
@@ -214,14 +247,20 @@ ClaimLegacyTx == <<
 >>
 
 \* complete_runtime_batch (receipts mode)
-\* Successful receipt completion uses the synchronous done_entries row as
-\* durable receipt-closure evidence and does not append a duplicate
-\* lease_claim_closures row on the hot path. Cold terminal-delete paths
-\* materialize an explicit closure if they remove that done evidence before
-\* claim prune.
+\* Successful compact receipt completion appends a compact terminal batch and a
+\* compact claim-local closure batch. Compact terminal counts are read from the
+\* retained batch ledger directly; terminal-count deltas are reserved for
+\* done_entries terminal mutations. Terminal history and claim-closure evidence
+\* are separate partition-truncated ledgers.
+\* Non-success, cancellation, rescue, and wide terminal paths close by claim
+\* shape: a row-local lease_claims claim appends an explicit
+\* lease_claim_closures row, while a compact lease_claim_batches claim (which
+\* has no lease_claims row to balance an explicit closure against in the prune
+\* count proofs) appends a lease_claim_closure_batches row. Both closure
+\* children are partition-truncated hot ledgers.
 CompleteReceiptsTx == <<
-    Mut("Insert", "done_entries"),
-    Mut("Insert", "queue_terminal_count_deltas"),
+    Mut("Insert", "receipt_completion_batches"),
+    Mut("Insert", "lease_claim_closure_batches"),
     Mut("Delete", "attempt_state")
 >>
 
@@ -236,25 +275,35 @@ CompleteLegacyTx == <<
     Mut("Delete", "attempt_state")
 >>
 
-\* close_receipt_tx — queue_storage.rs:6517
-\* Used by cancel_job_tx and the rescue path.
+\* close_receipt_pairs_tx — the general receipt closer (cancel, rescue,
+\* terminal-delete). A row-local lease_claims claim appends an explicit
+\* lease_claim_closures row and stamps lease_claims.closed_at; a compact
+\* lease_claim_batches claim appends a lease_claim_closure_batches row instead
+\* (no lease_claims row exists for it). A given transaction takes whichever arm
+\* matches the claim shape; both closure children are partition-truncated hot
+\* ledgers.
 CloseReceiptTx == <<
-    Mut("Insert", "lease_claim_closures")
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims")
 >>
 
-\* rescue_stale_receipt_claims_tx — queue_storage.rs:8195
-\* Sweeps from the per-slot claim_ring_slots rescue cursor, anti-joins
-\* lease_claims against closures + leases, closes stale stragglers by
-\* appending to lease_claim_closures, then advances the tiny
-\* control-plane cursor across closed, lease-managed, fresh, or newly
-\* rescued rows. Stale open rows not closed by the transaction stop the
-\* cursor until a later pass.
+\* rescue_stale_receipt_claims_for_slot_tx — sweeps from the per-slot
+\* claim_ring_slots rescue cursor, anti-joins lease_claims and
+\* lease_claim_batches against both closure ledgers + leases, and closes stale
+\* stragglers: a row-local claim appends to lease_claim_closures and stamps
+\* lease_claims.closed_at, a compact batch claim appends to
+\* lease_claim_closure_batches. It then advances the tiny control-plane cursor
+\* across closed, lease-managed, fresh, or newly rescued rows. Stale open rows
+\* not closed by the transaction stop the cursor until a later pass.
 RescueReceiptsTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims"),
     Mut("Update", "claim_ring_slots")
 >>
 
-\* rescue_expired_receipt_deadlines_tx — queue_storage.rs:8597
+\* rescue_expired_receipt_deadlines_tx
 \* Uses a second per-slot claim_ring_slots cursor ordered by deadline_at.
 \* Closed / lease-managed claims advance the cursor, expired open receipt
 \* claims are closed by appending deadline_expired closure rows, and the
@@ -263,10 +312,11 @@ RescueReceiptsTx == <<
 \* updated or deleted.
 RescueReceiptDeadlinesTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Update", "claim_ring_slots")
 >>
 
-\* ensure_running_leases_from_receipts_tx — queue_storage.rs:7574
+\* ensure_running_leases_from_receipts_tx
 \* Materialize a receipt into a real lease row. INSERTs the lease,
 \* UPDATEs the claim's materialized_at column.
 EnsureRunningTx == <<
@@ -274,22 +324,30 @@ EnsureRunningTx == <<
     Mut("Update", "lease_claims")
 >>
 
-\* cancel_job_tx receipt-only branch — queue_storage.rs:6568
-\* Closes the receipt with a `cancelled` outcome, inserts a done row,
-\* defensively deletes any orphan lease.
+\* cancel_job_tx receipt-only branch — closes the receipt with a `cancelled`
+\* outcome, inserts a done row, defensively deletes any orphan lease. A
+\* row-local claim closes into lease_claim_closures (+ lease_claims.closed_at);
+\* a compact batch claim closes into lease_claim_closure_batches instead.
 CancelReceiptOnlyTx == <<
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "leases")
 >>
 
-\* cancel_job_tx running-lease branch — queue_storage.rs ~:5581
+\* cancel_job_tx running-lease branch — deletes the materialized lease, writes
+\* the done row, and closes the underlying receipt via close_receipt_pairs_tx:
+\* a row-local claim into lease_claim_closures, a compact batch claim into
+\* lease_claim_closure_batches.
 CancelRunningTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
-    Mut("Insert", "lease_claim_closures")
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims")
 >>
 
 \* cancel_job_tx ready branch (append-only ready segments)
@@ -302,7 +360,8 @@ CancelReadyTx == <<
 \* age_ready_jobs_tx (reprioritize)
 ReprioritizeReadyTx == <<
     Mut("Insert", "ready_tombstones"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 \* delete_job_compat ready branch. SQL DELETE from the public awa.jobs view
@@ -312,14 +371,14 @@ DeleteReadyCompatTx == <<
     Mut("Insert", "ready_tombstones")
 >>
 
-\* fail_to_dlq / fail_terminal — queue_storage.rs:10081, 10126
+\* fail_to_dlq / fail_terminal
 FailToDlqTx == <<
     Mut("Delete", "leases"),
     Mut("Delete", "attempt_state"),
     Mut("Insert", "dlq_entries")
 >>
 
-\* retry_after / snooze — queue_storage.rs:9947, 9997
+\* retry_after / snooze
 RetryToDeferredTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "deferred_jobs")
@@ -328,7 +387,8 @@ RetryToDeferredTx == <<
 \* promote_due_state — DELETE deferred_jobs, INSERT ready_entries
 PromoteDeferredTx == <<
     Mut("Delete", "deferred_jobs"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 \* enter_callback_wait — waiting_external is a state on the leases row.
@@ -347,6 +407,8 @@ ResumeWaitingTx == <<
 \* complete_external / fail_external — terminal callback resolution.
 ResolveExternalTerminalTx == <<
     Mut("Delete", "leases"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
@@ -354,12 +416,15 @@ ResolveExternalTerminalTx == <<
 \* retry_external — delete the waiting lease and park in deferred_jobs.
 RetryExternalTx == <<
     Mut("Delete", "leases"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Insert", "deferred_jobs")
 >>
 
 \* DLQ admin lifecycle.
 MoveFailedToDlqTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "dlq_entries")
@@ -367,26 +432,35 @@ MoveFailedToDlqTx == <<
 
 DiscardTerminalTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
 
 DeleteTerminalCompatTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
 >>
 
+DeleteCompactReceiptTerminalCompatTx == <<
+    Mut("Insert", "receipt_completion_tombstones")
+>>
+
 RetryFromTerminalTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Update", "lease_claims"),
     Mut("Delete", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 RetryFromDlqTx == <<
     Mut("Delete", "dlq_entries"),
-    Mut("Insert", "ready_entries")
+    Mut("Insert", "ready_entries"),
+    Mut("Insert", "ready_segments")
 >>
 
 PurgeDlqTx == <<
@@ -420,9 +494,13 @@ RotateReadyTx == << Mut("Update", "queue_ring_state") >>
 PruneReadyTx  == <<
     Mut("Update", "queue_ring_slots"),
     Mut("Truncate", "ready_entries"),
+    Mut("Truncate", "ready_claim_attempt_batches"),
     Mut("Truncate", "done_entries"),
+    Mut("Truncate", "receipt_completion_batches"),
+    Mut("Truncate", "receipt_completion_tombstones"),
     Mut("Truncate", "ready_tombstones"),
-    Mut("Truncate", "queue_terminal_count_deltas")
+    Mut("Truncate", "queue_terminal_count_deltas"),
+    Mut("Truncate", "ready_segments")
 >>
 
 TerminalDeltaRollupTx == <<
@@ -439,11 +517,13 @@ RotateClaimsTx == << Mut("Update", "claim_ring_state") >>
 PruneClaimsTx  == <<
     Mut("Update", "claim_ring_slots"),
     Mut("Truncate", "lease_claims"),
-    Mut("Truncate", "lease_claim_closures")
+    Mut("Truncate", "lease_claim_batches"),
+    Mut("Truncate", "lease_claim_closures"),
+    Mut("Truncate", "lease_claim_closure_batches")
 >>
 
 Transactions == {
-    ClaimReceiptsTx, ClaimLegacyTx,
+    EnqueueReadyTx, ClaimReceiptsTx, ClaimLegacyTx,
     CompleteReceiptsTx, CompleteLegacyTx,
     CloseReceiptTx, RescueReceiptsTx, RescueReceiptDeadlinesTx, EnsureRunningTx,
     CancelReceiptOnlyTx, CancelRunningTx, CancelReadyTx, DeleteReadyCompatTx,
@@ -451,7 +531,8 @@ Transactions == {
     FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,
     EnterCallbackWaitTx, ResumeWaitingTx, ResolveExternalTerminalTx,
     RetryExternalTx, MoveFailedToDlqTx, DiscardTerminalTx,
-    DeleteTerminalCompatTx, RetryFromTerminalTx, RetryFromDlqTx, PurgeDlqTx,
+    DeleteTerminalCompatTx, DeleteCompactReceiptTerminalCompatTx,
+    RetryFromTerminalTx, RetryFromDlqTx, PurgeDlqTx,
     HeartbeatTx, ProgressFlushTx,
     RotateLeasesTx, PruneLeasesTx,
     RotateReadyTx, PruneReadyTx, TerminalDeltaRollupTx, TerminalDeltaRollupPinnedTx,

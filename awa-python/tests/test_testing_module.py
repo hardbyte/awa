@@ -31,7 +31,10 @@ async def tc():
     test_client = AwaTestClient(client)
     await test_client.migrate()
     await test_client.clean()
-    return test_client
+    try:
+        yield test_client
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

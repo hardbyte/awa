@@ -25,12 +25,10 @@ async def main() -> None:
     await client.migrate()
 
     if mode == "worker_chaos_probe":
+        worker_count = int(os.environ.get("MIXED_QUEUE_WORKERS", "1"))
+
         @client.task(ChaosProbe, queue=queue)
         async def handle(job):
-            if job.args.marker.startswith("rust-"):
-                # Keep the mixed-language smoke deterministic: wrong-language
-                # claims yield the job back without burning an attempt.
-                return awa.Snooze(seconds=0.05)
             print(
                 f"START mode={mode} pid={os.getpid()} job_id={job.id} marker={job.args.marker}",
                 flush=True,
@@ -43,7 +41,7 @@ async def main() -> None:
             return None
 
         await client.start(
-            [(queue, 1)],
+            [(queue, worker_count)],
             leader_election_interval_ms=100,
             heartbeat_interval_ms=50,
             promote_interval_ms=50,

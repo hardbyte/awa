@@ -159,6 +159,10 @@ async def test_bridge_ordering_key_routes_to_same_shard_asyncpg(awa_client):
         assert len({row["enqueue_shard"] for row in rows}) == 1
     finally:
         reset_sync(awa_client)
+        cleanup = awa_client.transaction()
+        cleanup.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        cleanup.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        cleanup.commit()
         await conn.close()
 
 
@@ -406,8 +410,12 @@ def test_psycopg_sync_mixed_with_app_sql(awa_client):
         # Commit so the Awa client (separate connection) can see the row
         conn.commit()
 
-        job = awa.Client(DATABASE_URL).get_job(row["id"])
-        assert job.state == awa.JobState.Available
+        verify_client = awa.Client(DATABASE_URL)
+        try:
+            job = verify_client.get_job(row["id"])
+            assert job.state == awa.JobState.Available
+        finally:
+            verify_client.close()
 
         conn.execute("DROP TABLE IF EXISTS bridge_test_sync_orders")
         conn.commit()

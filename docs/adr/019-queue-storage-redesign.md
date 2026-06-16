@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. The receipt-plane portion of this design (`open_receipt_claims` as a bounded live-frontier table) is **superseded by [ADR-023: Receipt Plane Ring Partitioning](023-receipt-plane-ring-partitioning.md)**, which replaces the flat `open_receipt_claims` table with partitioned `lease_claims` / `lease_claim_closures` reclaimed by ring rotation + `TRUNCATE`. The rest of ADR-019 (queue plane, lease ring, ready/done partitioning) is unchanged. References to `open_receipt_claims` below are kept verbatim as historical context — read them as "the live frontier", which is now derived from the anti-join.
+Accepted. The receipt-plane portion of this design (`open_receipt_claims` as a bounded live-frontier table) is **superseded by [ADR-023: Receipt Plane Ring Partitioning](023-receipt-plane-ring-partitioning.md)**, which replaces the flat `open_receipt_claims` table with partitioned `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` reclaimed by ring rotation + `TRUNCATE`. The rest of ADR-019 (queue plane, lease ring, ready/done partitioning) is unchanged. References to `open_receipt_claims` below are kept verbatim as historical context — read them as "the live frontier", which is now derived from the anti-join.
 
 ## Context
 
@@ -47,6 +47,7 @@ The implementation and migrations use these physical names:
 - `lane_state` maps to `{schema}.queue_lanes`
 - enqueue heads map to `{schema}.queue_enqueue_heads`
 - claim heads map to `{schema}.queue_claim_heads`
+- `ready_segments` maps to `{schema}.ready_segments`
 
 ### Physical layout
 
@@ -54,19 +55,19 @@ The implementation and migrations use these physical names:
 
 - Immediate jobs are appended to rotating ready partitions.
 - Ready rows are immutable once written.
-- Claim order is driven by queue-local lane metadata rather than scanning a large mutable heap.
+- Claim order is driven by queue-local lane metadata and the compact `{schema}.ready_segments` map rather than scanning a large mutable heap.
 
 2. `ready_tombstones`
 
 - Unclaimed cancellation, priority aging, and similar ready-lane mutations append a tombstone keyed by ready segment generation and lane identity.
-- Claim and exact-count paths anti-join tombstones and treat a tombstoned head lane as committed spent evidence for safe claim-cursor advancement.
+- Claim treats tombstones as committed spent evidence for safe claim-cursor advancement; exact-count paths skip tombstoned lanes.
 - Tombstones are reclaimed by truncating the matching ready segment; they do not create row-vacuum work on the hot ready table.
 
 3. `active_leases`
 
 - The common path still records every claim, but the implementation can now do that in two stages:
   - append-only `lease_claims` receipts for every claim (the receipt path is now the default, not a zero-deadline-only short cut)
-  - **historical:** a bounded `open_receipt_claims` frontier for currently-live receipt-backed attempts. ADR-023 replaces this with partitioned `lease_claims` / `lease_claim_closures`; "currently open" is derived as an anti-join over the active claim partitions.
+  - **historical:** a bounded `open_receipt_claims` frontier for currently-live receipt-backed attempts. ADR-023 replaces this with partitioned `lease_claims` plus explicit and compact closure evidence; "currently open" is derived as an anti-join over the active claim partitions.
   - lazy materialization into `active_leases` when the attempt needs the mutable execution path
 - Leases keep only dispatch and rescue-critical fields: ready reference, attempt identity, lane ordering, heartbeat/deadline state, and callback token/timeout.
 - Lease partitions rotate much faster than queue partitions and are pruned independently.
@@ -98,10 +99,10 @@ The implementation and migrations use these physical names:
 7. `lane_state` and segment cursor tables
 
 - Queue-local lane metadata is intentionally split so one row family does not absorb every enqueue and claim mutation.
-- `lane_state` itself is reduced to stable per-lane identity and legacy fallback fields. `queue_enqueue_heads` and `queue_claim_heads` remain as stable lane registries and lock targets; the mutable enqueue and claim cursors live in PostgreSQL sequences referenced by those rows.
+- `lane_state` itself is reduced to stable per-lane identity and legacy fallback fields. `queue_enqueue_heads` and `queue_claim_heads` remain as stable lane registries. The mutable enqueue and claim cursors live in PostgreSQL sequences referenced by those rows; enqueue reserves sequence ranges under a transaction-scoped lane advisory lock, while claim still locks `queue_claim_heads` to choose and emit work.
 - Availability counts have two grades. The dispatcher hot path and high-cadence worker metrics read `sum(enqueue_sequence_cursor - claim_sequence_cursor)` from the lane heads — two PK reads plus sequence state reads per lane, no scan over `ready_entries`. Admin calls that need exact availability (`queue_counts`) scan `ready_entries WHERE lane_seq >= claim_sequence_cursor` anti-joined with `ready_tombstones`. The dispatcher and metrics tolerate transient over-count from committed gaps, uncommitted sequence reservations, and tombstoned unclaimed rows; the cursor is only advanced after committed claims/cancels and only across committed spent/tombstoned prefixes, so it can lag but cannot skip visible ready work. **historical:** earlier iterations cached this as `queue_lanes.available_count` (a third counter mutated on every enqueue / claim / completion); long-horizon profiling under pinned xmin showed the cache was the dominant dead-tuple source, so v016 removed it in favour of the head-difference derivation.
 - Completed-history rollups live in a separate cold cache table so prune can preserve queue counts without serializing on the hot `lane_state` rows.
-- Completion must not update `lane_state` on every terminal transition; the hot path only mutates claim/enqueue control state. `running` is derived from active leases/receipts. ADR-026 terminal counts use append-only `queue_terminal_count_deltas` on the terminal path, folded `queue_terminal_live_counts` for sealed retained segments, and the post-prune `queue_terminal_rollups` cache. The permanent rollup is written in the prune transaction to a separate cold table rather than to `lane_state`, so prune does not serialize on the same hot rows as claim and enqueue.
+- Completion must not update `lane_state` on every terminal transition; the hot path only mutates claim/enqueue control state. `running` is derived from active leases/receipts. ADR-026 terminal counts use append-only `queue_terminal_count_deltas` for `done_entries` terminal mutations, retained compact receipt batches for compact successes, folded `queue_terminal_live_counts` for sealed retained segments, and the post-prune `queue_terminal_rollups` cache. The permanent rollup is written in the prune transaction to a separate cold table rather than to `lane_state`, so prune does not serialize on the same hot rows as claim and enqueue.
 - Ready and lease segment cursor tables tell dispatch and maintenance which physical segment is active, claimable, or prunable.
 - Lease prune order is derived from `lease_ring_state(current_slot, generation, slot_count)`. The older `{schema}.lease_ring_slots` table remains as transitional compatibility/inspection state, but it is no longer updated on every rotation and is not the authoritative ordering source.
 - Rotation state for queue and lease segments is owned by the maintenance leader.
@@ -109,11 +110,11 @@ The implementation and migrations use these physical names:
 
 ### Lifecycle mapping
 
-- Enqueue immediate job: append to `ready_entries`.
-- Claim: lock the queue's `queue_claim_heads` row, join the matching `queue_enqueue_heads` row, select the next ready entries anti-joined with `ready_tombstones`, increment `run_lease`, append a receipt into `lease_claims` by default, and advance the claim cursor based on committed spent evidence plus the rows actually selected after commit.
+- Enqueue immediate job: reserve a lane sequence range under the lane advisory lock, append to `ready_entries`, and append compact `ready_segments` metadata in the same transaction.
+- Claim: lock the queue's `queue_claim_heads` row, join the matching `queue_enqueue_heads` row, use the cached ready-slot hint when it still validates against `ready_entries`, refresh that hint from `ready_segments` when the cursor leaves the cached slot, select the next ready entries, treat any matching `ready_tombstones` rows as spent lane evidence, increment `run_lease`, append a receipt into `lease_claims` by default, and advance the claim cursor based on committed spent evidence plus the rows actually selected after commit.
 - Receipt-backed deadlines: per-queue deadlines live on `lease_claims.deadline_at` until the attempt materializes into the lease plane for callbacks, progress, or other mutable state.
 - Receipt rescue before materialization: close the stale receipt append-only and requeue it without first materializing a mutable `leases` row.
-- Runtime reads that need the current live receipt-backed set (`queue_counts`, receipt rescue, and receipt-backed `load_job`) consult only the active claim-ring partitions, not the full append-only claim history. **historical:** ADR-019 used a bounded `open_receipt_claims` table for this; ADR-023 derives the same set as an anti-join over partitioned `lease_claims` / `lease_claim_closures`.
+- Runtime reads that need the current live receipt-backed set (`queue_counts`, receipt rescue, and receipt-backed `load_job`) consult only the active claim-ring partitions, not the full append-only claim history. **historical:** ADR-019 used a bounded `open_receipt_claims` table for this; ADR-023 derives the same set as an anti-join over partitioned `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches`.
 - First heartbeat or progress flush for a receipt-backed attempt: lazily materialize the claim into `attempt_state` while keeping the claim on the append-only receipt path.
 - Callback registration or other lease-specific mutation for a receipt-backed attempt: lazily materialize the claim into `active_leases`.
 - Heartbeat after lease materialization / callback wait: update the active lease row only.
@@ -152,22 +153,22 @@ The leader-elected maintenance service owns:
 - queue depth publication
 - DLQ retention cleanup
 
-All prune paths remain best-effort and take their child-table locks with `NOWAIT`. The explicit lock contract is:
+All prune paths remain best-effort and take their child-table locks with a short transaction-local `lock_timeout`. The explicit lock contract is:
 
 - claim takes `FOR UPDATE OF claims SKIP LOCKED` on `queue_claim_heads` while it advances the claim cursor and inserts the claim
 - rotate publishes the next lease slot with a compare-and-swap update on `lease_ring_state`
-- prune-ready takes `FOR UPDATE` on `queue_ring_state`, `FOR UPDATE` on the target `queue_ring_slots` row, and `ACCESS EXCLUSIVE NOWAIT` on the child partitions before it rechecks liveness and truncates
-- prune-leases derives the oldest initialized slot from `lease_ring_state`, locks the child partition `ACCESS EXCLUSIVE NOWAIT`, rechecks that the slot is not current, then truncates if it is empty
-- prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on the target `claim_ring_slots` row, and `ACCESS EXCLUSIVE NOWAIT` on both the matching `lease_claims_*` and `lease_claim_closures_*` partitions, verifies every claim in the slot has explicit closure evidence or durable terminal/deferred/DLQ evidence, then `TRUNCATE`s both partitions in lockstep. Open claims make prune skip the slot until normal completion, normal non-success closure, or the separate receipt-rescue scans close them.
+- prune-ready takes `FOR UPDATE` on `queue_ring_state` and on the target `queue_ring_slots` row, proves the sealed slot has no active leases, no receipt claims without durable closure evidence, and no retained ready rows still at or ahead of their lane cursor, then takes bounded `ACCESS EXCLUSIVE` on the child partitions, rechecks those gates, and only then truncates
+- prune-leases derives the oldest initialized slot from `lease_ring_state`, locks the child partition with bounded `ACCESS EXCLUSIVE`, rechecks that the slot is not current, then truncates if it is empty
+- prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state` and on the target `claim_ring_slots` row, proves every visible claim in the sealed slot has durable closure evidence, then takes bounded `ACCESS EXCLUSIVE` on the matching `lease_claims_*`, `lease_claim_closures_*`, and `lease_claim_closure_batches_*` partitions, rechecks for open claims, and only then `TRUNCATE`s them in lockstep. Open claims make prune skip until normal completion, normal non-success closure, or the separate receipt-rescue scans close them.
 
-That order is deliberate. The TLA+ storage race / lock-order models exist to prove that claim, rotate, and prune cannot interleave into “claim lands in a pruned segment” behavior.
+That order is deliberate. The TLA+ storage race / lock-order models cross-check the abstract claim, rotate, and prune ordering. The Rust prune paths also recheck their liveness gates after taking partition locks, which covers the MVCC visibility window that the lock-order model abstracts away.
 
 Rotation and prune policy is also part of this decision:
 
 - lease and claim-ring segments rotate quickly because their churn is the remaining hot-path source
 - ready / terminal segments rotate more slowly than the lease and claim rings; deferred and DLQ rows are plain backlog/hold tables with their own promotion, retry, purge, and retention cleanup paths
 - prune walks sealed segments oldest-first
-- prune returns gracefully when a reader or writer still holds the segment, without queueing an `ACCESS EXCLUSIVE` request behind that reader
+- prune returns gracefully when a reader or writer still holds the segment beyond the short lock-timeout window, but it may queue briefly to avoid starvation under continuous parent-partition readers
 - long-lived readers can still pin a segment horizon, so operators are expected to run analytical reads on replicas and keep primary-side `statement_timeout` discipline
 
 Ordinary queue-storage terminal history is therefore a rotation-and-prune story, not a row-by-row delete story. DLQ retention remains a bounded cleanup pass against the separate `dlq_entries` hold table, and the canonical compatibility path still has row-retention cleanup.
@@ -188,7 +189,7 @@ Recorded local 5k-job runtime soak: **9,537 jobs/s**, **3.671 ms pickup p50**, *
 
 The phase-driven portable comparison harness lives in a separate repo: [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking). That harness records producer, subscriber, and end-to-end latency on a shared timebase while also sampling throughput, queue depth, and dead tuples over time. Recent runs place Awa ahead of pgque on end-to-end latency and on sustained throughput in clean-phase scenarios, while pgque holds a comparable dead-tuple profile (both are append-only / partition-rotated). See [`SYSTEM_COMPARISONS.md`](https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/SYSTEM_COMPARISONS.md) for the per-system architectural notes and [docs/benchmarking.md](../benchmarking.md) for awa's own regression methodology.
 
-The current pressure frontier after the split-head change is the lease plane: `queue_lanes` is no longer the dominant MVCC hotspot, but the mutable `active_leases` family still absorbs steady insert/delete churn and heartbeat updates. The current implementation now includes a short-job receipt path (`lease_claims` plus lazy materialization) that substantially reduces dead tuples for zero-deadline short jobs. Long-horizon profiling also showed that the append-only history alone was not enough: open-claim reads and rescue scans needed bounded access paths so they would not degrade into history scans. The original ADR-019 design used a bounded `open_receipt_claims` table for this; ADR-023 replaces it with partitioned `lease_claims` / `lease_claim_closures`, live-set anti-joins over active partitions, and tiny per-slot rescue cursors in `claim_ring_slots`, eliminating the last per-claim MVCC churn source on the receipt plane. Further lease-plane work is still tracked in [`lease-plane-redesign-spike.md`](../archive/0.6-storage-design/lease-plane-redesign-spike.md). The remaining queue-level coordination controls are implemented as bounded claimers, queue striping (`queue_stripe_count`), and per-queue enqueue-head sharding (`queue_meta.enqueue_shards`). The archived [`bounded-claimers-plan.md`](../archive/0.6-storage-design/bounded-claimers-plan.md) and [`queue-striping-plan.md`](../archive/0.6-storage-design/queue-striping-plan.md) capture design history; current operator guidance lives in [`configuration.md`](../configuration.md#queue-storage-tuning).
+The current pressure frontier after the split-head change is the lease plane: `queue_lanes` is no longer the dominant MVCC hotspot, but the mutable `active_leases` family still absorbs steady insert/delete churn and heartbeat updates. The current implementation now includes a short-job receipt path (`lease_claims` plus lazy materialization) that substantially reduces dead tuples for zero-deadline short jobs. Long-horizon profiling also showed that the append-only history alone was not enough: open-claim reads and rescue scans needed bounded access paths so they would not degrade into history scans. The original ADR-019 design used a bounded `open_receipt_claims` table for this; ADR-023 replaces it with partitioned `lease_claims`, explicit `lease_claim_closures`, compact `lease_claim_closure_batches`, live-set anti-joins over active partitions, and tiny per-slot rescue cursors in `claim_ring_slots`, eliminating the last per-claim MVCC churn source on the receipt plane. Further lease-plane work is still tracked in [`lease-plane-redesign-spike.md`](../archive/0.6-storage-design/lease-plane-redesign-spike.md). The remaining queue-level coordination controls are implemented as bounded claimers, queue striping (`queue_stripe_count`), and per-queue enqueue-head sharding (`queue_meta.enqueue_shards`). The archived [`bounded-claimers-plan.md`](../archive/0.6-storage-design/bounded-claimers-plan.md) and [`queue-striping-plan.md`](../archive/0.6-storage-design/queue-striping-plan.md) capture design history; current operator guidance lives in [`configuration.md`](../configuration.md#queue-storage-tuning).
 
 Spec-level safety is checked by the segmented-storage TLA+ family — `AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`, `AwaSegmentedStorageTrace` — under [`correctness/storage/`](../../correctness/storage/). The TLA+ action → Rust function correspondence is in [`correctness/storage/MAPPING.md`](../../correctness/storage/MAPPING.md).
 

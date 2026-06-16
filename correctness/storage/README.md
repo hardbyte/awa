@@ -15,7 +15,7 @@ It uses the storage naming set:
 - `ready_segments` / `ready_segment_cursor`
 - `lease_segments` / `lease_segment_cursor`
 - `terminal_segments` / `terminal_segment_cursor`
-- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims` and `lease_claim_closures` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier; implementation stale-rescue and deadline-rescue scans use separate per-slot cursors over this history)
+- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims`, `lease_claim_batches`, `lease_claim_closures`, and `lease_claim_closure_batches` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier; compact completion validates immutable `receipt_id` values returned by row-local or compact-batch claims, and implementation stale-rescue and deadline-rescue scans use the same per-attempt advisory key plus separate per-slot cursors over this history)
 
 Terminal-count derived state (`queue_terminal_count_deltas`, `queue_terminal_live_counts`, and `queue_terminal_rollups`) is not lifecycle state and is not part of `AwaSegmentedStorage`. The append/truncate contract for those tables is covered by `AwaDeadTupleContract`, while Rust integration tests assert that exact reads include folded counters plus pending deltas.
 
@@ -42,7 +42,7 @@ What it models:
 - stale completion rejection via per-worker lease snapshots
 - segment rotation and prune safety for ready, tombstone, lease, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
 - unpartitioned backlog row-vacuum handling for `deferred_jobs` and `dlq_entries`
-- receipt-plane append-only receipts with explicit closures for non-success exits and terminal-row evidence for successful completions. `RescueStaleReceipt` models Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction. The deadline-rescue cursor is a sibling implementation refinement ordered by `deadline_at`: it advances over closed or lease-managed claims, closes expired open receipts, and stops before the first open future-deadline claim.
+- receipt-plane append-only receipts with explicit closures for non-success exits and compact claim-local closure batches for successful completions. `RescueStaleReceipt` models Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, uses the same per-attempt advisory key as completion before writing rescue closure evidence, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction. The deadline-rescue cursor is a sibling implementation refinement ordered by `deadline_at`: it advances over closed or lease-managed claims, closes expired open receipts, and stops before the first open future-deadline claim.
 - a second config with two workers to exercise interleavings on the same storage invariants
 
 Heartbeat freshness is tracked at the lease level (not `attempt_state`) to match the Rust implementation. `ParkToWaiting` clears heartbeat freshness while keeping the lease row live; `ResumeWaitingToRunning` restores a running lease on the same `run_lease`.
@@ -56,7 +56,7 @@ Key safety checks include:
 - DLQ rows hold no live runtime (no lease, attempt_state, etc.)
 - `dlq_entries` and `terminal_entries` are disjoint (a job is in exactly one terminal family at a time)
 - pruned terminal segments hold no live terminal rows; terminal rotation is deadlock-free and respects the same open/sealed/pruned lifecycle as the other families
-- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have explicit closure evidence or durable terminal/deferred/DLQ evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while a claim row still depends on it.
+- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every row-local claim or compact claim-batch item in the partition to have durable closure evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while claim evidence still depends on it.
 
 What it intentionally does not model:
 
@@ -157,7 +157,7 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ```
 
-Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE NOWAIT` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's NOWAIT / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
+Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
 
 ## Race-exposure companion spec
 
@@ -264,7 +264,7 @@ See [`MAPPING.md`](./MAPPING.md#trace-validation) for the full description of ho
 
 See [`../README.md`](../README.md) for the full Known Divergences list. Specific to this spec:
 
-- **Public SQL projections are not modelled as separate views.** `AwaSegmentedStorage` models the storage state and invariants underneath `ready_entries`, `ready_tombstones`, `leases`, `done_entries`, `dlq_entries`, and receipt partitions. It does not separately derive `awa.jobs`, `terminal_jobs`, admin state counts, or health-check availability. Those projection paths are covered by Rust regression tests and the correspondence notes in [`MAPPING.md`](./MAPPING.md#public-read-and-compatibility-surfaces).
+- **Public SQL projections are not modelled as separate views.** `AwaSegmentedStorage` models the storage state and invariants underneath `ready_entries`, `ready_claim_attempt_batches`, `ready_tombstones`, `leases`, `done_entries`, `receipt_completion_batches`, `dlq_entries`, and receipt partitions including compact closure batches. It does not separately derive `awa.jobs`, `terminal_jobs`, admin state counts, or health-check availability. Those projection paths are covered by Rust regression tests and the correspondence notes in [`MAPPING.md`](./MAPPING.md#public-read-and-compatibility-surfaces).
 - **Enqueue-shard routing is split across specs.** The base storage model uses one `(queue, priority, enqueue_shard)` lane. Cross-shard `lane_seq` collisions are checked by `AwaShardedPrune`, but the producer shard chooser, per-queue `enqueue_shards` changes, and projection exactness across shards remain code-tested rather than represented in a single unified TLA+ state.
 - **DLQ bulk ops are modelled as quantified single-row actions.** The Rust `bulk_retry_from_dlq` / `purge_dlq` paths are transactionally atomic across the matching rows; the spec explores arbitrary interleavings of individual `RetryFromDlq(j)` / `PurgeDlq(j)` which is a strictly weaker claim. Safety invariants hold under both framings; a refinement with a `BulkScope` set variable could tighten this.
 - **Unique-claim conflicts on `retry_from_dlq`.** The Rust contract says retry-from-dlq returns `UniqueConflict` and leaves the DLQ row intact when a replacement owns the unique slot. The model doesn't have unique keys, so TLC simply explores `RetryFromDlq(j)` whenever the precondition holds. Preserving-the-DLQ-row-on-conflict is enforced in SQL (`awa-model/src/queue_storage.rs::sync_unique_claim`).
