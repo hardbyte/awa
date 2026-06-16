@@ -15,7 +15,7 @@ It uses the storage naming set:
 - `ready_segments` / `ready_segment_cursor`
 - `lease_segments` / `lease_segment_cursor`
 - `terminal_segments` / `terminal_segment_cursor`
-- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims` and `lease_claim_closures` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier)
+- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims` and `lease_claim_closures` partitioned by `claim_slot`, reclaimed by rotation and `TRUNCATE` instead of the earlier `open_receipt_claims` INSERT+DELETE frontier; implementation stale-rescue and deadline-rescue scans use separate per-slot cursors over this history)
 
 Terminal-count derived state (`queue_terminal_count_deltas`, `queue_terminal_live_counts`, and `queue_terminal_rollups`) is not lifecycle state and is not part of `AwaSegmentedStorage`. The append/truncate contract for those tables is covered by `AwaDeadTupleContract`, while Rust integration tests assert that exact reads include folded counters plus pending deltas.
 
@@ -42,7 +42,7 @@ What it models:
 - stale completion rejection via per-worker lease snapshots
 - segment rotation and prune safety for ready, tombstone, lease, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
 - unpartitioned backlog row-vacuum handling for `deferred_jobs` and `dlq_entries`
-- receipt-plane append-only receipts and closures matched into the same `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A rescue-before-truncate
+- receipt-plane append-only receipts with explicit closures for non-success exits and terminal-row evidence for successful completions. `RescueStaleReceipt` models Tier-A rescue-before-truncate. The Rust stale-rescue cursor is treated as an implementation refinement: it sweeps immutable receipt history in bounded cyclic windows, can pass fresh claims for this sweep, and stops before stale open claims not closed by the transaction. The deadline-rescue cursor is a sibling implementation refinement ordered by `deadline_at`: it advances over closed or lease-managed claims, closes expired open receipts, and stops before the first open future-deadline claim.
 - a second config with two workers to exercise interleavings on the same storage invariants
 
 Heartbeat freshness is tracked at the lease level (not `attempt_state`) to match the Rust implementation. `ParkToWaiting` clears heartbeat freshness while keeping the lease row live; `ResumeWaitingToRunning` restores a running lease on the same `run_lease`.
@@ -56,7 +56,7 @@ Key safety checks include:
 - DLQ rows hold no live runtime (no lease, attempt_state, etc.)
 - `dlq_entries` and `terminal_entries` are disjoint (a job is in exactly one terminal family at a time)
 - pruned terminal segments hold no live terminal rows; terminal rotation is deadlock-free and respects the same open/sealed/pruned lifecycle as the other families
-- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have a matching closure before `TRUNCATE` fires
+- pruned claim segments hold no open receipts (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment` requires every claim in the partition to have explicit closure evidence or durable terminal/deferred/DLQ evidence before `TRUNCATE` fires. `PruneReadySegment` separately refuses to remove terminal evidence while a claim row still depends on it.
 
 What it intentionally does not model:
 
@@ -147,7 +147,7 @@ Run the broken correlated-hash witness with:
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans — **39,040 distinct states, clean**. Models claim (receipts and legacy modes), complete, close-receipt, rescue-receipts, ensure-running, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
 
 Run:
@@ -157,7 +157,7 @@ Run:
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ```
 
-Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's lock-timeout / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
+Coverage note: the plans model the lock steps that actually appear in the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS EXCLUSIVE NOWAIT` / the implicit AccessShare of SELECT on partition children). They do NOT model implicit table-level locks beyond what is named, or Postgres's NOWAIT / deadlock-detector abort choice. The spec treats a waits-for cycle as a safety violation, which is conservative — Postgres would abort one transaction and let the other proceed. For our purposes "this sequence of lock requests could produce a cycle" is the thing we want to catch, regardless of how the runtime resolves it.
 
 ## Race-exposure companion spec
 

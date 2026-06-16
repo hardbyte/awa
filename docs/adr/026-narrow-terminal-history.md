@@ -125,7 +125,9 @@ This ADR changes the batching defaults that determine whether lower WAL turns in
 - `queue_slot_count = 16`, `lease_slot_count = 8`, `claim_slot_count = 8`, and `lease_claim_receipts = true` remain the queue-storage defaults.
 - `terminal_count_rollup_interval = 30s` folds pending terminal-count deltas for sealed queue slots. Each tick processes at most four sealed slots. Exact reads include pending deltas, so this cadence affects compaction pressure, not correctness.
 
-The queue-storage short-job completion path also uses one fused statement for the common receipt-backed, payload-empty terminal transition: close the receipt in `lease_claim_closures` and insert the narrow `done_entries` fact from the claimed runtime snapshot in the same SQL statement. Jobs with unique-key transitions, terminal payload metadata, materialized heartbeat/progress state, or missed receipt closures keep the general transaction path.
+The queue-storage short-job completion path also uses one fused statement for the common receipt-backed, payload-empty terminal transition: insert the narrow `done_entries` fact and the matching terminal-count delta from the claimed runtime snapshot. That `done_entries` row is the durable closure evidence for successful receipt completion, so the hot path does not write a duplicate `lease_claim_closures` row. Jobs with unique-key transitions, terminal payload metadata, materialized heartbeat/progress state, or missed receipt evidence keep the general transaction path.
+
+If a later retry, DLQ move, discard, or SQL compatibility delete removes a terminal row before claim prune has reclaimed the originating receipt, the terminal-delete path first materializes an explicit `lease_claim_closures` row. This keeps claim-ring prune independent of terminal retention timing without adding a closure insert to the common successful completion path.
 
 The offered-rate benchmark turns that lower write budget into an explicit capacity check. With one queue shard, one claimer, `claim_batch_size = 512`, queue-storage completion shards at `1`, and `max_workers = 1024`, a 10-second `10k/s` no-op workload keeps durable completions at the offered rate, drains to zero backlog, and writes `1.8 KiB` WAL per completed job. A `12k/s` offered workload exceeds that reference configuration and accumulates backlog during the offer window before draining afterward.
 
@@ -138,9 +140,9 @@ ADR-026 deliberately keeps the opposite contract:
 - completion still writes the durable terminal fact synchronously;
 - `done_entries` remains the terminal source of truth for counts, admin reads, retries, DLQ moves, discard, and retention;
 - there is no materializer, no lag window, and no extra prune precondition;
-- the fast path is an implementation detail of the same logical transition: only claims that are successfully closed in `lease_claim_closures` are inserted into `done_entries`.
+- the fast path is an implementation detail of the same logical transition: only claims that can be closed by durable evidence are inserted into `done_entries`; successful completion uses that `done_entries` row as the evidence, while non-success and cold terminal-delete paths use `lease_claim_closures`.
 
-The overlap with ADR-024 is the insight that duplicating ready-body JSONB is wasteful. The difference is where the system draws the safety boundary: ADR-024 deferred the terminal fact; ADR-026 keeps the terminal fact durable and only narrows its payload, then fuses the receipt-close and terminal-insert SQL so the synchronous contract is cheap enough to hit the throughput target.
+The overlap with ADR-024 is the insight that duplicating ready-body JSONB is wasteful. The difference is where the system draws the safety boundary: ADR-024 deferred the terminal fact; ADR-026 keeps the terminal fact durable and only narrows its payload, then fuses receipt-claim locking, terminal insert, and count-delta append so the synchronous contract is cheap enough to hit the throughput target.
 
 The first tuning move for overload remains semantic enqueue sharding when the workload can accept partitioned FIFO. This ADR lowers the durable completion write budget underneath those defaults.
 

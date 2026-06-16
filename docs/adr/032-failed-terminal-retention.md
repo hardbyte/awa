@@ -12,7 +12,9 @@ That coarseness creates a silent-loss cliff for `failed` terminal rows. A job th
 
 The mechanism that drops them is the prune `TRUNCATE` itself. From the prune path:
 
-> `FOR UPDATE` on `queue_ring_state` and `queue_ring_slots[slot]`, then `LOCK TABLE ... ACCESS EXCLUSIVE`, recheck active rows, then `TRUNCATE`; ready-backed terminal rows, ready tombstones, and pending terminal-count deltas are reclaimed with their retained ready bodies.
+> `FOR UPDATE` on `queue_ring_state` and `queue_ring_slots[slot]`, then `LOCK TABLE ... ACCESS EXCLUSIVE NOWAIT`, recheck active rows, then `TRUNCATE`; ready-backed terminal rows, ready tombstones, and pending terminal-count deltas are reclaimed with their retained ready bodies.
+
+ADR-019 later tightened automatic prune paths to take the child-table lock with `NOWAIT`, so a contended prune tick returns `Blocked` rather than queueing behind application traffic. That lock-mode change does not alter the failed-retention floor: carry-forward still happens only after prune owns the child locks and before the `TRUNCATE` in the same transaction.
 
 A `failed` row in the truncated slot is reclaimed alongside the rest of the segment. Nothing carries it forward, and nothing tells the operator it is gone.
 

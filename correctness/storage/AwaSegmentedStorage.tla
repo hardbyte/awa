@@ -39,21 +39,36 @@ EXTENDS TLC, Naturals, FiniteSets
 \* ready body and the terminal fact together; MoveFailedToDlq removes from the
 \* terminal family before re-appending to DLQ.
 \*
-\* Claim family modelling (ADR-023): every Claim action opens an
-\* append-only receipt in the current claim segment, and every
-\* attempt-ending transition (FastComplete / StatefulComplete / FailToDlq
-\* / RetryToDeferred / RescueToReady / CancelWaitingToTerminal /
-\* TimeoutWaitingToDlq / TimeoutWaitingToReady)
-\* writes a closure row in that same segment. ParkToWaiting does NOT
-\* close the receipt: waiting_external remains a row in `leases`, so the
-\* attempt is still alive in callback wait and its receipt stays open.
+\* Claim family modelling (ADR-023/026): every Claim action opens an
+\* append-only receipt in the current claim segment. Non-success exits
+\* (FailToDlq / RetryToDeferred / RescueToReady /
+\* CancelWaitingToTerminal / TimeoutWaitingToDlq /
+\* TimeoutWaitingToReady) write an explicit closure row in that same
+\* segment. Successful receipt completion instead writes `done_entries`
+\* as the durable closure evidence and avoids the duplicate closure row
+\* on the hot path. ParkToWaiting does NOT close the receipt:
+\* waiting_external remains a row in `leases`, so the attempt is still
+\* alive in callback wait and its receipt stays open.
 \* ResumeWaitingToRunning also keeps the receipt open because the handler
 \* continues the same run_lease. PruneClaimSegment requires every claim in the
 \* sealed partition to be closed before TRUNCATE fires, and rescue can
 \* force-close stragglers via RescueStaleReceipt. This replaces the
 \* earlier open_receipt_claims INSERT+DELETE frontier: the entire
-\* receipt plane is reclaimed by partition rotation, which is what makes
-\* the 0.6 vacuum-aware story complete.
+\* receipt plane is reclaimed by partition rotation.
+\* The Rust implementation also keeps per-claim-slot rescue cursors
+\* in claim_ring_slots. This model treats those cursors as implementation
+\* refinements over claimOpen / claimClosed history rather than lifecycle
+\* state. The stale-receipt cursor is a cyclic bounded sweep over
+\* (claimed_at, job_id, run_lease): fresh claims may be skipped for this
+\* pass and revisited after wrap, while stale open claims stop cursor
+\* advancement until a rescue step closes them. The deadline cursor is a
+\* separate bounded sweep over (deadline_at, job_id, run_lease): closed
+\* and lease-managed claims are skipped, expired open receipt claims are
+\* force-closed, and the first open future-deadline claim stops
+\* advancement until it expires or closes through normal completion.
+\* Both cursors refine the same storage facts modelled here: an open
+\* claim is removed from claimOpen and a matching closure evidence row is
+\* represented in claimClosed.
 \*
 \* Enqueue-shard modelling (ADR-025): `laneState` here represents one
 \* `(queue, priority, enqueue_shard)` triple. The Rust implementation
@@ -193,6 +208,7 @@ CurrentReady ==
 JobsInReadySegment(seg) == {j \in Jobs : readySegmentOf[j] = seg}
 JobsInTerminalSegment(seg) == {j \in Jobs : terminalSegmentOf[j] = seg}
 KeysInClaimSegment(seg) == {k \in ClaimKeys : claimSegmentOf[k] = seg}
+ClaimKeyJob(k) == k[1]
 
 InitSegments(Range) == [s \in Range |-> IF s = 1 THEN "open" ELSE "pruned"]
 
@@ -239,9 +255,10 @@ UnchangedSegmentState ==
                 terminalSegmentCursor,
                 claimSegmentCursor>>
 
-\* Receipt-plane data variables (claim-ring). Every action that doesn't
-\* open or close a claim receipt unchanges this bundle. Claim() opens a
-\* receipt; attempt-ending transitions close one.
+\* Receipt-plane data variables (claim-ring). Claim() opens a receipt.
+\* Explicit non-success exits append closure rows in claimClosed. Successful
+\* receipt completion closes the live claim by terminal evidence instead and
+\* leaves claimClosed unchanged.
 UnchangedClaimData ==
     UNCHANGED <<claimSegmentOf, claimOpen, claimClosed>>
 
@@ -360,10 +377,10 @@ AdvanceClaimCursor ==
     /\ UnchangedClaimData
 
 \* Claim now also appends a claim receipt into the current claim segment.
-\* The receipt lives in `claim_slot = claimSegmentCursor`; the
-\* corresponding closure row (written by an attempt-ending transition)
-\* targets the same slot, which is why `claimSegmentOf[<<j, r>>]` is
-\* preserved across close until the whole partition is pruned. Each
+\* The receipt lives in `claim_slot = claimSegmentCursor`; explicit
+\* closure rows target the same slot, which is why
+\* `claimSegmentOf[<<j, r>>]` is preserved across close until the whole
+\* partition is pruned. Each
 \* attempt has its own (j, run_lease) key so the previous attempt's
 \* receipt bookkeeping is unaffected by the next claim.
 Claim(w, j) ==
@@ -634,7 +651,6 @@ FastComplete(w, j) ==
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
-    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
@@ -646,6 +662,7 @@ FastComplete(w, j) ==
                    laneSeq,
                    readySegmentOf,
                    claimSegmentOf,
+                   claimClosed,
                    readyTombstones>>
     /\ UnchangedSegmentState
 
@@ -667,7 +684,6 @@ StatefulComplete(w, j) ==
     /\ progressTouched' = progressTouched \ {j}
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
-    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
@@ -677,6 +693,7 @@ StatefulComplete(w, j) ==
                    laneSeq,
                    readySegmentOf,
                    claimSegmentOf,
+                   claimClosed,
                    readyTombstones>>
     /\ UnchangedSegmentState
 
@@ -1247,6 +1264,8 @@ PruneReadySegment(seg) ==
     /\ seg \in ReadySegments
     /\ readySegments[seg] = "sealed"
     /\ \A j \in Jobs : readySegmentOf[j] = seg => j \notin CurrentReady /\ j \notin activeLeases /\ j \notin ReceiptClaimJobs
+    /\ \A k \in ClaimKeys :
+          ((claimSegmentOf[k] # NoClaimSegment /\ readySegmentOf[ClaimKeyJob(k)] = seg) => k \in claimClosed)
     /\ readyEntries' = readyEntries \ JobsInReadySegment(seg)
     /\ terminalEntries' = terminalEntries \ JobsInReadySegment(seg)
     /\ readyTombstones' = {t \in readyTombstones : t.segment # seg}
@@ -1342,12 +1361,14 @@ PruneTerminalSegment(seg) ==
 \* ADR-023 prune of the claim ring. The precondition
 \* `\A k : claimSegmentOf[k] = seg => k \notin claimOpen` captures
 \* rescue-before-truncate: every claim row in the partition must be
-\* closed (either by a terminal transition or by RescueStaleReceipt)
+\* closed by explicit closure evidence or by durable terminal evidence
 \* before `prune_oldest_claims` can TRUNCATE the lease_claims /
-\* lease_claim_closures children for that slot. Note this iterates over
-\* ClaimKeys, so an old (j, r) receipt left behind by a previous attempt
-\* is correctly counted even when the same job has been re-claimed
-\* under (j, r+1) into a newer partition.
+\* lease_claim_closures children for that slot. Ready prune is separately
+\* guarded so it cannot remove terminal evidence while a claim row still
+\* depends on it. Note this iterates over ClaimKeys, so an old (j, r)
+\* receipt left behind by a previous attempt is correctly counted even
+\* when the same job has been re-claimed under (j, r+1) into a newer
+\* partition.
 PruneClaimSegment(seg) ==
     /\ seg \in ClaimSegments
     /\ claimSegments[seg] = "sealed"

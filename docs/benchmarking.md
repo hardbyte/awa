@@ -340,7 +340,7 @@ This rate was previously a documented scaling limit (only 20-57k of 60k promoted
 
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `AWA_COMPLETION_FLUSH_MS` (default `1 ms`): completion batcher flush interval
-- `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher flush. Queue-storage short-job completion uses a fused receipt-close + terminal-insert statement, so the default keeps finalization latency low while still amortising durable completion work under load.
+- `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher flush. Queue-storage short-job completion uses a fused receipt-claim lock, terminal-insert, and count-delta statement, so the default keeps finalization latency low while still amortising durable completion work under load.
 - `AWA_COMPLETION_SHARDS`: number of parallel completion flushers. The runtime default is storage-dependent: `8` for canonical storage and `1` for queue storage. Queue storage starts conservative because the terminal / receipt path already batches heavily and the effective fleet-wide flusher count is `processes × AWA_COMPLETION_SHARDS`. Increase only after measuring end-to-end throughput, p99 latency, WAL bytes/job, and dead tuples for the target worker-process topology.
 
 Internal promotion constants are fixed in the runtime: `PROMOTE_BATCH_SIZE = 4,096` rows per promotion batch and `PROMOTE_MAX_BATCHES_PER_TICK = 32` batches per maintenance tick. They are not environment variables or builder options.

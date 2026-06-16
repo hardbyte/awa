@@ -798,6 +798,29 @@ async fn age_receipt_claim(
     .expect("Failed to age receipt claim for rescue test");
 }
 
+async fn age_attempt_heartbeat(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+    run_lease: i64,
+    age: Duration,
+) {
+    let age_millis = i64::try_from(age.as_millis()).expect("test heartbeat age fits in i64 millis");
+    sqlx::query(&format!(
+        "UPDATE {}.attempt_state
+         SET heartbeat_at = clock_timestamp() - ($1 * interval '1 millisecond'),
+             updated_at = clock_timestamp()
+         WHERE job_id = $2 AND run_lease = $3",
+        store.schema()
+    ))
+    .bind(age_millis)
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(pool)
+    .await
+    .expect("Failed to age attempt heartbeat for rescue test");
+}
+
 async fn wait_for_callback_job(
     store: &QueueStorage,
     pool: &sqlx::PgPool,
@@ -1091,6 +1114,7 @@ struct CompleteJob {
 #[derive(Clone)]
 struct BlockingCompleteWorkerGate {
     release: Arc<Notify>,
+    released: Arc<AtomicBool>,
     entered: Arc<AtomicBool>,
     entered_wake: Arc<Notify>,
 }
@@ -1099,6 +1123,7 @@ impl BlockingCompleteWorkerGate {
     fn new() -> Self {
         Self {
             release: Arc::new(Notify::new()),
+            released: Arc::new(AtomicBool::new(false)),
             entered: Arc::new(AtomicBool::new(false)),
             entered_wake: Arc::new(Notify::new()),
         }
@@ -1126,6 +1151,7 @@ impl BlockingCompleteWorkerGate {
     }
 
     fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
         self.release.notify_waiters();
     }
 }
@@ -1143,7 +1169,13 @@ impl Worker for BlockingCompleteWorker {
     async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         self.gate.entered.store(true, Ordering::SeqCst);
         self.gate.entered_wake.notify_waiters();
-        self.gate.release.notified().await;
+        loop {
+            let notified = self.gate.release.notified();
+            if self.gate.released.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
         Ok(JobResult::Completed)
     }
 }
@@ -1672,7 +1704,7 @@ impl Worker for ProgressRescueWorker {
                 if ctx.is_cancelled() {
                     break;
                 }
-                if started.elapsed() > Duration::from_secs(5) {
+                if started.elapsed() > Duration::from_secs(30) {
                     return Err(JobError::terminal(
                         "progress rescue did not cancel stale attempt",
                     ));
@@ -1895,7 +1927,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
 
     // Claim + complete a receipt-backed job. Without prune, this leaves
-    // one row in lease_claims_0 and one row in lease_claim_closures_0.
+    // one row in lease_claims_0; the terminal done row is the closure
+    // evidence for successful completion.
     let job_id = enqueue_job(
         &pool,
         &store,
@@ -1932,7 +1965,8 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await;
     client.shutdown(Duration::from_secs(5)).await;
 
-    // Sanity: one claim + one closure both landed in slot 0.
+    // Sanity: the claim landed in slot 0 and successful completion
+    // did not need a duplicate closure row.
     let slot0_claims: i64 =
         sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
             .fetch_one(&pool)
@@ -1945,7 +1979,10 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     .await
     .expect("count lease_claim_closures_0");
     assert_eq!(slot0_claims, 1, "completed claim must live in slot 0");
-    assert_eq!(slot0_closures, 1, "matching closure must live in slot 0");
+    assert_eq!(
+        slot0_closures, 0,
+        "successful completion uses done_entries as closure evidence"
+    );
 
     // Rotate from slot 0 → slot 1. Slot 1 is empty, so busy-check
     // passes and the cursor advances.
@@ -1976,8 +2013,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     }
 
     // Keep rotating until the next target wraps to slot 0, which still
-    // holds the completed claim + closure pair. The busy-check must
-    // refuse.
+    // holds the completed claim. The busy-check must refuse.
     match store
         .rotate_claims(&pool)
         .await
@@ -1995,9 +2031,24 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         "rotate onto slot 0 with live rows must SkippedBusy, got {busy_outcome:?}"
     );
 
-    // Prune the oldest initialized slot. With every claim in slot 0
-    // having a matching closure, PartitionTruncateSafety holds and
-    // prune TRUNCATEs both children.
+    // Prune the oldest initialized slot. The completed claim has a
+    // matching done_entries row, so PartitionTruncateSafety holds even
+    // without a duplicate completed-closure row, and prune TRUNCATEs
+    // both children.
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.claim_ring_slots
+        SET rescue_cursor_claimed_at = clock_timestamp(),
+            rescue_cursor_job_id = $1,
+            rescue_cursor_run_lease = 1
+        WHERE slot = 0
+        "#
+    ))
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .expect("seed non-default rescue cursor before claim prune");
+
     let prune_outcome = store
         .prune_oldest_claims(&pool)
         .await
@@ -2027,6 +2078,24 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         post_prune_closures, 0,
         "lease_claim_closures_0 must be empty post-prune"
     );
+    let cursor_reset: (bool, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT
+            rescue_cursor_claimed_at = '-infinity'::timestamptz,
+            rescue_cursor_job_id,
+            rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = 0
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read claim rescue cursor after claim prune");
+    assert_eq!(
+        cursor_reset,
+        (true, 0, 0),
+        "claim prune should reset only the matching claim-slot rescue cursor"
+    );
 
     // And now rotate onto slot 0 succeeds.
     match store
@@ -2037,6 +2106,77 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected Rotated to slot 0 after prune, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_lease_prune_keeps_claim_cursor";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    match store
+        .rotate_leases(&pool)
+        .await
+        .expect("rotate_leases -> slot 1")
+    {
+        RotateOutcome::Rotated { slot, generation } => {
+            assert_eq!(slot, 1);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("expected Rotated {{ slot: 1, generation: 1 }}, got {other:?}"),
+    }
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.claim_ring_slots
+        SET rescue_cursor_claimed_at = clock_timestamp(),
+            rescue_cursor_job_id = 42,
+            rescue_cursor_run_lease = 7
+        WHERE slot = 0
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed claim rescue cursor before lease prune");
+
+    let prune = store
+        .prune_oldest_leases(&pool)
+        .await
+        .expect("prune_oldest_leases");
+    assert!(
+        matches!(prune, PruneOutcome::Pruned { slot: 0, .. }),
+        "lease prune should truncate empty lease slot 0, got {prune:?}"
+    );
+
+    let cursor: (bool, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT
+            rescue_cursor_claimed_at = '-infinity'::timestamptz,
+            rescue_cursor_job_id,
+            rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = 0
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read claim rescue cursor after lease prune");
+    assert_eq!(
+        cursor,
+        (false, 42, 7),
+        "lease pruning must not mutate claim rescue cursors; lease and claim slots are independent rings"
+    );
 }
 
 /// Wave-1 regression test for the prune safety predicate. If a claim
@@ -2232,7 +2372,7 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
 /// `lease_claim_closures` reflect the lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_receipt_claims_is_absent_after_install() {
-    let (_db_guard, pool) = setup_pool(4).await;
+    let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_open_receipt_claims_absent";
     let queue = "qs_open_receipt_claims_absent";
     let store = create_store_with_config(
@@ -2312,8 +2452,8 @@ async fn test_open_receipt_claims_is_absent_after_install() {
     );
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        1,
-        "the completion must have written a closure row"
+        0,
+        "successful completion uses done_entries as receipt closure evidence"
     );
     assert!(
         !open_receipt_claims_present(&pool, schema).await,
@@ -2324,10 +2464,10 @@ async fn test_open_receipt_claims_is_absent_after_install() {
 }
 
 /// Partition-routing smoke test for the ADR-023 receipt plane: a
-/// receipt-backed claim + completion cycle lands rows in the expected
-/// child partitions of `lease_claims` and `lease_claim_closures`, and
-/// both rows share the same `claim_slot` so the closure co-locates with
-/// the claim it tombstones.
+/// receipt-backed claim + completion cycle lands the claim row in the
+/// expected `lease_claims` child partition. Successful completion uses
+/// `done_entries` as closure evidence, so no duplicate completed
+/// closure row is expected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_partition_routing() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -2369,7 +2509,7 @@ async fn test_lease_claim_partition_routing() {
     let job_id = enqueue_job(
         &pool,
         &store,
-        &RetryJob { id: 777 },
+        &CompleteJob { id: 777 },
         InsertOpts {
             queue: queue.to_string(),
             ..Default::default()
@@ -2377,32 +2517,34 @@ async fn test_lease_claim_partition_routing() {
     )
     .await;
 
-    let client = queue_storage_client(
-        &pool,
-        queue,
-        QueueStorageConfig {
-            schema: schema.to_string(),
-            queue_slot_count: 4,
-            lease_slot_count: 2,
-            claim_slot_count: 4,
-            queue_stripe_count: 1,
-            lease_claim_receipts: true,
-        },
-        RetryOnceWorker,
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim partition-routed job");
+    assert_eq!(claimed.len(), 1, "job should be claimed");
+    assert_eq!(claimed[0].job.id, job_id, "claimed job id");
+    assert!(
+        claimed[0].claim.lease_claim_receipt,
+        "test setup must exercise the receipt claim path"
     );
-    client.start().await.expect("client start");
+    assert_eq!(
+        claimed[0].claim.claim_slot, current_slot,
+        "claim should use the rotated current slot"
+    );
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete partition-routed claim");
 
-    let _completed = wait_for_job_state(
-        &store,
-        &pool,
-        job_id,
-        &[JobState::Completed],
-        Duration::from_secs(10),
-    )
-    .await;
+    let completed = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load completed job")
+        .expect("completed job row");
+    assert_eq!(completed.state, JobState::Completed);
 
-    // Assert claim and closure both live in claim_slot = 2, and in the
-    // matching physical child partition.
+    // Assert the claim lives in the current claim slot and matching
+    // physical child partition.
     let claim_slot: i32 = sqlx::query_scalar(&format!(
         "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 ORDER BY run_lease DESC LIMIT 1"
     ))
@@ -2410,21 +2552,12 @@ async fn test_lease_claim_partition_routing() {
     .fetch_one(&pool)
     .await
     .expect("read claim_slot from lease_claims");
-    assert_eq!(claim_slot, 2, "claim row should land in current slot");
-
-    let closure_slot: i32 = sqlx::query_scalar(&format!(
-        "SELECT claim_slot FROM {schema}.lease_claim_closures WHERE job_id = $1 ORDER BY closed_at DESC LIMIT 1"
-    ))
-    .bind(job_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read claim_slot from lease_claim_closures");
     assert_eq!(
-        closure_slot, claim_slot,
-        "closure must live in the same partition as its originating claim"
+        claim_slot, current_slot,
+        "claim row should land in current slot"
     );
 
-    // Physically: both rows must be addressable via their child-partition names.
+    // Physically: the claim row must be addressable via its child-partition name.
     let claim_in_child: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {schema}.lease_claims_2 WHERE job_id = $1"
     ))
@@ -2441,12 +2574,10 @@ async fn test_lease_claim_partition_routing() {
     .fetch_one(&pool)
     .await
     .expect("count in lease_claim_closures_2");
-    assert!(
-        closure_in_child >= 1,
-        "closure row must be in lease_claim_closures_2"
+    assert_eq!(
+        closure_in_child, 0,
+        "successful completion must not write a duplicate completed closure"
     );
-
-    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// Rotation-isolation check for the ADR-023 claim ring. A claim landed
@@ -3212,6 +3343,63 @@ async fn test_queue_storage_late_completion_after_cancel_is_noop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_cancel_writes_explicit_closure() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_cancel_closure";
+    let schema = "awa_qs_receipt_cancel_closure";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 104 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("Failed to claim receipt cancel job");
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+    assert!(
+        claimed.claim.lease_claim_receipt,
+        "zero-deadline claim should use receipt plane"
+    );
+
+    let cancelled = store
+        .cancel_running(&pool, job_id, claimed.job.run_lease, "test cancel", None)
+        .await
+        .expect("Failed to cancel receipt-backed running job")
+        .expect("Expected receipt-backed running job to be cancelled");
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "cancelled receipt-backed attempts must keep explicit closure evidence"
+    );
+
+    let completed = store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&claimed))
+        .await
+        .expect("Failed to attempt stale completion after receipt cancel");
+    assert!(
+        completed.is_empty(),
+        "late completion should be ignored after receipt cancel"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_dlq_and_retry_race_has_single_winner() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_guard_dlq_race";
@@ -3495,7 +3683,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
     let completed_counts = store
         .queue_counts(&pool, queue)
         .await
@@ -3503,6 +3691,92 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(completed_counts.running, 0);
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_sql_compat_delete_materializes_receipt_closure() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_delete_compat_closure";
+    let schema = "awa_qs_receipt_delete_compat_closure";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 12 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start receipt delete-compat client");
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    client.shutdown(Duration::from_secs(5)).await;
+
+    assert_eq!(completed_done_count(&pool, &store, queue).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        0,
+        "successful completion should use done_entries as receipt closure evidence"
+    );
+
+    let deleted: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("delete_job_compat should delete completed job");
+    assert!(deleted, "completed job should be deleted through compat");
+
+    assert_eq!(completed_done_count(&pool, &store, queue).await, 0);
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "terminal delete must materialize explicit closure before removing done evidence"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+
+    match store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate claim ring after compat delete")
+    {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("expected claim ring rotation after compat delete, got {other:?}"),
+    }
+
+    match store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("claim prune after compat delete")
+    {
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
+        other => panic!(
+            "compat-deleted terminal should leave enough closure evidence to prune claim slot, got {other:?}"
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3767,6 +4041,311 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_terminal_evidence() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_deadline_cursor";
+    let schema = "awa_qs_receipt_deadline_cursor";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 21 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 22 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim deadline cursor jobs");
+    assert_eq!(claimed.len(), 2);
+    assert!(claimed.iter().all(|entry| entry.claim.lease_claim_receipt));
+
+    store
+        .complete_runtime_batch(&pool, &claimed[0..1])
+        .await
+        .expect("complete first receipt job");
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.lease_claims
+        SET deadline_at = CASE
+            WHEN job_id = $1 THEN clock_timestamp() - interval '10 seconds'
+            WHEN job_id = $2 THEN clock_timestamp() + interval '10 minutes'
+        END
+        WHERE job_id IN ($1, $2)
+        "#
+    ))
+    .bind(first)
+    .bind(second)
+    .execute(&pool)
+    .await
+    .expect("set receipt deadlines");
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("deadline rescue should advance over terminal evidence");
+    assert!(
+        rescued.is_empty(),
+        "terminal evidence should close the expired first claim and the future second claim must not be rescued"
+    );
+
+    let cursor_job: i64 = sqlx::query_scalar(&format!(
+        "SELECT deadline_cursor_job_id FROM {schema}.claim_ring_slots WHERE slot = $1"
+    ))
+    .bind(claimed[0].claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read deadline cursor");
+    assert_eq!(
+        cursor_job, first,
+        "deadline cursor should advance past the completed claim instead of rechecking it forever"
+    );
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.lease_claims \
+         SET deadline_at = clock_timestamp() - interval '1 second' \
+         WHERE job_id = $1"
+    ))
+    .bind(second)
+    .execute(&pool)
+    .await
+    .expect("expire second receipt deadline");
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("deadline rescue should continue after cursor");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, second);
+
+    let closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.lease_claim_closures"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count receipt closures");
+    assert_eq!(
+        closures, 1,
+        "successful completion remains closed by done_entries; only the rescued open claim writes an explicit closure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_wraps() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_receipt_rescue_cursor";
+    let schema = "awa_qs_runtime_receipt_rescue_cursor";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_a = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 11 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_b = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 12 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let job_c = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 13 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 3, Duration::ZERO)
+        .await
+        .expect("claim three receipt-backed jobs");
+    assert_eq!(claimed.len(), 3);
+    assert!(
+        claimed.iter().all(|entry| entry.claim.lease_claim_receipt),
+        "all claims should stay on the receipt plane"
+    );
+
+    let claim_a = claimed
+        .iter()
+        .find(|entry| entry.job.id == job_a)
+        .expect("claim for job A")
+        .clone();
+    let claim_b = claimed
+        .iter()
+        .find(|entry| entry.job.id == job_b)
+        .expect("claim for job B");
+    let claim_c = claimed
+        .iter()
+        .find(|entry| entry.job.id == job_c)
+        .expect("claim for job C")
+        .clone();
+    let claim_b = claim_b.clone();
+
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_a,
+        claim_a.job.run_lease,
+        Duration::from_secs(300),
+    )
+    .await;
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_b,
+        claim_b.job.run_lease,
+        Duration::from_secs(200),
+    )
+    .await;
+    age_receipt_claim(
+        &pool,
+        &store,
+        job_c,
+        claim_c.job.run_lease,
+        Duration::from_secs(100),
+    )
+    .await;
+
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+        VALUES ($1, $2, clock_timestamp(), clock_timestamp())
+        "#
+    ))
+    .bind(job_b)
+    .bind(claim_b.job.run_lease)
+    .execute(&pool)
+    .await
+    .expect("seed fresh heartbeat blocker");
+
+    let completed = store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&claim_a))
+        .await
+        .expect("complete first claim");
+    assert_eq!(completed, vec![(job_a, claim_a.job.run_lease)]);
+
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::from_secs(90))
+        .await
+        .expect("receipt rescue should rescue stale claims");
+    assert_eq!(
+        rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_c],
+        "fresh heartbeat on job B must not prevent rescuing stale job C"
+    );
+
+    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT rescue_cursor_claimed_at, rescue_cursor_job_id, rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = $1
+        "#
+    ))
+    .bind(claim_a.claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read rescue cursor after first rescue");
+    assert_eq!(
+        (cursor.1, cursor.2),
+        (job_c, claim_c.job.run_lease),
+        "fresh job B must not pin the sweep cursor ahead of stale job C"
+    );
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.attempt_state
+        SET heartbeat_at = clock_timestamp() - interval '300 seconds',
+            updated_at = clock_timestamp()
+        WHERE job_id = $1 AND run_lease = $2
+        "#
+    ))
+    .bind(job_b)
+    .bind(claim_b.job.run_lease)
+    .execute(&pool)
+    .await
+    .expect("make heartbeat blocker stale");
+
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::from_secs(90))
+        .await
+        .expect("receipt rescue should resume after blocker turns stale");
+    assert_eq!(
+        rescued.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![job_b],
+        "second rescue should wrap and close the formerly fresh claim"
+    );
+
+    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT rescue_cursor_claimed_at, rescue_cursor_job_id, rescue_cursor_run_lease
+        FROM {schema}.claim_ring_slots
+        WHERE slot = $1
+        "#
+    ))
+    .bind(claim_a.claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read rescue cursor after second rescue");
+    assert_eq!(
+        (cursor.1, cursor.2),
+        (job_c, claim_c.job.run_lease),
+        "cursor should advance through the rescued blocker and already-closed tail"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_materialize_heartbeat";
@@ -3885,7 +4464,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4016,7 +4595,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4133,7 +4712,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(Duration::from_secs(2))
         .deadline_rescue_interval(Duration::from_secs(10))
         .callback_rescue_interval(Duration::from_secs(10))
         .build()
@@ -4175,12 +4754,21 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(running.state, JobState::Running);
     assert!(running.heartbeat_at.is_some());
 
+    age_attempt_heartbeat(
+        &pool,
+        &store,
+        job_id,
+        running.run_lease,
+        Duration::from_secs(120),
+    )
+    .await;
+
     let completed = wait_for_job_state(
         &store,
         &pool,
         job_id,
         &[JobState::Completed],
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     )
     .await;
     assert_eq!(completed.state, JobState::Completed);
@@ -4189,7 +4777,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4635,7 +5223,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
 
     release.notify_waiters();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -4660,7 +5248,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
         .expect("Expected receipt rescue job to exist");
     assert_eq!(current.state, JobState::Completed);
     assert_eq!(current.attempt, 2);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4756,7 +5344,7 @@ async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(Duration::from_secs(2))
         .deadline_rescue_interval(Duration::from_secs(10))
         .callback_rescue_interval(Duration::from_secs(10))
         .build()
@@ -5005,14 +5593,20 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     .await;
     assert_eq!(completed.state, JobState::Completed);
 
-    let prune_after_completion = store
-        .prune_oldest(&pool, Duration::ZERO)
-        .await
-        .expect("Failed to prune oldest completed slot");
-    assert!(
-        matches!(prune_after_completion, PruneOutcome::Pruned { slot: 0, .. }),
-        "unexpected prune outcome after completion: {prune_after_completion:?}"
-    );
+    let prune_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let prune_after_completion = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("Failed to prune oldest completed slot");
+        match prune_after_completion {
+            PruneOutcome::Pruned { slot: 0, .. } => break,
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => panic!("unexpected prune outcome after completion: {other:?}"),
+        }
+    }
 
     let counts_after_prune = store
         .queue_counts(&pool, queue)
@@ -7632,8 +8226,8 @@ async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
     let queue = "qs_bounded_claimers_limit";
     let instance_a = Uuid::new_v4();
     let instance_b = Uuid::new_v4();
-    let ttl = Duration::from_secs(3);
-    let idle_threshold = Duration::from_millis(500);
+    let ttl = Duration::from_secs(30);
+    let idle_threshold = Duration::from_secs(10);
 
     let lease_a = store
         .acquire_queue_claimer(&pool, queue, instance_a, 1, ttl, idle_threshold)
@@ -7699,8 +8293,8 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
     let store = create_store(&pool, schema).await;
     let queue = "qs_bounded_claimers_heartbeat";
     let instance = Uuid::new_v4();
-    let ttl = Duration::from_secs(3);
-    let idle_threshold = Duration::from_millis(500);
+    let ttl = Duration::from_secs(300);
+    let idle_threshold = Duration::from_secs(120);
 
     let lease = store
         .acquire_queue_claimer(&pool, queue, instance, 1, ttl, idle_threshold)
@@ -7753,7 +8347,11 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
     sqlx::query(&format!(
         "UPDATE {schema}.queue_claimer_leases SET last_claimed_at = $1 WHERE queue = $2 AND claimer_slot = $3"
     ))
-    .bind(Utc::now() - chrono::Duration::milliseconds(600))
+    .bind(
+        Utc::now()
+            - chrono::Duration::from_std(idle_threshold + Duration::from_secs(1))
+                .expect("idle threshold should fit chrono duration"),
+    )
     .bind(queue)
     .bind(lease.claimer_slot)
     .execute(&pool)

@@ -11,9 +11,9 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* The claim/rotate/prune race against the lease ring is mitigated by:
 \*   - the rotators taking FOR UPDATE on lease_ring_state and the
 \*     target slot row (so two rotators serialise),
-\*   - LOCK TABLE ACCESS EXCLUSIVE on the partition child (so prune
-\*     waits for in-flight claim/complete writes to commit before
-\*     truncating).
+\*   - LOCK TABLE ACCESS EXCLUSIVE NOWAIT on the partition child (so prune
+\*     fails fast under contention instead of queueing ahead of worker
+\*     traffic before truncating).
 \* Note: the claim CTE reads lease_ring_state with a plain SELECT, NOT
 \* a FOR SHARE. The conflict detection between claim and rotate is the
 \* rotator's CAS UPDATE (`WHERE current_slot=$ AND generation=$`) plus
@@ -50,7 +50,7 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* What it intentionally does not model:
 \* - MVCC / snapshot isolation — we only care about lock-order safety
 \* - the actual data under the locks — AwaSegmentedStorage covers that
-\* - Postgres's lock_timeout or deadlock detector abort choice — we
+\* - Postgres's NOWAIT or deadlock detector abort choice — we
 \*   flag cycles as safety violations so the spec fails fast rather
 \*   than modelling the race-to-abort
 \* - implicit table-level locks beyond what is explicitly named in each
@@ -221,34 +221,54 @@ OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
        Step(ReadyChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared) >>
 
-\* complete_runtime_batch receipt branch (ADR-023)
+\* complete_runtime_batch receipt branch (ADR-023/026)
 \*   No queue_lanes lock (completion does not gate on a lane row)
-\*   INSERT INTO lease_claim_closures (routed to the originating claim_slot)
-\*   INSERT INTO done_entries / dlq_entries / deferred_jobs
+\*   Successful receipt completion uses done_entries as durable closure
+\*   evidence and does not insert lease_claim_closures on the hot path.
+\*   Non-success close paths are modelled by CloseReceiptPlan /
+\*   CancelReceiptOnlyPlan / CancelRunningPlan.
 CompletePlan(claimSlot, readySlot) ==
-    << Step(ClosureChildResource(claimSlot), ModeShared),
-       Step(DoneChildResource(readySlot), ModeShared) >>
+    << Step(DoneChildResource(readySlot), ModeShared) >>
 
-\* close_receipt_tx (queue_storage.rs:5450, called from cancel_job_tx)
+\* close_receipt_tx (queue_storage.rs:6517, called from cancel_job_tx)
 \*   WITH locked_claim AS (SELECT ... FROM lease_claims FOR UPDATE)
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
 CloseReceiptPlan(claimSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
-\* rescue_stale_receipt_claims_tx (queue_storage.rs:6672)
+\* rescue_stale_receipt_claims_tx (queue_storage.rs:8195)
+\*   plain SELECT of claim_ring_state to prefer the oldest initialized slot
+\*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
 \*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)
 \*     FOR UPDATE OF claims SKIP LOCKED
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
+\*   UPDATE claim_ring_slots[slot] rescue cursor
 \* The leases anti-join takes AccessShare on the leases
 \* parent so rescue can race against prune_oldest_leases.
 RescueReceiptsPlan(claimSlot) ==
-    << Step(ClaimChildResource(claimSlot), ModeShared),
+    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
+       Step(ClaimChildResource(claimSlot), ModeShared),
        Step(LeasesParentResource, ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
-\* ensure_running_leases_from_receipts_tx (queue_storage.rs:6102)
+\* rescue_expired_receipt_deadlines_tx
+\*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
+\*   bounded scan of lease_claims_<slot> ordered by deadline_at
+\*   anti-join lease_claim_closures_<slot> and leases parent
+\*   FOR UPDATE OF expired claim rows SKIP LOCKED
+\*   INSERT INTO lease_claim_closures ... deadline_expired
+\*   UPDATE claim_ring_slots[slot] deadline cursor
+\* Same resource order as stale receipt rescue; only the index order and
+\* advancement predicate differ.
+RescueReceiptDeadlinesPlan(claimSlot) ==
+    << Step(ClaimRingSlotResource(claimSlot), ModeExclusive),
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared) >>
+
+\* ensure_running_leases_from_receipts_tx (queue_storage.rs:7574)
 \*   CTE claim_refs: SELECT ... FROM lease_claims FOR UPDATE OF claims
 \*   INSERT INTO leases ...
 \*   UPDATE lease_claims SET materialized_at = ...
@@ -256,7 +276,7 @@ EnsureRunningPlan(claimSlot, leaseSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
-\* cancel_job_tx receipt-only branch (queue_storage.rs:5621)
+\* cancel_job_tx receipt-only branch (queue_storage.rs:6568)
 \*   SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED
 \*   insert_done_rows_tx → INSERT INTO done_entries
 \*   INSERT INTO lease_claim_closures
@@ -276,6 +296,15 @@ CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
 CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
     << Step(LeaseChildResource(leaseSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared),
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared) >>
+
+\* terminal-delete paths that remove done_entries evidence before claim prune
+\* can consume the corresponding receipt. Rust materializes an explicit
+\* closure in the same transaction. The representative plan covers
+\* retry-from-terminal, DLQ move, discard, and SQL compatibility delete.
+TerminalDeletePlan(readySlot, claimSlot) ==
+    << Step(DoneChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClosureChildResource(claimSlot), ModeShared) >>
 
@@ -306,7 +335,7 @@ RotateLeasesPlan(nextSlot) ==
 \* prune_oldest_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
 \*   SELECT ... FROM lease_ring_slots[slot] FOR UPDATE
-\*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE
+\*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE NOWAIT
 PruneLeasesPlan(slot) ==
     << Step(LeaseRingStateResource, ModeExclusive),
        Step(LeaseRingSlotResource(slot), ModeExclusive),
@@ -320,7 +349,7 @@ RotateReadyPlan(nextSlot) ==
 \* prune_oldest
 \*   SELECT ... FROM queue_ring_state FOR UPDATE
 \*   SELECT ... FROM queue_ring_slots FOR UPDATE
-\*   LOCK TABLE ready_child[slot], done_child[slot] ACCESS EXCLUSIVE
+\*   LOCK TABLE ready_child[slot], done_child[slot] ACCESS EXCLUSIVE NOWAIT
 \*   SELECT count FROM leases WHERE ready_slot = $1 (AccessShare on leases parent)
 PruneReadyPlan(slot) ==
     << Step(QueueRingStateResource, ModeExclusive),
@@ -342,8 +371,8 @@ RotateClaimsPlan(nextSlot) ==
 \* prune_oldest_claims (ADR-023)
 \*   SELECT ... FROM claim_ring_state FOR UPDATE
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
-\*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE
-\*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE
+\*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE NOWAIT
+\*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE NOWAIT
 \*   rescue-before-truncate: close any still-open claims via the
 \*     existing receipt-rescue path (modelled at the data-spec level, no
 \*     extra locks here because the rescue uses the same child AccessExclusive)
@@ -507,6 +536,15 @@ StartRescueReceipts(t, claimSlot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartRescueReceiptDeadlines(t, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = RescueReceiptDeadlinesPlan(claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 StartEnsureRunning(t, claimSlot, leaseSlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -536,6 +574,16 @@ StartCancelRunning(t, leaseSlot, readySlot, claimSlot) ==
     /\ claimSlot \in ClaimSlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = CancelRunningPlan(leaseSlot, readySlot, claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartTerminalDelete(t, readySlot, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ readySlot \in ReadySlots
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = TerminalDeletePlan(readySlot, claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
@@ -608,6 +656,7 @@ Next ==
     \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartCloseReceipt(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceipts(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceiptDeadlines(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots, ls \in LeaseSlots :
           StartEnsureRunning(t, cs, ls)
     \/ \E t \in TxIds, cs \in ClaimSlots, rs \in ReadySlots,
@@ -616,6 +665,8 @@ Next ==
     \/ \E t \in TxIds, ls \in LeaseSlots, rs \in ReadySlots,
          cs \in ClaimSlots :
            StartCancelRunning(t, ls, rs, cs)
+    \/ \E t \in TxIds, rs \in ReadySlots, cs \in ClaimSlots :
+          StartTerminalDelete(t, rs, cs)
     \/ \E t \in TxIds, srcQ \in Queues, dstQ \in Queues,
          srcP \in Priorities, dstP \in Priorities, rs \in ReadySlots :
           StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)

@@ -528,7 +528,7 @@ let client = Client::builder(pool.clone())
             ..Default::default()
         },
         Duration::from_millis(1_000),
-        Duration::from_millis(250),
+        Duration::from_millis(1_000),
     )
     .claim_rotate_interval(Duration::from_millis(1_000))
     .build()?;
@@ -545,7 +545,7 @@ await client.start(
     queue_storage_claim_slot_count=8,
     queue_storage_queue_stripe_count=1,
     queue_storage_queue_rotate_interval_ms=1000,
-    queue_storage_lease_rotate_interval_ms=250,
+    queue_storage_lease_rotate_interval_ms=1000,
     queue_storage_claim_rotate_interval_ms=1000,
 )
 ```
@@ -556,11 +556,11 @@ await client.start(
 | --- | --- | --- |
 | `queue_slot_count` | `16` | Number of rotating ready/tombstone/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. Ready-backed terminal rows rely on the matching ready partition until queue prune reclaims both. |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
-| `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
+| `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`; each slot also has a tiny stale-rescue cursor in `claim_ring_slots`. |
 | `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current tuned recommendation; higher values should be benchmarked before use. |
-| `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring prune). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
+| `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; successful completion uses `done_entries` as closure evidence; non-success exits write explicit closures into `lease_claim_closures`; both receipt tables are reclaimed by claim-ring prune). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
-| `lease_rotate_interval` | `250ms` | How often lease segments rotate |
+| `lease_rotate_interval` | `1000ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions. |
 
 The benchmark harness in [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking) reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.

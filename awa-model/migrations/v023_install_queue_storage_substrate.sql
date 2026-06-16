@@ -260,9 +260,71 @@ BEGIN
     EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.claim_ring_slots (
-            slot       INT PRIMARY KEY,
-            generation BIGINT NOT NULL
+            slot                       INT PRIMARY KEY,
+            generation                 BIGINT NOT NULL,
+            rescue_cursor_claimed_at   TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            rescue_cursor_job_id       BIGINT NOT NULL DEFAULT 0,
+            rescue_cursor_run_lease    BIGINT NOT NULL DEFAULT 0,
+            deadline_cursor_deadline_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            deadline_cursor_job_id      BIGINT NOT NULL DEFAULT 0,
+            deadline_cursor_run_lease   BIGINT NOT NULL DEFAULT 0
         )
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.claim_ring_slots
+            ADD COLUMN IF NOT EXISTS rescue_cursor_claimed_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            ADD COLUMN IF NOT EXISTS rescue_cursor_job_id BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS rescue_cursor_run_lease BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS deadline_cursor_deadline_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            ADD COLUMN IF NOT EXISTS deadline_cursor_job_id BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS deadline_cursor_run_lease BIGINT NOT NULL DEFAULT 0
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_claimed_at IS
+            'Receipt-rescue sweep cursor: claimed_at component of the last claim visited in this slot; stale unclosed claims stop advancement until rescue closes them, and fresh claims are revisited after wrap.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_job_id IS
+            'Receipt-rescue sweep cursor tie-breaker: job_id component of the last claim visited in this slot.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.rescue_cursor_run_lease IS
+            'Receipt-rescue sweep cursor tie-breaker: run_lease component of the last claim visited in this slot.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.deadline_cursor_deadline_at IS
+            'Receipt deadline-rescue sweep cursor: deadline_at component of the last deadline claim visited in this slot; open future deadlines stop advancement until they expire or close.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.deadline_cursor_job_id IS
+            'Receipt deadline-rescue sweep cursor tie-breaker: job_id component of the last deadline claim visited in this slot.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.deadline_cursor_run_lease IS
+            'Receipt deadline-rescue sweep cursor tie-breaker: run_lease component of the last deadline claim visited in this slot.'
         $ddl$,
         p_schema
     );
@@ -944,7 +1006,17 @@ BEGIN
     );
 
     EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS idx_%s_lease_claims_rescue_cursor ON %I.lease_claims (claimed_at, job_id, run_lease)',
+        p_schema, p_schema
+    );
+
+    EXECUTE format(
         'CREATE INDEX IF NOT EXISTS idx_%s_lease_claims_deadline_brin ON %I.lease_claims USING BRIN (deadline_at) WITH (pages_per_range = 16)',
+        p_schema, p_schema
+    );
+
+    EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS idx_%s_lease_claims_deadline_cursor ON %I.lease_claims (deadline_at, job_id, run_lease) WHERE deadline_at IS NOT NULL',
         p_schema, p_schema
     );
 
