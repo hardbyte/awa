@@ -17,6 +17,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - **Breaking (beta series): `PruneOutcome::Pruned` gains a `carried_failed_rows` field** ([#337](https://github.com/hardbyte/awa/issues/337)) — `Pruned { slot, carried_failed_rows }`; exhaustive matches on `PruneOutcome` need the new binding.
 - **Breaking (beta series): `QueueStorage::prune_oldest` takes a `failed_retention: Duration`** ([#337](https://github.com/hardbyte/awa/issues/337)). `Duration::ZERO` disables the floor; `MaintenanceService` passes its configured `failed_retention`. `QueueCounts` gains a `pruned_failed: i64` field.
 
+### Fixed
+
+- **Compact claims close into the compact closure ledger on every path** ([#352](https://github.com/hardbyte/awa/pull/352)). Receipt rescue, terminal close (completion / fail / retryable / cancel), and admin cancel of a compact (zero-deadline) claim now write a `lease_claim_closure_batches` row instead of an explicit `lease_claim_closures` row. A compact claim has no `lease_claims` row, so an explicit closure was invisible to the queue-ring prune count proof and wedged the slot on `SkippedActive { QueueUnclosedClaimRefs }` until the claim ring pruned. Deadline-backed row-local claims continue to write explicit closures.
+
 ## [0.6.0-beta.2] — 2026-06-10
 
 Second beta of the 0.6 line. The headline is storage-engine work under pinned MVCC horizons ([#169](https://github.com/hardbyte/awa/issues/169)): sequence-backed cursors, append-only ready segments, and a terminal-count delta ledger replace the remaining hot-row update paths that beta.1 still carried. This is also the release the #169 stable gate will be validated against — see "Benchmark evidence" below.

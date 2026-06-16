@@ -252,8 +252,12 @@ ClaimLegacyTx == <<
 \* retained batch ledger directly; terminal-count deltas are reserved for
 \* done_entries terminal mutations. Terminal history and claim-closure evidence
 \* are separate partition-truncated ledgers.
-\* Non-success, cancellation, rescue, and wide terminal paths still use
-\* explicit lease_claim_closures.
+\* Non-success, cancellation, rescue, and wide terminal paths close by claim
+\* shape: a row-local lease_claims claim appends an explicit
+\* lease_claim_closures row, while a compact lease_claim_batches claim (which
+\* has no lease_claims row to balance an explicit closure against in the prune
+\* count proofs) appends a lease_claim_closure_batches row. Both closure
+\* children are partition-truncated hot ledgers.
 CompleteReceiptsTx == <<
     Mut("Insert", "receipt_completion_batches"),
     Mut("Insert", "lease_claim_closure_batches"),
@@ -271,22 +275,30 @@ CompleteLegacyTx == <<
     Mut("Delete", "attempt_state")
 >>
 
-\* close_receipt_tx — queue_storage.rs:6517
-\* Used by cancel_job_tx and the rescue path.
+\* close_receipt_pairs_tx — the general receipt closer (cancel, rescue,
+\* terminal-delete). A row-local lease_claims claim appends an explicit
+\* lease_claim_closures row and stamps lease_claims.closed_at; a compact
+\* lease_claim_batches claim appends a lease_claim_closure_batches row instead
+\* (no lease_claims row exists for it). A given transaction takes whichever arm
+\* matches the claim shape; both closure children are partition-truncated hot
+\* ledgers.
 CloseReceiptTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
     Mut("Update", "lease_claims")
 >>
 
-\* rescue_stale_receipt_claims_tx — queue_storage.rs:8195
-\* Sweeps from the per-slot claim_ring_slots rescue cursor, anti-joins
-\* lease_claims against closures + leases, closes stale stragglers by
-\* appending to lease_claim_closures, then advances the tiny
-\* control-plane cursor across closed, lease-managed, fresh, or newly
-\* rescued rows. Stale open rows not closed by the transaction stop the
-\* cursor until a later pass.
+\* rescue_stale_receipt_claims_for_slot_tx — sweeps from the per-slot
+\* claim_ring_slots rescue cursor, anti-joins lease_claims and
+\* lease_claim_batches against both closure ledgers + leases, and closes stale
+\* stragglers: a row-local claim appends to lease_claim_closures and stamps
+\* lease_claims.closed_at, a compact batch claim appends to
+\* lease_claim_closure_batches. It then advances the tiny control-plane cursor
+\* across closed, lease-managed, fresh, or newly rescued rows. Stale open rows
+\* not closed by the transaction stop the cursor until a later pass.
 RescueReceiptsTx == <<
     Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
     Mut("Update", "lease_claims"),
     Mut("Update", "claim_ring_slots")
 >>
@@ -312,23 +324,29 @@ EnsureRunningTx == <<
     Mut("Update", "lease_claims")
 >>
 
-\* cancel_job_tx receipt-only branch — queue_storage.rs:6568
-\* Closes the receipt with a `cancelled` outcome, inserts a done row,
-\* defensively deletes any orphan lease.
+\* cancel_job_tx receipt-only branch — closes the receipt with a `cancelled`
+\* outcome, inserts a done row, defensively deletes any orphan lease. A
+\* row-local claim closes into lease_claim_closures (+ lease_claims.closed_at);
+\* a compact batch claim closes into lease_claim_closure_batches instead.
 CancelReceiptOnlyTx == <<
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
     Mut("Update", "lease_claims"),
     Mut("Delete", "leases")
 >>
 
-\* cancel_job_tx running-lease branch — queue_storage.rs ~:5581
+\* cancel_job_tx running-lease branch — deletes the materialized lease, writes
+\* the done row, and closes the underlying receipt via close_receipt_pairs_tx:
+\* a row-local claim into lease_claim_closures, a compact batch claim into
+\* lease_claim_closure_batches.
 CancelRunningTx == <<
     Mut("Delete", "leases"),
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas"),
     Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
     Mut("Update", "lease_claims")
 >>
 

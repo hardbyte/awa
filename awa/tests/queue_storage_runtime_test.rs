@@ -4037,7 +4037,7 @@ async fn test_queue_storage_late_completion_after_cancel_is_noop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_receipt_cancel_writes_explicit_closure() {
+async fn test_queue_storage_receipt_cancel_writes_batch_closure() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_cancel_closure";
     let schema = "awa_qs_receipt_cancel_closure";
@@ -4079,8 +4079,13 @@ async fn test_queue_storage_receipt_cancel_writes_explicit_closure() {
     assert_eq!(cancelled.state, JobState::Cancelled);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "a compact (batch-sourced) claim has no lease_claims row, so cancel closes it through the batch ledger rather than an explicit closure"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         1,
-        "cancelled receipt-backed attempts must keep explicit closure evidence"
+        "cancelled compact attempts keep batch closure evidence"
     );
 
     let completed = store
@@ -4563,6 +4568,234 @@ async fn test_queue_storage_sql_compat_delete_tombstones_compact_receipt_complet
         other => panic!(
             "compat-deleted terminal should leave enough closure evidence to prune claim slot, got {other:?}"
         ),
+    }
+}
+
+/// A compact (zero-deadline, receipts-mode) claim that is rescued while
+/// still open must close into `lease_claim_closure_batches`, NOT an
+/// explicit `lease_claim_closures` row. The compact claim has only a
+/// `lease_claim_batches` row (no `lease_claims` row), so the queue prune
+/// gate `queue_prune_has_unclosed_claim_refs_tx` can only see the closure
+/// through the batch ledger's `compact_count`. An explicit closure for it
+/// is invisible to the gate (its `explicit_count` JOINs `lease_claims`),
+/// which permanently wedged the queue slot on
+/// `SkippedActive { QueueUnclosedClaimRefs }` until the claim ring pruned.
+/// This drives the rescue path directly and proves the queue slot prunes
+/// without first pruning the claim ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_rescued_compact_claim_closes_via_batch_and_queue_prunes() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_rescue_compact_batch_closure";
+    let schema = "awa_qs_rescue_compact_batch_closure";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 31 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Compact claim: zero deadline routes into lease_claim_batches with no
+    // lease_claims row.
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("compact claim of zero-deadline job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert!(
+        claimed[0].claim.lease_claim_receipt,
+        "zero-deadline receipt claim must be compact"
+    );
+    let run_lease = claimed[0].job.run_lease;
+    assert_eq!(
+        lease_claim_batch_count(&pool, &store).await,
+        1,
+        "compact claim must land in lease_claim_batches"
+    );
+    assert_eq!(
+        lease_claim_count(&pool, &store).await,
+        0,
+        "compact claim must not write a lease_claims row"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
+
+    // Make the open claim stale so heartbeat rescue force-closes it. The
+    // compact claim has no attempt_state row, so the rescue staleness
+    // predicate falls back to claimed_at.
+    age_receipt_claim(&pool, &store, job_id, run_lease, Duration::from_secs(600)).await;
+
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::from_secs(60))
+        .await
+        .expect("rescue stale compact claim");
+    assert_eq!(rescued.len(), 1, "stale compact claim must be rescued");
+    assert_eq!(rescued[0].id, job_id);
+
+    // Core fix assertion: the rescue closed the compact claim into the
+    // batch ledger, not the explicit closure table.
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        0,
+        "rescue of a compact claim must not write an explicit closure row"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "rescue of a compact claim must close it via lease_claim_closure_batches"
+    );
+    assert_eq!(
+        open_receipt_claim_count(&pool, &store).await,
+        0,
+        "the rescued compact claim must read as closed"
+    );
+
+    // Rotate the QUEUE ring off slot 0 so prune_oldest targets it.
+    match store.rotate(&pool).await.expect("rotate queue ring") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("expected queue ring rotation to slot 1, got {other:?}"),
+    }
+
+    // The queue slot must prune WITHOUT first pruning the claim ring: the
+    // batch closure is visible to the queue prune gate via compact_count.
+    let prune_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let outcome = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("prune oldest queue slot after compact rescue");
+        match outcome {
+            PruneOutcome::Pruned { slot, .. } => {
+                assert_eq!(slot, 0);
+                break;
+            }
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                continue;
+            }
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::QueueUnclosedClaimRefs,
+                ..
+            } => panic!(
+                "compact claim closed via batch ledger must not wedge queue prune on unclosed claim refs"
+            ),
+            other => panic!("unexpected prune outcome after compact rescue: {other:?}"),
+        }
+    }
+}
+
+/// Terminal close (admin cancel) of an OPEN compact claim must also close
+/// it into `lease_claim_closure_batches` rather than an explicit closure
+/// row, for the same queue-prune-visibility reason as the rescue path.
+/// Admin cancel of a never-materialized compact claim routes through the
+/// receipt-only cancel branch in `cancel_job_tx`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_cancelled_compact_claim_closes_via_batch_and_queue_prunes() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_cancel_compact_batch_closure";
+    let schema = "awa_qs_cancel_compact_batch_closure";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 32 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("compact claim of zero-deadline job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert!(claimed[0].claim.lease_claim_receipt);
+    assert_eq!(lease_claim_batch_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
+
+    let cancelled = store
+        .cancel_job(&pool, job_id)
+        .await
+        .expect("cancel open compact claim")
+        .expect("cancel must move the compact claim to a terminal row");
+    assert_eq!(cancelled.id, job_id);
+    assert_eq!(cancelled.state, JobState::Cancelled);
+
+    // Core fix assertion: cancel of a compact claim closes it via the
+    // batch ledger, not an explicit closure row.
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        0,
+        "cancel of a compact claim must not write an explicit closure row"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        1,
+        "cancel of a compact claim must close it via lease_claim_closure_batches"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+
+    match store.rotate(&pool).await.expect("rotate queue ring") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("expected queue ring rotation to slot 1, got {other:?}"),
+    }
+
+    let prune_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let outcome = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("prune oldest queue slot after compact cancel");
+        match outcome {
+            PruneOutcome::Pruned { slot, .. } => {
+                assert_eq!(slot, 0);
+                break;
+            }
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                continue;
+            }
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::QueueUnclosedClaimRefs,
+                ..
+            } => panic!(
+                "compact claim closed via batch ledger must not wedge queue prune on unclosed claim refs"
+            ),
+            other => panic!("unexpected prune outcome after compact cancel: {other:?}"),
+        }
     }
 }
 
@@ -5452,8 +5685,13 @@ async fn test_queue_storage_queue_counts_do_not_double_count_materialized_receip
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "the materialized attempt's claim is compact (batch-sourced), so completion closes it through the batch ledger, not an explicit closure"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         1,
-        "successful materialized receipt completion must close the receipt claim"
+        "successful materialized receipt completion must close the compact claim via the batch ledger"
     );
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
 }
@@ -5544,8 +5782,13 @@ async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rota
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "the materialized attempt's claim is compact (batch-sourced), so completion closes it through the batch ledger, not an explicit closure"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         1,
-        "materialized receipt completion should close through explicit receipt evidence"
+        "materialized receipt completion should close through the compact batch ledger"
     );
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
 
@@ -5621,8 +5864,13 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
     assert_eq!(lease_claim_batch_count(&pool, &store).await, 2);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
-        1,
-        "retryable failure closes explicitly; compact final success closes through receipt_completion_batches"
+        0,
+        "both compact attempts are batch-sourced, so neither writes an explicit closure row"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
+        2,
+        "the retryable failure and the final compact success each close their compact claim through the batch ledger"
     );
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -5681,8 +5929,13 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "a compact (batch-sourced) claim has no lease_claims row, so a retryable failure closes it through lease_claim_closure_batches, not an explicit closure"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         1,
-        "retryable receipt failure closes the receipt claim"
+        "retryable receipt failure closes the compact claim via the batch ledger"
     );
 }
 
@@ -5812,8 +6065,13 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "both attempts are compact (batch-sourced), so neither the rescue nor the retry success writes an explicit closure row"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         2,
-        "rescue closes the stale receipt and this worker's retry success uses the general closure path"
+        "rescue of the stale compact attempt and the retry success each close their compact claim through the batch ledger"
     );
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -6616,8 +6874,13 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "both attempts are compact (batch-sourced), so neither the rescue nor the retry success writes an explicit closure row"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         2,
-        "rescue closes the stale receipt and this worker's retry success uses the general closure path"
+        "rescue of the stale compact attempt and the retry success each close their compact claim through the batch ledger"
     );
 
     release.notify_waiters();
@@ -6645,8 +6908,13 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(current.attempt, 2);
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "late stale completion must not add an explicit closure for either compact attempt"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         2,
-        "late stale completion must not change the closed receipt set"
+        "late stale completion must not change the closed receipt set held in the batch ledger"
     );
 
     client.shutdown(Duration::from_secs(5)).await;

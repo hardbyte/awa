@@ -158,6 +158,26 @@ async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) ->
     .expect("count lease_claim_closures")
 }
 
+async fn lease_claim_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.lease_claim_batches",
+        store.schema()
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("count lease_claim_batches")
+}
+
+async fn lease_claim_closure_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.lease_claim_closure_batches",
+        store.schema()
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("count lease_claim_closure_batches")
+}
+
 async fn leases_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {}.leases",
@@ -535,8 +555,8 @@ async fn test_admin_cancel_during_materialize_no_orphan_lease() {
     .await
     .expect("read job_id");
 
-    // Drive a real claim through the store to populate lease_claims
-    // with a runtime-shaped row.
+    // Drive a real claim through the store. A zero-deadline claim is
+    // compact, so it populates lease_claim_batches (no lease_claims row).
     let claimed = store
         .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
         .await
@@ -573,11 +593,21 @@ async fn test_admin_cancel_during_materialize_no_orphan_lease() {
     );
     assert_eq!(
         lease_claim_count(&pool, &store).await,
+        0,
+        "test setup: a compact claim has no lease_claims row"
+    );
+    assert_eq!(
+        lease_claim_batch_count(&pool, &store).await,
         1,
-        "test setup: one claim row present"
+        "test setup: one compact claim batch present"
     );
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "test setup: no closure yet"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         0,
         "test setup: no closure yet"
     );
@@ -593,8 +623,13 @@ async fn test_admin_cancel_during_materialize_no_orphan_lease() {
     );
     assert_eq!(
         lease_claim_closure_count(&pool, &store).await,
+        0,
+        "a compact claim has no lease_claims row, so cancel closes it on the batch ledger, not an explicit closure"
+    );
+    assert_eq!(
+        lease_claim_closure_batch_count(&pool, &store).await,
         1,
-        "cancel must write a closure on the receipt plane"
+        "cancel must write a compact closure batch on the receipt plane"
     );
 
     let job = store
