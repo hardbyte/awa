@@ -162,6 +162,17 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
                   AND table_name = 'lease_claim_closure_batches'
                   AND column_name = 'receipt_ranges'
             )
+            AND (
+                SELECT count(*) = 3
+                FROM information_schema.columns
+                WHERE table_schema = $1
+                  AND table_name = 'queue_claim_heads'
+                  AND column_name = ANY(ARRAY[
+                      'ready_segment_slot',
+                      'ready_segment_generation',
+                      'ready_segment_next_lane_seq'
+                  ])
+            )
             AND EXISTS (
                 SELECT 1
                 FROM pg_proc AS p

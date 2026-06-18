@@ -497,6 +497,25 @@ BEGIN
         p_schema
     );
 
+    -- ready_segment_* are a legacy claim-routing cache. claim_ready_runtime no
+    -- longer reads or writes them — it resolves the target ready slot from
+    -- ready_segments on every claim — but they are retained UNUSED so workers
+    -- still on the previous queue_storage_schema_ready check start cleanly
+    -- during a rolling upgrade. Dropping them is a breaking change deferred to a
+    -- major version per the additive-only migration policy (see migrations.rs).
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS ready_segment_slot INT',
+        p_schema
+    );
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS ready_segment_generation BIGINT',
+        p_schema
+    );
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS ready_segment_next_lane_seq BIGINT',
+        p_schema
+    );
+
     EXECUTE format(
         $ddl$
         ALTER TABLE %I.queue_claim_heads SET (
@@ -3084,10 +3103,14 @@ BEGIN
                       AND segment.priority = claims.priority
                       AND segment.enqueue_shard = claims.enqueue_shard
                       AND segment.next_lane_seq > cursors.claim_seq
-                    -- Ready segments are disjoint contiguous lane ranges, so the
-                    -- segment with the smallest next_lane_seq > claim_seq is the
-                    -- same containing segment as the smallest first_lane_seq.
-                    -- Ordering by next_lane_seq lets the
+                    -- Ready segments are non-overlapping and visibility-ordered
+                    -- (aborted sequence reservations can leave gaps, so they are
+                    -- not strictly contiguous). The smallest next_lane_seq >
+                    -- claim_seq is therefore the next segment covering or after
+                    -- the cursor; the later ready_entries lookup validates the
+                    -- target row, so a gap just falls through to the next real
+                    -- entry rather than emitting phantom work. Ordering by
+                    -- next_lane_seq lets the
                     -- (queue, priority, enqueue_shard, next_lane_seq, ...) index
                     -- short-circuit at LIMIT 1 instead of materialising and
                     -- sorting the whole tail (which grows with the claim cursor).
@@ -3164,9 +3187,9 @@ BEGIN
                       AND segment.priority = v_lane_priority
                       AND segment.enqueue_shard = v_lane_shard
                       AND segment.next_lane_seq > v_lane_claim_seq
-                    -- Order by next_lane_seq (same disjoint-range containing
-                    -- segment as first_lane_seq) so the index short-circuits at
-                    -- LIMIT 1; see the inline routing probe above.
+                    -- Order by next_lane_seq (non-overlapping segments, so this
+                    -- is the next segment covering or after the cursor) for the
+                    -- index short-circuit; see the inline routing probe above.
                     ORDER BY segment.next_lane_seq ASC
                     LIMIT 1
                 ) AS segment

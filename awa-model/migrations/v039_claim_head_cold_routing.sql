@@ -1,17 +1,19 @@
--- v039: drop the queue_claim_heads ready-segment routing cache.
+-- v039: refresh claim_ready_runtime to the cache-free ready-segment routing path.
 --
--- v023 owns the queue-storage substrate helper. The migration runner reapplies
--- the helper definition before this file, so claim_ready_runtime() is already
--- redefined to resolve the ready slot/generation from ready_segments on every
--- claim, and fresh installs no longer create the ready_segment_* columns.
+-- v023 owns the queue-storage substrate helper; the migration runner reapplies
+-- it before this file, so claim_ready_runtime() is already redefined to resolve
+-- the target ready slot from ready_segments on every claim (ordered by
+-- next_lane_seq so the existing index short-circuits at LIMIT 1) instead of
+-- caching the result back onto the singleton queue_claim_heads row. That
+-- per-claim UPDATE was the dominant dead-tuple accumulator under a pinned MVCC
+-- snapshot.
 --
--- This migration refreshes every already-installed queue-storage schema (so the
--- cache-free claim_ready_runtime() reaches awa and any in-transition awa_exp)
--- and then drops the now-unused cache columns. The cache re-introduced a
--- per-claim UPDATE on a single hot queue_claim_heads row whose dead tuples could
--- not be reclaimed under a pinned MVCC snapshot, which made queue_claim_heads
--- the dominant dead-tuple accumulator during long-running transactions. The
--- table returns to the cold lane-registry shape #295 intended.
+-- This migration refreshes every already-installed queue-storage schema so the
+-- cache-free function reaches awa and any in-transition awa_exp. The
+-- ready_segment_* cache columns are intentionally LEFT IN PLACE: the
+-- additive-only migration policy (migrations.rs) forbids dropping columns that a
+-- rolling worker's queue_storage_schema_ready check still requires. They are
+-- unused after this migration; a future major version can drop them.
 
 DO $$
 DECLARE
@@ -74,23 +76,10 @@ BEGIN
             v_claim_slots,
             v_lease_claim_receipts
         );
-
-        EXECUTE format(
-            'ALTER TABLE %I.queue_claim_heads DROP COLUMN IF EXISTS ready_segment_slot',
-            v_schema
-        );
-        EXECUTE format(
-            'ALTER TABLE %I.queue_claim_heads DROP COLUMN IF EXISTS ready_segment_generation',
-            v_schema
-        );
-        EXECUTE format(
-            'ALTER TABLE %I.queue_claim_heads DROP COLUMN IF EXISTS ready_segment_next_lane_seq',
-            v_schema
-        );
     END LOOP;
 END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (39, 'Drop queue_claim_heads ready-segment routing cache for queue storage')
+VALUES (39, 'Refresh claim_ready_runtime to cache-free ready-segment routing')
 ON CONFLICT (version) DO NOTHING;
