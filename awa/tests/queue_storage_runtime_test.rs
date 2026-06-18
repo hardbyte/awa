@@ -1430,22 +1430,11 @@ async fn test_queue_storage_completed_done_row_is_narrow_and_hydrates_from_ready
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_queue_storage_claim_runtime_populates_ready_segment_cache() {
+async fn test_queue_storage_claim_runtime_does_not_write_ready_segment_cache() {
     let (_db_guard, pool) = setup_pool(6).await;
-    let queue = "qs_claim_segment_cache";
-    let schema = "awa_qs_claim_segment_cache";
-    let store = create_store_with_config(
-        &pool,
-        QueueStorageConfig {
-            schema: schema.to_string(),
-            queue_slot_count: 4,
-            lease_slot_count: 2,
-            claim_slot_count: 2,
-            lease_claim_receipts: true,
-            ..Default::default()
-        },
-    )
-    .await;
+    let queue = "qs_claim_segment_cache_cold";
+    let schema = "awa_qs_claim_segment_cache_cold";
+    let store = create_store(&pool, schema).await;
     enqueue_job(
         &pool,
         &store,
@@ -1457,10 +1446,24 @@ async fn test_queue_storage_claim_runtime_populates_ready_segment_cache() {
     )
     .await;
 
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.queue_claim_heads
+        SET ready_segment_slot = -17,
+            ready_segment_generation = -18,
+            ready_segment_next_lane_seq = -19
+        WHERE queue = $1
+        "#
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed legacy ready-segment cache sentinels");
+
     let claimed = store
         .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
         .await
-        .expect("Failed to claim cached segment job");
+        .expect("Failed to claim cache-free segment job");
     let claimed = claimed.into_iter().next().expect("missing claimed job");
 
     let (cached_slot, cached_generation, cached_next): (Option<i32>, Option<i64>, Option<i64>) =
@@ -1478,21 +1481,12 @@ async fn test_queue_storage_claim_runtime_populates_ready_segment_cache() {
         .bind(claimed.claim.enqueue_shard)
         .fetch_one(&pool)
         .await
-        .expect("fetch ready segment cache");
+        .expect("fetch retained ready segment cache columns");
 
     assert_eq!(
-        cached_slot,
-        Some(claimed.claim.ready_slot),
-        "claim routing cache should point at the ready slot that produced the claim"
-    );
-    assert_eq!(
-        cached_generation,
-        Some(claimed.claim.ready_generation),
-        "claim routing cache should point at the ready generation that produced the claim"
-    );
-    assert!(
-        cached_next.unwrap_or_default() > claimed.claim.lane_seq,
-        "claim routing cache should retain an exclusive upper lane bound beyond the claimed lane"
+        (cached_slot, cached_generation, cached_next),
+        (Some(-17), Some(-18), Some(-19)),
+        "claim routing must not write the retained legacy ready-segment cache columns"
     );
 }
 

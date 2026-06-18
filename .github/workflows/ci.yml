@@ -4,11 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
   DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
+# PRs default to a low-minute gate so AWA does not monopolize shared Actions
+# capacity across repositories. Add the `full-ci` label, dispatch CI manually,
+# or merge to main to run the expensive DB/Python/E2E/smoke matrix.
 
 jobs:
   # ─── Rust ───────────────────────────────────────────────
@@ -46,6 +55,7 @@ jobs:
   rust-test:
     name: Rust tests
     needs: [rust-build]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     # Migration replay tests are intentionally exhaustive for queue-storage
     # upgrade safety and can take ~25m on GitHub-hosted runners by themselves.
@@ -115,6 +125,7 @@ jobs:
   # ─── Python (awa-python) ────────────────────────────────
   python-build-test:
     name: Python build + test
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     services:
@@ -190,6 +201,7 @@ jobs:
 
   frontend-e2e:
     name: Frontend E2E tests
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     # 20m has been hitting the wall on slow GH-hosted runners — the
     # full Playwright suite (8 specs) plus per-test PG seeding is on
@@ -242,6 +254,7 @@ jobs:
   # ─── CLI wheel build test ───────────────────────────────
   cli-wheel-build:
     name: CLI wheel build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -264,6 +277,7 @@ jobs:
   cli-smoke:
     name: CLI smoke test
     needs: [rust-build]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -314,6 +328,7 @@ jobs:
   chaos-smoke:
     name: Chaos smoke (mixed Rust + Python)
     needs: [rust-build]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -360,6 +375,7 @@ jobs:
   telemetry-validation:
     name: Telemetry OTLP validation
     needs: [rust-build]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:

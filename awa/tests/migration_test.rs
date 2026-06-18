@@ -2388,7 +2388,9 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
     .unwrap();
     assert_eq!(
         claim_head_cache_columns, 3,
-        "queue_claim_heads must expose the ready-segment cache columns used by claim routing"
+        "queue_claim_heads ready-segment columns are retained (additive-only migration policy) \
+         even though claim_ready_runtime no longer reads or writes them; dropping them is \
+         deferred to a major version"
     );
 }
 

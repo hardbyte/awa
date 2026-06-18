@@ -497,6 +497,12 @@ BEGIN
         p_schema
     );
 
+    -- ready_segment_* are a legacy claim-routing cache. claim_ready_runtime no
+    -- longer reads or writes them — it resolves the target ready slot from
+    -- ready_segments on every claim — but they are retained UNUSED so workers
+    -- still on the previous queue_storage_schema_ready check start cleanly
+    -- during a rolling upgrade. Dropping them is a breaking change deferred to a
+    -- major version per the additive-only migration policy (see migrations.rs).
     EXECUTE format(
         'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS ready_segment_slot INT',
         p_schema
@@ -521,22 +527,6 @@ BEGIN
         )
         $ddl$,
         p_schema
-    );
-
-    EXECUTE format(
-        'COMMENT ON COLUMN %I.queue_claim_heads.ready_segment_slot IS %L',
-        p_schema,
-        'Nullable claim-routing cache: ready slot that currently contains the lane claim cursor. This is a performance hint only; claim_ready_runtime revalidates ready rows before emitting work.'
-    );
-    EXECUTE format(
-        'COMMENT ON COLUMN %I.queue_claim_heads.ready_segment_generation IS %L',
-        p_schema,
-        'Nullable claim-routing cache: ready generation paired with ready_segment_slot.'
-    );
-    EXECUTE format(
-        'COMMENT ON COLUMN %I.queue_claim_heads.ready_segment_next_lane_seq IS %L',
-        p_schema,
-        'Nullable claim-routing cache: exclusive upper lane_seq for the cached ready slot/generation. When claim_seq reaches this value, claim_ready_runtime refreshes from ready_segments.'
     );
 
     --------------------------------------------------------------------
@@ -3061,9 +3051,6 @@ BEGIN
             v_claim_seq_name TEXT;
             v_lane_claim_seq BIGINT;
             v_lane_next_seq BIGINT;
-            v_cached_target_slot INT;
-            v_cached_target_generation BIGINT;
-            v_cached_target_next_lane_seq BIGINT;
             v_claim_limit BIGINT;
             v_claimed_count BIGINT;
             v_target_slot INT;
@@ -3083,9 +3070,6 @@ BEGIN
                 claims.seq_name,
                 cursors.claim_seq,
                 cursors.next_seq,
-                claims.ready_segment_slot,
-                claims.ready_segment_generation,
-                claims.ready_segment_next_lane_seq,
                 candidate.ready_slot,
                 candidate.ready_generation,
                 candidate.next_lane_seq
@@ -3095,9 +3079,6 @@ BEGIN
                 v_claim_seq_name,
                 v_lane_claim_seq,
                 v_lane_next_seq,
-                v_cached_target_slot,
-                v_cached_target_generation,
-                v_cached_target_next_lane_seq,
                 v_target_slot,
                 v_target_generation,
                 v_target_next_lane_seq
@@ -3112,39 +3093,28 @@ BEGIN
                     %1$I.sequence_next_value(enqueues.seq_name) AS next_seq
             ) AS cursors
             LEFT JOIN LATERAL (
-                SELECT
-                    ready.ready_slot,
-                    ready.ready_generation,
-                    claims.ready_segment_next_lane_seq AS next_lane_seq,
-                    ready.run_at
-                FROM %1$I.ready_entries AS ready
-                WHERE claims.ready_segment_slot IS NOT NULL
-                  AND claims.ready_segment_generation IS NOT NULL
-                  AND claims.ready_segment_next_lane_seq IS NOT NULL
-                  AND claims.ready_segment_next_lane_seq > cursors.claim_seq
-                  AND ready.ready_slot = claims.ready_segment_slot
-                  AND ready.ready_generation = claims.ready_segment_generation
-                  AND ready.queue = p_queue
-                  AND ready.priority = claims.priority
-                  AND ready.enqueue_shard = claims.enqueue_shard
-                  AND ready.lane_seq >= cursors.claim_seq
-                  AND ready.lane_seq < claims.ready_segment_next_lane_seq
-                ORDER BY ready.lane_seq ASC
-                LIMIT 1
-            ) AS cached_candidate ON TRUE
-            LEFT JOIN LATERAL (
                 WITH first_segment AS MATERIALIZED (
                     SELECT
                         segment.ready_slot,
                         segment.ready_generation,
                         segment.first_run_at
                     FROM %1$I.ready_segments AS segment
-                    WHERE cached_candidate.ready_slot IS NULL
-                      AND segment.queue = p_queue
+                    WHERE segment.queue = p_queue
                       AND segment.priority = claims.priority
                       AND segment.enqueue_shard = claims.enqueue_shard
                       AND segment.next_lane_seq > cursors.claim_seq
-                    ORDER BY segment.first_lane_seq ASC
+                    -- Ready segments are non-overlapping and visibility-ordered
+                    -- (aborted sequence reservations can leave gaps, so they are
+                    -- not strictly contiguous). The smallest next_lane_seq >
+                    -- claim_seq is therefore the next segment covering or after
+                    -- the cursor; the later ready_entries lookup validates the
+                    -- target row, so a gap just falls through to the next real
+                    -- entry rather than emitting phantom work. Ordering by
+                    -- next_lane_seq lets the
+                    -- (queue, priority, enqueue_shard, next_lane_seq, ...) index
+                    -- short-circuit at LIMIT 1 instead of materialising and
+                    -- sorting the whole tail (which grows with the claim cursor).
+                    ORDER BY segment.next_lane_seq ASC
                     LIMIT 1
                 )
                 SELECT
@@ -3165,10 +3135,10 @@ BEGIN
             ) AS segment_candidate ON TRUE
             CROSS JOIN LATERAL (
                 SELECT
-                    COALESCE(cached_candidate.ready_slot, segment_candidate.ready_slot) AS ready_slot,
-                    COALESCE(cached_candidate.ready_generation, segment_candidate.ready_generation) AS ready_generation,
-                    COALESCE(cached_candidate.next_lane_seq, segment_candidate.next_lane_seq) AS next_lane_seq,
-                    COALESCE(cached_candidate.run_at, segment_candidate.run_at) AS run_at
+                    segment_candidate.ready_slot AS ready_slot,
+                    segment_candidate.ready_generation AS ready_generation,
+                    segment_candidate.next_lane_seq AS next_lane_seq,
+                    segment_candidate.run_at AS run_at
             ) AS candidate
             WHERE claims.queue = p_queue
               AND NOT EXISTS (
@@ -3217,7 +3187,10 @@ BEGIN
                       AND segment.priority = v_lane_priority
                       AND segment.enqueue_shard = v_lane_shard
                       AND segment.next_lane_seq > v_lane_claim_seq
-                    ORDER BY segment.first_lane_seq ASC
+                    -- Order by next_lane_seq (non-overlapping segments, so this
+                    -- is the next segment covering or after the cursor) for the
+                    -- index short-circuit; see the inline routing probe above.
+                    ORDER BY segment.next_lane_seq ASC
                     LIMIT 1
                 ) AS segment
                 CROSS JOIN LATERAL (
@@ -3264,18 +3237,14 @@ BEGIN
                 RETURN;
             END IF;
 
-            IF v_cached_target_slot IS DISTINCT FROM v_target_slot
-               OR v_cached_target_generation IS DISTINCT FROM v_target_generation
-               OR v_cached_target_next_lane_seq IS DISTINCT FROM v_target_next_lane_seq THEN
-                UPDATE %1$I.queue_claim_heads AS claims
-                SET
-                    ready_segment_slot = v_target_slot,
-                    ready_segment_generation = v_target_generation,
-                    ready_segment_next_lane_seq = v_target_next_lane_seq
-                WHERE claims.queue = p_queue
-                  AND claims.priority = v_lane_priority
-                  AND claims.enqueue_shard = v_lane_shard;
-            END IF;
+            -- The claim head stays a cold lane registry: the ready
+            -- slot/generation is resolved from ready_segments on every claim
+            -- rather than cached back onto this row. Caching it here
+            -- re-introduced a per-claim UPDATE whose dead tuples could not be
+            -- reclaimed under a pinned MVCC snapshot, making queue_claim_heads
+            -- the dominant dead-tuple accumulator during a long-running
+            -- transaction. The ready_segments scan above is the sole routing
+            -- source now.
 
             v_claim_limit := LEAST(GREATEST(v_lane_next_seq - v_lane_claim_seq, 0), p_max_batch);
             IF v_claim_limit <= 0 THEN
