@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 38;
+pub const CURRENT_VERSION: i32 = 39;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -174,6 +174,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Add compact receipt claim batch ledger for queue storage",
         &[V23_UP, V38_UP],
     ),
+    (
+        39,
+        "Drop queue_claim_heads ready-segment routing cache for queue storage",
+        &[V23_UP, V39_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -213,6 +218,7 @@ const V35_UP: &str = include_str!("../migrations/v035_receipt_deadline_rescue_cu
 const V36_UP: &str = include_str!("../migrations/v036_compact_receipt_completions.sql");
 const V37_UP: &str = include_str!("../migrations/v037_ready_segments.sql");
 const V38_UP: &str = include_str!("../migrations/v038_compact_claim_batches.sql");
+const V39_UP: &str = include_str!("../migrations/v039_drop_claim_head_segment_cache.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
