@@ -1430,6 +1430,67 @@ async fn test_queue_storage_completed_done_row_is_narrow_and_hydrates_from_ready
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claim_runtime_does_not_write_ready_segment_cache() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_claim_segment_cache_cold";
+    let schema = "awa_qs_claim_segment_cache_cold";
+    let store = create_store(&pool, schema).await;
+    enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 42 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.queue_claim_heads
+        SET ready_segment_slot = -17,
+            ready_segment_generation = -18,
+            ready_segment_next_lane_seq = -19
+        WHERE queue = $1
+        "#
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed legacy ready-segment cache sentinels");
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim cache-free segment job");
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+
+    let (cached_slot, cached_generation, cached_next): (Option<i32>, Option<i64>, Option<i64>) =
+        sqlx::query_as(&format!(
+            r#"
+            SELECT ready_segment_slot, ready_segment_generation, ready_segment_next_lane_seq
+            FROM {schema}.queue_claim_heads
+            WHERE queue = $1
+              AND priority = $2
+              AND enqueue_shard = $3
+            "#
+        ))
+        .bind(queue)
+        .bind(claimed.claim.priority)
+        .bind(claimed.claim.enqueue_shard)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch retained ready segment cache columns");
+
+    assert_eq!(
+        (cached_slot, cached_generation, cached_next),
+        (Some(-17), Some(-18), Some(-19)),
+        "claim routing must not write the retained legacy ready-segment cache columns"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_failed_narrow_done_row_can_retry_from_ready_hydration() {
     let (_db_guard, pool) = setup_pool(6).await;
     let queue = "qs_narrow_done_retry";
