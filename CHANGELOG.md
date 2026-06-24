@@ -8,7 +8,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Added
 
-- **Transaction-scoped admin cancel** (PR_LINK_PLACEHOLDER). `admin::cancel_tx` and `admin::cancel_by_unique_key_tx` accept a caller-provided `&mut sqlx::Transaction` and run the cancellation inside it, so the cancel commits or rolls back atomically with the caller's other work and the cooperative `awa:cancel` NOTIFY to a running worker fires only on the caller's commit. The pool-based `cancel` / `cancel_by_unique_key` are unchanged. On the queue-storage engine the `_tx` variants skip the best-effort post-commit claim-cursor advance the pool variants perform — the derived queue depth can briefly over-count by one until later committed rows on the lane are claimed; canonical counts are unaffected.
+- **Transaction-scoped admin cancel** ([#357](https://github.com/hardbyte/awa/pull/357)). `admin::cancel_tx` and `admin::cancel_by_unique_key_tx` accept a caller-provided `&mut sqlx::Transaction` and run the cancellation inside it, so the cancel commits or rolls back atomically with the caller's other work and the cooperative `awa:cancel` NOTIFY to a running worker fires only on the caller's commit. The pool-based `cancel` / `cancel_by_unique_key` are unchanged. On the queue-storage engine the `_tx` variants skip the best-effort post-commit claim-cursor advance the pool variants perform — the derived queue depth can briefly over-count by one until later committed rows on the lane are claimed; canonical counts are unaffected.
 
 ## [0.6.0-rc.1] — 2026-06-24
 
