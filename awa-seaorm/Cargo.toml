@@ -14,7 +14,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 
 [dev-dependencies]
-awa-testing = { path = "../awa-testing", version = "0.6.0-beta.2" }
+awa-testing = { path = "../awa-testing", version = "0.6.0-rc.1" }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
