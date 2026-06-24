@@ -923,6 +923,73 @@ async fn test_admin_cancel_by_unique_key() {
 }
 
 #[tokio::test]
+async fn test_admin_cancel_by_unique_key_tx_is_transactional() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+    let queue = "integ_cancel_by_unique_key_tx";
+    clean_queue(client.pool(), queue).await;
+
+    let args = SendEmail {
+        to: "cancel-by-key-tx@example.com".into(),
+        subject: "Cancel me by key in a tx".into(),
+    };
+    let job = insert_with(
+        client.pool(),
+        &args,
+        InsertOpts {
+            queue: queue.into(),
+            unique: Some(UniqueOpts {
+                by_queue: true,
+                by_args: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let args_value = serde_json::to_value(&args).unwrap();
+
+    // Rolled-back transaction: the cancel resolves the job but must NOT persist.
+    let mut tx = client.pool().begin().await.unwrap();
+    let cancelled = admin::cancel_by_unique_key_tx(
+        &mut tx,
+        SendEmail::kind(),
+        Some(queue),
+        Some(&args_value),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.expect("tx cancel should find the job").id, job.id);
+    tx.rollback().await.unwrap();
+
+    let after_rollback = client.get_job(job.id).await.unwrap();
+    assert_ne!(
+        after_rollback.state,
+        JobState::Cancelled,
+        "a rolled-back cancel_by_unique_key_tx must leave the job uncancelled"
+    );
+
+    // Committed transaction: the cancel takes effect.
+    let mut tx = client.pool().begin().await.unwrap();
+    let cancelled = admin::cancel_by_unique_key_tx(
+        &mut tx,
+        SendEmail::kind(),
+        Some(queue),
+        Some(&args_value),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.expect("tx cancel should find the job").id, job.id);
+    tx.commit().await.unwrap();
+
+    let after_commit = client.get_job(job.id).await.unwrap();
+    assert_eq!(after_commit.state, JobState::Cancelled);
+}
+
+#[tokio::test]
 async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
     let _guard = test_lock().lock().await;
     let client = setup().await;

@@ -8197,6 +8197,22 @@ impl QueueStorage {
         }
     }
 
+    /// Transaction-scoped cancel used by [`crate::admin::cancel_tx`]. Runs the
+    /// full cancellation on the caller's transaction and returns the cancelled
+    /// row. Unlike [`Self::cancel_job`] this does NOT perform the post-commit
+    /// claim-cursor advance, so the derived queue depth may briefly over-count
+    /// by one until later committed rows on the lane are claimed.
+    pub(crate) async fn cancel_job_in_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<JobRow>, AwaError> {
+        Ok(self
+            .cancel_job_tx(tx, job_id)
+            .await?
+            .map(|result| result.row))
+    }
+
     pub async fn cancel_jobs_by_ids(
         &self,
         pool: &PgPool,

@@ -517,6 +517,127 @@ pub async fn cancel(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErr
     Ok(Some(job))
 }
 
+/// Transaction-scoped variant of [`cancel`].
+///
+/// Runs the cancellation inside the caller's transaction `tx` instead of opening
+/// its own, so the cancel commits (or rolls back) atomically with the caller's
+/// other work, and the cooperative `awa:cancel` NOTIFY to a running worker fires
+/// only when the caller commits.
+///
+/// On the queue-storage engine this skips the best-effort claim-cursor advance
+/// that [`cancel`] performs after its own commit (it cannot run inside the
+/// caller's transaction); the derived queue depth may briefly over-count by one
+/// until later committed rows on the lane are claimed. Counts are unaffected on
+/// the canonical engine.
+pub async fn cancel_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    job_id: i64,
+) -> Result<Option<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+        return store
+            .cancel_job_in_tx(tx, job_id)
+            .await?
+            .ok_or(AwaError::JobNotFound { id: job_id })
+            .map(Some);
+    }
+
+    let prior_state: Option<JobState> =
+        sqlx::query_scalar::<_, JobState>("SELECT state FROM awa.jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+
+    let Some(prior_state) = prior_state else {
+        return Err(AwaError::JobNotFound { id: job_id });
+    };
+
+    let job: Option<JobRow> = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'cancelled', finalized_at = now(),
+            callback_id = NULL, callback_timeout_at = NULL,
+            callback_filter = NULL, callback_on_complete = NULL,
+            callback_on_fail = NULL, callback_transform = NULL
+        WHERE id = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+        RETURNING *
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+
+    let Some(job) = job else {
+        return Err(AwaError::JobNotFound { id: job_id });
+    };
+
+    if matches!(prior_state, JobState::Running | JobState::WaitingExternal) {
+        notify_cancellation_tx(tx, job.id, job.run_lease).await?;
+    }
+
+    Ok(Some(job))
+}
+
+/// Queue-storage candidate lookup for a unique key. Shared by
+/// [`cancel_by_unique_key`] and [`cancel_by_unique_key_tx`] so the two cannot
+/// drift.
+fn unique_key_candidate_sql(schema: &str) -> String {
+    format!(
+        r#"
+        WITH current_available AS (
+            SELECT ready.job_id, ready.unique_key
+            FROM {schema}.ready_entries AS ready
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = ready.queue
+             AND claims.priority = ready.priority
+             AND claims.enqueue_shard = ready.enqueue_shard
+            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = ready.ready_slot
+                    AND tomb.ready_generation = ready.ready_generation
+                    AND tomb.queue = ready.queue
+                    AND tomb.priority = ready.priority
+                    AND tomb.enqueue_shard = ready.enqueue_shard
+                    AND tomb.lane_seq = ready.lane_seq
+              )
+        ),
+        candidates AS (
+            SELECT job_id
+            FROM current_available
+            WHERE unique_key = $1
+            UNION ALL
+            SELECT job_id
+            FROM {schema}.deferred_jobs
+            WHERE unique_key = $1
+            UNION ALL
+            SELECT job_id
+            FROM {schema}.leases
+            WHERE unique_key = $1
+        )
+        SELECT job_id
+        FROM candidates
+        ORDER BY job_id ASC
+        LIMIT 1
+        "#,
+        schema = schema
+    )
+}
+
+/// Canonical (non queue-storage) candidate lookup for a unique key.
+const UNIQUE_KEY_CANDIDATE_SQL_CANONICAL: &str = r#"
+    WITH candidates AS (
+        SELECT id FROM awa.jobs_hot
+        WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+        UNION ALL
+        SELECT id FROM awa.scheduled_jobs
+        WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+        ORDER BY id ASC
+        LIMIT 1
+    )
+    SELECT id
+    FROM candidates
+    "#;
+
 /// Cancel a job by its unique key components.
 ///
 /// Reconstructs the BLAKE3 unique key from the same inputs used at insert time
@@ -560,47 +681,7 @@ pub async fn cancel_by_unique_key(
     let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
 
     if let Some(store) = active_queue_storage(pool).await? {
-        let sql = format!(
-            r#"
-            WITH current_available AS (
-                SELECT ready.job_id, ready.unique_key
-                FROM {schema}.ready_entries AS ready
-                JOIN {schema}.queue_claim_heads AS claims
-                  ON claims.queue = ready.queue
-                 AND claims.priority = ready.priority
-                 AND claims.enqueue_shard = ready.enqueue_shard
-                WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                      WHERE tomb.ready_slot = ready.ready_slot
-                        AND tomb.ready_generation = ready.ready_generation
-                        AND tomb.queue = ready.queue
-                        AND tomb.priority = ready.priority
-                        AND tomb.enqueue_shard = ready.enqueue_shard
-                        AND tomb.lane_seq = ready.lane_seq
-                  )
-            ),
-            candidates AS (
-                SELECT job_id
-                FROM current_available
-                WHERE unique_key = $1
-                UNION ALL
-                SELECT job_id
-                FROM {schema}.deferred_jobs
-                WHERE unique_key = $1
-                UNION ALL
-                SELECT job_id
-                FROM {schema}.leases
-                WHERE unique_key = $1
-            )
-            SELECT job_id
-            FROM candidates
-            ORDER BY job_id ASC
-            LIMIT 1
-            "#,
-            schema = store.schema()
-        );
-
+        let sql = unique_key_candidate_sql(store.schema());
         let candidate: Option<i64> = sqlx::query_scalar(&sql)
             .bind(&unique_key)
             .fetch_optional(pool)
@@ -615,27 +696,56 @@ pub async fn cancel_by_unique_key(
     // Find the oldest matching job across both physical tables, then route
     // through `cancel(...)` so running jobs emit the same cooperative
     // cancellation notification as ID-based admin cancels.
-    let candidate: Option<i64> = sqlx::query_scalar(
-        r#"
-        WITH candidates AS (
-            SELECT id FROM awa.jobs_hot
-            WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
-            UNION ALL
-            SELECT id FROM awa.scheduled_jobs
-            WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
-            ORDER BY id ASC
-            LIMIT 1
-        )
-        SELECT id
-        FROM candidates
-        "#,
-    )
-    .bind(&unique_key)
-    .fetch_optional(pool)
-    .await?;
+    let candidate: Option<i64> = sqlx::query_scalar(UNIQUE_KEY_CANDIDATE_SQL_CANONICAL)
+        .bind(&unique_key)
+        .fetch_optional(pool)
+        .await?;
 
     match candidate {
         Some(job_id) => match cancel(pool, job_id).await {
+            Ok(row) => Ok(row),
+            Err(AwaError::JobNotFound { .. }) => Ok(None),
+            Err(err) => Err(err),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Transaction-scoped variant of [`cancel_by_unique_key`].
+///
+/// Resolves the candidate and cancels it inside the caller's transaction `tx`,
+/// so the cancel is atomic with the caller's other work (and the `awa:cancel`
+/// NOTIFY fires only on the caller's commit). See [`cancel_tx`] for the
+/// queue-storage claim-cursor caveat.
+pub async fn cancel_by_unique_key_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    kind: &str,
+    queue: Option<&str>,
+    args: Option<&serde_json::Value>,
+    period_bucket: Option<i64>,
+) -> Result<Option<JobRow>, AwaError> {
+    let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
+
+    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+        let sql = unique_key_candidate_sql(store.schema());
+        let candidate: Option<i64> = sqlx::query_scalar(&sql)
+            .bind(&unique_key)
+            .fetch_optional(tx.as_mut())
+            .await?;
+
+        return match candidate {
+            Some(job_id) => cancel_tx(tx, job_id).await,
+            None => Ok(None),
+        };
+    }
+
+    let candidate: Option<i64> = sqlx::query_scalar(UNIQUE_KEY_CANDIDATE_SQL_CANONICAL)
+        .bind(&unique_key)
+        .fetch_optional(tx.as_mut())
+        .await?;
+
+    match candidate {
+        Some(job_id) => match cancel_tx(tx, job_id).await {
             Ok(row) => Ok(row),
             Err(AwaError::JobNotFound { .. }) => Ok(None),
             Err(err) => Err(err),
