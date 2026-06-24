@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "awa-pg"
 requires-python = ">=3.10"
-version = "0.6.0-rc.1"
+version = "0.6.0-rc.2"
 description = "Postgres-native background job queue — Python SDK with async/sync workers, transactional enqueue, and progress tracking. Install awa-pg[ui] to add the bundled web dashboard."
 readme = "README.md"
 license = {text = "MIT OR Apache-2.0"}
@@ -32,7 +32,7 @@ classifiers = [
 #
 # Kept opt-in so the default `awa-pg` install stays small — workers and
 # producers don't need the ~10 MB UI bundle.
-ui = ["awa-cli==0.6.0-rc.1"]
+ui = ["awa-cli==0.6.0-rc.2"]
 
 [project.urls]
 Homepage = "https://github.com/hardbyte/awa"

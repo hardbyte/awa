@@ -4,6 +4,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.0-rc.2] — 2026-06-25
+
+### Added
+
+- **Transaction-scoped admin cancel** ([#357](https://github.com/hardbyte/awa/pull/357)). `admin::cancel_tx` and `admin::cancel_by_unique_key_tx` accept a caller-provided `&mut sqlx::Transaction` and run the cancellation inside it, so the cancel commits or rolls back atomically with the caller's other work and the cooperative `awa:cancel` NOTIFY to a running worker fires only on the caller's commit. The pool-based `cancel` / `cancel_by_unique_key` are unchanged. On the queue-storage engine the `_tx` variants skip the best-effort post-commit claim-cursor advance the pool variants perform — the derived queue depth can briefly over-count by one until later committed rows on the lane are claimed; canonical counts are unaffected.
+
 ## [0.6.0-rc.1] — 2026-06-24
 
 First release candidate for the 0.6 line. It promotes the beta.2 queue-storage engine after the [#169](https://github.com/hardbyte/awa/issues/169) pinned-MVCC dead-tuple gate passed on `main`: a 60-minute idle-in-transaction soak now holds throughput with no dead-tuple cliff, and the last dominant pinned-horizon hot row (`queue_claim_heads`) is removed in this delta. Migrations v032–v039 apply via `awa migrate` (or the SQL-only path in [`docs/migrations.md`](docs/migrations.md) for external migration tooling).
