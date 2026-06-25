@@ -950,7 +950,8 @@ async fn test_admin_cancel_by_unique_key_tx_is_transactional() {
     .unwrap();
     let args_value = serde_json::to_value(&args).unwrap();
 
-    // Rolled-back transaction: the cancel resolves the job but must NOT persist.
+    // Rolled-back transaction, passing a `&mut Transaction` (which deref-coerces
+    // to `&mut PgConnection`): the cancel resolves the job but must NOT persist.
     let mut tx = client.pool().begin().await.unwrap();
     let cancelled = admin::cancel_by_unique_key_tx(
         &mut tx,
@@ -971,10 +972,13 @@ async fn test_admin_cancel_by_unique_key_tx_is_transactional() {
         "a rolled-back cancel_by_unique_key_tx must leave the job uncancelled"
     );
 
-    // Committed transaction: the cancel takes effect.
+    // Committed transaction, passing an explicit `&mut PgConnection` — exactly
+    // how a `transact!`-style helper hands a connection (not a `Transaction`) to
+    // its body.
     let mut tx = client.pool().begin().await.unwrap();
+    let conn: &mut sqlx::PgConnection = &mut tx;
     let cancelled = admin::cancel_by_unique_key_tx(
-        &mut tx,
+        conn,
         SendEmail::kind(),
         Some(queue),
         Some(&args_value),

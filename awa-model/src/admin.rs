@@ -5,6 +5,7 @@ use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
+use sqlx::Acquire;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
 use std::cmp::max;
@@ -517,19 +518,45 @@ pub async fn cancel(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErr
     Ok(Some(job))
 }
 
-/// Transaction-scoped variant of [`cancel`].
+/// Transaction-participating variant of [`cancel`].
 ///
-/// Runs the cancellation inside the caller's transaction `tx` instead of opening
-/// its own, so the cancel commits (or rolls back) atomically with the caller's
-/// other work, and the cooperative `awa:cancel` NOTIFY to a running worker fires
-/// only when the caller commits.
+/// Runs the cancellation on the caller-provided connection `conn` rather than
+/// acquiring its own from a pool. When `conn` is already inside a transaction —
+/// the common case, and a `&mut Transaction` deref-coerces to `&mut PgConnection`
+/// — the cancel commits or rolls back atomically with the caller's other work,
+/// and the cooperative `awa:cancel` NOTIFY to a running worker fires only when the
+/// caller commits. When `conn` is a standalone pooled connection the cancel runs
+/// in its own transaction.
+///
+/// Internally the cancel runs in a nested transaction — a `SAVEPOINT` when `conn`
+/// is already in a transaction — so a cancel error rolls back only the cancel
+/// rather than poisoning the caller's transaction.
 ///
 /// On the queue-storage engine this skips the best-effort claim-cursor advance
 /// that [`cancel`] performs after its own commit (it cannot run inside the
 /// caller's transaction); the derived queue depth may briefly over-count by one
 /// until later committed rows on the lane are claimed. Counts are unaffected on
 /// the canonical engine.
-pub async fn cancel_tx<'a>(
+pub async fn cancel_tx(
+    conn: &mut sqlx::PgConnection,
+    job_id: i64,
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = conn.begin().await?;
+    match cancel_in_tx(&mut tx, job_id).await {
+        Ok(row) => {
+            tx.commit().await?;
+            Ok(row)
+        }
+        Err(err) => {
+            tx.rollback().await.ok();
+            Err(err)
+        }
+    }
+}
+
+/// Inner cancellation logic, run on an existing transaction. Shared by
+/// [`cancel_tx`] and [`cancel_by_unique_key_tx`].
+async fn cancel_in_tx<'a>(
     tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     job_id: i64,
 ) -> Result<Option<JobRow>, AwaError> {
@@ -711,13 +738,34 @@ pub async fn cancel_by_unique_key(
     }
 }
 
-/// Transaction-scoped variant of [`cancel_by_unique_key`].
+/// Transaction-participating variant of [`cancel_by_unique_key`].
 ///
-/// Resolves the candidate and cancels it inside the caller's transaction `tx`,
-/// so the cancel is atomic with the caller's other work (and the `awa:cancel`
-/// NOTIFY fires only on the caller's commit). See [`cancel_tx`] for the
-/// queue-storage claim-cursor caveat.
-pub async fn cancel_by_unique_key_tx<'a>(
+/// Resolves the candidate and cancels it on the caller-provided connection
+/// `conn`, so the cancel is atomic with the caller's other work (and the
+/// `awa:cancel` NOTIFY fires only on the caller's commit). A `&mut Transaction`
+/// deref-coerces to `&mut PgConnection`. See [`cancel_tx`] for the
+/// nested-transaction and queue-storage claim-cursor caveats.
+pub async fn cancel_by_unique_key_tx(
+    conn: &mut sqlx::PgConnection,
+    kind: &str,
+    queue: Option<&str>,
+    args: Option<&serde_json::Value>,
+    period_bucket: Option<i64>,
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = conn.begin().await?;
+    match cancel_by_unique_key_in_tx(&mut tx, kind, queue, args, period_bucket).await {
+        Ok(row) => {
+            tx.commit().await?;
+            Ok(row)
+        }
+        Err(err) => {
+            tx.rollback().await.ok();
+            Err(err)
+        }
+    }
+}
+
+async fn cancel_by_unique_key_in_tx<'a>(
     tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     kind: &str,
     queue: Option<&str>,
@@ -734,7 +782,7 @@ pub async fn cancel_by_unique_key_tx<'a>(
             .await?;
 
         return match candidate {
-            Some(job_id) => cancel_tx(tx, job_id).await,
+            Some(job_id) => cancel_in_tx(tx, job_id).await,
             None => Ok(None),
         };
     }
@@ -745,7 +793,7 @@ pub async fn cancel_by_unique_key_tx<'a>(
         .await?;
 
     match candidate {
-        Some(job_id) => match cancel_tx(tx, job_id).await {
+        Some(job_id) => match cancel_in_tx(tx, job_id).await {
             Ok(row) => Ok(row),
             Err(AwaError::JobNotFound { .. }) => Ok(None),
             Err(err) => Err(err),
