@@ -4,6 +4,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.0-rc.3] — 2026-06-25
+
+### Changed
+
+- **`admin::cancel_tx` / `admin::cancel_by_unique_key_tx` now take `&mut PgConnection`** ([#358](https://github.com/hardbyte/awa/pull/358)) instead of the `&mut sqlx::Transaction` introduced in rc.2. A `&mut Transaction` deref-coerces to `&mut PgConnection`, so existing callers are unaffected, while callers that only hold a connection mid-transaction (e.g. behind a `transact!`-style helper that derefs the transaction) can now use them too. This matches awa's existing multi-statement consumer convention (`insert_many_copy`). Internally the cancel runs in a nested transaction — a `SAVEPOINT` when the connection is already in one — so a cancel error rolls back only the cancel rather than poisoning the caller's transaction.
+
 ## [0.6.0-rc.2] — 2026-06-25
 
 ### Added
