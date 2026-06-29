@@ -637,9 +637,18 @@ fn unique_key_candidate_sql(schema: &str) -> String {
             FROM {schema}.deferred_jobs
             WHERE unique_key = $1
             UNION ALL
-            SELECT job_id
-            FROM {schema}.leases
-            WHERE unique_key = $1
+            -- A running job's unique_key is stored on its ready_entries row;
+            -- reach it through the lease's lane identity.
+            SELECT leases.job_id
+            FROM {schema}.leases AS leases
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = leases.ready_slot
+             AND ready.ready_generation = leases.ready_generation
+             AND ready.queue = leases.queue
+             AND ready.priority = leases.priority
+             AND ready.enqueue_shard = leases.enqueue_shard
+             AND ready.lane_seq = leases.lane_seq
+            WHERE ready.unique_key = $1
         )
         SELECT job_id
         FROM candidates
