@@ -1249,6 +1249,88 @@ async fn test_admin_cancel_by_unique_key_mismatched_queue_returns_none() {
     );
 }
 
+/// Force the engine onto the queue-storage substrate the way a fresh install
+/// auto-finalizes onto it — the inverse of `awa_testing::reset_runtime_backend`.
+/// The substrate already exists in the `awa` schema (installed by the
+/// migrations); flipping the transition state and registering the backend is
+/// enough for the admin paths to route there.
+async fn activate_queue_storage(pool: &sqlx::PgPool) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET state = 'active',
+            current_engine = 'queue_storage',
+            prepared_engine = NULL,
+            details = jsonb_build_object('schema', 'awa'),
+            transition_epoch = transition_epoch + 1,
+            updated_at = now(),
+            finalized_at = now()
+        WHERE singleton
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("activate queue-storage transition state");
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
+        VALUES ('queue_storage', 'awa', now())
+        ON CONFLICT (backend) DO UPDATE
+        SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("register queue-storage backend");
+    tx.commit().await.unwrap();
+}
+
+/// `cancel_by_unique_key` and its `_tx` variant must run against the
+/// queue-storage substrate, not only the canonical tables. The queue-storage
+/// candidate query spans the available, deferred, and running-job lookups (the
+/// running one reaches `unique_key` through a `leases → ready_entries` join), so
+/// it must execute and return `Ok(None)` when nothing matches the key.
+#[tokio::test]
+async fn test_admin_cancel_by_unique_key_queue_storage_active() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+    activate_queue_storage(client.pool()).await;
+
+    let pool_result = admin::cancel_by_unique_key(
+        client.pool(),
+        SendEmail::kind(),
+        Some("integ_cancel_by_unique_key_qs"),
+        None,
+        None,
+    )
+    .await;
+
+    let mut tx = client.pool().begin().await.unwrap();
+    let tx_result = admin::cancel_by_unique_key_tx(
+        &mut tx,
+        SendEmail::kind(),
+        Some("integ_cancel_by_unique_key_qs"),
+        None,
+        None,
+    )
+    .await;
+    tx.rollback().await.unwrap();
+
+    // Restore the canonical engine before asserting so a failed assertion can't
+    // leak queue-storage state into other tests sharing the database.
+    awa_testing::setup::reset_runtime_backend(client.pool()).await;
+
+    assert!(
+        matches!(pool_result, Ok(None)),
+        "queue-storage cancel_by_unique_key must not error when nothing matches; got {pool_result:?}"
+    );
+    assert!(
+        matches!(tx_result, Ok(None)),
+        "queue-storage cancel_by_unique_key_tx must not error when nothing matches; got {tx_result:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_admin_pause_resume_queue() {
     let _guard = test_lock().lock().await;
