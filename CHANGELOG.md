@@ -8,7 +8,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- **`admin::cancel_by_unique_key` / `cancel_by_unique_key_tx` on the queue-storage engine**. The candidate lookup's running-job branch read `unique_key` directly from `{schema}.leases`, but the `leases` table does not carry that column, so any cancel-by-unique-key issued while queue storage was the active engine failed at plan time with `column "unique_key" does not exist`. The running-job branch now recovers the key by joining each lease back to its originating `ready_entries` row — the same lane-identity join the candidate and jobs-compat views already use. Canonical-engine behaviour was unaffected.
+- **`admin::cancel_by_unique_key` / `cancel_by_unique_key_tx` on the queue-storage engine** ([#359](https://github.com/hardbyte/awa/pull/359)). The candidate lookup's running-job branch read `unique_key` directly from `{schema}.leases`, but the `leases` table does not carry that column, so any cancel-by-unique-key issued while queue storage was the active engine failed at plan time with `column "unique_key" does not exist`. The running-job branch now recovers the key by joining each lease back to its originating `ready_entries` row — the same lane-identity join the candidate and jobs-compat views already use. Canonical-engine behaviour was unaffected.
 
 ## [0.6.0-rc.3] — 2026-06-25
 
