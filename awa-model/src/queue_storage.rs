@@ -14239,6 +14239,13 @@ impl QueueStorage {
                 FROM {done_child}
                 GROUP BY queue, priority
             ),
+            -- Scan the entire partition being truncated (all generations),
+            -- mirroring done_counts' whole-child scan above. The rotate guard
+            -- keeps a partition to one generation at prune time, so this is the
+            -- same set today; counting the whole child keeps the rollup fold
+            -- conservative even if that invariant is ever weakened (a stray
+            -- generation's batches would otherwise be truncated without being
+            -- folded into the rollup -> terminal-count undercount).
             batch_rows AS (
                 SELECT
                     batch.ready_generation,
@@ -14251,7 +14258,6 @@ impl QueueStorage {
                     batch.job_ids,
                     batch.run_leases
                 ) AS item(job_id, run_lease)
-                WHERE batch.ready_generation = $3
             ),
             batch_counts AS (
                 SELECT
@@ -14288,7 +14294,6 @@ impl QueueStorage {
         ))
         .bind(failed_retention_secs)
         .bind(retention_floor)
-        .bind(generation)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
