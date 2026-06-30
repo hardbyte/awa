@@ -64,11 +64,21 @@ impl TestClient {
     }
 
     /// Claim and execute a single job, optionally filtered by queue.
+    ///
+    /// Routes through the active storage engine: under queue storage it claims
+    /// and records the outcome via the runtime store API; under canonical it
+    /// drives the `awa.jobs` view directly.
     pub async fn work_one_in_queue<W: Worker>(
         &self,
         worker: &W,
         queue: Option<&str>,
     ) -> Result<WorkResult, AwaError> {
+        if let Some(schema) =
+            awa_model::queue_storage::QueueStorage::active_schema(&self.pool).await?
+        {
+            return self.work_one_queue_storage(worker, queue, &schema).await;
+        }
+
         // Claim one job
         let jobs: Vec<JobRow> = sqlx::query_as::<_, JobRow>(
             r#"
@@ -102,27 +112,7 @@ impl TestClient {
             None => return Ok(WorkResult::NoJob),
         };
 
-        let cancel = Arc::new(AtomicBool::new(false));
-        let state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>> =
-            Arc::new(HashMap::new());
-        let progress = Arc::new(std::sync::Mutex::new(ProgressState::new(
-            job.progress.clone(),
-        )));
-        let ctx = JobContext::new_for_testing(
-            job.clone(),
-            cancel,
-            state,
-            self.pool.clone(),
-            progress.clone(),
-        );
-
-        let result = worker.perform(&ctx).await;
-
-        // Snapshot progress from the buffer after handler execution
-        let progress_snapshot: Option<serde_json::Value> = {
-            let guard = progress.lock().expect("progress lock poisoned");
-            guard.clone_latest()
-        };
+        let (result, progress_snapshot) = self.run_handler(&job, worker).await;
 
         // Update job state based on result
         match &result {
@@ -207,6 +197,157 @@ impl TestClient {
                 .bind(&progress_snapshot)
                 .execute(&self.pool)
                 .await?;
+                Ok(WorkResult::Failed(job, msg.clone()))
+            }
+        }
+    }
+
+    /// Build a testing `JobContext`, run the worker, and snapshot any progress
+    /// it buffered. Shared by the canonical and queue-storage work paths.
+    async fn run_handler<W: Worker>(
+        &self,
+        job: &JobRow,
+        worker: &W,
+    ) -> (Result<JobResult, JobError>, Option<serde_json::Value>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>> =
+            Arc::new(HashMap::new());
+        let progress = Arc::new(std::sync::Mutex::new(ProgressState::new(
+            job.progress.clone(),
+        )));
+        let ctx = JobContext::new_for_testing(
+            job.clone(),
+            cancel,
+            state,
+            self.pool.clone(),
+            progress.clone(),
+        );
+        let result = worker.perform(&ctx).await;
+        let snapshot = {
+            let guard = progress.lock().expect("progress lock poisoned");
+            guard.clone_latest()
+        };
+        (result, snapshot)
+    }
+
+    /// Queue-storage variant of [`Self::work_one_in_queue`]: claim, run the
+    /// handler, and record the outcome through the runtime store API rather
+    /// than writing the `awa.jobs` view (which the engine rejects).
+    async fn work_one_queue_storage<W: Worker>(
+        &self,
+        worker: &W,
+        queue: Option<&str>,
+        schema: &str,
+    ) -> Result<WorkResult, AwaError> {
+        use std::time::Duration;
+        let store = awa_model::queue_storage::QueueStorage::from_existing_schema(schema)?;
+
+        // The store claims per queue; when the caller did not pin one, resolve a
+        // queue carrying a ready job of this worker's kind.
+        let target_queue = match queue {
+            Some(queue) => queue.to_string(),
+            None => {
+                let resolved: Option<String> = sqlx::query_scalar(&format!(
+                    "SELECT queue FROM {schema}.ready_entries WHERE kind = $1 ORDER BY job_id ASC LIMIT 1"
+                ))
+                .bind(worker.kind())
+                .fetch_optional(&self.pool)
+                .await?;
+                match resolved {
+                    Some(queue) => queue,
+                    None => return Ok(WorkResult::NoJob),
+                }
+            }
+        };
+
+        let claimed = store
+            .claim_runtime_batch(&self.pool, &target_queue, 1, Duration::from_secs(60))
+            .await?;
+        let claimed = match claimed.into_iter().next() {
+            Some(claimed) => claimed,
+            None => return Ok(WorkResult::NoJob),
+        };
+        let job = claimed.job.clone();
+
+        let (result, progress_snapshot) = self.run_handler(&job, worker).await;
+
+        match &result {
+            Ok(JobResult::Completed) => {
+                store
+                    .complete_runtime_batch(&self.pool, std::slice::from_ref(&claimed))
+                    .await?;
+                Ok(WorkResult::Completed(job))
+            }
+            Ok(JobResult::Cancel(reason)) => {
+                store
+                    .cancel_running(&self.pool, job.id, job.run_lease, reason, progress_snapshot)
+                    .await?;
+                Ok(WorkResult::Cancelled(job, reason.clone()))
+            }
+            Ok(JobResult::RetryAfter(delay)) => {
+                store
+                    .retry_after(&self.pool, job.id, job.run_lease, *delay, progress_snapshot)
+                    .await?;
+                Ok(WorkResult::Retryable(job))
+            }
+            Err(JobError::Retryable(_)) => {
+                // A retryable error reschedules the job. Canonical leaves it in
+                // a finalized `retryable` state (not re-claimable by a later
+                // `work_one`); the store needs an explicit delay, so use a long
+                // one rather than a near-immediate reschedule that would let the
+                // same job be re-claimed within a test or accumulate across runs.
+                store
+                    .retry_after(
+                        &self.pool,
+                        job.id,
+                        job.run_lease,
+                        Duration::from_secs(3600),
+                        progress_snapshot,
+                    )
+                    .await?;
+                Ok(WorkResult::Retryable(job))
+            }
+            Ok(JobResult::Snooze(delay)) => {
+                store
+                    .snooze(&self.pool, job.id, job.run_lease, *delay, progress_snapshot)
+                    .await?;
+                Ok(WorkResult::Snoozed(job))
+            }
+            Ok(JobResult::WaitForCallback(_)) => {
+                // The handler registers the callback via the context; park to
+                // waiting_external when it did, otherwise fail like the
+                // canonical path.
+                match self.get_job(job.id).await?.callback_id {
+                    Some(callback_id) => {
+                        let entered = store
+                            .enter_callback_wait(&self.pool, job.id, job.run_lease, callback_id)
+                            .await?;
+                        assert!(
+                            entered,
+                            "enter_callback_wait did not transition job {} to waiting_external",
+                            job.id
+                        );
+                        Ok(WorkResult::WaitingExternal(self.get_job(job.id).await?))
+                    }
+                    None => {
+                        let msg = "WaitForCallback returned without calling register_callback";
+                        store
+                            .fail_terminal(
+                                &self.pool,
+                                job.id,
+                                job.run_lease,
+                                msg,
+                                progress_snapshot,
+                            )
+                            .await?;
+                        Ok(WorkResult::Failed(job, msg.to_string()))
+                    }
+                }
+            }
+            Err(JobError::Terminal(msg)) => {
+                store
+                    .fail_terminal(&self.pool, job.id, job.run_lease, msg, progress_snapshot)
+                    .await?;
                 Ok(WorkResult::Failed(job, msg.clone()))
             }
         }

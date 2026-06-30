@@ -51,21 +51,9 @@ async fn setup() -> TestClient {
 /// concurrent test runs against a shared DB can cause small delta errors that
 /// compound over time).
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue meta");
-    sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue state counts");
+    // Engine-aware cleanup lives in the shared harness so a queue name can be
+    // reused across tests and re-runs under either storage engine.
+    awa_testing::setup::clean_queue(pool, queue).await;
 }
 
 async fn run_batch_operation_to_completion(
@@ -752,6 +740,12 @@ async fn test_work_one_no_job() {
 
 #[tokio::test]
 async fn test_admin_retry() {
+    // Manufactures a failed job via a raw `UPDATE awa.jobs`; queue storage
+    // rejects view writes. The queue-storage retry path is covered by
+    // queue_storage_runtime_test.
+    if awa_testing::setup::skip_unless_canonical("test_admin_retry") {
+        return;
+    }
     let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_admin_retry";
@@ -816,6 +810,11 @@ async fn test_admin_cancel() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_emits_canonical_running_cancel_notification() {
+    if awa_testing::setup::skip_unless_canonical(
+        "test_admin_cancel_by_unique_key_emits_canonical_running_cancel_notification",
+    ) {
+        return;
+    }
     let _guard = test_lock().lock().await;
     let client = setup_with_connections(4).await;
     let queue = "integ_cancel_by_unique_key_notify";
@@ -1013,6 +1012,14 @@ async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_noop_when_already_completed() {
+    // Manufactures a completed job via a raw `UPDATE awa.jobs`; queue storage
+    // rejects view writes. The queue-storage cancel-by-unique-key candidate
+    // query is covered by test_admin_cancel_by_unique_key_queue_storage_active.
+    if awa_testing::setup::skip_unless_canonical(
+        "test_admin_cancel_by_unique_key_noop_when_already_completed",
+    ) {
+        return;
+    }
     let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_completed";
@@ -1117,6 +1124,14 @@ async fn test_admin_cancel_by_unique_key_scheduled_job() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_cancels_oldest_when_multiple_exist() {
+    // Relies on multiple non-terminal jobs sharing a unique key (canonical
+    // unique_states semantics) and a raw `UPDATE awa.jobs`; not a queue-storage
+    // scenario.
+    if awa_testing::setup::skip_unless_canonical(
+        "test_admin_cancel_by_unique_key_cancels_oldest_when_multiple_exist",
+    ) {
+        return;
+    }
     let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_multi";
@@ -1249,43 +1264,6 @@ async fn test_admin_cancel_by_unique_key_mismatched_queue_returns_none() {
     );
 }
 
-/// Force the engine onto the queue-storage substrate the way a fresh install
-/// auto-finalizes onto it — the inverse of `awa_testing::reset_runtime_backend`.
-/// The substrate already exists in the `awa` schema (installed by the
-/// migrations); flipping the transition state and registering the backend is
-/// enough for the admin paths to route there.
-async fn activate_queue_storage(pool: &sqlx::PgPool) {
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query(
-        r#"
-        UPDATE awa.storage_transition_state
-        SET state = 'active',
-            current_engine = 'queue_storage',
-            prepared_engine = NULL,
-            details = jsonb_build_object('schema', 'awa'),
-            transition_epoch = transition_epoch + 1,
-            updated_at = now(),
-            finalized_at = now()
-        WHERE singleton
-        "#,
-    )
-    .execute(&mut *tx)
-    .await
-    .expect("activate queue-storage transition state");
-    sqlx::query(
-        r#"
-        INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
-        VALUES ('queue_storage', 'awa', now())
-        ON CONFLICT (backend) DO UPDATE
-        SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
-        "#,
-    )
-    .execute(&mut *tx)
-    .await
-    .expect("register queue-storage backend");
-    tx.commit().await.unwrap();
-}
-
 /// `cancel_by_unique_key` and its `_tx` variant must run against the
 /// queue-storage substrate, not only the canonical tables. The queue-storage
 /// candidate query spans the available, deferred, and running-job lookups (the
@@ -1295,7 +1273,7 @@ async fn activate_queue_storage(pool: &sqlx::PgPool) {
 async fn test_admin_cancel_by_unique_key_queue_storage_active() {
     let _guard = test_lock().lock().await;
     let client = setup().await;
-    activate_queue_storage(client.pool()).await;
+    awa_testing::setup::activate_queue_storage(client.pool()).await;
 
     let pool_result = admin::cancel_by_unique_key(
         client.pool(),
@@ -1454,6 +1432,11 @@ async fn test_admin_queue_stats() {
 
 #[tokio::test]
 async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
+    if awa_testing::setup::skip_unless_canonical(
+        "test_admin_metadata_caches_track_state_and_catalog_changes",
+    ) {
+        return;
+    }
     let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue_a = "integ_admin_meta_a";
@@ -1688,6 +1671,11 @@ async fn drain_dirty_for(
 
 #[tokio::test]
 async fn test_admin_metadata_tracks_scheduled_promotion_path() {
+    if awa_testing::setup::skip_unless_canonical(
+        "test_admin_metadata_tracks_scheduled_promotion_path",
+    ) {
+        return;
+    }
     let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_admin_meta_promote";
@@ -1872,6 +1860,11 @@ async fn test_heartbeat_progress_updates_do_not_dirty_admin_metadata() {
 /// one 100-key batch.
 #[tokio::test]
 async fn test_flush_dirty_admin_metadata_drains_full_backlog() {
+    if awa_testing::setup::skip_unless_canonical(
+        "test_flush_dirty_admin_metadata_drains_full_backlog",
+    ) {
+        return;
+    }
     let _guard = test_lock().lock().await;
     let client = setup().await;
 
