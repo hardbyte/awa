@@ -49,10 +49,20 @@ pub async fn setup(max_connections: u32) -> PgPool {
     pool
 }
 
-/// Clear any previously-activated runtime backend so legacy integration tests
-/// start from the canonical compatibility surface unless they opt into a
-/// queue-storage runtime explicitly.
+/// Initialise the active storage engine to the one selected by the
+/// `AWA_TEST_ENGINE` env var: `canonical` (default) or `queue_storage`. awa's
+/// caller-facing contract is engine-invariant, so running the same suite under
+/// both values exercises both backends. Tests that pin a specific engine call
+/// [`reset_to_canonical`] / [`activate_queue_storage`] directly.
 pub async fn reset_runtime_backend(pool: &PgPool) {
+    match std::env::var("AWA_TEST_ENGINE").as_deref() {
+        Ok("queue_storage") => activate_queue_storage(pool).await,
+        _ => reset_to_canonical(pool).await,
+    }
+}
+
+/// Force the canonical engine and clear any queue-storage runtime registration.
+pub async fn reset_to_canonical(pool: &PgPool) {
     let mut tx = pool
         .begin()
         .await
@@ -85,6 +95,84 @@ pub async fn reset_runtime_backend(pool: &PgPool) {
     tx.commit()
         .await
         .expect("Failed to commit runtime backend reset transaction");
+}
+
+/// Activate the queue-storage engine against the substrate installed in the
+/// `awa` schema (mirrors a fresh-install auto-finalize).
+pub async fn activate_queue_storage(pool: &PgPool) {
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("Failed to start queue-storage activation transaction");
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET state = 'active',
+            current_engine = 'queue_storage',
+            prepared_engine = NULL,
+            details = jsonb_build_object('schema', 'awa'),
+            transition_epoch = transition_epoch + 1,
+            updated_at = now(),
+            finalized_at = now()
+        WHERE singleton
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to activate queue-storage transition state for test setup");
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
+        VALUES ('queue_storage', 'awa', now())
+        ON CONFLICT (backend) DO UPDATE
+        SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to register queue-storage backend for test setup");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(&mut *tx)
+        .await
+        .expect("Failed to reset runtime instances for test setup");
+    tx.commit()
+        .await
+        .expect("Failed to commit queue-storage activation transaction");
+}
+
+/// The storage engine the suite is running against, selected by `AWA_TEST_ENGINE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestEngine {
+    Canonical,
+    QueueStorage,
+}
+
+/// The engine selected for this test run (`canonical` unless `AWA_TEST_ENGINE=queue_storage`).
+pub fn test_engine() -> TestEngine {
+    match std::env::var("AWA_TEST_ENGINE").as_deref() {
+        Ok("queue_storage") => TestEngine::QueueStorage,
+        _ => TestEngine::Canonical,
+    }
+}
+
+/// Guard for tests whose assertions are specific to the canonical engine —
+/// e.g. admin-metadata caches maintained by canonical row triggers, or the
+/// canonical running-cancel notification. Returns `true` (with a skip notice)
+/// when the run is under another engine, so the test can early-return:
+///
+/// ```ignore
+/// if awa_testing::setup::skip_unless_canonical("my_test") { return; }
+/// ```
+pub fn skip_unless_canonical(test: &str) -> bool {
+    if test_engine() != TestEngine::Canonical {
+        eprintln!(
+            "[skip] {test}: canonical-only assertions; running under AWA_TEST_ENGINE=queue_storage"
+        );
+        true
+    } else {
+        false
+    }
 }
 
 /// Delete all jobs, queue metadata, and admin caches for a specific queue.
