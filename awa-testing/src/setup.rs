@@ -182,11 +182,19 @@ pub fn skip_unless_canonical(test: &str) -> bool {
 /// this, but concurrent test runs against a shared DB can cause small delta
 /// errors that compound over time.
 pub async fn clean_queue(pool: &PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
+    match awa_model::queue_storage::QueueStorage::active_schema(pool)
         .await
-        .expect("Failed to clean queue jobs");
+        .expect("active_schema lookup for clean_queue")
+    {
+        Some(schema) => clean_queue_substrate(pool, &schema, queue).await,
+        None => {
+            sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
+                .bind(queue)
+                .execute(pool)
+                .await
+                .expect("Failed to clean queue jobs");
+        }
+    }
     sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
         .bind(queue)
         .execute(pool)
@@ -197,6 +205,41 @@ pub async fn clean_queue(pool: &PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue state counts");
+}
+
+/// Drain every job-bearing plane of the queue-storage substrate for one queue
+/// and release its unique claims, so a queue name can be reused across tests
+/// and re-runs against the same database. The canonical `awa.jobs` view only
+/// surfaces a queue's head under queue storage, so a single view `DELETE`
+/// leaves the rest of the lane (and its `job_unique_claims`) behind.
+async fn clean_queue_substrate(pool: &PgPool, schema: &str, queue: &str) {
+    // Release unique claims first, while the rows that carry the job ids exist.
+    sqlx::query(&format!(
+        "DELETE FROM awa.job_unique_claims WHERE job_id IN (
+             SELECT job_id FROM {schema}.ready_entries WHERE queue = $1
+             UNION SELECT job_id FROM {schema}.deferred_jobs WHERE queue = $1
+             UNION SELECT job_id FROM {schema}.leases WHERE queue = $1
+             UNION SELECT job_id FROM {schema}.done_entries WHERE queue = $1
+             UNION SELECT job_id FROM {schema}.dlq_entries WHERE queue = $1)"
+    ))
+    .bind(queue)
+    .execute(pool)
+    .await
+    .expect("Failed to release queue unique claims");
+
+    for plane in [
+        "ready_entries",
+        "deferred_jobs",
+        "leases",
+        "done_entries",
+        "dlq_entries",
+    ] {
+        sqlx::query(&format!("DELETE FROM {schema}.{plane} WHERE queue = $1"))
+            .bind(queue)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|err| panic!("Failed to clean {plane} for queue {queue}: {err}"));
+    }
 }
 
 /// Query job state counts for a queue, returning a map of state -> count.

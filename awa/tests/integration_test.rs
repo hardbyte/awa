@@ -51,21 +51,9 @@ async fn setup() -> TestClient {
 /// concurrent test runs against a shared DB can cause small delta errors that
 /// compound over time).
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue meta");
-    sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue state counts");
+    // Engine-aware cleanup lives in the shared harness so a queue name can be
+    // reused across tests and re-runs under either storage engine.
+    awa_testing::setup::clean_queue(pool, queue).await;
 }
 
 async fn run_batch_operation_to_completion(

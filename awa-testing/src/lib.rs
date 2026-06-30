@@ -261,7 +261,7 @@ impl TestClient {
         };
 
         let claimed = store
-            .claim_runtime_batch(&self.pool, &target_queue, 1, Duration::from_secs(300))
+            .claim_runtime_batch(&self.pool, &target_queue, 1, Duration::from_secs(60))
             .await?;
         let claimed = match claimed.into_iter().next() {
             Some(claimed) => claimed,
@@ -291,14 +291,17 @@ impl TestClient {
                 Ok(WorkResult::Retryable(job))
             }
             Err(JobError::Retryable(_)) => {
-                // A retryable error reschedules the job; the store takes an
-                // explicit delay, whose value does not affect the WorkResult.
+                // A retryable error reschedules the job. Canonical leaves it in
+                // a finalized `retryable` state (not re-claimable by a later
+                // `work_one`); the store needs an explicit delay, so use a long
+                // one rather than a near-immediate reschedule that would let the
+                // same job be re-claimed within a test or accumulate across runs.
                 store
                     .retry_after(
                         &self.pool,
                         job.id,
                         job.run_lease,
-                        Duration::from_secs(1),
+                        Duration::from_secs(3600),
                         progress_snapshot,
                     )
                     .await?;
@@ -316,9 +319,14 @@ impl TestClient {
                 // canonical path.
                 match self.get_job(job.id).await?.callback_id {
                     Some(callback_id) => {
-                        store
+                        let entered = store
                             .enter_callback_wait(&self.pool, job.id, job.run_lease, callback_id)
                             .await?;
+                        assert!(
+                            entered,
+                            "enter_callback_wait did not transition job {} to waiting_external",
+                            job.id
+                        );
                         Ok(WorkResult::WaitingExternal(self.get_job(job.id).await?))
                     }
                     None => {
