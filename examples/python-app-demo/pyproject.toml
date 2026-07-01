@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Tiny FastAPI app showing SQLAlchemy-backed transactional enqueue and an operational Awa UI story"
 requires-python = ">=3.10"
 dependencies = [
-    "awa-pg>=0.3.0",
-    "awa-cli>=0.3.0",
+    "awa-pg>=0.6",
+    "awa-cli>=0.6",
     "asyncpg>=0.31.0",
     "email-validator>=2.2.0",
     "fastapi>=0.115.0",

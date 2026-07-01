@@ -145,7 +145,7 @@ The two tracks are deliberately separate. If they ever diverge on workload shape
 
 ### 2026-05-03 cross-system reference run
 
-An overnight run of the companion benchmark repo compared `awa` 0.6 alpha builds with the same phase-driven harness. Treat these as reference results for shape and regression tracking, not universal product guarantees.
+An overnight run of the companion benchmark repo compared `awa` 0.6 alpha builds with the same phase-driven harness. Treat these as reference results for shape and regression tracking, not universal product guarantees. These numbers are from pre-0.6.0 alpha builds; for the current 0.6.0 pinned-MVCC shape see the [MVCC Horizon Benchmark](#mvcc-horizon-benchmark) section above and the #169 benchmark evidence in the [CHANGELOG](../CHANGELOG.md).
 
 Key observations:
 
