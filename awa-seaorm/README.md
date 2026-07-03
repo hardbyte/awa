@@ -14,8 +14,8 @@ It does **not** replace Awa's core `sqlx` API, reimplement Awa's admin/lifecycle
 
 ```toml
 [dependencies]
-awa = "0.6.0-beta.1"
-awa-seaorm = "0.6.0-beta.1"
+awa = "0.6"
+awa-seaorm = "0.6"
 sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
     "sqlx-postgres",
     "runtime-tokio-rustls",
