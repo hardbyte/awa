@@ -4,7 +4,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
-## [0.6.0] — 2026-07-01
+## [0.6.0] — 2026-07-04
 
 The 0.6 line makes the append-only **queue-storage engine** the default and the supported substrate for high-throughput, low-bloat operation on managed Postgres. The [#169](https://github.com/hardbyte/awa/issues/169) pinned-MVCC dead-tuple gate **passed** on `main`: after the rc line removed the last dominant hot-row update path (the `queue_claim_heads` ready-segment routing cache), a 60-minute idle-in-transaction soak holds bounded queue depth through the pinned hour and drains fully in recovery. See "Benchmark evidence" below for the caveats — awa is not immune to long readers, and this release does not claim otherwise.
 
