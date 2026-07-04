@@ -44,7 +44,7 @@ Worker polling, heartbeating, claiming, and completion remain on the Awa runtime
 
 ```toml
 [dependencies]
-awa = { version = "0.6.0-beta.1", features = ["tokio-postgres"] }
+awa = { version = "0.6", features = ["tokio-postgres"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -157,8 +157,8 @@ The adapter lives in the optional `awa-seaorm` crate:
 
 ```toml
 [dependencies]
-awa = "0.6.0-beta.1"
-awa-seaorm = "0.6.0-beta.1"
+awa = "0.6"
+awa-seaorm = "0.6"
 sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
     "sqlx-postgres",
     "runtime-tokio-rustls",

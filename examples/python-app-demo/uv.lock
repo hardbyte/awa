@@ -104,7 +104,7 @@ wheels = [
 
 [[package]]
 name = "awa-cli"
-version = "0.6.0b1"
+version = "0.6.0"
 source = { directory = "../../awa-cli" }
 
 [[package]]
@@ -134,11 +134,11 @@ requires-dist = [
 
 [[package]]
 name = "awa-pg"
-version = "0.6.0b1"
+version = "0.6.0"
 source = { directory = "../../awa-python" }
 
 [package.metadata]
-requires-dist = [{ name = "awa-cli", marker = "extra == 'ui'", specifier = "==0.6.0b1" }]
+requires-dist = [{ name = "awa-cli", marker = "extra == 'ui'", specifier = "==0.6.0" }]
 provides-extras = ["ui"]
 
 [package.metadata.requires-dev]

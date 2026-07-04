@@ -4,6 +4,90 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-04
+
+The 0.6 line makes the append-only **queue-storage engine** the default and the supported substrate for high-throughput, low-bloat operation on managed Postgres. The [#169](https://github.com/hardbyte/awa/issues/169) pinned-MVCC dead-tuple gate **passed** on `main`: after the rc line removed the last dominant hot-row update path (the `queue_claim_heads` ready-segment routing cache), a 60-minute idle-in-transaction soak holds bounded queue depth through the pinned hour and drains fully in recovery. See "Benchmark evidence" below for the caveats — awa is not immune to long readers, and this release does not claim otherwise.
+
+This entry frames the consolidated `0.5.x → 0.6.0` diff as one release; the dated `0.6.0-{alpha,beta,rc}` sections below remain the granular development log. Migrations v001–v039 apply via `awa migrate`; existing installs walk the staged transition (see "Upgrading from 0.5.x"). The SQL-only path for external migration tooling is documented in [`docs/migrations.md`](docs/migrations.md).
+
+### What's new since 0.5.x
+
+**Storage and durability**
+
+- **Queue-storage engine, default-on** ([ADR-019](docs/adr/019-queue-storage-redesign.md)). Append-only `ready_entries`, `deferred_jobs`, `done_entries`, and `dlq_entries` paired with a partitioned receipt ring keep dead-tuple footprint bounded under sustained load. Replaces the row-mutating canonical engine for fresh installs.
+- **No remaining hot-row update paths on the claim/complete loop.**
+  - Lane cursors moved from MVCC-updated rows to Postgres sequences ([#321](https://github.com/hardbyte/awa/pull/321), v027).
+  - Completion, DLQ, retry, and discard no longer `DELETE FROM ready_entries`; they route through append-only ready segments plus a tombstone ledger ([#323](https://github.com/hardbyte/awa/pull/323), v028).
+  - Terminal counts append signed rows to a delta ledger that the maintenance leader folds asynchronously ([#329](https://github.com/hardbyte/awa/pull/329), v030, [ADR-026](docs/adr/026-narrow-terminal-history.md)).
+  - The per-claim `queue_claim_heads` routing-cache update — the last dominant dead-tuple accumulator under a pinned horizon — is gone; claim routes through the `ready_segments` control plane instead ([#355](https://github.com/hardbyte/awa/pull/355), v039).
+  - Rollup mutation and segment truncation stand down while another backend pins the MVCC horizon, then catch up once it clears ([#333](https://github.com/hardbyte/awa/pull/333)).
+- **Compact receipt claim and completion batches** ([#352](https://github.com/hardbyte/awa/pull/352), v036–v038, [ADR-026](docs/adr/026-narrow-terminal-history.md)). Receipt-backed successful completions write compact terminal batches instead of one `done_entries` row per job, with compact claim-local closure, ready-segment, claim-attempt, and lease-claim evidence so stale scans stay bounded. `{schema}.terminal_jobs` is the public terminal read surface — direct SQL against `done_entries` must not assume all completed jobs are physically stored there.
+- **Failed-terminal retention floor** ([#337](https://github.com/hardbyte/awa/issues/337), v032, [ADR-032](docs/adr/032-failed-terminal-retention.md)). Non-DLQ `failed` terminal rows stay retryable for at least `failed_retention` (default `72h`); rows aged past the floor are folded into a cumulative, monotonic `QueueCounts.pruned_failed` so operators have standing visibility of loss that was previously silent. `retry_failed_by_kind` / `retry_failed_by_queue` report the matched/retried/pruned split rather than silently dropping ids.
+- **Receipt-plane ring partitioning** ([ADR-023](docs/adr/023-receipt-plane-ring-partitioning.md)). `lease_claims` and `lease_claim_closures` partitioned by claim slot, rotated by the maintenance leader, with bounded per-slot cursors so rescue/close/deadline sweeps cost work proportional to live receipts ([#349](https://github.com/hardbyte/awa/pull/349), v033–v035).
+- **Per-claim deadlines** in receipts mode. Set `QueueConfig.deadline_duration` to bound a single attempt; rescue force-closes expired claims with `'deadline_expired'`.
+- **Staged 0.5 → 0.6 transition tooling**: `awa storage prepare`, `prepare-queue-storage-schema`, `enter-mixed-transition`, `finalize` (with `--wait` / `--check`, [#298](https://github.com/hardbyte/awa/pull/298)), `abort`, plus a storage-transition readiness UI ([#299](https://github.com/hardbyte/awa/pull/299)). `awa migrate` owns the `awa.*` substrate DDL ([#308](https://github.com/hardbyte/awa/issues/308), v023) — it is no longer installed opportunistically, and `awa --reset --schema awa` is rejected. Fresh installs auto-finalize on first `awa migrate`. Full procedure in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
+
+**Operator surfaces**
+
+- **Dead Letter Queue** ([ADR-020](docs/adr/020-dead-letter-queue.md)). Per-queue `dlq_enabled` policy plus a full admin surface: `awa dlq depth | list | retry | retry-bulk | move | purge` (CLI), matching admin UI tab, Rust/Python client APIs.
+- **Durable batch operations** ([#328](https://github.com/hardbyte/awa/pull/328), v029, [ADR-030](docs/adr/030-batch-operations.md)). Crash-safe, maintenance-driven bulk `set_priority` and `move_queue` over job selections, with preview/submit/list/get/cancel/purge through the HTTP API, CLI, and admin-UI Batch Ops tab; Python parity via [#332](https://github.com/hardbyte/awa/pull/332). The first-class reprioritization surface ([#307](https://github.com/hardbyte/awa/issues/307)).
+- **Transaction-scoped admin cancel** ([#357](https://github.com/hardbyte/awa/pull/357)/[#358](https://github.com/hardbyte/awa/pull/358)). `admin::cancel_tx` and `admin::cancel_by_unique_key_tx` take a caller-provided `&mut PgConnection` and run the cancellation (and the cooperative `awa:cancel` NOTIFY) atomically with the caller's other work; the pool-based `cancel` / `cancel_by_unique_key` are unchanged.
+- **Descriptor catalog** ([ADR-022](docs/adr/022-descriptor-catalog.md)). Code-declared queue and job-kind metadata (`display_name`, `description`, `owner`, `tags`, `docs_url`) drives admin UI labels and drift detection.
+- **Cron missed-fire policy** (`coalesce` default / `catch_up`) plus **pause / resume** ([#320](https://github.com/hardbyte/awa/pull/320), v026): `POST /api/cron/{name}/pause` / `/resume`, evaluator skips paused rows, manual `trigger_cron_job` bypasses pause, `/cron` UI controls.
+- **Metrics off the exact-scan path** ([#330](https://github.com/hardbyte/awa/pull/330), v031) — worker health reads lane-head cursor signals instead of scanning ready rows — plus **maintenance branch observability** ([#302](https://github.com/hardbyte/awa/pull/302)).
+- **`awa-pg[ui]` Python extra** + `python -m awa serve`. The bare `awa-pg` install stays small; `pip install 'awa-pg[ui]'` pulls in the `awa-cli` wheel and launches the embedded React dashboard.
+- **Managed-Postgres deployment guide** ([`docs/deploying-on-managed-postgres.md`](docs/deploying-on-managed-postgres.md)). Per-vCPU sizing data, Cloud SQL IAM grants, AlloyDB notes, auth-proxy sidecar pattern, and MVCC operator guidance (separate database for long readers, `idle_in_transaction_session_timeout`, `xact_start` alerting).
+
+**Producer APIs and tuning**
+
+- **`PartitionedQueue`** ([#348](https://github.com/hardbyte/awa/pull/348), [ADR-031](docs/adr/031-partitioned-queues.md)) — deterministic routing from one hot logical queue to multiple physical partitions. Partition 0 is the logical queue name itself (`email`, `email__p1`, …) so direct enqueues to the logical name stay consumable, and key→partition selection uses a domain-separated hash so it composes with ADR-025 enqueue-shard routing. Replaces the beta-series `QueueFanout` (see Breaking changes).
+- **Per-job routing in Python COPY batch APIs** ([#348](https://github.com/hardbyte/awa/pull/348)). `insert_many_copy` / `enqueue_many_copy` accept `opts=[...]` entries that override `queue` and `ordering_key` per job, so one COPY call can carry a mixed-partition batch.
+- **Transactional follow-up jobs** ([ADR-029](docs/adr/029-transactional-followup-jobs.md), [#285](https://github.com/hardbyte/awa/pull/285)/[#288](https://github.com/hardbyte/awa/pull/288)). `ClientBuilder::on_completed_enqueue` (and friends) registers a follow-up job inserted in the same transaction as the lifecycle transition.
+- **Callback-only router and user-owned callback layers** ([#291](https://github.com/hardbyte/awa/pull/291)/[#293](https://github.com/hardbyte/awa/pull/293)) with a configurable URL prefix — embed Awa's router or implement the contract in your own API layer (axum and FastAPI examples). The `WaitingForCallback` lifecycle event plus client-side `resolve_callback` / `complete_external` / `fail_external` / `retry_external` ([#276](https://github.com/hardbyte/awa/pull/276)) make parked jobs visible to hooks and resolvable in-process.
+- **Direct queue-storage COPY producer path** as the documented high-volume entry point. Rust: `QueueStorage::enqueue_params_copy(pool, &jobs)`. Python: `Client.enqueue_many_copy(jobs)`. The compat `insert_many_copy` route remains for ad-hoc inserts.
+- **`InsertOpts::ordering_key`** pins related jobs to the same shard at `enqueue_shards > 1` (a Kafka-partition-key analogue), and **`awa.queue_meta.enqueue_shards`** ([ADR-025](docs/adr/025-sharded-enqueue-heads.md)) is the per-queue semantic switch: default `1` preserves strict `(queue, priority)` FIFO; `≥ 2` switches to partitioned FIFO.
+- **Completion-batcher defaults tuned** to `(batch=512, flush=1ms)` with adaptive completion shards, tunable via `AWA_COMPLETION_BATCH_SIZE` / `AWA_COMPLETION_FLUSH_MS` / `AWA_COMPLETION_SHARDS`.
+- **`awa-seaorm` crate** ([#275](https://github.com/hardbyte/awa/pull/275)) for transactional enqueue alongside SeaORM application writes.
+- **Registered handler futures no longer require `Sync`** ([#331](https://github.com/hardbyte/awa/pull/331)) — only `Send + 'static`, so handlers awaiting `sqlx` / `reqwest` compile without workarounds.
+
+**Telemetry**
+
+- **`awa-metrics` crate** so non-runtime callers (`awa-ui`, `awa-cli`) emit the same OTel counters as the worker (`awa-worker::AwaMetrics` re-exports for source compatibility).
+- **Sub-second buckets on `awa.job.wait_duration`**, **`awa.enqueue.batch_size` / `awa.enqueue.duration` histograms**, and an **`awa.enqueue.shard` attribute on `awa.job.claimed`** for per-shard claim throughput.
+- **`queue_counts_fast`** ([#289](https://github.com/hardbyte/awa/pull/289)) — index-only depth probe for high-cadence pollers. It under-counts unrolled terminal rows; use `queue_counts` when exact terminal counts matter.
+- **Exact terminal counts without `done_entries` scans** ([#290](https://github.com/hardbyte/awa/issues/290) via [#304](https://github.com/hardbyte/awa/pull/304)/[#306](https://github.com/hardbyte/awa/pull/306)): folded counters serve exact reads when the terminal-counter trust marker is set (`awa storage rebuild-terminal-counters`; fresh installs auto-mark).
+- **Maintenance branch duration histograms** + `awa_maintenance_branch_overrun_total{branch=…}` ([#302](https://github.com/hardbyte/awa/pull/302)).
+
+### Breaking changes
+
+Coming from 0.5.x, only the storage transition (below) needs action — the 0.5 public client API is otherwise source-compatible. The renames below landed within the 0.6 beta/rc series, so early-0.6 adopters must handle them:
+
+- **`QueueFanout` → `PartitionedQueue`** ([#348](https://github.com/hardbyte/awa/pull/348)), no compatibility alias: `width` → `partitions`, `queue_fanout` → `partitioned_queue`, Python `*_per_queue` kwargs → `*_per_partition`. Routing also differs from the beta.2 `QueueFanout` (partition 0 is the logical name; domain-separated hash), so a given key may land on a different partition. Drain fanout queues before upgrading, or pin explicit names via `from_physical_queues`.
+- **`QueueCounts.completed` → `QueueCounts.terminal`** ([#306](https://github.com/hardbyte/awa/pull/306)) — it counts completed, cancelled, and discarded terminal rows; `QueueCounts` also gains `pruned_failed`.
+- **`retry_failed_by_kind` / `retry_failed_by_queue` return `RetryFailedOutcome { retried, matched, pruned_failed_count }`** ([#337](https://github.com/hardbyte/awa/issues/337)) instead of a bare `Vec<JobRow>`; Python `retry_failed` / `retry_failed_sync` return the outcome rather than a plain list.
+- **`JobEvent` / `UntypedJobEvent` gain a `WaitingForCallback` variant** ([#276](https://github.com/hardbyte/awa/pull/276)) — exhaustive matches need a new arm.
+- **`PruneOutcome::Pruned` gains `carried_failed_rows`** and **`QueueStorage::prune_oldest` takes a `failed_retention: Duration`** ([#337](https://github.com/hardbyte/awa/issues/337)) — `Duration::ZERO` disables the floor.
+
+### Upgrading from 0.5.x
+
+- **Fresh installs:** nothing to do. `awa migrate` auto-finalizes to the queue-storage engine on first run.
+- **Existing 0.5.x clusters:** roll out 0.6 workers first (they understand both engines and the transition states), then walk `prepare → enter-mixed-transition → finalize`, following [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md). **Rollback boundary:** one-way after `enter-mixed-transition` followed by any queue-storage write — plan to restore from backup if rollback is needed past that point.
+- Update the dependency: `awa = "0.6.0"` (Rust) / `awa-pg==0.6.0` (Python).
+
+### Operating notes
+
+- **Set `enqueue_shards` explicitly per queue.** The default `1` is the conservative FIFO-preserving choice but serialises producers on a single head row; `4`/`8` is operator tuning for contended hot queues. The trade-off is semantic, not a free perf win — see [`docs/configuration.md`](docs/configuration.md#sharding-the-enqueue-head-per-queue).
+- **MVCC discipline.** If your application runs long-lived `REPEATABLE READ` / `SERIALIZABLE` transactions on the same database awa lives in, give awa its own database. A long-pinned `xmin` blocks dead-tuple cleanup and degrades queue-storage throughput over long horizons — bound non-awa sessions with `idle_in_transaction_session_timeout` and alert on `pg_stat_activity.xact_start` age. Tracked in [#169](https://github.com/hardbyte/awa/issues/169).
+- **Cloud SQL with IAM auth:** the runtime SA needs `cloudsqlsuperuser` for `prepare_schema` to install. Run `GRANT cloudsqlsuperuser TO "your-sa@project.iam"` once per instance. AlloyDB grants this automatically. Full guide: [`docs/deploying-on-managed-postgres.md`](docs/deploying-on-managed-postgres.md).
+
+### Benchmark evidence (#169)
+
+Long-horizon pinned-MVCC behaviour, measured with the [companion harness](https://github.com/hardbyte/postgresql-job-queue-benchmarking) (1 replica, 64 workers, 800 jobs/s offered, 60-minute idle-in-transaction reader). **These are point-in-time results from that harness and hardware, not universal claims.**
+
+- **Awa on the 0.6 storage engine:** the clean phase holds the offered rate at shallow median depth. Under the 60-minute pinned reader, completion sags but queue depth stays bounded (no dead-tuple cliff) and drains fully once the pin releases — the append-only segments hold zero dead tuples, with residual pressure confined to terminal-counter and ring-state metadata. This bounded-depth-through-the-pin / full-drain-in-recovery shape is the [#169](https://github.com/hardbyte/awa/issues/169) gate the 0.6.0 tag was held on, and it passed.
+- **Reference comparison:** a feature-minimal reference queue (no per-row retries, heartbeats, cancellation, or deadlines) holds flat through the same phase at a fraction of the WAL/job. Every per-row-state-machine Postgres queue — River, Oban, pg-boss, Graphile, pgmq — shares awa's degradation shape under a pinned horizon. Awa is not immune to long readers; the MVCC-discipline rules above are the supported mitigation.
+- A separate Cloud SQL PG18 16-vCPU staging sweep (v021 shard-aware lane indexes) moved end-to-end drain on a 3.5M-row backlog from ~1,300 jobs/s to ~8,800–10,600 jobs/s. That is a producer/claim-throughput result on contended backlog, independent of the MVCC question above.
+
 ## [0.6.0-rc.4] — 2026-06-30
 
 ### Fixed
