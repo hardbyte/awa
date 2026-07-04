@@ -65,7 +65,7 @@ croner = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = { version = "0.31", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
 
 # CEL expressions (optional)
 cel = { version = "0.13", features = ["json"] }
