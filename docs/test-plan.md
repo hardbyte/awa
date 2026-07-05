@@ -244,6 +244,64 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 
 The formal suite includes passing configs and expected-counterexample configs. The expected-counterexample configs keep historical bugs executable: old dispatch claim, old view trigger, naive segment race, old storage-transition gate, shard-ignorant prune, and deliberate lock-order cycles. Trace configs use a `TraceIncomplete` invariant as a positive witness: a valid trace violates that invariant after TLC consumes every event.
 
+## 0.7 Planned Validation
+
+Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`](0.7-roadmap.md)) and the release gates on the [#383 tracker](https://github.com/hardbyte/awa/issues/383). Rows move into the matrix above as they are implemented.
+
+### Harness & compatibility
+
+| # | Test | Rust | Py | Ref |
+| --- | --- | --- | --- | --- |
+| V1 | Broad integration suite green under `AWA_TEST_ENGINE=queue_storage` | ✓ | ✓ | #360 |
+| V2 | Engine guard rejects canonical-only raw-SQL helpers under queue_storage | ✓ |  | #360 |
+| V3 | Pinned 0.6.0 binary: enqueue→claim→complete→cancel against 0.7 schema | ✓ | ✓ | #367 |
+| V4 | 0.7 binary against pre-migrate 0.6 schema fails loudly (message + exit code asserted) | ✓ |  | #367 |
+| V5 | `awa migrate` refuses non-`active` storage state, names finalize steps | ✓ |  | #370 |
+
+### Deployment & operations
+
+| # | Test | Rust | Py | Ref |
+| --- | --- | --- | --- | --- |
+| V6 | `/readyz` flips 503 on DB-down / schema-mismatch / stalled claim loop | ✓ |  | #368 |
+| V7 | Maintenance-only role: promotes/rescues/rotates, never claims or dispatches | ✓ | ✓ | #282 |
+| V8 | Chaos topology with zero general workers (maintenance-only + callback ingress + HttpWorker) | ✓ |  | #282, #372 |
+| V9 | Callback contract parity: embedded router vs `awa callbacks serve` (shared contract tests) | ✓ | ✓ | #372 |
+| V10 | `tick()` bounded steps; scheduler-driven demo promotes/rescues with no resident worker | ✓ | ✓ | #118 |
+| V11 | Unauthenticated non-loopback serve → read-only + banner; token auth constant-time; mutation audit line | ✓ |  | #343 |
+| V12 | `awa doctor` checks cover every troubleshooting.md scenario; `--json` schema asserted | ✓ |  | #373 |
+| V13 | Integration suite through pgbouncer session mode; transaction mode engages NOTIFY fallback + warning | ✓ | ✓ | #374 |
+| V14 | Helm chart kind smoke: four-surface topology installs, probes pass, migration hook runs | ✓ |  | #344 |
+
+### Observability
+
+| # | Test | Rust | Py | Ref |
+| --- | --- | --- | --- | --- |
+| V15 | Trace context: enqueue→claim→finalize one connected trace; retries/callbacks/cron linked | ✓ |  | #110 |
+| V16 | Trace propagation across the PyO3 boundary (Python handler is a child span) |  | ✓ | #110 |
+| V17 | Tracing overhead A/B within the E8 gate (<2% sampled enqueue cost) | ✓ |  | #110 |
+| V18 | Attempt-timeline API assembles ordered events across retries incl. callback park/resume | ✓ |  | #375 |
+| V19 | Alert pack rules lint/import clean | ✓ |  | #376 |
+
+### Flow & tenancy
+
+| # | Test | Rust | Py | Ref |
+| --- | --- | --- | --- | --- |
+| V20 | Per-key Tier 1: worker-local cap holds exactly; fleet approximation matches documented formula | ✓ | ✓ | #340 |
+| V21 | Per-key fairness under Zipf-skewed tenants (Jain index bound, no starvation) | ✓ |  | #340 |
+| V22 | A→B promotion is transactional with parent finalize; `on_parent_failure` policies (TLA+ witness + integration) | ✓ | ✓ | #14 |
+| V23 | Backpressure: `Signal` surfaces pressure, `Reject` returns typed error, transactional enqueue unaffected by default | ✓ | ✓ | #341 |
+| V24 | SQL contract conformance script green; BLAKE3 unique-key + shard-hash cross-language vectors | ✓ | ✓ | #342 |
+
+### Storage & performance (gate evidence, benchmark harness)
+
+| # | Test | Ref |
+| --- | --- | --- |
+| V25 | 0.6 pinned-MVCC long-horizon shape still passes on 0.7 main (798/s through 60-min pin, bounded depth, full reclaim) | #383 Gate 2 |
+| V26 | #246 shape: ≤5% rescue-ON overhead at 1×256, or named mechanism + mitigation | #246 / E2 |
+| V27 | Ring-state dead tuples reduced to noise on the long-horizon idle phase | #371 |
+| V28 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
+| V29 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
+
 ## Running Tests
 
 ```bash
