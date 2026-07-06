@@ -167,25 +167,78 @@ then `40` seconds is a reasonable Kubernetes grace period.
 
 ## Health Checks
 
-Awa provides a runtime health API in-process:
+Workers ship an opt-in HTTP health listener ([#368](https://github.com/hardbyte/awa/issues/368)).
+Enable it with the `AWA_HEALTH_ADDR` environment variable or the builder:
+
+```rust
+let client = Client::builder(pool)
+    .queue("email", QueueConfig::default())
+    .health_addr("0.0.0.0:8321".parse()?)   // or AWA_HEALTH_ADDR=0.0.0.0:8321
+    .build()?;
+```
+
+Two endpoints:
+
+- `GET /healthz` — process liveness. `200` for as long as the runtime is up,
+  **including during graceful drain** — a draining worker must not be killed
+  by its liveness probe.
+- `GET /readyz` — readiness. `200` only when the worker can do useful work:
+  Postgres reachable, schema at least the binary's expected version, every
+  queue's claim loop ticking, heartbeat + maintenance services alive, and not
+  shutting down. Otherwise `503` with a JSON body naming each failing check
+  (`postgres_connected`, `schema_version`, `expected_schema_version`,
+  `schema_compatible`, `poll_loop_alive`, `heartbeat_alive`,
+  `maintenance_alive`, `shutting_down`, `leader`).
+
+Kubernetes probes against the listener:
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          env:
+            - name: AWA_HEALTH_ADDR
+              value: "0.0.0.0:8321"
+          ports:
+            - name: health
+              containerPort: 8321
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 5
+```
+
+The listener is deliberately minimal (no TLS, no auth): bind it to the pod IP
+or loopback and keep it off public ingress.
+
+The in-process API remains available without the listener:
 
 - Rust: `client.health_check().await`
 - Python: `await client.health_check()`
 
-It does not provide worker HTTP endpoints by itself. Your application should expose `/healthz` and `/readyz` if your platform expects HTTP probes.
+### `awa health` — probe-less environments
 
-Awa's current `health_check().healthy` result requires:
+For cron drivers, systemd `ExecStartPre`, or CI smoke checks, `awa health`
+answers the cluster-level question from the database alone — reachable,
+schema migrated for this binary, and fleet heartbeat counts:
 
-- Postgres reachable
-- all configured dispatchers alive
-- heartbeat loop alive
-- maintenance loop alive
-- not currently shutting down
+```console
+$ awa health --database-url "$DATABASE_URL"
+ready:              yes
+postgres:           connected
+schema version:     39 (binary expects >= 39)
+storage:            active (queue_storage)
+live runtimes:      3 (0 unhealthy)
+```
 
-Recommended worker probes:
-
-- liveness: same conditions as `health_check().healthy`
-- readiness: not shutting down
+`--json` emits the same report as a machine-readable object. Exit code `0`
+means ready; `1` means unreachable or unmigrated. Fleet numbers are
+informational — an idle cluster with zero workers is still "ready" for
+producers and migrations.
 
 `awa serve` is separate; its HTTP server is for the web UI/admin API, not for worker liveness.
 

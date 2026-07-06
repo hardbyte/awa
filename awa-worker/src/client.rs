@@ -4,6 +4,7 @@ use crate::dispatcher::{
 };
 use crate::events::{BoxedUntypedEventHandler, JobEvent, UntypedJobEvent};
 use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, Worker};
+use crate::health_server::{self, HealthProbe};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
@@ -21,8 +22,9 @@ use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -57,6 +59,8 @@ pub enum BuildError {
     InvalidTerminalCountRollupInterval,
     #[error("invalid queue storage config: {0}")]
     InvalidQueueStorage(String),
+    #[error("invalid AWA_HEALTH_ADDR '{0}': expected a socket address like 0.0.0.0:8321")]
+    InvalidHealthAddr(String),
 }
 
 /// Health check result.
@@ -163,6 +167,7 @@ pub struct ClientBuilder {
     storage: RuntimeStorage,
     transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
+    health_addr: Option<SocketAddr>,
 }
 
 impl ClientBuilder {
@@ -220,6 +225,7 @@ impl ClientBuilder {
             storage,
             transition_role: TransitionWorkerRole::Auto,
             storage_error,
+            health_addr: None,
         }
     }
 
@@ -941,6 +947,16 @@ impl ClientBuilder {
     }
 
     /// Build the client.
+    /// Serve `GET /healthz` and `GET /readyz` on this address while the
+    /// runtime is running (#368). Defaults to off; the `AWA_HEALTH_ADDR`
+    /// environment variable is honoured when this is not set. Port 0 binds
+    /// an ephemeral port — read it back with
+    /// [`Client::health_listener_addr`] after `start()`.
+    pub fn health_addr(mut self, addr: SocketAddr) -> Self {
+        self.health_addr = Some(addr);
+        self
+    }
+
     pub fn build(self) -> Result<Client, BuildError> {
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
@@ -1054,6 +1070,18 @@ impl ClientBuilder {
         );
         let dlq_policy = DlqPolicy::new(self.dlq_enabled_by_default, self.dlq_overrides);
 
+        let health_addr = match self.health_addr {
+            Some(addr) => Some(addr),
+            None => match std::env::var("AWA_HEALTH_ADDR") {
+                Ok(raw) if !raw.trim().is_empty() => Some(
+                    raw.trim()
+                        .parse::<SocketAddr>()
+                        .map_err(|_| BuildError::InvalidHealthAddr(raw))?,
+                ),
+                _ => None,
+            },
+        };
+
         Ok(Client {
             pool: self.pool,
             queues: self.queues,
@@ -1107,6 +1135,8 @@ impl ClientBuilder {
             runtime_hostname: std::env::var("HOSTNAME").ok(),
             runtime_pid: std::process::id() as i32,
             runtime_version: env!("CARGO_PKG_VERSION"),
+            health_addr,
+            health_bound_addr: Arc::new(OnceLock::new()),
         })
     }
 }
@@ -1207,6 +1237,11 @@ pub struct Client {
     runtime_hostname: Option<String>,
     runtime_pid: i32,
     runtime_version: &'static str,
+    /// Optional health/readiness listener address (#368). None = disabled.
+    health_addr: Option<SocketAddr>,
+    /// The address the health listener actually bound (set during `start()`;
+    /// differs from `health_addr` when port 0 requested an ephemeral port).
+    health_bound_addr: Arc<OnceLock<SocketAddr>>,
 }
 
 #[derive(Clone)]
@@ -1587,6 +1622,34 @@ impl Client {
         service_handles.extend(completion_batcher.spawn());
         if let Some(handle) = cancel_listener_handle {
             service_handles.push(handle);
+        }
+
+        // Health/readiness listener (#368). Bind failures abort startup —
+        // a misconfigured probe address must not fail silently. Uses
+        // service_cancel so /readyz keeps answering (503, shutting_down)
+        // through the graceful drain.
+        if let Some(addr) = self.health_addr {
+            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
+                awa_model::AwaError::Validation(format!(
+                    "failed to bind health listener on {addr}: {err}"
+                ))
+            })?;
+            let bound = listener.local_addr().map_err(|err| {
+                awa_model::AwaError::Validation(format!(
+                    "failed to resolve health listener address: {err}"
+                ))
+            })?;
+            let _ = self.health_bound_addr.set(bound);
+            let probe = HealthProbe {
+                pool: self.pool.clone(),
+                dispatcher_alive: self.dispatcher_alive.clone(),
+                heartbeat_alive: self.heartbeat_alive.clone(),
+                maintenance_alive: self.maintenance_alive.clone(),
+                leader: self.leader.clone(),
+                dispatch_cancel: self.dispatch_cancel.clone(),
+            };
+            let cancel = self.service_cancel.clone();
+            service_handles.push(tokio::spawn(health_server::serve(listener, probe, cancel)));
         }
 
         // Start heartbeat service (uses service_cancel — stays alive during drain)
@@ -2040,6 +2103,13 @@ impl Client {
     }
 
     /// Health check.
+    /// The address the health/readiness listener bound during `start()`.
+    /// `None` when the listener is disabled or `start()` has not run yet.
+    /// Useful with port 0 (ephemeral) configurations.
+    pub fn health_listener_addr(&self) -> Option<SocketAddr> {
+        self.health_bound_addr.get().copied()
+    }
+
     pub async fn health_check(&self) -> HealthCheck {
         let postgres_connected = sqlx::query("SELECT 1").execute(&self.pool).await.is_ok();
         let poll_loop_alive = self

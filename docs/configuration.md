@@ -610,6 +610,20 @@ For very high-throughput no-op queues, size `max_workers` for durable completion
 
 The terminal write path is already narrow for running/waiting jobs: successful receipt completions use compact `receipt_completion_batches_*` rows, and other retained terminal facts use `done_entries_*` without duplicating immutable ready body fields when the ready row is still retained. Both surfaces hydrate through `terminal_jobs`, so the default completion settings stay conservative without giving up durable terminal history.
 
+## Worker health listener
+
+Set `AWA_HEALTH_ADDR` (or `ClientBuilder::health_addr`) to serve `GET /healthz` and
+`GET /readyz` from the worker runtime for infrastructure probes:
+
+```bash
+AWA_HEALTH_ADDR=0.0.0.0:8321
+```
+
+Port `0` binds an ephemeral port (read it back with `Client::health_listener_addr()`).
+Unset means no listener. Endpoint semantics, response fields, and Kubernetes probe
+examples live in [deployment.md](deployment.md#health-checks); `awa health` covers
+probe-less environments from the CLI.
+
 ## Dead Letter Queue
 
 The DLQ is the **separate, durable hold-table for jobs that exhausted retries or hit a non-retryable terminal failure**. Without it, terminal failures live in ordinary queue-storage `done_entries_*` partitions and are reclaimed when queue-ring prune can safely truncate their segment. With DLQ enabled, those rows land in `dlq_entries`, are visible to the admin UI / API as a discrete backlog, and can be retried or purged by an operator.

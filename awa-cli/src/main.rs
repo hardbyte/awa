@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
+mod health;
 mod storage_wait;
 
 #[derive(Parser)]
@@ -118,6 +119,15 @@ enum Commands {
     Callbacks {
         #[command(subcommand)]
         command: CallbackCommands,
+    },
+    /// Cluster readiness probe: database reachable, schema migrated, fleet heartbeats
+    Health {
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Seconds to wait for the database connection
+        #[arg(long, default_value = "5")]
+        connect_timeout: u64,
     },
 }
 
@@ -654,6 +664,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
         }
 
+        Commands::Health {
+            json,
+            connect_timeout,
+        } => {
+            let db_url = require_pool(&cli.database_url)?;
+            let pool_result = PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(connect_timeout))
+                .connect(&db_url)
+                .await;
+
+            let report = match pool_result {
+                Ok(pool) => health::probe(&pool).await,
+                Err(_) => health::unreachable_report(),
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", health::render_human(&report));
+            }
+            if !report.ready {
+                std::process::exit(1);
+            }
+        }
+
         // Most remaining CLI commands are single-shot (one query, then exit)
         // so a small pool is sufficient. `storage prepare-queue-storage-schema`
         // is the exception: it acquires an advisory-lock connection and then
@@ -668,7 +704,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
 
             match command {
-                Commands::Migrate { .. } | Commands::Serve { .. } | Commands::Callbacks { .. } => {
+                Commands::Migrate { .. }
+                | Commands::Serve { .. }
+                | Commands::Callbacks { .. }
+                | Commands::Health { .. } => {
                     unreachable!()
                 }
 
