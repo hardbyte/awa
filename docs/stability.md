@@ -1,0 +1,56 @@
+# Public Surface Stability Policy
+
+> **Status: Draft** — introduced by [`0.7-roadmap.md`](0.7-roadmap.md) decision D6, pending
+> ADR-036 acceptance. Tracked in [#369](https://github.com/hardbyte/awa/issues/369). Until
+> accepted, this document describes intent, not promises.
+
+Awa is consumed through several distinct surfaces. This document states, per surface, what is
+covered by a compatibility promise, what is explicitly internal, and what each release type may
+change. Anything not listed here is **internal** and may change in any release without notice.
+
+## Release types (pre-1.0)
+
+While Awa is pre-1.0, "minor" releases (0.6 → 0.7) play the semver-major role:
+
+| Release type | May contain |
+| --- | --- |
+| **Patch** (0.7.0 → 0.7.1) | Bug fixes only. No breaking changes to any listed surface. No new migrations except to fix a defective migration. |
+| **Minor** (0.7 → 0.8) | Breaking changes to listed surfaces are allowed **only** with: a changelog entry under "Breaking changes", a migration path in the upgrade guide, and — where feasible — a deprecation period per the policy below. |
+| **Beta / RC** | Surfaces may change between pre-release tags of the same line (the 0.6 `QueueFanout` → `PartitionedQueue` rename is the precedent). Pre-release tags promise nothing to each other; the stable tag promises everything below. |
+
+## Deprecation policy
+
+Announce in release N (changelog + doc note), warn at runtime in N+1 where the surface makes a
+runtime warning possible, remove in N+2. Security fixes may compress this schedule; the
+changelog will say so explicitly.
+
+## Surfaces
+
+| Surface | What is covered | What is not |
+| --- | --- | --- |
+| **Rust API** (`awa`, `awa-model`, `awa-macros`, `awa-testing`, `awa-seaorm`) | All `pub` items documented on docs.rs. Semver-checked in CI (planned: `cargo-semver-checks`). | `#[doc(hidden)]` items; anything behind an unstable feature flag; `awa-worker`/`awa-ui` internals not re-exported by `awa`. |
+| **Python API** (`awa-pg`) | Everything exported by `awa/__init__.py` and typed in the `.pyi` stubs (stub/API drift gated in CI per [#378](https://github.com/hardbyte/awa/issues/378)). Async and `_sync` counterparts per ADR-009. | Underscore-prefixed members; the raw PyO3 module layout. |
+| **SQL producer contract** | `awa.insert_job_compat(...)` per [#342](https://github.com/hardbyte/awa/issues/342): signature, semantics, BLAKE3 `unique_key` derivation, `ordering_key` → shard hash. Versioned against `awa.schema_version`; conformance script provided. | Every other function, table, view, and trigger in the `awa.*` schema. Direct DML against storage tables is unsupported. |
+| **Terminal read surface** | `{schema}.terminal_jobs` (per ADR-026) and the documented public views. | `done_entries` physical layout and all segment/ring/ledger internals — compact batches mean not every completed job is physically a `done_entries` row. |
+| **HTTP admin API** | Versioned response types published by the `awa-api` crate ([#143](https://github.com/hardbyte/awa/issues/143)) once split. | Handler internals; the embedded UI's asset paths; any endpoint not documented in `ui-design.md`. |
+| **Callback receiver contract** | The signed callback endpoints (ADR-018/021/027): paths under the configured prefix, signature scheme, payload shapes, error mapping. Identical between embedded router and `awa callbacks serve`. | — |
+| **CLI** | Documented commands, their exit codes, and `--json` output schemas (e.g. `awa doctor`, `awa storage status`). | Human-readable (non-`--json`) output formatting. |
+| **Metrics** | Metric names, types, and attribute keys listed in the telemetry docs. | Attribute *values* cardinality; bucket boundaries (may be tuned in minors with a changelog note). |
+| **Storage schema / migrations** | The migration *path*: `awa migrate` upgrades any supported prior version's schema (support window per [#367](https://github.com/hardbyte/awa/issues/367) and ADR-037's gate). | Schema contents. Tables, indexes, functions, and triggers are internal; migrations may reshape them freely. There is no downgrade path. |
+| **Configuration** | Documented `QueueConfig`/builder options, Python `start()` kwargs, and `AWA_*` environment variables in `configuration.md`. | Undocumented env vars; internal tuning defaults (may change in minors with a changelog note). |
+
+## What "supported" means for binary/schema skew
+
+Rolling deploys create windows where an older binary runs against a newer schema. The support
+statement (maintained with [#367](https://github.com/hardbyte/awa/issues/367)):
+
+- A binary one minor version behind the schema must either work correctly or fail loudly and
+  legibly — never silently misbehave.
+- A newer binary against an older schema refuses to run and names the migration step.
+- The 0.7 boundary additionally requires a finalized queue-storage transition (ADR-037).
+
+## Relationship to release notes
+
+Every stable release's changelog lists breaking changes against this document's surface list.
+If a change breaks something *not* listed here, it is not a breaking change — but if that
+surprises users repeatedly, the fix is to amend this document, not to argue.
