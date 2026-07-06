@@ -1457,6 +1457,21 @@ impl Client {
         &self,
         effective_storage: &RuntimeStorage,
     ) -> Result<(), awa_model::AwaError> {
+        // ADR-037: the canonical engine is deprecated in 0.7 and its
+        // claim/execution/trigger paths are removed in 0.8. Warn on every
+        // runtime that resolves to it, whatever the reason (explicit builder
+        // choice, drain role, or an unfinalized transition).
+        if matches!(effective_storage, RuntimeStorage::Canonical) {
+            warn!(
+                transition_role = ?self.transition_role,
+                "This runtime is executing on the canonical storage engine, which is \
+                 deprecated in 0.7 and will be removed in 0.8. Finalize the queue-storage \
+                 transition (`awa storage prepare --engine queue_storage`, `awa storage \
+                 enter-mixed-transition`, `awa storage finalize --wait`) — see \
+                 docs/upgrade-0.5-to-0.6.md and ADR-037"
+            );
+        }
+
         if self.storage.queue_storage().is_none() {
             return Ok(());
         }

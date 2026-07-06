@@ -14,6 +14,17 @@ pub enum AwaError {
     #[error("schema not migrated: expected version {expected}, found {found}")]
     SchemaNotMigrated { expected: i32, found: i32 },
 
+    #[error(
+        "storage transition not finalized (state: {state}): awa 0.7 refuses to apply \
+         migrations while the deprecated canonical engine can still hold work (ADR-037). \
+         Finalize the queue-storage transition on awa 0.6 first — `awa storage prepare \
+         --engine queue_storage`, then `awa storage enter-mixed-transition`, then \
+         `awa storage finalize --wait` — and re-run `awa migrate`. Fresh installs (no jobs, \
+         no recently-live runtimes) are exempt. See docs/upgrade-0.6-to-0.7.md and \
+         docs/upgrade-0.5-to-0.6.md."
+    )]
+    StorageNotFinalized { state: String },
+
     #[error("unknown job kind: {kind}")]
     UnknownJobKind { kind: String },
 

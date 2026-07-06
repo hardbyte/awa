@@ -33,6 +33,9 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Dea
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
+AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + 0.7 migrate gate
+AwaStorageTransition.tla       ;; AwaStorageTransitionCurrentGate.cfg     ;; MixedHasQueueExecutor is violated ;; pre-v014 capability-gate witness
+AwaStorageTransition.tla       ;; AwaStorageTransitionMigrate07Ungated.cfg ;; Migrate07OnlyOnQuiescedCanonical is violated ;; ungated 0.7 migrate witness
 AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; per-row rescue fallback converges
 AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueBatchOnly.cfg   ;; Temporal property Convergence was violated ;; batch-only rescue starvation witness
 '

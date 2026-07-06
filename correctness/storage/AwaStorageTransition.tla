@@ -11,7 +11,8 @@ EXTENDS TLC, Naturals, FiniteSets
 
 CONSTANTS MaxCanonicalBacklog,
           MaxQueueRows,
-          RequireQueueExecutorOnEnter
+          RequireQueueExecutorOnEnter,
+          GateMigrate07
 
 States == {"canonical", "prepared", "mixed_transition", "active"}
 Engines == {"canonical", "queue_storage", "none"}
@@ -26,7 +27,9 @@ VARIABLES state,
           autoPreMixedLive,
           queueTargetLive,
           explicitDrainLive,
-          mixedEntryHadQueueExecutor
+          mixedEntryHadQueueExecutor,
+          migrated07,
+          migrate07EntryClean
 
 vars == <<state,
           currentEngine,
@@ -38,7 +41,9 @@ vars == <<state,
           autoPreMixedLive,
           queueTargetLive,
           explicitDrainLive,
-          mixedEntryHadQueueExecutor>>
+          mixedEntryHadQueueExecutor,
+          migrated07,
+          migrate07EntryClean>>
 
 ActiveEngine ==
     IF state \in {"mixed_transition", "active"}
@@ -113,6 +118,8 @@ Init ==
     /\ queueTargetLive = 0
     /\ explicitDrainLive = 0
     /\ mixedEntryHadQueueExecutor = TRUE
+    /\ migrated07 = FALSE
+    /\ migrate07EntryClean = TRUE
 
 PrepareQueueStorage ==
     /\ state \in {"canonical", "prepared"}
@@ -127,7 +134,9 @@ PrepareQueueStorage ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 PrepareSchema ==
     /\ state = "prepared"
@@ -142,7 +151,9 @@ PrepareSchema ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 EnterMixedTransition ==
     /\ CanEnterMixed
@@ -156,7 +167,9 @@ EnterMixedTransition ==
                    oldCanonicalLive,
                    autoPreMixedLive,
                    queueTargetLive,
-                   explicitDrainLive>>
+                   explicitDrainLive,
+                   migrated07,
+                   migrate07EntryClean>>
 
 Finalize ==
     /\ CanFinalize
@@ -170,7 +183,9 @@ Finalize ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 AbortPrepared ==
     /\ state = "prepared"
@@ -184,7 +199,9 @@ AbortPrepared ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 AbortMixed ==
     /\ CanAbortMixed
@@ -198,7 +215,9 @@ AbortMixed ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StartOldCanonical ==
     /\ state \in {"canonical", "prepared"}
@@ -213,7 +232,9 @@ StartOldCanonical ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StopOldCanonical ==
     /\ oldCanonicalLive > 0
@@ -227,7 +248,9 @@ StopOldCanonical ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StartAutoPreMixed ==
     /\ state \in {"canonical", "prepared"}
@@ -242,7 +265,9 @@ StartAutoPreMixed ==
                    oldCanonicalLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StopAutoPreMixed ==
     /\ autoPreMixedLive > 0
@@ -256,7 +281,9 @@ StopAutoPreMixed ==
                    oldCanonicalLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StartQueueTarget ==
     /\ state # "canonical"
@@ -273,7 +300,9 @@ StartQueueTarget ==
                    oldCanonicalLive,
                    autoPreMixedLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StopQueueTarget ==
     /\ queueTargetLive > 0
@@ -287,7 +316,9 @@ StopQueueTarget ==
                    oldCanonicalLive,
                    autoPreMixedLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StartExplicitDrain ==
     /\ state \in {"prepared", "mixed_transition"}
@@ -302,7 +333,9 @@ StartExplicitDrain ==
                    oldCanonicalLive,
                    autoPreMixedLive,
                    queueTargetLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 StopExplicitDrain ==
     /\ explicitDrainLive > 0
@@ -316,7 +349,9 @@ StopExplicitDrain ==
                    oldCanonicalLive,
                    autoPreMixedLive,
                    queueTargetLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 ProducerEnqueueCanonical ==
     /\ ActiveEngine = "canonical"
@@ -331,7 +366,9 @@ ProducerEnqueueCanonical ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 ProducerEnqueueQueueStorage ==
     /\ ActiveEngine = "queue_storage"
@@ -346,7 +383,9 @@ ProducerEnqueueQueueStorage ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 DrainCanonical ==
     /\ canonicalBacklog > 0
@@ -361,7 +400,9 @@ DrainCanonical ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
 
 CompleteQueueStorage ==
     /\ queueRows > 0
@@ -372,6 +413,42 @@ CompleteQueueStorage ==
                    preparedEngine,
                    preparedSchemaReady,
                    canonicalBacklog,
+                   oldCanonicalLive,
+                   autoPreMixedLive,
+                   queueTargetLive,
+                   explicitDrainLive,
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean>>
+
+\* The 0.7 migrate gate (#370 / ADR-037). `awa migrate` on a 0.7 binary
+\* applies pending migrations only when the transition is finalized or the
+\* cluster is effectively fresh — canonical, unprepared, no canonical work,
+\* and no recently-live runtime of any kind (mirroring the SQL conditions in
+\* `awa.storage_auto_finalize_if_fresh`).
+Migrate07GateOpen ==
+    \/ state = "active"
+    \/ /\ state = "canonical"
+       /\ preparedEngine = "none"
+       /\ canonicalBacklog = 0
+       /\ oldCanonicalLive + autoPreMixedLive + queueTargetLive + explicitDrainLive = 0
+
+\* Ghost record of what the gate is meant to guarantee at the moment the
+\* migration lands: no canonical work and no runtime that could still
+\* execute canonical work. Checked by Migrate07OnlyOnQuiescedCanonical;
+\* the Ungated config demonstrates the counterexample without the gate.
+Migrate07 ==
+    /\ ~migrated07
+    /\ IF GateMigrate07 THEN Migrate07GateOpen ELSE TRUE
+    /\ migrated07' = TRUE
+    /\ migrate07EntryClean' =
+           (canonicalBacklog = 0 /\ LiveCanonicalCapability + LiveDrainCapability = 0)
+    /\ UNCHANGED <<state,
+                   currentEngine,
+                   preparedEngine,
+                   preparedSchemaReady,
+                   canonicalBacklog,
+                   queueRows,
                    oldCanonicalLive,
                    autoPreMixedLive,
                    queueTargetLive,
@@ -399,6 +476,7 @@ Next ==
     \/ ProducerEnqueueQueueStorage
     \/ DrainCanonical
     \/ CompleteQueueStorage
+    \/ Migrate07
     \/ Stutter
 
 Spec == Init /\ [][Next]_vars
@@ -415,6 +493,8 @@ TypeOK ==
     /\ queueTargetLive \in 0..1
     /\ explicitDrainLive \in 0..1
     /\ mixedEntryHadQueueExecutor \in BOOLEAN
+    /\ migrated07 \in BOOLEAN
+    /\ migrate07EntryClean \in BOOLEAN
 
 PreparedRequiresEngine ==
     state \in {"prepared", "mixed_transition"} => preparedEngine = "queue_storage"
@@ -442,5 +522,10 @@ MixedHasQueueExecutor ==
 
 AbortMixedKeepsCanonicalIfQueueStorageUnused ==
     state = "canonical" /\ currentEngine = "canonical" => queueRows = 0
+
+\* A 0.7 migration never lands while canonical work exists or a runtime
+\* that can still execute canonical work is live.
+Migrate07OnlyOnQuiescedCanonical ==
+    migrated07 => migrate07EntryClean
 
 =============================================================================
