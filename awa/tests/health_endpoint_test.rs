@@ -1,8 +1,10 @@
 //! Worker health/readiness listener tests (#368).
 //!
 //! Uses a dedicated `awa_health_test` database: these tests delete
-//! `schema_version` rows and close pools to fault-inject, which must not
-//! race the shared integration database.
+//! `schema_version` rows and refuse connections to fault-inject, which must
+//! not race the shared integration database. For the same reason the tests
+//! serialize against each other — a process-local mutex plus a Postgres
+//! advisory lock (so process-per-test runners stay safe too).
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
@@ -12,7 +14,38 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
+
+static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+const HEALTH_TEST_LOCK_KEY: i64 = 0x6177_6168_6c74_6831; // "awahlth1"
+
+fn test_mutex() -> &'static Mutex<()> {
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+struct HealthTestGuard {
+    _local: tokio::sync::MutexGuard<'static, ()>,
+    _conn: PgConnection,
+}
+
+async fn acquire_health_guard() -> HealthTestGuard {
+    let local = test_mutex().lock().await;
+    ensure_health_database().await;
+    let mut conn = PgConnection::connect(&health_database_url())
+        .await
+        .expect("Failed to open health test lock connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(HEALTH_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .expect("Failed to acquire health test advisory lock");
+    HealthTestGuard {
+        _local: local,
+        _conn: conn,
+    }
+}
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -51,15 +84,22 @@ async fn ensure_health_database() {
     .await
     .expect("Failed to check health database existence");
     if !exists {
-        sqlx::raw_sql("CREATE DATABASE awa_health_test")
+        // Tolerate the duplicate-database race: another test process can
+        // create it between the existence check and this statement.
+        if let Err(err) = sqlx::raw_sql("CREATE DATABASE awa_health_test")
             .execute(&mut admin)
             .await
-            .expect("Failed to create health test database");
+        {
+            let duplicate = matches!(
+                &err,
+                sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("42P04")
+            );
+            assert!(duplicate, "Failed to create health test database: {err}");
+        }
     }
 }
 
 async fn setup() -> PgPool {
-    ensure_health_database().await;
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(5))
@@ -122,6 +162,7 @@ async fn wait_for_ready(addr: SocketAddr, expected: bool) -> serde_json::Value {
 
 #[tokio::test]
 async fn test_healthz_and_readyz_report_running_worker() {
+    let _guard = acquire_health_guard().await;
     let pool = setup().await;
     let client = build_and_start(&pool, "health_baseline").await;
     let addr = client
@@ -156,6 +197,7 @@ async fn test_healthz_and_readyz_report_running_worker() {
 
 #[tokio::test]
 async fn test_readyz_flips_503_on_schema_mismatch() {
+    let _guard = acquire_health_guard().await;
     let pool = setup().await;
     let client = build_and_start(&pool, "health_schema").await;
     let addr = client.health_listener_addr().expect("listener address");
@@ -185,6 +227,7 @@ async fn test_readyz_flips_503_on_schema_mismatch() {
 
 #[tokio::test]
 async fn test_readyz_reports_shutting_down_during_drain() {
+    let _guard = acquire_health_guard().await;
     let pool = setup().await;
     let queue = "health_drain";
     sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
@@ -270,6 +313,7 @@ async fn test_readyz_reports_shutting_down_during_drain() {
 
 #[tokio::test]
 async fn test_readyz_flips_503_when_database_unreachable() {
+    let _guard = acquire_health_guard().await;
     let pool = setup().await;
     let client = build_and_start(&pool, "health_db_down").await;
     let addr = client.health_listener_addr().expect("listener address");
@@ -314,6 +358,7 @@ async fn test_invalid_health_addr_env_is_a_build_error() {
     // Env mutation is process-global; this is the only test that touches
     // AWA_HEALTH_ADDR, and no other test reads it (they configure the
     // builder explicitly).
+    let _guard = acquire_health_guard().await;
     let pool = setup().await;
     std::env::set_var("AWA_HEALTH_ADDR", "not-an-address");
     let result = Client::builder(pool.clone())
