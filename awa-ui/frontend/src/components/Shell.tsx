@@ -6,7 +6,13 @@ import {
 } from "react-aria-components";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
-import { fetchCapabilities, fetchRuntime, type RuntimeOverview } from "@/lib/api";
+import {
+  fetchCapabilities,
+  fetchRuntime,
+  fetchStorage,
+  type RuntimeOverview,
+  type StorageStatusReport,
+} from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   Sidebar,
@@ -172,31 +178,32 @@ function RefreshControl() {
   );
 }
 
-// Returns live worker count, plus a capability label when the cluster is
-// mid-transition (mixed or non-canonical). On a canonical-only cluster the
-// label is suppressed — the engine name conveys nothing operators need to see.
-function summariseCluster(runtime: RuntimeOverview | undefined): {
+// Returns live worker count, plus an engine label when the cluster routes
+// to a non-canonical engine or is mid-transition. The label comes from the
+// authoritative transition state — NOT from per-instance
+// `storage_capability`, which reports what a runtime COULD execute and
+// therefore reads "queue_storage" on every capable worker of a fully
+// canonical cluster. On a canonical cluster the label is suppressed.
+function summariseCluster(
+  runtime: RuntimeOverview | undefined,
+  storage: StorageStatusReport | null | undefined
+): {
   liveCount: number;
-  capability: string | null;
+  engineLabel: string | null;
 } | null {
   if (!runtime) return null;
   const live = runtime.instances.filter((instance) => !instance.stale);
   if (live.length === 0) return null;
 
-  const capabilities = new Set(
-    live.map((instance) => instance.storage_capability ?? "canonical")
-  );
-  const ordered = Array.from(capabilities).sort();
-  const mixedOrNonCanonical =
-    ordered.length > 1 || (ordered[0] !== undefined && ordered[0] !== "canonical");
-  return {
-    liveCount: live.length,
-    capability: mixedOrNonCanonical
-      ? ordered.length > 1
-        ? "mixed storage"
-        : (ordered[0] ?? "").replace(/_/g, " ")
-      : null,
-  };
+  let engineLabel: string | null = null;
+  if (storage) {
+    if (storage.state === "mixed_transition") {
+      engineLabel = "mixed transition";
+    } else if (storage.active_engine !== "canonical") {
+      engineLabel = storage.active_engine.replace(/_/g, " ");
+    }
+  }
+  return { liveCount: live.length, engineLabel };
 }
 
 const SIDEBAR_OPEN_KEY = "sidebar-open";
@@ -230,10 +237,12 @@ function CloseMobileOnNavigate({ path }: { path: string }) {
 // Live-worker pulse for the sidebar footer.
 function ClusterStatusChip({
   runtime,
+  storage,
   isPending,
   isError,
 }: {
   runtime: RuntimeOverview | undefined;
+  storage: StorageStatusReport | null | undefined;
   isPending: boolean;
   isError: boolean;
 }) {
@@ -253,7 +262,7 @@ function ClusterStatusChip({
       </div>
     );
   }
-  const summary = summariseCluster(runtime);
+  const summary = summariseCluster(runtime, storage);
   if (!summary) {
     return (
       <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs text-muted-fg">
@@ -271,8 +280,8 @@ function ClusterStatusChip({
       </span>
       <span className="flex flex-col">
         <span className="font-medium text-fg">{workerLabel}</span>
-        {summary.capability && (
-          <span className="capitalize text-muted-fg">{summary.capability}</span>
+        {summary.engineLabel && (
+          <span className="capitalize text-muted-fg">{summary.engineLabel}</span>
         )}
       </span>
     </div>
@@ -359,13 +368,21 @@ export function Shell() {
   const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
 
   // Cluster status for the sidebar footer; poll-aligned with other pages.
-  // On pre-v10 deployments `storage_capability` is absent per instance; the
-  // aggregator treats that as canonical so the chip still renders.
   const runtimeQuery = useQuery({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
     refetchInterval: poll.interval,
     staleTime: poll.staleTime,
+  });
+  // Authoritative engine/transition state for the chip label. Backends
+  // predating /api/storage resolve to null; stop polling once known-absent.
+  const storageQuery = useQuery({
+    queryKey: ["storage", "chip"],
+    queryFn: () => fetchStorage(),
+    refetchInterval: (query) =>
+      query.state.data === null ? false : poll.interval,
+    staleTime: poll.staleTime,
+    retry: false,
   });
 
   function isActive(to: string): boolean {
@@ -413,6 +430,7 @@ export function Shell() {
           <div className="group-data-[collapsible=dock]:hidden">
             <ClusterStatusChip
               runtime={runtimeQuery.data}
+              storage={storageQuery.data}
               isPending={runtimeQuery.isPending}
               isError={runtimeQuery.isError}
             />

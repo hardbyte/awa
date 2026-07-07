@@ -1,12 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
+  effectiveEngine,
   fetchQueueRuntime,
   fetchRuntime,
   fetchStorage,
 } from "@/lib/api";
 import type {
   QueueRuntimeSummary,
+  RuntimeInstance,
   RuntimeOverview,
   StorageStatusReport,
 } from "@/lib/api";
@@ -45,6 +47,34 @@ import {
 } from "@/components/RuntimeDisplay";
 
 type LifecycleFilter = "live" | "all";
+
+// The engine the instance is executing on — the operational fact the old
+// capability caption misrepresented (a canonical-executing worker reports
+// `queue_storage` capability). Capability is shown only when it adds
+// information beyond the engine.
+function EngineCaption({
+  instance,
+  storage,
+}: {
+  instance: RuntimeInstance;
+  storage: StorageStatusReport | null | undefined;
+}) {
+  const engine = effectiveEngine(instance, storage);
+  if (!engine) return null;
+  const capability = instance.storage_capability ?? "canonical";
+  const note =
+    engine === "canonical" && capability === "queue_storage"
+      ? " (queue-storage capable)"
+      : capability === "canonical_drain_only"
+        ? " (drain only)"
+        : "";
+  return (
+    <span className="text-xs text-muted-fg">
+      {engine === "queue_storage" ? "queue storage" : "canonical"} engine
+      {note}
+    </span>
+  );
+}
 
 export function RuntimePage() {
   const poll = usePollInterval();
@@ -440,12 +470,10 @@ export function RuntimePage() {
                         ) : (
                           <span className="text-sm text-muted-fg">Worker</span>
                         )}
-                        {instance.storage_capability &&
-                          instance.storage_capability !== "canonical" && (
-                            <span className="text-xs capitalize text-muted-fg">
-                              {instance.storage_capability.replace(/_/g, " ")}
-                            </span>
-                          )}
+                        <EngineCaption
+                          instance={instance}
+                          storage={storageQuery.data}
+                        />
                       </div>
                     </TableCell>
                     <TableCell>

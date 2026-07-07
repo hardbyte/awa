@@ -280,6 +280,34 @@ export interface StorageStatusReport {
   history?: StorageBacklogSample[];
 }
 
+/**
+ * The engine an instance is actually executing on, derived from the fields
+ * snapshots publish today. `storage_capability` is what the runtime COULD
+ * execute — a default-built worker reports `queue_storage` even while it
+ * executes canonical on a canonical cluster — so it must never be rendered
+ * as the engine in use. Mirrors the worker's `resolve_effective_storage`:
+ * an explicit transition role wins, otherwise the cluster's routing state
+ * decides. Returns null when the cluster state is unknown (old backend,
+ * /api/storage 404) rather than guessing.
+ */
+export function effectiveEngine(
+  instance: Pick<RuntimeInstance, "storage_capability" | "transition_role">,
+  storage: Pick<StorageStatusReport, "state" | "active_engine"> | null | undefined
+): "canonical" | "queue_storage" | null {
+  const capability = instance.storage_capability ?? "canonical";
+  if (capability === "canonical" || capability === "canonical_drain_only") {
+    return "canonical";
+  }
+  const role = instance.transition_role ?? "auto";
+  if (role === "canonical_drain") return "canonical";
+  if (role === "queue_storage_target") return "queue_storage";
+  if (!storage) return null;
+  const routed =
+    (storage.state === "mixed_transition" || storage.state === "active") &&
+    storage.active_engine === "queue_storage";
+  return routed ? "queue_storage" : "canonical";
+}
+
 export interface ListJobsParams {
   state?: string;
   kind?: string;
