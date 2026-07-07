@@ -32,3 +32,4 @@ correctness/**/*_TTrace_*.tla
 # Benchmark run artifacts
 /benchmarks/portable/results/
 /benchmarks/portable/awa-bench/target/
+.compat-venv-*

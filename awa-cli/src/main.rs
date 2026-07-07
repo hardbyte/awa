@@ -468,7 +468,17 @@ struct RetryFailedArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    // Errors render through Display, not the derive(Debug) shape: operator
+    // guidance (e.g. the ADR-037 migrate-gate message naming the finalize
+    // steps) lives in the Display impls and must reach the terminal.
+    if let Err(err) = run().await {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

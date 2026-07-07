@@ -42,11 +42,21 @@ changelog will say so explicitly.
 ## What "supported" means for binary/schema skew
 
 Rolling deploys create windows where an older binary runs against a newer schema. The support
-statement (maintained with [#367](https://github.com/hardbyte/awa/issues/367)):
+statement, asserted nightly by `scripts/compat-matrix.sh` against **pinned release
+artifacts** ([#367](https://github.com/hardbyte/awa/issues/367)):
 
-- A binary one minor version behind the schema must either work correctly or fail loudly and
-  legibly — never silently misbehave.
-- A newer binary against an older schema refuses to run and names the migration step.
+- **One minor behind (0.6.x binary, 0.7 schema):** full lifecycle supported — enqueue,
+  claim, complete, cancel — on a finalized cluster. Asserted with the published
+  `awa-pg==0.6.0` wheel.
+- **Two minors behind (0.5.x binary, finalized schema):** asymmetric. *Producers* keep
+  working — the `awa.jobs` compatibility routing sends their inserts to the active engine.
+  *Workers* are inert: they claim from the canonical hot table, which is empty on a
+  finalized cluster. Upgrade workers before or with the finalize step.
+- **Newer binary, older unfinalized schema:** `awa migrate` refuses loudly (exit non-zero,
+  message names the exact finalize steps) rather than upgrading over live canonical work —
+  the [ADR-037](adr/037-canonical-engine-deprecation.md) gate. Asserted against a 0.5.7-era
+  schema carrying a canonical job; the pre-migrate-0.6 variant of this leg activates
+  automatically once the 0.7 line ships its first migration.
 - The 0.7 boundary additionally requires a finalized queue-storage transition (ADR-037).
 
 ## Relationship to release notes
