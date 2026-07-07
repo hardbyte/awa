@@ -1309,6 +1309,14 @@ impl MaintenanceService {
         };
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
+                let (cancelled_duplicates, rescued): (Vec<_>, Vec<_>) = rescued
+                    .into_iter()
+                    .partition(|job| job.state == JobState::Cancelled);
+                self.handle_duplicate_cancellations("heartbeat", &cancelled_duplicates)
+                    .await;
+                if rescued.is_empty() {
+                    return;
+                }
                 self.metrics.maintenance_rescues.add(
                     rescued.len() as u64,
                     &[opentelemetry::KeyValue::new("awa.rescue.kind", "heartbeat")],
@@ -1395,6 +1403,14 @@ impl MaintenanceService {
         };
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
+                let (cancelled_duplicates, rescued): (Vec<_>, Vec<_>) = rescued
+                    .into_iter()
+                    .partition(|job| job.state == JobState::Cancelled);
+                self.handle_duplicate_cancellations("deadline", &cancelled_duplicates)
+                    .await;
+                if rescued.is_empty() {
+                    return;
+                }
                 self.metrics.maintenance_rescues.add(
                     rescued.len() as u64,
                     &[opentelemetry::KeyValue::new("awa.rescue.kind", "deadline")],
@@ -1481,6 +1497,14 @@ impl MaintenanceService {
         };
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
+                let (cancelled_duplicates, rescued): (Vec<_>, Vec<_>) = rescued
+                    .into_iter()
+                    .partition(|job| job.state == JobState::Cancelled);
+                self.handle_duplicate_cancellations("callback_timeout", &cancelled_duplicates)
+                    .await;
+                if rescued.is_empty() {
+                    return;
+                }
                 self.metrics.maintenance_rescues.add(
                     rescued.len() as u64,
                     &[opentelemetry::KeyValue::new(
@@ -1621,7 +1645,6 @@ impl MaintenanceService {
         };
 
         let mut rescued = Vec::new();
-        let mut cancelled = Vec::new();
         for id in ids {
             let attempt = {
                 let query = sqlx::query_as::<_, JobRow>(per_row_sql).bind(id);
@@ -1652,7 +1675,7 @@ impl MaintenanceService {
                         .cancel_unique_conflicted_job(id, from_state, duplicate_error)
                         .await
                     {
-                        Ok(Some(row)) => cancelled.push(row),
+                        Ok(Some(row)) => rescued.push(row),
                         Ok(None) => {}
                         Err(err) if is_unique_claim_conflict(&err) => {
                             error!(
@@ -1676,35 +1699,48 @@ impl MaintenanceService {
             }
         }
 
-        if !cancelled.is_empty() {
-            self.metrics.maintenance_rescues.add(
-                cancelled.len() as u64,
-                &[opentelemetry::KeyValue::new(
-                    "awa.rescue.kind",
-                    format!("{rescue_kind}_duplicate_cancelled"),
-                )],
-            );
-            warn!(
-                count = cancelled.len(),
-                rescue_kind, "Cancelled unique-conflicted jobs superseded by a newer duplicate"
-            );
-            self.signal_cancellation(&cancelled).await;
-            // These rows reach `cancelled` outside the normal admin-cancel
-            // path, so observers get the same terminal lifecycle event.
-            for job in &cancelled {
-                let handlers = self.lifecycle_handlers.clone();
-                let kind = job.kind.clone();
-                let event = crate::events::UntypedJobEvent::Cancelled {
-                    job: job.clone(),
-                    reason: duplicate_error.to_string(),
-                };
-                tokio::spawn(async move {
-                    crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
-                });
-            }
-        }
-
         Ok(rescued)
+    }
+
+    /// Shared handling for rescue rows that were cancelled because a newer
+    /// duplicate held their unique claim (either engine): metrics, local
+    /// cancellation signal, and the same terminal lifecycle event a normal
+    /// cancellation dispatches.
+    async fn handle_duplicate_cancellations(&self, rescue_kind: &str, cancelled: &[JobRow]) {
+        if cancelled.is_empty() {
+            return;
+        }
+        self.metrics.maintenance_rescues.add(
+            cancelled.len() as u64,
+            &[opentelemetry::KeyValue::new(
+                "awa.rescue.kind",
+                format!("{rescue_kind}_duplicate_cancelled"),
+            )],
+        );
+        warn!(
+            count = cancelled.len(),
+            rescue_kind, "Cancelled unique-conflicted jobs superseded by a newer duplicate"
+        );
+        self.signal_cancellation(cancelled).await;
+        for job in cancelled {
+            let handlers = self.lifecycle_handlers.clone();
+            let kind = job.kind.clone();
+            let reason = job
+                .errors
+                .as_ref()
+                .and_then(|errors| errors.last())
+                .and_then(|entry| entry.get("error"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("rescued as duplicate: unique claim held by a newer job")
+                .to_string();
+            let event = crate::events::UntypedJobEvent::Cancelled {
+                job: job.clone(),
+                reason,
+            };
+            tokio::spawn(async move {
+                crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
+            });
+        }
     }
 
     /// The job id currently holding the unique claim for `job_id`'s key,

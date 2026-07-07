@@ -82,9 +82,18 @@ async fn insert_unique(pool: &PgPool, queue: &str, n: i64) -> i64 {
 }
 
 async fn job_state(pool: &PgPool, id: i64) -> String {
+    job_state_opt(pool, id)
+        .await
+        .expect("job should be visible in awa.jobs")
+}
+
+/// Under queue storage a claimed (running) job is not visible through the
+/// `awa.jobs` compatibility view, so probes that can race a claim read an
+/// Option instead of assuming presence.
+async fn job_state_opt(pool: &PgPool, id: i64) -> Option<String> {
     sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
         .bind(id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
         .expect("state probe")
 }
@@ -191,4 +200,122 @@ async fn test_rescue_survives_unique_claim_conflict() {
 
     client.shutdown(Duration::from_secs(10)).await;
     clean(&pool).await;
+}
+
+/// The queue-storage engine has the same wedge shape through a different
+/// door: rescue re-inserts each rescued job as a `retryable` deferred row
+/// inside one batch transaction, and `sync_unique_claim` refuses the
+/// re-entry while a duplicate holds the claim. This test strands the jobs
+/// live (parked handlers with a heartbeat-staleness shorter than the
+/// heartbeat interval) instead of via raw SQL, so it exercises the real
+/// claim/lease plane end to end.
+#[tokio::test]
+async fn test_rescue_survives_unique_claim_conflict_queue_storage() {
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&database_url())
+        .await
+        .expect("Failed to connect — is Postgres running?");
+    migrations::run(&pool).await.expect("Failed to migrate");
+    awa_testing::setup::activate_queue_storage(&pool).await;
+    clean(&pool).await;
+
+    // Job A: unique, pending-only mask — the claim is released the moment
+    // it is claimed. Job C: no uniqueness, the innocent stuck job.
+    let job_a = insert_unique(&pool, CONSUMED_QUEUE, 11).await;
+    let job_c = insert_with(
+        &pool,
+        &UcRescueJob { n: 12 },
+        InsertOpts {
+            queue: CONSUMED_QUEUE.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("plain insert should succeed")
+    .id;
+
+    // Handlers park forever; heartbeat_staleness (2s) is far below the
+    // heartbeat refresh interval (30s default), so every claimed job goes
+    // heartbeat-stale while genuinely running — a live stand-in for a
+    // crashed worker.
+    let client = Client::builder(pool.clone())
+        .queue(
+            CONSUMED_QUEUE,
+            QueueConfig {
+                max_workers: 4,
+                ..QueueConfig::default()
+            },
+        )
+        .register::<UcRescueJob, _, _>(|_args: UcRescueJob, _ctx| async move {
+            std::future::pending::<()>().await;
+            Ok(JobResult::Completed)
+        })
+        .heartbeat_rescue_interval(Duration::from_millis(500))
+        .heartbeat_staleness(Duration::from_secs(2))
+        .build()
+        .expect("client should build");
+    client.start().await.expect("client should start");
+
+    // Wait for A to be claimed — under queue storage a running job drops
+    // out of the compat view, and its claim is released by the pending-only
+    // mask at that moment. Then park the duplicate on an unconsumed queue
+    // so it takes and keeps the claim.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match job_state_opt(&pool, job_a).await.as_deref() {
+            None | Some("running") => break,
+            _ => {}
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("job A was never claimed");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let job_b = insert_unique(&pool, PARKED_QUEUE, 11).await;
+
+    // Old behavior: the whole rescue batch aborts on A's conflict and C is
+    // never rescued. Fixed behavior: A is cancelled (claim holder wins) and
+    // C keeps being rescued — its attempt count advances. C oscillates
+    // between running (invisible in the view) and retryable, so remember
+    // the highest attempt seen.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut c_attempt_seen: i16 = 0;
+    loop {
+        let a = job_state_opt(&pool, job_a).await;
+        if let Some(attempt) =
+            sqlx::query_scalar::<_, i16>("SELECT attempt FROM awa.jobs WHERE id = $1")
+                .bind(job_c)
+                .fetch_optional(&pool)
+                .await
+                .expect("attempt probe")
+        {
+            c_attempt_seen = c_attempt_seen.max(attempt);
+        }
+        if a.as_deref() == Some("cancelled") && c_attempt_seen >= 1 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "QS rescue did not converge: A={a:?} (want cancelled), C attempt seen={c_attempt_seen}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let rendered: String = sqlx::query_scalar("SELECT errors::text FROM awa.jobs WHERE id = $1")
+        .bind(job_a)
+        .fetch_one(&pool)
+        .await
+        .expect("errors probe");
+    assert!(
+        rendered.contains("rescued as duplicate"),
+        "cancelled job should record why: {rendered}"
+    );
+    assert_eq!(job_state(&pool, job_b).await, "available");
+
+    client.shutdown(Duration::from_secs(5)).await;
+    clean(&pool).await;
+    awa_testing::setup::reset_runtime_backend(&pool).await;
 }
