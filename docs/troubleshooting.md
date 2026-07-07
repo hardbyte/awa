@@ -141,7 +141,7 @@ In all cases the cancel itself is durable — only the early wake-up is lost. Lo
 
 Symptom (canonical engine): maintenance repeats, every tick:
 
-```
+```text
 Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
 Failed to rescue deadline-expired jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
 ```
@@ -153,6 +153,7 @@ SELECT j.id AS stuck_job, j.kind, j.queue, j.unique_key,
        c.job_id AS claim_holder, h.state AS holder_state
 FROM awa.jobs_hot j
 JOIN awa.job_unique_claims c ON c.unique_key = j.unique_key AND c.job_id <> j.id
+LEFT JOIN awa.jobs h ON h.id = c.job_id
 WHERE j.state = 'running';
 ```
 

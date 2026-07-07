@@ -1689,6 +1689,19 @@ impl MaintenanceService {
                 rescue_kind, "Cancelled unique-conflicted jobs superseded by a newer duplicate"
             );
             self.signal_cancellation(&cancelled).await;
+            // These rows reach `cancelled` outside the normal admin-cancel
+            // path, so observers get the same terminal lifecycle event.
+            for job in &cancelled {
+                let handlers = self.lifecycle_handlers.clone();
+                let kind = job.kind.clone();
+                let event = crate::events::UntypedJobEvent::Cancelled {
+                    job: job.clone(),
+                    reason: duplicate_error.to_string(),
+                };
+                tokio::spawn(async move {
+                    crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
+                });
+            }
         }
 
         Ok(rescued)
