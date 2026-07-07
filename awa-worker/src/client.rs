@@ -946,7 +946,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Build the client.
     /// Serve `GET /healthz` and `GET /readyz` on this address while the
     /// runtime is running (#368). Defaults to off; the `AWA_HEALTH_ADDR`
     /// environment variable is honoured when this is not set. Port 0 binds
@@ -957,6 +956,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Build the client.
     pub fn build(self) -> Result<Client, BuildError> {
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
@@ -1575,6 +1575,29 @@ impl Client {
         )
         .await?;
 
+        // Health/readiness listener (#368): bind BEFORE any background
+        // service is spawned, so an in-use address fails start() without
+        // leaking already-running tasks (callers that see start() fail
+        // don't call shutdown()). The serve task itself is spawned with the
+        // other services below; service_cancel keeps /readyz answering
+        // (503, shutting_down) through the graceful drain.
+        let health_listener = if let Some(addr) = self.health_addr {
+            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
+                awa_model::AwaError::Validation(format!(
+                    "failed to bind health listener on {addr}: {err}"
+                ))
+            })?;
+            let bound = listener.local_addr().map_err(|err| {
+                awa_model::AwaError::Validation(format!(
+                    "failed to resolve health listener address: {err}"
+                ))
+            })?;
+            let _ = self.health_bound_addr.set(bound);
+            Some(listener)
+        } else {
+            None
+        };
+
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
         let runtime_worker_capacity = self.global_max_workers.unwrap_or_else(|| {
@@ -1619,27 +1642,7 @@ impl Client {
 
         let mut service_handles = self.service_handles.write().await;
 
-        service_handles.extend(completion_batcher.spawn());
-        if let Some(handle) = cancel_listener_handle {
-            service_handles.push(handle);
-        }
-
-        // Health/readiness listener (#368). Bind failures abort startup —
-        // a misconfigured probe address must not fail silently. Uses
-        // service_cancel so /readyz keeps answering (503, shutting_down)
-        // through the graceful drain.
-        if let Some(addr) = self.health_addr {
-            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|err| {
-                awa_model::AwaError::Validation(format!(
-                    "failed to bind health listener on {addr}: {err}"
-                ))
-            })?;
-            let bound = listener.local_addr().map_err(|err| {
-                awa_model::AwaError::Validation(format!(
-                    "failed to resolve health listener address: {err}"
-                ))
-            })?;
-            let _ = self.health_bound_addr.set(bound);
+        if let Some(listener) = health_listener {
             let probe = HealthProbe {
                 pool: self.pool.clone(),
                 dispatcher_alive: self.dispatcher_alive.clone(),
@@ -1650,6 +1653,11 @@ impl Client {
             };
             let cancel = self.service_cancel.clone();
             service_handles.push(tokio::spawn(health_server::serve(listener, probe, cancel)));
+        }
+
+        service_handles.extend(completion_batcher.spawn());
+        if let Some(handle) = cancel_listener_handle {
+            service_handles.push(handle);
         }
 
         // Start heartbeat service (uses service_cancel — stays alive during drain)
@@ -2102,7 +2110,6 @@ impl Client {
         crate::enqueue_specs::dispatch_specs_in_tx(tx, job, &specs, outcome_context.as_ref()).await
     }
 
-    /// Health check.
     /// The address the health/readiness listener bound during `start()`.
     /// `None` when the listener is disabled or `start()` has not run yet.
     /// Useful with port 0 (ephemeral) configurations.
@@ -2110,6 +2117,7 @@ impl Client {
         self.health_bound_addr.get().copied()
     }
 
+    /// Health check.
     pub async fn health_check(&self) -> HealthCheck {
         let postgres_connected = sqlx::query("SELECT 1").execute(&self.pool).await.is_ok();
         let poll_loop_alive = self

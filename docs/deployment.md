@@ -188,7 +188,8 @@ Two endpoints:
   shutting down. Otherwise `503` with a JSON body naming each failing check
   (`postgres_connected`, `schema_version`, `expected_schema_version`,
   `schema_compatible`, `poll_loop_alive`, `heartbeat_alive`,
-  `maintenance_alive`, `shutting_down`, `leader`).
+  `maintenance_alive`, `shutting_down`). `leader` is also reported but is
+  informational — it never gates readiness.
 
 Kubernetes probes against the listener:
 

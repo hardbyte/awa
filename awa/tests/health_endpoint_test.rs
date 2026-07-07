@@ -225,6 +225,56 @@ async fn test_readyz_flips_503_on_schema_mismatch() {
     client.shutdown(Duration::from_secs(10)).await;
 }
 
+/// The supported rolling-deploy skew: a schema NEWER than the binary must
+/// stay ready — and, critically, probing it must not mutate
+/// `schema_version`. (`current_version` rewrites rows when its legacy
+/// heuristic fires, and a future version triggers that heuristic; probes
+/// use the read-only variant.)
+#[tokio::test]
+async fn test_readyz_stays_ready_on_newer_schema_without_mutating() {
+    let _guard = acquire_health_guard().await;
+    let pool = setup().await;
+    let client = build_and_start(&pool, "health_newer_schema").await;
+    let addr = client.health_listener_addr().expect("listener address");
+    wait_for_ready(addr, true).await;
+
+    sqlx::query(
+        "INSERT INTO awa.schema_version (version, description) VALUES ($1, 'future version for health test')",
+    )
+    .bind(migrations::CURRENT_VERSION + 1)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rows_before: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Still ready, reporting the newer version...
+    let body = wait_for_ready(addr, true).await;
+    assert_eq!(body["schema_compatible"], true);
+    assert_eq!(body["schema_version"], migrations::CURRENT_VERSION + 1);
+
+    // ...and several probe cycles later the version table is untouched.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = get(addr, "/readyz").await;
+    let rows_after: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_before, rows_after,
+        "readiness probes must never rewrite schema_version"
+    );
+
+    sqlx::query("DELETE FROM awa.schema_version WHERE version = $1")
+        .bind(migrations::CURRENT_VERSION + 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    client.shutdown(Duration::from_secs(10)).await;
+}
+
 #[tokio::test]
 async fn test_readyz_reports_shutting_down_during_drain() {
     let _guard = acquire_health_guard().await;

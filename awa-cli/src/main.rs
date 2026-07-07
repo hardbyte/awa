@@ -676,7 +676,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
 
             let report = match pool_result {
-                Ok(pool) => health::probe(&pool).await,
+                Ok(pool) => {
+                    health::probe_with_timeout(&pool, Duration::from_secs(connect_timeout)).await
+                }
                 Err(_) => health::unreachable_report(),
             };
 

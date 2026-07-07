@@ -44,11 +44,25 @@ pub fn unreachable_report() -> HealthReport {
     }
 }
 
+/// [`probe`] bounded by a wall-clock budget: a Postgres that accepts
+/// connections but stalls mid-query must not hang the probe — expiry
+/// reports unreachable instead.
+pub async fn probe_with_timeout(pool: &PgPool, budget: std::time::Duration) -> HealthReport {
+    match tokio::time::timeout(budget, probe(pool)).await {
+        Ok(report) => report,
+        Err(_) => unreachable_report(),
+    }
+}
+
 pub async fn probe(pool: &PgPool) -> HealthReport {
     let postgres_connected = sqlx::query("SELECT 1").execute(pool).await.is_ok();
 
+    // Read-only on purpose: `current_version` can rewrite schema_version
+    // rows via its legacy-numbering heuristic; a probe must never mutate.
     let schema_version = if postgres_connected {
-        awa_model::migrations::current_version(pool).await.ok()
+        awa_model::migrations::current_version_readonly(pool)
+            .await
+            .ok()
     } else {
         None
     };

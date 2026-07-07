@@ -69,9 +69,12 @@ impl HealthProbe {
 
         // A newer schema than the binary expects is the supported rolling-
         // deploy skew (older binary against newer schema); an older schema
-        // means `awa migrate` has not run and the runtime cannot work.
+        // means `awa migrate` has not run and the runtime cannot work. The
+        // read-only probe is load-bearing: `current_version` rewrites
+        // schema_version rows when its legacy heuristic fires, and a probe
+        // polled by an orchestrator must never mutate the database.
         let schema_version = if postgres_connected {
-            awa_model::migrations::current_version(&self.pool)
+            awa_model::migrations::current_version_readonly(&self.pool)
                 .await
                 .ok()
         } else {

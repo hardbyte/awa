@@ -397,6 +397,38 @@ async fn recently_live_runtimes_exist(conn: &mut PgConnection) -> Result<bool, A
     Ok(exists)
 }
 
+/// Read-only schema version probe: the raw `MAX(version)` with no legacy
+/// normalization and **no writes**.
+///
+/// Health probes and other read paths must use this instead of
+/// [`current_version`]: that helper rewrites `schema_version` rows when its
+/// legacy-numbering heuristic fires, and the heuristic also matches a schema
+/// *newer* than this binary (any version outside the known range with a
+/// row at 6 or above) — exactly the supported rolling-deploy skew, which a
+/// probe must observe without mutating.
+pub async fn current_version_readonly(pool: &PgPool) -> Result<i32, AwaError> {
+    let mut conn = pool.acquire().await?;
+    let has_schema: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !has_schema {
+        return Ok(0);
+    }
+    let has_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'schema_version')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !has_table {
+        return Ok(0);
+    }
+    let version: Option<i32> = sqlx::query_scalar("SELECT MAX(version) FROM awa.schema_version")
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(version.unwrap_or(0))
+}
+
 /// Get the current schema version.
 pub async fn current_version(pool: &PgPool) -> Result<i32, AwaError> {
     let mut conn = pool.acquire().await?;
