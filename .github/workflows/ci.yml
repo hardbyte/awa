@@ -37,6 +37,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Check CI test-shard membership
+        run: ./scripts/ci-test-shard.sh check
 
   rust-build:
     name: Rust build
@@ -53,13 +55,27 @@ jobs:
         run: cargo build --workspace
 
   rust-test:
-    name: Rust tests
+    name: Rust tests (${{ matrix.shard }})
     needs: [rust-build]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
-    # Migration replay tests are intentionally exhaustive for queue-storage
-    # upgrade safety and can take ~25m on GitHub-hosted runners by themselves.
-    timeout-minutes: 60
+    # Sharded per #335: the migration replay suite alone took ~22 minutes as
+    # one binary, so it is partitioned per-test across four shards with
+    # cargo-nextest, the other slow binaries form `heavy`, and everything
+    # else (including new test files, automatically) lands in `rest`.
+    # Shard membership lives in scripts/ci-test-shard.sh; the lint job runs
+    # its `check` mode so renames can't silently drop coverage.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - migrations-1
+          - migrations-2
+          - migrations-3
+          - migrations-4
+          - heavy
+          - rest
     services:
       postgres:
         image: postgres:17-alpine
@@ -76,13 +92,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
       - name: Wait for Postgres
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
-      - name: Run tests
-        run: cargo test --workspace
+      - name: Run test shard
+        run: ./scripts/ci-test-shard.sh "${{ matrix.shard }}"
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 

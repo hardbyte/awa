@@ -1,8 +1,9 @@
 //! Migration tests: step-through upgrade, data survival, idempotency,
 //! and migration_sql() consistency.
 //!
-//! **Must run with `--test-threads=1`** — these tests drop and recreate
-//! the `awa` schema, which would break concurrent tests.
+//! Tests serialize through a Postgres advisory lock (plus a process-local
+//! mutex), so they are safe under parallel threads and under per-test
+//! processes — CI shards this binary with `cargo nextest --partition`.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
@@ -86,10 +87,19 @@ async fn ensure_migration_database() {
     .await
     .expect("Failed to check migration database existence");
     if !exists {
-        sqlx::raw_sql("CREATE DATABASE awa_migration_test")
+        // Tolerate the duplicate-database race: under per-test processes
+        // (cargo-nextest CI shards) another test can create it between the
+        // existence check and this statement.
+        if let Err(err) = sqlx::raw_sql("CREATE DATABASE awa_migration_test")
             .execute(&mut admin)
             .await
-            .expect("Failed to create migration test database");
+        {
+            let duplicate = matches!(
+                &err,
+                sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("42P04")
+            );
+            assert!(duplicate, "Failed to create migration test database: {err}");
+        }
     }
 }
 
