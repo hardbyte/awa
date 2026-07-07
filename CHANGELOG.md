@@ -20,6 +20,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Internal
 
+- **Nightly binary/schema compat matrix ([#367](https://github.com/hardbyte/awa/issues/367)).** Pinned release artifacts (`awa-pg` 0.6.0 and 0.5.7 wheels from PyPI) run against the newest schema every night: the 0.6.0 leg asserts the full job lifecycle on a finalized cluster; the 0.5.7 leg asserts the documented asymmetry (producers route through the compat layer to the active engine, workers are inert); the backward-guard leg asserts the newest `awa migrate` refuses an old unfinalized schema with the exact finalize-steps message and a non-zero exit. The support statement lives in `docs/stability.md`.
+
 - **CI: the Rust tests job is sharded ([#335](https://github.com/hardbyte/awa/issues/335)).** One `cargo test --workspace` run took ~31 minutes, ~22 of them the migration replay binary alone. The job is now a six-way matrix: the migration suite partitioned per-test across four shards with `cargo-nextest` (safe because those tests already serialize through a Postgres advisory lock), the other slow binaries in a `heavy` shard, and everything else — including any new test file, automatically — in `rest`. Shard membership lives in `scripts/ci-test-shard.sh`; the lint job validates it so renames can't drop coverage, and the nextest profile flags any test slower than 60s as the standing worklist for shrinking real-time fixture windows.
 
 ## [0.6.1] — 2026-07-07

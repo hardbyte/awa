@@ -30,6 +30,39 @@ jobs:
       - name: Run TLC model suite
         run: ./correctness/run-tlc-suite.sh
 
+  compat-matrix:
+    name: Binary/schema compat matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: astral-sh/setup-uv@v5
+      - name: Build current awa CLI
+        run: cargo build -p awa-cli
+      - name: Run compat matrix (pinned release artifacts vs newest schema)
+        run: ./scripts/compat-matrix.sh
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+
   postgres-failover-smoke:
     name: Postgres failover smoke
     runs-on: ubuntu-latest

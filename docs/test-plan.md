@@ -254,9 +254,9 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | --- | --- | --- | --- | --- |
 | V1 | Broad integration suite green under `AWA_TEST_ENGINE=queue_storage` | ✓ | ✓ | #360 |
 | V2 | Engine guard rejects canonical-only raw-SQL helpers under queue_storage | ✓ |  | #360 |
-| V3 | Pinned 0.6.0 binary: enqueue→claim→complete→cancel against 0.7 schema | ✓ | ✓ | #367 |
-| V4 | 0.7 binary against pre-migrate 0.6 schema fails loudly (message + exit code asserted) | ✓ |  | #367 |
-| V5 | `awa migrate` refuses non-`active` storage state, names finalize steps | ✓ |  | #370 |
+| V3 | Pinned 0.6.0 binary: enqueue→claim→complete→cancel against 0.7 schema | | ✓ | #367 — nightly `scripts/compat-matrix.sh` (awa-pg 0.6.0 wheel; a pinned native-binary leg can extend it) |
+| V4 | Newest binary against a pre-migrate old schema fails loudly (message + exit code asserted) | ✓ |  | #367 — asserted against a 0.5.7 schema with canonical work; the 0.6-schema variant activates with the first 0.7 migration |
+| V5 | `awa migrate` refuses non-`active` storage state, names finalize steps | ✓ |  | #370 — `migration_test` gate tests + the nightly backward-guard leg |
 
 ### Deployment & operations
 
