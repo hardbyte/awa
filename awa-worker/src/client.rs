@@ -3129,9 +3129,30 @@ mod tests {
             "long-running canonical job should be in flight before migration"
         );
 
-        migrations::run(&pool)
+        // The 0.7 migrate gate (#370 / ADR-037) refuses to apply pending
+        // migrations while canonical work is live — a 0.5.x cluster steps
+        // through a 0.6 binary instead. Assert the refusal, then apply the
+        // remaining migrations the way a 0.6-line binary would (raw
+        // migration SQL) so the canonical-drain → cutover flow below stays
+        // exercised end to end.
+        let gate_err = migrations::run(&pool)
             .await
-            .expect("Schema upgrade from 0.5.x to 0.6 should succeed during canonical runtime");
+            .expect_err("0.7 migrate must refuse a live canonical runtime with in-flight work");
+        assert!(
+            matches!(
+                &gate_err,
+                awa_model::AwaError::StorageNotFinalized { state } if state == "canonical"
+            ),
+            "expected StorageNotFinalized, got: {gate_err}"
+        );
+        for (_version, _desc, sql) in
+            migrations::migration_sql_range(9, migrations::CURRENT_VERSION)
+        {
+            sqlx::raw_sql(&sql)
+                .execute(&pool)
+                .await
+                .expect("raw migration application should succeed mid-drain");
+        }
         assert_eq!(
             active_queue_storage_schema(&pool).await,
             None,
