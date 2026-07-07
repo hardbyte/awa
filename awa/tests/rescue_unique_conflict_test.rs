@@ -14,9 +14,38 @@
 use awa::{Client, JobArgs, JobResult, QueueConfig, UniqueOpts};
 use awa_model::{insert_with, migrations, InsertOpts, JobState};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::postgres::{PgConnection, PgPoolOptions};
+use sqlx::{Connection, PgPool};
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
+
+// Both tests flip the cluster-wide storage engine, so they must never run
+// concurrently — process-local mutex for in-binary threads plus a Postgres
+// advisory lock for process-per-test runners.
+static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+const RESCUE_TEST_LOCK_KEY: i64 = 0x6177_6172_6573_6331; // "awaresc1"
+
+struct RescueTestGuard {
+    _local: tokio::sync::MutexGuard<'static, ()>,
+    _conn: PgConnection,
+}
+
+async fn acquire_rescue_guard() -> RescueTestGuard {
+    let local = TEST_MUTEX.get_or_init(|| Mutex::new(())).lock().await;
+    let mut conn = PgConnection::connect(&database_url())
+        .await
+        .expect("Failed to open rescue test lock connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(RESCUE_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .expect("Failed to acquire rescue test advisory lock");
+    RescueTestGuard {
+        _local: local,
+        _conn: conn,
+    }
+}
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -103,6 +132,7 @@ async fn test_rescue_survives_unique_claim_conflict() {
     if awa_testing::setup::skip_unless_canonical("test_rescue_survives_unique_claim_conflict") {
         return;
     }
+    let _guard = acquire_rescue_guard().await;
     let pool = setup().await;
     clean(&pool).await;
 
@@ -211,6 +241,7 @@ async fn test_rescue_survives_unique_claim_conflict() {
 /// claim/lease plane end to end.
 #[tokio::test]
 async fn test_rescue_survives_unique_claim_conflict_queue_storage() {
+    let _guard = acquire_rescue_guard().await;
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(5))
