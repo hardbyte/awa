@@ -4,7 +4,6 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Breaking changes
 
 - **0.7 migrate gate ([#370](https://github.com/hardbyte/awa/issues/370), [ADR-037](docs/adr/037-canonical-engine-deprecation.md)).** `awa migrate` (and `awa_model::migrations::run`) now refuses to apply pending migrations unless the storage transition is finalized (`state = active`) or the install is fresh (no jobs, no recently-live runtimes — the same conditions as worker-startup auto-finalize). Nothing is applied on refusal; the error names the finalize steps. Complete the staged transition on 0.6 binaries first: see [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).
@@ -18,7 +17,6 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 - **Worker health & readiness endpoints ([#368](https://github.com/hardbyte/awa/issues/368)).** Opt-in HTTP listener in the worker runtime (`AWA_HEALTH_ADDR` or `ClientBuilder::health_addr`): `GET /healthz` (process liveness, stays `200` through graceful drain) and `GET /readyz` (`503` + JSON reasons when Postgres is unreachable, the schema is older than the binary, a claim loop stalls, heartbeat/maintenance die, or shutdown starts). No new dependencies in `awa-worker`. Kubernetes probe examples in `docs/deployment.md`.
 - **`awa health` CLI probe.** Cluster-level readiness from the database alone (reachable, schema migrated for this binary, storage state, fleet heartbeat counts) with `--json` output and exit codes for probe-less environments.
->>>>>>> e9167e5 (feat(worker): opt-in health/readiness endpoints + awa health CLI probe (#368))
 
 ## [0.6.1] — 2026-07-07
 
@@ -33,7 +31,6 @@ Patch release: one canonical-engine bug fix, no migrations, no API changes.
 ### Operator note
 
 If a cluster is currently wedged (repeating `Failed to rescue ... idx_awa_jobs_unique` logs), upgrading is sufficient — the next sweep resolves it. The mask itself is still worth revisiting: on the canonical engine, a `unique_states` mask that a runtime transition can *enter* from outside (e.g. including `retryable` but not `running`) always risks superseded-job cancellations; masks closed under retry/rescue/promotion (`{}` or the full non-terminal set) avoid the conflict entirely. See the new [troubleshooting entry](docs/troubleshooting.md#rescue-fails-with-idx_awa_jobs_unique).
-=======
 ## [0.6.0] — 2026-07-04
 
 The 0.6 line makes the append-only **queue-storage engine** the default and the supported substrate for high-throughput, low-bloat operation on managed Postgres. The [#169](https://github.com/hardbyte/awa/issues/169) pinned-MVCC dead-tuple gate **passed** on `main`: after the rc line removed the last dominant hot-row update path (the `queue_claim_heads` ready-segment routing cache), a 60-minute idle-in-transaction soak holds bounded queue depth through the pinned hour and drains fully in recovery. See "Benchmark evidence" below for the caveats — awa is not immune to long readers, and this release does not claim otherwise.
