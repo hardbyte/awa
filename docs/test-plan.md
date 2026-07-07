@@ -304,6 +304,14 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 
 ## Running Tests
 
+CI runs the Rust suite as a sharded matrix (`scripts/ci-test-shard.sh`): the
+migration replay binary is partitioned per-test with `cargo-nextest`, the
+other slow binaries form a `heavy` shard, and every remaining test target —
+including newly added files, automatically — runs in `rest`. Locally,
+`cargo test --workspace` remains the equivalent single command; individual
+shards can be reproduced with e.g. `./scripts/ci-test-shard.sh heavy`.
+
+
 ```bash
 # Start Postgres
 docker run -d --name awa-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test -p 15432:5432 postgres:18-alpine

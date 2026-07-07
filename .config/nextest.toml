@@ -1,0 +1,21 @@
+# Used by the CI migration shards (scripts/ci-test-shard.sh); harmless for
+# local `cargo nextest run`.
+#
+# The slow-timeout only FLAGS tests, it never kills them — it is the durable
+# per-run list of >60s tests that #335's real-time-window audit works from.
+#
+# migration_test runs one test process at a time: most of its tests already
+# serialize through a Postgres advisory lock, but a few schema-bootstrap
+# tests predate the guard and race on CREATE SCHEMA under concurrent
+# processes. Serial execution costs nothing — the advisory lock was already
+# the effective concurrency limit — and shard-level parallelism comes from
+# each CI shard owning its own Postgres.
+[profile.default]
+slow-timeout = { period = "60s" }
+
+[test-groups]
+migrations = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(migration_test)'
+test-group = 'migrations'

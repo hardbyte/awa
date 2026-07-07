@@ -18,6 +18,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - **Worker health & readiness endpoints ([#368](https://github.com/hardbyte/awa/issues/368)).** Opt-in HTTP listener in the worker runtime (`AWA_HEALTH_ADDR` or `ClientBuilder::health_addr`): `GET /healthz` (process liveness, stays `200` through graceful drain) and `GET /readyz` (`503` + JSON reasons when Postgres is unreachable, the schema is older than the binary, a claim loop stalls, heartbeat/maintenance die, or shutdown starts). No new dependencies in `awa-worker`. Kubernetes probe examples in `docs/deployment.md`.
 - **`awa health` CLI probe.** Cluster-level readiness from the database alone (reachable, schema migrated for this binary, storage state, fleet heartbeat counts) with `--json` output and exit codes for probe-less environments.
 
+### Internal
+
+- **CI: the Rust tests job is sharded ([#335](https://github.com/hardbyte/awa/issues/335)).** One `cargo test --workspace` run took ~31 minutes, ~22 of them the migration replay binary alone. The job is now a six-way matrix: the migration suite partitioned per-test across four shards with `cargo-nextest` (safe because those tests already serialize through a Postgres advisory lock), the other slow binaries in a `heavy` shard, and everything else — including any new test file, automatically — in `rest`. Shard membership lives in `scripts/ci-test-shard.sh`; the lint job validates it so renames can't drop coverage, and the nextest profile flags any test slower than 60s as the standing worklist for shrinking real-time fixture windows.
+
 ## [0.6.1] — 2026-07-07
 
 Patch release: one canonical-engine bug fix, no migrations, no API changes.
