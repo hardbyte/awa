@@ -4,6 +4,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-07-07
+
+Patch release: one canonical-engine bug fix, no migrations, no API changes.
+
+### Fixed
+
+- **Canonical rescue sweeps no longer wedge on a unique-key conflict ([#388](https://github.com/hardbyte/awa/issues/388)).** A unique job whose `unique_states` mask excludes `running` holds no claim while executing, so a newer duplicate can legitimately be enqueued and take the claim; rescuing the older job (`running -> retryable`, or `waiting_external -> retryable` for callback timeouts) then re-enters the claim set and raises `idx_awa_jobs_unique`. The rescue statements are batched, so that single row aborted the whole sweep every maintenance tick — starving stale-heartbeat, deadline, and callback-timeout rescue for every other stuck job in the cluster. The sweeps now retry row-at-a-time on that failure: clean rows rescue as before, the conflicted row is **cancelled** with an error entry (`rescued as duplicate: ... unique claim held by a newer job`) — the claim holder wins — and a row that cannot even be cancelled (its mask claims `cancelled` too) is skipped with a loud log naming the claim holder instead of blocking the batch. New metric attribute `awa.rescue.kind = "<kind>_duplicate_cancelled"` counts the fallback cancellations. Modelled in `correctness/storage/AwaCanonicalUniqueRescue.tla`: the per-row config passes the `Convergence` liveness property; the pre-fix batch-only config is kept as an expected counterexample.
+
+### Operator note
+
+If a cluster is currently wedged (repeating `Failed to rescue ... idx_awa_jobs_unique` logs), upgrading is sufficient — the next sweep resolves it. The mask itself is still worth revisiting: on the canonical engine, a `unique_states` mask that a runtime transition can *enter* from outside (e.g. including `retryable` but not `running`) always risks superseded-job cancellations; masks closed under retry/rescue/promotion (`{}` or the full non-terminal set) avoid the conflict entirely. See the new [troubleshooting entry](docs/troubleshooting.md#rescue-fails-with-idx_awa_jobs_unique).
+
 ## [0.6.0] — 2026-07-04
 
 The 0.6 line makes the append-only **queue-storage engine** the default and the supported substrate for high-throughput, low-bloat operation on managed Postgres. The [#169](https://github.com/hardbyte/awa/issues/169) pinned-MVCC dead-tuple gate **passed** on `main`: after the rc line removed the last dominant hot-row update path (the `queue_claim_heads` ready-segment routing cache), a 60-minute idle-in-transaction soak holds bounded queue depth through the pinned hour and drains fully in recovery. See "Benchmark evidence" below for the caveats — awa is not immune to long readers, and this release does not claim otherwise.

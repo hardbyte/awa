@@ -137,6 +137,29 @@ To recover:
 
 In all cases the cancel itself is durable — only the early wake-up is lost. Long-running handlers that don't poll `ctx.is_cancelled()` between heartbeats won't notice the cancel until they finish or heartbeat-rescue fires.
 
+## Rescue Fails With `idx_awa_jobs_unique`
+
+Symptom (canonical engine): maintenance repeats, every tick:
+
+```
+Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
+Failed to rescue deadline-expired jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
+```
+
+Cause: a unique job whose `unique_states` mask excludes `running` was stuck running (holding no claim), a newer duplicate took the claim, and the rescue transition back into a claiming state conflicts. Since 0.6.1 the sweep degrades row-at-a-time: the conflicted job is cancelled with a `rescued as duplicate` error entry (the claim holder wins) and everything else rescues normally, so the log appears at most once per conflicted job. On 0.6.0 the whole batched sweep aborted every tick — upgrade, or clear the conflict by hand:
+
+```sql
+SELECT j.id AS stuck_job, j.kind, j.queue, j.unique_key,
+       c.job_id AS claim_holder, h.state AS holder_state
+FROM awa.jobs_hot j
+JOIN awa.job_unique_claims c ON c.unique_key = j.unique_key AND c.job_id <> j.id
+WHERE j.state = 'running';
+```
+
+Cancel the `stuck_job` (cancelled is outside the default mask, so the transition succeeds), or delete the claim row if its holder no longer exists.
+
+Prevention: on the canonical engine, choose `unique_states` masks that are *closed under runtime transitions* — retry/rescue move `running -> retryable`, promotion moves `retryable -> available` and `scheduled -> available`. A mask a transition can enter from outside (e.g. `{scheduled, available, retryable}` without `running`) means any stuck-then-superseded job ends in a fallback cancellation. `{}` (no dedup) and the full non-terminal set `{scheduled, available, running, retryable}` are always safe; pair the full mask with a short `by_period` bucket if you need "a change during a run still gets a fresh run" semantics.
+
 ## Producer Enqueue Is Slower Than Expected
 
 ### What It Usually Means

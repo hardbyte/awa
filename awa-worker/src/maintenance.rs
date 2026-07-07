@@ -22,6 +22,92 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// The canonical unique-claim conflict raised by `awa.sync_job_unique_claims`
+/// (SQLSTATE 23505, constraint reported as `idx_awa_jobs_unique`). See #388.
+fn is_unique_claim_conflict(err: &awa_model::AwaError) -> bool {
+    match err {
+        awa_model::AwaError::Database(sqlx::Error::Database(db_err)) => {
+            db_err.code().as_deref() == Some("23505")
+        }
+        _ => false,
+    }
+}
+
+/// Single-row variants of the batched canonical rescue UPDATEs, used by the
+/// #388 fallback. Bodies mirror the batch statements exactly; only the WHERE
+/// clause narrows to one id (re-checking the staleness predicate so a row
+/// that recovered between selection and update is left alone).
+const HEARTBEAT_RESCUE_PER_ROW_SQL: &str = r#"
+    UPDATE awa.jobs
+    SET state = 'retryable',
+        finalized_at = now(),
+        heartbeat_at = NULL,
+        deadline_at = NULL,
+        callback_id = NULL,
+        callback_timeout_at = NULL,
+        callback_filter = NULL,
+        callback_on_complete = NULL,
+        callback_on_fail = NULL,
+        callback_transform = NULL,
+        errors = errors || jsonb_build_object(
+            'error', 'heartbeat stale: worker presumed dead',
+            'attempt', attempt,
+            'at', now()
+        )::jsonb
+    WHERE id = $1
+      AND state = 'running'
+      AND heartbeat_at < now() - ($2 * interval '1 millisecond')
+    RETURNING *
+"#;
+
+const DEADLINE_RESCUE_PER_ROW_SQL: &str = r#"
+    UPDATE awa.jobs
+    SET state = 'retryable',
+        finalized_at = now(),
+        heartbeat_at = NULL,
+        deadline_at = NULL,
+        callback_id = NULL,
+        callback_timeout_at = NULL,
+        callback_filter = NULL,
+        callback_on_complete = NULL,
+        callback_on_fail = NULL,
+        callback_transform = NULL,
+        errors = errors || jsonb_build_object(
+            'error', 'hard deadline exceeded',
+            'attempt', attempt,
+            'at', now()
+        )::jsonb
+    WHERE id = $1
+      AND state = 'running'
+      AND deadline_at IS NOT NULL
+      AND deadline_at < now()
+    RETURNING *
+"#;
+
+const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
+    UPDATE awa.jobs
+    SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
+        finalized_at = now(),
+        callback_id = NULL,
+        callback_timeout_at = NULL,
+        callback_filter = NULL,
+        callback_on_complete = NULL,
+        callback_on_fail = NULL,
+        callback_transform = NULL,
+        run_at = CASE WHEN attempt >= max_attempts THEN run_at
+                 ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
+        errors = errors || jsonb_build_object(
+            'error', 'callback timed out',
+            'attempt', attempt,
+            'at', now()
+        )::jsonb
+    WHERE id = $1
+      AND state = 'waiting_external'
+      AND callback_timeout_at IS NOT NULL
+      AND callback_timeout_at < now()
+    RETURNING *
+"#;
+
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
@@ -1156,11 +1242,10 @@ impl MaintenanceService {
     /// Rescue jobs with stale heartbeats (crash detection).
     #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
     async fn rescue_stale_heartbeats(&self) {
+        let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
         let outcome = match &self.storage {
-            RuntimeStorage::Canonical => {
-                let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
-                sqlx::query_as::<_, JobRow>(
-                    r#"
+            RuntimeStorage::Canonical => sqlx::query_as::<_, JobRow>(
+                r#"
                     UPDATE awa.jobs
                     SET state = 'retryable',
                         finalized_at = now(),
@@ -1186,18 +1271,41 @@ impl MaintenanceService {
                     )
                     RETURNING *
                     "#,
-                )
-                .bind(staleness_ms)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(awa_model::AwaError::Database)
-            }
+            )
+            .bind(staleness_ms)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(awa_model::AwaError::Database),
             RuntimeStorage::QueueStorage(runtime) => {
                 runtime
                     .store
                     .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
                     .await
             }
+        };
+        let outcome = match outcome {
+            Err(err)
+                if matches!(self.storage, RuntimeStorage::Canonical)
+                    && is_unique_claim_conflict(&err) =>
+            {
+                warn!(
+                    error = %err,
+                    "Batched heartbeat rescue hit a unique-claim conflict; retrying row-at-a-time (#388)"
+                );
+                self.rescue_canonical_per_row(
+                    "SELECT id FROM awa.jobs_hot \
+                     WHERE state = 'running' \
+                       AND heartbeat_at < now() - ($1 * interval '1 millisecond') \
+                     LIMIT 500",
+                    HEARTBEAT_RESCUE_PER_ROW_SQL,
+                    Some(staleness_ms),
+                    "running",
+                    "rescued as duplicate: heartbeat stale and unique claim held by a newer job",
+                    "heartbeat",
+                )
+                .await
+            }
+            other => other,
         };
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
@@ -1260,6 +1368,31 @@ impl MaintenanceService {
                 runtime.store.rescue_expired_deadlines(&self.pool).await
             }
         };
+        let outcome = match outcome {
+            Err(err)
+                if matches!(self.storage, RuntimeStorage::Canonical)
+                    && is_unique_claim_conflict(&err) =>
+            {
+                warn!(
+                    error = %err,
+                    "Batched deadline rescue hit a unique-claim conflict; retrying row-at-a-time (#388)"
+                );
+                self.rescue_canonical_per_row(
+                    "SELECT id FROM awa.jobs_hot \
+                     WHERE state = 'running' \
+                       AND deadline_at IS NOT NULL \
+                       AND deadline_at < now() \
+                     LIMIT 500",
+                    DEADLINE_RESCUE_PER_ROW_SQL,
+                    None,
+                    "running",
+                    "rescued as duplicate: deadline expired and unique claim held by a newer job",
+                    "deadline",
+                )
+                .await
+            }
+            other => other,
+        };
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
                 self.metrics.maintenance_rescues.add(
@@ -1320,6 +1453,31 @@ impl MaintenanceService {
             RuntimeStorage::QueueStorage(runtime) => {
                 runtime.store.rescue_expired_callbacks(&self.pool).await
             }
+        };
+        let outcome = match outcome {
+            Err(err)
+                if matches!(self.storage, RuntimeStorage::Canonical)
+                    && is_unique_claim_conflict(&err) =>
+            {
+                warn!(
+                    error = %err,
+                    "Batched callback-timeout rescue hit a unique-claim conflict; retrying row-at-a-time (#388)"
+                );
+                self.rescue_canonical_per_row(
+                    "SELECT id FROM awa.jobs_hot \
+                     WHERE state = 'waiting_external' \
+                       AND callback_timeout_at IS NOT NULL \
+                       AND callback_timeout_at < now() \
+                     LIMIT 500",
+                    CALLBACK_RESCUE_PER_ROW_SQL,
+                    None,
+                    "waiting_external",
+                    "rescued as duplicate: callback timed out and unique claim held by a newer job",
+                    "callback_timeout",
+                )
+                .await
+            }
+            other => other,
         };
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
@@ -1426,6 +1584,173 @@ impl MaintenanceService {
             }
             _ => {}
         }
+    }
+
+    /// Row-at-a-time fallback for the canonical rescue sweeps (#388).
+    ///
+    /// The batched rescue UPDATEs abort wholesale when any single row's
+    /// `running -> retryable` (or `waiting_external -> retryable`) transition
+    /// re-enters its unique-claim state set while another job holds the
+    /// claim — `awa.sync_job_unique_claims` raises `idx_awa_jobs_unique`.
+    /// One poisoned row must not starve rescue for the whole cluster, so on
+    /// that specific failure the sweep retries per row: rows that rescue
+    /// cleanly are returned as usual; a row whose rescue conflicts is
+    /// cancelled instead (the claim holder — the job that superseded it —
+    /// wins), and a row that can't even be cancelled (its mask claims
+    /// `cancelled` too) is skipped with a loud log so it never blocks the
+    /// rest of the batch.
+    async fn rescue_canonical_per_row(
+        &self,
+        candidates_sql: &str,
+        per_row_sql: &str,
+        staleness_ms: Option<i64>,
+        from_state: &str,
+        duplicate_error: &str,
+        rescue_kind: &'static str,
+    ) -> Result<Vec<JobRow>, awa_model::AwaError> {
+        let ids: Vec<i64> = {
+            let query = sqlx::query_scalar(candidates_sql);
+            let query = match staleness_ms {
+                Some(ms) => query.bind(ms),
+                None => query,
+            };
+            query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(awa_model::AwaError::Database)?
+        };
+
+        let mut rescued = Vec::new();
+        let mut cancelled = Vec::new();
+        for id in ids {
+            let attempt = {
+                let query = sqlx::query_as::<_, JobRow>(per_row_sql).bind(id);
+                let query = match staleness_ms {
+                    Some(ms) => query.bind(ms),
+                    None => query,
+                };
+                query
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(awa_model::AwaError::Database)
+            };
+            match attempt {
+                Ok(Some(row)) => rescued.push(row),
+                // The row was completed/claimed/rescued by someone else
+                // between candidate selection and the update.
+                Ok(None) => {}
+                Err(err) if is_unique_claim_conflict(&err) => {
+                    let holder = self.unique_claim_holder(id).await;
+                    warn!(
+                        job_id = id,
+                        claim_holder = ?holder,
+                        rescue_kind,
+                        "Rescue conflicts with a unique claim held by another job; \
+                         cancelling the superseded job (#388)"
+                    );
+                    match self
+                        .cancel_unique_conflicted_job(id, from_state, duplicate_error)
+                        .await
+                    {
+                        Ok(Some(row)) => cancelled.push(row),
+                        Ok(None) => {}
+                        Err(err) if is_unique_claim_conflict(&err) => {
+                            error!(
+                                job_id = id,
+                                claim_holder = ?holder,
+                                rescue_kind,
+                                "Cannot rescue or cancel unique-conflicted job: its \
+                                 unique_states mask claims 'cancelled' as well; skipping \
+                                 so the sweep can proceed — resolve manually (see \
+                                 docs/troubleshooting.md, #388)"
+                            );
+                        }
+                        Err(err) => {
+                            error!(job_id = id, error = %err, rescue_kind, "Failed to cancel unique-conflicted job");
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!(job_id = id, error = %err, rescue_kind, "Per-row rescue failed");
+                }
+            }
+        }
+
+        if !cancelled.is_empty() {
+            self.metrics.maintenance_rescues.add(
+                cancelled.len() as u64,
+                &[opentelemetry::KeyValue::new(
+                    "awa.rescue.kind",
+                    format!("{rescue_kind}_duplicate_cancelled"),
+                )],
+            );
+            warn!(
+                count = cancelled.len(),
+                rescue_kind, "Cancelled unique-conflicted jobs superseded by a newer duplicate"
+            );
+            self.signal_cancellation(&cancelled).await;
+        }
+
+        Ok(rescued)
+    }
+
+    /// The job id currently holding the unique claim for `job_id`'s key,
+    /// for operator-legible conflict logs.
+    async fn unique_claim_holder(&self, job_id: i64) -> Option<i64> {
+        sqlx::query_scalar(
+            r#"
+            SELECT c.job_id
+            FROM awa.jobs AS j
+            JOIN awa.job_unique_claims AS c ON c.unique_key = j.unique_key
+            WHERE j.id = $1 AND c.job_id <> j.id
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Terminal fallback for a job whose rescue transition conflicts with a
+    /// unique claim: the newer claim holder wins, this job is cancelled with
+    /// an error entry naming why. `cancelled` sits outside the default
+    /// unique-states mask, so this transition normally releases nothing and
+    /// claims nothing.
+    async fn cancel_unique_conflicted_job(
+        &self,
+        job_id: i64,
+        from_state: &str,
+        error_message: &str,
+    ) -> Result<Option<JobRow>, awa_model::AwaError> {
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE awa.jobs
+            SET state = 'cancelled',
+                finalized_at = now(),
+                heartbeat_at = NULL,
+                deadline_at = NULL,
+                callback_id = NULL,
+                callback_timeout_at = NULL,
+                callback_filter = NULL,
+                callback_on_complete = NULL,
+                callback_on_fail = NULL,
+                callback_transform = NULL,
+                errors = errors || jsonb_build_object(
+                    'error', $3::text,
+                    'attempt', attempt,
+                    'at', now()
+                )::jsonb
+            WHERE id = $1 AND state = $2::awa.job_state
+            RETURNING *
+            "#,
+        )
+        .bind(job_id)
+        .bind(from_state)
+        .bind(error_message)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Signal cancellation to any rescued jobs that are still running on this instance.

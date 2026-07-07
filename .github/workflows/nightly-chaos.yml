@@ -143,6 +143,18 @@ jobs:
           exit 1
       - name: AwaDeadTupleContract (architectural reclaim contract)
         run: ./correctness/run-tlc.sh storage/AwaDeadTupleContract.tla storage/AwaDeadTupleContract.cfg
+      - name: AwaCanonicalUniqueRescue (per-row rescue fallback, #388)
+        run: ./correctness/run-tlc.sh storage/AwaCanonicalUniqueRescue.tla
+      - name: AwaCanonicalUniqueRescue (batch-only — expected to fail)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaCanonicalUniqueRescue.tla storage/AwaCanonicalUniqueRescueBatchOnly.cfg > /tmp/tlc-unique-rescue.log 2>&1
+          if grep -q "Temporal property Convergence was violated" /tmp/tlc-unique-rescue.log; then
+            echo "batch-only rescue correctly starves on the unique-claim conflict"
+            exit 0
+          fi
+          cat /tmp/tlc-unique-rescue.log
+          exit 1
 
   postgres-failover-smoke:
     name: Postgres failover smoke
