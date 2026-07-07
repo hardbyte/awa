@@ -374,11 +374,14 @@ export function Shell() {
     refetchInterval: poll.interval,
     staleTime: poll.staleTime,
   });
-  // Authoritative engine/transition state for the chip label. Backends
-  // predating /api/storage resolve to null; stop polling once known-absent.
+  // Authoritative engine/transition state for the chip label. Shares the
+  // runtime page's query key and fetch shape so visiting /runtime dedupes
+  // into one /api/storage poll instead of two (the history param costs
+  // nothing server-side). Backends predating /api/storage resolve to null;
+  // stop polling once known-absent.
   const storageQuery = useQuery({
-    queryKey: ["storage", "chip"],
-    queryFn: () => fetchStorage(),
+    queryKey: ["storage", "with-history"],
+    queryFn: () => fetchStorage({ history: true }),
     refetchInterval: (query) =>
       query.state.data === null ? false : poll.interval,
     staleTime: poll.staleTime,
