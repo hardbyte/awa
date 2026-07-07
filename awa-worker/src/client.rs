@@ -1503,7 +1503,7 @@ impl Client {
                  deprecated in 0.7 and will be removed in 0.8. Finalize the queue-storage \
                  transition (`awa storage prepare --engine queue_storage`, `awa storage \
                  enter-mixed-transition`, `awa storage finalize --wait`) — see \
-                 docs/upgrade-0.5-to-0.6.md and ADR-037"
+                 docs/upgrade-0.6-to-0.7.md, docs/upgrade-0.5-to-0.6.md, and ADR-037"
             );
         }
 
