@@ -1,5 +1,9 @@
 # Upgrade Checklist: 0.5.x → 0.6
 
+> **Planning to run 0.7?** Finalize before upgrading: the 0.7 `awa migrate` refuses
+> unfinalized clusters ([ADR-037](adr/037-canonical-engine-deprecation.md),
+> [upgrade-0.6-to-0.7.md](upgrade-0.6-to-0.7.md)).
+
 This is the operator-facing rollout sheet for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). The companion long-form explanation is in [migrations.md](migrations.md). This file is the short version: one-screen pre-flight, two phases, an explicit rollback boundary, and the health checks to run at each step.
 
 > **Fresh installs do not need this file.** A new cluster runs `awa migrate` and starts workers; the first worker auto-finalizes via `awa.storage_auto_finalize_if_fresh()`. See migrations.md ["Fresh install"](migrations.md#fresh-install-no-prior-canonical-data). This checklist is for **upgrading existing 0.5.x clusters**, where canonical drain is unavoidable and auto-finalize correctly defers to the staged path.

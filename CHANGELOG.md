@@ -4,6 +4,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **0.7 migrate gate ([#370](https://github.com/hardbyte/awa/issues/370), [ADR-037](docs/adr/037-canonical-engine-deprecation.md)).** `awa migrate` (and `awa_model::migrations::run`) now refuses to apply pending migrations unless the storage transition is finalized (`state = active`) or the install is fresh (no jobs, no recently-live runtimes — the same conditions as worker-startup auto-finalize). Nothing is applied on refusal; the error names the finalize steps. Complete the staged transition on 0.6 binaries first: see [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).
+- **Canonical engine deprecated.** Runtimes whose effective storage resolves to the canonical engine log a startup deprecation warning; canonical claim/execution/trigger paths will be removed in 0.8.
+
+### Correctness
+
+- `AwaStorageTransition.tla` models the 0.7 migrate gate (`Migrate07OnlyOnQuiescedCanonical`), with an expected-counterexample config (`AwaStorageTransitionMigrate07Ungated.cfg`) witnessing why the gate is required; the transition model family runs in nightly CI via the TLC suite runner (`correctness/run-tlc-suite.sh`).
+
 ## [0.6.1] — 2026-07-07
 
 Patch release: one canonical-engine bug fix, no migrations, no API changes.

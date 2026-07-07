@@ -185,7 +185,8 @@ The model separates three runtime populations that collapse to similar database 
 
 Configs:
 
-- [`AwaStorageTransition.cfg`](./AwaStorageTransition.cfg): desired gate, requiring a live queue-storage executor at `EnterMixedTransition`. TLC completes cleanly with **222 distinct states**.
+- [`AwaStorageTransition.cfg`](./AwaStorageTransition.cfg): desired gates — a live queue-storage executor required at `EnterMixedTransition`, and the ADR-037 0.7 migrate gate (`GateMigrate07 = TRUE`) checked via `Migrate07OnlyOnQuiescedCanonical`. TLC completes cleanly with **444 distinct states**.
+- [`AwaStorageTransitionMigrate07Ungated.cfg`](./AwaStorageTransitionMigrate07Ungated.cfg): expected-counterexample witness for the ADR-037 migrate gate. With `GateMigrate07 = FALSE`, `Migrate07` fires without the finalized-or-fresh check and TLC trips `Migrate07OnlyOnQuiescedCanonical` — a 0.7 migration lands while canonical work or a canonical-capable runtime is live. The production gate is `check_storage_finalized_gate` in `awa-model/src/migrations.rs`.
 - [`AwaStorageTransitionCurrentGate.cfg`](./AwaStorageTransitionCurrentGate.cfg): historical pre-v014 failing witness for the old SQL-level capability-only gate. TLC trips `MixedHasQueueExecutor` in 5 steps: prepare queue storage, prepare schema, start an auto pre-mixed runtime, enter mixed transition, and end up with queue-storage routing but no queue executor.
 
 Run:

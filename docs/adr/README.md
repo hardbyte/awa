@@ -44,7 +44,7 @@ Template: `Status / Context / Decision / Consequences (positive, negative) / Alt
 | 034 | [Job dependencies](034-job-dependencies.md) | Proposed | Single-parent A→B chaining: `waiting_on` parking state promoted transactionally by the parent's guarded finalization, with an `on_parent_failure` policy (#14) | Builds on ADR-029; workflow engine remains a non-goal |
 | 035 | [Backpressure and flow control](035-backpressure-flow-control.md) | Proposed | Soft depth signals from lane-head cursors by default, opt-in hard rejection, paced-producer helpers (#341) | Makes the ADR-006 transactional-enqueue tension explicit; composes ADR-025/031 |
 | 036 | [Public surface stability policy](036-public-surface-stability-policy.md) | Proposed | Surface-by-surface compatibility map and deprecation policy, published as `docs/stability.md` (#369) | Governs ADR-016 and the #342 SQL producer contract |
-| 037 | [Canonical engine deprecation](037-canonical-engine-deprecation.md) | Proposed | 0.7 migrate gate requires a finalized queue-storage transition; canonical paths removed in 0.8 (#370) | Completes ADR-019's supersession of the pre-0.6 model |
+| 037 | [Canonical engine deprecation](037-canonical-engine-deprecation.md) | Accepted | 0.7 `awa migrate` refuses unfinalized clusters (fresh installs exempt); canonical deprecated with a startup warning in 0.7, claim/execution/trigger paths removed in 0.8 (#370) | Completes ADR-019's supersession of the pre-0.6 model; bounds the #360 dual-engine matrix |
 
 ## Validation artifacts
 

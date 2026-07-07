@@ -272,6 +272,10 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         0
     };
 
+    if has_schema && current < CURRENT_VERSION {
+        check_storage_finalized_gate(conn).await?;
+    }
+
     if !(has_schema && current == CURRENT_VERSION) {
         for &(version, description, steps) in MIGRATIONS {
             if version <= current {
@@ -310,6 +314,87 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
     }
 
     Ok(())
+}
+
+/// The 0.7 migrate gate (#370 / ADR-037).
+///
+/// The canonical engine is deprecated in 0.7 and its code paths are removed
+/// in 0.8, so pending migrations are only applied when the cluster can never
+/// again route work to it: the storage transition must be finalized
+/// (`state = 'active'`), or the install must be fresh. "Fresh" mirrors what
+/// `awa.storage_auto_finalize_if_fresh` accepts at worker startup — an
+/// unprepared canonical state with no jobs and no recently-live runtimes —
+/// so the two doors admit exactly the same clusters. Anything else is a
+/// cluster that must complete the staged 0.6 transition before upgrading.
+///
+/// Runs against any schema age: pre-v010 schemas (no transition machinery)
+/// are treated as unprepared canonical, and each probe guards for tables
+/// that don't exist yet at old versions.
+async fn check_storage_finalized_gate(conn: &mut PgConnection) -> Result<(), AwaError> {
+    let transition: Option<(String, Option<String>)> =
+        if relation_exists(conn, "storage_transition_state").await? {
+            sqlx::query_as(
+                "SELECT state, prepared_engine FROM awa.storage_transition_state WHERE singleton",
+            )
+            .fetch_optional(&mut *conn)
+            .await?
+        } else {
+            None
+        };
+
+    let (state, prepared_engine) = match transition {
+        Some((state, prepared_engine)) => (state, prepared_engine),
+        None => ("canonical".to_string(), None),
+    };
+
+    if state == "active" {
+        return Ok(());
+    }
+
+    let effectively_fresh = state == "canonical"
+        && prepared_engine.is_none()
+        && !canonical_jobs_exist(conn).await?
+        && !recently_live_runtimes_exist(conn).await?;
+
+    if effectively_fresh {
+        return Ok(());
+    }
+
+    Err(AwaError::StorageNotFinalized { state })
+}
+
+/// Relation existence probe covering both tables and views — `awa.jobs` is
+/// a view over `jobs_hot` on current schemas.
+async fn relation_exists(conn: &mut PgConnection, relation: &str) -> Result<bool, AwaError> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(format!("awa.{relation}"))
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(exists)
+}
+
+async fn canonical_jobs_exist(conn: &mut PgConnection) -> Result<bool, AwaError> {
+    if !relation_exists(conn, "jobs").await? {
+        return Ok(false);
+    }
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM awa.jobs)")
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(exists)
+}
+
+async fn recently_live_runtimes_exist(conn: &mut PgConnection) -> Result<bool, AwaError> {
+    if !relation_exists(conn, "runtime_instances").await? {
+        return Ok(false);
+    }
+    // The 90-second window matches the heartbeat-staleness gate used by
+    // awa.storage_auto_finalize_if_fresh and storage_enter_mixed_transition.
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM awa.runtime_instances WHERE last_seen_at + make_interval(secs => 90) >= now())",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(exists)
 }
 
 /// Get the current schema version.

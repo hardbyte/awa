@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 pyo3::create_exception!(_awa, AwaError, pyo3::exceptions::PyException);
 pyo3::create_exception!(_awa, UniqueConflict, AwaError);
 pyo3::create_exception!(_awa, SchemaNotMigrated, AwaError);
+pyo3::create_exception!(_awa, StorageNotFinalized, AwaError);
 pyo3::create_exception!(_awa, UnknownJobKind, AwaError);
 pyo3::create_exception!(_awa, SerializationError, AwaError);
 pyo3::create_exception!(_awa, ValidationError, AwaError);
@@ -127,6 +128,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("AwaError", m.py().get_type::<AwaError>())?;
     m.add("UniqueConflict", m.py().get_type::<UniqueConflict>())?;
     m.add("SchemaNotMigrated", m.py().get_type::<SchemaNotMigrated>())?;
+    m.add("StorageNotFinalized", m.py().get_type::<StorageNotFinalized>())?;
     m.add("UnknownJobKind", m.py().get_type::<UnknownJobKind>())?;
     m.add(
         "SerializationError",

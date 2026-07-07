@@ -361,6 +361,166 @@ async fn test_migrations_are_idempotent() {
     assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
+// ── 0.7 migrate gate (#370 / ADR-037) ────────────────────────────
+
+/// Rewind `schema_version` so `run()` sees pending migrations again. The
+/// re-applied migrations are idempotent by policy, so this only re-runs SQL
+/// that is safe to repeat.
+async fn rewind_schema_version(pool: &PgPool, from_version: i32) {
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= $1")
+        .bind(from_version)
+        .execute(pool)
+        .await
+        .expect("schema_version rewind should succeed");
+}
+
+fn assert_storage_not_finalized(err: &awa::AwaError, expected_state: &str) {
+    assert!(
+        matches!(
+            err,
+            awa::AwaError::StorageNotFinalized { state } if state == expected_state
+        ),
+        "expected StorageNotFinalized with state '{expected_state}', got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_migrate_gate_allows_effectively_fresh_canonical() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    // Canonical state, no prepared engine, no jobs, no live runtimes —
+    // the same conditions awa.storage_auto_finalize_if_fresh accepts.
+    migrations::run(&pool)
+        .await
+        .expect("effectively-fresh canonical cluster should migrate");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+}
+
+#[tokio::test]
+async fn test_migrate_gate_allows_active_cluster() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    simulate_non_canonical_compat_routing(&pool).await;
+    // A finalized cluster with live workers and pending migrations is the
+    // normal 0.6 → 0.7 upgrade shape.
+    insert_runtime_instance(&pool, "queue_storage").await;
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    migrations::run(&pool)
+        .await
+        .expect("finalized (active) cluster should migrate");
+}
+
+#[tokio::test]
+async fn test_migrate_gate_refuses_canonical_cluster_with_jobs() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        r#"
+        SELECT awa.insert_job_compat(
+            'gate_test_job', 'gate_queue', '{}'::jsonb,
+            'available'::awa.job_state, 2::smallint, 25::smallint,
+            NULL::timestamptz, '{}'::jsonb, ARRAY[]::text[],
+            NULL::bytea, NULL::bit(8)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    let err = migrations::run(&pool).await.unwrap_err();
+    assert_storage_not_finalized(&err, "canonical");
+}
+
+#[tokio::test]
+async fn test_migrate_gate_refuses_prepared_state() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    storage::prepare(
+        &pool,
+        "queue_storage",
+        serde_json::json!({"schema": "awa_queue_storage"}),
+    )
+    .await
+    .unwrap();
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    let err = migrations::run(&pool).await.unwrap_err();
+    assert_storage_not_finalized(&err, "prepared");
+
+    storage::abort(&pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migrate_gate_refuses_mixed_transition_state() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    sqlx::raw_sql(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET state = 'mixed_transition',
+            prepared_engine = 'queue_storage',
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            transition_epoch = transition_epoch + 1,
+            updated_at = now()
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    let err = migrations::run(&pool).await.unwrap_err();
+    assert_storage_not_finalized(&err, "mixed_transition");
+}
+
+#[tokio::test]
+async fn test_migrate_gate_refuses_recently_live_canonical_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    insert_runtime_instance(&pool, "canonical").await;
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    let err = migrations::run(&pool).await.unwrap_err();
+    assert_storage_not_finalized(&err, "canonical");
+
+    // Once the runtime's heartbeat is stale the cluster counts as fresh
+    // again — matching the auto-finalize 90-second window.
+    sqlx::raw_sql("UPDATE awa.runtime_instances SET last_seen_at = now() - interval '10 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    migrations::run(&pool)
+        .await
+        .expect("stale runtimes should not hold the migrate gate closed");
+}
+
 #[tokio::test]
 async fn test_documented_runtime_grants_cover_admin_refresh_truncate() {
     let _guard = acquire_migration_guard().await;
@@ -449,11 +609,30 @@ async fn test_step_through_upgrade_preserves_data() {
     .await
     .unwrap();
 
-    // Step 2: Run full migrations (should apply V2 + V3 + V4)
-    migrations::run(&pool).await.unwrap();
+    // Step 2: the 0.7 migrate gate (#370 / ADR-037) refuses run() while
+    // canonical jobs exist on an unfinalized cluster — the operator is
+    // expected to finish the staged transition on a 0.6 binary first.
+    let gate_err = migrations::run(&pool).await.unwrap_err();
+    assert!(
+        matches!(
+            &gate_err,
+            awa::AwaError::StorageNotFinalized { state } if state == "canonical"
+        ),
+        "expected StorageNotFinalized for canonical cluster with jobs, got: {gate_err}"
+    );
+
+    // Step 3: apply the remaining migrations the way a 0.6-line binary
+    // would (raw migration SQL) and verify the seeded data survives.
+    for (_version, _desc, sql) in migrations::migration_sql_range(1, migrations::CURRENT_VERSION) {
+        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+    }
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+
+    // With no pending migrations the gate is not consulted: run() stays a
+    // no-op success on an up-to-date cluster whatever its transition state.
+    migrations::run(&pool).await.unwrap();
 
     let job_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = 'migration_test'")

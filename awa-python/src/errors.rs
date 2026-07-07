@@ -1,6 +1,6 @@
 use crate::{
     AwaError as PyAwaError, CallbackNotFound, DatabaseError, SchemaNotMigrated, SerializationError,
-    UniqueConflict, UnknownJobKind, ValidationError,
+    StorageNotFinalized, UniqueConflict, UnknownJobKind, ValidationError,
 };
 use pyo3::PyErr;
 
@@ -35,6 +35,11 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         awa_model::AwaError::SchemaNotMigrated { expected, found } => SchemaNotMigrated::new_err(
             format!("schema not migrated: expected version {expected}, found {found}"),
         ),
+        // The Display impl carries the full operator guidance (finalize
+        // steps + upgrade guide links) — pass it through verbatim.
+        err @ awa_model::AwaError::StorageNotFinalized { .. } => {
+            StorageNotFinalized::new_err(err.to_string())
+        }
         awa_model::AwaError::UnknownJobKind { kind } => {
             UnknownJobKind::new_err(format!("unknown job kind: {kind}"))
         }
