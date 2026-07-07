@@ -6,6 +6,7 @@ pub mod dispatcher;
 mod enqueue_specs;
 pub mod events;
 pub mod executor;
+mod health_server;
 pub mod heartbeat;
 #[cfg(feature = "http-worker")]
 pub mod http_worker;
