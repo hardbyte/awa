@@ -173,6 +173,8 @@ What this proves: the race is real at the data-spec abstraction level. The safe 
 
 ## Storage-transition companion spec
 
+[`AwaCanonicalUniqueRescue.tla`](./AwaCanonicalUniqueRescue.tla) models the interaction between the canonical batched rescue sweeps and the `sync_job_unique_claims` trigger: a pending-only unique-states mask releases the claim while a job runs, a duplicate takes it, and the `running -> retryable` rescue transition is refused. [`AwaCanonicalUniqueRescueBatchOnly.cfg`](./AwaCanonicalUniqueRescueBatchOnly.cfg) is the expected-counterexample witness (the batched sweep starves the innocent stuck job — TLC reports the `Convergence` liveness property violated); [`AwaCanonicalUniqueRescue.cfg`](./AwaCanonicalUniqueRescue.cfg) checks the per-row fallback shipped in 0.6.1 (innocent job rescued, conflicted job cancelled, `ClaimConsistency` preserved).
+
 [`AwaStorageTransition.tla`](./AwaStorageTransition.tla) models the `0.5.x canonical -> 0.6 queue_storage` control plane from #180. It is deliberately smaller than the segmented-storage data model: it tracks the transition singleton, prepared schema readiness, runtime capability reports, effective queue executors, canonical backlog count, queue-storage row count, producer routing, finalize, and abort interlocks.
 
 The model separates three runtime populations that collapse to similar database rows in parts of the implementation:

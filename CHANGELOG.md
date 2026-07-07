@@ -4,6 +4,20 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-07-07
+
+Patch release: one canonical-engine bug fix, no migrations, no API changes.
+
+### Fixed
+
+- **Rescue sweeps no longer wedge on a unique-key conflict ([#388](https://github.com/hardbyte/awa/issues/388)) — both engines.** A unique job whose `unique_states` mask excludes `running` holds no claim while executing, so a newer duplicate can legitimately be enqueued and take the claim; returning the older job to a claiming state then conflicts. On the **canonical** engine the batched rescue UPDATEs (`running -> retryable`, `waiting_external -> retryable`) tripped the `sync_job_unique_claims` trigger (`idx_awa_jobs_unique`) and the whole 500-row sweep aborted every maintenance tick. On the **queue-storage** engine the same shape hid one layer deeper: rescue re-inserts each rescued job as a `retryable` deferred row inside one batch transaction, and `sync_unique_claim` raised `UniqueConflict` — aborting the whole batch identically. Both engines now degrade per row: clean rows rescue as before; the conflicted row is **cancelled** with an error entry (`rescued as duplicate: unique claim held by a newer job`) — the claim holder wins — via a savepoint on queue storage (terminal counters stay exact) and a row-at-a-time retry on canonical. Fallback cancellations dispatch the normal `Cancelled` lifecycle event and are counted under `awa.rescue.kind = "<kind>_duplicate_cancelled"`. Modelled in `correctness/storage/AwaCanonicalUniqueRescue.tla` (per-row config passes the `Convergence` liveness property; the batch-only config is the retained production-wedge counterexample), with end-to-end regression tests on both engines.
+
+- **Admin UI no longer renders storage *capability* as the engine in use.** The per-instance badge previously showed `storage_capability` — which reads `queue_storage` for every capable worker even on a fully canonical cluster — and the sidebar cluster chip aggregated the same field. The runtime page now derives and shows the **effective engine** (from capability, transition role, and the authoritative transition state), noting capability only when it adds information, and the sidebar chip labels the cluster from `/api/storage` instead. Publishing the resolved engine in runtime snapshots (so the UI need not derive it) is tracked in [#391](https://github.com/hardbyte/awa/issues/391).
+
+### Operator note
+
+If a cluster is currently wedged (repeating `Failed to rescue ... idx_awa_jobs_unique` logs), upgrading is sufficient — the next sweep resolves it. The mask itself is still worth revisiting: on the canonical engine, a `unique_states` mask that a runtime transition can *enter* from outside (e.g. including `retryable` but not `running`) always risks superseded-job cancellations; masks closed under retry/rescue/promotion (`{}` or the full non-terminal set) avoid the conflict entirely. See the new [troubleshooting entry](docs/troubleshooting.md#rescue-fails-with-idx_awa_jobs_unique).
+
 ## [0.6.0] — 2026-07-04
 
 The 0.6 line makes the append-only **queue-storage engine** the default and the supported substrate for high-throughput, low-bloat operation on managed Postgres. The [#169](https://github.com/hardbyte/awa/issues/169) pinned-MVCC dead-tuple gate **passed** on `main`: after the rc line removed the last dominant hot-row update path (the `queue_claim_heads` ready-segment routing cache), a 60-minute idle-in-transaction soak holds bounded queue depth through the pinned hour and drains fully in recovery. See "Benchmark evidence" below for the caveats — awa is not immune to long readers, and this release does not claim otherwise.

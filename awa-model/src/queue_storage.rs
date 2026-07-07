@@ -5,6 +5,7 @@ use crate::insert::prepare_row_raw;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
+use sqlx::Acquire;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -12216,6 +12217,115 @@ impl QueueStorage {
         Ok(Some(deferred.into_job_row()?))
     }
 
+    /// Rescue-path fallback for unique-claim conflicts: insert the rescued
+    /// attempt's deferred successor, degrading to a cancelled terminal row
+    /// when the job's unique claim is held by a newer duplicate — the claim
+    /// holder wins, and one poisoned row must not abort the whole batched
+    /// rescue transaction. The insert attempt runs inside a savepoint so the
+    /// conflict leaves the outer transaction usable.
+    async fn insert_rescued_deferred_or_cancel_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        row: LeaseTransitionRow,
+        deferred: DeferredJobRow,
+        duplicate_error: &str,
+    ) -> Result<JobRow, AwaError> {
+        let old_state = row.state;
+        {
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_deferred_rows_tx(&mut savepoint, vec![deferred.clone()], Some(old_state))
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    return deferred.into_job_row();
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        self.cancel_rescued_duplicate_tx(tx, row, deferred.payload, duplicate_error)
+            .await
+    }
+
+    /// Same fallback for rescue arms that write a terminal row directly
+    /// (callback timeout at max attempts): a `failed` insert that conflicts
+    /// with a newer duplicate's claim becomes a cancellation instead.
+    async fn insert_rescued_done_or_cancel_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        row: LeaseTransitionRow,
+        done: DoneJobRow,
+        duplicate_error: &str,
+    ) -> Result<JobRow, AwaError> {
+        let old_state = row.state;
+        {
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), Some(old_state))
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    return done.into_job_row();
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        self.cancel_rescued_duplicate_tx(tx, row, done.payload, duplicate_error)
+            .await
+    }
+
+    /// Write the cancelled terminal row for a rescue that lost its unique
+    /// claim to a newer duplicate. `cancelled` normally sits outside the
+    /// claiming mask so the insert is conflict-free; a mask that claims
+    /// `cancelled` as well conflicts again, and then the row is written with
+    /// its unique key stripped — the attempt held no claim (that is what
+    /// made it conflict), so there is nothing to release, and losing the key
+    /// on this terminal row beats aborting rescue for the whole cluster.
+    async fn cancel_rescued_duplicate_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        row: LeaseTransitionRow,
+        base_payload: serde_json::Value,
+        duplicate_error: &str,
+    ) -> Result<JobRow, AwaError> {
+        let old_state = row.state;
+        let mut payload = RuntimePayload::from_json(base_payload)?;
+        payload.push_error(lifecycle_error(duplicate_error, row.attempt, true));
+        let done = row.into_done_row(JobState::Cancelled, Utc::now(), payload.into_json());
+
+        {
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), Some(old_state))
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    return done.into_job_row();
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let mut stripped = done;
+        stripped.unique_key = None;
+        stripped.unique_states = None;
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&stripped), Some(old_state))
+            .await?;
+        stripped.into_job_row()
+    }
+
     pub async fn cancel_running(
         &self,
         pool: &PgPool,
@@ -12917,9 +13027,15 @@ impl QueueStorage {
                 Some(Utc::now()),
                 payload.into_json(),
             );
-            self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
+            let rescued_row = self
+                .insert_rescued_deferred_or_cancel_tx(
+                    &mut tx,
+                    row,
+                    deferred,
+                    "rescued as duplicate: unique claim held by a newer job",
+                )
                 .await?;
-            rescued.push(deferred.into_job_row()?);
+            rescued.push(rescued_row);
         }
         for row in moved_receipts {
             let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
@@ -12938,9 +13054,15 @@ impl QueueStorage {
                 Some(Utc::now()),
                 payload.into_json(),
             );
-            self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
+            let rescued_row = self
+                .insert_rescued_deferred_or_cancel_tx(
+                    &mut tx,
+                    row,
+                    deferred,
+                    "rescued as duplicate: unique claim held by a newer job",
+                )
                 .await?;
-            rescued.push(deferred.into_job_row()?);
+            rescued.push(rescued_row);
         }
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rescued)
@@ -13026,9 +13148,15 @@ impl QueueStorage {
                 Some(Utc::now()),
                 payload.into_json(),
             );
-            self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
+            let rescued_row = self
+                .insert_rescued_deferred_or_cancel_tx(
+                    &mut tx,
+                    row,
+                    deferred,
+                    "rescued as duplicate: unique claim held by a newer job",
+                )
                 .await?;
-            rescued.push(deferred.into_job_row()?);
+            rescued.push(rescued_row);
         }
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rescued)
@@ -13097,9 +13225,15 @@ impl QueueStorage {
                 let done =
                     row.clone()
                         .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
-                self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(row.state))
+                let rescued_row = self
+                    .insert_rescued_done_or_cancel_tx(
+                        &mut tx,
+                        row,
+                        done,
+                        "rescued as duplicate: unique claim held by a newer job",
+                    )
                     .await?;
-                rescued.push(done.into_job_row()?);
+                rescued.push(rescued_row);
             } else {
                 let deferred = row.clone().into_deferred_row(
                     JobState::Retryable,
@@ -13108,9 +13242,15 @@ impl QueueStorage {
                     Some(Utc::now()),
                     payload.into_json(),
                 );
-                self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
+                let rescued_row = self
+                    .insert_rescued_deferred_or_cancel_tx(
+                        &mut tx,
+                        row,
+                        deferred,
+                        "rescued as duplicate: unique claim held by a newer job",
+                    )
                     .await?;
-                rescued.push(deferred.into_job_row()?);
+                rescued.push(rescued_row);
             }
         }
         tx.commit().await.map_err(map_sqlx_error)?;
