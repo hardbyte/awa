@@ -79,6 +79,15 @@ def inject_traceparent(metadata: dict[str, Any] | None) -> dict[str, Any] | None
     return captured
 
 
+def ambient_traceparent() -> str | None:
+    """Capture hook for the PyO3 layer (transaction inserts): the ambient
+    traceparent, unless capture is disabled. Mirrors ``inject_traceparent``
+    for call sites that assemble metadata on the Rust side."""
+    if _capture_disabled():
+        return None
+    return current_traceparent()
+
+
 async def call_with_context(
     traceparent: str | None,
     handler: Callable[[Any], Awaitable[Any]],

@@ -93,12 +93,16 @@ pub(crate) fn init_telemetry(
         .with_resource(resource.clone())
         .build();
 
-    global::set_meter_provider(provider.clone());
-    *guard = Some(provider);
-
+    // Install the trace half BEFORE committing the meter provider and the
+    // idempotency guard: a span-exporter build error must fail the whole
+    // call cleanly (nothing installed, retry possible), not leave metrics
+    // live with traces silently dead behind a set guard.
     if traces {
         install_trace_pipeline(&endpoint, &resource)?;
     }
+
+    global::set_meter_provider(provider.clone());
+    *guard = Some(provider);
     Ok(true)
 }
 
@@ -107,8 +111,7 @@ pub(crate) fn init_telemetry(
 /// runtime's `job.execute` / `send {queue}` spans reach the collector.
 ///
 /// If some embedding has already installed a global `tracing` subscriber,
-/// span export is skipped with a warning rather than failing `init_telemetry`
-/// (the metrics half is already live at that point).
+/// span export is skipped with a warning rather than failing `init_telemetry`.
 fn install_trace_pipeline(endpoint: &str, resource: &Resource) -> PyResult<()> {
     let runtime = pyo3_async_runtimes::tokio::get_runtime();
 

@@ -100,7 +100,7 @@ async def main() -> None:
     client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
     tx = await client.transaction()
-    await tx.execute(f"DELETE FROM awa.jobs WHERE queue = '{QUEUE}'")
+    await tx.execute("DELETE FROM awa.jobs WHERE queue = $1", QUEUE)
     await tx.commit()
 
     handler_span_ids: list[str] = []

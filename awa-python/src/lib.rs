@@ -128,7 +128,10 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("AwaError", m.py().get_type::<AwaError>())?;
     m.add("UniqueConflict", m.py().get_type::<UniqueConflict>())?;
     m.add("SchemaNotMigrated", m.py().get_type::<SchemaNotMigrated>())?;
-    m.add("StorageNotFinalized", m.py().get_type::<StorageNotFinalized>())?;
+    m.add(
+        "StorageNotFinalized",
+        m.py().get_type::<StorageNotFinalized>(),
+    )?;
     m.add("UnknownJobKind", m.py().get_type::<UnknownJobKind>())?;
     m.add(
         "SerializationError",

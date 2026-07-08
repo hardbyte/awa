@@ -99,6 +99,21 @@ async def test_insert_inside_span_captures_traceparent(client):
     assert stored.traceparent == traceparent  # convenience getter
 
 
+async def test_transaction_insert_captures_traceparent(client):
+    """Transactional enqueue participates too: the shared PyO3 prepare path
+    reads the ambient opentelemetry-python context (the client wrappers are
+    bypassed by ``client.transaction()``)."""
+    with _tracer.start_as_current_span("producer") as span:
+        expected_trace_id = f"{span.get_span_context().trace_id:032x}"
+        tx = await client.transaction()
+        job = await tx.insert(TracedJob(n=9), queue="trace_py")
+        await tx.commit()
+
+    stored = await client.get_job(job.id)
+    assert stored.traceparent is not None, f"metadata: {stored.metadata}"
+    assert expected_trace_id in stored.traceparent
+
+
 async def test_insert_outside_span_stores_nothing(client):
     job = await client.insert(TracedJob(n=2), queue="trace_py")
     stored = await client.get_job(job.id)
