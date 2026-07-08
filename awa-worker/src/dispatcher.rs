@@ -450,7 +450,12 @@ impl Dispatcher {
                 _ = self.capacity_wake.notified() => {
                     self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
-                _ = tokio::time::sleep(self.config.poll_interval) => {
+                // Cap the sleep at the override refresh cadence: overrides
+                // are re-read on wake, so a long (possibly overridden) poll
+                // interval must not delay picking up the next change
+                // (ADR-038). An idle extra wake per cadence costs one claim
+                // round-trip — what short-poll queues do constantly anyway.
+                _ = tokio::time::sleep(self.config.poll_interval.min(override_refresh_interval())) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
@@ -470,7 +475,7 @@ impl Dispatcher {
                 _ = self.capacity_wake.notified() => {
                     self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
-                _ = tokio::time::sleep(self.config.poll_interval) => {
+                _ = tokio::time::sleep(self.config.poll_interval.min(override_refresh_interval())) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
