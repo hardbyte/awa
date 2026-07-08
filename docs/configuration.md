@@ -651,8 +651,12 @@ metadata under the reserved `awa:traceparent` key and reconnects it at execution
 
 Both sides carry OTel [messaging semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/)
 (`messaging.system = "awa"`, producer/consumer span kinds, `send {queue}` /
-`job.execute {kind}` names). Handlers can forward the context onward via
-`ctx.traceparent()` (Rust) or `job.traceparent` (Python).
+`job.execute {kind}` names). To propagate onward from a Rust handler
+(outgoing HTTP headers), use the ambient context —
+`awa_model::trace::current_traceparent()` — so downstream spans nest under
+the execution span; `ctx.traceparent()` (Rust) and `job.traceparent`
+(Python) return the stored *enqueue-site* context for inspection or for
+continuing the trace where no ambient context exists.
 
 Capture costs well under a microsecond per enqueue and is on by default;
 `AWA_TRACE_CAPTURE=off` disables ambient capture process-wide. An explicit

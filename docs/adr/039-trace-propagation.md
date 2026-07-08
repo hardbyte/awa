@@ -62,8 +62,11 @@ a 1ms enqueue roundtrip (E8 gate, rerunnable via the ignored
 `traceparent`, so parent-based samplers on the worker respect the producer's
 decision on first attempts and re-decide at the root for retries.
 
-Handlers can forward the context onward: `ctx.traceparent()` (Rust) and
-`job.traceparent` (Python).
+Handlers inspect the stored enqueue-site context via `ctx.traceparent()`
+(Rust) and `job.traceparent` (Python). Rust handlers propagating onward
+(outgoing HTTP headers) use the ambient `trace::current_traceparent()`
+instead, so downstream spans nest under the execution span rather than
+becoming its siblings.
 
 ## Consequences
 

@@ -220,7 +220,10 @@ await client.insert(
 ```
 
 Inside a handler, `job.traceparent` returns the enqueue-site context so
-Python-side instrumentation can continue the same trace:
+Python-side instrumentation can continue the same trace (the span below
+joins it alongside the Rust-side `job.execute` span — Python handlers have
+no ambient OpenTelemetry context today, so the enqueue site is the best
+available parent):
 
 ```python
 ctx = TraceContextTextMapPropagator().extract({"traceparent": job.traceparent})
