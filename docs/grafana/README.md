@@ -114,6 +114,24 @@ curl -s "http://localhost:9090/api/v1/label/__name__/values" | grep awa
 
 Expected metrics: `awa_job_completed_total`, `awa_job_in_flight`, `awa_job_duration_seconds_*`, etc.
 
+### 4. Traces
+
+With trace propagation enabled (ADR-039; automatic when your producer runs
+an OpenTelemetry pipeline), the runtime's `send {queue}` and
+`job.execute {kind}` spans arrive alongside the metrics — browse them in
+Grafana under **Explore → Tempo**, or search TraceQL like
+`{ span.messaging.system = "awa" }`.
+
+## Keeping these assets honest
+
+These dashboards and alert rules are validated in CI against a live LGTM
+stack on every full run (`scripts/validate-grafana.sh`): every `awa_*`
+identifier they reference must exist in Prometheus (or still be defined in
+`awa-metrics` for condition-gated metrics), both dashboards must import
+through the Grafana API, every Postgres panel's SQL must `EXPLAIN` against
+a migrated schema, and a trace must be readable through Grafana's Tempo
+datasource. Run the whole thing locally with `scripts/telemetry-e2e-local.sh`.
+
 ## Metrics Reference
 
 All metrics use the `awa` OTel meter name and are exported via OTLP to your configured collector.
