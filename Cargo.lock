@@ -457,6 +457,7 @@ dependencies = [
  "chrono-tz",
  "croner",
  "hex",
+ "opentelemetry",
  "serde",
  "serde_json",
  "sqlx",
@@ -464,6 +465,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
+ "tracing-opentelemetry",
  "uuid",
 ]
 
@@ -539,6 +541,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
 ]

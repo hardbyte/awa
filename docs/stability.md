@@ -40,6 +40,13 @@ changelog will say so explicitly.
 | **Storage schema / migrations** | The migration *path*: `awa migrate` upgrades any supported prior version's schema (support window per [#367](https://github.com/hardbyte/awa/issues/367) and ADR-037's gate). | Schema contents. Tables, indexes, functions, and triggers are internal; migrations may reshape them freely. There is no downgrade path. |
 | **Configuration** | Documented `QueueConfig`/builder options, Python `start()` kwargs, and `AWA_*` environment variables in `configuration.md`. | Undocumented env vars; internal tuning defaults (may change in minors with a changelog note). |
 
+**Reserved metadata namespace.** Job `metadata` keys prefixed `awa:` are
+reserved for awa itself (today: `awa:traceparent`,
+[ADR-039](adr/039-trace-propagation.md)). A caller-supplied value under a
+documented reserved key is honored as authoritative, but awa may add,
+interpret, or stop writing reserved keys in any release. Keys without the
+prefix are user-owned and pass through untouched.
+
 ## What "supported" means for binary/schema skew
 
 Rolling deploys create windows where an older binary runs against a newer schema. The support

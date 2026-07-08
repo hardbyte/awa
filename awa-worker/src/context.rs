@@ -99,6 +99,20 @@ impl JobContext {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// W3C traceparent captured at the **enqueue site**, if any. The
+    /// execution span already joins that trace automatically; this getter
+    /// is for inspecting the stored context (or building span links).
+    ///
+    /// To propagate the trace onward from handler code (outgoing HTTP
+    /// headers, child processes), use
+    /// [`awa_model::trace::current_traceparent`] instead: handlers run
+    /// inside the `job.execute` span, so the ambient context makes the
+    /// downstream span a child of the execution — forwarding the enqueue
+    /// context would make it a sibling.
+    pub fn traceparent(&self) -> Option<&str> {
+        awa_model::trace::traceparent_from_metadata(&self.job.metadata)
+    }
+
     /// Clone the shared cancellation flag for language bridges.
     pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()

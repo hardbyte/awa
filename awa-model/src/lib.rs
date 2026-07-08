@@ -13,6 +13,7 @@ pub mod migrations;
 pub mod partitioned_queue;
 pub mod queue_storage;
 pub mod storage;
+pub mod trace;
 pub mod unique;
 
 // Re-exports for ergonomics

@@ -28,6 +28,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 croner.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 uuid.workspace = true
 opentelemetry.workspace = true
 anyhow = { version = "1", optional = true }

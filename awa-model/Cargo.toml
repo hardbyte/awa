@@ -23,6 +23,8 @@ chrono.workspace = true
 chrono-tz.workspace = true
 croner.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
 uuid.workspace = true
 hex = "0.4"
 cel = { workspace = true, optional = true }
