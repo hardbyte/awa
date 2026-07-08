@@ -65,6 +65,8 @@ from typing import Any
 
 from awa._awa import derive_kind
 
+from . import _trace
+
 # ---------------------------------------------------------------------------
 # SQL
 # ---------------------------------------------------------------------------
@@ -243,7 +245,7 @@ def _prepare_values(
 ) -> dict[str, Any]:
     """Prepare shared insert values for all bridge backends."""
     args_data = _coerce_job_data(args)
-    metadata_data = metadata or {}
+    metadata_data = _trace.inject_traceparent(metadata) or {}
     _reject_null_bytes(args_data)
     _reject_null_bytes(metadata_data)
 

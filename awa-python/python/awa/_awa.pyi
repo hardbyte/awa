@@ -769,6 +769,7 @@ def init_telemetry(
     endpoint: str,
     service_name: str,
     export_interval_ms: int = 5000,
+    traces: bool = True,
 ) -> bool: ...
 def shutdown_telemetry() -> None: ...
 
