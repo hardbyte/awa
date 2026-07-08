@@ -318,7 +318,9 @@ fn override_refresh_interval() -> Duration {
         std::env::var("AWA_OVERRIDE_REFRESH_MS")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .map(Duration::from_millis)
+            // Floor at 50ms: zero would turn the poll sleep into a busy
+            // loop and make every wake refresh.
+            .map(|ms| Duration::from_millis(ms.max(50)))
             .unwrap_or(Duration::from_secs(10))
     })
 }

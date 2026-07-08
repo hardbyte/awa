@@ -53,8 +53,9 @@ Two guard rails, both logged when they bite:
 
 **Negative / limits**
 
-- Changes take up to one refresh cadence to apply; the cadence is deliberately not
-  configurable in Tier 1.
+- Changes take up to one refresh cadence to apply. The cadence has a process-wide
+  escape hatch (`AWA_OVERRIDE_REFRESH_MS`, floored at 50ms) but is deliberately not
+  configurable per queue in Tier 1.
 - Per-claimer application means a brief window where claimers of one queue disagree.
 - Live concurrency (`max_workers`), correctness-coupled cadences (heartbeat/rescue), and
   Python/UI parity are explicitly Tier 2 ([#397](https://github.com/hardbyte/awa/issues/397)).
