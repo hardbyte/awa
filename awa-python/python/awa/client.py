@@ -27,6 +27,8 @@ from awa._awa import (
     Transaction,
 )
 
+from . import _trace
+
 T = TypeVar("T")
 
 DEFAULT_QUEUE_STORAGE_SCHEMA = "awa"
@@ -144,7 +146,7 @@ class AsyncClient:
             priority=priority,
             max_attempts=max_attempts,
             tags=tags if tags is not None else [],
-            metadata=metadata,
+            metadata=_trace.inject_traceparent(metadata),
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
@@ -177,7 +179,7 @@ class AsyncClient:
             priority=priority,
             max_attempts=max_attempts,
             tags=tags if tags is not None else [],
-            metadata=metadata,
+            metadata=_trace.inject_traceparent(metadata),
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
@@ -212,7 +214,7 @@ class AsyncClient:
             priority=priority,
             max_attempts=max_attempts,
             tags=tags if tags is not None else [],
-            metadata=metadata,
+            metadata=_trace.inject_traceparent(metadata),
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
@@ -982,7 +984,7 @@ class Client:
             priority=priority,
             max_attempts=max_attempts,
             tags=tags if tags is not None else [],
-            metadata=metadata,
+            metadata=_trace.inject_traceparent(metadata),
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
@@ -1015,7 +1017,7 @@ class Client:
             priority=priority,
             max_attempts=max_attempts,
             tags=tags if tags is not None else [],
-            metadata=metadata,
+            metadata=_trace.inject_traceparent(metadata),
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
@@ -1050,7 +1052,7 @@ class Client:
             priority=priority,
             max_attempts=max_attempts,
             tags=tags if tags is not None else [],
-            metadata=metadata,
+            metadata=_trace.inject_traceparent(metadata),
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,

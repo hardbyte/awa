@@ -433,7 +433,7 @@ jobs:
     needs: [rust-build]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18-alpine
@@ -453,6 +453,8 @@ jobs:
           - 4317:4317
           - 4318:4318
           - 9090:9090
+          - 3000:3000
+          - 3200:3200
         options: >-
           --health-cmd "cat /tmp/ready"
           --health-interval 10s
@@ -463,7 +465,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          workspaces: |
+            . -> target
+            awa-python -> awa-python/target
+      - uses: astral-sh/setup-uv@v7
       - name: Wait for Postgres
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
       - name: Wait for OTLP collector
@@ -479,3 +484,25 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
           OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4317
           PROMETHEUS_URL: http://localhost:9090
+          TEMPO_URL: http://localhost:3200
+      - name: Build awa-python for the cross-language trace leg
+        # uv sync builds the wheel from source (compiling the PyO3 crate)
+        # and installs it into the project venv — no explicit maturin step.
+        run: |
+          cd awa-python
+          uv sync
+      - name: Run cross-language trace e2e (python → rust → python)
+        run: |
+          cd awa-python
+          uv run --with opentelemetry-exporter-otlp-proto-grpc \
+            python ../scripts/trace-e2e-python.py
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+          OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4317
+          TEMPO_URL: http://localhost:3200
+      - name: Validate published Grafana dashboards and alerts
+        run: scripts/validate-grafana.sh
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+          PROMETHEUS_URL: http://localhost:9090
+          GRAFANA_URL: http://localhost:3000

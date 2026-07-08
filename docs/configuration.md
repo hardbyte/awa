@@ -659,10 +659,13 @@ the execution span; `ctx.traceparent()` (Rust) and `job.traceparent`
 continuing the trace where no ambient context exists.
 
 Capture costs well under a microsecond per enqueue and is on by default;
-`AWA_TRACE_CAPTURE=off` disables ambient capture process-wide. An explicit
+`AWA_TRACE_CAPTURE=off` disables ambient capture process-wide (Rust and
+Python alike). Python producers are captured at the binding layer whenever
+`opentelemetry-api` is importable, and Python handlers get the job's trace
+context attached as their ambient OpenTelemetry context — see the
+[Python guide](getting-started-python.md#distributed-tracing). An explicit
 `metadata["awa:traceparent"]` supplied at enqueue always wins — that is also
-the participation path for SQL-native producers and Python producers (the
-Rust core cannot see opentelemetry-python's ambient context).
+the participation path for SQL-native producers.
 
 ## Dead Letter Queue
 

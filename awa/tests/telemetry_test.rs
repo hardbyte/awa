@@ -2021,3 +2021,346 @@ async fn dashboard_panels_have_observed_data() {
     let _ = meter_provider.shutdown();
     eprintln!("Dashboard validated at http://localhost:3200/d/awa-job-queue/awa-job-queue");
 }
+
+// ── Trace pipeline e2e (ADR-039) ─────────────────────────────────────
+//
+// Asserts the FULL span path: producer span → traceparent captured at
+// enqueue → worker execution span exported over OTLP → queryable in Tempo
+// with the topology ADR-039 promises (first attempt parented to the
+// enqueue site; retries as fresh roots carrying a span link back).
+
+fn tempo_url() -> String {
+    std::env::var("TEMPO_URL").unwrap_or_else(|_| "http://localhost:3200".to_string())
+}
+
+/// Install a process-global OTLP trace pipeline (tracer provider + tracing
+/// subscriber). Global because the worker's spans are created on spawned
+/// runtime tasks; once-only because a process can only have one subscriber
+/// — the ignored-test gate serializes the tests that rely on it.
+///
+/// The tonic channel is connected EAGERLY on the test's tokio runtime: the
+/// batch span processor drives exports from its own plain thread, and a
+/// lazily-connected channel would try to start its connection driver there
+/// (no reactor → every export times out).
+async fn install_trace_pipeline(
+    endpoint: &str,
+    service_name: &str,
+) -> opentelemetry_sdk::trace::SdkTracerProvider {
+    static PIPELINE: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = OnceLock::new();
+    if let Some(provider) = PIPELINE.get() {
+        return provider.clone();
+    }
+    let channel = tonic::transport::Channel::from_shared(endpoint.to_string())
+        .expect("valid OTLP endpoint")
+        .connect()
+        .await
+        .expect("connect to OTLP collector");
+    use opentelemetry_otlp::WithTonicConfig;
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_channel(channel)
+        .build()
+        .expect("Failed to build OTLP span exporter");
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            Resource::builder()
+                .with_service_name(service_name.to_owned())
+                .build(),
+        )
+        .build();
+    use opentelemetry::trace::TracerProvider as _;
+    let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("awa-trace-e2e"));
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+        .expect("set global tracing subscriber");
+    PIPELINE.set(provider.clone()).ok();
+    provider
+}
+
+/// Standard base64 (with padding) of a hex string — OTLP protojson encodes
+/// trace/span ids as base64 bytes, while awa's traceparent carries hex.
+fn hex_to_base64(hex: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+        .collect();
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Fetch all spans of one trace from Tempo, or None until it is queryable.
+async fn tempo_trace_spans(
+    client: &reqwest::Client,
+    trace_id_hex: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let url = format!("{}/api/traces/{trace_id_hex}", tempo_url());
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let mut spans = Vec::new();
+    for batch in body["batches"].as_array()? {
+        for scope in batch["scopeSpans"].as_array().cloned().unwrap_or_default() {
+            for span in scope["spans"].as_array().cloned().unwrap_or_default() {
+                spans.push(span);
+            }
+        }
+    }
+    (!spans.is_empty()).then_some(spans)
+}
+
+/// Poll Tempo until the trace is queryable (ingest is asynchronous).
+async fn wait_for_tempo_trace(
+    client: &reqwest::Client,
+    trace_id_hex: &str,
+    minimum_spans: usize,
+) -> Vec<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(spans) = tempo_trace_spans(client, trace_id_hex).await {
+            if spans.len() >= minimum_spans {
+                return spans;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "trace {trace_id_hex} did not become queryable in Tempo within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn span_attr<'a>(span: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    span["attributes"].as_array()?.iter().find_map(|attribute| {
+        (attribute["key"].as_str() == Some(key))
+            .then(|| attribute["value"]["stringValue"].as_str())
+            .flatten()
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct TraceE2eJob {
+    pub mode: String,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_trace_pipeline_reaches_tempo() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
+    let pool = setup_pool("awa_test_telemetry_traces").await;
+    let queue = "trace_demo";
+    clean_queue(&pool, queue).await;
+
+    let provider = install_trace_pipeline(&otlp_endpoint(), "awa-trace-e2e").await;
+
+    // Enqueue two jobs inside one producer span: one that completes first
+    // try, one that retries once (to witness the fresh-root-plus-link
+    // topology). Inserted BEFORE the worker starts so claims are immediate.
+    let producer_span = tracing::info_span!("e2e.enqueue");
+    let producer_context = {
+        use opentelemetry::trace::TraceContextExt;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        producer_span.context().span().span_context().clone()
+    };
+    assert!(producer_context.is_valid(), "producer span context invalid");
+    let producer_trace_hex = producer_context.trace_id().to_string();
+
+    use tracing::Instrument;
+    let complete_job = insert_with(
+        &pool,
+        &TraceE2eJob {
+            mode: "complete".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .instrument(producer_span.clone())
+    .await
+    .expect("insert complete job");
+    let retry_job = insert_with(
+        &pool,
+        &TraceE2eJob {
+            mode: "retry".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .instrument(producer_span.clone())
+    .await
+    .expect("insert retry job");
+    drop(producer_span);
+
+    let enqueue_site = |job: &awa::model::JobRow| -> opentelemetry::trace::SpanContext {
+        awa_model::trace::traceparent_from_metadata(&job.metadata)
+            .and_then(awa_model::trace::parse_traceparent)
+            .expect("traceparent captured at enqueue")
+    };
+    let complete_site = enqueue_site(&complete_job);
+    let retry_site = enqueue_site(&retry_job);
+    assert_eq!(complete_site.trace_id().to_string(), producer_trace_hex);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .register::<TraceE2eJob, _, _>(move |args: TraceE2eJob, ctx| {
+            let attempts = handler_attempts.clone();
+            let attempt = ctx.job.attempt;
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                if args.mode == "retry" && attempt <= 1 {
+                    Ok(JobResult::RetryAfter(Duration::ZERO))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+        })
+        .promote_interval(Duration::from_millis(100))
+        .heartbeat_interval(Duration::from_millis(100))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(100))
+        .build()
+        .expect("Failed to build client");
+    client.start().await.expect("Failed to start client");
+
+    wait_for_job_state(&pool, complete_job.id, "completed").await;
+    wait_for_job_state(&pool, retry_job.id, "completed").await;
+    client.shutdown(Duration::from_secs(5)).await;
+    provider.force_flush().expect("flush spans");
+
+    // ── Producer trace in Tempo: enqueue → send → execute, one trace ──
+    let http = reqwest::Client::new();
+    // Expect at least: e2e.enqueue + 2× send + first-attempt executes.
+    let spans = wait_for_tempo_trace(&http, &producer_trace_hex, 4).await;
+
+    let send_b64 = hex_to_base64(&complete_site.span_id().to_string());
+    let send_span = spans
+        .iter()
+        .find(|s| s["spanId"].as_str() == Some(send_b64.as_str()))
+        .unwrap_or_else(|| panic!("enqueue-site span missing from Tempo trace: {spans:?}"));
+    assert_eq!(
+        send_span["name"].as_str(),
+        Some(format!("send {queue}").as_str())
+    );
+
+    let execute_span = spans
+        .iter()
+        .find(|s| {
+            s["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("job.execute"))
+                && s["parentSpanId"].as_str() == Some(send_b64.as_str())
+        })
+        .unwrap_or_else(|| {
+            panic!("job.execute span parented to the enqueue site missing: {spans:?}")
+        });
+    assert_eq!(execute_span["kind"].as_str(), Some("SPAN_KIND_CONSUMER"));
+    assert_eq!(span_attr(execute_span, "messaging.system"), Some("awa"));
+    assert_eq!(
+        span_attr(execute_span, "messaging.destination.name"),
+        Some(queue)
+    );
+
+    // ── Retry attempt: fresh root trace, span link back ──
+    // Find the retry's second-attempt trace via TraceQL on the job id.
+    let retry_site_trace_hex = retry_site.trace_id().to_string();
+    let retry_site_span_b64 = hex_to_base64(&retry_site.span_id().to_string());
+    let query = format!("{{ span.messaging.message.id = \"{}\" }}", retry_job.id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let retry_trace_hex = loop {
+        let resp: serde_json::Value = http
+            .get(format!("{}/api/search", tempo_url()))
+            .query(&[("q", query.as_str()), ("limit", "20")])
+            .send()
+            .await
+            .expect("tempo search request")
+            .json()
+            .await
+            .unwrap_or_default();
+        let other = resp["traces"].as_array().and_then(|traces| {
+            traces.iter().find_map(|t| {
+                let id = t["traceID"].as_str()?;
+                // Tempo may render the id without leading zeros; compare
+                // against the tail of the padded producer id.
+                (!retry_site_trace_hex.ends_with(id)).then(|| id.to_string())
+            })
+        });
+        if let Some(id) = other {
+            break id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retry attempt trace not searchable in Tempo within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let retry_spans = wait_for_tempo_trace(&http, &retry_trace_hex, 1).await;
+    let retry_execute = retry_spans
+        .iter()
+        .find(|s| {
+            s["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("job.execute"))
+        })
+        .unwrap_or_else(|| panic!("retry execute span missing: {retry_spans:?}"));
+    assert!(
+        retry_execute["parentSpanId"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "retry execute span should be a root span"
+    );
+    let links = retry_execute["links"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        links
+            .iter()
+            .any(|l| l["spanId"].as_str() == Some(retry_site_span_b64.as_str())),
+        "retry execute span should link back to the enqueue site; links: {links:?}"
+    );
+
+    let _ = attempts;
+    eprintln!(
+        "trace e2e OK: producer trace {producer_trace_hex} and retry trace {retry_trace_hex} both queryable in Tempo"
+    );
+}

@@ -315,10 +315,25 @@ fn prepare_insert(
             derive_kind(&class_name)
         }
     };
-    let metadata_json = metadata
+    let mut metadata_json = metadata
         .map(|value| py_to_json(py, value.bind(py)))
         .transpose()?
         .unwrap_or(serde_json::json!({}));
+    // Producer capture for transaction inserts (ADR-039): the Python client
+    // wrappers inject before crossing the FFI, but transactions hand raw
+    // metadata straight to this shared prepare path — read the ambient
+    // opentelemetry-python context here so `tx.insert(...)` participates
+    // too. A caller-supplied key wins; failures degrade to no capture.
+    if let serde_json::Value::Object(map) = &mut metadata_json {
+        if !map.contains_key(awa_model::trace::TRACEPARENT_METADATA_KEY) {
+            if let Some(traceparent) = python_ambient_traceparent(py) {
+                map.insert(
+                    awa_model::trace::TRACEPARENT_METADATA_KEY.to_string(),
+                    traceparent.into(),
+                );
+            }
+        }
+    }
     let run_at = run_at
         .map(|value| parse_run_at(py, value.bind(py)))
         .transpose()?;
@@ -329,6 +344,28 @@ fn prepare_insert(
         metadata_json,
         run_at,
     })
+}
+
+/// Ambient opentelemetry-python traceparent for producer capture, honoring
+/// `AWA_TRACE_CAPTURE`. `None` when opentelemetry is not installed, there
+/// is no active span, or the hook itself fails — capture must never break
+/// an insert.
+fn python_ambient_traceparent(py: Python<'_>) -> Option<String> {
+    use pyo3::sync::PyOnceLock;
+    static AMBIENT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    let hook = AMBIENT
+        .get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+            Ok(py
+                .import("awa._trace")?
+                .getattr("ambient_traceparent")?
+                .unbind())
+        })
+        .ok()?;
+    hook.bind(py)
+        .call0()
+        .ok()?
+        .extract::<Option<String>>()
+        .ok()?
 }
 
 fn tx_ref<'a>(

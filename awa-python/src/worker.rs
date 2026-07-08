@@ -3,8 +3,21 @@ use crate::job::{json_to_py, PyJob};
 use awa_model::JobRow;
 use awa_worker::{JobContext, JobError, JobResult, Worker};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use std::fmt;
 use tracing::warn;
+
+/// `awa._trace.call_with_context`, resolved once. Attaches the execution
+/// span's context as the ambient OpenTelemetry context around the handler
+/// (a no-op shim when opentelemetry is not installed Python-side).
+static TRACE_TRAMPOLINE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+fn trace_trampoline(py: Python<'_>) -> PyResult<&Py<PyAny>> {
+    TRACE_TRAMPOLINE.get_or_try_init(py, || {
+        let module = py.import("awa._trace")?;
+        Ok(module.getattr("call_with_context")?.unbind())
+    })
+}
 
 #[derive(Debug)]
 struct PythonHandlerError {
@@ -50,8 +63,21 @@ impl Worker for PythonWorker {
         let py_job = Python::attach(|py| build_dispatch_job(py, ctx.job.clone(), &args_type, ctx))
             .map_err(|err| classify_python_error(err, true))?;
 
+        // Hand the handler the trace context to attach: the execution span's
+        // own context when a Rust trace pipeline is installed (Python spans
+        // then nest under `job.execute`), else the stored enqueue-site
+        // context so the trace still connects (ADR-039).
+        let traceparent = awa_model::trace::current_traceparent().or_else(|| {
+            awa_model::trace::traceparent_from_metadata(&ctx.job.metadata).map(str::to_owned)
+        });
+
         let future = Python::attach(|py| {
-            let coro = handler.call1(py, (py_job,))?;
+            let coro = match (&traceparent, trace_trampoline(py)) {
+                (Some(tp), Ok(trampoline)) => {
+                    trampoline.call1(py, (tp.as_str(), &handler, py_job))?
+                }
+                _ => handler.call1(py, (py_job,))?,
+            };
             pyo3_async_runtimes::into_future_with_locals(&task_locals, coro.into_bound(py))
         })
         .map_err(|err| classify_python_error(err, true))?;

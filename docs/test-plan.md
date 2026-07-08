@@ -409,17 +409,23 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --pack
 # Progress tests (Python)
 cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/test_progress.py -v
 
-# Telemetry OTLP integration test (requires otel-lgtm + postgres)
-# Start an OTLP collector (receives metrics via gRPC, exposes Prometheus API):
-docker run -d --name otel-lgtm -p 4317:4317 -p 9090:9090 grafana/otel-lgtm:0.22.0
-# Wait for ready:
-until curl -sf http://localhost:9090/api/v1/status/runtimeinfo; do sleep 2; done
-# Run the test:
+# Telemetry e2e — metrics AND traces AND the published Grafana dashboards,
+# same assertions as the CI telemetry-validation job (starts grafana/otel-lgtm
+# itself and leaves it running for eyeballing; see the script header):
+scripts/telemetry-e2e-local.sh
+
+# Or piecewise against an already-running otel-lgtm
+# (docker run -d --name awa-otel-lgtm -p 4317:4317 -p 9090:9090 -p 3000:3000 -p 3200:3200 grafana/otel-lgtm:0.22.0):
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  TEMPO_URL=http://localhost:3200 \
   cargo test -p awa --test telemetry_test -- --ignored --nocapture
+scripts/validate-grafana.sh                # dashboards/alerts vs live stack
+# Cross-language trace leg (needs the awa-python dev venv + built wheel):
+cd awa-python && uv run --with opentelemetry-exporter-otlp-proto-grpc \
+  python ../scripts/trace-e2e-python.py
 # Cleanup:
-docker rm -f otel-lgtm
+docker rm -f awa-otel-lgtm
 
 # Repeat 20 times to detect flakes
 for i in $(seq 1 20); do echo "=== Run $i ===" && cargo test --workspace 2>&1 | tail -1; done

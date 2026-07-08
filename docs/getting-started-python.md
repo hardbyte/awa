@@ -203,33 +203,28 @@ awa.init_telemetry(
 
 ### Distributed tracing
 
-The worker-side execution span automatically continues a trace captured at
-enqueue ([ADR-039](adr/039-trace-propagation.md)). Rust producers are captured
-ambiently; a Python producer sets the reserved metadata key itself, because the
-Rust core cannot see opentelemetry-python's ambient context:
+Distributed tracing ([ADR-039](adr/039-trace-propagation.md)) is automatic
+when `opentelemetry-api` is importable (install it directly, via your tracing
+stack, or with the `awa-pg[otel]` extra) — no configuration:
 
-```python
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+- **Producers**: `insert` / `insert_many_copy` / `enqueue_many_copy` and the
+  `awa.bridge` helpers capture the current OpenTelemetry span's context into
+  the reserved `awa:traceparent` metadata key. An explicit
+  `metadata={"awa:traceparent": ...}` always wins, and
+  `AWA_TRACE_CAPTURE=off` disables ambient capture.
+- **Handlers**: the worker attaches the job's trace context as the ambient
+  OpenTelemetry context before invoking your handler, so instrumented
+  libraries (httpx, requests, SQLAlchemy, ...) and spans you create nest
+  into the job's trace with no extra code. `job.traceparent` still exposes
+  the stored enqueue-site value for inspection.
 
-carrier: dict[str, str] = {}
-TraceContextTextMapPropagator().inject(carrier)  # reads the current span
-await client.insert(
-    SendEmail(to="user@example.com"),
-    metadata={"awa:traceparent": carrier["traceparent"]},
-)
-```
+Without `opentelemetry` installed, all of this is a cached no-op.
 
-Inside a handler, `job.traceparent` returns the enqueue-site context so
-Python-side instrumentation can continue the same trace (the span below
-joins it alongside the Rust-side `job.execute` span — Python handlers have
-no ambient OpenTelemetry context today, so the enqueue site is the best
-available parent):
-
-```python
-ctx = TraceContextTextMapPropagator().extract({"traceparent": job.traceparent})
-with tracer.start_as_current_span("process-email", context=ctx):
-    ...
-```
+To export awa's own Rust-side spans (`send {queue}`, `job.execute {kind}`)
+to your collector, `init_telemetry` now installs a trace pipeline alongside
+metrics (pass `traces=False` to keep it metrics-only). With it enabled,
+handler-side spans nest under the execution span; without it, they attach to
+the enqueue-site context so the trace still connects.
 
 ## More Examples
 

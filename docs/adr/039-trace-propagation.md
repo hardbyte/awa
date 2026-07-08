@@ -86,11 +86,14 @@ becoming its siblings.
 
 - The traceparent is visible in job metadata (UI, handlers). Treated as a
   feature — it aids debugging — but it is user-visible surface.
-- Python *producers* are not captured automatically: the Rust core cannot
-  see opentelemetry-python's ambient context across the FFI boundary.
-  Documented pattern: set `metadata["awa:traceparent"]` at enqueue.
-  Automatic capture at the awa-python binding layer is the remaining #110
-  follow-up.
+- Python producers cannot be captured by the Rust-side hook (the core
+  cannot see opentelemetry-python's ambient context across the FFI
+  boundary), so the awa-python *binding layer* captures instead: the client
+  wrappers and `awa.bridge` inject the key when `opentelemetry-api` is
+  importable (optional dependency, cached no-op otherwise), and the worker
+  attaches the job's trace context around handler invocation —
+  execution-span context when `init_telemetry`'s trace pipeline is
+  installed, enqueue-site context as the fallback.
 - `tracestate` is not carried (only `traceparent`); vendor-specific state
   is dropped at the queue boundary.
 - Far-future scheduled first attempts still parent to the enqueue trace,
