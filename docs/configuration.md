@@ -636,6 +636,30 @@ Unset means no listener. Endpoint semantics, response fields, and Kubernetes pro
 examples live in [deployment.md](deployment.md#health-checks); `awa health` covers
 probe-less environments from the CLI.
 
+## Distributed tracing
+
+When a producer enqueues inside an OpenTelemetry span (any `tracing` span under a
+`tracing-opentelemetry` layer), awa captures the W3C `traceparent` into the job's
+metadata under the reserved `awa:traceparent` key and reconnects it at execution
+([ADR-039](adr/039-trace-propagation.md)):
+
+- **First attempt** — the `job.execute` span joins the producer's trace as a
+  remote child: enqueue → execute reads as one trace.
+- **Retries** — each retry starts a fresh root trace carrying a span *link*
+  back to the enqueue site, so a job retried hours later doesn't stretch the
+  original trace across its backoff schedule or inherit its sampling decision.
+
+Both sides carry OTel [messaging semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/)
+(`messaging.system = "awa"`, producer/consumer span kinds, `send {queue}` /
+`job.execute {kind}` names). Handlers can forward the context onward via
+`ctx.traceparent()` (Rust) or `job.traceparent` (Python).
+
+Capture costs well under a microsecond per enqueue and is on by default;
+`AWA_TRACE_CAPTURE=off` disables ambient capture process-wide. An explicit
+`metadata["awa:traceparent"]` supplied at enqueue always wins — that is also
+the participation path for SQL-native producers and Python producers (the
+Rust core cannot see opentelemetry-python's ambient context).
+
 ## Dead Letter Queue
 
 The DLQ is the **separate, durable hold-table for jobs that exhausted retries or hit a non-retryable terminal failure**. Without it, terminal failures live in ordinary queue-storage `done_entries_*` partitions and are reclaimed when queue-ring prune can safely truncate their segment. With DLQ enabled, those rows land in `dlq_entries`, are visible to the admin UI / API as a discrete backlog, and can be retried or purged by an operator.

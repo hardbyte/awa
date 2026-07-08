@@ -201,6 +201,33 @@ awa.init_telemetry(
 
 `init_telemetry` is idempotent; only the first call installs a provider. Call `awa.shutdown_telemetry()` at the end of short-lived scripts to flush pending metrics. See [`awa-python/examples/telemetry.py`](../awa-python/examples/telemetry.py) for a runnable example.
 
+### Distributed tracing
+
+The worker-side execution span automatically continues a trace captured at
+enqueue ([ADR-039](adr/039-trace-propagation.md)). Rust producers are captured
+ambiently; a Python producer sets the reserved metadata key itself, because the
+Rust core cannot see opentelemetry-python's ambient context:
+
+```python
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+carrier: dict[str, str] = {}
+TraceContextTextMapPropagator().inject(carrier)  # reads the current span
+await client.insert(
+    SendEmail(to="user@example.com"),
+    metadata={"awa:traceparent": carrier["traceparent"]},
+)
+```
+
+Inside a handler, `job.traceparent` returns the enqueue-site context so
+Python-side instrumentation can continue the same trace:
+
+```python
+ctx = TraceContextTextMapPropagator().extract({"traceparent": job.traceparent})
+with tracer.start_as_current_span("process-email", context=ctx):
+    ...
+```
+
 ## More Examples
 
 - [Bundled quickstart example](../awa-python/examples/quickstart.py)

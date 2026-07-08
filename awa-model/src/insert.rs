@@ -286,10 +286,11 @@ pub fn prepare_job_insert(
 pub fn prepare_raw_job_insert(
     kind: impl Into<String>,
     args: impl Into<serde_json::Value>,
-    opts: InsertOpts,
+    mut opts: InsertOpts,
 ) -> Result<PreparedJobInsert, AwaError> {
     let kind = kind.into();
     let args = args.into();
+    crate::trace::inject_traceparent(&mut opts.metadata);
 
     reject_null_bytes(&args)?;
     reject_null_bytes(&opts.metadata)?;
@@ -343,7 +344,18 @@ where
 }
 
 /// Insert a job with custom options.
-#[tracing::instrument(skip(executor, args), fields(job.kind = args.kind_str(), job.queue = %opts.queue))]
+#[tracing::instrument(
+    skip(executor, args),
+    fields(
+        job.kind = args.kind_str(),
+        job.queue = %opts.queue,
+        otel.name = %format!("send {}", opts.queue),
+        otel.kind = "producer",
+        messaging.system = "awa",
+        messaging.destination.name = %opts.queue,
+        messaging.operation.r#type = "send",
+    )
+)]
 pub async fn insert_with<'e, E>(
     executor: E,
     args: &impl JobArgs,
@@ -382,7 +394,17 @@ fn precompute_rows(jobs: &[InsertParams]) -> Result<Vec<PreparedRow>, AwaError> 
 ///
 /// Supports uniqueness constraints — jobs with `unique` opts will have their
 /// `unique_key` and `unique_states` computed and included.
-#[tracing::instrument(skip(executor, jobs), fields(job.count = jobs.len()))]
+#[tracing::instrument(
+    skip(executor, jobs),
+    fields(
+        job.count = jobs.len(),
+        otel.name = "send",
+        otel.kind = "producer",
+        messaging.system = "awa",
+        messaging.operation.r#type = "send",
+        messaging.batch.message_count = jobs.len(),
+    )
+)]
 pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -425,7 +447,17 @@ where
 /// (Transaction derefs to PgConnection). For high-volume queue-storage
 /// producers, prefer [`QueueStorage::enqueue_params_copy`](crate::QueueStorage::enqueue_params_copy)
 /// on a `QueueStorage` built with the same config as the worker fleet.
-#[tracing::instrument(skip(conn, jobs), fields(job.count = jobs.len()))]
+#[tracing::instrument(
+    skip(conn, jobs),
+    fields(
+        job.count = jobs.len(),
+        otel.name = "send",
+        otel.kind = "producer",
+        messaging.system = "awa",
+        messaging.operation.r#type = "send",
+        messaging.batch.message_count = jobs.len(),
+    )
+)]
 pub async fn insert_many_copy(
     conn: &mut PgConnection,
     jobs: &[InsertParams],
@@ -631,7 +663,17 @@ pub async fn insert_many_copy(
 ///
 /// Wraps the operation in a transaction so the staging rows are cleaned up at
 /// commit time even if the caller does not reuse the connection afterward.
-#[tracing::instrument(skip(pool, jobs), fields(job.count = jobs.len()))]
+#[tracing::instrument(
+    skip(pool, jobs),
+    fields(
+        job.count = jobs.len(),
+        otel.name = "send",
+        otel.kind = "producer",
+        messaging.system = "awa",
+        messaging.operation.r#type = "send",
+        messaging.batch.message_count = jobs.len(),
+    )
+)]
 pub async fn insert_many_copy_from_pool(
     pool: &PgPool,
     jobs: &[InsertParams],

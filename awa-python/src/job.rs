@@ -158,6 +158,14 @@ impl PyJob {
         json_to_py(py, &self.metadata_json)
     }
 
+    /// W3C traceparent captured at the enqueue site, if any. Pass it to an
+    /// OpenTelemetry propagator to continue the producer's trace from a
+    /// Python handler.
+    #[getter]
+    fn traceparent(&self) -> Option<String> {
+        awa_model::trace::traceparent_from_metadata(&self.metadata_json).map(str::to_owned)
+    }
+
     #[getter]
     fn run_at(&self) -> String {
         self.run_at.to_rfc3339()

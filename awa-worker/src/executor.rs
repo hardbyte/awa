@@ -292,8 +292,39 @@ impl JobExecutor {
             job.queue = %job_queue,
             job.attempt = job.attempt,
             otel.name = %format!("job.execute {}", job_kind),
+            otel.kind = "consumer",
             otel.status_code = tracing::field::Empty,
+            messaging.system = "awa",
+            messaging.destination.name = %job_queue,
+            messaging.operation.r#type = "process",
+            messaging.message.id = %job_id,
         );
+
+        // Continue the producer's trace (#110): a traceparent captured at
+        // enqueue (awa_model::trace) reconnects the execution span to it.
+        // First attempts join it as a remote child — the enqueue→execute
+        // flow reads as one trace. Retries instead start a fresh trace with
+        // a LINK back, per OTel messaging guidance for deferred processing:
+        // a job retried hours later would otherwise stretch the original
+        // trace across its whole backoff schedule and inherit its sampling
+        // decision. set_parent fails when no OpenTelemetry layer is
+        // installed — the normal untraced case, so the error is dropped.
+        if let Some(enqueue_site) = awa_model::trace::traceparent_from_metadata(&job.metadata)
+            .and_then(awa_model::trace::parse_traceparent)
+        {
+            use opentelemetry::trace::TraceContextExt;
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            if job.attempt <= 1 {
+                let _ = span.set_parent(
+                    opentelemetry::Context::new().with_remote_span_context(enqueue_site),
+                );
+            } else {
+                // Detach from the ambient dispatcher claim span so the
+                // retry is a root span, then link back to the enqueue site.
+                let _ = span.set_parent(opentelemetry::Context::new());
+                span.add_link(enqueue_site);
+            }
+        }
 
         async move {
             // Seed progress from the persisted checkpoint (for retries/snoozes)
