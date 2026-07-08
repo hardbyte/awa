@@ -114,6 +114,21 @@ impl TokenBucket {
     fn refund(&mut self, n: u32) {
         self.tokens = (self.tokens + n as f64).min(self.max_tokens);
     }
+
+    /// Live retune (ADR-038): change the sustained rate (and derived burst)
+    /// without resetting accumulated tokens beyond the new ceiling. All
+    /// claimers share this bucket through the Arc, so one refresh applies
+    /// queue-wide.
+    pub(crate) fn reconfigure(&mut self, rate_limit: &RateLimit) {
+        let burst = if rate_limit.burst == 0 {
+            (rate_limit.max_rate.ceil() as u32).max(1)
+        } else {
+            rate_limit.burst
+        };
+        self.max_tokens = burst as f64;
+        self.tokens = self.tokens.min(self.max_tokens);
+        self.refill_rate = rate_limit.max_rate;
+    }
 }
 
 pub(crate) fn shared_rate_limiter(config: &QueueConfig) -> Option<Arc<StdMutex<TokenBucket>>> {
@@ -293,6 +308,21 @@ impl OverflowPool {
 }
 
 /// Dispatcher polls a single queue for available jobs and dispatches them.
+/// How often dispatchers re-read `queue_meta` overrides (ADR-038). A
+/// deliberate slow cadence: tuning changes apply within seconds without
+/// adding a control query to every poll. `AWA_OVERRIDE_REFRESH_MS`
+/// shortens or lengthens it (read once per process).
+fn override_refresh_interval() -> Duration {
+    static INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("AWA_OVERRIDE_REFRESH_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(10))
+    })
+}
+
 pub struct Dispatcher {
     queue: String,
     runtime_instance_id: Uuid,
@@ -306,6 +336,14 @@ pub struct Dispatcher {
     cancel: CancellationToken,
     job_set: Arc<Mutex<JoinSet<()>>>,
     rate_limiter: Option<Arc<StdMutex<TokenBucket>>>,
+    /// Builder-configured baseline for the hot-reloadable knobs (ADR-038):
+    /// a NULL override reverts to these.
+    base_poll_interval: Duration,
+    base_claim_batch_size: usize,
+    base_deadline_duration: Duration,
+    base_rate_limit: Option<RateLimit>,
+    overrides_refreshed_at: Option<Instant>,
+    applied_overrides: awa_model::admin::QueueRuntimeOverrides,
     storage: RuntimeStorage,
     capacity_wake: Arc<Notify>,
     claimer_owner_id: Uuid,
@@ -334,6 +372,10 @@ impl Dispatcher {
         Self {
             queue,
             runtime_instance_id,
+            base_poll_interval: config.poll_interval,
+            base_claim_batch_size: config.claim_batch_size,
+            base_deadline_duration: config.deadline_duration,
+            base_rate_limit: config.rate_limit.clone(),
             config,
             pool,
             executor,
@@ -344,6 +386,8 @@ impl Dispatcher {
             cancel,
             job_set,
             rate_limiter,
+            overrides_refreshed_at: None,
+            applied_overrides: awa_model::admin::QueueRuntimeOverrides::default(),
             storage,
             capacity_wake,
             claimer_owner_id,
@@ -406,7 +450,12 @@ impl Dispatcher {
                 _ = self.capacity_wake.notified() => {
                     self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
-                _ = tokio::time::sleep(self.config.poll_interval) => {
+                // Cap the sleep at the override refresh cadence: overrides
+                // are re-read on wake, so a long (possibly overridden) poll
+                // interval must not delay picking up the next change
+                // (ADR-038). An idle extra wake per cadence costs one claim
+                // round-trip — what short-poll queues do constantly anyway.
+                _ = tokio::time::sleep(self.config.poll_interval.min(override_refresh_interval())) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
@@ -426,7 +475,7 @@ impl Dispatcher {
                 _ = self.capacity_wake.notified() => {
                     self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
-                _ = tokio::time::sleep(self.config.poll_interval) => {
+                _ = tokio::time::sleep(self.config.poll_interval.min(override_refresh_interval())) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
@@ -484,7 +533,96 @@ impl Dispatcher {
 
     /// Drain immediately available work after a wake-up until the queue is empty,
     /// capacity is exhausted, rate limiting stops us, or shutdown is requested.
+    /// ADR-038 hot reload: apply per-queue overrides from `queue_meta` on a
+    /// slow cadence. NULL (or a missing row) reverts each knob to its
+    /// builder-configured baseline. Two guard rails: a rate-limit override
+    /// only retunes an existing limiter (enabling limiting on an unlimited
+    /// queue live is Tier 2), and a deadline override never crosses the
+    /// zero boundary — receipts-vs-legacy claim mode is chosen by
+    /// zero/non-zero deadline and must stay stable while running.
+    async fn refresh_runtime_overrides(&mut self) {
+        let due = self
+            .overrides_refreshed_at
+            .is_none_or(|at| at.elapsed() >= override_refresh_interval());
+        if !due {
+            return;
+        }
+        self.overrides_refreshed_at = Some(Instant::now());
+
+        let overrides =
+            match awa_model::admin::queue_runtime_overrides(&self.pool, &self.queue).await {
+                Ok(overrides) => overrides.unwrap_or_default(),
+                Err(err) => {
+                    debug!(
+                        queue = %self.queue,
+                        error = %err,
+                        "Override refresh failed; keeping current values"
+                    );
+                    return;
+                }
+            };
+        if overrides == self.applied_overrides {
+            return;
+        }
+
+        self.config.poll_interval = overrides
+            .poll_interval_ms
+            .map(|ms| Duration::from_millis(ms as u64))
+            .unwrap_or(self.base_poll_interval);
+        self.config.claim_batch_size = overrides
+            .claim_batch_size
+            .map(|n| (n as usize).max(1))
+            .unwrap_or(self.base_claim_batch_size);
+
+        match overrides.deadline_ms {
+            Some(ms) if self.base_deadline_duration.is_zero() != (ms == 0) => {
+                warn!(
+                    queue = %self.queue,
+                    override_deadline_ms = ms,
+                    "Ignoring deadline override that crosses the zero boundary: \
+                     the receipts-vs-legacy claim mode is fixed at startup"
+                );
+                self.config.deadline_duration = self.base_deadline_duration;
+            }
+            Some(ms) => {
+                self.config.deadline_duration = Duration::from_millis(ms as u64);
+            }
+            None => {
+                self.config.deadline_duration = self.base_deadline_duration;
+            }
+        }
+
+        match (&self.rate_limiter, &self.base_rate_limit) {
+            (Some(limiter), Some(base)) => {
+                let effective = RateLimit {
+                    max_rate: overrides.rate_limit.unwrap_or(base.max_rate),
+                    burst: if overrides.rate_limit.is_some() {
+                        0 // derive burst from the overridden rate
+                    } else {
+                        base.burst
+                    },
+                };
+                limiter
+                    .lock()
+                    .expect("rate limiter mutex poisoned")
+                    .reconfigure(&effective);
+            }
+            _ if overrides.rate_limit.is_some() => {
+                warn!(
+                    queue = %self.queue,
+                    "Ignoring rate-limit override: queue was built without a rate \
+                     limit (enabling limiting live is Tier 2)"
+                );
+            }
+            _ => {}
+        }
+
+        info!(queue = %self.queue, ?overrides, "Applied queue runtime overrides");
+        self.applied_overrides = overrides;
+    }
+
     async fn drain_ready(&mut self, wake_reason: WakeReason, woke_at: Instant) {
+        self.refresh_runtime_overrides().await;
         self.metrics
             .record_dispatch_wake(&self.queue, wake_reason.as_str());
         let mut first_iteration = true;

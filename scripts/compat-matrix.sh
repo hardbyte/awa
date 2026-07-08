@@ -15,10 +15,12 @@
 #                   live canonical work refuses loudly (ADR-037 gate) —
 #                   message content and exit code asserted.
 #
-# A second backward sub-leg (newest binary vs pre-migrate 0.6 schema)
-# activates automatically once the 0.7 line ships its first migration:
-# today both binaries share CURRENT_VERSION so there is nothing pending to
-# gate. The support statement lives in docs/stability.md.
+#   backward-0.6     the newest `awa migrate` against an UNFINALIZED 0.6-final
+#                   schema with canonical work also refuses (v040 exists, so
+#                   there are pending migrations to gate), while the same
+#                   schema finalized upgrades cleanly.
+#
+# The support statement lives in docs/stability.md.
 set -euo pipefail
 
 PGHOST=${PGHOST:-localhost}
@@ -102,6 +104,87 @@ case "$gate_output" in
     ;;
 esac
 echo "newest migrate refused legibly (exit ${gate_rc}, names the finalize steps)"
+
+BACK06_DB=awa_compat_backward_06
+echo "── leg: backward guard (0.6-final unfinalized schema with work refuses; finalized upgrades)"
+psql_admin "DROP DATABASE IF EXISTS ${BACK06_DB} WITH (FORCE)"
+psql_admin "CREATE DATABASE ${BACK06_DB}"
+DATABASE_URL="${BASE_URL}/${BACK06_DB}" .compat-venv-060/bin/python - <<'PY'
+import asyncio, os
+from dataclasses import dataclass
+import awa
+
+@dataclass
+class LegacyJob:
+    marker: str
+
+async def main():
+    client = awa.AsyncClient(os.environ["DATABASE_URL"])
+    await client.migrate()
+    await client.insert(LegacyJob(marker="stranded"), queue="compat_backward")
+    print("0.6.0 schema prepared with canonical job")
+
+asyncio.run(main())
+PY
+set +e
+gate06_output=$("$AWA_BIN" --database-url "${BASE_URL}/${BACK06_DB}" migrate 2>&1)
+gate06_rc=$?
+set -e
+if [ "$gate06_rc" -eq 0 ]; then
+  echo "FAIL: newest migrate must refuse an unfinalized 0.6 schema with canonical work" >&2
+  echo "$gate06_output"
+  exit 1
+fi
+case "$gate06_output" in
+  *"storage transition not finalized"*"awa storage prepare"*) ;;
+  *)
+    echo "FAIL: 0.6 refusal must name the finalize steps; got:" >&2
+    echo "$gate06_output"
+    exit 1
+    ;;
+esac
+echo "newest migrate refused the unfinalized 0.6 schema legibly (exit ${gate06_rc})"
+
+UP06_DB=awa_compat_upgrade_06
+echo "── leg: the supported upgrade — finalized 0.6 schema with work migrates cleanly"
+psql_admin "DROP DATABASE IF EXISTS ${UP06_DB} WITH (FORCE)"
+psql_admin "CREATE DATABASE ${UP06_DB}"
+DATABASE_URL="${BASE_URL}/${UP06_DB}" .compat-venv-060/bin/python -c "
+import asyncio, os, awa
+async def main():
+    client = awa.AsyncClient(os.environ['DATABASE_URL'])
+    await client.migrate()
+asyncio.run(main())
+"
+psql "${BASE_URL}/${UP06_DB}" -v ON_ERROR_STOP=1 -q <<'SQL'
+UPDATE awa.storage_transition_state
+SET state = 'active', current_engine = 'queue_storage', prepared_engine = NULL,
+    details = jsonb_build_object('schema', 'awa', 'auto_finalized', true),
+    transition_epoch = transition_epoch + 1, updated_at = now(), finalized_at = now()
+WHERE singleton;
+INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
+VALUES ('queue_storage', 'awa', now())
+ON CONFLICT (backend) DO UPDATE
+SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at;
+SQL
+DATABASE_URL="${BASE_URL}/${UP06_DB}" .compat-venv-060/bin/python -c "
+import asyncio, os, awa
+from dataclasses import dataclass
+@dataclass
+class LiveJob:
+    marker: str
+async def main():
+    client = awa.AsyncClient(os.environ['DATABASE_URL'])
+    await client.insert(LiveJob(marker='live'), queue='compat_upgrade')
+asyncio.run(main())
+"
+"$AWA_BIN" --database-url "${BASE_URL}/${UP06_DB}" migrate
+upgraded=$(psql "${BASE_URL}/${UP06_DB}" -qAt -c "SELECT MAX(version) FROM awa.schema_version")
+if [ "$upgraded" -lt 40 ]; then
+  echo "FAIL: finalized 0.6 schema should upgrade to the newest version (got ${upgraded})" >&2
+  exit 1
+fi
+echo "finalized 0.6 schema with live work upgraded cleanly to v${upgraded}"
 
 echo
 echo "compat matrix: all legs behaved as documented"

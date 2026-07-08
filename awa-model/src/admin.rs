@@ -959,6 +959,84 @@ where
     Ok(())
 }
 
+/// Per-queue runtime overrides (ADR-038). `None` fields mean "no
+/// override" — dispatchers fall back to their builder-configured values.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QueueRuntimeOverrides {
+    pub poll_interval_ms: Option<i32>,
+    pub claim_batch_size: Option<i32>,
+    pub rate_limit: Option<f64>,
+    pub deadline_ms: Option<i64>,
+}
+
+/// Replace the full override state for a queue (whole-row semantics: the
+/// passed struct IS the new override set; `None` fields clear). Dispatchers
+/// apply the change on their next refresh cadence without a restart.
+pub async fn set_queue_runtime_overrides(
+    pool: &PgPool,
+    queue: &str,
+    overrides: &QueueRuntimeOverrides,
+) -> Result<(), AwaError> {
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (
+            queue, paused,
+            override_poll_interval_ms, override_claim_batch_size,
+            override_rate_limit, override_deadline_ms, overrides_updated_at
+        )
+        VALUES ($1, FALSE, $2, $3, $4, $5, now())
+        ON CONFLICT (queue) DO UPDATE SET
+            override_poll_interval_ms = EXCLUDED.override_poll_interval_ms,
+            override_claim_batch_size = EXCLUDED.override_claim_batch_size,
+            override_rate_limit = EXCLUDED.override_rate_limit,
+            override_deadline_ms = EXCLUDED.override_deadline_ms,
+            overrides_updated_at = now()
+        "#,
+    )
+    .bind(queue)
+    .bind(overrides.poll_interval_ms)
+    .bind(overrides.claim_batch_size)
+    .bind(overrides.rate_limit)
+    .bind(overrides.deadline_ms)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Clear every override for a queue — dispatchers revert to their
+/// builder-configured values on the next refresh.
+pub async fn clear_queue_runtime_overrides(pool: &PgPool, queue: &str) -> Result<(), AwaError> {
+    set_queue_runtime_overrides(pool, queue, &QueueRuntimeOverrides::default()).await
+}
+
+/// The current override state for a queue (`None` when the queue has no
+/// control-plane row).
+pub async fn queue_runtime_overrides(
+    pool: &PgPool,
+    queue: &str,
+) -> Result<Option<QueueRuntimeOverrides>, AwaError> {
+    type OverrideRow = (Option<i32>, Option<i32>, Option<f64>, Option<i64>);
+    let row: Option<OverrideRow> = sqlx::query_as(
+        r#"
+        SELECT override_poll_interval_ms, override_claim_batch_size,
+               override_rate_limit, override_deadline_ms
+        FROM awa.queue_meta
+        WHERE queue = $1
+        "#,
+    )
+    .bind(queue)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(poll_interval_ms, claim_batch_size, rate_limit, deadline_ms)| QueueRuntimeOverrides {
+            poll_interval_ms,
+            claim_batch_size,
+            rate_limit,
+            deadline_ms,
+        },
+    ))
+}
+
 /// Resume a paused queue.
 pub async fn resume_queue<'e, E>(executor: E, queue: &str) -> Result<(), AwaError>
 where

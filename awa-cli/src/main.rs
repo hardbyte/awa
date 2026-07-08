@@ -456,6 +456,44 @@ enum QueueCommands {
     Drain { queue: String },
     /// Show queue statistics
     Stats,
+    /// Manage live runtime overrides for a queue (applied without restarts)
+    Overrides {
+        #[command(subcommand)]
+        command: OverrideCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum OverrideCommands {
+    /// Set the override state for a queue. Flags you pass become the new
+    /// override set; omitted flags are cleared (whole-state semantics —
+    /// run `show` first when adjusting one knob). Workers apply changes
+    /// within their refresh cadence (~10s), no restart needed.
+    Set {
+        queue: String,
+        /// Override the dispatch poll interval, in milliseconds
+        #[arg(long)]
+        poll_interval_ms: Option<i32>,
+        /// Override the claim batch size
+        #[arg(long)]
+        claim_batch_size: Option<i32>,
+        /// Override the sustained rate limit (jobs/second; only retunes a
+        /// queue built with a rate limit)
+        #[arg(long)]
+        rate_limit: Option<f64>,
+        /// Override the per-attempt deadline, in milliseconds (cannot cross
+        /// the zero boundary — claim mode is fixed at startup)
+        #[arg(long)]
+        deadline_ms: Option<i64>,
+    },
+    /// Clear every override — workers revert to builder-configured values
+    Clear { queue: String },
+    /// Show the current override state
+    Show {
+        queue: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]
@@ -1231,51 +1269,105 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
 
-                Commands::Queue { command } => match command {
-                    QueueCommands::Pause { queue } => {
-                        awa_model::admin::pause_queue(&pool, &queue, Some("cli")).await?;
-                        println!("Paused queue '{queue}'");
-                    }
-                    QueueCommands::Resume { queue } => {
-                        awa_model::admin::resume_queue(&pool, &queue).await?;
-                        println!("Resumed queue '{queue}'");
-                    }
-                    QueueCommands::Drain { queue } => {
-                        let count = awa_model::admin::drain_queue(&pool, &queue).await?;
-                        println!("Drained {count} jobs from queue '{queue}'");
-                    }
-                    QueueCommands::Stats => {
-                        let stats = awa_model::admin::queue_overviews(&pool).await?;
-                        if stats.is_empty() {
-                            println!("No queues found.");
-                        } else {
-                            println!(
-                                "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10} {:<8}",
-                                "QUEUE",
-                                "AVAIL",
-                                "RUNNING",
-                                "FAILED",
-                                "COMPLETED/1H",
-                                "LAG(s)",
-                                "PAUSED"
-                            );
-                            for stat in &stats {
+                Commands::Queue { command } => {
+                    match command {
+                        QueueCommands::Pause { queue } => {
+                            awa_model::admin::pause_queue(&pool, &queue, Some("cli")).await?;
+                            println!("Paused queue '{queue}'");
+                        }
+                        QueueCommands::Resume { queue } => {
+                            awa_model::admin::resume_queue(&pool, &queue).await?;
+                            println!("Resumed queue '{queue}'");
+                        }
+                        QueueCommands::Drain { queue } => {
+                            let count = awa_model::admin::drain_queue(&pool, &queue).await?;
+                            println!("Drained {count} jobs from queue '{queue}'");
+                        }
+                        QueueCommands::Overrides { command } => {
+                            match command {
+                                OverrideCommands::Set {
+                                    queue,
+                                    poll_interval_ms,
+                                    claim_batch_size,
+                                    rate_limit,
+                                    deadline_ms,
+                                } => {
+                                    let overrides = awa_model::admin::QueueRuntimeOverrides {
+                                        poll_interval_ms,
+                                        claim_batch_size,
+                                        rate_limit,
+                                        deadline_ms,
+                                    };
+                                    awa_model::admin::set_queue_runtime_overrides(
+                                        &pool, &queue, &overrides,
+                                    )
+                                    .await?;
+                                    println!(
+                                        "Overrides set for queue '{queue}': {}",
+                                        serde_json::to_string(&overrides)?
+                                    );
+                                    println!(
+                                        "Workers apply them within their refresh cadence (~10s)."
+                                    );
+                                }
+                                OverrideCommands::Clear { queue } => {
+                                    awa_model::admin::clear_queue_runtime_overrides(&pool, &queue)
+                                        .await?;
+                                    println!("Overrides cleared for queue '{queue}' — workers revert to builder values.");
+                                }
+                                OverrideCommands::Show { queue, json } => {
+                                    let overrides =
+                                        awa_model::admin::queue_runtime_overrides(&pool, &queue)
+                                            .await?;
+                                    match overrides {
+                                Some(overrides) if json => {
+                                    println!("{}", serde_json::to_string_pretty(&overrides)?)
+                                }
+                                Some(overrides) => {
+                                    println!("queue '{queue}' overrides:");
+                                    println!("  poll_interval_ms:  {:?}", overrides.poll_interval_ms);
+                                    println!("  claim_batch_size:  {:?}", overrides.claim_batch_size);
+                                    println!("  rate_limit:        {:?}", overrides.rate_limit);
+                                    println!("  deadline_ms:       {:?}", overrides.deadline_ms);
+                                }
+                                None => println!("queue '{queue}' has no control-plane row (no overrides)."),
+                            }
+                                }
+                            }
+                        }
+                        QueueCommands::Stats => {
+                            let stats = awa_model::admin::queue_overviews(&pool).await?;
+                            if stats.is_empty() {
+                                println!("No queues found.");
+                            } else {
                                 println!(
                                     "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10} {:<8}",
-                                    stat.queue,
-                                    stat.available,
-                                    stat.running,
-                                    stat.failed,
-                                    stat.completed_last_hour,
-                                    stat.lag_seconds
-                                        .map(|s| format!("{:.1}", s))
-                                        .unwrap_or_else(|| "-".to_string()),
-                                    if stat.paused { "yes" } else { "no" },
+                                    "QUEUE",
+                                    "AVAIL",
+                                    "RUNNING",
+                                    "FAILED",
+                                    "COMPLETED/1H",
+                                    "LAG(s)",
+                                    "PAUSED"
                                 );
+                                for stat in &stats {
+                                    println!(
+                                        "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10} {:<8}",
+                                        stat.queue,
+                                        stat.available,
+                                        stat.running,
+                                        stat.failed,
+                                        stat.completed_last_hour,
+                                        stat.lag_seconds
+                                            .map(|s| format!("{:.1}", s))
+                                            .unwrap_or_else(|| "-".to_string()),
+                                        if stat.paused { "yes" } else { "no" },
+                                    );
+                                }
                             }
                         }
                     }
-                },
+                }
             }
         }
     }
