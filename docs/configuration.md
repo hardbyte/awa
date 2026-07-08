@@ -610,6 +610,18 @@ For very high-throughput no-op queues, size `max_workers` for durable completion
 
 The terminal write path is already narrow for running/waiting jobs: successful receipt completions use compact `receipt_completion_batches_*` rows, and other retained terminal facts use `done_entries_*` without duplicating immutable ready body fields when the ready row is still retained. Both surfaces hydrate through `terminal_jobs`, so the default completion settings stay conservative without giving up durable terminal history.
 
+## Live tuning: per-queue runtime overrides
+
+The dispatch knobs can be changed on a **running fleet** ([ADR-038](adr/038-queue-runtime-overrides.md)) — no restart:
+
+```console
+$ awa queue overrides set email --poll-interval-ms 1000 --claim-batch-size 64
+$ awa queue overrides show email
+$ awa queue overrides clear email
+```
+
+Overridable: `poll_interval`, `claim_batch_size`, `rate_limit` (retunes a queue built with a rate limit; enabling limiting live is not supported), and `deadline_duration` (must stay on the same side of zero — the claim mode is fixed at startup). Semantics: the builder value is the default, a set override wins, clearing reverts. `set` replaces the whole override state, so `show` first when adjusting a single knob. Workers apply changes within their refresh cadence (10s by default; `AWA_OVERRIDE_REFRESH_MS` tunes it).
+
 ## Worker health listener
 
 Set `AWA_HEALTH_ADDR` (or `ClientBuilder::health_addr`) to serve `GET /healthz` and
