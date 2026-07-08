@@ -23,8 +23,10 @@ Rust in the path.
 
 **Carry the context in job metadata under a reserved key, not a schema
 column.** At enqueue, `prepare_raw_job_insert` — the single choke point every
-Rust producer path funnels through (typed, raw, batch, COPY, transactional,
-Python) — serializes the ambient span context as a W3C `traceparent` string
+Rust-backed producer path funnels through (typed, raw, batch, COPY,
+transactional; the Python bindings' inserts also pass through it, but a
+Python caller's own OpenTelemetry context is not visible to ambient capture —
+see Consequences) — serializes the ambient span context as a W3C `traceparent` string
 into `metadata["awa:traceparent"]` when a valid context exists and the key is
 absent. Metadata keys prefixed `awa:` are reserved (documented in
 `docs/stability.md`). This needs no migration, rides both engines
