@@ -486,10 +486,11 @@ jobs:
           PROMETHEUS_URL: http://localhost:9090
           TEMPO_URL: http://localhost:3200
       - name: Build awa-python for the cross-language trace leg
+        # uv sync builds the wheel from source (compiling the PyO3 crate)
+        # and installs it into the project venv — no explicit maturin step.
         run: |
           cd awa-python
           uv sync
-          uv run maturin develop
       - name: Run cross-language trace e2e (python → rust → python)
         run: |
           cd awa-python
