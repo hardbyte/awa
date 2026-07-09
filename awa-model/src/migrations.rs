@@ -239,30 +239,58 @@ fn normalize_legacy_version(old_version: i32) -> i32 {
 ///
 /// Applies only migrations newer than the current schema version.
 /// V1 bootstraps the canonical schema from scratch; V2+ are incremental
-/// and use `IF NOT EXISTS` guards so they are safe to re-run.
+/// and use `IF NOT EXISTS` guards so they are safe to re-run. Legacy
+/// `schema_version` rows from pre-0.4 releases are normalized to the new
+/// numbering in [`current_version`] before the pending set is computed.
 ///
-/// by replacing the legacy `schema_version` rows with the new numbering.
+/// Safe to call concurrently from any number of processes against the same
+/// database: a transaction-scoped advisory lock serializes runners, and every
+/// step is idempotent, so concurrent runs converge on a single application.
 ///
 /// Takes `&PgPool` for ergonomic use from Rust.
 pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
     let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
-    let mut conn = pool.acquire().await?;
-    sqlx::query("SELECT pg_advisory_lock($1)")
+
+    // Run the version check, ADR-037 finalize gate, and every migration step
+    // inside a single transaction guarded by a *transaction-scoped* advisory
+    // lock. `pg_advisory_xact_lock` gives us two properties a session-scoped
+    // `pg_advisory_lock` did not:
+    //
+    //   1. Serialization: concurrent runners on the same database block on the
+    //      lock, then re-read `schema_version` inside it and no-op. Advisory
+    //      locks are per-database, so runners against different databases never
+    //      contend — the correct semantics on both counts.
+    //
+    //   2. Cancellation safety: the lock is released automatically when the
+    //      transaction ends. If this future is dropped mid-migration (e.g. a
+    //      Rust caller wraps `run` in `tokio::time::timeout`), the transaction
+    //      rolls back and the lock is freed immediately. A session-scoped lock
+    //      would instead ride the pooled connection back into the pool still
+    //      held — sqlx does not `DISCARD ALL` on release — and every later
+    //      migrate in any process would block until that connection happened
+    //      to close.
+    //
+    // Wrapping the steps in one transaction also makes a partial upgrade
+    // atomic: a failed or cancelled run leaves no half-applied step. This is
+    // only sound because every migration is transaction-safe (no
+    // `CREATE INDEX CONCURRENTLY`, `VACUUM`, or explicit transaction control).
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
+    apply_migrations(&mut tx).await?;
+    tx.commit().await?;
 
-    let result = run_inner(&mut conn).await;
+    // Best-effort admin-metadata cache warmup, deliberately outside the
+    // migration transaction: it must not extend the lock hold, and a slow or
+    // timed-out refresh must not roll back the committed schema.
+    warm_admin_metadata_cache(pool).await;
 
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_key)
-        .execute(&mut *conn)
-        .await;
-
-    result
+    Ok(())
 }
 
-async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
+async fn apply_migrations(conn: &mut PgConnection) -> Result<(), AwaError> {
     let has_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
             .fetch_one(&mut *conn)
@@ -293,29 +321,38 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         info!(version = current, "Schema is up to date");
     }
 
-    // Ensure the admin metadata cache is warm. Since v006 removed the
-    // synchronous triggers on jobs_hot, the cache is only updated by the
-    // maintenance leader. Refreshing here guarantees queue_stats() and
-    // state_counts() return accurate data immediately after migrate().
-    let has_refresh: bool = sqlx::query_scalar(
+    Ok(())
+}
+
+/// Warm the admin-metadata cache after migrations commit.
+///
+/// Since v006 removed the synchronous triggers on `jobs_hot`, the cache is
+/// only updated by the maintenance leader. Refreshing here guarantees
+/// `queue_stats()` and `state_counts()` return accurate data immediately after
+/// `migrate()`. Best-effort: any failure is swallowed, since the schema is
+/// already committed and the leader will refresh the cache anyway.
+///
+/// Runs on its own pooled connection, outside the migration transaction, so it
+/// neither holds the migration advisory lock nor risks rolling back committed
+/// schema on a slow refresh.
+async fn warm_admin_metadata_cache(pool: &PgPool) {
+    let has_refresh: Result<bool, _> = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'refresh_admin_metadata' AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'awa'))",
     )
-    .fetch_one(&mut *conn)
-    .await?;
-    if has_refresh {
-        // Best-effort cache warmup. Uses a short statement timeout to avoid
-        // blocking if a previous runtime's maintenance leader is still
-        // holding the cache advisory lock during a slow shutdown.
-        // Wrapped in an explicit transaction because SET LOCAL is only
-        // effective inside a transaction block (not in autocommit mode).
+    .fetch_one(pool)
+    .await;
+    if matches!(has_refresh, Ok(true)) {
+        // Uses a short statement timeout to avoid blocking if a previous
+        // runtime's maintenance leader is still holding the cache advisory
+        // lock during a slow shutdown. Wrapped in an explicit transaction
+        // because SET LOCAL is only effective inside a transaction block (not
+        // in autocommit mode).
         let _ = sqlx::raw_sql(
             "BEGIN; SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata(); COMMIT;",
         )
-        .execute(&mut *conn)
+        .execute(pool)
         .await;
     }
-
-    Ok(())
 }
 
 /// The 0.7 migrate gate (#370 / ADR-037).
