@@ -3107,3 +3107,145 @@ async fn test_auto_finalize_refuses_when_runtime_is_live() {
     let after = storage::status(&pool).await.unwrap();
     assert_eq!(after.state, "canonical");
 }
+
+// ── Concurrency & cancellation safety (migration advisory lock) ───
+
+/// Build a dedicated pool with a specific connection ceiling — the shared
+/// `pool()` caps at 2, too few to genuinely race several runners at once.
+async fn pool_with_max_connections(max: u32) -> PgPool {
+    ensure_migration_database().await;
+    PgPoolOptions::new()
+        .max_connections(max)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(&migration_database_url())
+        .await
+        .expect("Failed to connect to migration test database — is Postgres running?")
+}
+
+/// Race N concurrent `run()` calls against a fresh database and assert they
+/// converge: every run succeeds, the schema reaches CURRENT_VERSION, and each
+/// migration version is recorded exactly once. Without the migration advisory
+/// lock the interleaved DDL would collide ("relation already exists", "tuple
+/// concurrently updated"); the lock serializes the runners so all converge on
+/// a single application.
+#[tokio::test]
+async fn test_concurrent_runs_apply_once_and_converge() {
+    let _guard = acquire_migration_guard().await;
+
+    const RACERS: usize = 8;
+    let pool = pool_with_max_connections(RACERS as u32 + 2).await;
+    reset_schema(&pool).await;
+
+    // `migrations::run` is `!Send` (it holds a pooled connection / transaction
+    // across awaits), so the racers run on a LocalSet rather than tokio::spawn.
+    // Cooperative scheduling is enough to exercise lock contention: while one
+    // run holds the lock and awaits Postgres, the others park inside
+    // pg_advisory_xact_lock.
+    let local = tokio::task::LocalSet::new();
+    let results: Vec<Result<(), awa::AwaError>> = local
+        .run_until(async {
+            let mut handles = Vec::with_capacity(RACERS);
+            for _ in 0..RACERS {
+                let pool = pool.clone();
+                handles.push(tokio::task::spawn_local(async move {
+                    migrations::run(&pool).await
+                }));
+            }
+            let mut out = Vec::with_capacity(RACERS);
+            for handle in handles {
+                out.push(handle.await.expect("run task should not panic"));
+            }
+            out
+        })
+        .await;
+
+    for (index, result) in results.iter().enumerate() {
+        if let Err(err) = result {
+            panic!("concurrent run {index} failed: {err}");
+        }
+    }
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+
+    // No version applied more than once — a torn/interleaved application would
+    // leave duplicate rows (or would have errored above).
+    let duplicate_versions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT version FROM awa.schema_version GROUP BY version HAVING count(*) > 1) AS d",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(duplicate_versions, 0, "schema_version has duplicate rows");
+
+    // Exactly one row per known migration (v008 is a reserved gap, so this is
+    // the migration count, not CURRENT_VERSION).
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded,
+        migrations::migration_sql().len() as i64,
+        "every migration version should be recorded exactly once"
+    );
+
+    pool.close().await;
+}
+
+/// A `run()` cancelled while it holds the migration lock must not strand the
+/// lock. Because the lock is transaction-scoped, dropping the future rolls the
+/// transaction back and frees the lock, so a subsequent `run()` proceeds
+/// promptly. With the old session-scoped lock the cancelled run left the lock
+/// held on the pooled connection and every later migrate blocked until that
+/// connection happened to close — this test would then hang on the final run.
+#[tokio::test]
+async fn test_cancelled_run_does_not_strand_migration_lock() {
+    let _guard = acquire_migration_guard().await;
+
+    let pool = pool_with_max_connections(4).await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("initial migrate");
+
+    // Hold ACCESS EXCLUSIVE on awa.schema_version so a racing run parks *while
+    // holding the migration advisory lock*: run() acquires the xact lock, then
+    // blocks on its early `SELECT MAX(version) FROM awa.schema_version`.
+    let mut blocker = PgConnection::connect(&migration_database_url())
+        .await
+        .expect("blocker connection should open");
+    let mut blocker_tx = blocker.begin().await.expect("blocker begin");
+    sqlx::raw_sql("LOCK TABLE awa.schema_version IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker_tx)
+        .await
+        .expect("blocker should lock schema_version");
+
+    // Start a run and cancel it: the timeout drops the future while it is
+    // parked on the held table lock, holding the migration advisory lock.
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        migrations::run(&pool),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "run should still be blocked on the held table lock when the timeout fires"
+    );
+
+    // Release the table lock. The cancelled run's rollback must have already
+    // freed the migration advisory lock.
+    blocker_tx.rollback().await.expect("blocker rollback");
+    drop(blocker);
+
+    // A fresh run must acquire the migration lock and finish. If the cancelled
+    // run had stranded a session-scoped lock, this would block until the
+    // timeout and fail.
+    tokio::time::timeout(std::time::Duration::from_secs(30), migrations::run(&pool))
+        .await
+        .expect("subsequent run must not block on a stranded migration lock")
+        .expect("subsequent migrate should succeed");
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+
+    pool.close().await;
+}
