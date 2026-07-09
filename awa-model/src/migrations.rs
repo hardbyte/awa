@@ -341,17 +341,33 @@ async fn warm_admin_metadata_cache(pool: &PgPool) {
     )
     .fetch_one(pool)
     .await;
-    if matches!(has_refresh, Ok(true)) {
-        // Uses a short statement timeout to avoid blocking if a previous
-        // runtime's maintenance leader is still holding the cache advisory
-        // lock during a slow shutdown. Wrapped in an explicit transaction
-        // because SET LOCAL is only effective inside a transaction block (not
-        // in autocommit mode).
-        let _ = sqlx::raw_sql(
-            "BEGIN; SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata(); COMMIT;",
-        )
-        .execute(pool)
-        .await;
+    if !matches!(has_refresh, Ok(true)) {
+        return;
+    }
+
+    // Use a *managed* transaction (not raw `BEGIN; … COMMIT;`): the SET LOCAL
+    // scopes a short statement timeout so a maintenance leader still holding
+    // the cache advisory lock during a slow shutdown can't block us — but if
+    // that timeout fires, the batch aborts and a raw trailing COMMIT would
+    // never run, leaving the pooled connection "idle in transaction (aborted)"
+    // for the next borrower (sqlx doesn't track transactions it didn't open).
+    // pool.begin()'s guard rolls back on drop, keeping the connection clean.
+    let Ok(mut tx) = pool.begin().await else {
+        return;
+    };
+    let refreshed =
+        sqlx::raw_sql("SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata();")
+            .execute(&mut *tx)
+            .await;
+    match refreshed {
+        Ok(_) => {
+            let _ = tx.commit().await;
+        }
+        // Explicit rollback (rather than relying on the Drop guard) so the
+        // connection is returned clean immediately, not on its next use.
+        Err(_) => {
+            let _ = tx.rollback().await;
+        }
     }
 }
 
