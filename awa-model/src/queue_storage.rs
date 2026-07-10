@@ -1174,8 +1174,7 @@ mod ring_ledger_derivation_tests {
         for slot_count in [2_i32, 4, 8, 16] {
             for generation in 0..(slot_count as i64 * 2 + 3) {
                 let current_slot = (generation % slot_count as i64) as i32;
-                let sealed =
-                    initialized_sealed_ring_slots(current_slot, generation, slot_count);
+                let sealed = initialized_sealed_ring_slots(current_slot, generation, slot_count);
                 // Ascending generations, all below the cursor.
                 let mut previous = -1_i64;
                 for &(slot, slot_generation) in &sealed {
@@ -14586,9 +14585,8 @@ impl QueueStorage {
         // Sealed slots and their last-open generations are derived from
         // the rotation-ledger cursor (#371); no per-slot generation rows
         // exist anymore.
-        let (current_slot, generation, slot_count): (i32, i64, i32) =
-            sqlx::query_as(&format!(
-                r#"
+        let (current_slot, generation, slot_count): (i32, i64, i32) = sqlx::query_as(&format!(
+            r#"
                 SELECT ledger.slot, ledger.generation, state.slot_count
                 FROM {schema}.queue_ring_state AS state
                 CROSS JOIN LATERAL (
@@ -14599,10 +14597,10 @@ impl QueueStorage {
                 ) AS ledger
                 WHERE state.singleton = TRUE
                 "#
-            ))
-            .fetch_one(pool)
-            .await
-            .map_err(map_sqlx_error)?;
+        ))
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
         let sealed_slots = initialized_sealed_ring_slots(current_slot, generation, slot_count);
 
         let mut pending_slots = Vec::new();

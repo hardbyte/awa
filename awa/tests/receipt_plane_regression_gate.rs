@@ -22,13 +22,23 @@
 //!      completions); the bound exists to catch a regression that
 //!      starts churning rows on a path that should be append-only.
 //!
-//!   3. The queue ring MUST advance — `queue_ring_state.current_slot`
-//!      moves at least N times during the run (where N is conservative
-//!      relative to the rotation interval and run length). A pinned
-//!      ring is the regression that issue #197 explicitly commits to
-//!      catching.
+//!   3. The queue ring MUST advance — the `queue_ring_rotations` ledger
+//!      cursor (#371: the max-generation row) moves at least N times
+//!      during the run (where N is conservative relative to the
+//!      rotation interval and run length). A pinned ring is the
+//!      regression that issue #197 explicitly commits to catching.
 //!
 //!   4. The claim ring MUST advance for the same reason.
+//!
+//!   5. The ring-state control plane MUST NOT churn at rotation cadence
+//!      (#371). The cold tables — `lease_ring_state`, `claim_ring_state`,
+//!      `queue_ring_slots`, `lease_ring_slots` — see zero UPDATE/DELETE
+//!      and zero dead tuples; `queue_ring_state` is allowed only the rare
+//!      #290 trust-marker flip (bounded well below the rotation count).
+//!      Rotation appends to the `{ring}_ring_rotations` ledgers instead;
+//!      a per-rotation cursor UPDATE is the regression this catches.
+//!      (`claim_ring_slots` is excluded — its rescue-cursor columns are
+//!      legitimately updated at maintenance cadence.)
 //!
 //! Marked `#[ignore]` so it runs only via the nightly-chaos workflow
 //! (which already drives the existing receipt-plane chaos tests). Run
@@ -129,13 +139,58 @@ async fn sample_per_partition_dead_tup(
     .expect("dead-tuple sample failed")
 }
 
+/// Current ring cursor: the max-generation row of the ring's rotation
+/// ledger (#371).
 async fn ring_state(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
     sqlx::query_as::<_, (i32, i64)>(&format!(
-        "SELECT current_slot, generation FROM {schema}.{ring}_ring_state WHERE singleton = TRUE"
+        "SELECT slot, generation FROM {schema}.{ring}_ring_rotations ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(pool)
     .await
-    .expect("ring state read failed")
+    .expect("ring cursor read failed")
+}
+
+/// The ring-state control-plane tables that, since #371, must no longer
+/// churn at rotation cadence. The cursor moved to the append-only
+/// `{ring}_ring_rotations` ledgers, so these tables hold only cold config
+/// (`slot_count`, the #290 queue trust marker) or are pure row-lock
+/// targets. The pre-#371 regression was a per-rotation UPDATE on each of
+/// them; the gate proves writes stay far below the rotation count and that
+/// no dead tuples accumulate. (`claim_ring_slots` is excluded — its
+/// rescue-cursor columns are legitimately updated at maintenance cadence.)
+const RING_STATE_FAMILY: [&str; 5] = [
+    "queue_ring_state",
+    "lease_ring_state",
+    "claim_ring_state",
+    "queue_ring_slots",
+    "lease_ring_slots",
+];
+
+/// Cumulative write counters and current dead tuples for a set of tables.
+/// `n_tup_upd` / `n_tup_del` are monotonic since schema creation, so the
+/// delta across the run is exact regardless of vacuum timing; `n_dead_tup`
+/// is the direct dead-tuple reading.
+async fn ring_family_write_stats(
+    pool: &sqlx::PgPool,
+    schema: &str,
+) -> std::collections::HashMap<String, (i64, i64, i64)> {
+    let relnames: Vec<String> = RING_STATE_FAMILY.iter().map(|s| s.to_string()).collect();
+    sqlx::query_as::<_, (String, i64, i64, i64)>(
+        r#"
+        SELECT relname, n_tup_upd::bigint, n_tup_del::bigint, n_dead_tup::bigint
+        FROM pg_stat_user_tables
+        WHERE schemaname = $1
+          AND relname = ANY($2)
+        "#,
+    )
+    .bind(schema)
+    .bind(relnames)
+    .fetch_all(pool)
+    .await
+    .expect("ring-family stats sample failed")
+    .into_iter()
+    .map(|(name, upd, del, dead)| (name, (upd, del, dead)))
+    .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -218,6 +273,11 @@ async fn test_receipt_plane_steady_state_bounds_under_load() {
     // Capture initial ring positions to compute advance later.
     let (queue_initial_slot, queue_initial_gen) = ring_state(&pool, &schema, "queue").await;
     let (claim_initial_slot, claim_initial_gen) = ring_state(&pool, &schema, "claim").await;
+
+    // #371 invariant 5: capture the ring-state family's cumulative write
+    // counters before load. A non-zero delta on any of these across the
+    // run is a regression back to per-rotation cursor churn.
+    let ring_family_initial = ring_family_write_stats(&pool, &schema).await;
 
     // Producer loop: insert at target_rate jobs/sec for duration_secs.
     let started = Instant::now();
@@ -306,6 +366,9 @@ async fn test_receipt_plane_steady_state_bounds_under_load() {
     let (queue_final_slot, queue_final_gen) = ring_state(&pool, &schema, "queue").await;
     let (claim_final_slot, claim_final_gen) = ring_state(&pool, &schema, "claim").await;
 
+    // #371 invariant 5: final ring-state family write counters.
+    let ring_family_final = ring_family_write_stats(&pool, &schema).await;
+
     client.shutdown(Duration::from_secs(10)).await;
 
     let claim_peak_total: i64 = peak_claim_dead.values().copied().max().unwrap_or(0);
@@ -393,6 +456,45 @@ async fn test_receipt_plane_steady_state_bounds_under_load() {
         duration_secs,
         expected_min_rotations
     );
+
+    // Invariant 5 (#371): the ring-state control plane no longer churns at
+    // rotation cadence. Before #371 every rotation UPDATEd each of these
+    // tables, so writes tracked the rotation count 1:1 and dead tuples
+    // piled up under a pinned horizon. Now the cursor lives in the
+    // append-only `{ring}_ring_rotations` ledgers, so these tables take
+    // only cold-config writes (the #290 queue trust marker, at
+    // empty↔non-empty transitions) and must:
+    //   (a) accumulate zero dead tuples, and
+    //   (b) take far fewer writes than the ring rotated.
+    // The write count is bounded as a strict fraction of the rotation
+    // count rather than a hard zero: pg_stat's cumulative counters can
+    // absorb a stray cold write or a late flush, and a `<= rotations/2`
+    // bound already catches the pre-#371 per-rotation regression
+    // unambiguously without fighting a one-off stat-flush race.
+    let rotation_activity = queue_rotations.max(claim_rotations).max(1);
+    let max_control_writes = (rotation_activity / 2).max(4);
+    for table in RING_STATE_FAMILY {
+        let (initial_upd, initial_del, _) =
+            ring_family_initial.get(table).copied().unwrap_or((0, 0, 0));
+        let (final_upd, final_del, final_dead) =
+            ring_family_final.get(table).copied().unwrap_or((0, 0, 0));
+        let writes = (final_upd - initial_upd) + (final_del - initial_del);
+        assert!(
+            writes <= max_control_writes,
+            "{table} took {writes} writes during load (bound {max_control_writes}); that tracks the \
+             rotation count ({rotation_activity}) and looks like the pre-#371 per-rotation cursor \
+             UPDATE regressing back — rotation must append to the ledger instead (#371)"
+        );
+        // Dead tuples must not track the rotation count either. A couple of
+        // dead versions from the rare #290 trust-marker flip are fine (they
+        // may not be autovacuumed yet); one-per-rotation is the regression.
+        assert!(
+            final_dead <= max_control_writes,
+            "{table} holds {final_dead} dead tuples after load (bound {max_control_writes}); that \
+             tracks the rotation count ({rotation_activity}) — the ring control plane must not churn \
+             a row per rotation now that the cursor lives in the append-only ledger (#371)"
+        );
+    }
 
     // Sanity: at least one job actually exercised the receipt-plane
     // path. Without this we could pass on a no-op workload.
