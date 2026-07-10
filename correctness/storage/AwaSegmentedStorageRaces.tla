@@ -1,9 +1,11 @@
 ---- MODULE AwaSegmentedStorageRaces ----
 EXTENDS TLC, Naturals, FiniteSets
 
-\* Focused race spec: does the claim-path read of lease_ring_state and
-\* claim_ring_state race with concurrent RotateLeaseSegments /
-\* PruneLeaseSegment and RotateClaimSegments / PruneClaimSegment?
+\* Focused race spec: does the claim-path read of the lease-ring and
+\* claim-ring cursors (since #371 the max-generation rows of
+\* lease_ring_rotations / claim_ring_rotations) race with concurrent
+\* RotateLeaseSegments / PruneLeaseSegment and RotateClaimSegments /
+\* PruneClaimSegment?
 \*
 \* The base AwaSegmentedStorage spec models Claim as a single atomic
 \* action: in one step it reads leaseSegmentCursor and claimSegmentCursor,
@@ -11,7 +13,8 @@ EXTENDS TLC, Naturals, FiniteSets
 \* cursor values, and advances laneState. That hides the real code path:
 \*
 \*   1. claim_ready_runtime locks queue_lanes via FOR UPDATE
-\*   2. it reads lease_ring_state.current_slot and claim_ring_state.current_slot
+\*   2. it reads the current lease and claim slots from the rotation
+\*      ledgers (max-generation rows)
 \*   3. it inserts into {schema}.leases tagged with lease_slot AND
 \*      {schema}.lease_claims tagged with claim_slot
 \*
@@ -157,8 +160,8 @@ EnqueueReady(j) ==
 
 \* Phase 1 of claim: the worker has acquired the queue_lanes row lock
 \* (modelled by the "no other worker has a pending intent on the same
-\* lane" precondition) and has snapshotted the lease_ring_state AND
-\* claim_ring_state cursors. Between BeginClaim and CommitClaim,
+\* lane" precondition) and has snapshotted the lease-ring AND
+\* claim-ring ledger cursors. Between BeginClaim and CommitClaim,
 \* RotateLeaseSegments / PruneLeaseSegment / RotateClaimSegments /
 \* PruneClaimSegment may fire.
 BeginClaim(w, j) ==

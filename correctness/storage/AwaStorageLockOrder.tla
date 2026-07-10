@@ -9,23 +9,38 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* them trips an invariant.
 \*
 \* The claim/rotate/prune race against the lease ring is mitigated by:
-\*   - the rotators taking FOR UPDATE on lease_ring_state and the
-\*     target slot row (so two rotators serialise),
+\*   - the rotators and pruners taking the per-ring rotation advisory
+\*     lock (#371: `pg_try_advisory_xact_lock` on
+\*     `awa.queue_storage.ring_rotation:{schema}:{ring}`; it replaced the
+\*     pre-ledger FOR UPDATE on the `{ring}_ring_state` singleton row,
+\*     whose cursor columns are gone) plus FOR UPDATE on the target slot
+\*     row (so rotate, prune, and the delta rollup serialise),
 \*   - LOCK TABLE ACCESS EXCLUSIVE on the partition child under a bounded
 \*     lock_timeout (so prune can break starvation without queueing
 \*     indefinitely ahead of worker traffic before truncating).
-\* Note: the claim CTE reads lease_ring_state with a plain SELECT, NOT
-\* a FOR SHARE. The conflict detection between claim and rotate is the
-\* rotator's CAS UPDATE (`WHERE current_slot=$ AND generation=$`) plus
-\* the rotator's empty-partition busy-check, not a row-level lock.
-\* The plans below treat the ring-state read as a no-lock step (it is
-\* simply elided from the plan).
+\* Note: the claim CTE reads the ring cursor (the max-generation row of
+\* the append-only `{ring}_ring_rotations` ledger) with a plain SELECT,
+\* NOT a FOR SHARE. The conflict detection between claim and rotate is
+\* the rotator's ledger INSERT ... ON CONFLICT (generation) DO NOTHING
+\* CAS plus the rotator's empty-partition busy-check, not a row-level
+\* lock. The plans below treat the cursor read as a no-lock step (it is
+\* simply elided from the plan), and likewise elide the ledger INSERT /
+\* fold DELETE themselves: they are RowExclusive DML on tables nothing
+\* ever locks exclusively, so they cannot participate in a waits-for
+\* cycle at this abstraction level.
+\*
+\* The Rust rotate/prune/rollup paths acquire the rotation lock with
+\* pg_try_advisory_xact_lock and *skip the tick* on contention. The
+\* model conservatively lets transactions WAIT on that resource instead;
+\* every waits-for edge the model admits is therefore a superset of what
+\* the try-lock implementation can produce, so NoDeadlock over the model
+\* covers the implementation.
 \*
 \* ADR-023/026 extends the locked resources with the claim ring
-\* (claim_ring_state, claim_ring_slots, lease_claims / lease_claim_batches
-\* child partitions, lease_claim_closures child partitions, compact
-\* closure-batch child partitions) and the parallel rotate/prune
-\* plans for the claim ring. The claim path takes a RowExclusive on
+\* (the claim-ring rotation lock, claim_ring_slots, lease_claims /
+\* lease_claim_batches child partitions, lease_claim_closures child
+\* partitions, compact closure-batch child partitions) and the parallel
+\* rotate/prune plans for the claim ring. The claim path takes a RowExclusive on
 \* the lease_claims or lease_claim_batches child partition (receipts mode)
 \* or the leases child partition (legacy mode). Closure writes on terminal transitions take
 \* a RowExclusive on the lease_claim_closures or
@@ -81,10 +96,11 @@ CONSTANTS TxIds,
 \* doesn't track, and they can't deadlock with anything else because
 \* they're per-row.
 \*
-\* `ModeExclusive` covers AccessExclusive (LOCK TABLE / TRUNCATE) and
-\* the FOR UPDATE on singleton rows like `lease_ring_state`. For a
-\* singleton row, "FOR UPDATE" really IS exclusive at the abstraction
-\* level — only one tx at a time gets to advance the cursor.
+\* `ModeExclusive` covers AccessExclusive (LOCK TABLE / TRUNCATE), the
+\* per-ring rotation advisory locks (#371 — one holder at a time, by
+\* construction), and FOR UPDATE on single-row lock targets like the
+\* `{ring}_ring_slots` rows: for a one-row target, "FOR UPDATE" really
+\* IS exclusive at the abstraction level.
 \*
 \* The compatibility check therefore is: S/S allowed, S/X and X/X both
 \* conflict.
@@ -111,10 +127,10 @@ Compatible(held, wanted) == held = ModeShared /\ wanted = ModeShared
 \* deadlock; two transactions on the same lane and shard reduce to
 \* the existing `LaneResource(q, p)` model.
 LaneResource(q, p) == [k |-> "queue_lane", q |-> q, p |-> p]
-LeaseRingStateResource == [k |-> "lease_ring_state"]
+LeaseRingRotationLockResource == [k |-> "lease_ring_rotation_lock"]
 LeaseRingSlotResource(s) == [k |-> "lease_ring_slot", s |-> s]
 LeaseChildResource(s) == [k |-> "lease_child", s |-> s]
-QueueRingStateResource == [k |-> "queue_ring_state"]
+QueueRingRotationLockResource == [k |-> "queue_ring_rotation_lock"]
 QueueRingSlotResource(s) == [k |-> "queue_ring_slot", s |-> s]
 ReadyChildResource(s) == [k |-> "ready_child", s |-> s]
 ReadyClaimAttemptBatchChildResource(s) == [k |-> "ready_claim_attempt_batch_child", s |-> s]
@@ -128,7 +144,7 @@ LeasesParentResource == [k |-> "leases_parent"]
 ClaimProofResource == [k |-> "claim_proof_children"]
 ClosureProofResource == [k |-> "closure_proof_children"]
 ClosureBatchProofResource == [k |-> "closure_batch_proof_children"]
-ClaimRingStateResource == [k |-> "claim_ring_state"]
+ClaimRingRotationLockResource == [k |-> "claim_ring_rotation_lock"]
 ClaimRingSlotResource(s) == [k |-> "claim_ring_slot", s |-> s]
 ClaimChildResource(s) == [k |-> "claim_child", s |-> s]
 ClaimBatchChildResource(s) == [k |-> "claim_batch_child", s |-> s]
@@ -155,10 +171,10 @@ ClosureBatchChildResources == { ClosureBatchChildResource(s) : s \in ClaimSlots 
 
 Resources ==
     LaneResources \cup
-    {LeaseRingStateResource} \cup
+    {LeaseRingRotationLockResource} \cup
     LeaseRingSlotResources \cup
     LeaseChildResources \cup
-    {QueueRingStateResource} \cup
+    {QueueRingRotationLockResource} \cup
     QueueRingSlotResources \cup
     ReadyChildResources \cup
     ReadyClaimAttemptBatchChildResources \cup
@@ -172,7 +188,7 @@ Resources ==
     {ClaimProofResource} \cup
     {ClosureProofResource} \cup
     {ClosureBatchProofResource} \cup
-    {ClaimRingStateResource} \cup
+    {ClaimRingRotationLockResource} \cup
     ClaimRingSlotResources \cup
     ClaimChildResources \cup
     ClaimBatchChildResources \cup
@@ -216,10 +232,11 @@ EnqueueTwoStripePlan(p) ==
 \*   FOR UPDATE OF queue_claim_heads SKIP LOCKED (per-(queue,priority) row)
 \*   refresh queue_claim_heads.ready_segment_* on the already-locked row
 \*     when the cached ready-slot hint no longer validates
-\*   plain SELECT of lease_ring_state and claim_ring_state — no
-\*     FOR SHARE / FOR UPDATE; serialisation against rotate is via
-\*     the rotator's CAS UPDATE on (current_slot, generation), not a
-\*     row lock here, so these reads are NOT modelled as plan steps.
+\*   plain SELECT of the lease_ring_rotations and claim_ring_rotations
+\*     cursors (max-generation rows) — no FOR SHARE / FOR UPDATE;
+\*     serialisation against rotate is via the rotator's ledger-insert
+\*     CAS on the generation PK, not a row lock here, so these reads
+\*     are NOT modelled as plan steps.
 \*   plain SELECT of ready_entries_<slot> (implicit AccessShare on child)
 \*   INSERT INTO ready_claim_attempt_batches_<ready_slot> (receipts mode)
 \*   INSERT INTO lease_claim_batches_<claim_slot> or
@@ -302,7 +319,8 @@ CloseReceiptPlan(claimSlot) ==
        Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
 \* rescue_stale_receipt_claims_tx
-\*   plain SELECT of claim_ring_state to prefer the oldest initialized slot
+\*   plain SELECT of the claim_ring_rotations cursor to prefer the
+\*     oldest initialized slot
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   SELECT ... FROM lease_claims / lease_claim_batches claims LEFT JOIN
 \*     attempt_state ...
@@ -408,25 +426,27 @@ BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
        Step(ReadyChildResource(readySlot), ModeShared) >>
 
 \* rotate_leases
-\*   SELECT ... FROM lease_ring_state FOR UPDATE
-\*   SELECT count(*) FROM lease_child[next_slot] (AccessShare on child)
-\*   UPDATE lease_ring_state / lease_ring_slots
+\*   pg_try_advisory_xact_lock on the lease-ring rotation lock
+\*   SELECT EXISTS FROM lease_child[next_slot] (AccessShare on child)
+\*   INSERT INTO lease_ring_rotations (ledger CAS; RowExclusive, elided)
 RotateLeasesPlan(nextSlot) ==
-    << Step(LeaseRingStateResource, ModeExclusive),
+    << Step(LeaseRingRotationLockResource, ModeExclusive),
        Step(LeaseChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest_leases
-\*   SELECT ... FROM lease_ring_state FOR UPDATE
+\*   pg_try_advisory_xact_lock on the lease-ring rotation lock
 \*   SELECT ... FROM lease_ring_slots[slot] FOR UPDATE
 \*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 PruneLeasesPlan(slot) ==
-    << Step(LeaseRingStateResource, ModeExclusive),
+    << Step(LeaseRingRotationLockResource, ModeExclusive),
        Step(LeaseRingSlotResource(slot), ModeExclusive),
        Step(LeaseChildResource(slot), ModeExclusive) >>
 
-\* rotate_ready similar to rotate_leases (approximated)
+\* rotate (queue ring) similar to rotate_leases: rotation lock, busy/idle
+\* probes on the next and current children, then the ledger CAS insert
+\* (RowExclusive, elided).
 RotateReadyPlan(nextSlot) ==
-    << Step(QueueRingStateResource, ModeExclusive),
+    << Step(QueueRingRotationLockResource, ModeExclusive),
        Step(ReadyChildResource(nextSlot), ModeShared),
        Step(ReadyClaimAttemptBatchChildResource(nextSlot), ModeShared),
        Step(ReadyTombstoneChildResource(nextSlot), ModeShared),
@@ -437,8 +457,9 @@ RotateReadyPlan(nextSlot) ==
        Step(TerminalDeltaChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest
-\*   SELECT ... FROM queue_ring_state FOR UPDATE
-\*   SELECT ... FROM queue_ring_slots FOR UPDATE
+\*   pg_try_advisory_xact_lock on the queue-ring rotation lock
+\*   SELECT ... FROM queue_ring_slots[slot] FOR UPDATE (target derived
+\*     from the ledger cursor)
 \*   prove sealed-slot skip gates before child exclusive locks:
 \*     active leases (leases parent), unclosed receipt claims
 \*     (claim/closure proof resources), and pending retained ready rows
@@ -447,7 +468,7 @@ RotateReadyPlan(nextSlot) ==
 \*   repeat the active/pending/unclosed proofs after the exclusive child
 \*     locks before TRUNCATE
 PruneReadyPlan(slot) ==
-    << Step(QueueRingStateResource, ModeExclusive),
+    << Step(QueueRingRotationLockResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
        Step(LeasesParentResource, ModeShared),
        Step(ClaimProofResource, ModeShared),
@@ -468,22 +489,43 @@ PruneReadyPlan(slot) ==
        Step(ClosureBatchProofResource, ModeShared),
        Step(ReadyChildResource(slot), ModeShared) >>
 
+\* rollup_terminal_count_delta_slot (#290 / #371)
+\*   pg_try_advisory_xact_lock on the queue-ring rotation lock
+\*   SELECT ... FROM queue_ring_slots[slot] FOR UPDATE (generation
+\*     derived from the ledger cursor)
+\*   pending-ready probe: plain SELECT on ready_child[slot]
+\*   LOCK TABLE terminal_delta_child[slot] ACCESS EXCLUSIVE with bounded
+\*     lock_timeout
+\*   active-lease / unclosed-claim proofs (leases parent + claim proof
+\*     children, AccessShare)
+\*   fold into queue_terminal_live_counts (RowExclusive, elided) and
+\*     TRUNCATE terminal_delta_child[slot] (already held exclusive)
+RollupTerminalDeltasPlan(slot) ==
+    << Step(QueueRingRotationLockResource, ModeExclusive),
+       Step(QueueRingSlotResource(slot), ModeExclusive),
+       Step(ReadyChildResource(slot), ModeShared),
+       Step(TerminalDeltaChildResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared) >>
+
 \* rotate_claims (ADR-023)
-\*   SELECT ... FROM claim_ring_state FOR UPDATE
-\*   SELECT count(*) FROM claim_child[next_slot]
-\*   SELECT count(*) FROM claim_batch_child[next_slot]
-\*   SELECT count(*) FROM closure_child[next_slot]
-\*   SELECT count(*) FROM closure_batch_child[next_slot]
-\*   UPDATE claim_ring_state
+\*   pg_try_advisory_xact_lock on the claim-ring rotation lock
+\*   SELECT EXISTS FROM claim_child[next_slot]
+\*   SELECT EXISTS FROM claim_batch_child[next_slot]
+\*   SELECT EXISTS FROM closure_child[next_slot]
+\*   SELECT EXISTS FROM closure_batch_child[next_slot]
+\*   INSERT INTO claim_ring_rotations (ledger CAS; RowExclusive, elided)
 RotateClaimsPlan(nextSlot) ==
-    << Step(ClaimRingStateResource, ModeExclusive),
+    << Step(ClaimRingRotationLockResource, ModeExclusive),
        Step(ClaimChildResource(nextSlot), ModeShared),
        Step(ClaimBatchChildResource(nextSlot), ModeShared),
        Step(ClosureChildResource(nextSlot), ModeShared),
        Step(ClosureBatchChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest_claims (ADR-023)
-\*   SELECT ... FROM claim_ring_state FOR UPDATE
+\*   pg_try_advisory_xact_lock on the claim-ring rotation lock
 \*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
 \*   prove every claim in the sealed slot has durable closure evidence
 \*     with plain SELECT / AccessShare on the claim children. The Rust
@@ -499,7 +541,7 @@ RotateClaimsPlan(nextSlot) ==
 \*   TRUNCATE claim_child[slot] + claim_batch_child[slot] +
 \*     closure_child[slot] + closure_batch_child[slot]
 PruneClaimsPlan(slot) ==
-    << Step(ClaimRingStateResource, ModeExclusive),
+    << Step(ClaimRingRotationLockResource, ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive),
        Step(ClaimChildResource(slot), ModeShared),
        Step(ClaimBatchChildResource(slot), ModeShared),
@@ -624,6 +666,15 @@ StartPruneReady(t, slot) ==
     /\ slot \in ReadySlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = PruneReadyPlan(slot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartRollupTerminalDeltas(t, slot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ slot \in ReadySlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = RollupTerminalDeltasPlan(slot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
@@ -779,6 +830,7 @@ Next ==
     \/ \E t \in TxIds, ls \in LeaseSlots : StartPruneLeases(t, ls)
     \/ \E t \in TxIds, rs \in ReadySlots : StartRotateReady(t, rs)
     \/ \E t \in TxIds, rs \in ReadySlots : StartPruneReady(t, rs)
+    \/ \E t \in TxIds, rs \in ReadySlots : StartRollupTerminalDeltas(t, rs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRotateClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartCloseReceipt(t, cs)
@@ -811,12 +863,12 @@ Spec == ConfigOK /\ Init /\ [][Next]_vars
 \* This is a harness for the checker, not a model of any real path.
 
 CycleAPlan ==
-    << Step(LeaseRingStateResource, ModeExclusive),
-       Step(QueueRingStateResource, ModeExclusive) >>
+    << Step(LeaseRingRotationLockResource, ModeExclusive),
+       Step(QueueRingRotationLockResource, ModeExclusive) >>
 
 CycleBPlan ==
-    << Step(QueueRingStateResource, ModeExclusive),
-       Step(LeaseRingStateResource, ModeExclusive) >>
+    << Step(QueueRingRotationLockResource, ModeExclusive),
+       Step(LeaseRingRotationLockResource, ModeExclusive) >>
 
 StartCycleA(t) ==
     /\ t \in TxIds
