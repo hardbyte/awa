@@ -4,7 +4,7 @@ use sqlx::{Connection, PgPool};
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 40;
+pub const CURRENT_VERSION: i32 = 41;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -180,6 +180,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         &[V23_UP, V39_UP],
     ),
     (40, "Per-queue runtime overrides on queue_meta", &[V40_UP]),
+    (
+        41,
+        "Compact deadline receipt claims and batch deadline-rescue cursors (#246)",
+        &[V23_UP, V41_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -221,6 +226,7 @@ const V37_UP: &str = include_str!("../migrations/v037_ready_segments.sql");
 const V38_UP: &str = include_str!("../migrations/v038_compact_claim_batches.sql");
 const V39_UP: &str = include_str!("../migrations/v039_claim_head_cold_routing.sql");
 const V40_UP: &str = include_str!("../migrations/v040_queue_runtime_overrides.sql");
+const V41_UP: &str = include_str!("../migrations/v041_compact_deadline_claims.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

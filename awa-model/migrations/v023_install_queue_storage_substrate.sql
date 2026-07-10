@@ -269,7 +269,9 @@ BEGIN
             rescue_cursor_run_lease    BIGINT NOT NULL DEFAULT 0,
             deadline_cursor_deadline_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
             deadline_cursor_job_id      BIGINT NOT NULL DEFAULT 0,
-            deadline_cursor_run_lease   BIGINT NOT NULL DEFAULT 0
+            deadline_cursor_run_lease   BIGINT NOT NULL DEFAULT 0,
+            batch_deadline_cursor_deadline_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            batch_deadline_cursor_batch_id    BIGINT NOT NULL DEFAULT 0
         )
         $ddl$,
         p_schema
@@ -283,7 +285,9 @@ BEGIN
             ADD COLUMN IF NOT EXISTS rescue_cursor_run_lease BIGINT NOT NULL DEFAULT 0,
             ADD COLUMN IF NOT EXISTS deadline_cursor_deadline_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
             ADD COLUMN IF NOT EXISTS deadline_cursor_job_id BIGINT NOT NULL DEFAULT 0,
-            ADD COLUMN IF NOT EXISTS deadline_cursor_run_lease BIGINT NOT NULL DEFAULT 0
+            ADD COLUMN IF NOT EXISTS deadline_cursor_run_lease BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS batch_deadline_cursor_deadline_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
+            ADD COLUMN IF NOT EXISTS batch_deadline_cursor_batch_id BIGINT NOT NULL DEFAULT 0
         $ddl$,
         p_schema
     );
@@ -327,6 +331,20 @@ BEGIN
         $ddl$
         COMMENT ON COLUMN %I.claim_ring_slots.deadline_cursor_run_lease IS
             'Receipt deadline-rescue sweep cursor tie-breaker: run_lease component of the last deadline claim visited in this slot.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.batch_deadline_cursor_deadline_at IS
+            'Compact-batch deadline-rescue sweep cursor (#246): deadline_at component of the last expired lease_claim_batches row visited in this slot; a batch with any open expired member stops advancement until rescue or completion closes it.'
+        $ddl$,
+        p_schema
+    );
+    EXECUTE format(
+        $ddl$
+        COMMENT ON COLUMN %I.claim_ring_slots.batch_deadline_cursor_batch_id IS
+            'Compact-batch deadline-rescue sweep cursor tie-breaker: batch_id component of the last expired claim batch visited in this slot.'
         $ddl$,
         p_schema
     );
@@ -1150,7 +1168,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON TABLE %I.lease_claim_batches IS %L',
         p_schema,
-        'Append-only compact receipt-claim ledger. Zero-deadline receipt claims can store one row per claim batch here instead of one lease_claims row per job; cold paths expand by receipt_id and materialize only when needed.'
+        'Append-only compact receipt-claim ledger. Receipt claims store one row per claim batch here instead of one lease_claims row per job; cold paths expand by receipt_id and materialize only when needed.'
     );
 
     EXECUTE format(
@@ -1168,7 +1186,7 @@ BEGIN
     EXECUTE format(
         'COMMENT ON COLUMN %I.lease_claim_batches.deadline_at IS %L',
         p_schema,
-        'Reserved for future compact deadline support. The initial compact claim path only uses this ledger when deadline_at is NULL; deadline-backed claims continue to write row-local lease_claims.'
+        'Shared hard deadline for every claim in this batch (#246). All jobs claimed by one claim_ready_runtime call share one claimed_at, hence one deadline. NULL when the claiming queue has deadline_duration = 0. Batch deadline rescue scans this column via the per-partition partial deadline-cursor index.'
     );
 
     EXECUTE format(
@@ -1432,6 +1450,17 @@ BEGIN
 
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_batches_%s_rescue_cursor ON %I.%I (claimed_at, batch_id)',
+            p_schema, v_slot, p_schema, format('lease_claim_batches_%s', v_slot)
+        );
+
+        -- Batch deadline-rescue cursor scan (#246): compact deadline-backed
+        -- claim batches are swept per slot ordered by (deadline_at,
+        -- batch_id). Partial on deadline_at IS NOT NULL so the zero-deadline
+        -- hot path (the common shape) never maintains index entries; one
+        -- entry per claimed batch (not per job) keeps the index tiny even at
+        -- saturation.
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS idx_%s_lease_claim_batches_%s_deadline_cursor ON %I.%I (deadline_at, batch_id) WHERE deadline_at IS NOT NULL',
             p_schema, v_slot, p_schema, format('lease_claim_batches_%s', v_slot)
         );
 
@@ -2683,10 +2712,17 @@ BEGIN
 
     --------------------------------------------------------------------
     -- claim_ready_runtime() function. The claim CTE branches on the
-    -- receipts mode: receipts=TRUE writes compact zero-deadline claims into
-    -- lease_claim_batches or deadline-backed claims into lease_claims
-    -- (ADR-023); receipts=FALSE writes directly into the partitioned leases
-    -- table.
+    -- receipts mode: receipts=TRUE writes compact claim batches into
+    -- lease_claim_batches (ADR-023); receipts=FALSE writes directly into
+    -- the partitioned leases table.
+    --
+    -- Every job claimed by one call shares v_claimed_at, so a claim batch
+    -- has exactly one deadline value: deadline-backed claims (#246) use
+    -- the same compact representation with the batch's deadline_at
+    -- populated instead of one lease_claims row per job. Row-local
+    -- lease_claims rows are no longer written by the claim path; the
+    -- table remains for legacy in-flight claims mid-upgrade and keeps its
+    -- deadline-rescue machinery.
     --------------------------------------------------------------------
 
     IF p_lease_claim_receipts THEN
@@ -2813,10 +2849,9 @@ BEGIN
                     array_agg(claim_items.lane_seq ORDER BY claim_items.lane_seq, claim_items.job_id),
                     array_agg(claim_items.attempt ORDER BY claim_items.lane_seq, claim_items.job_id),
                     array_agg(claim_items.max_attempts ORDER BY claim_items.lane_seq, claim_items.job_id),
-                    NULL::timestamptz,
+                    v_deadline_at,
                     v_claimed_at
                 FROM claim_items
-                WHERE p_deadline_secs <= 0
                 GROUP BY
                     claim_items.claim_slot,
                     claim_items.ready_slot,
@@ -2833,70 +2868,7 @@ BEGIN
                     claim_batches.priority,
                     claim_batches.enqueue_shard
             ),
-            row_claims AS (
-                INSERT INTO %1$I.lease_claims AS claim_rows (
-                    claim_slot,
-                    receipt_id,
-                    job_id,
-                    run_lease,
-                    ready_slot,
-                    ready_generation,
-                    queue,
-                    priority,
-                    attempt,
-                    max_attempts,
-                    lane_seq,
-                    enqueue_shard,
-                    deadline_at
-                )
-                SELECT
-                    claim_items.claim_slot,
-                    claim_items.receipt_id,
-                    claim_items.job_id,
-                    claim_items.run_lease,
-                    claim_items.ready_slot,
-                    claim_items.ready_generation,
-                    claim_items.queue,
-                    claim_items.priority,
-                    claim_items.attempt,
-                    claim_items.max_attempts,
-                    claim_items.lane_seq,
-                    claim_items.enqueue_shard,
-                    v_deadline_at
-                FROM claim_items
-                WHERE p_deadline_secs > 0
-                RETURNING
-                    claim_rows.claim_slot,
-                    claim_rows.receipt_id,
-                    claim_rows.ready_slot,
-                    claim_rows.ready_generation,
-                    claim_rows.job_id,
-                    claim_rows.queue,
-                    claim_rows.priority,
-                    claim_rows.lane_seq,
-                    claim_rows.attempt,
-                    claim_rows.run_lease,
-                    claim_rows.max_attempts,
-                    NULL::bigint AS claim_batch_id,
-                    NULL::int AS claim_batch_index
-            ),
             claimed AS (
-                SELECT
-                    row_claims.claim_slot,
-                    row_claims.receipt_id,
-                    row_claims.claim_batch_id,
-                    row_claims.claim_batch_index,
-                    row_claims.ready_slot,
-                    row_claims.ready_generation,
-                    row_claims.job_id,
-                    row_claims.queue,
-                    row_claims.priority,
-                    row_claims.lane_seq,
-                    row_claims.attempt,
-                    row_claims.run_lease,
-                    row_claims.max_attempts
-                FROM row_claims
-                UNION ALL
                 SELECT
                     claim_items.claim_slot,
                     claim_items.receipt_id,
