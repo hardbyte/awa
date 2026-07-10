@@ -49,7 +49,13 @@ EXTENDS TLC, Naturals, FiniteSets
 \* Claim family modelling (ADR-023/026): every Claim action opens an
 \* append-only receipt in the current claim segment. In Rust, that receipt
 \* can be a row-local lease_claims entry or an item in lease_claim_batches;
-\* this model represents both as `claimOpen`. Non-success exits
+\* this model represents both as `claimOpen`. Since #246 both zero-deadline
+\* and deadline-backed claims use the compact lease_claim_batches item
+\* (a claim batch shares one claimed_at, hence one deadline_at); row-local
+\* lease_claims survives only for legacy in-flight claims mid-upgrade and
+\* for claims that materialize into mutable leases. The model does not
+\* carry a deadline variable: the row-vs-batch choice is a refinement below
+\* claimOpen / claimClosed, so it needs no lifecycle state here. Non-success exits
 \* (FailToDlq / RetryToDeferred / RescueToReady /
 \* CancelWaitingToTerminal / TimeoutWaitingToDlq /
 \* TimeoutWaitingToReady) write an explicit closure row in that same
@@ -71,14 +77,19 @@ EXTENDS TLC, Naturals, FiniteSets
 \* state. The stale-receipt cursor is a cyclic bounded sweep over
 \* (claimed_at, job_id, run_lease): fresh claims may be skipped for this
 \* pass and revisited after wrap, while stale open claims stop cursor
-\* advancement until a rescue step closes them. The deadline cursor is a
-\* separate bounded sweep over (deadline_at, job_id, run_lease): closed
-\* and lease-managed claims are skipped, expired open receipt claims are
-\* force-closed, and the first open future-deadline claim stops
-\* advancement until it expires or closes through normal completion.
-\* Both cursors refine the same storage facts modelled here: an open
-\* claim is removed from claimOpen and matching durable closure evidence
-\* is represented in claimClosed.
+\* advancement until a rescue step closes them. There are two deadline
+\* sweeps, one per claim representation: the row-local cursor sweeps
+\* (deadline_at, job_id, run_lease) over legacy lease_claims, and the
+\* compact-batch cursor (#246) sweeps (deadline_at, batch_id) over
+\* lease_claim_batches, expanding each expired batch into members and
+\* force-closing the open ones. Both skip closed and lease-managed claims,
+\* force-close expired open receipt claims, and stop advancement at the
+\* first open future-deadline claim (row) or partially-open expired batch
+\* until it expires or closes through normal completion. All three cursors
+\* refine the same storage facts modelled here: an open claim is removed
+\* from claimOpen and matching durable closure evidence is represented in
+\* claimClosed, whether that evidence is a row-local lease_claim_closures
+\* row or a compact lease_claim_closure_batches row.
 \* The Rust implementation also writes `ready_claim_attempt_batches` in the
 \* ready row's queue-ring slot during Claim. Each SQL row stores a batch
 \* of covered lane_seq ranges as cursor-recovery proof that those lanes
