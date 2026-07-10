@@ -33,7 +33,10 @@ use uuid::Uuid;
 /// transaction across awaits), so it cannot be awaited directly inside the
 /// `future_into_py` bridge, whose future must be `Send`. We drive it on a
 /// throwaway `current_thread` runtime inside `spawn_blocking` — this keeps the
-/// asyncio loop free and lets `asyncio.wait_for()` cancel the outer call.
+/// asyncio loop free. Note that `asyncio.wait_for()` cancellation only detaches
+/// the outer await: a `spawn_blocking` task cannot be interrupted, so the
+/// migration keeps running to completion in the background. The migration
+/// itself stays crash/cancel-safe through its transaction-scoped advisory lock.
 ///
 /// This lives in a dedicated `async fn` (taking the pool *by value*) rather
 /// than inline in each caller on purpose: the `!Send` migration future is
