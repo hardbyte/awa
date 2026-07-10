@@ -14262,7 +14262,7 @@ impl QueueStorage {
 
         // Ring rotation lock first (stabilises the cursor against rotate
         // and prune), then the slot row lock — the same order every
-        // queue-ring maintenance tx uses (`RollupPlan` in
+        // queue-ring maintenance tx uses (`RollupTerminalDeltasPlan` in
         // `correctness/storage/AwaStorageLockOrder.tla`).
         if !self
             .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue)
