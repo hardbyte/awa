@@ -1012,6 +1012,21 @@ impl AwaMetrics {
                     self.maintenance_rotate_attempts.add(1, &attrs);
                 }
             }
+            awa_model::RotateOutcome::SkippedIdle { slot } => {
+                // Idle skip (#371): the ring received no writes, so
+                // rotation deliberately left the cursor in place. Expected
+                // steady state on a quiet queue — dashboards should read a
+                // flat generation plus `skipped_idle` attempts as healthy,
+                // not as a pinned ring (which reports `skipped_busy`).
+                let attrs = [
+                    opentelemetry::KeyValue::new("awa.ring", ring),
+                    opentelemetry::KeyValue::new("awa.ring.outcome", "skipped_idle"),
+                    opentelemetry::KeyValue::new("awa.ring.blocker", "none"),
+                ];
+                self.maintenance_rotate_attempts.add(1, &attrs);
+                let slot_attrs = [opentelemetry::KeyValue::new("awa.ring", ring)];
+                self.ring_current_slot.record(*slot as i64, &slot_attrs);
+            }
         }
     }
 

@@ -6,6 +6,10 @@
 //! in `benchmark_test.rs`, and the reproducible validation output is checked in
 //! under `docs/adr/bench/`.
 
+// The metadata `json!` literal is large enough to exceed the default
+// macro recursion limit of 128.
+#![recursion_limit = "256"]
+
 mod bench_output;
 
 use awa::model::{
@@ -186,11 +190,13 @@ struct MaintenanceCounters {
     queue_prune_skipped_active: AtomicU64,
     queue_rotate_ok: AtomicU64,
     queue_rotate_skipped_busy: AtomicU64,
+    queue_rotate_skipped_idle: AtomicU64,
     lease_prune_ok: AtomicU64,
     lease_prune_blocked: AtomicU64,
     lease_prune_skipped_active: AtomicU64,
     lease_rotate_ok: AtomicU64,
     lease_rotate_skipped_busy: AtomicU64,
+    lease_rotate_skipped_idle: AtomicU64,
 }
 
 async fn ensure_pgstattuple(pool: &sqlx::PgPool) {
@@ -550,6 +556,9 @@ async fn maintenance_loop(
                     RotateOutcome::SkippedBusy { .. } => {
                         counters.queue_rotate_skipped_busy.fetch_add(1, Ordering::Relaxed);
                     }
+                    RotateOutcome::SkippedIdle { .. } => {
+                        counters.queue_rotate_skipped_idle.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
 
                 match store.prune_oldest(&pool, Duration::ZERO).await {
@@ -579,6 +588,11 @@ async fn maintenance_loop(
                     RotateOutcome::SkippedBusy { .. } => {
                         counters
                             .lease_rotate_skipped_busy
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    RotateOutcome::SkippedIdle { .. } => {
+                        counters
+                            .lease_rotate_skipped_idle
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -792,11 +806,35 @@ async fn test_queue_storage_round_trip_smoke() {
         .expect("Failed to prune smoke queue slot");
     assert!(matches!(pruned_queue, PruneOutcome::Pruned { slot: 0, .. }));
 
+    // With every lease completed the lease ring is idle and rotation
+    // deliberately skips (#371). Hold one live lease across the rotate so
+    // the rotate/prune mechanics are exercised, then complete it.
+    let idle_leases = store
+        .rotate_leases(&pool)
+        .await
+        .expect("Failed to probe idle smoke lease slot");
+    assert!(matches!(idle_leases, RotateOutcome::SkippedIdle { .. }));
+
+    store
+        .enqueue_batch(&pool, "smoke", 2, 1)
+        .await
+        .expect("Failed to enqueue lease-rotation smoke job");
+    let lease_holder = store
+        .claim_batch(&pool, "smoke", 1)
+        .await
+        .expect("Failed to claim lease-rotation smoke job");
+    assert_eq!(lease_holder.len(), 1);
+
     let rotated_leases = store
         .rotate_leases(&pool)
         .await
         .expect("Failed to rotate smoke lease slot");
     assert!(matches!(rotated_leases, RotateOutcome::Rotated { .. }));
+
+    store
+        .complete_batch(&pool, &lease_holder)
+        .await
+        .expect("Failed to complete lease-rotation smoke claim");
     let pruned_leases = store
         .prune_oldest_leases(&pool)
         .await
@@ -812,7 +850,7 @@ async fn test_queue_storage_round_trip_smoke() {
         .expect("Failed to sample final smoke counts");
     assert_eq!(final_counts.available, 0);
     assert_eq!(final_counts.running, 0);
-    assert_eq!(final_counts.terminal, 10);
+    assert_eq!(final_counts.terminal, 11);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -1058,7 +1096,7 @@ async fn test_queue_storage_storage_benchmark() {
     let p99 = percentile(&claim_latencies, 0.99);
 
     println!(
-        "[queue storage] baseline={baseline_rate:.0}/s overlap={overlap_rate:.0}/s cooldown={cooldown_rate:.0}/s max_dead={} final_dead={} queue_prune_ok={} queue_prune_blocked={} queue_rotate_ok={} queue_rotate_skipped_busy={} lease_prune_ok={} lease_prune_blocked={} lease_rotate_ok={} lease_rotate_skipped_busy={}",
+        "[queue storage] baseline={baseline_rate:.0}/s overlap={overlap_rate:.0}/s cooldown={cooldown_rate:.0}/s max_dead={} final_dead={} queue_prune_ok={} queue_prune_blocked={} queue_rotate_ok={} queue_rotate_skipped_busy={} queue_rotate_skipped_idle={} lease_prune_ok={} lease_prune_blocked={} lease_rotate_ok={} lease_rotate_skipped_busy={} lease_rotate_skipped_idle={}",
         max_total_dead_tup,
         final_total_dead_tup,
         maintenance_counters.queue_prune_ok.load(Ordering::Relaxed),
@@ -1067,6 +1105,9 @@ async fn test_queue_storage_storage_benchmark() {
         maintenance_counters
             .queue_rotate_skipped_busy
             .load(Ordering::Relaxed),
+        maintenance_counters
+            .queue_rotate_skipped_idle
+            .load(Ordering::Relaxed),
         maintenance_counters.lease_prune_ok.load(Ordering::Relaxed),
         maintenance_counters
             .lease_prune_blocked
@@ -1074,6 +1115,9 @@ async fn test_queue_storage_storage_benchmark() {
         maintenance_counters.lease_rotate_ok.load(Ordering::Relaxed),
         maintenance_counters
             .lease_rotate_skipped_busy
+            .load(Ordering::Relaxed),
+        maintenance_counters
+            .lease_rotate_skipped_idle
             .load(Ordering::Relaxed),
     );
     println!(
@@ -1137,11 +1181,13 @@ async fn test_queue_storage_storage_benchmark() {
         "queue_prune_skipped_active": maintenance_counters.queue_prune_skipped_active.load(Ordering::Relaxed),
         "queue_rotate_ok": maintenance_counters.queue_rotate_ok.load(Ordering::Relaxed),
         "queue_rotate_skipped_busy": maintenance_counters.queue_rotate_skipped_busy.load(Ordering::Relaxed),
+        "queue_rotate_skipped_idle": maintenance_counters.queue_rotate_skipped_idle.load(Ordering::Relaxed),
         "lease_prune_ok": maintenance_counters.lease_prune_ok.load(Ordering::Relaxed),
         "lease_prune_blocked": maintenance_counters.lease_prune_blocked.load(Ordering::Relaxed),
         "lease_prune_skipped_active": maintenance_counters.lease_prune_skipped_active.load(Ordering::Relaxed),
         "lease_rotate_ok": maintenance_counters.lease_rotate_ok.load(Ordering::Relaxed),
         "lease_rotate_skipped_busy": maintenance_counters.lease_rotate_skipped_busy.load(Ordering::Relaxed),
+        "lease_rotate_skipped_idle": maintenance_counters.lease_rotate_skipped_idle.load(Ordering::Relaxed),
         "samples": samples,
     });
     if let Some(start) = db_profile_start.as_ref() {

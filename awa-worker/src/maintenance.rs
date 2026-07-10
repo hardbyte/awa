@@ -2097,6 +2097,9 @@ impl MaintenanceService {
                             "Skipped busy queue storage queue segment",
                         );
                     }
+                    RotateOutcome::SkippedIdle { slot } => {
+                        debug!(slot, "Skipped idle queue storage queue segment");
+                    }
                 }
             }
             Err(err) => {
@@ -2171,6 +2174,9 @@ impl MaintenanceService {
                             "Skipped busy queue storage lease segment",
                         );
                     }
+                    RotateOutcome::SkippedIdle { slot } => {
+                        debug!(slot, "Skipped idle queue storage lease segment");
+                    }
                 }
             }
             Err(err) => {
@@ -2239,6 +2245,9 @@ impl MaintenanceService {
                             closure_batch_rows = busy.closure_batches,
                             "Skipped busy queue storage claim segment",
                         );
+                    }
+                    RotateOutcome::SkippedIdle { slot } => {
+                        debug!(slot, "Skipped idle queue storage claim segment");
                     }
                 }
             }
