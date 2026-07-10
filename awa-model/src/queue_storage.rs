@@ -366,6 +366,29 @@ enum TerminalDeltaSlotRollup {
     Blocked,
 }
 
+/// Outcome of [`QueueStorage::fold_terminal_rollup_deltas`] (#371).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalRollupFoldOutcome {
+    /// Delta rows consumed (deleted) by the fold.
+    pub folded_delta_rows: usize,
+    /// Distinct (queue, priority) keys upserted into the rollups.
+    pub folded_keys: usize,
+    /// True when the fold stood down because another backend pinned the
+    /// MVCC horizon; the delta rows stay visible to exact readers.
+    pub skipped_mvcc_pinned: bool,
+}
+
+/// Outcome of [`QueueStorage::fold_ring_rotation_ledgers`] (#371).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RingLedgerFoldOutcome {
+    /// Ledger rows trimmed across the queue, lease, and claim rings.
+    pub trimmed_rows: u64,
+    /// True when the fold stood down because another backend pinned the
+    /// MVCC horizon; the ledgers keep their full history until the next
+    /// clear-horizon tick.
+    pub skipped_mvcc_pinned: bool,
+}
+
 /// Discriminator for [`PruneOutcome::SkippedActive`].
 ///
 /// Multiple gates can fire `SkippedActive` for the same ring (e.g. queue
@@ -804,6 +827,99 @@ fn oldest_initialized_ring_slot(
     Some((oldest_slot, oldest_generation))
 }
 
+/// Ring families that share the append-only rotation-ledger pattern
+/// (#371). The current cursor of each ring is the max-generation row of
+/// `{schema}.{ring}_ring_rotations`; the `{ring}_ring_state` singleton
+/// holds only cold config (`slot_count`, plus the #290 trust marker on
+/// the queue ring).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RingFamily {
+    Queue,
+    Lease,
+    Claim,
+}
+
+impl RingFamily {
+    fn name(self) -> &'static str {
+        match self {
+            RingFamily::Queue => "queue",
+            RingFamily::Lease => "lease",
+            RingFamily::Claim => "claim",
+        }
+    }
+
+    fn ledger_relname(self) -> &'static str {
+        match self {
+            RingFamily::Queue => "queue_ring_rotations",
+            RingFamily::Lease => "lease_ring_rotations",
+            RingFamily::Claim => "claim_ring_rotations",
+        }
+    }
+
+    fn state_relname(self) -> &'static str {
+        match self {
+            RingFamily::Queue => "queue_ring_state",
+            RingFamily::Lease => "lease_ring_state",
+            RingFamily::Claim => "claim_ring_state",
+        }
+    }
+
+    /// Advisory-lock name serializing rotate ↔ prune ↔ delta-rollup for
+    /// one ring. Replaces the pre-#371 `FOR UPDATE` on the ring-state
+    /// singleton: the row is gone (cursor lives in the append-only
+    /// ledger), but the mutual exclusion it provided is still required —
+    /// on a fully-initialized ring the rotation target and the prune
+    /// target are the same slot, and rotating into a slot mid-truncate
+    /// would route fresh writes into a partition being wiped.
+    fn rotation_lock_name(self, schema: &str) -> String {
+        format!("awa.queue_storage.ring_rotation:{schema}:{}", self.name())
+    }
+}
+
+/// Latest generation at which `slot` was the ring's open slot, derived
+/// from the current cursor. Rotation advances the cursor slot and the
+/// generation in lock-step by exactly one (`slot = generation mod
+/// slot_count`, genesis at `(0, 0)`), so the ledger's max row determines
+/// every older slot's last-open generation without per-slot state.
+/// Returns `None` for slots the ring has not rotated through yet.
+fn ring_slot_generation(
+    current_slot: i32,
+    generation: i64,
+    slot_count: i32,
+    slot: i32,
+) -> Option<i64> {
+    if slot_count <= 0 || slot < 0 || slot >= slot_count {
+        return None;
+    }
+    let offset = (current_slot - slot).rem_euclid(slot_count) as i64;
+    let slot_generation = generation - offset;
+    (slot_generation >= 0).then_some(slot_generation)
+}
+
+/// All sealed (initialized, non-current) ring slots with their last-open
+/// generations, ordered by generation ascending — the same order the
+/// pre-#371 `queue_ring_slots` scan (`WHERE generation >= 0 AND slot <>
+/// current ORDER BY generation`) produced.
+fn initialized_sealed_ring_slots(
+    current_slot: i32,
+    generation: i64,
+    slot_count: i32,
+) -> Vec<(i32, i64)> {
+    if slot_count <= 1 {
+        return Vec::new();
+    }
+    let initialized_slots = (generation + 1).min(slot_count as i64) as i32;
+    (1..initialized_slots)
+        .rev()
+        .map(|offset| {
+            (
+                (current_slot - offset).rem_euclid(slot_count),
+                generation - offset as i64,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod identifier_tests {
     use super::{validate_ident, QueueStorage, QueueStorageConfig};
@@ -924,6 +1040,82 @@ mod ring_slot_tests {
         assert_eq!(oldest_initialized_ring_slot(7, 7, 8), Some((0, 0)));
         assert_eq!(oldest_initialized_ring_slot(0, 8, 8), Some((1, 1)));
         assert_eq!(oldest_initialized_ring_slot(1, 9, 8), Some((2, 2)));
+    }
+}
+
+#[cfg(test)]
+mod ring_ledger_derivation_tests {
+    use super::{
+        initialized_sealed_ring_slots, oldest_initialized_ring_slot, ring_slot_generation,
+    };
+
+    /// Rotation advances slot and generation in lock-step from genesis
+    /// (0, 0), so the cursor always satisfies `slot = generation mod
+    /// slot_count` and each slot's last-open generation is derivable.
+    #[test]
+    fn cursor_slot_is_generation_mod_slot_count() {
+        for slot_count in [2_i32, 4, 8, 16] {
+            for generation in 0..(slot_count as i64 * 3) {
+                let slot = (generation % slot_count as i64) as i32;
+                assert_eq!(
+                    ring_slot_generation(slot, generation, slot_count, slot),
+                    Some(generation),
+                    "current slot derives to the cursor generation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slot_generation_derives_older_slots() {
+        // Cursor at slot 3, generation 19, slot_count 16: slot 3 opened
+        // at 19, slot 2 at 18, ..., slot 0 at 16, slot 15 at 15, etc.
+        assert_eq!(ring_slot_generation(3, 19, 16, 3), Some(19));
+        assert_eq!(ring_slot_generation(3, 19, 16, 2), Some(18));
+        assert_eq!(ring_slot_generation(3, 19, 16, 0), Some(16));
+        assert_eq!(ring_slot_generation(3, 19, 16, 15), Some(15));
+        assert_eq!(ring_slot_generation(3, 19, 16, 4), Some(4));
+    }
+
+    #[test]
+    fn slot_generation_is_none_for_never_opened_slots() {
+        // Cursor at (2, 2) in an 8-slot ring: slots 3..7 never opened.
+        for slot in 3..8 {
+            assert_eq!(ring_slot_generation(2, 2, 8, slot), None);
+        }
+        // Out-of-range slots are never derivable.
+        assert_eq!(ring_slot_generation(2, 2, 8, -1), None);
+        assert_eq!(ring_slot_generation(2, 2, 8, 8), None);
+    }
+
+    #[test]
+    fn sealed_slots_match_slot_generation_and_ordering() {
+        for slot_count in [2_i32, 4, 8, 16] {
+            for generation in 0..(slot_count as i64 * 2 + 3) {
+                let current_slot = (generation % slot_count as i64) as i32;
+                let sealed =
+                    initialized_sealed_ring_slots(current_slot, generation, slot_count);
+                // Ascending generations, all below the cursor.
+                let mut previous = -1_i64;
+                for &(slot, slot_generation) in &sealed {
+                    assert!(slot_generation > previous);
+                    assert!(slot_generation < generation);
+                    assert_ne!(slot, current_slot);
+                    assert_eq!(
+                        ring_slot_generation(current_slot, generation, slot_count, slot),
+                        Some(slot_generation)
+                    );
+                    previous = slot_generation;
+                }
+                // The oldest sealed slot agrees with the prune target.
+                assert_eq!(
+                    sealed.first().copied(),
+                    oldest_initialized_ring_slot(current_slot, generation, slot_count)
+                );
+                // Ring keeps at most slot_count - 1 sealed slots.
+                assert!(sealed.len() < slot_count as usize);
+            }
+        }
     }
 }
 
@@ -2918,7 +3110,7 @@ impl QueueStorage {
                 if lease_claims_legacy_exists || closures_legacy_exists {
                     Some(
                         sqlx::query_scalar(&format!(
-                            "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
+                            "SELECT slot FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
                         ))
                         .fetch_one(install_tx.as_mut())
                         .await
@@ -3138,13 +3330,17 @@ impl QueueStorage {
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
+                {schema}.queue_terminal_rollup_deltas,
                 {schema}.queue_terminal_live_counts,
                 {schema}.queue_terminal_count_deltas,
                 {schema}.queue_claimer_leases,
                 {schema}.queue_claimer_state,
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots,
-                {schema}.claim_ring_slots
+                {schema}.claim_ring_slots,
+                {schema}.queue_ring_rotations,
+                {schema}.lease_ring_rotations,
+                {schema}.claim_ring_rotations
             "#
         ))
         .execute(tx.as_mut())
@@ -3158,57 +3354,40 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.queue_ring_state
-            SET current_slot = 0,
-                generation = 0,
-                slot_count = $1
-            WHERE singleton = TRUE
-            "#
-        ))
-        .bind(self.queue_slot_count() as i32)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        for (family, slot_count) in [
+            (RingFamily::Queue, self.queue_slot_count()),
+            (RingFamily::Lease, self.lease_slot_count()),
+            (RingFamily::Claim, self.claim_slot_count()),
+        ] {
+            let state = family.state_relname();
+            sqlx::query(&format!(
+                r#"
+                UPDATE {schema}.{state}
+                SET slot_count = $1
+                WHERE singleton = TRUE
+                "#
+            ))
+            .bind(slot_count as i32)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.lease_ring_state
-            SET current_slot = 0,
-                generation = 0,
-                slot_count = $1
-            WHERE singleton = TRUE
-            "#
-        ))
-        .bind(self.lease_slot_count() as i32)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.claim_ring_state
-            SET current_slot = 0,
-                generation = 0,
-                slot_count = $1
-            WHERE singleton = TRUE
-            "#
-        ))
-        .bind(self.claim_slot_count() as i32)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+            // The rotation ledgers were truncated above; re-seed the
+            // genesis cursor (slot 0, generation 0).
+            let ledger = family.ledger_relname();
+            sqlx::query(&format!(
+                "INSERT INTO {schema}.{ledger} (generation, slot) VALUES (0, 0)"
+            ))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
 
         for slot in 0..self.queue_slot_count() {
             sqlx::query(&format!(
-                r#"
-                INSERT INTO {schema}.queue_ring_slots (slot, generation)
-                VALUES ($1, $2)
-                "#
+                "INSERT INTO {schema}.queue_ring_slots (slot) VALUES ($1)"
             ))
             .bind(slot as i32)
-            .bind(if slot == 0 { 0_i64 } else { -1_i64 })
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -3216,13 +3395,9 @@ impl QueueStorage {
 
         for slot in 0..self.lease_slot_count() {
             sqlx::query(&format!(
-                r#"
-                INSERT INTO {schema}.lease_ring_slots (slot, generation)
-                VALUES ($1, $2)
-                "#
+                "INSERT INTO {schema}.lease_ring_slots (slot) VALUES ($1)"
             ))
             .bind(slot as i32)
-            .bind(if slot == 0 { 0_i64 } else { -1_i64 })
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -3230,13 +3405,9 @@ impl QueueStorage {
 
         for slot in 0..self.claim_slot_count() {
             sqlx::query(&format!(
-                r#"
-                INSERT INTO {schema}.claim_ring_slots (slot, generation)
-                VALUES ($1, $2)
-                "#
+                "INSERT INTO {schema}.claim_ring_slots (slot) VALUES ($1)"
             ))
             .bind(slot as i32)
-            .bind(if slot == 0 { 0_i64 } else { -1_i64 })
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -3533,21 +3704,93 @@ impl QueueStorage {
         Ok(start)
     }
 
-    async fn current_queue_ring<'a>(
+    /// Current ring cursor: the max-generation row of the ring's
+    /// append-only rotation ledger (#371). Backward PK scan, O(1).
+    async fn ring_cursor_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        family: RingFamily,
     ) -> Result<(i32, i64), AwaError> {
         let schema = self.schema();
+        let ledger = family.ledger_relname();
         sqlx::query_as(&format!(
             r#"
-            SELECT current_slot, generation
-            FROM {schema}.queue_ring_state
-            WHERE singleton = TRUE
+            SELECT slot, generation
+            FROM {schema}.{ledger}
+            ORDER BY generation DESC
+            LIMIT 1
             "#
         ))
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
+    }
+
+    /// Ring width from the demoted cold-config singleton.
+    async fn ring_slot_count_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        family: RingFamily,
+    ) -> Result<i32, AwaError> {
+        let schema = self.schema();
+        let state = family.state_relname();
+        sqlx::query_scalar(&format!(
+            "SELECT slot_count FROM {schema}.{state} WHERE singleton = TRUE"
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
+    /// Try to take the per-ring rotation lock (transaction-scoped
+    /// advisory lock). Non-blocking: rotate/prune/rollup are periodic
+    /// maintenance ticks, so under contention the caller skips the tick
+    /// instead of queueing behind the holder.
+    async fn try_ring_rotation_lock_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        family: RingFamily,
+    ) -> Result<bool, AwaError> {
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(family.rotation_lock_name(self.schema()))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)
+    }
+
+    /// Append the next rotation to the ring's ledger. The primary key on
+    /// `generation` makes the insert a compare-and-swap: a conflict means
+    /// another rotator observed the same cursor and won — the caller must
+    /// treat `false` as a lost race, not retry with the same generation.
+    async fn append_ring_rotation_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        family: RingFamily,
+        next_generation: i64,
+        next_slot: i32,
+    ) -> Result<bool, AwaError> {
+        let schema = self.schema();
+        let ledger = family.ledger_relname();
+        let inserted = sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.{ledger} (generation, slot)
+            VALUES ($1, $2)
+            ON CONFLICT (generation) DO NOTHING
+            "#
+        ))
+        .bind(next_generation)
+        .bind(next_slot)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(inserted.rows_affected() == 1)
+    }
+
+    async fn current_queue_ring<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    ) -> Result<(i32, i64), AwaError> {
+        self.ring_cursor_tx(tx, RingFamily::Queue).await
     }
 
     async fn next_job_ids<'a>(
@@ -4844,6 +5087,14 @@ impl QueueStorage {
         Ok(rows.len())
     }
 
+    /// Upsert pruned terminal counts into the permanent
+    /// `queue_terminal_rollups` denormaliser, clamping both columns at
+    /// zero. Since #371 this runs only from the horizon-gated fold
+    /// ([`Self::fold_terminal_rollup_deltas`]) — the prune transaction
+    /// appends delta rows instead, so a pinned MVCC horizon cannot pile
+    /// up dead rollup versions. Keys are folded through a `BTreeMap`, so
+    /// the upsert always touches (queue, priority) keys in deterministic
+    /// order.
     async fn adjust_terminal_rollups_batch<'a, I>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4911,6 +5162,73 @@ impl QueueStorage {
                     0,
                     rollups.pruned_failed_count + EXCLUDED.pruned_failed_count
                 )
+            "#
+        ))
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&pruned_completed_deltas)
+        .bind(&pruned_failed_deltas)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Append pruned terminal counts as delta rows (#371). Runs inside
+    /// the prune transaction in place of the pre-#371 rollup upsert;
+    /// deltas are folded into `queue_terminal_rollups` by
+    /// [`Self::fold_terminal_rollup_deltas`] when the MVCC horizon is
+    /// clear.
+    async fn append_terminal_rollup_deltas_tx<'a, I>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deltas: I,
+    ) -> Result<(), AwaError>
+    where
+        I: IntoIterator<Item = (String, i16, i64, i64)>,
+    {
+        let mut grouped: BTreeMap<(String, i16), (i64, i64)> = BTreeMap::new();
+        for (queue, priority, pruned_completed_delta, pruned_failed_delta) in deltas {
+            if pruned_completed_delta == 0 && pruned_failed_delta == 0 {
+                continue;
+            }
+            let entry = grouped.entry((queue, priority)).or_insert((0_i64, 0_i64));
+            entry.0 += pruned_completed_delta;
+            entry.1 += pruned_failed_delta;
+        }
+
+        if grouped.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self.schema();
+        let mut queues = Vec::with_capacity(grouped.len());
+        let mut priorities = Vec::with_capacity(grouped.len());
+        let mut pruned_completed_deltas = Vec::with_capacity(grouped.len());
+        let mut pruned_failed_deltas = Vec::with_capacity(grouped.len());
+
+        for ((queue, priority), (pruned_completed_delta, pruned_failed_delta)) in grouped {
+            queues.push(queue);
+            priorities.push(priority);
+            pruned_completed_deltas.push(pruned_completed_delta);
+            pruned_failed_deltas.push(pruned_failed_delta);
+        }
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.queue_terminal_rollup_deltas (
+                queue,
+                priority,
+                pruned_completed_delta,
+                pruned_failed_delta
+            )
+            SELECT *
+            FROM unnest(
+                $1::text[],
+                $2::smallint[],
+                $3::bigint[],
+                $4::bigint[]
+            )
             "#
         ))
         .bind(&queues)
@@ -6999,6 +7317,8 @@ impl QueueStorage {
                 -- The GREATEST legacy dedupe applies to the completed
                 -- column only: queue_lanes never carried a failed
                 -- column, so failed counts come from the rollups alone.
+                -- Unfolded prune deltas (#371) are added on top of the
+                -- folded rollups so counts stay exact between folds.
                 SELECT
                     COALESCE(
                         sum(
@@ -7006,11 +7326,15 @@ impl QueueStorage {
                                 COALESCE(lanes.pruned_completed_count, 0),
                                 COALESCE(rollups.pruned_completed_count, 0)
                             )
+                            + COALESCE(pending.pruned_completed_delta, 0)
                         ),
                         0
                     )::bigint AS completed,
                     COALESCE(
-                        sum(COALESCE(rollups.pruned_failed_count, 0)),
+                        sum(
+                            COALESCE(rollups.pruned_failed_count, 0)
+                            + COALESCE(pending.pruned_failed_delta, 0)
+                        ),
                         0
                     )::bigint AS failed
                 FROM (
@@ -7023,6 +7347,17 @@ impl QueueStorage {
                     FROM {schema}.queue_terminal_rollups
                     WHERE queue = ANY($1)
                 ) AS rollups
+                USING (queue, priority)
+                FULL OUTER JOIN (
+                    SELECT
+                        queue,
+                        priority,
+                        sum(pruned_completed_delta)::bigint AS pruned_completed_delta,
+                        sum(pruned_failed_delta)::bigint AS pruned_failed_delta
+                    FROM {schema}.queue_terminal_rollup_deltas
+                    WHERE queue = ANY($1)
+                    GROUP BY queue, priority
+                ) AS pending
                 USING (queue, priority)
             ),
             live_running AS (
@@ -7195,18 +7530,25 @@ impl QueueStorage {
         .fetch_one(pool)
         .await
         .map_err(map_sqlx_error)?;
-        // terminal: denormalised rollup only. Live (un-rolled-up)
-        // done_entries rows are excluded — see method-level docs. The
-        // GREATEST legacy dedupe applies to the completed column only:
-        // queue_lanes never carried a failed column.
+        // terminal: denormalised rollup plus unfolded prune deltas
+        // (#371). Live (un-rolled-up) done_entries rows are excluded —
+        // see method-level docs. The GREATEST legacy dedupe applies to
+        // the completed column only: queue_lanes never carried a failed
+        // column.
         let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
             r#"
             SELECT
-                COALESCE(sum(GREATEST(
-                    COALESCE(lanes.pruned_completed_count, 0),
-                    COALESCE(rollups.pruned_completed_count, 0)
-                )), 0)::bigint,
-                COALESCE(sum(COALESCE(rollups.pruned_failed_count, 0)), 0)::bigint
+                COALESCE(sum(
+                    GREATEST(
+                        COALESCE(lanes.pruned_completed_count, 0),
+                        COALESCE(rollups.pruned_completed_count, 0)
+                    )
+                    + COALESCE(pending.pruned_completed_delta, 0)
+                ), 0)::bigint,
+                COALESCE(sum(
+                    COALESCE(rollups.pruned_failed_count, 0)
+                    + COALESCE(pending.pruned_failed_delta, 0)
+                ), 0)::bigint
             FROM (
                 SELECT queue, priority, pruned_completed_count
                 FROM {schema}.queue_lanes
@@ -7217,6 +7559,17 @@ impl QueueStorage {
                 FROM {schema}.queue_terminal_rollups
                 WHERE queue = ANY($1)
             ) AS rollups
+            USING (queue, priority)
+            FULL OUTER JOIN (
+                SELECT
+                    queue,
+                    priority,
+                    sum(pruned_completed_delta)::bigint AS pruned_completed_delta,
+                    sum(pruned_failed_delta)::bigint AS pruned_failed_delta
+                FROM {schema}.queue_terminal_rollup_deltas
+                WHERE queue = ANY($1)
+                GROUP BY queue, priority
+            ) AS pending
             USING (queue, priority)
             "#
         ))
@@ -7244,11 +7597,22 @@ impl QueueStorage {
     ) -> Result<u64, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
+        // Folded rollups plus unfolded prune deltas (#371), so the count
+        // stays exact between maintenance folds.
         let pruned_failed: i64 = sqlx::query_scalar(&format!(
             r#"
-            SELECT COALESCE(sum(pruned_failed_count), 0)::bigint
-            FROM {schema}.queue_terminal_rollups
-            WHERE queue = ANY($1)
+            SELECT
+                COALESCE((
+                    SELECT sum(pruned_failed_count)
+                    FROM {schema}.queue_terminal_rollups
+                    WHERE queue = ANY($1)
+                ), 0)::bigint
+                +
+                COALESCE((
+                    SELECT sum(pruned_failed_delta)
+                    FROM {schema}.queue_terminal_rollup_deltas
+                    WHERE queue = ANY($1)
+                ), 0)::bigint
             "#
         ))
         .bind(&queues)
@@ -8879,9 +9243,10 @@ impl QueueStorage {
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
             ),
             lease_ring AS (
-                SELECT current_slot AS lease_slot, generation AS lease_generation
-                FROM {schema}.lease_ring_state
-                WHERE singleton = TRUE
+                SELECT slot AS lease_slot, generation AS lease_generation
+                FROM {schema}.lease_ring_rotations
+                ORDER BY generation DESC
+                LIMIT 1
             ),
             row_claim_refs AS (
                 -- Source claim metadata directly from the partitioned
@@ -10407,9 +10772,15 @@ impl QueueStorage {
         let schema = self.schema();
         let preferred_slot = sqlx::query_as::<_, (i32, i64, i32)>(&format!(
             r#"
-            SELECT current_slot, generation, slot_count
-            FROM {schema}.claim_ring_state
-            WHERE singleton = TRUE
+            SELECT ledger.slot, ledger.generation, state.slot_count
+            FROM {schema}.claim_ring_state AS state
+            CROSS JOIN LATERAL (
+                SELECT slot, generation
+                FROM {schema}.claim_ring_rotations
+                ORDER BY generation DESC
+                LIMIT 1
+            ) AS ledger
+            WHERE state.singleton = TRUE
             "#
         ))
         .fetch_optional(tx.as_mut())
@@ -13388,17 +13759,26 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let state: (i32, i64, i32) = sqlx::query_as(&format!(
-            r#"
-            SELECT current_slot, generation, slot_count
-            FROM {schema}.queue_ring_state
-            WHERE singleton = TRUE
-            FOR UPDATE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // #371: the per-ring advisory lock replaces the pre-ledger
+        // `FOR UPDATE` on the ring-state singleton for rotate ↔ prune
+        // serialization. Non-blocking: rotation is a periodic tick, so
+        // under contention we skip instead of queueing behind a prune.
+        if !self
+            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue)
+            .await?
+        {
+            let (current_slot, _) = self.ring_cursor_tx(&mut tx, RingFamily::Queue).await?;
+            let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: (current_slot + 1).rem_euclid(slot_count),
+                busy: BusyCounts::default(),
+            });
+        }
+
+        let (current_slot, generation) = self.ring_cursor_tx(&mut tx, RingFamily::Queue).await?;
+        let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
+        let state = (current_slot, generation, slot_count);
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
         let ready_busy =
@@ -13467,10 +13847,8 @@ impl QueueStorage {
         // Idle gate (#371): the next slot is drained; if the *current*
         // slot's children are also empty, the ring received no writes
         // since this slot opened — there is nothing to seal, and the
-        // UPDATEs below would only churn the `queue_ring_state`
-        // singleton and the `queue_ring_slots` row (one dead tuple each
-        // per tick, unreclaimable while an MVCC horizon is pinned).
-        // Skip without touching any row.
+        // ledger append below would only grow the rotation ledger with
+        // rows that carry no sealed data. Skip without touching any row.
         //
         // Race note: a concurrent enqueue that commits into the current
         // slot right after this probe is benign. Rotation is enablement,
@@ -13496,32 +13874,20 @@ impl QueueStorage {
 
         let next_generation = state.1 + 1;
 
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.queue_ring_state
-            SET current_slot = $1,
-                generation = $2
-            WHERE singleton = TRUE
-            "#
-        ))
-        .bind(next_slot)
-        .bind(next_generation)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.queue_ring_slots
-            SET generation = $2
-            WHERE slot = $1
-            "#
-        ))
-        .bind(next_slot)
-        .bind(next_generation)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // Insert-conflict is the CAS: the advisory lock already excludes
+        // well-behaved rotators, so a conflicting generation means some
+        // writer bypassed the lock — treat it as a lost race, never as
+        // retry-with-same-generation.
+        if !self
+            .append_ring_rotation_tx(&mut tx, RingFamily::Queue, next_generation, next_slot)
+            .await?
+        {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: next_slot,
+                busy: BusyCounts::default(),
+            });
+        }
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(RotateOutcome::Rotated {
@@ -13535,23 +13901,30 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        // FOR UPDATE serialises with prune_oldest_leases and parallel
-        // rotators. Without it two rotators can both pass the busy-check,
-        // both compute the same next_slot, and the loser's CAS update
-        // wastes work. `RotateLeasesPlan` in
+        // The per-ring advisory lock serialises with prune_oldest_leases
+        // and parallel rotators (#371 — it replaces the pre-ledger
+        // `FOR UPDATE` on the lease_ring_state singleton). Without it two
+        // rotators can both pass the busy-check, both compute the same
+        // next_slot, and the loser's ledger CAS wastes work.
+        // `RotateLeasesPlan` in
         // `correctness/storage/AwaStorageLockOrder.tla` requires this
         // lock as the first acquired resource for the rotation tx.
-        let state: (i32, i64, i32) = sqlx::query_as(&format!(
-            r#"
-            SELECT current_slot, generation, slot_count
-            FROM {schema}.lease_ring_state
-            WHERE singleton = TRUE
-            FOR UPDATE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        if !self
+            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Lease)
+            .await?
+        {
+            let (current_slot, _) = self.ring_cursor_tx(&mut tx, RingFamily::Lease).await?;
+            let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: (current_slot + 1).rem_euclid(slot_count),
+                busy: BusyCounts::default(),
+            });
+        }
+
+        let (current_slot, generation) = self.ring_cursor_tx(&mut tx, RingFamily::Lease).await?;
+        let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
+        let state = (current_slot, generation, slot_count);
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
         let lease_busy =
@@ -13570,12 +13943,13 @@ impl QueueStorage {
         }
 
         // Idle gate (#371): if the current slot's lease child is empty
-        // there is nothing to seal, and the CAS UPDATE below would only
-        // churn the `lease_ring_state` singleton (the top residual
-        // pinned-horizon dead-tuple accumulator at the historical 250ms
-        // cadence — ~14.4k dead tuples/hour). See `rotate` for the race
-        // analysis: a lease that lands after this probe is sealed one
-        // tick later; nothing is lost.
+        // there is nothing to seal, and the ledger append below would
+        // only grow the rotation ledger (the lease ring was the top
+        // residual pinned-horizon dead-tuple accumulator at the
+        // historical 250ms singleton-UPDATE cadence — ~14.4k dead tuples
+        // per hour). See `rotate` for the race analysis: a lease that
+        // lands after this probe is sealed one tick later; nothing is
+        // lost.
         let current_children = [lease_child_name(schema, state.0 as usize)];
         if Self::relations_all_empty_tx(&mut tx, &current_children).await? {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -13584,27 +13958,12 @@ impl QueueStorage {
 
         let next_generation = state.1 + 1;
 
-        let rotated = sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.lease_ring_state
-            SET current_slot = $1,
-                generation = $2
-            WHERE singleton = TRUE
-              AND current_slot = $3
-              AND generation = $4
-            "#
-        ))
-        .bind(next_slot)
-        .bind(next_generation)
-        .bind(state.0)
-        .bind(state.1)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if rotated.rows_affected() == 0 {
-            // Another rotator beat us to the CAS. Report the bounded
-            // presence evidence we sampled before giving up.
+        if !self
+            .append_ring_rotation_tx(&mut tx, RingFamily::Lease, next_generation, next_slot)
+            .await?
+        {
+            // Another rotator beat us to the ledger CAS. Report the
+            // bounded presence evidence we sampled before giving up.
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
@@ -13773,21 +14132,7 @@ impl QueueStorage {
             return Ok(TerminalDeltaRollupOutcome::default());
         }
 
-        let schema = self.schema();
-        let current_slot: i32 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT current_slot
-            FROM {schema}.queue_ring_state
-            WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let slots = self
-            .terminal_delta_rollup_candidates(pool, current_slot)
-            .await?;
+        let slots = self.terminal_delta_rollup_candidates(pool).await?;
 
         let mut outcome = TerminalDeltaRollupOutcome::default();
         for (slot, generation) in slots {
@@ -13853,22 +14198,29 @@ impl QueueStorage {
     async fn terminal_delta_rollup_candidates(
         &self,
         pool: &PgPool,
-        current_slot: i32,
     ) -> Result<Vec<(i32, i64)>, AwaError> {
         let schema = self.schema();
-        let sealed_slots: Vec<(i32, i64)> = sqlx::query_as(&format!(
-            r#"
-            SELECT slot, generation
-            FROM {schema}.queue_ring_slots
-            WHERE generation >= 0
-              AND slot <> $1
-            ORDER BY generation ASC, slot ASC
-            "#
-        ))
-        .bind(current_slot)
-        .fetch_all(pool)
-        .await
-        .map_err(map_sqlx_error)?;
+        // Sealed slots and their last-open generations are derived from
+        // the rotation-ledger cursor (#371); no per-slot generation rows
+        // exist anymore.
+        let (current_slot, generation, slot_count): (i32, i64, i32) =
+            sqlx::query_as(&format!(
+                r#"
+                SELECT ledger.slot, ledger.generation, state.slot_count
+                FROM {schema}.queue_ring_state AS state
+                CROSS JOIN LATERAL (
+                    SELECT slot, generation
+                    FROM {schema}.queue_ring_rotations
+                    ORDER BY generation DESC
+                    LIMIT 1
+                ) AS ledger
+                WHERE state.singleton = TRUE
+                "#
+            ))
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        let sealed_slots = initialized_sealed_ring_slots(current_slot, generation, slot_count);
 
         let mut pending_slots = Vec::new();
         for (slot, generation) in sealed_slots {
@@ -13908,21 +14260,25 @@ impl QueueStorage {
         let delta_child = terminal_delta_child_name(schema, slot as usize);
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let current_slot: i32 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT current_slot
-            FROM {schema}.queue_ring_state
-            WHERE singleton = TRUE
-            FOR UPDATE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // Ring rotation lock first (stabilises the cursor against rotate
+        // and prune), then the slot row lock — the same order every
+        // queue-ring maintenance tx uses (`RollupPlan` in
+        // `correctness/storage/AwaStorageLockOrder.tla`).
+        if !self
+            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue)
+            .await?
+        {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::Blocked);
+        }
 
-        let slot_generation: Option<i64> = sqlx::query_scalar(&format!(
+        let (current_slot, current_generation) =
+            self.ring_cursor_tx(&mut tx, RingFamily::Queue).await?;
+        let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
+
+        let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
             r#"
-            SELECT generation
+            SELECT slot
             FROM {schema}.queue_ring_slots
             WHERE slot = $1
             FOR UPDATE
@@ -13933,15 +14289,22 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(slot_generation) = slot_generation else {
+        if slot_locked.is_none() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(TerminalDeltaSlotRollup::Empty);
-        };
+        }
 
         if current_slot == slot {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(TerminalDeltaSlotRollup::SkippedActive);
         }
+
+        let Some(slot_generation) =
+            ring_slot_generation(current_slot, current_generation, slot_count, slot)
+        else {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalDeltaSlotRollup::Empty);
+        };
 
         if slot_generation != generation {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -14139,6 +14502,124 @@ impl QueueStorage {
         }
     }
 
+    /// Fold pending `queue_terminal_rollup_deltas` rows into the
+    /// permanent `queue_terminal_rollups` denormaliser (#371).
+    ///
+    /// Queue prune appends per-(queue, priority) delta rows instead of
+    /// upserting the rollups inside the prune transaction, so a pinned
+    /// MVCC horizon cannot pile up dead rollup versions. This fold runs
+    /// from the maintenance leader (piggybacking the 30s terminal-rollup
+    /// tick), stands down while any other backend pins the MVCC horizon
+    /// (the same guard the terminal-count delta rollup uses), and
+    /// otherwise consumes the delta rows with `DELETE ... RETURNING`,
+    /// aggregates them, and upserts the rollups in deterministic
+    /// (queue, priority) order with the historical `GREATEST(0, ...)`
+    /// clamp applied at fold time.
+    ///
+    /// Exact readers ([`Self::queue_counts`], [`Self::queue_counts_fast`],
+    /// [`Self::pruned_failed_count_for_queue`]) add unfolded delta sums to
+    /// their rollup reads, so counts stay exact regardless of fold timing.
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.fold_terminal_rollup_deltas")]
+    pub async fn fold_terminal_rollup_deltas(
+        &self,
+        pool: &PgPool,
+    ) -> Result<TerminalRollupFoldOutcome, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        if Self::terminal_delta_rollup_mvcc_horizon_pinned_tx(&mut tx).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalRollupFoldOutcome {
+                skipped_mvcc_pinned: true,
+                ..Default::default()
+            });
+        }
+
+        let deltas: Vec<(String, i16, i64, i64)> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.queue_terminal_rollup_deltas
+            RETURNING queue, priority, pruned_completed_delta, pruned_failed_delta
+            "#
+        ))
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if deltas.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(TerminalRollupFoldOutcome::default());
+        }
+
+        let folded_delta_rows = deltas.len();
+        let folded_keys = deltas
+            .iter()
+            .map(|(queue, priority, _, _)| (queue.clone(), *priority))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+
+        self.adjust_terminal_rollups_batch(&mut tx, deltas.into_iter())
+            .await?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(TerminalRollupFoldOutcome {
+            folded_delta_rows,
+            folded_keys,
+            skipped_mvcc_pinned: false,
+        })
+    }
+
+    /// Trim the ring-rotation ledgers to one full wrap (#371).
+    ///
+    /// Rotation appends one ledger row per advance; this fold deletes
+    /// rows older than `max_generation - (slot_count - 1)`, retaining one
+    /// row per slot so every sealed slot's last-open generation stays
+    /// directly readable from the ledger. Like the terminal-delta
+    /// rollup, the fold stands down while another backend pins the MVCC
+    /// horizon, so the deleted versions are immediately reclaimable when
+    /// they are created.
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.fold_ring_rotation_ledgers")]
+    pub async fn fold_ring_rotation_ledgers(
+        &self,
+        pool: &PgPool,
+    ) -> Result<RingLedgerFoldOutcome, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        if Self::terminal_delta_rollup_mvcc_horizon_pinned_tx(&mut tx).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RingLedgerFoldOutcome {
+                skipped_mvcc_pinned: true,
+                ..Default::default()
+            });
+        }
+
+        let mut trimmed_rows = 0_u64;
+        for family in [RingFamily::Queue, RingFamily::Lease, RingFamily::Claim] {
+            let ledger = family.ledger_relname();
+            let state = family.state_relname();
+            let deleted = sqlx::query(&format!(
+                r#"
+                DELETE FROM {schema}.{ledger}
+                WHERE generation < (
+                    SELECT max(generation) FROM {schema}.{ledger}
+                ) - (
+                    SELECT slot_count - 1 FROM {schema}.{state} WHERE singleton = TRUE
+                )::bigint
+                "#
+            ))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            trimmed_rows += deleted.rows_affected();
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(RingLedgerFoldOutcome {
+            trimmed_rows,
+            skipped_mvcc_pinned: false,
+        })
+    }
+
     /// Prune the oldest sealed queue ring slot.
     ///
     /// `failed_retention` is the floor for `failed` terminal rows: rows
@@ -14157,35 +14638,54 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let state: (i32,) = sqlx::query_as(&format!(
-            r#"
-            SELECT current_slot
-            FROM {schema}.queue_ring_state
-            WHERE singleton = TRUE
-            FOR UPDATE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // Ring rotation lock replaces the pre-#371 `FOR UPDATE` on the
+        // queue_ring_state singleton: it keeps the cursor stable for the
+        // whole prune so rotate cannot hand the slot being truncated out
+        // to fresh writes.
+        if !self
+            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue)
+            .await?
+        {
+            let (current_slot, generation) =
+                self.ring_cursor_tx(&mut tx, RingFamily::Queue).await?;
+            let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(
+                match oldest_initialized_ring_slot(current_slot, generation, slot_count) {
+                    Some((slot, _)) => PruneOutcome::Blocked { slot },
+                    None => PruneOutcome::Noop,
+                },
+            );
+        }
 
-        let target: Option<(i32, i64)> = sqlx::query_as(&format!(
+        let (current_slot, current_generation) =
+            self.ring_cursor_tx(&mut tx, RingFamily::Queue).await?;
+        let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
+        let state = (current_slot,);
+
+        let Some((slot, generation)) =
+            oldest_initialized_ring_slot(current_slot, current_generation, slot_count)
+        else {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::Noop);
+        };
+
+        // Slot row lock: second resource in the queue-ring lock order
+        // (ring advisory lock → slot row → child ACCESS EXCLUSIVE).
+        let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
             r#"
-            SELECT slot, generation
+            SELECT slot
             FROM {schema}.queue_ring_slots
-            WHERE generation >= 0
-              AND slot <> $1
-            ORDER BY generation ASC, slot ASC
-            LIMIT 1
+            WHERE slot = $1
             FOR UPDATE
             "#
         ))
-        .bind(state.0)
+        .bind(slot)
         .fetch_optional(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some((slot, generation)) = target else {
+        if slot_locked.is_none() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::Noop);
         };
@@ -14297,18 +14797,11 @@ impl QueueStorage {
 
         // #337: failed terminal rows still inside the retention floor
         // are re-homed into the live done segment before the TRUNCATE
-        // so they stay retryable. The queue_ring_state row is held FOR
-        // UPDATE above, which serializes against rotate — the current
-        // slot cannot move while carried rows are re-inserted into it.
+        // so they stay retryable. The ring rotation lock is held above,
+        // which serializes against rotate — the current slot (and its
+        // generation, read from the ledger cursor) cannot move while
+        // carried rows are re-inserted into it.
         let carried_failed_rows = if retention_floor {
-            let (current_generation,): (i64,) = sqlx::query_as(&format!(
-                "SELECT generation FROM {schema}.queue_ring_slots WHERE slot = $1"
-            ))
-            .bind(state.0)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
             // Carried rows are widened to the self-contained synthetic
             // done-row shape (the COALESCE chain mirrors
             // `done_row_projection`) because the ready rows they would
@@ -14517,8 +15010,19 @@ impl QueueStorage {
         match truncate {
             Ok(_) => {
                 if !pruned_terminal_counts.is_empty() {
-                    self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
-                        .await?;
+                    // #371: append the pruned counts as delta rows instead
+                    // of upserting `queue_terminal_rollups` here — the
+                    // upsert under a pinned MVCC horizon left one
+                    // unreclaimable dead rollup version per prune. The
+                    // maintenance leader folds the deltas
+                    // (`fold_terminal_rollup_deltas`) when the horizon is
+                    // clear; exact readers add unfolded delta sums to
+                    // their rollup reads.
+                    self.append_terminal_rollup_deltas_tx(
+                        &mut tx,
+                        pruned_terminal_counts.into_iter(),
+                    )
+                    .await?;
                 }
 
                 // #290: the live counter rows for this slot are about to
@@ -14566,7 +15070,7 @@ impl QueueStorage {
 
         // `PruneLeasesPlan` in
         // `correctness/storage/AwaStorageLockOrder.tla` requires the
-        // sequence `lease_ring_state FOR UPDATE` →
+        // sequence lease-ring advisory lock →
         // `lease_ring_slots[slot] FOR UPDATE` → `ACCESS EXCLUSIVE` on
         // the child. The child lock is bounded by a short
         // transaction-local lock_timeout because pure NOWAIT can starve
@@ -14574,19 +15078,27 @@ impl QueueStorage {
         // wait would put maintenance at the head of the relation-lock
         // queue indefinitely. Without these locks a concurrent
         // rotator can flip the cursor under the prune's liveness check
-        // (current_slot recheck races a CAS update) and prune what
+        // (current_slot recheck races the ledger CAS) and prune what
         // should be the active partition.
-        let state: (i32, i64, i32) = sqlx::query_as(&format!(
-            r#"
-            SELECT current_slot, generation, slot_count
-            FROM {schema}.lease_ring_state
-            WHERE singleton = TRUE
-            FOR UPDATE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        if !self
+            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Lease)
+            .await?
+        {
+            let (current_slot, generation) =
+                self.ring_cursor_tx(&mut tx, RingFamily::Lease).await?;
+            let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(
+                match oldest_initialized_ring_slot(current_slot, generation, slot_count) {
+                    Some((slot, _)) => PruneOutcome::Blocked { slot },
+                    None => PruneOutcome::Noop,
+                },
+            );
+        }
+
+        let (current_slot, generation) = self.ring_cursor_tx(&mut tx, RingFamily::Lease).await?;
+        let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
+        let state = (current_slot, generation, slot_count);
 
         let Some((slot, _generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
         else {
@@ -14629,16 +15141,10 @@ impl QueueStorage {
             return Err(map_sqlx_error(err));
         }
 
-        let current_slot: i32 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT current_slot
-            FROM {schema}.lease_ring_state
-            WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // The ring rotation lock held above keeps the cursor stable, but
+        // keep the explicit recheck to document the truncate
+        // precondition.
+        let (current_slot, _) = self.ring_cursor_tx(&mut tx, RingFamily::Lease).await?;
 
         if current_slot == slot {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -14693,8 +15199,10 @@ impl QueueStorage {
 
     /// ADR-023 claim-ring rotation. Parallel of `rotate_leases`.
     ///
-    /// Advances `claim_ring_state.current_slot` via compare-and-swap. Before
-    /// flipping the cursor the target partition must be drained: the
+    /// Advances the claim-ring cursor by appending to the
+    /// `claim_ring_rotations` ledger (the generation PK insert is the
+    /// compare-and-swap). Before flipping the cursor the target partition
+    /// must be drained: the
     /// `lease_claims_<next>`, `lease_claim_batches_<next>`,
     /// `lease_claim_closures_<next>`, and
     /// `lease_claim_closure_batches_<next>` child tables
@@ -14706,17 +15214,25 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let state: (i32, i64, i32) = sqlx::query_as(&format!(
-            r#"
-            SELECT current_slot, generation, slot_count
-            FROM {schema}.claim_ring_state
-            WHERE singleton = TRUE
-            FOR UPDATE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // Per-ring advisory lock: serialises with prune_oldest_claims and
+        // parallel rotators (#371 — replaces the pre-ledger `FOR UPDATE`
+        // on the claim_ring_state singleton).
+        if !self
+            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Claim)
+            .await?
+        {
+            let (current_slot, _) = self.ring_cursor_tx(&mut tx, RingFamily::Claim).await?;
+            let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: (current_slot + 1).rem_euclid(slot_count),
+                busy: BusyCounts::default(),
+            });
+        }
+
+        let (current_slot, generation) = self.ring_cursor_tx(&mut tx, RingFamily::Claim).await?;
+        let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
+        let state = (current_slot, generation, slot_count);
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
 
@@ -14757,12 +15273,12 @@ impl QueueStorage {
         }
 
         // Idle gate (#371): if every child of the *current* slot is empty
-        // there is no claim evidence to seal, and the CAS UPDATE below
-        // would only churn the `claim_ring_state` singleton (~3.6k dead
-        // tuples/hour under a pinned MVCC horizon at the historical
-        // cadence). See `rotate` for the race analysis: a claim that
-        // lands after this probe is sealed one tick later; nothing is
-        // lost.
+        // there is no claim evidence to seal, and the ledger append below
+        // would only grow the rotation ledger (the pre-ledger singleton
+        // UPDATE accumulated ~3.6k dead tuples/hour under a pinned MVCC
+        // horizon at the historical cadence). See `rotate` for the race
+        // analysis: a claim that lands after this probe is sealed one
+        // tick later; nothing is lost.
         let current_children = [
             claim_child_name(schema, state.0 as usize),
             claim_batch_child_name(schema, state.0 as usize),
@@ -14776,27 +15292,12 @@ impl QueueStorage {
 
         let next_generation = state.1 + 1;
 
-        let rotated = sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.claim_ring_state
-            SET current_slot = $1,
-                generation = $2
-            WHERE singleton = TRUE
-              AND current_slot = $3
-              AND generation = $4
-            "#
-        ))
-        .bind(next_slot)
-        .bind(next_generation)
-        .bind(state.0)
-        .bind(state.1)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if rotated.rows_affected() == 0 {
-            // Lost the CAS race. Report the bounded presence evidence we
-            // sampled before giving up.
+        if !self
+            .append_ring_rotation_tx(&mut tx, RingFamily::Claim, next_generation, next_slot)
+            .await?
+        {
+            // Lost the ledger CAS race. Report the bounded presence
+            // evidence we sampled before giving up.
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
@@ -14824,7 +15325,9 @@ impl QueueStorage {
     /// `lease_claim_closure_batches_<slot>` children. Takes the full ADR-023
     /// lock sequence:
     ///
-    /// 1. `FOR UPDATE` on `claim_ring_state` (serialises with rotate).
+    /// 1. The claim-ring rotation advisory lock (serialises with rotate;
+    ///    #371 — replaces the pre-ledger `FOR UPDATE` on the
+    ///    `claim_ring_state` singleton).
     /// 2. `FOR UPDATE` on the target `claim_ring_slots` row.
     /// 3. Proves every claim in the sealed partition has closure evidence.
     /// 4. `LOCK TABLE ACCESS EXCLUSIVE` on all claim-ring children with a
@@ -14845,17 +15348,28 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let state: (i32, i64, i32) = sqlx::query_as(&format!(
-            r#"
-            SELECT current_slot, generation, slot_count
-            FROM {schema}.claim_ring_state
-            WHERE singleton = TRUE
-            FOR UPDATE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // Claim-ring advisory lock: first resource in `PruneClaimsPlan`
+        // (`correctness/storage/AwaStorageLockOrder.tla`); serialises
+        // with rotate_claims and parallel pruners.
+        if !self
+            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Claim)
+            .await?
+        {
+            let (current_slot, generation) =
+                self.ring_cursor_tx(&mut tx, RingFamily::Claim).await?;
+            let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(
+                match oldest_initialized_ring_slot(current_slot, generation, slot_count) {
+                    Some((slot, _)) => PruneOutcome::Blocked { slot },
+                    None => PruneOutcome::Noop,
+                },
+            );
+        }
+
+        let (current_slot, generation) = self.ring_cursor_tx(&mut tx, RingFamily::Claim).await?;
+        let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
+        let state = (current_slot, generation, slot_count);
 
         let Some((slot, _generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
         else {
@@ -14930,17 +15444,10 @@ impl QueueStorage {
         }
 
         // After taking ACCESS EXCLUSIVE, recheck that the slot is still
-        // not the current one. The ring-state lock should already make
-        // this stable, but keeping the explicit gate documents the
+        // not the current one. The ring rotation lock should already
+        // make this stable, but keeping the explicit gate documents the
         // truncate precondition.
-        let current_slot: i32 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let (current_slot, _) = self.ring_cursor_tx(&mut tx, RingFamily::Claim).await?;
 
         if current_slot == slot {
             tx.commit().await.map_err(map_sqlx_error)?;
