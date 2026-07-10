@@ -1,6 +1,6 @@
 use crate::error::AwaError;
 use sqlx::postgres::PgConnection;
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use tracing::info;
 
 /// Current schema version.
@@ -332,43 +332,70 @@ async fn apply_migrations(conn: &mut PgConnection) -> Result<(), AwaError> {
 /// `migrate()`. Best-effort: any failure is swallowed, since the schema is
 /// already committed and the leader will refresh the cache anyway.
 ///
-/// Runs on its own pooled connection, outside the migration transaction, so it
+/// Runs on a *detached* connection, outside the migration transaction, so it
 /// neither holds the migration advisory lock nor risks rolling back committed
 /// schema on a slow refresh.
+///
+/// ## Why a detached connection, not `pool.begin()`
+///
+/// `migrations::run` may be driven on a short-lived runtime that is dropped the
+/// instant it returns — the Python bridge builds a throwaway `current_thread`
+/// runtime and `block_on`s the whole migration on it (see awa-python's
+/// `run_migrations_offthread`). A *pooled* connection returns to the pool via
+/// an async step on its owning runtime; if that runtime is torn down before the
+/// return completes, the return is guillotined and the connection's pool
+/// semaphore permit is leaked — one leaked permit eventually deadlocks every
+/// later `acquire`, poisoning the client's whole pool. (This was #408's
+/// regression: the warmup's `pool.begin()` was the last pool op before the
+/// throwaway runtime dropped.)
+///
+/// `acquire().detach()` hands us a `PgConnection` the pool no longer tracks:
+/// there is no return-to-pool step to race and no permit to strand. We close it
+/// explicitly with `close().await`, which completes inline before the runtime
+/// goes away. The pool is one connection smaller afterwards; it re-opens a
+/// replacement lazily on the next `acquire`. This runs once per `migrate()`, so
+/// the extra connect is negligible.
 async fn warm_admin_metadata_cache(pool: &PgPool) {
+    // Detach immediately so nothing borrowed from the pool outlives this
+    // function on a runtime that may be about to be dropped.
+    let Ok(conn) = pool.acquire().await else {
+        return;
+    };
+    let mut conn = conn.detach();
+
     let has_refresh: Result<bool, _> = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'refresh_admin_metadata' AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'awa'))",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut conn)
     .await;
-    if !matches!(has_refresh, Ok(true)) {
-        return;
-    }
 
-    // Use a *managed* transaction (not raw `BEGIN; … COMMIT;`): the SET LOCAL
-    // scopes a short statement timeout so a maintenance leader still holding
-    // the cache advisory lock during a slow shutdown can't block us — but if
-    // that timeout fires, the batch aborts and a raw trailing COMMIT would
-    // never run, leaving the pooled connection "idle in transaction (aborted)"
-    // for the next borrower (sqlx doesn't track transactions it didn't open).
-    // pool.begin()'s guard rolls back on drop, keeping the connection clean.
-    let Ok(mut tx) = pool.begin().await else {
-        return;
-    };
-    let refreshed =
-        sqlx::raw_sql("SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata();")
+    if matches!(has_refresh, Ok(true)) {
+        // Managed transaction (not raw `BEGIN; … COMMIT;`): the SET LOCAL scopes
+        // a short statement timeout so a maintenance leader still holding the
+        // cache advisory lock during a slow shutdown can't block us — but if
+        // that timeout fires the batch aborts and a raw trailing COMMIT would
+        // never run, leaving the connection "idle in transaction (aborted)". A
+        // managed transaction's guard rolls back on drop, keeping it clean.
+        if let Ok(mut tx) = conn.begin().await {
+            let refreshed = sqlx::raw_sql(
+                "SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata();",
+            )
             .execute(&mut *tx)
             .await;
-    match refreshed {
-        Ok(_) => {
-            let _ = tx.commit().await;
-        }
-        // Explicit rollback (rather than relying on the Drop guard) so the
-        // connection is returned clean immediately, not on its next use.
-        Err(_) => {
-            let _ = tx.rollback().await;
+            match refreshed {
+                Ok(_) => {
+                    let _ = tx.commit().await;
+                }
+                Err(_) => {
+                    let _ = tx.rollback().await;
+                }
+            }
         }
     }
+
+    // Detached: nothing returns this to the pool, so close it explicitly (inline,
+    // before any short-lived runtime is dropped) rather than leaking the socket.
+    let _ = conn.close().await;
 }
 
 /// The 0.7 migrate gate (#370 / ADR-037).
