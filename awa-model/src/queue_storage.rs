@@ -9270,7 +9270,15 @@ impl QueueStorage {
             WITH inflight(job_id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
             ),
-            lease_ring AS (
+            -- #371: MATERIALIZED pins the max-generation ledger read to a
+            -- single evaluation. Without it PG18 inlines this one-reference
+            -- CTE into the `CROSS JOIN lease_ring` below, and the planner
+            -- re-runs the `ORDER BY generation DESC LIMIT 1` index descent
+            -- once per materialized claim row (loops=N). The pre-ledger
+            -- `lease_ring_state` singleton was a single cached heap read; the
+            -- ledger descent cost scales with unfolded ledger depth, so the
+            -- per-row re-execution regressed the completion hot path.
+            lease_ring AS MATERIALIZED (
                 SELECT slot AS lease_slot, generation AS lease_generation
                 FROM {schema}.lease_ring_rotations
                 ORDER BY generation DESC
