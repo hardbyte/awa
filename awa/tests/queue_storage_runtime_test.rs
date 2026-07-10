@@ -5553,12 +5553,14 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
     client.shutdown(Duration::from_secs(5)).await;
 }
 
-/// Receipts mode + non-zero deadline_duration: the claim path writes
-/// the deadline onto `lease_claims.deadline_at`, and the deadline-rescue
-/// maintenance path force-closes claims whose deadline has passed
-/// without a closure or materialized lease. This exercises the
-/// receipts-side counterpart that `rescue_expired_receipt_deadlines_tx`
-/// adds alongside the lease-side `rescue_expired_deadlines` scan.
+/// Receipts mode + non-zero deadline_duration: the claim path writes the
+/// shared deadline onto compact `lease_claim_batches.deadline_at` (#246 —
+/// one row per claimed batch, not one lease_claims row per job), and the
+/// batch deadline-rescue maintenance path force-closes members whose
+/// deadline has passed without closure evidence or a materialized lease.
+/// This exercises the receipts-side counterpart that
+/// `rescue_expired_receipt_deadlines_tx` adds alongside the lease-side
+/// `rescue_expired_deadlines` scan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim() {
     let (_db_guard, pool) = setup_pool(10).await;
@@ -5589,9 +5591,9 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
     .await;
 
     // Sub-second deadline: rescue should sweep this claim on the next
-    // maintenance tick. The claim write path stores deadline_at on
-    // lease_claims directly; receipts mode no longer rejects
-    // deadline > 0.
+    // maintenance tick. The claim write path stores the shared deadline
+    // on the compact claim batch; deadline > 0 no longer materializes
+    // per-job lease_claims rows.
     let claimed = store
         .claim_runtime_batch(&pool, queue, 1, Duration::from_millis(100))
         .await
@@ -5601,31 +5603,44 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
         claimed[0].claim.lease_claim_receipt,
         "claim should be on the receipts path"
     );
+    assert!(
+        claimed[0].claim.claim_batch_id.is_some(),
+        "deadline-backed claims must use the compact batch representation (#246)"
+    );
 
-    // Verify deadline_at landed on lease_claims.
+    // Verify deadline_at landed on the compact claim batch and that no
+    // per-job lease_claims row was written.
     let deadline_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(&format!(
-        "SELECT deadline_at FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2"
+        "SELECT deadline_at FROM {schema}.lease_claim_batches WHERE batch_id = $1"
     ))
-    .bind(job_id)
-    .bind(claimed[0].job.run_lease)
+    .bind(claimed[0].claim.claim_batch_id)
     .fetch_one(&pool)
     .await
-    .expect("lease_claims row should exist");
+    .expect("lease_claim_batches row should exist");
     assert!(
         deadline_at.is_some(),
-        "deadline_at must be set on the claim when deadline_duration > 0"
+        "deadline_at must be set on the claim batch when deadline_duration > 0"
+    );
+    let row_claims: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.lease_claims"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count lease_claims");
+    assert_eq!(
+        row_claims, 0,
+        "deadline-backed claims must not write row-local lease_claims rows"
     );
 
     sqlx::query(&format!(
-        "UPDATE {schema}.lease_claims \
+        "UPDATE {schema}.lease_claim_batches \
          SET deadline_at = clock_timestamp() - interval '1 millisecond' \
-         WHERE job_id = $1 AND run_lease = $2"
+         WHERE batch_id = $1"
     ))
-    .bind(job_id)
-    .bind(claimed[0].job.run_lease)
+    .bind(claimed[0].claim.claim_batch_id)
     .execute(&pool)
     .await
-    .expect("Failed to expire lease claim deadline");
+    .expect("Failed to expire claim batch deadline");
 
     let rescued = store
         .rescue_expired_deadlines(&pool)
@@ -5634,17 +5649,55 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
     assert_eq!(rescued.len(), 1, "exactly one claim should be rescued");
     assert_eq!(rescued[0].id, job_id);
 
-    // Closure is recorded with outcome='deadline_expired'.
+    // Closure evidence is compact: a lease_claim_closure_batches row with
+    // outcome='deadline_expired' covering the member's receipt_id.
     let outcome: String = sqlx::query_scalar(&format!(
-        "SELECT outcome FROM {schema}.lease_claim_closures \
-         WHERE job_id = $1 AND run_lease = $2"
+        "SELECT outcome FROM {schema}.lease_claim_closure_batches \
+         WHERE receipt_ranges @> $1::bigint"
     ))
-    .bind(job_id)
-    .bind(claimed[0].job.run_lease)
+    .bind(claimed[0].claim.receipt_id)
     .fetch_one(&pool)
     .await
-    .expect("closure row should exist after rescue");
+    .expect("closure batch row should exist after rescue");
     assert_eq!(outcome, "deadline_expired");
+
+    // The rescued attempt is re-routed through retry policy; the job must
+    // become claimable again on a later attempt.
+    let reclaimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim after promote should succeed");
+    let reclaimed = if reclaimed.is_empty() {
+        // The rescued row lands in deferred_jobs with backoff; promote it.
+        sqlx::query(&format!(
+            "UPDATE {schema}.deferred_jobs SET run_at = clock_timestamp() WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("make deferred rescued job due");
+        store
+            .promote_due(&pool, JobState::Retryable, 10)
+            .await
+            .expect("promote rescued job");
+        store
+            .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+            .await
+            .expect("claim promoted rescued job")
+    } else {
+        reclaimed
+    };
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "rescued job must be claimable again after deadline force-close"
+    );
+    assert_eq!(reclaimed[0].job.id, job_id);
+    assert_eq!(
+        reclaimed[0].job.run_lease,
+        claimed[0].job.run_lease + 1,
+        "re-claim must be a fresh attempt"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5686,12 +5739,38 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
     )
     .await;
 
-    let claimed = store
-        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+    // Two separate claim calls produce two compact claim batches (#246),
+    // so the batch deadline cursor has two distinct (deadline_at, batch_id)
+    // entries to sweep.
+    let claimed_first = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
         .await
-        .expect("claim deadline cursor jobs");
-    assert_eq!(claimed.len(), 2);
+        .expect("claim first deadline cursor job");
+    assert_eq!(claimed_first.len(), 1);
+    assert_eq!(claimed_first[0].job.id, first);
+    let claimed_second = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim second deadline cursor job");
+    assert_eq!(claimed_second.len(), 1);
+    assert_eq!(claimed_second[0].job.id, second);
+    let claimed: Vec<_> = claimed_first
+        .iter()
+        .cloned()
+        .chain(claimed_second.iter().cloned())
+        .collect();
     assert!(claimed.iter().all(|entry| entry.claim.lease_claim_receipt));
+    assert!(claimed
+        .iter()
+        .all(|entry| entry.claim.claim_batch_id.is_some()));
+    let first_batch = claimed_first[0]
+        .claim
+        .claim_batch_id
+        .expect("first claim batch id");
+    let second_batch = claimed_second[0]
+        .claim
+        .claim_batch_id
+        .expect("second claim batch id");
 
     store
         .complete_runtime_batch(&pool, &claimed[0..1])
@@ -5700,19 +5779,19 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
 
     sqlx::query(&format!(
         r#"
-        UPDATE {schema}.lease_claims
+        UPDATE {schema}.lease_claim_batches
         SET deadline_at = CASE
-            WHEN job_id = $1 THEN clock_timestamp() - interval '10 seconds'
-            WHEN job_id = $2 THEN clock_timestamp() + interval '10 minutes'
+            WHEN batch_id = $1 THEN clock_timestamp() - interval '10 seconds'
+            WHEN batch_id = $2 THEN clock_timestamp() + interval '10 minutes'
         END
-        WHERE job_id IN ($1, $2)
+        WHERE batch_id IN ($1, $2)
         "#
     ))
-    .bind(first)
-    .bind(second)
+    .bind(first_batch)
+    .bind(second_batch)
     .execute(&pool)
     .await
-    .expect("set receipt deadlines");
+    .expect("set claim batch deadlines");
 
     let rescued = store
         .rescue_expired_deadlines(&pool)
@@ -5723,27 +5802,27 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
         "terminal evidence should close the expired first claim and the future second claim must not be rescued"
     );
 
-    let cursor_job: i64 = sqlx::query_scalar(&format!(
-        "SELECT deadline_cursor_job_id FROM {schema}.claim_ring_slots WHERE slot = $1"
+    let cursor_batch: i64 = sqlx::query_scalar(&format!(
+        "SELECT batch_deadline_cursor_batch_id FROM {schema}.claim_ring_slots WHERE slot = $1"
     ))
     .bind(claimed[0].claim.claim_slot)
     .fetch_one(&pool)
     .await
-    .expect("read deadline cursor");
+    .expect("read batch deadline cursor");
     assert_eq!(
-        cursor_job, first,
-        "deadline cursor should advance past the completed claim instead of rechecking it forever"
+        cursor_batch, first_batch,
+        "batch deadline cursor should advance past the completed batch instead of rechecking it forever"
     );
 
     sqlx::query(&format!(
-        "UPDATE {schema}.lease_claims \
+        "UPDATE {schema}.lease_claim_batches \
          SET deadline_at = clock_timestamp() - interval '1 second' \
-         WHERE job_id = $1"
+         WHERE batch_id = $1"
     ))
-    .bind(second)
+    .bind(second_batch)
     .execute(&pool)
     .await
-    .expect("expire second receipt deadline");
+    .expect("expire second claim batch deadline");
 
     let rescued = store
         .rescue_expired_deadlines(&pool)
@@ -5752,15 +5831,457 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
     assert_eq!(rescued.len(), 1);
     assert_eq!(rescued[0].id, second);
 
-    let closures: i64 = sqlx::query_scalar(&format!(
+    // Compact members close compactly: rescue writes a
+    // lease_claim_closure_batches row, never a row-local closure.
+    let row_closures: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.lease_claim_closures"
     ))
     .fetch_one(&pool)
     .await
     .expect("count receipt closures");
     assert_eq!(
-        closures, 1,
-        "rescued open claim writes explicit closure; compact success does not"
+        row_closures, 0,
+        "compact members must not write row-local closures"
+    );
+    let expired_closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.lease_claim_closure_batches WHERE outcome = 'deadline_expired'"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count deadline_expired closure batches");
+    assert_eq!(expired_closures, 1);
+}
+
+/// Compact deadline claim happy path (#246): a deadline-backed batch claim
+/// completes through the ordinary compact completion path; the batch's
+/// deadline never fires, rescue is a no-op, and the closure evidence
+/// balances the claim evidence (the claim-prune count proof).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_compact_deadline_claim_completes_normally() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_compact_deadline_complete";
+    let schema = "awa_qs_compact_deadline_complete";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 61 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("deadline-backed compact claim");
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].claim.claim_batch_id.is_some());
+
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete deadline-backed compact claim");
+
+    let completed: String = sqlx::query_scalar(&format!(
+        "SELECT outcome FROM {schema}.lease_claim_closure_batches \
+         WHERE receipt_ranges @> $1::bigint"
+    ))
+    .bind(claimed[0].claim.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("completion closure batch for deadline-backed claim");
+    assert_eq!(completed, "completed");
+
+    // Rescue must not touch the completed member even after the deadline
+    // passes: closure evidence wins.
+    sqlx::query(&format!(
+        "UPDATE {schema}.lease_claim_batches SET deadline_at = clock_timestamp() - interval '1 second'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("expire completed batch deadline");
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue after completion");
+    assert!(
+        rescued.is_empty(),
+        "completed deadline-backed claim must not be rescued"
+    );
+
+    // Claim-prune count proof shape: claims (rows + batch members) must
+    // equal closures (explicit + compact closed_count).
+    let (claims_total, closures_total): (i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT
+            (SELECT count(*)::bigint FROM {schema}.lease_claims)
+            + (SELECT COALESCE(sum(claimed_count), 0)::bigint FROM {schema}.lease_claim_batches),
+            (SELECT count(*)::bigint FROM {schema}.lease_claim_closures)
+            + (SELECT COALESCE(sum(closed_count), 0)::bigint FROM {schema}.lease_claim_closure_batches)
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count claim/closure totals");
+    assert_eq!(
+        claims_total, closures_total,
+        "completed deadline-backed batch must satisfy the prune count proof"
+    );
+    let _ = job_id;
+}
+
+/// Partial-batch deadline expiry (#246): two jobs claimed in one call share
+/// one compact batch and one deadline. One member completes before expiry;
+/// after the batch deadline passes, rescue force-closes ONLY the open
+/// member, and the count proof balances (one 'completed' + one
+/// 'deadline_expired' closure for two claimed members).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_compact_deadline_partial_batch_rescues_only_expired_member() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_compact_deadline_partial";
+    let schema = "awa_qs_compact_deadline_partial";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 62 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 63 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(300))
+        .await
+        .expect("claim two jobs in one deadline-backed batch");
+    assert_eq!(claimed.len(), 2);
+    let batch_ids: std::collections::BTreeSet<i64> = claimed
+        .iter()
+        .map(|entry| entry.claim.claim_batch_id.expect("compact batch id"))
+        .collect();
+    assert_eq!(
+        batch_ids.len(),
+        1,
+        "both jobs must land in one compact claim batch"
+    );
+
+    let completed_entry = claimed
+        .iter()
+        .find(|entry| entry.job.id == first)
+        .expect("claimed first job")
+        .clone();
+    let open_entry = claimed
+        .iter()
+        .find(|entry| entry.job.id == second)
+        .expect("claimed second job")
+        .clone();
+
+    store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&completed_entry))
+        .await
+        .expect("complete one member of the deadline batch");
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.lease_claim_batches SET deadline_at = clock_timestamp() - interval '1 second'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("expire shared batch deadline");
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue expired batch members");
+    assert_eq!(rescued.len(), 1, "only the open member is rescued");
+    assert_eq!(rescued[0].id, second);
+
+    let completed_outcome: String = sqlx::query_scalar(&format!(
+        "SELECT outcome FROM {schema}.lease_claim_closure_batches WHERE receipt_ranges @> $1::bigint"
+    ))
+    .bind(completed_entry.claim.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("completed member closure");
+    assert_eq!(completed_outcome, "completed");
+    let expired_outcome: String = sqlx::query_scalar(&format!(
+        "SELECT outcome FROM {schema}.lease_claim_closure_batches WHERE receipt_ranges @> $1::bigint"
+    ))
+    .bind(open_entry.claim.receipt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("expired member closure");
+    assert_eq!(expired_outcome, "deadline_expired");
+
+    // Cursor advances past the batch once every member is closed.
+    let cursor_batch: i64 = sqlx::query_scalar(&format!(
+        "SELECT batch_deadline_cursor_batch_id FROM {schema}.claim_ring_slots WHERE slot = $1"
+    ))
+    .bind(open_entry.claim.claim_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("read batch deadline cursor");
+    assert_eq!(
+        cursor_batch,
+        open_entry.claim.claim_batch_id.expect("batch id"),
+        "batch deadline cursor should advance past the fully-closed batch"
+    );
+
+    let (claims_total, closures_total): (i64, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT
+            (SELECT count(*)::bigint FROM {schema}.lease_claims)
+            + (SELECT COALESCE(sum(claimed_count), 0)::bigint FROM {schema}.lease_claim_batches),
+            (SELECT count(*)::bigint FROM {schema}.lease_claim_closures)
+            + (SELECT COALESCE(sum(closed_count), 0)::bigint FROM {schema}.lease_claim_closure_batches)
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count claim/closure totals");
+    assert_eq!(claims_total, 2);
+    assert_eq!(
+        claims_total, closures_total,
+        "partially-expired batch must still satisfy the prune count proof"
+    );
+}
+
+/// Legacy in-flight row-local deadline claims (written before the #246
+/// compact-deadline upgrade) must still be force-closed by the row-local
+/// deadline rescue path after a rolling upgrade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_legacy_row_deadline_claim_still_rescued() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_legacy_row_deadline";
+    let schema = "awa_qs_legacy_row_deadline";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 64 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("claim job to transplant into legacy shape");
+    assert_eq!(claimed.len(), 1);
+    let entry = claimed[0].clone();
+
+    // Transplant the compact batch claim into the pre-upgrade shape: one
+    // row-local lease_claims row with an (already expired) deadline and no
+    // batch row — exactly what in-flight deadline claims look like when a
+    // 0.6 node wrote them just before the upgrade landed.
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.lease_claim_batches WHERE batch_id = $1"
+    ))
+    .bind(entry.claim.claim_batch_id)
+    .execute(&pool)
+    .await
+    .expect("remove compact batch row");
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.lease_claims (
+            claim_slot, receipt_id, job_id, run_lease, ready_slot,
+            ready_generation, queue, priority, attempt, max_attempts,
+            lane_seq, enqueue_shard, deadline_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            clock_timestamp() - interval '1 second'
+        )
+        "#
+    ))
+    .bind(entry.claim.claim_slot)
+    .bind(entry.claim.receipt_id)
+    .bind(entry.job.id)
+    .bind(entry.job.run_lease)
+    .bind(entry.claim.ready_slot)
+    .bind(entry.claim.ready_generation)
+    .bind(&entry.claim.queue)
+    .bind(entry.claim.priority)
+    .bind(entry.job.attempt)
+    .bind(entry.job.max_attempts)
+    .bind(entry.claim.lane_seq)
+    .bind(entry.claim.enqueue_shard)
+    .execute(&pool)
+    .await
+    .expect("insert legacy row-local deadline claim");
+
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue legacy row-local deadline claim");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, job_id);
+
+    let outcome: String = sqlx::query_scalar(&format!(
+        "SELECT outcome FROM {schema}.lease_claim_closures WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(entry.job.run_lease)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy row closure");
+    assert_eq!(outcome, "deadline_expired");
+}
+
+/// Rotation/prune interaction (#246): an expired deadline batch in a sealed
+/// claim slot keeps `prune_oldest_claims` at SkippedActive (the count proof
+/// sees an open member) until deadline rescue writes the closure; the next
+/// prune TRUNCATEs the slot and resets the batch deadline cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_expired_deadline_batch_blocks_prune_until_rescued() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_deadline_batch_prune_gate";
+    let schema = "awa_qs_deadline_batch_prune_gate";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 4,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 65 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("deadline-backed compact claim in slot 0");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].claim.claim_slot, 0);
+
+    // Seal slot 0 by rotating the claim ring, then expire the batch.
+    match store.rotate_claims(&pool).await.expect("rotate claims") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("expected rotate to slot 1, got {other:?}"),
+    }
+    sqlx::query(&format!(
+        "UPDATE {schema}.lease_claim_batches SET deadline_at = clock_timestamp() - interval '1 second'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("expire sealed-slot batch deadline");
+
+    // Prune must refuse while the expired member has no closure evidence.
+    let blocked = store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("prune with open claim");
+    assert!(
+        matches!(
+            blocked,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::ClaimOpen,
+                ..
+            }
+        ),
+        "prune must skip while the expired batch member is unclosed, got {blocked:?}"
+    );
+
+    // Deadline rescue force-closes the sealed slot's expired member
+    // (oldest initialized slot is swept first).
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue sealed-slot expired batch");
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].id, job_id);
+
+    let pruned = store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("prune after rescue");
+    match pruned {
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("expected Pruned {{ slot: 0 }}, got {other:?}"),
+    }
+
+    let (cursor_deadline_reset, cursor_batch): (bool, i64) = sqlx::query_as(&format!(
+        r#"
+        SELECT
+            batch_deadline_cursor_deadline_at = '-infinity'::timestamptz,
+            batch_deadline_cursor_batch_id
+        FROM {schema}.claim_ring_slots
+        WHERE slot = 0
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read batch deadline cursor after prune");
+    assert!(
+        cursor_deadline_reset && cursor_batch == 0,
+        "prune must reset the batch deadline cursor for the truncated slot"
     );
 }
 
