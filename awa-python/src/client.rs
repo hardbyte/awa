@@ -27,6 +27,36 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Run schema migrations off the asyncio event loop.
+///
+/// `migrations::run` is `!Send` (it holds a pooled connection / open
+/// transaction across awaits), so it cannot be awaited directly inside the
+/// `future_into_py` bridge, whose future must be `Send`. We drive it on a
+/// throwaway `current_thread` runtime inside `spawn_blocking` — this keeps the
+/// asyncio loop free and lets `asyncio.wait_for()` cancel the outer call.
+///
+/// This lives in a dedicated `async fn` (taking the pool *by value*) rather
+/// than inline in each caller on purpose: the `!Send` migration future is
+/// confined to this function's concrete, named future, so it never leaks into
+/// the caller's `future_into_py` block where rustc's auto-trait solver would
+/// otherwise have to reason about it. Awaiting the `!Send` `block_on` result
+/// inline (via `spawn_blocking(..).await`) trips a higher-ranked
+/// `Send`/`Executor is not general enough` inference error on some rustc
+/// versions (observed on 1.97); routing through this helper keeps the outer
+/// future unambiguously `Send` across toolchains.
+async fn run_migrations_offthread(pool: PgPool) -> PyResult<()> {
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build current_thread runtime for migrate");
+        rt.block_on(awa_model::migrations::run(&pool))
+    })
+    .await
+    .map_err(|e| state_error(format!("migration task failed: {e}")))?
+    .map_err(map_awa_error)
+}
+
 fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     if !timeout_seconds.is_finite() || timeout_seconds.is_sign_negative() {
         return Err(map_awa_error(awa_model::AwaError::Validation(
@@ -570,20 +600,8 @@ impl PyClient {
 
     fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        // migrations::run() is !Send (holds PoolConnection across awaits).
-        // We bridge it via spawn_blocking + a current_thread runtime so the
-        // asyncio event loop stays free and asyncio.wait_for() can cancel.
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build current_thread runtime for migrate");
-                rt.block_on(awa_model::migrations::run(&pool))
-            })
-            .await
-            .map_err(|e| state_error(format!("migration task failed: {e}")))?
-            .map_err(map_awa_error)?;
+            run_migrations_offthread(pool).await?;
             Ok(())
         })
     }
@@ -658,23 +676,12 @@ impl PyClient {
                     // schema is configured to a non-`awa` name this is
                     // just a quick idempotent no-op.
                     //
-                    // `migrations::run` is `!Send` (holds a
-                    // `PoolConnection` across awaits), and this async
-                    // block goes through `future_into_py` which
-                    // requires `Send`. Bridge via spawn_blocking +
-                    // current_thread runtime, the same pattern
-                    // `Self::migrate` uses.
-                    let pool_for_migrate = pool.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("failed to build current_thread runtime for migrate");
-                        rt.block_on(awa_model::migrations::run(&pool_for_migrate))
-                    })
-                    .await
-                    .map_err(|e| state_error(format!("migration task failed: {e}")))?
-                    .map_err(map_awa_error)?;
+                    // Re-run the control-plane migrations off-thread (they are
+                    // `!Send`), the same pattern `Self::migrate` uses. Routed
+                    // through the shared helper so the `!Send` migration future
+                    // stays out of this `future_into_py` block — see
+                    // `run_migrations_offthread`.
+                    run_migrations_offthread(pool.clone()).await?;
                     store.prepare_schema(&pool).await.map_err(map_awa_error)?;
                     store.reset(&pool).await.map_err(map_awa_error)?;
                     store.activate_backend(&pool).await.map_err(map_awa_error)?;
