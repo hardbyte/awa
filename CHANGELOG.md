@@ -9,9 +9,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - **0.7 migrate gate ([#370](https://github.com/hardbyte/awa/issues/370), [ADR-037](docs/adr/037-canonical-engine-deprecation.md)).** `awa migrate` (and `awa_model::migrations::run`) now refuses to apply pending migrations unless the storage transition is finalized (`state = active`) or the install is fresh (no jobs, no recently-live runtimes — the same conditions as worker-startup auto-finalize). Nothing is applied on refusal; the error names the finalize steps. Complete the staged transition on 0.6 binaries first: see [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).
 - **Canonical engine deprecated.** Runtimes whose effective storage resolves to the canonical engine log a startup deprecation warning; canonical claim/execution/trigger paths will be removed in 0.8.
 
+### Performance
+
+- **Compact deadline receipt claims ([#246](https://github.com/hardbyte/awa/issues/246), [ADR-023](docs/adr/023-receipt-plane-ring-partitioning.md)).** Deadline-backed receipt claims (the default when a queue sets `deadline_duration > 0`) now write the same compact `lease_claim_batches` row as zero-deadline claims — every job claimed in one `claim_ready_runtime` call shares one `claimed_at`, hence one `deadline_at` — instead of one row-local `lease_claims` row per job. At 256-worker saturation this removes ~83k steady-state live `lease_claims` rows and the associated end-to-end p99 regression. Migration **v041** refreshes every installed queue-storage schema with the compact claim function, a per-slot batch deadline-rescue cursor on `claim_ring_slots`, and a partial `(deadline_at, batch_id) WHERE deadline_at IS NOT NULL` sweep index per `lease_claim_batches` child. Additive only: row-local `lease_claims` and its deadline cursor are retained for claims that materialize into mutable leases and for legacy in-flight claims written before the upgrade.
+
 ### Correctness
 
 - `AwaStorageTransition.tla` models the 0.7 migrate gate (`Migrate07OnlyOnQuiescedCanonical`), with an expected-counterexample config (`AwaStorageTransitionMigrate07Ungated.cfg`) witnessing why the gate is required; the transition model family runs in nightly CI via the TLC suite runner (`correctness/run-tlc-suite.sh`).
+- Compact deadline claims ([#246](https://github.com/hardbyte/awa/issues/246)) preserve the `AwaSegmentedStorage.tla` receipt-plane invariants (`NoLostClaim`, `PrunedClaimSegmentsAreEmpty`): the lifecycle model already abstracts row-local and compact claims as `claimOpen`/`claimClosed`, so a deadline-backed claim force-closed by batch deadline rescue is covered by the existing `RescueStaleReceipt` / `RescueToReady` transitions. The full TLC suite re-passed (`AwaSegmentedStorage`: 790,881 states, depth 24); `MAPPING.md` and the spec's claim-family comment record that both deadline modes are now compact.
 
 ### Features
 
