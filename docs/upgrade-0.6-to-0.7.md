@@ -49,6 +49,31 @@ transition to `finalize`, then upgrade to 0.7. A 0.7 binary will not migrate a 0
 schema directly — stepping-stone upgrades are the supported path (the same pattern Oban,
 River, and Postgres itself use).
 
+## The v041 ring-rotation ledger migration — lockstep, no mixed fleet
+
+Migration **v041** ([#371](https://github.com/hardbyte/awa/issues/371),
+[ADR-040](adr/040-append-only-ring-rotation-ledger.md)) is the one 0.7 migration that
+**breaks the normal binary/schema skew window**. It moves the queue/lease/claim ring
+cursors out of the mutable `{ring}_ring_state` singleton columns (`current_slot`,
+`generation`) into append-only `{ring}_ring_rotations` ledgers, and then **drops those
+columns** after seeding the ledger from them. This is a deliberate exception to the
+otherwise additive-only migration policy: a pre-v041 binary that read a now-frozen cursor
+would silently misroute writes into sealed slots, so the migration removes the column to
+turn that into a loud, safe failure instead.
+
+**Consequence: binaries and v041 must move together. Do not run a mixed fleet of pre-
+and post-v041 binaries against one database.** Because the cursor columns are gone, a
+0.6 (or any pre-v041) binary cannot claim, enqueue, or rotate against a v041 schema — it
+fails loudly. This one migration needs a brief **stop-the-world** window:
+
+1. Stop or fully drain all workers (no pre-v041 binary left connected).
+2. Run `awa migrate` (applies v041; seeds the ledgers before dropping the columns, so the
+   current cursor survives exactly).
+3. Start the 0.7 binaries.
+
+Fresh installs are unaffected — they get the ledger shape directly. Rolling upgrades that
+keep old binaries live across this migration are **not** supported for v041.
+
 ## Runtime deprecation warning
 
 Any 0.7 worker whose effective storage resolves to the canonical engine — an unfinalized
@@ -58,7 +83,10 @@ still works in 0.7, and is gone in 0.8.
 
 ## Rollback
 
-0.7's gate itself changes nothing in the database. If you deploy 0.7 binaries against a
-finalized cluster and need to roll back to 0.6 binaries, that is supported within the
-documented skew window: a binary one minor version behind the schema must work or fail
-loudly. There is no schema downgrade path (unchanged from previous releases).
+0.7's migrate *gate* itself changes nothing in the database. However, once migration
+**v041** has run (see above), the one-minor-version binary/schema skew window no longer
+applies: a 0.6 binary against a v041 schema fails loudly (the ring-cursor columns it reads
+are gone), so rolling back to 0.6 binaries after applying v041 is **not** supported. Roll
+back the binary only to a build that also carries the v041 ledger cursor (i.e. another 0.7
+build). Before v041 is applied, the normal skew guarantee holds. There is no schema
+downgrade path (unchanged from previous releases).
