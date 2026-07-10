@@ -2832,9 +2832,15 @@ BEGIN
     IF p_lease_claim_receipts THEN
         v_claimed_cte := format(
             $cte$
-            claim_ring AS (
+            claim_ring AS MATERIALIZED (
                 -- #371: current claim cursor = max-generation ledger row
-                -- (backward PK scan, O(1)).
+                -- (backward PK scan, O(1)). MATERIALIZED pins it to a
+                -- single evaluation: this single-reference CTE would
+                -- otherwise be inlined and re-run the backward index
+                -- descent once per selected row (loops=N) on the inner
+                -- side of the claim_attempt_batches nested loop. The
+                -- pre-ledger claim_ring_state singleton was one cached
+                -- read; the per-row ledger descent regressed claim yield.
                 SELECT slot AS claim_slot
                 FROM %1$I.claim_ring_rotations
                 ORDER BY generation DESC
@@ -3674,9 +3680,15 @@ BEGIN
             END IF;
 
             RETURN QUERY
-            WITH lease_ring AS (
+            WITH lease_ring AS MATERIALIZED (
                 -- #371: current lease cursor = max-generation ledger row
-                -- (backward PK scan, O(1)).
+                -- (backward PK scan, O(1)). MATERIALIZED pins it to a
+                -- single evaluation: this single-reference CTE would
+                -- otherwise be inlined and re-run the backward index
+                -- descent once per claimed row (loops=N) on the inner
+                -- side of the final CROSS JOIN. The pre-ledger
+                -- lease_ring_state singleton was one cached read; the
+                -- per-row ledger descent regressed claim yield.
                 SELECT slot AS lease_slot, generation AS lease_generation
                 FROM %1$I.lease_ring_rotations
                 ORDER BY generation DESC
