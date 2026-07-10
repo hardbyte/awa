@@ -50,7 +50,6 @@ SET search_path = pg_catalog, awa, public
 AS $install$
 DECLARE
     v_slot           INT;
-    v_initial_gen    BIGINT;
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
 BEGIN
@@ -111,15 +110,25 @@ BEGIN
     EXECUTE format('CREATE SEQUENCE IF NOT EXISTS %I.job_id_seq', p_schema);
 
     --------------------------------------------------------------------
-    -- Ring-state singletons (queue / lease / claim) and slot tables.
+    -- Ring-state singletons (queue / lease / claim), rotation ledgers,
+    -- and slot tables.
+    --
+    -- #371: the ring cursor lives in an append-only rotation ledger
+    -- (`{ring}_ring_rotations`); the current cursor is the max-generation
+    -- row (backward PK scan, O(1)). The `{ring}_ring_state` singletons are
+    -- demoted to cold per-schema config (`slot_count`, plus the #290 trust
+    -- marker on the queue ring) and are no longer written per rotation.
+    -- The legacy `current_slot` / `generation` cursor columns are DROPPED
+    -- after being copied into the ledger: a pre-0.7 binary reading a stale
+    -- frozen cursor would silently misroute writes, while a missing column
+    -- is a loud, safe failure. This is a deliberate exception to the
+    -- additive-only migration policy — see the v041 migration notes.
     --------------------------------------------------------------------
 
     EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.queue_ring_state (
             singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-            current_slot INT NOT NULL,
-            generation   BIGINT NOT NULL,
             slot_count   INT NOT NULL
         )
         $ddl$,
@@ -148,17 +157,61 @@ BEGIN
     );
 
     EXECUTE format(
-        'INSERT INTO %I.queue_ring_state (singleton, current_slot, generation, slot_count) VALUES (TRUE, 0, 0, %s) ON CONFLICT (singleton) DO NOTHING',
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.queue_ring_rotations (
+            generation BIGINT PRIMARY KEY,
+            slot       INT NOT NULL,
+            rotated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        )
+        $ddl$,
+        p_schema
+    );
+
+    -- Upgrade path: seed the ledger from the legacy singleton cursor
+    -- BEFORE dropping the columns, so the current cursor survives the
+    -- representation change exactly.
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = p_schema
+          AND table_name = 'queue_ring_state'
+          AND column_name = 'current_slot'
+    ) THEN
+        EXECUTE format(
+            'INSERT INTO %1$I.queue_ring_rotations (generation, slot) SELECT generation, current_slot FROM %1$I.queue_ring_state WHERE singleton ON CONFLICT (generation) DO NOTHING',
+            p_schema
+        );
+        EXECUTE format(
+            'ALTER TABLE %I.queue_ring_state DROP COLUMN current_slot, DROP COLUMN generation',
+            p_schema
+        );
+    END IF;
+
+    EXECUTE format(
+        'INSERT INTO %I.queue_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
         p_schema, p_queue_slot_count
+    );
+
+    -- Genesis cursor for fresh installs: slot 0, generation 0.
+    EXECUTE format(
+        'INSERT INTO %1$I.queue_ring_rotations (generation, slot) SELECT 0, 0 WHERE NOT EXISTS (SELECT 1 FROM %1$I.queue_ring_rotations)',
+        p_schema
     );
 
     EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.queue_ring_slots (
-            slot       INT PRIMARY KEY,
-            generation BIGINT NOT NULL
+            slot INT PRIMARY KEY
         )
         $ddl$,
+        p_schema
+    );
+
+    -- #371: per-slot generations are derived from the rotation ledger
+    -- (`slot = generation mod slot_count`; rotation advances both by
+    -- exactly one), so the mutable per-rotate generation column is gone.
+    -- The slot rows remain as row-lock targets and cursor holders.
+    EXECUTE format(
+        'ALTER TABLE %I.queue_ring_slots DROP COLUMN IF EXISTS generation',
         p_schema
     );
 
@@ -179,8 +232,6 @@ BEGIN
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.lease_ring_state (
             singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-            current_slot INT NOT NULL,
-            generation   BIGINT NOT NULL,
             slot_count   INT NOT NULL
         )
         $ddl$,
@@ -201,17 +252,53 @@ BEGIN
     );
 
     EXECUTE format(
-        'INSERT INTO %I.lease_ring_state (singleton, current_slot, generation, slot_count) VALUES (TRUE, 0, 0, %s) ON CONFLICT (singleton) DO NOTHING',
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.lease_ring_rotations (
+            generation BIGINT PRIMARY KEY,
+            slot       INT NOT NULL,
+            rotated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        )
+        $ddl$,
+        p_schema
+    );
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = p_schema
+          AND table_name = 'lease_ring_state'
+          AND column_name = 'current_slot'
+    ) THEN
+        EXECUTE format(
+            'INSERT INTO %1$I.lease_ring_rotations (generation, slot) SELECT generation, current_slot FROM %1$I.lease_ring_state WHERE singleton ON CONFLICT (generation) DO NOTHING',
+            p_schema
+        );
+        EXECUTE format(
+            'ALTER TABLE %I.lease_ring_state DROP COLUMN current_slot, DROP COLUMN generation',
+            p_schema
+        );
+    END IF;
+
+    EXECUTE format(
+        'INSERT INTO %I.lease_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
         p_schema, p_lease_slot_count
+    );
+
+    EXECUTE format(
+        'INSERT INTO %1$I.lease_ring_rotations (generation, slot) SELECT 0, 0 WHERE NOT EXISTS (SELECT 1 FROM %1$I.lease_ring_rotations)',
+        p_schema
     );
 
     EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.lease_ring_slots (
-            slot       INT PRIMARY KEY,
-            generation BIGINT NOT NULL
+            slot INT PRIMARY KEY
         )
         $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.lease_ring_slots DROP COLUMN IF EXISTS generation',
         p_schema
     );
 
@@ -233,8 +320,6 @@ BEGIN
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.claim_ring_state (
             singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-            current_slot INT NOT NULL,
-            generation   BIGINT NOT NULL,
             slot_count   INT NOT NULL
         )
         $ddl$,
@@ -255,15 +340,46 @@ BEGIN
     );
 
     EXECUTE format(
-        'INSERT INTO %I.claim_ring_state (singleton, current_slot, generation, slot_count) VALUES (TRUE, 0, 0, %s) ON CONFLICT (singleton) DO NOTHING',
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.claim_ring_rotations (
+            generation BIGINT PRIMARY KEY,
+            slot       INT NOT NULL,
+            rotated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        )
+        $ddl$,
+        p_schema
+    );
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = p_schema
+          AND table_name = 'claim_ring_state'
+          AND column_name = 'current_slot'
+    ) THEN
+        EXECUTE format(
+            'INSERT INTO %1$I.claim_ring_rotations (generation, slot) SELECT generation, current_slot FROM %1$I.claim_ring_state WHERE singleton ON CONFLICT (generation) DO NOTHING',
+            p_schema
+        );
+        EXECUTE format(
+            'ALTER TABLE %I.claim_ring_state DROP COLUMN current_slot, DROP COLUMN generation',
+            p_schema
+        );
+    END IF;
+
+    EXECUTE format(
+        'INSERT INTO %I.claim_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
         p_schema, p_claim_slot_count
+    );
+
+    EXECUTE format(
+        'INSERT INTO %1$I.claim_ring_rotations (generation, slot) SELECT 0, 0 WHERE NOT EXISTS (SELECT 1 FROM %1$I.claim_ring_rotations)',
+        p_schema
     );
 
     EXECUTE format(
         $ddl$
         CREATE TABLE IF NOT EXISTS %I.claim_ring_slots (
             slot                       INT PRIMARY KEY,
-            generation                 BIGINT NOT NULL,
             rescue_cursor_claimed_at   TIMESTAMPTZ NOT NULL DEFAULT '-infinity'::timestamptz,
             rescue_cursor_job_id       BIGINT NOT NULL DEFAULT 0,
             rescue_cursor_run_lease    BIGINT NOT NULL DEFAULT 0,
@@ -285,6 +401,11 @@ BEGIN
             ADD COLUMN IF NOT EXISTS deadline_cursor_job_id BIGINT NOT NULL DEFAULT 0,
             ADD COLUMN IF NOT EXISTS deadline_cursor_run_lease BIGINT NOT NULL DEFAULT 0
         $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.claim_ring_slots DROP COLUMN IF EXISTS generation',
         p_schema
     );
 
@@ -895,6 +1016,25 @@ BEGIN
 
     EXECUTE format(
         'ALTER TABLE %I.queue_terminal_rollups ADD COLUMN IF NOT EXISTS pruned_failed_count BIGINT NOT NULL DEFAULT 0',
+        p_schema
+    );
+
+    -- #371: queue prune appends its per-(queue, priority) pruned terminal
+    -- counts here instead of upserting `queue_terminal_rollups` in the
+    -- prune transaction (an upsert under a pinned MVCC horizon leaves an
+    -- unreclaimable dead rollup version per prune). The maintenance
+    -- leader folds the deltas into the rollups when the horizon is clear;
+    -- exact readers add the unfolded delta sums to their rollup reads.
+    EXECUTE format(
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.queue_terminal_rollup_deltas (
+            queue                  TEXT NOT NULL,
+            priority               SMALLINT NOT NULL,
+            pruned_completed_delta BIGINT NOT NULL DEFAULT 0,
+            pruned_failed_delta    BIGINT NOT NULL DEFAULT 0,
+            recorded_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        )
+        $ddl$,
         p_schema
     );
 
@@ -2693,9 +2833,12 @@ BEGIN
         v_claimed_cte := format(
             $cte$
             claim_ring AS (
-                SELECT current_slot AS claim_slot
-                FROM %1$I.claim_ring_state
-                WHERE singleton = TRUE
+                -- #371: current claim cursor = max-generation ledger row
+                -- (backward PK scan, O(1)).
+                SELECT slot AS claim_slot
+                FROM %1$I.claim_ring_rotations
+                ORDER BY generation DESC
+                LIMIT 1
             ),
             claim_attempt_batches AS (
                 INSERT INTO %1$I.ready_claim_attempt_batches AS attempt_rows (
@@ -3532,9 +3675,12 @@ BEGIN
 
             RETURN QUERY
             WITH lease_ring AS (
-                SELECT current_slot AS lease_slot, generation AS lease_generation
-                FROM %1$I.lease_ring_state
-                WHERE singleton = TRUE
+                -- #371: current lease cursor = max-generation ledger row
+                -- (backward PK scan, O(1)).
+                SELECT slot AS lease_slot, generation AS lease_generation
+                FROM %1$I.lease_ring_rotations
+                ORDER BY generation DESC
+                LIMIT 1
             ),
             selected AS (
                 SELECT
@@ -3658,31 +3804,29 @@ BEGIN
     );
 
     --------------------------------------------------------------------
-    -- Seed ring-slot generation rows. Slot 0 starts at generation 0;
-    -- the rest start at -1 (sentinel for "never rotated through").
+    -- Seed ring-slot rows. These are row-lock targets (and, for the
+    -- claim ring, rescue-cursor holders); per-slot generations are
+    -- derived from the rotation ledger (#371).
     --------------------------------------------------------------------
 
     FOR v_slot IN 0..(p_queue_slot_count - 1) LOOP
-        v_initial_gen := CASE WHEN v_slot = 0 THEN 0 ELSE -1 END;
         EXECUTE format(
-            'INSERT INTO %I.queue_ring_slots (slot, generation) VALUES (%s, %s) ON CONFLICT (slot) DO NOTHING',
-            p_schema, v_slot, v_initial_gen
+            'INSERT INTO %I.queue_ring_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING',
+            p_schema, v_slot
         );
     END LOOP;
 
     FOR v_slot IN 0..(p_lease_slot_count - 1) LOOP
-        v_initial_gen := CASE WHEN v_slot = 0 THEN 0 ELSE -1 END;
         EXECUTE format(
-            'INSERT INTO %I.lease_ring_slots (slot, generation) VALUES (%s, %s) ON CONFLICT (slot) DO NOTHING',
-            p_schema, v_slot, v_initial_gen
+            'INSERT INTO %I.lease_ring_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING',
+            p_schema, v_slot
         );
     END LOOP;
 
     FOR v_slot IN 0..(p_claim_slot_count - 1) LOOP
-        v_initial_gen := CASE WHEN v_slot = 0 THEN 0 ELSE -1 END;
         EXECUTE format(
-            'INSERT INTO %I.claim_ring_slots (slot, generation) VALUES (%s, %s) ON CONFLICT (slot) DO NOTHING',
-            p_schema, v_slot, v_initial_gen
+            'INSERT INTO %I.claim_ring_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING',
+            p_schema, v_slot
         );
     END LOOP;
 END;
@@ -3752,10 +3896,13 @@ BEGIN
 
     IF to_regclass('awa.lease_claims_legacy') IS NOT NULL
        OR to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
-        SELECT current_slot
+        -- #371: the install above seeded the rotation ledger; the current
+        -- claim cursor is the max-generation row.
+        SELECT slot
         INTO v_legacy_claim_slot
-        FROM awa.claim_ring_state
-        WHERE singleton;
+        FROM awa.claim_ring_rotations
+        ORDER BY generation DESC
+        LIMIT 1;
     END IF;
 
     IF to_regclass('awa.lease_claims_legacy') IS NOT NULL THEN
