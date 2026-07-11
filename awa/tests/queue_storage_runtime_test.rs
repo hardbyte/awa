@@ -2010,11 +2010,12 @@ impl Worker for MultiClientTrackingWorker {
 }
 
 /// ADR-023 claim-ring control-plane smoke test. Exercises
-/// `rotate_claims`, the busy-check, and `prune_oldest_claims` on an
-/// empty schema: rotate cycles through every slot, prune is a noop
-/// when nothing's been written, install + reset leaves the ring
-/// seeded correctly. The end-to-end test
-/// `test_claim_ring_rotate_and_prune_under_load` covers the busy-path.
+/// `rotate_claims`, the #371 idle gate, and `prune_oldest_claims` on an
+/// empty schema: rotate is idle-skipped when nothing has been written
+/// (the cursor freezes instead of lapping empty slots), prune is a
+/// noop, install + reset leaves the ring seeded correctly. The
+/// end-to-end test `test_claim_ring_rotate_and_prune_under_load`
+/// covers cursor advancement and the busy-path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_claim_ring_rotates_and_prunes_empty() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -2054,23 +2055,33 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         "seeded slot table should have one open slot and the rest uninitialized"
     );
 
-    // Rotate four times — should advance cursor 0 -> 1 -> 2 -> 3 -> 0,
-    // generation 0 -> 1 -> 2 -> 3 -> 4. Empty partitions make the
-    // busy-check trivially pass.
+    // Rotate four times — every attempt is idle-skipped (#371): the
+    // ring received no writes, so there is nothing to seal and the
+    // cursor must freeze at slot 0 instead of lapping empty slots
+    // (each lap used to churn a dead claim_ring_state tuple per tick).
     for step in 1..=4_i64 {
         let outcome = store
             .rotate_claims(&pool)
             .await
             .expect("rotate_claims should succeed");
-        let expected_slot = (step % 4) as i32;
         match outcome {
-            RotateOutcome::Rotated { slot, generation } => {
-                assert_eq!(slot, expected_slot, "slot at step {step}");
-                assert_eq!(generation, step, "generation at step {step}");
+            RotateOutcome::SkippedIdle { slot } => {
+                assert_eq!(slot, 0, "idle ring must keep slot 0 at step {step}");
             }
             other => panic!("rotate_claims step {step} unexpected outcome: {other:?}"),
         }
     }
+    let (idle_slot, idle_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT current_slot, generation FROM {schema}.claim_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read claim ring state after idle rotations");
+    assert_eq!(
+        (idle_slot, idle_gen),
+        (0, 0),
+        "idle rotations must not advance the cursor or generation"
+    );
 
     // On a schema with no claims written yet, prune either noops
     // (oldest_initialized_ring_slot returns None) or TRUNCATEs an
@@ -2117,6 +2128,138 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .prepare_schema(&pool)
         .await
         .expect("prepare_schema should be idempotent");
+}
+
+/// The #371 idle gate must not freeze rotation while sealed slots still
+/// hold rows. Prune never advances a slot's generation (only rotation
+/// does, by reusing slots), so a gate scoped to the current slot alone
+/// would strand later sealed slots' rows on a drained ring until new
+/// traffic resumed rotation. The gate probes the ring's parent tables:
+/// rotation keeps cycling until prune has reclaimed everything, and
+/// only then reports `SkippedIdle`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_idle_gate_holds_rotation_open_until_sealed_slots_reclaimed() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_idle_reclaim";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "idle_reclaim_q";
+
+    // Emulate a ring that rotated twice under traffic and then fully
+    // drained its ready backlog, leaving processed rows in the two
+    // sealed slots. This is exactly what rotate() writes: the opened
+    // slot's generation on queue_ring_slots plus the cursor on
+    // queue_ring_state.
+    for (slot, generation) in [(0_i32, 0_i64), (1, 1)] {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.done_entries (
+                ready_slot, ready_generation, job_id, kind, queue, state,
+                priority, attempt, run_lease, lane_seq, enqueue_shard,
+                attempted_at, finalized_at, payload
+            ) VALUES ($1, $2, $3, 'idle_reclaim_job', $4,
+                      'completed'::awa.job_state, 2::smallint, 1::smallint,
+                      1::bigint, $5::bigint, 0::smallint, now(), now(),
+                      '{{}}'::jsonb)"
+        ))
+        .bind(slot)
+        .bind(generation)
+        .bind(8_000_000_i64 + i64::from(slot))
+        .bind(queue)
+        .bind(100_i64 + i64::from(slot))
+        .execute(&pool)
+        .await
+        .expect("seed sealed done row");
+    }
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_slots SET generation = 1 WHERE slot = 1"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seal slot 1");
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_slots SET generation = 2 WHERE slot = 2"
+    ))
+    .execute(&pool)
+    .await
+    .expect("open slot 2");
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 2, generation = 2 \
+         WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance cursor as two busy rotations would");
+
+    // While sealed rows remain anywhere in the ring, rotation must NOT
+    // idle-skip — the frozen-generation reclamation trap.
+    let outcome = store.rotate(&pool).await.expect("rotate with sealed rows");
+    assert!(
+        !matches!(outcome, RotateOutcome::SkippedIdle { .. }),
+        "rotation must stay live while sealed slots hold rows, got {outcome:?}"
+    );
+
+    // Prune reclaims oldest-first; rotation stays live between prunes.
+    let pruned = store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("prune oldest sealed slot");
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
+        "first prune should reclaim slot 0, got {pruned:?}"
+    );
+    let outcome = store
+        .rotate(&pool)
+        .await
+        .expect("rotate with one sealed slot left");
+    assert!(
+        !matches!(outcome, RotateOutcome::SkippedIdle { .. }),
+        "rotation must stay live while slot 1 still holds rows, got {outcome:?}"
+    );
+
+    let pruned = store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("prune second sealed slot");
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 1, .. }),
+        "second prune should reclaim slot 1, got {pruned:?}"
+    );
+
+    // Everything reclaimed: the ring is genuinely empty and rotation
+    // may now freeze.
+    let outcome = store.rotate(&pool).await.expect("rotate on empty ring");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedIdle { .. }),
+        "fully reclaimed ring should idle-skip, got {outcome:?}"
+    );
+    let (frozen_slot, frozen_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT current_slot, generation FROM {schema}.queue_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read frozen cursor");
+    let outcome = store.rotate(&pool).await.expect("repeat idle rotate");
+    assert!(matches!(outcome, RotateOutcome::SkippedIdle { .. }));
+    let (still_slot, still_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT current_slot, generation FROM {schema}.queue_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read cursor after repeat idle rotate");
+    assert_eq!(
+        (frozen_slot, frozen_gen),
+        (still_slot, still_gen),
+        "idle rotations must not move the cursor"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2339,7 +2482,9 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     );
 
     // Rotate from slot 0 → slot 1. Slot 1 is empty, so busy-check
-    // passes and the cursor advances.
+    // passes, and slot 0 holds the completed claim evidence, so the
+    // idle gate (#371) sees a non-empty current slot and the cursor
+    // advances.
     match store
         .rotate_claims(&pool)
         .await
@@ -2352,30 +2497,69 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         other => panic!("expected Rotated {{ slot: 1, generation: 1 }}, got {other:?}"),
     }
 
-    // Now try to rotate once more. Next target is slot 2, still empty,
-    // so this also succeeds.
-    match store
-        .rotate_claims(&pool)
-        .await
-        .expect("rotate_claims -> slot 2")
-    {
-        RotateOutcome::Rotated { slot, generation } => {
-            assert_eq!(slot, 2);
-            assert_eq!(generation, 2);
+    // Walk the cursor around to slot 3 "under load": claim + complete
+    // one job in each intermediate slot so every rotation seals real
+    // claim evidence. (An empty current slot would now be SkippedIdle
+    // by the #371 idle gate rather than rotated — the pure-timer walk
+    // this test previously relied on no longer advances an idle ring.)
+    for (job_seq, expected_slot) in [(2_i64, 2_i32), (3, 3)] {
+        let walk_job = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: job_seq },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let walk_claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+            .await
+            .expect("claim walk job");
+        assert_eq!(walk_claimed.len(), 1, "walk job should be claimed");
+        assert_eq!(walk_claimed[0].job.id, walk_job);
+        store
+            .complete_runtime_batch(&pool, &walk_claimed)
+            .await
+            .expect("complete walk job");
+
+        match store
+            .rotate_claims(&pool)
+            .await
+            .expect("rotate_claims walk step")
+        {
+            RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, expected_slot),
+            other => panic!("expected Rotated to slot {expected_slot}, got {other:?}"),
         }
-        other => panic!("expected Rotated {{ slot: 2, generation: 2 }}, got {other:?}"),
     }
 
-    // Keep rotating until the next target wraps to slot 0, which still
-    // holds the completed claim. The busy-check must refuse.
-    match store
-        .rotate_claims(&pool)
+    // Seal live evidence into slot 3 as well, so the final
+    // rotate-after-prune below exercises the busy/idle gates the same
+    // way a loaded ring would.
+    let tail_job = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let tail_claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
         .await
-        .expect("rotate_claims -> slot 3")
-    {
-        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 3),
-        other => panic!("expected Rotated to slot 3, got {other:?}"),
-    }
+        .expect("claim tail job");
+    assert_eq!(tail_claimed.len(), 1, "tail job should be claimed");
+    assert_eq!(tail_claimed[0].job.id, tail_job);
+    store
+        .complete_runtime_batch(&pool, &tail_claimed)
+        .await
+        .expect("complete tail job");
+
+    // The next target wraps to slot 0, which still holds the completed
+    // claim. The busy-check must refuse.
     let busy_outcome = store
         .rotate_claims(&pool)
         .await
@@ -2488,17 +2672,27 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
     )
     .await;
 
+    // The lease ring is empty so `rotate_leases` idle-skips (#371);
+    // advance the cursor directly (rotation of a busy ring updates only
+    // lease_ring_state) so slot 0 becomes the prune target.
     match store
         .rotate_leases(&pool)
         .await
-        .expect("rotate_leases -> slot 1")
+        .expect("rotate_leases on empty ring")
     {
-        RotateOutcome::Rotated { slot, generation } => {
-            assert_eq!(slot, 1);
-            assert_eq!(generation, 1);
-        }
-        other => panic!("expected Rotated {{ slot: 1, generation: 1 }}, got {other:?}"),
+        RotateOutcome::SkippedIdle { slot } => assert_eq!(slot, 0),
+        other => panic!("expected SkippedIdle {{ slot: 0 }}, got {other:?}"),
     }
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.lease_ring_state
+        SET current_slot = 1, generation = 1
+        WHERE singleton = TRUE
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance lease ring cursor for prune setup");
 
     sqlx::query(&format!(
         r#"
@@ -2648,10 +2842,14 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
         .expect("test prune lock timeout"),
     );
 
-    store
-        .rotate_claims(&pool)
-        .await
-        .expect("rotate away from claim slot 0");
+    // The ring is empty at this point, so `rotate_claims` idle-skips
+    // (#371); move the cursor off slot 0 directly so prune targets it.
+    sqlx::query(&format!(
+        "UPDATE {schema}.claim_ring_state SET current_slot = 1, generation = 1 WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance claim ring cursor away from slot 0");
 
     let mut writer_tx = pool.begin().await.expect("begin claim writer tx");
     sqlx::query(&format!(
@@ -2771,14 +2969,24 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
     .await
     .expect("remove seed ready row");
 
-    let rotated = store
+    // Slot 0 is now empty, so `rotate` idle-skips (#371) rather than
+    // advancing. This test needs the cursor off slot 0 so slot 0 becomes
+    // the prune target; move it directly, exactly as a rotation of a busy
+    // ring would (rotate updates only queue_ring_state / queue_ring_slots).
+    let idle = store
         .rotate(&pool)
         .await
         .expect("rotate away from ready slot 0");
     assert!(
-        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
-        "unexpected rotate outcome: {rotated:?}"
+        matches!(idle, RotateOutcome::SkippedIdle { slot: 0 }),
+        "empty ready slot 0 should idle-skip: {idle:?}"
     );
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 1, generation = 1 WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance queue ring cursor off slot 0 for prune setup");
 
     let post_lock_job_id = 1_000_091_i64;
     let mut writer_tx = pool.begin().await.expect("begin ready writer tx");
@@ -3143,25 +3351,25 @@ async fn test_lease_claim_partition_routing() {
     )
     .await;
 
-    // Rotate the claim ring forward so the current slot is not zero —
-    // this proves the claim CTE actually reads claim_ring_state rather
-    // than defaulting.
-    for _ in 0..2 {
-        store
-            .rotate_claims(&pool)
-            .await
-            .expect("rotate_claims should succeed");
-    }
+    // Move the claim-ring cursor forward so the current slot is not
+    // zero — this proves the claim CTE actually reads claim_ring_state
+    // rather than defaulting. The ring is empty, so `rotate_claims`
+    // idle-skips (#371); advance the cursor directly, exactly as a
+    // rotation of a busy ring would (rotate updates only
+    // claim_ring_state).
+    sqlx::query(&format!(
+        "UPDATE {schema}.claim_ring_state SET current_slot = 2, generation = 2 WHERE singleton"
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance claim ring cursor for routing setup");
     let current_slot: i32 = sqlx::query_scalar(&format!(
         "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
     ))
     .fetch_one(&pool)
     .await
     .expect("read current claim slot");
-    assert_eq!(
-        current_slot, 2,
-        "ring should be at slot 2 after two rotations"
-    );
+    assert_eq!(current_slot, 2, "ring cursor should be at slot 2");
 
     let job_id = enqueue_job(
         &pool,
@@ -3362,6 +3570,391 @@ async fn test_lease_claim_rotation_isolation() {
         slot_a, job_a_slot_still,
         "rotation must not move existing claim rows across partitions"
     );
+}
+
+/// Read `(current_slot, generation)` for one of the three ring-state
+/// singletons (`ring` is "queue" / "lease" / "claim").
+async fn ring_cursor(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
+    sqlx::query_as::<_, (i32, i64)>(&format!(
+        "SELECT current_slot, generation FROM {schema}.{ring}_ring_state WHERE singleton = TRUE"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read ring state")
+}
+
+/// Physical row identity of a ring-state singleton. If any UPDATE runs
+/// against the row, `ctid` and/or `xmin` change — this is the
+/// deterministic form of "no dead tuple was created", independent of
+/// pg_stat flush timing.
+async fn ring_row_identity(pool: &sqlx::PgPool, schema: &str, table: &str) -> (String, String) {
+    sqlx::query_as::<_, (String, String)>(&format!(
+        "SELECT ctid::text, xmin::text FROM {schema}.{table}"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read ring-state row identity")
+}
+
+/// `pg_stat_user_tables.n_dead_tup` for the ring bookkeeping tables.
+async fn ring_state_dead_tuples(pool: &sqlx::PgPool, schema: &str) -> Vec<(String, i64)> {
+    sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT relname, n_dead_tup
+        FROM pg_stat_user_tables
+        WHERE schemaname = $1
+          AND relname IN (
+              'queue_ring_state',
+              'queue_ring_slots',
+              'lease_ring_state',
+              'claim_ring_state'
+          )
+        ORDER BY relname
+        "#,
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .expect("sample ring-state dead tuples")
+}
+
+/// #371 idle gate: rotating a ring that received no writes must be a
+/// pure no-op — `SkippedIdle`, cursor and generation unchanged, and
+/// crucially *zero* ring-state row versions created. Before this gate
+/// every timer tick UPDATEd the ring-state singleton (plus a
+/// `queue_ring_slots` row on the queue ring), and under a pinned MVCC
+/// horizon those dead tuples were unreclaimable (~14.4k/hour on
+/// `lease_ring_state` at the historical 250ms cadence).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_idle_ring_rotation_skips_without_ring_state_churn() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_idle_rotation_skip";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Reset dead-tuple stats from schema setup so the baseline below is
+    // clean. VACUUM reports its result to pg_stat synchronously.
+    for table in [
+        "queue_ring_state",
+        "queue_ring_slots",
+        "lease_ring_state",
+        "claim_ring_state",
+    ] {
+        sqlx::query(&format!("VACUUM {schema}.{table}"))
+            .execute(&pool)
+            .await
+            .expect("vacuum ring-state table");
+    }
+    let baseline_dead = ring_state_dead_tuples(&pool, schema).await;
+
+    let queue_before = ring_cursor(&pool, schema, "queue").await;
+    let lease_before = ring_cursor(&pool, schema, "lease").await;
+    let claim_before = ring_cursor(&pool, schema, "claim").await;
+    let queue_row_before = ring_row_identity(&pool, schema, "queue_ring_state").await;
+    let lease_row_before = ring_row_identity(&pool, schema, "lease_ring_state").await;
+    let claim_row_before = ring_row_identity(&pool, schema, "claim_ring_state").await;
+
+    for round in 0..25 {
+        match store.rotate(&pool).await.expect("idle queue rotate") {
+            RotateOutcome::SkippedIdle { slot } => assert_eq!(
+                slot, queue_before.0,
+                "idle queue rotate must keep the current slot (round {round})"
+            ),
+            other => panic!("idle queue rotate round {round}: expected SkippedIdle, got {other:?}"),
+        }
+        match store.rotate_leases(&pool).await.expect("idle lease rotate") {
+            RotateOutcome::SkippedIdle { slot } => assert_eq!(
+                slot, lease_before.0,
+                "idle lease rotate must keep the current slot (round {round})"
+            ),
+            other => panic!("idle lease rotate round {round}: expected SkippedIdle, got {other:?}"),
+        }
+        match store.rotate_claims(&pool).await.expect("idle claim rotate") {
+            RotateOutcome::SkippedIdle { slot } => assert_eq!(
+                slot, claim_before.0,
+                "idle claim rotate must keep the current slot (round {round})"
+            ),
+            other => panic!("idle claim rotate round {round}: expected SkippedIdle, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        ring_cursor(&pool, schema, "queue").await,
+        queue_before,
+        "idle rotation must not advance the queue ring cursor or generation"
+    );
+    assert_eq!(
+        ring_cursor(&pool, schema, "lease").await,
+        lease_before,
+        "idle rotation must not advance the lease ring cursor or generation"
+    );
+    assert_eq!(
+        ring_cursor(&pool, schema, "claim").await,
+        claim_before,
+        "idle rotation must not advance the claim ring cursor or generation"
+    );
+
+    // No UPDATE ran: the singleton rows are physically the same tuple.
+    assert_eq!(
+        ring_row_identity(&pool, schema, "queue_ring_state").await,
+        queue_row_before,
+        "idle rotation must not create a new queue_ring_state row version"
+    );
+    assert_eq!(
+        ring_row_identity(&pool, schema, "lease_ring_state").await,
+        lease_row_before,
+        "idle rotation must not create a new lease_ring_state row version"
+    );
+    assert_eq!(
+        ring_row_identity(&pool, schema, "claim_ring_state").await,
+        claim_row_before,
+        "idle rotation must not create a new claim_ring_state row version"
+    );
+
+    // pg_stat corroboration: give the (asynchronous) stats machinery a
+    // moment, then require the dead-tuple counters to stay flat. 75
+    // idle rotations would have produced >= 25 dead tuples on each
+    // ring-state table before the idle gate; the small slack absorbs a
+    // late stats flush from schema setup, not rotation churn.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let _ = sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(&pool)
+        .await;
+    let final_dead = ring_state_dead_tuples(&pool, schema).await;
+    for ((relname, baseline), (relname_after, after)) in baseline_dead.iter().zip(final_dead.iter())
+    {
+        assert_eq!(relname, relname_after, "dead-tuple samples must align");
+        assert!(
+            *after <= baseline + 5,
+            "{relname}: n_dead_tup grew from {baseline} to {after} across 25 idle rotate \
+             ticks — idle rotation is churning ring bookkeeping rows again (#371)"
+        );
+    }
+}
+
+/// The #371 idle gate must never fire while traffic flows: a ring whose
+/// current slot holds live rows rotates exactly as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_active_ring_rotation_proceeds_despite_idle_gate() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_active_rotation_proceeds";
+    let queue = "qs_active_rotation_proceeds";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Queue ring: an enqueued (not yet claimed) job makes the current
+    // slot non-empty, so rotation seals it and advances.
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 371 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    match store.rotate(&pool).await.expect("rotate active queue ring") {
+        RotateOutcome::Rotated { slot, generation } => {
+            assert_eq!(slot, 1);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("active queue ring must rotate, got {other:?}"),
+    }
+
+    // Claim the job (compact receipt path) and materialize a lease via
+    // a registered callback, so both the claim ring and the lease ring
+    // hold live rows in their current slots.
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    let _callback_id = store
+        .register_callback(
+            &pool,
+            claimed[0].job.id,
+            claimed[0].job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback to materialize a lease");
+    assert_eq!(lease_count(&pool, &store).await, 1);
+
+    // Lease ring: the materialized lease keeps the current slot busy.
+    match store
+        .rotate_leases(&pool)
+        .await
+        .expect("rotate active lease ring")
+    {
+        RotateOutcome::Rotated { slot, generation } => {
+            assert_eq!(slot, 1);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("active lease ring must rotate, got {other:?}"),
+    }
+
+    // Claim ring: the compact claim wrote receipt evidence into the
+    // current claim slot.
+    match store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate active claim ring")
+    {
+        RotateOutcome::Rotated { slot, generation } => {
+            assert_eq!(slot, 1);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("active claim ring must rotate, got {other:?}"),
+    }
+}
+
+/// Drain-then-idle (#371): a ring that carried traffic keeps rotating
+/// until its slots are sealed and pruned; once fully drained, further
+/// rotation skips and the generation stops advancing. This is the
+/// expected steady state of a quiet queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_drained_ring_rotation_skips_after_prune() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_drained_rotation_skips";
+    let queue = "qs_drained_rotation_skips";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Traffic: enqueue, claim (compact receipt path), complete.
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim job");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete job");
+
+    // While slot 0 holds the traffic's evidence, rotation proceeds.
+    match store.rotate(&pool).await.expect("seal queue slot 0") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("queue ring with evidence must rotate, got {other:?}"),
+    }
+    match store.rotate_claims(&pool).await.expect("seal claim slot 0") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("claim ring with evidence must rotate, got {other:?}"),
+    }
+
+    // Drain: prune the sealed slots.
+    match store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("prune queue slot 0")
+    {
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("queue slot 0 should prune after drain, got {other:?}"),
+    }
+    match store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("prune claim slot 0")
+    {
+        PruneOutcome::Pruned { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("claim slot 0 should prune after drain, got {other:?}"),
+    }
+
+    // Fully drained: every further rotate tick skips and the cursors
+    // freeze. Operators observe the generation stop advancing on a
+    // quiet queue — that is the intended behavior, not a pinned ring.
+    let queue_cursor = ring_cursor(&pool, schema, "queue").await;
+    let lease_cursor = ring_cursor(&pool, schema, "lease").await;
+    let claim_cursor = ring_cursor(&pool, schema, "claim").await;
+    for _ in 0..3 {
+        assert!(
+            matches!(
+                store.rotate(&pool).await.expect("idle queue rotate"),
+                RotateOutcome::SkippedIdle { slot } if slot == queue_cursor.0
+            ),
+            "drained queue ring must skip rotation"
+        );
+        assert!(
+            matches!(
+                store.rotate_leases(&pool).await.expect("idle lease rotate"),
+                RotateOutcome::SkippedIdle { slot } if slot == lease_cursor.0
+            ),
+            "compact traffic never wrote lease rows; lease ring must skip rotation"
+        );
+        assert!(
+            matches!(
+                store.rotate_claims(&pool).await.expect("idle claim rotate"),
+                RotateOutcome::SkippedIdle { slot } if slot == claim_cursor.0
+            ),
+            "drained claim ring must skip rotation"
+        );
+    }
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, queue_cursor);
+    assert_eq!(ring_cursor(&pool, schema, "lease").await, lease_cursor);
+    assert_eq!(ring_cursor(&pool, schema, "claim").await, claim_cursor);
+
+    // New traffic un-idles the ring: the next enqueue makes the current
+    // slot non-empty and rotation resumes on the following tick.
+    let _revived = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    match store
+        .rotate(&pool)
+        .await
+        .expect("rotate revived queue ring")
+    {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 2),
+        other => panic!("revived queue ring must rotate, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5721,13 +6314,40 @@ async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rota
     assert_eq!(lease_count(&pool, &store).await, 0);
 
     let claim_lease_slot = claimed[0].claim.lease_slot;
+    // With no lease rows anywhere, `rotate_leases` now reports
+    // SkippedIdle (#371) instead of advancing. The invariant under test
+    // is that materialization reads the ring's *current* slot rather
+    // than the slot recorded at claim time, so move the cursor directly
+    // — in production the ring advances like this whenever other jobs'
+    // leases keep it busy.
     match store.rotate_leases(&pool).await.expect("rotate lease ring") {
-        RotateOutcome::Rotated { slot, .. } => assert_ne!(
+        RotateOutcome::SkippedIdle { slot } => assert_eq!(
             slot, claim_lease_slot,
-            "test must materialize into a different lease slot than the original claim carried"
+            "compact claim leaves no lease rows, so the lease ring is idle"
         ),
-        other => panic!("expected lease ring rotation before materialization, got {other:?}"),
+        other => panic!("expected idle lease ring before materialization, got {other:?}"),
     }
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.lease_ring_state
+        SET current_slot = (current_slot + 1) % slot_count,
+            generation = generation + 1
+        WHERE singleton = TRUE
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance lease ring cursor for materialization regression setup");
+    let rotated_lease_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT current_slot FROM {schema}.lease_ring_state WHERE singleton = TRUE"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read advanced lease ring cursor");
+    assert_ne!(
+        rotated_lease_slot, claim_lease_slot,
+        "test must materialize into a different lease slot than the original claim carried"
+    );
 
     let callback_id = store
         .register_callback(
@@ -9288,14 +9908,23 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
     assert_invariant_holds(&pool, schema, queue, "after first carry").await;
 
     // Lap the ring so the carried row's slot (1) becomes the oldest
-    // sealed slot again: 1→2→3→0. The carried row keeps slot 2/3/0
-    // empty, so each rotate succeeds.
-    for expected_slot in [2_i32, 3, 0] {
-        match store.rotate(&pool).await.expect("rotate around ring") {
-            RotateOutcome::Rotated { slot, .. } if slot == expected_slot => {}
-            other => panic!("expected Rotated {{ slot: {expected_slot} }}, got {other:?}"),
-        }
-    }
+    // sealed slot again: 1→2→3→0. Slots 2/3/0 are empty, so `rotate`
+    // now idle-skips (#371) instead of advancing; move the cursor
+    // directly, exactly as a rotation of a busy ring would (each hop is
+    // current_slot+1, generation+1). A real fleet laps the same way
+    // whenever other queues' traffic keeps the ring busy. After the
+    // three hops the cursor is (slot 0, generation 4), which makes
+    // `oldest_initialized_ring_slot` target slot 1 for the second prune.
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.queue_ring_state
+        SET current_slot = 0, generation = 4
+        WHERE singleton = TRUE
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("lap queue ring cursor around to slot 0 for re-carry setup");
 
     // Second prune: current slot is 0, so the oldest sealed non-current
     // slot is slot 1 (the carried row). It is carried again into slot 0.
@@ -9512,12 +10141,30 @@ async fn test_queue_terminal_count_delta_rollup_skips_empty_old_slots() {
     )
     .await;
 
-    for _ in 0..21 {
-        match store.rotate(&pool).await.expect("rotate queue ring") {
-            awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
-            other => panic!("expected Rotated, got {other:?}"),
-        }
+    // Lap the ring 21 slots forward. The ring is empty, so `rotate` now
+    // idle-skips (#371) rather than advancing; replay exactly the writes
+    // 21 real rotations from (slot 0, generation 0) would make — the
+    // ring-state cursor lands on (slot 21, generation 21), and each slot
+    // n in 1..=21 records generation n in `queue_ring_slots` (rotation
+    // stamps the *incoming* slot's generation). A loaded ring laps the
+    // same way; this test only needs the sealed-slot bookkeeping, not the
+    // traffic that would normally drive it.
+    for slot in 1..=21_i32 {
+        sqlx::query(&format!(
+            "UPDATE {schema}.queue_ring_slots SET generation = $2 WHERE slot = $1"
+        ))
+        .bind(slot)
+        .bind(slot as i64)
+        .execute(&pool)
+        .await
+        .expect("stamp lapped slot generation");
     }
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 21, generation = 21 WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance queue ring cursor to slot 21");
 
     let target_slot = 20_i32;
     let target_generation: i64 = sqlx::query_scalar(&format!(

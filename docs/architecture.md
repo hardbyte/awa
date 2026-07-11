@@ -207,6 +207,8 @@ Queue storage has three independent rings, each advanced by the elected maintena
 
 The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.
 
+Rotation is also gated on the ring having something to seal: if every child table of the *current* slot is empty, the tick reports `skipped_idle` and leaves the ring-state row untouched instead of advancing the cursor over nothing. An idle queue therefore stops rotating entirely — `current_slot` and `generation` freeze until the next write lands — which keeps the ring bookkeeping rows free of dead-tuple churn under a pinned MVCC horizon. A frozen generation on a quiet queue is expected and healthy; a frozen generation **with** rows accumulating (`skipped_busy` outcomes) is the pinned-ring condition to alert on.
+
 The common safety pattern is:
 
 1. Lock the ring-state row with `FOR UPDATE`.

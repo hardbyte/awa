@@ -279,6 +279,15 @@ pub enum RotateOutcome {
         slot: i32,
         busy: BusyCounts,
     },
+    /// Ring is idle: every child table of the *current* slot is empty, so
+    /// there is nothing to seal and rotation was skipped without updating
+    /// any ring-state row. Issue #371: timer-driven rotation of an idle
+    /// ring UPDATEs the singleton ring-state row every tick, and under a
+    /// pinned MVCC horizon each of those dead tuples stays unreclaimable.
+    /// `slot` is the current slot, which stays open.
+    SkippedIdle {
+        slot: i32,
+    },
 }
 
 /// Per-table presence observed at a rotation gate. Each non-zero value means
@@ -13356,6 +13365,24 @@ impl QueueStorage {
             .map_err(map_sqlx_error)
     }
 
+    /// Idle-gate probe (#371): true when every relation in `relations` is
+    /// empty. Short-circuits on the first non-empty relation, so under
+    /// active traffic the extra cost over the existing busy gate is a
+    /// single `EXISTS ... LIMIT 1` probe; when the ring really is idle all
+    /// probes hit empty heaps. Same SQL shape (and lock strength —
+    /// AccessShare only) as the per-table busy checks above.
+    async fn relations_all_empty_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        relations: &[String],
+    ) -> Result<bool, AwaError> {
+        for relation in relations {
+            if Self::relation_has_rows_tx(tx, relation).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
     pub async fn rotate(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
@@ -13437,6 +13464,48 @@ impl QueueStorage {
             });
         }
 
+        // Idle gate (#371): skip the rotation only when the ENTIRE ring
+        // is empty — every partition of every ring family, not just the
+        // current slot. The UPDATEs below would only churn the
+        // `queue_ring_state` singleton and the `queue_ring_slots` row
+        // (one dead tuple each per tick, unreclaimable while an MVCC
+        // horizon is pinned).
+        //
+        // The whole-ring scope is load-bearing for reclamation: prune
+        // never advances a slot's generation (only rotation does, by
+        // reusing slots), so `prune_oldest` keeps selecting the same
+        // already-truncated slot while rotation is frozen. Gating on
+        // current-slot emptiness alone would freeze a drained ring that
+        // still holds rows in later sealed slots and strand them until
+        // new traffic resumed rotation. Probing the parents keeps
+        // rotation cycling until prune has reclaimed everything, and
+        // freezes only when there is genuinely nothing left to seal OR
+        // prune. (A queue holding failed rows inside the retention
+        // floor keeps rotating until retention expires — those rows
+        // need live reclamation machinery by definition.)
+        //
+        // Race note: a concurrent enqueue that commits right after this
+        // probe is benign. Rotation is enablement, not obligation (the
+        // TLA+ rotate actions are guarded and carry no fairness), so
+        // skipping only delays sealing that write by one rotate tick —
+        // the next tick observes the row and rotates. The skip never
+        // loses data and never leaves a non-empty slot unsealed while
+        // traffic flows.
+        let ring_parents = [
+            format!("{schema}.ready_entries"),
+            format!("{schema}.ready_claim_attempt_batches"),
+            format!("{schema}.done_entries"),
+            format!("{schema}.ready_tombstones"),
+            format!("{schema}.ready_segments"),
+            format!("{schema}.receipt_completion_batches"),
+            format!("{schema}.receipt_completion_tombstones"),
+            format!("{schema}.queue_terminal_count_deltas"),
+        ];
+        if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedIdle { slot: state.0 });
+        }
+
         let next_generation = state.1 + 1;
 
         sqlx::query(&format!(
@@ -13510,6 +13579,21 @@ impl QueueStorage {
                     ..Default::default()
                 },
             });
+        }
+
+        // Idle gate (#371): skip only when the ENTIRE lease ring is
+        // empty (parent probe, all partitions). Otherwise the CAS
+        // UPDATE below only churns the `lease_ring_state` singleton
+        // (the top residual pinned-horizon dead-tuple accumulator at
+        // the historical 250ms cadence — ~14.4k dead tuples/hour).
+        // See `rotate` for both the race analysis and why the
+        // whole-ring scope is load-bearing (prune never advances slot
+        // generations; freezing rotation with sealed rows behind would
+        // strand them until traffic resumed).
+        let ring_parents = [format!("{schema}.leases")];
+        if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedIdle { slot: state.0 });
         }
 
         let next_generation = state.1 + 1;
@@ -14684,6 +14768,26 @@ impl QueueStorage {
                     ..Default::default()
                 },
             });
+        }
+
+        // Idle gate (#371): skip only when the ENTIRE claim ring is
+        // empty (parent probes, all partitions). Otherwise the CAS
+        // UPDATE below only churns the `claim_ring_state` singleton
+        // (~3.6k dead tuples/hour under a pinned MVCC horizon at the
+        // historical cadence). See `rotate` for both the race analysis
+        // and why the whole-ring scope is load-bearing (prune never
+        // advances slot generations; freezing rotation with sealed
+        // receipt evidence behind would strand it until traffic
+        // resumed).
+        let ring_parents = [
+            format!("{schema}.lease_claims"),
+            format!("{schema}.lease_claim_batches"),
+            format!("{schema}.lease_claim_closures"),
+            format!("{schema}.lease_claim_closure_batches"),
+        ];
+        if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedIdle { slot: state.0 });
         }
 
         let next_generation = state.1 + 1;
