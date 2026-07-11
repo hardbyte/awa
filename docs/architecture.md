@@ -213,7 +213,7 @@ Rotation is also gated on the ring having something to seal: if every child tabl
 
 The common safety pattern is:
 
-1. Take the per-ring rotation advisory lock (`pg_advisory_xact_lock`), try-locked so a periodic tick skips under contention rather than queueing. This replaces the pre-ledger `FOR UPDATE` on the ring-state singleton for rotate ↔ prune ↔ delta-rollup serialization.
+1. Take the per-ring rotation advisory lock (`pg_try_advisory_xact_lock`) so a periodic tick skips under contention rather than queueing. This replaces the pre-ledger `FOR UPDATE` on the ring-state singleton for rotate ↔ prune ↔ delta-rollup serialization.
 2. Choose the incoming or oldest initialized slot (from the ledger cursor).
 3. Prove cheap skip gates before the exclusive-lock path. Queue prune checks active leases and pending ready lanes before receipt-closure proof; claim prune proves open-claim closure before child locks.
 4. Take child-table `ACCESS EXCLUSIVE` locks with a short transaction-local `lock_timeout` so maintenance gives up promptly under contention.

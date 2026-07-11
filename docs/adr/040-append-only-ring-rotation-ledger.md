@@ -52,8 +52,8 @@ cursor's representation.
   are no longer written per rotation. Their `current_slot` / `generation` cursor
   columns are **dropped** (see Consequences — this is the compat break).
 - **Rotate ↔ prune ↔ delta-rollup serialization** moves from `FOR UPDATE` on the
-  singleton (the row is gone) to a **per-ring `pg_advisory_xact_lock`**,
-  try-locked so a periodic rotate skips under contention instead of queueing
+  singleton (the row is gone) to a **per-ring `pg_try_advisory_xact_lock`**,
+  so a periodic rotate skips under contention instead of queueing
   behind a prune. The lock order (ring advisory lock → `{ring}_ring_slots FOR
   UPDATE` → child partitions `ACCESS EXCLUSIVE`) is modelled in
   `AwaStorageLockOrder.tla`.
@@ -136,6 +136,6 @@ cursor's representation.
 Extends ADR-023's ring-partitioned receipt plane; applies ADR-026's dead-tuple
 reclaim discipline to the ring control plane (the same append-only-then-fold shape
 ADR-026 uses for terminal history); the rollup-delta landing table mirrors the
-#290 terminal-count delta pattern. The advisory-lock ordering and the horizon-gated
+`#290` terminal-count delta pattern. The advisory-lock ordering and the horizon-gated
 folds are modelled in `correctness/storage/AwaStorageLockOrder.tla` and
 `AwaDeadTupleContract.tla`.
