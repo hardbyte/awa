@@ -546,10 +546,14 @@ TerminalDeltaRollupTx == <<
     Mut("Update", "queue_terminal_live_counts"),
     Mut("Truncate", "queue_terminal_count_deltas")
 >>
-\* If another backend pins the MVCC horizon with an open snapshot or idle
-\* transaction id, terminal-count rollup returns before mutating the folded
-\* counter or truncating the delta child. This SELECT-only shape generates no
-\* dead tuples; exact reads include the still-pending delta rows.
+\* If another backend genuinely pins the MVCC horizon — a long-lived open
+\* snapshot (older than MVCC_HORIZON_PIN_MIN_AGE) or an idle-in-transaction
+\* backend holding a write xid — terminal-count rollup returns before mutating
+\* the folded counter or truncating the delta child. (The implementation
+\* age-gates the open-snapshot case so the transient backend_xmin of ordinary
+\* hot-path statements does not count as pinning; the pinned/clear abstraction
+\* here is unchanged.) This SELECT-only shape generates no dead tuples; exact
+\* reads include the still-pending delta rows.
 TerminalDeltaRollupPinnedTx == << >>
 
 \* #371 maintenance folds, both gated on the same clear-horizon check as
