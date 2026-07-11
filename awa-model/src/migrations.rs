@@ -4,7 +4,7 @@ use sqlx::{Connection, PgPool};
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 41;
+pub const CURRENT_VERSION: i32 = 42;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
