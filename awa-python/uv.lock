@@ -88,18 +88,12 @@ wheels = [
 
 [[package]]
 name = "awa-cli"
-version = "0.6.1"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/04/e6/a1445fc7000075161b42fad255cbc17dc00b318890ebe9d27ed37cd4d7a2/awa_cli-0.6.1-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:73419ee342d22526a4922868448ad31134390840e5371f006c4bc7221ce1e475", size = 5423227, upload-time = "2026-07-07T07:43:41.363Z" },
-    { url = "https://files.pythonhosted.org/packages/3a/7e/3b9dd6834efe163d153066aaf783b614991d86aff37a90fd522734e71182/awa_cli-0.6.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:53126be16d4e077f2330c410078bb8e077c1d13c1faf25bdce161d204b79939e", size = 5244462, upload-time = "2026-07-07T07:43:43.128Z" },
-    { url = "https://files.pythonhosted.org/packages/80/84/7601bd82a51651c182d1f0e41cfa553f420eae506436c6d5dac5f402c944/awa_cli-0.6.1-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6e58f20e6fec3f6ad4cc2911b54f9967e148e2384737d93071c265b5a3efc347", size = 5403305, upload-time = "2026-07-07T07:43:45.074Z" },
-    { url = "https://files.pythonhosted.org/packages/33/1f/5809527420857d5dcdbaecf0ed6c732fa8157616b79ae24667854877d0e0/awa_cli-0.6.1-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:40ad862f1f689aa08ea2f3d6bc134a912a8b7d01cb73ad778fb8cafecf5b9d25", size = 5564045, upload-time = "2026-07-07T07:43:46.845Z" },
-]
+version = "0.7.0a1"
+source = { directory = "../awa-cli" }
 
 [[package]]
 name = "awa-pg"
-version = "0.6.1"
+version = "0.7.0a1"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -127,7 +121,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "awa-cli", marker = "extra == 'ui'", specifier = "==0.6.1" },
+    { name = "awa-cli", marker = "extra == 'ui'", directory = "../awa-cli" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.26" },
 ]
 provides-extras = ["ui", "otel"]

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "awa-pg"
 requires-python = ">=3.10"
-version = "0.6.1"
+version = "0.7.0-alpha.1"
 description = "Postgres-native background job queue — Python SDK with async/sync workers, transactional enqueue, and progress tracking. Install awa-pg[ui] to add the bundled web dashboard."
 readme = "README.md"
 license = {text = "MIT OR Apache-2.0"}
@@ -32,7 +32,7 @@ classifiers = [
 #
 # Kept opt-in so the default `awa-pg` install stays small — workers and
 # producers don't need the ~10 MB UI bundle.
-ui = ["awa-cli==0.6.1"]
+ui = ["awa-cli==0.7.0-alpha.1"]
 # Convenience alias for distributed tracing (ADR-039). Purely optional:
 # awa auto-detects opentelemetry at runtime, so installing the API package
 # any other way works identically.
@@ -48,6 +48,15 @@ Changelog = "https://github.com/hardbyte/awa/releases"
 features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 python-source = "python"
 module-name = "awa._awa"
+
+# The [ui] extra pins the exact awa-cli version for published wheels, but
+# that version only exists on PyPI *after* release.yml publishes it — so
+# resolving the extra from the registry deadlocks every version-bump PR
+# (uv resolves the full extra matrix even when the extra isn't installed).
+# For local/CI resolution, satisfy the pin from the workspace path instead;
+# published wheel metadata is unaffected (uv sources never ship in wheels).
+[tool.uv.sources]
+awa-cli = { path = "../awa-cli" }
 
 [dependency-groups]
 dev = [

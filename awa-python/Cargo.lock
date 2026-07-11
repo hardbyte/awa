@@ -95,7 +95,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "awa-macros"
-version = "0.6.1"
+version = "0.7.0-alpha.1"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "awa-metrics"
-version = "0.6.1"
+version = "0.7.0-alpha.1"
 dependencies = [
  "awa-model",
  "opentelemetry",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.6.1"
+version = "0.7.0-alpha.1"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "awa-python"
-version = "0.6.1"
+version = "0.7.0-alpha.1"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.6.1"
+version = "0.7.0-alpha.1"
 dependencies = [
  "async-trait",
  "awa-macros",
