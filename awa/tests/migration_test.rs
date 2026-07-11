@@ -1342,6 +1342,18 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+
+    // Drop the named probe schemas so a later `migrations::run` (this or
+    // another test on the shared instance) does not reinstall them through
+    // the v041/v042 discovery loops — each reinstall holds ~150 ACCESS
+    // EXCLUSIVE locks, and the composed loops trip max_locks_per_transaction.
+    sqlx::raw_sql(
+        "DROP SCHEMA IF EXISTS awa_queue_storage_v031_index CASCADE; \
+         DROP SCHEMA IF EXISTS awa_queue_storage_v031_partial CASCADE;",
+    )
+    .execute(&pool)
+    .await
+    .expect("v031 probe schemas should drop cleanly");
 }
 
 /// v041 (#246) refreshes every installed queue-storage schema so the compact
@@ -1443,6 +1455,15 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+
+    // Drop the named probe schema so a later `migrations::run` (this or
+    // another test on the shared instance) does not reinstall it through
+    // the v041/v042 discovery loops — each reinstall holds ~150 ACCESS
+    // EXCLUSIVE locks, and the composed loops trip max_locks_per_transaction.
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("v041 deadline probe schema should drop cleanly");
 }
 
 async fn rollups_failed_column_exists(pool: &PgPool, schema: &str) -> bool {
@@ -1524,6 +1545,18 @@ async fn test_v032_backfills_queue_storage_pruned_failed_rollup_column() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+
+    // Drop the named probe schemas so a later `migrations::run` (this or
+    // another test on the shared instance) does not reinstall them through
+    // the v041/v042 discovery loops — each reinstall holds ~150 ACCESS
+    // EXCLUSIVE locks, and the composed loops trip max_locks_per_transaction.
+    sqlx::raw_sql(
+        "DROP SCHEMA IF EXISTS awa_queue_storage_v032_rollups CASCADE; \
+         DROP SCHEMA IF EXISTS awa_queue_storage_v032_partial CASCADE;",
+    )
+    .execute(&pool)
+    .await
+    .expect("v032 probe schemas should drop cleanly");
 }
 
 async fn ring_state_cursor_columns_exist(pool: &PgPool, schema: &str) -> bool {
@@ -1882,6 +1915,15 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
             .expect("schema readiness should be queryable after stale function replacement"),
         "schema with old claim_ready_runtime return shape must not be reported as ready"
     );
+
+    // Drop the named probe schema so a later `migrations::run` (this or
+    // another test on the shared instance) does not reinstall it through
+    // the v041/v042 discovery loops — each reinstall holds ~150 ACCESS
+    // EXCLUSIVE locks, and the composed loops trip max_locks_per_transaction.
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("ready-probe schema should drop cleanly");
 }
 
 #[tokio::test]
@@ -1948,6 +1990,14 @@ async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_curren
         trusted,
         "idempotent prepare_schema must not clear a trusted current-shape terminal counter"
     );
+
+    // Drop the named probe schema so a later `migrations::run` on the shared
+    // instance does not reinstall it through the v041/v042 discovery loops
+    // (each reinstall holds ~150 ACCESS EXCLUSIVE locks → max_locks_per_transaction).
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("trusted-marker schema should drop cleanly");
 }
 
 #[tokio::test]
@@ -1998,6 +2048,14 @@ async fn test_v030_preserves_untrusted_terminal_counter_marker_on_empty_schema()
         !trusted,
         "v030 must not re-trust a queue-storage schema whose marker was cleared before upgrade"
     );
+
+    // Drop the named probe schema so a later `migrations::run` on the shared
+    // instance does not reinstall it through the v041/v042 discovery loops
+    // (each reinstall holds ~150 ACCESS EXCLUSIVE locks → max_locks_per_transaction).
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("untrusted-marker schema should drop cleanly");
 }
 
 #[tokio::test]
