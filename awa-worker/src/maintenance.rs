@@ -2775,17 +2775,19 @@ impl MaintenanceService {
     ) {
         let schema = runtime.store.schema();
         // This is a high-cadence metrics path, not an admin exact-count
-        // endpoint. It stays on queue-storage control tables and bounded
-        // lane-head probes so long retained ready/done/receipt segments do
-        // not compete with worker traffic; admin surfaces that need exact
-        // counts still go through QueueStorage::queue_counts(). The one
-        // receipt-evidence read it does take is `receipt_running` below:
-        // since #246 in-flight claims live in `lease_claim_batches`, so a
-        // running gauge sourced from `leases` alone silently reads zero for
-        // receipt-short-path queues. The scan is bounded to currently-open
-        // claims (anti-joined against durable closure evidence), so it tracks
-        // in-flight depth, not retained history.
-        let open_running = awa_model::queue_storage::open_receipt_running_claims_sql(schema);
+        // endpoint, and it MUST NOT read the receipt-claim tables
+        // (`lease_claims` / `lease_claim_batches` / the closure tables):
+        // claim-ring rotation/prune takes them ACCESS EXCLUSIVE, and a gauge
+        // that blocked on that lock would stall the whole maintenance loop.
+        // The `queue_storage_metrics_query_uses_bounded_observability_path`
+        // unit test enforces this by locking those tables and requiring this
+        // function to still finish within 3s. So the `running` gauge below is
+        // intentionally `leases`-only (materialised claims). It therefore
+        // UNDER-reports queues whose in-flight work is still on compact
+        // `lease_claim_batches` (#246) and has not materialised — that is an
+        // accepted approximation for the cheap gauge. Surfaces that need the
+        // exact running count (which DOES expand lease_claim_batches) go
+        // through QueueStorage::queue_counts_exact() / admin::state_counts().
         let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
             r#"
             WITH head_signal AS (
@@ -2858,32 +2860,22 @@ impl MaintenanceService {
                 GROUP BY head_signal.queue
             ),
             leases AS (
+                -- Both legs are `leases`-only because this gauge must not touch
+                -- the receipt tables (see the function-level lock note). The
+                -- `running` leg is therefore an approximation (misses compact
+                -- lease_claim_batches claims, #246). `waiting_external` is exact
+                -- even so: a receipt claim cannot be `waiting_external` off the
+                -- `leases` plane — QueueStorage::register_callback runs
+                -- ensure_mutable_running_attempt_tx (materialises the claim into
+                -- `leases`) before enter_callback_wait_in_tx flips
+                -- `leases.state`. (Same waiting_external invariant, exact form,
+                -- at admin::state_counts.)
                 SELECT
                     queue,
                     count(*) FILTER (WHERE state = 'running')::bigint AS running,
-                    -- INVARIANT: the `waiting_external` FILTER is leases-only on
-                    -- purpose — unlike `running` (see receipt_running below) it
-                    -- needs no lease_claim_batches branch. A receipt claim
-                    -- cannot be `waiting_external` while it lives on a compact
-                    -- batch: `QueueStorage::register_callback` runs
-                    -- `ensure_mutable_running_attempt_tx` (materialises the
-                    -- claim into `leases`) BEFORE `enter_callback_wait_in_tx`
-                    -- flips `leases.state` to `waiting_external`. Every
-                    -- waiting_external row is therefore on `leases` by
-                    -- construction. (Same reasoning at admin::state_counts.)
                     count(*) FILTER (WHERE state = 'waiting_external')::bigint
                         AS waiting_external
                 FROM {schema}.leases
-                GROUP BY queue
-            ),
-            -- Receipt claims not yet materialised into `leases` are running too
-            -- (#246): since compact claims live in `lease_claim_batches`, a
-            -- leases-only running count under-reports a saturated queue. Only
-            -- the running leg needs this — see the waiting_external invariant
-            -- above.
-            receipt_running AS (
-                SELECT queue, count(*)::bigint AS running
-                FROM ({open_running}) AS open_running
                 GROUP BY queue
             ),
             deferred AS (
@@ -2912,8 +2904,7 @@ impl MaintenanceService {
             SELECT
                 queues.queue,
                 COALESCE(ready.available, 0)::bigint AS available,
-                (COALESCE(leases.running, 0) + COALESCE(receipt_running.running, 0))::bigint
-                    AS running,
+                COALESCE(leases.running, 0)::bigint AS running,
                 COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
                 COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
                 COALESCE(deferred.retryable, 0)::bigint AS retryable,
@@ -2927,8 +2918,6 @@ impl MaintenanceService {
               ON lag.queue = queues.queue
             LEFT JOIN leases
               ON leases.queue = queues.queue
-            LEFT JOIN receipt_running
-              ON receipt_running.queue = queues.queue
             LEFT JOIN deferred
               ON deferred.queue = queues.queue
             LEFT JOIN terminal
