@@ -229,10 +229,14 @@ BEGIN
             INTO v_lane_seq;
         END IF;
 
-        SELECT ring.current_slot, ring.generation
+        -- #371: the queue-ring cursor is the max-generation row of the
+        -- append-only rotation ledger (resolved against the active
+        -- queue-storage schema via the search_path set above).
+        SELECT ledger.slot, ledger.generation
         INTO v_ready_slot, v_ready_generation
-        FROM queue_ring_state AS ring
-        WHERE ring.singleton = TRUE;
+        FROM queue_ring_rotations AS ledger
+        ORDER BY ledger.generation DESC
+        LIMIT 1;
 
         INSERT INTO ready_entries (
             ready_slot,

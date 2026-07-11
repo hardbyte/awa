@@ -2032,27 +2032,46 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     )
     .await;
 
-    // Seeded state: current_slot = 0, generation = 0, slot_count = 4.
-    let (initial_slot, initial_gen, initial_count): (i32, i64, i32) = sqlx::query_as(&format!(
-        "SELECT current_slot, generation, slot_count FROM {schema}.claim_ring_state WHERE singleton"
+    // Seeded state: cursor (slot 0, generation 0), slot_count = 4.
+    let (initial_slot, initial_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(&pool)
     .await
-    .expect("read initial claim ring state");
+    .expect("read initial claim ring cursor");
+    let initial_count: i32 = sqlx::query_scalar(&format!(
+        "SELECT slot_count FROM {schema}.claim_ring_state WHERE singleton = TRUE"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read initial claim ring slot_count");
     assert_eq!(initial_slot, 0);
     assert_eq!(initial_gen, 0);
     assert_eq!(initial_count, 4);
 
-    let slot_rows: Vec<(i32, i64)> = sqlx::query_as(&format!(
-        "SELECT slot, generation FROM {schema}.claim_ring_slots ORDER BY slot"
+    // #371: per-slot generations are derived from the ledger cursor, so the
+    // seeded shape is (a) the slot rows exist and (b) the genesis cursor is
+    // the single ledger row (0, 0).
+    let slot_rows: Vec<i32> = sqlx::query_scalar(&format!(
+        "SELECT slot FROM {schema}.claim_ring_slots ORDER BY slot"
     ))
     .fetch_all(&pool)
     .await
     .expect("read initial claim ring slot rows");
     assert_eq!(
         slot_rows,
-        vec![(0, 0), (1, -1), (2, -1), (3, -1)],
-        "seeded slot table should have one open slot and the rest uninitialized"
+        vec![0, 1, 2, 3],
+        "seeded slot table should hold one row per ring slot"
+    );
+    let ledger_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.claim_ring_rotations"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count initial claim ring ledger rows");
+    assert_eq!(
+        ledger_rows, 1,
+        "fresh install seeds exactly one genesis rotation"
     );
 
     // Rotate four times — every attempt is idle-skipped (#371): the
@@ -2072,11 +2091,11 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         }
     }
     let (idle_slot, idle_gen): (i32, i64) = sqlx::query_as(&format!(
-        "SELECT current_slot, generation FROM {schema}.claim_ring_state WHERE singleton"
+        "SELECT slot, generation FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(&pool)
     .await
-    .expect("read claim ring state after idle rotations");
+    .expect("read claim ring cursor after idle rotations");
     assert_eq!(
         (idle_slot, idle_gen),
         (0, 0),
@@ -2097,29 +2116,45 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         "prune_oldest_claims on untouched ring must be Noop or Pruned, got {prune:?}"
     );
 
-    // reset() re-seeds the ring to the initial shape — claim_ring_state
-    // back to (0, 0, N), claim_ring_slots back to one-open-rest-uninit.
+    // reset() re-seeds the ring to the initial shape — the ledger back to a
+    // single genesis cursor (0, 0), claim_ring_slots back to one row per slot.
     store.reset(&pool).await.expect("reset should succeed");
-    let (reset_slot, reset_gen, reset_count): (i32, i64, i32) = sqlx::query_as(&format!(
-        "SELECT current_slot, generation, slot_count FROM {schema}.claim_ring_state WHERE singleton"
+    let (reset_slot, reset_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(&pool)
     .await
-    .expect("read claim ring state after reset");
+    .expect("read claim ring cursor after reset");
+    let reset_count: i32 = sqlx::query_scalar(&format!(
+        "SELECT slot_count FROM {schema}.claim_ring_state WHERE singleton = TRUE"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read claim ring slot_count after reset");
     assert_eq!(reset_slot, 0);
     assert_eq!(reset_gen, 0);
     assert_eq!(reset_count, 4);
 
-    let post_reset_rows: Vec<(i32, i64)> = sqlx::query_as(&format!(
-        "SELECT slot, generation FROM {schema}.claim_ring_slots ORDER BY slot"
+    let post_reset_rows: Vec<i32> = sqlx::query_scalar(&format!(
+        "SELECT slot FROM {schema}.claim_ring_slots ORDER BY slot"
     ))
     .fetch_all(&pool)
     .await
     .expect("read claim ring slot rows after reset");
     assert_eq!(
         post_reset_rows,
-        vec![(0, 0), (1, -1), (2, -1), (3, -1)],
+        vec![0, 1, 2, 3],
         "reset should restore the seeded claim-ring slot table"
+    );
+    let post_reset_ledger: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.claim_ring_rotations"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count claim ring ledger rows after reset");
+    assert_eq!(
+        post_reset_ledger, 1,
+        "reset should restore a single genesis rotation"
     );
 
     // prepare_schema() is idempotent: re-running after reset must not
@@ -2541,8 +2576,9 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
     .await;
 
     // The lease ring is empty so `rotate_leases` idle-skips (#371);
-    // advance the cursor directly (rotation of a busy ring updates only
-    // lease_ring_state) so slot 0 becomes the prune target.
+    // advance the cursor directly by appending a ledger row (rotation of a
+    // busy ring appends to lease_ring_rotations) so slot 0 becomes the prune
+    // target. Cursor (slot 1, generation 1) satisfies slot = generation mod 2.
     match store
         .rotate_leases(&pool)
         .await
@@ -2553,9 +2589,8 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
     }
     sqlx::query(&format!(
         r#"
-        UPDATE {schema}.lease_ring_state
-        SET current_slot = 1, generation = 1
-        WHERE singleton = TRUE
+        INSERT INTO {schema}.lease_ring_rotations (generation, slot)
+        VALUES (1, 1)
         "#
     ))
     .execute(&pool)
@@ -2711,9 +2746,10 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
     );
 
     // The ring is empty at this point, so `rotate_claims` idle-skips
-    // (#371); move the cursor off slot 0 directly so prune targets it.
+    // (#371); append a rotation to the ledger to move the cursor off
+    // slot 0 directly so prune targets it.
     sqlx::query(&format!(
-        "UPDATE {schema}.claim_ring_state SET current_slot = 1, generation = 1 WHERE singleton = TRUE"
+        "INSERT INTO {schema}.claim_ring_rotations (generation, slot) VALUES (1, 1)"
     ))
     .execute(&pool)
     .await
@@ -2850,7 +2886,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         "empty ready slot 0 should idle-skip: {idle:?}"
     );
     sqlx::query(&format!(
-        "UPDATE {schema}.queue_ring_state SET current_slot = 1, generation = 1 WHERE singleton = TRUE"
+        "INSERT INTO {schema}.queue_ring_rotations (generation, slot) VALUES (1, 1)"
     ))
     .execute(&pool)
     .await
@@ -3220,19 +3256,19 @@ async fn test_lease_claim_partition_routing() {
     .await;
 
     // Move the claim-ring cursor forward so the current slot is not
-    // zero — this proves the claim CTE actually reads claim_ring_state
-    // rather than defaulting. The ring is empty, so `rotate_claims`
-    // idle-skips (#371); advance the cursor directly, exactly as a
-    // rotation of a busy ring would (rotate updates only
-    // claim_ring_state).
+    // zero — this proves the claim CTE actually reads the claim rotation
+    // ledger rather than defaulting. The ring is empty, so `rotate_claims`
+    // idle-skips (#371); append the cursor hops to the ledger directly,
+    // exactly as a rotation of a busy ring would (slot = generation mod
+    // slot_count).
     sqlx::query(&format!(
-        "UPDATE {schema}.claim_ring_state SET current_slot = 2, generation = 2 WHERE singleton"
+        "INSERT INTO {schema}.claim_ring_rotations (generation, slot) VALUES (1, 1), (2, 2)"
     ))
     .execute(&pool)
     .await
     .expect("advance claim ring cursor for routing setup");
     let current_slot: i32 = sqlx::query_scalar(&format!(
-        "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
+        "SELECT slot FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(&pool)
     .await
@@ -3442,13 +3478,29 @@ async fn test_lease_claim_rotation_isolation() {
 
 /// Read `(current_slot, generation)` for one of the three ring-state
 /// singletons (`ring` is "queue" / "lease" / "claim").
+/// Current ring cursor `(slot, generation)`: the max-generation row of the
+/// ring's append-only rotation ledger (#371). The `{ring}_ring_state`
+/// singleton no longer carries the cursor columns.
 async fn ring_cursor(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
     sqlx::query_as::<_, (i32, i64)>(&format!(
-        "SELECT current_slot, generation FROM {schema}.{ring}_ring_state WHERE singleton = TRUE"
+        "SELECT slot, generation FROM {schema}.{ring}_ring_rotations \
+         ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(pool)
     .await
-    .expect("read ring state")
+    .expect("read ring cursor")
+}
+
+/// Number of rows in a ring's rotation ledger (#371). One on a fresh
+/// install (the genesis cursor); grows by one per rotation and is trimmed
+/// back to one wrap (`slot_count` rows) by the maintenance fold.
+async fn ring_ledger_row_count(pool: &sqlx::PgPool, schema: &str, ring: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {schema}.{ring}_ring_rotations"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("count ring ledger rows")
 }
 
 /// Physical row identity of a ring-state singleton. If any UPDATE runs
@@ -3528,6 +3580,11 @@ async fn test_idle_ring_rotation_skips_without_ring_state_churn() {
     let queue_before = ring_cursor(&pool, schema, "queue").await;
     let lease_before = ring_cursor(&pool, schema, "lease").await;
     let claim_before = ring_cursor(&pool, schema, "claim").await;
+    // #371: an idle rotate must not append to the ledger either. Genesis
+    // seeds exactly one row per ring; that count must survive the idle run.
+    let queue_ledger_before = ring_ledger_row_count(&pool, schema, "queue").await;
+    let lease_ledger_before = ring_ledger_row_count(&pool, schema, "lease").await;
+    let claim_ledger_before = ring_ledger_row_count(&pool, schema, "claim").await;
     let queue_row_before = ring_row_identity(&pool, schema, "queue_ring_state").await;
     let lease_row_before = ring_row_identity(&pool, schema, "lease_ring_state").await;
     let claim_row_before = ring_row_identity(&pool, schema, "claim_ring_state").await;
@@ -3570,6 +3627,24 @@ async fn test_idle_ring_rotation_skips_without_ring_state_churn() {
         ring_cursor(&pool, schema, "claim").await,
         claim_before,
         "idle rotation must not advance the claim ring cursor or generation"
+    );
+
+    // No ledger append ran: idle rotation is a pure no-op, so the ledgers
+    // keep exactly their genesis rows (#371).
+    assert_eq!(
+        ring_ledger_row_count(&pool, schema, "queue").await,
+        queue_ledger_before,
+        "idle rotation must not append to the queue rotation ledger"
+    );
+    assert_eq!(
+        ring_ledger_row_count(&pool, schema, "lease").await,
+        lease_ledger_before,
+        "idle rotation must not append to the lease rotation ledger"
+    );
+    assert_eq!(
+        ring_ledger_row_count(&pool, schema, "claim").await,
+        claim_ledger_before,
+        "idle rotation must not append to the claim rotation ledger"
     );
 
     // No UPDATE ran: the singleton rows are physically the same tuple.
@@ -3823,6 +3898,319 @@ async fn test_drained_ring_rotation_skips_after_prune() {
         RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 2),
         other => panic!("revived queue ring must rotate, got {other:?}"),
     }
+}
+
+/// #371: the rotation ledger's `generation` primary key makes the append
+/// a compare-and-swap: rotate's append is `INSERT ... ON CONFLICT
+/// (generation) DO NOTHING`, so a rotator whose observed cursor was
+/// already consumed by a competing appender writes zero rows and treats
+/// the tick as a lost race rather than double-advancing the ring. This
+/// pins the mechanism (the `generation` primary key) that makes the
+/// append a CAS, and that two rotators racing on the same current slot
+/// leave exactly one advance in the ledger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ring_rotation_ledger_append_is_a_generation_cas() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_rotation_cas";
+    let _store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (current_slot, generation) = ring_cursor(&pool, schema, "queue").await;
+    assert_eq!((current_slot, generation), (0, 0), "genesis cursor");
+
+    // First appender wins generation 1 at slot 1 (= 1 mod 4).
+    let winner = sqlx::query(&format!(
+        "INSERT INTO {schema}.queue_ring_rotations (generation, slot) \
+         VALUES (1, 1) ON CONFLICT (generation) DO NOTHING"
+    ))
+    .execute(&pool)
+    .await
+    .expect("winning rotation append");
+    assert_eq!(
+        winner.rows_affected(),
+        1,
+        "first appender advances the ring"
+    );
+
+    // A competing appender that observed the same cursor (generation 0)
+    // computes the same next generation (1); its CAS append conflicts on
+    // the generation PK and writes nothing — the lost race rotate maps to
+    // SkippedBusy. Even a different target slot cannot double-advance the
+    // generation.
+    let loser = sqlx::query(&format!(
+        "INSERT INTO {schema}.queue_ring_rotations (generation, slot) \
+         VALUES (1, 2) ON CONFLICT (generation) DO NOTHING"
+    ))
+    .execute(&pool)
+    .await
+    .expect("losing rotation append");
+    assert_eq!(
+        loser.rows_affected(),
+        0,
+        "the generation PK rejects the second appender's advance (CAS loss)"
+    );
+
+    // Exactly one advance is durable: the cursor is the winner's row and
+    // the ledger holds genesis + one rotation, never two rows at the same
+    // generation.
+    assert_eq!(
+        ring_cursor(&pool, schema, "queue").await,
+        (1, 1),
+        "cursor reflects the single winning append, not a double advance"
+    );
+    assert_eq!(
+        ring_ledger_row_count(&pool, schema, "queue").await,
+        2,
+        "genesis + one winning rotation; the CAS loser added no row"
+    );
+}
+
+/// #371: queue prune appends rollup deltas instead of upserting
+/// `queue_terminal_rollups` synchronously. The maintenance fold that
+/// drains the deltas mutates the permanent rollups, so it must stand down
+/// while another backend pins the MVCC horizon — and exact reads must stay
+/// correct across the deferral because they include the unfolded deltas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_rollup_delta_fold_defers_under_pinned_horizon() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_rollup_delta_fold_pin";
+    let schema = "awa_qs_rollup_delta_fold_pin";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 5)
+        .await
+        .expect("enqueue");
+    let claimed = store.claim_batch(&pool, queue, 5).await.expect("claim");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+    match store.rotate(&pool).await.expect("rotate") {
+        RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    match store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("prune_oldest")
+    {
+        PruneOutcome::Pruned { .. } => {}
+        other => panic!("expected Pruned, got {other:?}"),
+    }
+
+    // Prune recorded the 5 completions as an unfolded delta; nothing in
+    // the permanent rollup yet.
+    assert_eq!(pruned_delta_row_count(&pool, schema, queue).await, 1);
+    let (pruned_completed, _) = pruned_rollup_sums(&pool, schema, queue).await;
+    assert_eq!(
+        pruned_completed, 5,
+        "unfolded delta holds the exact pruned count"
+    );
+
+    // Pin the MVCC horizon with a second connection's open transaction.
+    let mut pinned = pool.acquire().await.expect("acquire pinned connection");
+    sqlx::query("BEGIN")
+        .execute(&mut *pinned)
+        .await
+        .expect("begin pinned transaction");
+    sqlx::query("SELECT txid_current()")
+        .fetch_one(&mut *pinned)
+        .await
+        .expect("establish pinned xid");
+
+    let outcome = store
+        .fold_terminal_rollup_deltas(&pool)
+        .await
+        .expect("fold under pin");
+    assert!(
+        outcome.skipped_mvcc_pinned,
+        "fold must stand down while the horizon is pinned"
+    );
+    assert_eq!(outcome.folded_delta_rows, 0);
+    assert_eq!(
+        pruned_delta_row_count(&pool, schema, queue).await,
+        1,
+        "deltas remain visible to exact reads while deferred"
+    );
+
+    // Exact reads stay correct across the deferral.
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts under pin");
+    assert_eq!(counts.terminal, 5, "exact reads include unfolded deltas");
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut *pinned)
+        .await
+        .expect("release pinned transaction");
+    drop(pinned);
+
+    // Horizon clear: the fold now drains the delta into the rollup.
+    let outcome = store
+        .fold_terminal_rollup_deltas(&pool)
+        .await
+        .expect("fold after release");
+    assert!(!outcome.skipped_mvcc_pinned);
+    assert_eq!(outcome.folded_delta_rows, 1);
+    assert_eq!(pruned_delta_row_count(&pool, schema, queue).await, 0);
+    let folded: i64 = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint \
+         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("folded rollup");
+    assert_eq!(folded, 5, "fold moved the count into the permanent rollup");
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts after fold");
+    assert_eq!(counts.terminal, 5, "total preserved across the fold");
+}
+
+/// #371: the ring-rotation ledger fold trims each ledger to one full wrap
+/// (`slot_count` rows) so sealed-slot generations stay derivable, but only
+/// once the MVCC horizon is clear (the trimmed versions must be
+/// immediately reclaimable). Under a pin the fold defers, leaving the full
+/// ledger; after release it trims to `<= slot_count`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_ring_rotation_ledger_fold_defers_under_pin_then_trims_to_one_wrap() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_ledger_fold_trim";
+    let queue = "qs_ledger_fold_trim";
+    let slot_count = 4;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: slot_count,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Drive the queue ring through more than one full wrap of rotations so
+    // the ledger grows well past `slot_count` rows. Each iteration enqueues
+    // a job (making the current slot non-empty), rotates to seal it, then
+    // prunes the sealed slot to keep the ring drainable.
+    let wraps = 2;
+    for round in 0..(slot_count * wraps + 1) {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: round as i64 },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+            .await
+            .expect("claim");
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .expect("complete");
+        match store.rotate(&pool).await.expect("rotate") {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("round {round}: expected Rotated, got {other:?}"),
+        }
+        let _ = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("prune_oldest");
+    }
+
+    let (cursor_slot, cursor_gen) = ring_cursor(&pool, schema, "queue").await;
+    let grown = ring_ledger_row_count(&pool, schema, "queue").await;
+    assert!(
+        grown > slot_count as i64,
+        "ledger should grow past one wrap before the fold (rows={grown}, slot_count={slot_count})"
+    );
+
+    // Pin the horizon: the ledger fold must defer, leaving the full ledger.
+    let mut pinned = pool.acquire().await.expect("acquire pinned connection");
+    sqlx::query("BEGIN")
+        .execute(&mut *pinned)
+        .await
+        .expect("begin pinned transaction");
+    sqlx::query("SELECT txid_current()")
+        .fetch_one(&mut *pinned)
+        .await
+        .expect("establish pinned xid");
+
+    let outcome = store
+        .fold_ring_rotation_ledgers(&pool)
+        .await
+        .expect("ledger fold under pin");
+    assert!(
+        outcome.skipped_mvcc_pinned,
+        "ledger fold must stand down while the horizon is pinned"
+    );
+    assert_eq!(outcome.trimmed_rows, 0);
+    assert_eq!(
+        ring_ledger_row_count(&pool, schema, "queue").await,
+        grown,
+        "deferred fold leaves the ledger untrimmed"
+    );
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut *pinned)
+        .await
+        .expect("release pinned transaction");
+    drop(pinned);
+
+    // Horizon clear: the fold trims each ledger to at most one wrap.
+    let outcome = store
+        .fold_ring_rotation_ledgers(&pool)
+        .await
+        .expect("ledger fold after release");
+    assert!(!outcome.skipped_mvcc_pinned);
+    assert!(
+        outcome.trimmed_rows > 0,
+        "fold should trim the excess ledger rows"
+    );
+    let trimmed = ring_ledger_row_count(&pool, schema, "queue").await;
+    assert!(
+        trimmed <= slot_count as i64,
+        "ledger trims to at most one wrap (rows={trimmed}, slot_count={slot_count})"
+    );
+
+    // The cursor and every sealed-slot derivation survive the trim: the
+    // max-generation row is retained, so the current cursor is unchanged.
+    assert_eq!(
+        ring_cursor(&pool, schema, "queue").await,
+        (cursor_slot, cursor_gen),
+        "trim retains the max-generation cursor row"
+    );
+
+    // Idempotent: a second fold on an already-trimmed ledger is a no-op.
+    let outcome = store
+        .fold_ring_rotation_ledgers(&pool)
+        .await
+        .expect("second ledger fold");
+    assert_eq!(
+        outcome.trimmed_rows, 0,
+        "already-trimmed ledger has nothing to trim"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4081,9 +4469,10 @@ async fn test_lease_claim_migration_preserves_rows() {
         assert!(!exists, "{name} must be dropped after migration");
     }
 
-    // All pre-existing rows landed in current claim_slot.
+    // All pre-existing rows landed in the current claim slot (the
+    // max-generation ledger row, #371).
     let current_slot: i32 = sqlx::query_scalar(&format!(
-        "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
+        "SELECT slot FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(&pool)
     .await
@@ -6718,17 +7107,24 @@ async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rota
     }
     sqlx::query(&format!(
         r#"
-        UPDATE {schema}.lease_ring_state
-        SET current_slot = (current_slot + 1) % slot_count,
-            generation = generation + 1
-        WHERE singleton = TRUE
+        INSERT INTO {schema}.lease_ring_rotations (generation, slot)
+        SELECT cursor.generation + 1,
+               (cursor.slot + 1) % state.slot_count
+        FROM {schema}.lease_ring_state AS state
+        CROSS JOIN LATERAL (
+            SELECT slot, generation
+            FROM {schema}.lease_ring_rotations
+            ORDER BY generation DESC
+            LIMIT 1
+        ) AS cursor
+        WHERE state.singleton = TRUE
         "#
     ))
     .execute(&pool)
     .await
     .expect("advance lease ring cursor for materialization regression setup");
     let rotated_lease_slot: i32 = sqlx::query_scalar(&format!(
-        "SELECT current_slot FROM {schema}.lease_ring_state WHERE singleton = TRUE"
+        "SELECT slot FROM {schema}.lease_ring_rotations ORDER BY generation DESC LIMIT 1"
     ))
     .fetch_one(&pool)
     .await
@@ -7251,9 +7647,10 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
         .await
         .expect("allocate later job id");
         let (ready_slot, ready_generation): (i32, i64) = sqlx::query_as(&format!(
-            "SELECT current_slot, generation
-             FROM {later_schema}.queue_ring_state
-             WHERE singleton = TRUE"
+            "SELECT slot, generation
+             FROM {later_schema}.queue_ring_rotations
+             ORDER BY generation DESC
+             LIMIT 1"
         ))
         .fetch_one(tx.as_mut())
         .await
@@ -9599,7 +9996,8 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
     // - done_entries for this queue is empty (partition truncated)
     // - queue_terminal_live_counts has no rows for this slot
     // - queue_terminal_count_deltas has no rows for this slot
-    // - queue_terminal_rollups.pruned_completed_count absorbed the 5
+    // - the 5 pruned completions are recorded (as a rollup delta, #371,
+    //   folded lazily by maintenance) so the effective pruned count is 5
     assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
     assert_eq!(
         live_count_sum(&pool, schema, queue).await,
@@ -9611,15 +10009,32 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
         0,
         "pending deltas for the pruned slot must be truncated"
     );
-    let rollup: i64 = sqlx::query_scalar::<_, i64>(&format!(
+    let (pruned_completed, _pruned_failed) = pruned_rollup_sums(&pool, schema, queue).await;
+    assert_eq!(
+        pruned_completed, 5,
+        "prune recorded the slot's 5 completions (folded rollup + unfolded delta, #371)"
+    );
+
+    // #371: fold the append-only delta into the permanent rollup and
+    // confirm the total is preserved with no pending rows left.
+    store
+        .fold_terminal_rollup_deltas(&pool)
+        .await
+        .expect("fold terminal rollup deltas");
+    assert_eq!(
+        pruned_delta_row_count(&pool, schema, queue).await,
+        0,
+        "fold must drain the unfolded rollup deltas"
+    );
+    let folded: i64 = sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint \
          FROM {schema}.queue_terminal_rollups WHERE queue = $1"
     ))
     .bind(queue)
     .fetch_one(&pool)
     .await
-    .expect("rollup sum");
-    assert_eq!(rollup, 5, "rollup absorbed the pruned slot's counter");
+    .expect("folded rollup sum");
+    assert_eq!(folded, 5, "fold absorbed the pruned slot's counter");
 }
 
 /// #337: prune re-homes failed terminal rows inside the retention floor
@@ -9723,22 +10138,14 @@ async fn test_queue_storage_prune_carries_failed_rows_inside_retention_floor() {
     // Exact counts moved with the carried row (ADR-026 invariant), and
     // the rollup split the truncated rows by state.
     assert_invariant_holds(&pool, schema, queue, "after retention-floor prune").await;
-    let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
-        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint, \
-                COALESCE(SUM(pruned_failed_count), 0)::bigint \
-         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("rollup sums");
+    let (pruned_completed, pruned_failed) = pruned_rollup_sums(&pool, schema, queue).await;
     assert_eq!(
         pruned_completed, 1,
-        "completed row folds into the completed column"
+        "completed row folds into the completed column (rollup + unfolded delta, #371)"
     );
     assert_eq!(
         pruned_failed, 1,
-        "expired failed row folds into the failed column"
+        "expired failed row folds into the failed column (rollup + unfolded delta, #371)"
     );
 
     let counts = store.queue_counts(&pool, queue).await.expect("counts");
@@ -10016,18 +10423,10 @@ async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
 
     // Completed rows folded into the completed column; pruned_failed_count
     // is untouched because no failed row was past the floor.
-    let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
-        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint, \
-                COALESCE(SUM(pruned_failed_count), 0)::bigint \
-         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("rollup sums");
+    let (pruned_completed, pruned_failed) = pruned_rollup_sums(&pool, schema, queue).await;
     assert_eq!(
         pruned_completed, 2,
-        "both completed rows fold into the completed column"
+        "both completed rows fold into the completed column (rollup + unfolded delta, #371)"
     );
     assert_eq!(
         pruned_failed, 0,
@@ -10169,19 +10568,11 @@ async fn test_queue_storage_prune_past_floor_folds_failed_into_rollup() {
     // No live done rows remain; all three failed rows folded into the
     // failed rollup column.
     assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
-    let (pruned_completed, pruned_failed): (i64, i64) = sqlx::query_as(&format!(
-        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint, \
-                COALESCE(SUM(pruned_failed_count), 0)::bigint \
-         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("rollup sums");
+    let (pruned_completed, pruned_failed) = pruned_rollup_sums(&pool, schema, queue).await;
     assert_eq!(pruned_completed, 0, "no completed rows in this scenario");
     assert_eq!(
         pruned_failed, 3,
-        "all three failed rows fold into the failed column"
+        "all three failed rows fold into the failed column (rollup + unfolded delta, #371)"
     );
 
     // The pruned failed rows are no longer retryable.
@@ -10298,17 +10689,17 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
 
     // Lap the ring so the carried row's slot (1) becomes the oldest
     // sealed slot again: 1→2→3→0. Slots 2/3/0 are empty, so `rotate`
-    // now idle-skips (#371) instead of advancing; move the cursor
-    // directly, exactly as a rotation of a busy ring would (each hop is
-    // current_slot+1, generation+1). A real fleet laps the same way
-    // whenever other queues' traffic keeps the ring busy. After the
-    // three hops the cursor is (slot 0, generation 4), which makes
-    // `oldest_initialized_ring_slot` target slot 1 for the second prune.
+    // now idle-skips (#371) instead of advancing; append the cursor hops
+    // to the rotation ledger directly, exactly as a rotation of a busy
+    // ring would (each hop is generation+1, slot = generation mod 4). A
+    // real fleet laps the same way whenever other queues' traffic keeps
+    // the ring busy. After the three hops the cursor is (slot 0,
+    // generation 4), which makes `oldest_initialized_ring_slot` target
+    // slot 1 for the second prune.
     sqlx::query(&format!(
         r#"
-        UPDATE {schema}.queue_ring_state
-        SET current_slot = 0, generation = 4
-        WHERE singleton = TRUE
+        INSERT INTO {schema}.queue_ring_rotations (generation, slot)
+        VALUES (2, 2), (3, 3), (4, 0)
         "#
     ))
     .execute(&pool)
@@ -10361,16 +10752,9 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         "counters track exactly one terminal row across the re-carry"
     );
 
-    // No failed row was ever past the floor, so nothing folded into the
-    // rollup despite two prunes.
-    let pruned_failed: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(SUM(pruned_failed_count), 0)::bigint \
-         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("rollup failed sum");
+    // No failed row was ever past the floor, so nothing was recorded as
+    // pruned-failed despite two prunes (rollup + unfolded delta, #371).
+    let (_pruned_completed, pruned_failed) = pruned_rollup_sums(&pool, schema, queue).await;
     assert_eq!(
         pruned_failed, 0,
         "the row was always carried, never pruned past the floor"
@@ -10531,33 +10915,27 @@ async fn test_queue_terminal_count_delta_rollup_skips_empty_old_slots() {
     .await;
 
     // Lap the ring 21 slots forward. The ring is empty, so `rotate` now
-    // idle-skips (#371) rather than advancing; replay exactly the writes
-    // 21 real rotations from (slot 0, generation 0) would make — the
-    // ring-state cursor lands on (slot 21, generation 21), and each slot
-    // n in 1..=21 records generation n in `queue_ring_slots` (rotation
-    // stamps the *incoming* slot's generation). A loaded ring laps the
-    // same way; this test only needs the sealed-slot bookkeeping, not the
-    // traffic that would normally drive it.
-    for slot in 1..=21_i32 {
-        sqlx::query(&format!(
-            "UPDATE {schema}.queue_ring_slots SET generation = $2 WHERE slot = $1"
-        ))
-        .bind(slot)
-        .bind(slot as i64)
-        .execute(&pool)
-        .await
-        .expect("stamp lapped slot generation");
-    }
+    // idle-skips (#371) rather than advancing; replay exactly the ledger
+    // appends 21 real rotations from (slot 0, generation 0) would make.
+    // With 32 slots there is no wrap, so slot n opens at generation n; the
+    // cursor lands on (slot 21, generation 21) and sealed-slot generations
+    // are derived from the ledger. A loaded ring laps the same way; this
+    // test only needs the sealed-slot bookkeeping, not the traffic that
+    // would normally drive it.
     sqlx::query(&format!(
-        "UPDATE {schema}.queue_ring_state SET current_slot = 21, generation = 21 WHERE singleton = TRUE"
+        "INSERT INTO {schema}.queue_ring_rotations (generation, slot) \
+         SELECT g, g::int FROM generate_series(1, 21) AS g"
     ))
     .execute(&pool)
     .await
     .expect("advance queue ring cursor to slot 21");
 
     let target_slot = 20_i32;
+    // Sealed-slot generation is derived from the ledger (#371): the
+    // largest generation whose slot equals target_slot.
     let target_generation: i64 = sqlx::query_scalar(&format!(
-        "SELECT generation FROM {schema}.queue_ring_slots WHERE slot = $1"
+        "SELECT generation FROM {schema}.queue_ring_rotations \
+         WHERE slot = $1 ORDER BY generation DESC LIMIT 1"
     ))
     .bind(target_slot)
     .fetch_one(&pool)
@@ -11039,6 +11417,51 @@ async fn terminal_counter_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) ->
     live_count_sum(pool, schema, queue).await + terminal_delta_sum(pool, schema, queue).await
 }
 
+/// Effective pruned terminal accounting for a queue: folded
+/// `queue_terminal_rollups` plus unfolded `queue_terminal_rollup_deltas`
+/// (#371). Queue prune now appends deltas instead of upserting the rollups
+/// synchronously, so tests that assert on the total pruned counts read the
+/// same folded-plus-pending sum the production count readers do — the sum
+/// is stable across fold timing while still pinning the exact totals.
+async fn pruned_rollup_sums(pool: &sqlx::PgPool, schema: &str, queue: &str) -> (i64, i64) {
+    sqlx::query_as::<_, (i64, i64)>(&format!(
+        "SELECT
+             COALESCE((
+                 SELECT SUM(pruned_completed_count)
+                 FROM {schema}.queue_terminal_rollups WHERE queue = $1
+             ), 0)::bigint
+             + COALESCE((
+                 SELECT SUM(pruned_completed_delta)
+                 FROM {schema}.queue_terminal_rollup_deltas WHERE queue = $1
+             ), 0)::bigint,
+             COALESCE((
+                 SELECT SUM(pruned_failed_count)
+                 FROM {schema}.queue_terminal_rollups WHERE queue = $1
+             ), 0)::bigint
+             + COALESCE((
+                 SELECT SUM(pruned_failed_delta)
+                 FROM {schema}.queue_terminal_rollup_deltas WHERE queue = $1
+             ), 0)::bigint"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("sum pruned rollups + unfolded deltas")
+}
+
+/// Number of unfolded `queue_terminal_rollup_deltas` rows for a queue
+/// (#371). Zero after a fold clears the horizon-gated deltas.
+async fn pruned_delta_row_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint \
+         FROM {schema}.queue_terminal_rollup_deltas WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count pruned rollup deltas")
+}
+
 async fn done_entries_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(&format!(
         "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1"
@@ -11159,20 +11582,18 @@ async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock(
         .expect("Failed to enqueue lease-lock job");
 
     let mut lock_tx = pool.begin().await.expect("Failed to begin lease lock tx");
-    sqlx::query(&format!(
-        r#"
-        SELECT current_slot
-        FROM {schema}.lease_ring_state
-        WHERE singleton = TRUE
-        FOR UPDATE
-        "#
-    ))
-    .execute(lock_tx.as_mut())
-    .await
-    .expect("Failed to lock lease ring state");
+    // #371: lease rotation now serialises on a per-ring advisory xact lock
+    // (it replaced the pre-ledger `FOR UPDATE` on the lease_ring_state
+    // singleton). Hold that lock so a claim that erroneously waited on the
+    // lease rotation lock would block; the claim must not take it.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:lease"))
+        .execute(lock_tx.as_mut())
+        .await
+        .expect("Failed to hold lease ring rotation lock");
 
     // `lock_tx` stays open until after the claim returns; a real dependency on
-    // the held row lock still times out, while loaded CI gets scheduler headroom.
+    // the held rotation lock still times out, while loaded CI gets scheduler headroom.
     let claimed_while_locked = tokio::time::timeout(
         Duration::from_secs(3),
         store.claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30)),
