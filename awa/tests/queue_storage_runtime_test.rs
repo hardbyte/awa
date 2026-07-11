@@ -4564,6 +4564,134 @@ async fn test_ring_rotation_ledger_fold_defers_under_pin_then_trims_to_one_wrap(
     );
 }
 
+/// #415 regression: the horizon-gated folds must RUN under ordinary
+/// concurrent traffic, not stand down. The first implementation gated on any
+/// live `backend_xmin`, which every in-flight query sets — so under continuous
+/// hot-path claims/enqueues the folds skipped on nearly every tick and the
+/// ledger grew without bound. A transient (young) active snapshot must not
+/// look like a pinned horizon; only a genuinely long-lived reader
+/// (`MVCC_HORIZON_PIN_MIN_AGE`) or an idle-in-transaction holder does. See
+/// [`test_ring_rotation_ledger_fold_defers_under_pin_then_trims_to_one_wrap`]
+/// for the idle-in-transaction pin, which this complements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_ring_rotation_ledger_fold_runs_under_transient_traffic() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_ledger_fold_transient";
+    let queue = "qs_ledger_fold_transient";
+    let slot_count = 4;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: slot_count,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Grow the ledger past one wrap so a successful fold has rows to trim.
+    let wraps = 2;
+    for round in 0..(slot_count * wraps + 1) {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: round as i64 },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+            .await
+            .expect("claim");
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .expect("complete");
+        match store.rotate(&pool).await.expect("rotate") {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("round {round}: expected Rotated, got {other:?}"),
+        }
+        let _ = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("prune_oldest");
+    }
+    let grown = ring_ledger_row_count(&pool, schema, "queue").await;
+    assert!(
+        grown > slot_count as i64,
+        "ledger should grow past one wrap before the fold (rows={grown}, slot_count={slot_count})"
+    );
+
+    // Hold a *young* live snapshot on another backend: a REPEATABLE READ
+    // transaction keeps `backend_xmin` set across statements (unlike READ
+    // COMMITTED, which drops it at statement end), so the sampler sees a held
+    // snapshot with NO write xid (`backend_xid` NULL) and a very recent
+    // `xact_start` — the same signature a burst of in-flight hot-path reads
+    // presents. Pre-fix, any live `backend_xmin` forced the fold to skip; it
+    // must now be ignored until the snapshot is genuinely old (or the holder
+    // is idle-in-transaction with a write xid).
+    let mut transient = pool.acquire().await.expect("acquire transient connection");
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *transient)
+        .await
+        .expect("begin transient transaction");
+    let _: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_class")
+        .fetch_one(&mut *transient)
+        .await
+        .expect("establish transient snapshot");
+    // Sanity: this backend really is holding a live snapshot right now.
+    let holds_snapshot: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+         WHERE datname = current_database() AND pid <> pg_backend_pid() \
+         AND backend_type = 'client backend' AND backend_xmin IS NOT NULL)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("probe backend_xmin");
+    assert!(
+        holds_snapshot,
+        "transient REPEATABLE READ backend must hold a live snapshot for this test to be meaningful"
+    );
+
+    let outcome = store
+        .fold_ring_rotation_ledgers(&pool)
+        .await
+        .expect("ledger fold under transient traffic");
+    assert!(
+        !outcome.skipped_mvcc_pinned,
+        "fold must not stand down for a transient (young) active snapshot"
+    );
+    assert!(
+        outcome.trimmed_rows > 0,
+        "fold should trim the excess ledger rows despite live hot-path traffic"
+    );
+    let trimmed = ring_ledger_row_count(&pool, schema, "queue").await;
+    assert!(
+        trimmed <= slot_count as i64,
+        "ledger trims to at most one wrap (rows={trimmed}, slot_count={slot_count})"
+    );
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut *transient)
+        .await
+        .expect("release transient transaction");
+    drop(transient);
+
+    // Same query path also un-skips the terminal-delta fold under transient
+    // traffic (both folds share the horizon gate).
+    let delta_outcome = store
+        .fold_terminal_rollup_deltas(&pool)
+        .await
+        .expect("delta fold under no pin");
+    assert!(!delta_outcome.skipped_mvcc_pinned);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_legacy_zero_deadline_claim_conversion_error_rolls_back() {
     let (_db_guard, pool) = setup_pool(4).await;

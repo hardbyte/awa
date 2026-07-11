@@ -29,6 +29,31 @@ const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
+/// Minimum age of another backend's active snapshot before the horizon-gated
+/// folds (ledger trim, terminal-delta fold, delta rollup) treat it as pinning
+/// the MVCC horizon and stand down (#371, ADR-040).
+///
+/// The folds DELETE rows whose versions are only immediately reclaimable if no
+/// snapshot older than the DELETE still needs them. The gate exists to skip
+/// while such a snapshot is live. Its first implementation stood down whenever
+/// *any* backend had `backend_xmin` set — but `backend_xmin` is set for the
+/// duration of *every* ordinary query, including sub-millisecond hot-path
+/// claims and enqueues. Under any continuous traffic there is always such a
+/// backend, so the folds skipped on essentially every tick and the ledgers and
+/// `queue_terminal_rollup_deltas` grew without bound for the whole run. That is
+/// the opposite of the intent: a transient autocommit snapshot is gone long
+/// before the next 30s fold tick, so it can never strand the tuples a fold
+/// deletes now.
+///
+/// We therefore only count an *active* backend as pinning once its transaction
+/// has been open longer than this threshold — comfortably above normal
+/// query/claim latency (single-digit ms) yet well under the 30s fold cadence,
+/// so a genuinely long-lived reader still stands the folds down before their
+/// deletions accumulate. Idle-in-transaction backends holding a live xid are
+/// always treated as pinning regardless of age (they hold their snapshot
+/// indefinitely with no query in flight to bound it).
+const MVCC_HORIZON_PIN_MIN_AGE: Duration = Duration::from_secs(5);
+
 /// Portable 64-bit hash over raw ordering-key bytes.
 ///
 /// This is intentionally simple enough to implement byte-for-byte in
@@ -14558,6 +14583,22 @@ impl QueueStorage {
         Ok(outcome)
     }
 
+    /// Does another backend hold a snapshot old enough to strand the versions
+    /// the horizon-gated folds delete? See [`MVCC_HORIZON_PIN_MIN_AGE`] for why
+    /// this is age-gated rather than tripping on any live `backend_xmin`.
+    ///
+    /// A backend counts as pinning when it is either:
+    /// - **idle in transaction with a live xid** — it holds its snapshot
+    ///   indefinitely with no in-flight query to bound the hold, so any age is
+    ///   dangerous; or
+    /// - **actively holding a snapshot** (`backend_xmin` set) whose transaction
+    ///   has been open longer than [`MVCC_HORIZON_PIN_MIN_AGE`] — a genuinely
+    ///   long-lived reader, not a transient hot-path claim/enqueue.
+    ///
+    /// `xact_start` is NULL for a backend not in a transaction; the age
+    /// comparison naturally excludes those. It can lag `backend_xmin` by a
+    /// statement boundary, but a backend with a snapshot and no transaction
+    /// start is a momentary state we are content to let the next tick catch.
     async fn terminal_delta_rollup_mvcc_horizon_pinned_tx(
         tx: &mut sqlx::Transaction<'_, Postgres>,
     ) -> Result<bool, AwaError> {
@@ -14570,7 +14611,11 @@ impl QueueStorage {
                   AND pid <> pg_backend_pid()
                   AND backend_type = 'client backend'
                   AND (
-                      backend_xmin IS NOT NULL
+                      (
+                          backend_xmin IS NOT NULL
+                          AND xact_start IS NOT NULL
+                          AND xact_start <= now() - make_interval(secs => $1)
+                      )
                       OR (
                           backend_xid IS NOT NULL
                           AND state LIKE 'idle in transaction%'
@@ -14579,6 +14624,7 @@ impl QueueStorage {
             )
             "#,
         )
+        .bind(MVCC_HORIZON_PIN_MIN_AGE.as_secs_f64())
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;

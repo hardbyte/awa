@@ -66,8 +66,22 @@ cursor's representation.
   the permanent rollups with the historical `GREATEST(0, …)` clamp) and
   `fold_ring_rotation_ledgers` (trims each ledger to one full wrap, `slot_count`
   rows, retaining every sealed slot's last-open generation). Both stand down while
-  another backend pins the horizon, so the versions they delete are immediately
-  reclaimable when created.
+  another backend **genuinely pins** the horizon, so the versions they delete are
+  immediately reclaimable when created.
+  - "Genuinely pins" is deliberately narrow: a backend counts as pinning only if
+    it is **idle-in-transaction holding a write xid** (it keeps its snapshot with
+    no in-flight statement to bound the hold), or **actively holding a snapshot
+    whose transaction has been open longer than a threshold**
+    (`MVCC_HORIZON_PIN_MIN_AGE`, 5s). It must NOT trip on the transient
+    `backend_xmin` that every ordinary statement — including sub-millisecond
+    hot-path claims and enqueues — sets for its own duration. The threshold sits
+    well above normal query/claim latency yet far below the 30s fold cadence, so a
+    genuinely long-lived reader still stands the folds down before their next
+    round of deletions accrues, while steady traffic never does. The first
+    implementation gated on any live `backend_xmin` and so skipped the folds on
+    essentially every tick under continuous load, letting the ledgers and the
+    delta landing table grow without bound for the whole run (see the Negative
+    consequence below); the age gate is the fix.
 
 ## Consequences
 
