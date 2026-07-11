@@ -124,6 +124,48 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue meta");
+    clean_queue_storage_claims(pool, queue).await;
+}
+
+/// Purge the queue-storage receipt-claim evidence for one queue.
+/// `clean_queue` above only deletes from the `awa.jobs` compat view; when
+/// queue-storage is the active backend the open-claim evidence that the
+/// running count reads lives on `{schema}.lease_claim_batches` /
+/// `lease_claims` / `leases`. A test that panics mid-flight can leave open
+/// claims there that a later re-run (on a persistent test DB) would still
+/// count as running. Clearing the claim planes keeps per-queue running
+/// assertions idempotent across runs. The closure tables carry no `queue`
+/// column (keyed by claim slot + receipt identity), so they are cleared
+/// wholesale; the claim/lease tables filter by queue.
+async fn clean_queue_storage_claims(pool: &sqlx::PgPool, queue: &str) {
+    // Clean by physical table presence, not the active-backend flag:
+    // `setup_pool` resets the runtime backend to canonical, so at
+    // `clean_queue` time `active_queue_storage_schema()` reports None even
+    // though the `awa` receipt-plane tables (and any leftover open claims
+    // from a prior run) still exist and become live once the client
+    // re-activates queue-storage. The default queue-storage schema is `awa`.
+    let schema = "awa";
+    let installed: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(format!("{schema}.lease_claim_batches"))
+        .fetch_one(pool)
+        .await
+        .expect("probe lease_claim_batches presence");
+    if !installed {
+        return;
+    }
+    for table in ["lease_claim_batches", "lease_claims", "leases"] {
+        sqlx::query(&format!("DELETE FROM {schema}.{table} WHERE queue = $1"))
+            .bind(queue)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|err| panic!("Failed to clean {schema}.{table}: {err}"));
+    }
+    for table in ["lease_claim_closures", "lease_claim_closure_batches"] {
+        sqlx::query(&format!("DELETE FROM {schema}.{table}"))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|err| panic!("Failed to clean {schema}.{table}: {err}"));
+    }
 }
 
 async fn reset_runtime_backend(pool: &sqlx::PgPool) {
@@ -172,67 +214,93 @@ async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> 
     active_queue_storage_schema(pool).await
 }
 
+/// Per-queue `(state)` rows across every queue-storage plane, used by the
+/// count and breakdown helpers below. `$1` is the queue name.
+///
+/// Open receipt claims count as `running`. Since #246 (compact deadline
+/// claims) the claim path writes receipt claims — zero-deadline AND
+/// deadline-backed — as compact `{schema}.lease_claim_batches` rows rather
+/// than one `lease_claims` row per job; only claims later materialised into
+/// mutable `leases` (or legacy in-flight rows written before the upgrade)
+/// remain in `lease_claims`. Reading `lease_claims` alone therefore sees 0
+/// running jobs while several are in flight, so both tables feed a single
+/// `claim_items` CTE that unnests the batch member arrays. This mirrors the
+/// authoritative `queue_counts` running derivation in queue_storage.rs and
+/// the `open_receipt_claim_count` helper in queue_storage_runtime_test.rs.
+fn queue_storage_state_sources_sql(schema: &str) -> String {
+    format!(
+        "WITH claim_items AS ( \
+             SELECT claims.claim_slot, claims.job_id, claims.run_lease, \
+                    claims.receipt_id, claims.queue, claims.closed_at \
+             FROM {schema}.lease_claims AS claims \
+             UNION ALL \
+             SELECT batches.claim_slot, items.job_id, items.run_lease, \
+                    items.receipt_id, batches.queue, NULL::timestamptz AS closed_at \
+             FROM {schema}.lease_claim_batches AS batches \
+             CROSS JOIN LATERAL unnest( \
+                 batches.job_ids, batches.run_leases, batches.receipt_ids \
+             ) AS items(job_id, run_lease, receipt_id) \
+         ) \
+         SELECT 'available'::awa.job_state AS state \
+         FROM {schema}.ready_entries AS ready \
+         JOIN {schema}.queue_claim_heads AS claims \
+           ON claims.queue = ready.queue \
+          AND claims.priority = ready.priority \
+          AND claims.enqueue_shard = ready.enqueue_shard \
+         WHERE ready.queue = $1 \
+           AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name) \
+         UNION ALL \
+         SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
+         UNION ALL \
+         SELECT state FROM {schema}.leases WHERE queue = $1 \
+         UNION ALL \
+         SELECT 'running'::awa.job_state AS state \
+         FROM claim_items AS lc \
+         WHERE lc.queue = $1 \
+           AND lc.closed_at IS NULL \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+             WHERE cx.claim_slot = lc.claim_slot \
+               AND cx.job_id = lc.job_id \
+               AND cx.run_lease = lc.run_lease \
+           ) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+             WHERE cb.claim_slot = lc.claim_slot \
+               AND cb.receipt_ranges @> lc.receipt_id \
+           ) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM {schema}.leases AS lease \
+             WHERE lease.job_id = lc.job_id \
+               AND lease.run_lease = lc.run_lease \
+           ) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM {schema}.deferred_jobs AS deferred \
+             WHERE deferred.job_id = lc.job_id \
+               AND deferred.run_lease = lc.run_lease \
+           ) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM {schema}.done_entries AS done \
+             WHERE done.job_id = lc.job_id \
+               AND done.run_lease = lc.run_lease \
+           ) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM {schema}.dlq_entries AS dlq \
+             WHERE dlq.job_id = lc.job_id \
+               AND dlq.run_lease = lc.run_lease \
+           ) \
+         UNION ALL \
+         SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
+         UNION ALL \
+         SELECT state FROM {schema}.dlq_entries WHERE queue = $1"
+    )
+}
+
 async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
-        // Open `lease_claims` (receipt-mode short-job claims that
-        // haven't materialised into a `leases` row yet) count as
-        // `running`. With receipts mode on by default, omitting them
-        // makes the test see 0 running jobs while several are
-        // actually in flight.
+        let sources = queue_storage_state_sources_sql(&schema);
         let sql = format!(
-            "SELECT COUNT(*)::bigint FROM (\
-                 SELECT 'available'::awa.job_state AS state \
-                 FROM {schema}.ready_entries AS ready \
-                 JOIN {schema}.queue_claim_heads AS claims \
-                   ON claims.queue = ready.queue \
-                  AND claims.priority = ready.priority \
-                  AND claims.enqueue_shard = ready.enqueue_shard \
-                 WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name) \
-                 UNION ALL \
-                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.leases WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT 'running'::awa.job_state AS state \
-                 FROM {schema}.lease_claims AS lc \
-                 WHERE lc.queue = $1 \
-                   AND lc.closed_at IS NULL \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
-                     WHERE cx.claim_slot = lc.claim_slot \
-                       AND cx.job_id = lc.job_id \
-                       AND cx.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
-                     WHERE cb.receipt_ranges @> lc.receipt_id \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.leases AS lease \
-                     WHERE lease.job_id = lc.job_id \
-                       AND lease.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.deferred_jobs AS deferred \
-                     WHERE deferred.job_id = lc.job_id \
-                       AND deferred.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.done_entries AS done \
-                     WHERE done.job_id = lc.job_id \
-                       AND done.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.dlq_entries AS dlq \
-                     WHERE dlq.job_id = lc.job_id \
-                       AND dlq.run_lease = lc.run_lease \
-                   ) \
-                 UNION ALL \
-                 SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
-             ) AS jobs \
+            "SELECT COUNT(*)::bigint FROM ({sources}) AS jobs \
              WHERE state = $2::awa.job_state"
         );
         return sqlx::query_scalar(&sql)
@@ -255,63 +323,12 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
 
 async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String, i64)> {
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
-        // Same receipts-mode fix as `queue_job_count` above: open
-        // `lease_claims` count as `running` so the breakdown matches
-        // the dispatcher's view of what's in flight.
+        // Shares `queue_storage_state_sources_sql` with `queue_job_count`
+        // above so the breakdown and the count agree — including the
+        // compact `lease_claim_batches` running expansion added for #246.
+        let sources = queue_storage_state_sources_sql(&schema);
         let sql = format!(
-            "SELECT state::text, COUNT(*)::bigint FROM (\
-                 SELECT 'available'::awa.job_state AS state \
-                 FROM {schema}.ready_entries AS ready \
-                 JOIN {schema}.queue_claim_heads AS claims \
-                   ON claims.queue = ready.queue \
-                  AND claims.priority = ready.priority \
-                  AND claims.enqueue_shard = ready.enqueue_shard \
-                 WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name) \
-                 UNION ALL \
-                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.leases WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT 'running'::awa.job_state AS state \
-                 FROM {schema}.lease_claims AS lc \
-                 WHERE lc.queue = $1 \
-                   AND lc.closed_at IS NULL \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
-                     WHERE cx.claim_slot = lc.claim_slot \
-                       AND cx.job_id = lc.job_id \
-                       AND cx.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
-                     WHERE cb.receipt_ranges @> lc.receipt_id \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.leases AS lease \
-                     WHERE lease.job_id = lc.job_id \
-                       AND lease.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.deferred_jobs AS deferred \
-                     WHERE deferred.job_id = lc.job_id \
-                       AND deferred.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.done_entries AS done \
-                     WHERE done.job_id = lc.job_id \
-                       AND done.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.dlq_entries AS dlq \
-                     WHERE dlq.job_id = lc.job_id \
-                       AND dlq.run_lease = lc.run_lease \
-                   ) \
-                 UNION ALL \
-                 SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
-             ) AS jobs \
+            "SELECT state::text, COUNT(*)::bigint FROM ({sources}) AS jobs \
              GROUP BY state ORDER BY state"
         );
         return sqlx::query_as(&sql)
@@ -425,12 +442,13 @@ async fn backdate_scheduled_run_at_by_ids(pool: &sqlx::PgPool, job_ids: &[i64]) 
 
 async fn backdate_running_deadline(pool: &sqlx::PgPool, job_id: i64) {
     if let Some(schema) = active_queue_storage_schema(pool).await {
-        // The running job lives on `leases` if it materialized
-        // (heartbeat / progress flush / callback wait) and on
-        // `lease_claims` otherwise. Receipts mode (the 0.6 default)
-        // keeps short claims on `lease_claims` for their full
-        // lifetime. Update both so the test's deadline-rescue setup
-        // works regardless of which path the in-flight attempt is on.
+        // An in-flight receipt claim can live on any of three planes: a
+        // `leases` row once it materializes (heartbeat / progress flush /
+        // callback wait), a compact `lease_claim_batches` row otherwise
+        // (the #246 default for both zero-deadline and deadline-backed
+        // claims), or a legacy row-local `lease_claims` row for claims
+        // written before the upgrade. Backdate the deadline on all three so
+        // the rescue setup works regardless of which plane holds the attempt.
         sqlx::query(&format!(
             "UPDATE {schema}.leases \
              SET deadline_at = now() - interval '1 second' \
@@ -440,6 +458,15 @@ async fn backdate_running_deadline(pool: &sqlx::PgPool, job_id: i64) {
         .execute(pool)
         .await
         .expect("Failed to backdate queue-storage lease deadline rescue job");
+        sqlx::query(&format!(
+            "UPDATE {schema}.lease_claim_batches \
+             SET deadline_at = now() - interval '1 second' \
+             WHERE $1 = ANY(job_ids)"
+        ))
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage compact batch deadline rescue job");
         sqlx::query(&format!(
             "UPDATE {schema}.lease_claims \
              SET deadline_at = now() - interval '1 second' \
@@ -462,11 +489,12 @@ async fn backdate_running_deadline(pool: &sqlx::PgPool, job_id: i64) {
 async fn backdate_running_heartbeat(pool: &sqlx::PgPool, job_id: i64) {
     if let Some(schema) = active_queue_storage_schema(pool).await {
         // Heartbeat-based rescue only applies once a claim has
-        // materialised into a `leases` row (heartbeat_at lives there,
-        // not on `lease_claims`). For receipts-mode short claims the
-        // deadline-based rescue is the analogue; backdate the
-        // receipt's deadline_at so `rescue_expired_receipt_deadlines_tx`
-        // closes it on the next tick.
+        // materialised into a `leases` row (heartbeat_at lives there, not
+        // on the claim planes). For an un-materialized receipt claim the
+        // deadline-based rescue is the analogue; backdate the receipt's
+        // deadline_at on both the compact `lease_claim_batches` plane (the
+        // #246 default) and legacy row-local `lease_claims` so
+        // `rescue_expired_receipt_deadlines_tx` closes it on the next tick.
         sqlx::query(&format!(
             "UPDATE {schema}.leases \
              SET heartbeat_at = now() - interval '5 minutes' \
@@ -476,6 +504,15 @@ async fn backdate_running_heartbeat(pool: &sqlx::PgPool, job_id: i64) {
         .execute(pool)
         .await
         .expect("Failed to backdate queue-storage lease heartbeat rescue job");
+        sqlx::query(&format!(
+            "UPDATE {schema}.lease_claim_batches \
+             SET deadline_at = now() - interval '1 second' \
+             WHERE $1 = ANY(job_ids)"
+        ))
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage compact batch rescue job");
         sqlx::query(&format!(
             "UPDATE {schema}.lease_claims \
              SET deadline_at = now() - interval '1 second' \
@@ -1455,6 +1492,124 @@ async fn test_collector_death_does_not_block_job_processing() {
     client.shutdown(Duration::from_secs(5)).await;
     let _ = meter_provider.shutdown();
     eprintln!("Collector-death resilience test passed!");
+}
+
+/// Regression guard for the `queue_job_count` / `queue_state_breakdown`
+/// helpers used by `dashboard_panels_have_observed_data`. Since #246 the
+/// claim path writes receipt claims as compact `lease_claim_batches` rows
+/// rather than one `lease_claims` row per job, so a helper that enumerates
+/// running work from `lease_claims` alone reports 0 running for a saturated
+/// queue (the exact failure the dashboard test hit). This test holds every
+/// worker slot in-flight and asserts the batch-expanding helpers see them —
+/// it needs Postgres but no OTLP collector, so it is not `#[ignore]`d and
+/// runs on every CI leg.
+#[tokio::test(flavor = "multi_thread")]
+async fn running_count_helpers_see_compact_batch_claims() {
+    let pool = setup_pool("awa_test_running_count_batches").await;
+    let queue = "running_count_batches";
+    clean_queue(&pool, queue).await;
+
+    let in_flight: i64 = 4;
+    let entered = Arc::new(AtomicUsize::new(0));
+    // Zero permits: every handler blocks on acquire until the test releases
+    // it, pinning `in_flight` jobs in the claimed-but-not-complete state.
+    let release = Arc::new(Semaphore::new(0));
+    let entered_worker = entered.clone();
+    let release_worker = release.clone();
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: in_flight as u32,
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<TelemetryJob, _, _>(move |_args, _ctx| {
+            let entered_worker = entered_worker.clone();
+            let release_worker = release_worker.clone();
+            async move {
+                entered_worker.fetch_add(1, Ordering::SeqCst);
+                let permit = release_worker
+                    .acquire()
+                    .await
+                    .expect("release semaphore stays open");
+                permit.forget();
+                Ok(JobResult::Completed)
+            }
+        })
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .build()
+        .expect("Failed to build running-count client");
+
+    client.start().await.expect("Failed to start client");
+    wait_for_leader(&client, Duration::from_secs(5)).await;
+
+    for index in 0..in_flight {
+        insert_with(
+            &pool,
+            &TelemetryJob {
+                value: format!("held-{index}"),
+            },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert held demo job");
+    }
+
+    // Wait until all workers are parked inside the handler.
+    let start = std::time::Instant::now();
+    while entered.load(Ordering::SeqCst) < in_flight as usize {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "timed out waiting for {in_flight} jobs to enter the handler; \
+             only {} entered",
+            entered.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The claims live in `lease_claim_batches`; the helpers must expand them.
+    let running = queue_job_count(&pool, queue, "running").await;
+    assert_eq!(
+        running,
+        in_flight,
+        "queue_job_count must count compact-batch claims as running; \
+         breakdown: {:?}",
+        queue_state_breakdown(&pool, queue).await
+    );
+    let breakdown = queue_state_breakdown(&pool, queue).await;
+    let running_in_breakdown = breakdown
+        .iter()
+        .find(|(state, _)| state == "running")
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+    assert_eq!(
+        running_in_breakdown, in_flight,
+        "queue_state_breakdown must agree with queue_job_count; got {breakdown:?}"
+    );
+
+    // Release the workers and drain so the DB is clean for reuse.
+    release.add_permits(in_flight as usize);
+    let drain_start = std::time::Instant::now();
+    loop {
+        if queue_job_count(&pool, queue, "running").await == 0 {
+            break;
+        }
+        assert!(
+            drain_start.elapsed() < Duration::from_secs(30),
+            "held jobs never drained after release"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// Exercises the Grafana dashboard queries against a live LGTM stack and prints

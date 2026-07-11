@@ -2784,10 +2784,19 @@ impl MaintenanceService {
     ) {
         let schema = runtime.store.schema();
         // This is a high-cadence metrics path, not an admin exact-count
-        // endpoint. Keep it on queue-storage control tables and bounded
-        // lane-head probes so long retained ready/done/receipt segments do
-        // not compete with worker traffic. Admin surfaces that need exact
-        // counts still go through QueueStorage::queue_counts().
+        // endpoint, and it MUST NOT read the receipt-claim tables
+        // (`lease_claims` / `lease_claim_batches` / the closure tables):
+        // claim-ring rotation/prune takes them ACCESS EXCLUSIVE, and a gauge
+        // that blocked on that lock would stall the whole maintenance loop.
+        // The `queue_storage_metrics_query_uses_bounded_observability_path`
+        // unit test enforces this by locking those tables and requiring this
+        // function to still finish within 3s. So the `running` gauge below is
+        // intentionally `leases`-only (materialised claims). It therefore
+        // UNDER-reports queues whose in-flight work is still on compact
+        // `lease_claim_batches` (#246) and has not materialised — that is an
+        // accepted approximation for the cheap gauge. Surfaces that need the
+        // exact running count (which DOES expand lease_claim_batches) go
+        // through QueueStorage::queue_counts_exact() / admin::state_counts().
         let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
             r#"
             WITH head_signal AS (
@@ -2860,6 +2869,16 @@ impl MaintenanceService {
                 GROUP BY head_signal.queue
             ),
             leases AS (
+                -- Both legs are `leases`-only because this gauge must not touch
+                -- the receipt tables (see the function-level lock note). The
+                -- `running` leg is therefore an approximation (misses compact
+                -- lease_claim_batches claims, #246). `waiting_external` is exact
+                -- even so: a receipt claim cannot be `waiting_external` off the
+                -- `leases` plane — QueueStorage::register_callback runs
+                -- ensure_mutable_running_attempt_tx (materialises the claim into
+                -- `leases`) before enter_callback_wait_in_tx flips
+                -- `leases.state`. (Same waiting_external invariant, exact form,
+                -- at admin::state_counts.)
                 SELECT
                     queue,
                     count(*) FILTER (WHERE state = 'running')::bigint AS running,
@@ -3167,7 +3186,7 @@ mod tests {
             .await
             .expect("begin receipt lock transaction");
         sqlx::query(
-            "LOCK TABLE awa.lease_claims, awa.lease_claim_closures, awa.lease_claim_closure_batches IN ACCESS EXCLUSIVE MODE",
+            "LOCK TABLE awa.lease_claims, awa.lease_claim_batches, awa.lease_claim_closures, awa.lease_claim_closure_batches IN ACCESS EXCLUSIVE MODE",
         )
         .execute(receipt_lock_tx.as_mut())
         .await

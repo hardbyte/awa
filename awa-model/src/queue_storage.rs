@@ -76,10 +76,12 @@ pub struct QueueStorageConfig {
     /// DELETE.
     pub claim_slot_count: usize,
     pub queue_stripe_count: usize,
-    /// Use the receipt-plane short path for zero-deadline jobs:
-    /// claim writes compact batches into `lease_claim_batches` for the
-    /// zero-deadline hot path, while deadline-backed attempts keep row-local
-    /// evidence in `lease_claims` for indexed deadline rescue. Compact claims
+    /// Use the receipt-plane short path: claim writes compact batches into
+    /// `lease_claim_batches` for both zero-deadline and deadline-backed
+    /// attempts (#246) — a batch shares one `claimed_at`, hence one
+    /// `deadline_at`, and expired batches are swept by the compact batch
+    /// deadline-rescue cursor. Row-local `lease_claims` evidence remains
+    /// readable for legacy in-flight claims mid-upgrade. Compact claims
     /// can still materialize into `leases` when the worker later needs mutable
     /// attempt state. Successful compact
     /// completion writes durable terminal history through
@@ -127,8 +129,9 @@ pub struct ClaimedEntry {
     /// receipt-backed claims and used by the compact completion path to
     /// validate the exact claim attempt without row-locking it.
     pub receipt_id: Option<i64>,
-    /// Compact claim batch row identity for zero-deadline receipt claims.
-    /// Row-local receipt claims leave this unset.
+    /// Compact claim batch row identity for receipt claims (zero-deadline
+    /// and deadline-backed alike since #246). Row-local receipt claims
+    /// leave this unset.
     pub claim_batch_id: Option<i64>,
     /// One-based item position inside `lease_claim_batches.*_ids` arrays.
     /// Present with `claim_batch_id` and used as an O(1) compact proof.
@@ -606,6 +609,84 @@ fn receipt_closed_evidence_sql(
                   AND dlq.run_lease = {claims_alias}.run_lease
             )
         )
+        "#
+    )
+}
+
+/// A subquery that yields the identity `(job_id, run_lease, queue)` of every
+/// receipt claim currently open (i.e. `running`) but not yet materialised
+/// into `leases`. Since #246 receipt claims — zero-deadline and
+/// deadline-backed alike — are written as compact `lease_claim_batches` rows
+/// rather than one `lease_claims` row per job, so the "open receipt claims"
+/// set is the union of legacy row-local `lease_claims` and the unnested
+/// members of `lease_claim_batches`, each anti-joined against every durable
+/// closure/terminal/materialised-lease evidence shape.
+///
+/// This is the canonical open-receipt-claim shape (mirrors `queue_counts`'s
+/// `live_running` derivation). Compose it wherever a running enumeration must
+/// see receipt claims: wrap in `(SELECT count(*) FROM (<sql>) …)`, join it, or
+/// `UNION ALL` its rows into a `current_jobs`-style view. `waiting_external`
+/// deliberately does NOT read this set — a claim can only reach
+/// `waiting_external` after `register_callback` materialises it into `leases`
+/// (see `enter_callback_wait_in_tx`), so those legs stay `leases`-only.
+///
+/// `leases` here is materialised-claim evidence; a claim present in `leases`
+/// is reported by the caller's own `leases` leg, so it is excluded here to
+/// avoid double counting.
+pub fn open_receipt_running_claims_sql(schema: &str) -> String {
+    let closure_rel = format!("{schema}.lease_claim_closures");
+    let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+    let row_closed =
+        receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+    format!(
+        r#"
+        SELECT claims.job_id, claims.run_lease, claims.queue
+        FROM {schema}.lease_claims AS claims
+        WHERE NOT {row_closed}
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.leases AS lease
+              WHERE lease.job_id = claims.job_id
+                AND lease.run_lease = claims.run_lease
+          )
+        UNION ALL
+        SELECT items.job_id, items.run_lease, batches.queue
+        FROM {schema}.lease_claim_batches AS batches
+        CROSS JOIN LATERAL unnest(
+            batches.job_ids,
+            batches.run_leases,
+            batches.receipt_ids
+        ) AS items(job_id, run_lease, receipt_id)
+        WHERE NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.claim_slot = batches.claim_slot
+                    AND closures.job_id = items.job_id
+                    AND closures.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  WHERE closure_batches.claim_slot = batches.claim_slot
+                    AND closure_batches.receipt_ranges @> items.receipt_id
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = items.job_id
+                    AND lease.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = items.job_id
+                    AND done.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = items.job_id
+                    AND deferred.run_lease = items.run_lease
+              )
+          AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = items.job_id
+                    AND dlq.run_lease = items.run_lease
+              )
         "#
     )
 }
@@ -2452,8 +2533,8 @@ impl QueueStorage {
     }
 
     fn use_lease_claim_receipts_for_runtime(&self, _deadline_duration: Duration) -> bool {
-        // Receipts mode now supports per-claim deadlines via
-        // `lease_claims.deadline_at` (rescued by
+        // Receipts mode supports per-claim deadlines via
+        // `lease_claim_batches.deadline_at` (#246; rescued by
         // `rescue_expired_receipt_deadlines_tx`), so receipts is the
         // live path whenever the engine is configured for receipts —
         // the queue's `deadline_duration` no longer disqualifies it.
@@ -6918,10 +6999,11 @@ impl QueueStorage {
     ) -> Result<QueueCounts, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
-        let closure_rel = format!("{schema}.lease_claim_closures");
-        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-        let closed_evidence =
-            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+        // Canonical open-receipt-claim shape (row-local + compact batch),
+        // reused by admin::state_counts. (The maintenance health gauge is
+        // deliberately NOT a consumer — it stays leases-only so it can
+        // never block on claim-ring ACCESS EXCLUSIVE locks.)
+        let open_running = open_receipt_running_claims_sql(schema);
         let counter_trusted = self.terminal_counter_trusted(pool).await?;
         // The live-terminal CTE swaps between counter-fed and
         // scan-fed depending on trust. Build it as a string so the
@@ -7034,72 +7116,19 @@ impl QueueStorage {
                           AND state = 'running'
                     ), 0)
                     +
-                    -- Derive the receipt-backed running count from
-                    -- lease_claims anti-joined with every durable
-                    -- closure evidence shape.
+                    -- Receipt-backed running claims (row-local `lease_claims`
+                    -- plus compact `lease_claim_batches` members, #246), each
+                    -- anti-joined against every durable closure/terminal/
+                    -- materialised-lease shape. Shared canonical shape reused
+                    -- by admin::state_counts (the health gauge stays
+                    -- leases-only by design).
                     COALESCE((
                         SELECT count(*)::bigint
-                        FROM {schema}.lease_claims AS claims
-                        WHERE claims.queue = ANY($1)
-                          AND NOT {closed_evidence}
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM {schema}.leases AS lease
-	                              WHERE lease.job_id = claims.job_id
-	                                AND lease.run_lease = claims.run_lease
-	                          )
-	                    ), 0)
-	                    +
-	                    -- Zero-deadline compact receipt claims live in
-	                    -- lease_claim_batches until they complete or a cold
-	                    -- path materializes them. Expand only for exact
-	                    -- admin-grade counts.
-	                    COALESCE((
-	                        SELECT count(*)::bigint
-	                        FROM {schema}.lease_claim_batches AS batches
-	                        CROSS JOIN LATERAL unnest(
-	                            batches.job_ids,
-	                            batches.run_leases,
-	                            batches.receipt_ids
-	                        ) AS items(job_id, run_lease, receipt_id)
-	                        WHERE batches.queue = ANY($1)
-	                          AND NOT EXISTS (
-	                              SELECT 1
-	                              FROM {schema}.lease_claim_closures AS closures
-	                              WHERE closures.claim_slot = batches.claim_slot
-	                                AND closures.job_id = items.job_id
-	                                AND closures.run_lease = items.run_lease
-	                          )
-	                          AND NOT EXISTS (
-	                              SELECT 1
-	                              FROM {schema}.lease_claim_closure_batches AS closure_batches
-	                              WHERE closure_batches.claim_slot = batches.claim_slot
-	                                AND closure_batches.receipt_ranges @> items.receipt_id
-	                          )
-	                          AND NOT EXISTS (
-	                              SELECT 1
-	                              FROM {schema}.leases AS lease
-	                              WHERE lease.job_id = items.job_id
-	                                AND lease.run_lease = items.run_lease
-	                          )
-	                          AND NOT EXISTS (
-	                              SELECT 1 FROM {schema}.done_entries AS done
-	                              WHERE done.job_id = items.job_id
-	                                AND done.run_lease = items.run_lease
-	                          )
-	                          AND NOT EXISTS (
-	                              SELECT 1 FROM {schema}.deferred_jobs AS deferred
-	                              WHERE deferred.job_id = items.job_id
-	                                AND deferred.run_lease = items.run_lease
-	                          )
-	                          AND NOT EXISTS (
-	                              SELECT 1 FROM {schema}.dlq_entries AS dlq
-	                              WHERE dlq.job_id = items.job_id
-	                                AND dlq.run_lease = items.run_lease
-	                          )
-	                    ), 0)
-	                )::bigint AS running
-	            ),
+                        FROM ({open_running}) AS open_running
+                        WHERE open_running.queue = ANY($1)
+                    ), 0)
+                )::bigint AS running
+            ),
             {live_terminal_cte}
             SELECT
                 lane_counts.available,
@@ -10344,23 +10373,32 @@ impl QueueStorage {
         Ok(rescued)
     }
 
-    /// Receipt-side counterpart to `rescue_expired_deadlines`: scans
-    /// `lease_claims` for rows whose per-claim `deadline_at` has
-    /// passed but which still don't have a closure or a materialized
-    /// lease row. Each match gets a `'deadline_expired'` closure
-    /// written and is returned for the maintenance caller to convert
-    /// into a deferred / DLQ row, exactly as the lease-side path does.
+    /// Receipt-side counterpart to `rescue_expired_deadlines`: scans both
+    /// receipt-claim representations for attempts whose per-claim
+    /// `deadline_at` has passed but which still don't have a closure or a
+    /// materialized lease row:
     ///
-    /// The two anti-joins mirror `rescue_stale_receipt_claims_tx`'s
+    /// * compact `lease_claim_batches` rows — the shape the claim path
+    ///   writes for deadline-backed claims since #246; the batch carries
+    ///   one shared `deadline_at`, and expired members are force-closed
+    ///   into `lease_claim_closure_batches`;
+    /// * row-local `lease_claims` rows — legacy in-flight claims written
+    ///   before the compact-deadline upgrade; these keep the original
+    ///   `lease_claim_closures` closure shape.
+    ///
+    /// Each match is returned for the maintenance caller to convert into
+    /// a deferred / DLQ row, exactly as the lease-side path does.
+    ///
+    /// The anti-joins mirror `rescue_stale_receipt_claims_tx`'s
     /// disambiguation: a claim that has already materialized into
     /// `leases` is on the lease-side deadline-rescue path, and
     /// rescuing it here would double-close it.
     ///
     /// Unlike the lease-side scan, receipt deadline rescue walks each
-    /// claim partition through a tiny cursor ordered by deadline. That
-    /// keeps a long MVCC horizon from making every maintenance tick
-    /// re-prove old successful receipt completions until claim prune
-    /// can truncate the partition.
+    /// claim partition through a tiny cursor ordered by deadline (one
+    /// cursor per representation). That keeps a long MVCC horizon from
+    /// making every maintenance tick re-prove old successful receipt
+    /// completions until claim prune can truncate the partition.
     async fn rescue_expired_receipt_deadlines_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -10369,21 +10407,25 @@ impl QueueStorage {
         let mut remaining = RECEIPT_RESCUE_BATCH_LIMIT;
         let preferred_slot = self.oldest_initialized_claim_slot_tx(tx).await?;
 
+        let mut slots: Vec<i32> = Vec::with_capacity(self.claim_slot_count() + 1);
         if let Some(slot) = preferred_slot {
+            slots.push(slot);
+        }
+        for slot in 0..self.claim_slot_count() {
+            let slot = slot as i32;
+            if Some(slot) != preferred_slot {
+                slots.push(slot);
+            }
+        }
+
+        for slot in slots {
             let mut slot_rescued = self
-                .rescue_expired_receipt_deadlines_for_slot_tx(tx, slot, remaining)
+                .rescue_expired_batch_deadlines_for_slot_tx(tx, slot, remaining)
                 .await?;
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
             rescued.append(&mut slot_rescued);
             if remaining == 0 {
-                return Ok(rescued);
-            }
-        }
-
-        for slot in 0..self.claim_slot_count() {
-            let slot = slot as i32;
-            if Some(slot) == preferred_slot {
-                continue;
+                break;
             }
 
             let mut slot_rescued = self
@@ -10391,7 +10433,6 @@ impl QueueStorage {
                 .await?;
             remaining = remaining.saturating_sub(slot_rescued.len() as i64);
             rescued.append(&mut slot_rescued);
-
             if remaining == 0 {
                 break;
             }
@@ -10657,6 +10698,332 @@ impl QueueStorage {
         Ok(rescued)
     }
 
+    /// Compact-batch counterpart of
+    /// `rescue_expired_receipt_deadlines_for_slot_tx` (#246). Deadline-backed
+    /// claims are written as one `lease_claim_batches` row per claimed batch
+    /// with a single shared `deadline_at`, so the sweep cursor is
+    /// `(deadline_at, batch_id)` on `claim_ring_slots.batch_deadline_cursor_*`
+    /// and the candidate window includes only batches whose deadline has
+    /// already passed (index-backed by the partial per-child
+    /// `(deadline_at, batch_id) WHERE deadline_at IS NOT NULL` index).
+    ///
+    /// Expired batches expand into members; members WITHOUT durable closure
+    /// evidence and WITHOUT a materialized lease are force-closed by
+    /// appending a `lease_claim_closure_batches` row with outcome
+    /// `'deadline_expired'` — the same closure shape compact claims use on
+    /// every other exit path, so the claim/queue prune count proofs see the
+    /// closure. Members that completed, materialized into `leases`
+    /// (lease-side deadline rescue owns those), or already closed are
+    /// skipped. The cursor advances past a batch only when every member is
+    /// proven closed, lease-managed, or was closed by this transaction, so a
+    /// partially-rescued batch (rescue-budget cutoff or a lost advisory-lock
+    /// race) is revisited next tick.
+    async fn rescue_expired_batch_deadlines_for_slot_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        slot: i32,
+        rescue_limit: i64,
+    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        if rescue_limit <= 0 {
+            return Ok(Vec::new());
+        }
+
+        let schema = self.schema();
+        let claim_batch_child = claim_batch_child_name(schema, slot as usize);
+        let closure_child = closure_child_name(schema, slot as usize);
+        let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            WITH cursor_row AS (
+                SELECT
+                    batch_deadline_cursor_deadline_at,
+                    batch_deadline_cursor_batch_id
+                FROM {schema}.claim_ring_slots
+                WHERE slot = $1
+                FOR UPDATE
+            ),
+            after_cursor AS MATERIALIZED (
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.batch_id,
+                    row_number() OVER (
+                        ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                    ) AS rn
+                FROM {claim_batch_child} AS claim_batches
+                CROSS JOIN cursor_row
+                WHERE claim_batches.claim_slot = $1
+                  AND claim_batches.deadline_at IS NOT NULL
+                  AND claim_batches.deadline_at < clock_timestamp()
+                  AND (claim_batches.deadline_at, claim_batches.batch_id)
+                      > (
+                          cursor_row.batch_deadline_cursor_deadline_at,
+                          cursor_row.batch_deadline_cursor_batch_id
+                        )
+                ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                LIMIT $2
+            ),
+            after_count AS (
+                SELECT count(*)::bigint AS count FROM after_cursor
+            ),
+            before_cursor AS MATERIALIZED (
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.batch_id,
+                    after_count.count + row_number() OVER (
+                        ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                    ) AS rn
+                FROM {claim_batch_child} AS claim_batches
+                CROSS JOIN cursor_row
+                CROSS JOIN after_count
+                WHERE after_count.count < $2
+                  AND claim_batches.claim_slot = $1
+                  AND claim_batches.deadline_at IS NOT NULL
+                  AND claim_batches.deadline_at < clock_timestamp()
+                  AND (claim_batches.deadline_at, claim_batches.batch_id)
+                      <= (
+                          cursor_row.batch_deadline_cursor_deadline_at,
+                          cursor_row.batch_deadline_cursor_batch_id
+                        )
+                ORDER BY claim_batches.deadline_at, claim_batches.batch_id
+                LIMIT (SELECT GREATEST($2 - count, 0) FROM after_count)
+            ),
+            candidate_keys AS MATERIALIZED (
+                SELECT claim_slot, batch_id, rn FROM after_cursor
+                UNION ALL
+                SELECT claim_slot, batch_id, rn FROM before_cursor
+            ),
+            -- Every member of a candidate batch, annotated with the same
+            -- durable closure evidence and materialized-lease anti-joins the
+            -- row-local deadline rescue uses. The batch deadline is shared,
+            -- so every member of a candidate batch is expired by
+            -- construction.
+            members AS MATERIALIZED (
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.batch_id,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    items.job_id,
+                    claim_batches.queue,
+                    'running'::awa.job_state AS state,
+                    claim_batches.priority,
+                    items.attempt,
+                    items.run_lease,
+                    items.max_attempts,
+                    items.lane_seq,
+                    claim_batches.enqueue_shard,
+                    items.receipt_id,
+                    claim_batches.claimed_at,
+                    claim_batches.deadline_at,
+                    (
+                        EXISTS (
+                            SELECT 1 FROM {closure_child} AS closures
+                            WHERE closures.claim_slot = claim_batches.claim_slot
+                              AND closures.job_id = items.job_id
+                              AND closures.run_lease = items.run_lease
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM {closure_batch_child} AS closure_batches
+                            WHERE closure_batches.receipt_ranges @> items.receipt_id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {schema}.done_entries AS done
+                            WHERE done.job_id = items.job_id
+                              AND done.run_lease = items.run_lease
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                            WHERE deferred.job_id = items.job_id
+                              AND deferred.run_lease = items.run_lease
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM {schema}.dlq_entries AS dlq
+                            WHERE dlq.job_id = items.job_id
+                              AND dlq.run_lease = items.run_lease
+                        )
+                    ) AS is_closed,
+                    EXISTS (
+                        SELECT 1 FROM {schema}.leases AS lease
+                        WHERE lease.job_id = items.job_id
+                          AND lease.run_lease = items.run_lease
+                    ) AS is_lease_managed,
+                    candidate_keys.rn
+                FROM candidate_keys
+                JOIN {claim_batch_child} AS claim_batches
+                  ON claim_batches.claim_slot = candidate_keys.claim_slot
+                 AND claim_batches.batch_id = candidate_keys.batch_id
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids,
+                    claim_batches.lane_seqs,
+                    claim_batches.attempts,
+                    claim_batches.max_attempts
+                ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+            ),
+            expired_members AS (
+                SELECT members.*
+                FROM members
+                WHERE NOT is_closed
+                  AND NOT is_lease_managed
+                ORDER BY rn, receipt_id
+                LIMIT $3
+            ),
+            expired_locked AS (
+                SELECT expired_members.*
+                FROM expired_members
+                JOIN {claim_batch_child} AS claim_batches
+                  ON claim_batches.claim_slot = expired_members.claim_slot
+                 AND claim_batches.batch_id = expired_members.batch_id
+                WHERE claim_batches.deadline_at < clock_timestamp()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {closure_child} AS closures
+                      WHERE closures.claim_slot = expired_members.claim_slot
+                        AND closures.job_id = expired_members.job_id
+                        AND closures.run_lease = expired_members.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {closure_batch_child} AS closure_batches
+                      WHERE closure_batches.receipt_ranges @> expired_members.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = expired_members.job_id
+                        AND done.run_lease = expired_members.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = expired_members.job_id
+                        AND deferred.run_lease = expired_members.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = expired_members.job_id
+                        AND dlq.run_lease = expired_members.run_lease
+                  )
+                  AND pg_catalog.pg_try_advisory_xact_lock(
+                      pg_catalog.hashtextextended(
+                          format('awa.receipt.complete:%s:%s', expired_members.job_id, expired_members.run_lease),
+                          0
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
+                      WHERE lease.job_id = expired_members.job_id
+                        AND lease.run_lease = expired_members.run_lease
+                  )
+                FOR UPDATE OF claim_batches SKIP LOCKED
+            ),
+            -- Compact batch-sourced claims have no lease_claims row to mark,
+            -- so they close into the batch closure ledger both prune count
+            -- proofs read via compact closed_count totals.
+            inserted_batches AS (
+                INSERT INTO {closure_batch_child} (
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    outcome,
+                    closed_count,
+                    receipt_ids,
+                    receipt_ranges,
+                    closed_at
+                )
+                SELECT
+                    expired_locked.claim_slot,
+                    expired_locked.ready_slot,
+                    expired_locked.ready_generation,
+                    'deadline_expired',
+                    count(*)::int,
+                    array_agg(expired_locked.receipt_id ORDER BY expired_locked.receipt_id),
+                    range_agg(int8range(expired_locked.receipt_id, expired_locked.receipt_id + 1, '[)') ORDER BY expired_locked.receipt_id),
+                    clock_timestamp()
+                FROM expired_locked
+                GROUP BY
+                    expired_locked.claim_slot,
+                    expired_locked.ready_slot,
+                    expired_locked.ready_generation
+                RETURNING claim_slot
+            ),
+            closed_locked AS (
+                SELECT expired_locked.claim_slot, expired_locked.job_id, expired_locked.run_lease
+                FROM expired_locked
+                WHERE EXISTS (SELECT 1 FROM inserted_batches)
+            ),
+            annotated AS (
+                SELECT
+                    members.*,
+                    (
+                        members.is_closed
+                        OR members.is_lease_managed
+                        OR EXISTS (
+                            SELECT 1 FROM closed_locked
+                            WHERE closed_locked.claim_slot = members.claim_slot
+                              AND closed_locked.job_id = members.job_id
+                              AND closed_locked.run_lease = members.run_lease
+                        )
+                    ) AS advanceable
+                FROM members
+            ),
+            -- The cursor may only advance past a batch when every one of its
+            -- members is advanceable; a single open member (rescue-budget
+            -- cutoff, lost advisory-lock race) blocks there so the batch is
+            -- revisited.
+            bounded AS (
+                SELECT
+                    annotated.*,
+                    min(CASE WHEN NOT annotated.advanceable THEN annotated.rn END) OVER () AS first_blocked_rn
+                FROM annotated
+            ),
+            advance_target AS (
+                SELECT deadline_at, batch_id
+                FROM bounded
+                WHERE first_blocked_rn IS NULL OR rn < first_blocked_rn
+                ORDER BY rn DESC
+                LIMIT 1
+            ),
+            advance_cursor AS (
+                UPDATE {schema}.claim_ring_slots AS slots
+                SET batch_deadline_cursor_deadline_at = advance_target.deadline_at,
+                    batch_deadline_cursor_batch_id = advance_target.batch_id
+                FROM advance_target
+                WHERE slots.slot = $1
+                RETURNING slots.slot
+            ),
+            cursor_advance AS (
+                SELECT count(*) FROM advance_cursor
+            )
+            SELECT
+                expired_locked.ready_slot,
+                expired_locked.ready_generation,
+                expired_locked.job_id,
+                expired_locked.queue,
+                expired_locked.state,
+                expired_locked.priority,
+                expired_locked.attempt,
+                expired_locked.run_lease,
+                expired_locked.max_attempts,
+                expired_locked.lane_seq,
+                expired_locked.enqueue_shard,
+                expired_locked.claimed_at AS attempted_at
+            FROM expired_locked
+            JOIN closed_locked
+              ON closed_locked.claim_slot = expired_locked.claim_slot
+             AND closed_locked.job_id = expired_locked.job_id
+             AND closed_locked.run_lease = expired_locked.run_lease
+            CROSS JOIN cursor_advance
+            "#
+        ))
+        .bind(slot)
+        .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
+        .bind(rescue_limit)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(rescued)
+    }
+
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let closure_rel = format!("{schema}.lease_claim_closures");
@@ -10847,7 +11214,7 @@ impl QueueStorage {
             candidates.push(row.into_job_row()?);
         }
 
-        // Zero-deadline receipt claims are stored as compact batches. Expand
+        // Receipt claims are stored as compact batches. Expand
         // them only for this admin read, and report still-open items as
         // running until durable closure, terminal, or materialized-lease
         // evidence supersedes the claim.
@@ -13118,10 +13485,11 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         // Receipts-mode short-path claims hold their deadline on
-        // `lease_claims.deadline_at` rather than on a `leases` row, so
-        // the receipt-plane needs its own scan; merge both populations
-        // into one `moved` set so the maintenance caller observes a
-        // single rescue batch per tick.
+        // `lease_claim_batches.deadline_at` (compact batches, #246) or on
+        // legacy row-local `lease_claims.deadline_at` rather than on a
+        // `leases` row, so the receipt-plane needs its own scan; merge
+        // all populations into one `moved` set so the maintenance caller
+        // observes a single rescue batch per tick.
         let receipt_deleted = if self.lease_claim_receipts() {
             self.rescue_expired_receipt_deadlines_tx(&mut tx).await?
         } else {
@@ -15001,7 +15369,9 @@ impl QueueStorage {
                         rescue_cursor_run_lease = 0,
                         deadline_cursor_deadline_at = '-infinity'::timestamptz,
                         deadline_cursor_job_id = 0,
-                        deadline_cursor_run_lease = 0
+                        deadline_cursor_run_lease = 0,
+                        batch_deadline_cursor_deadline_at = '-infinity'::timestamptz,
+                        batch_deadline_cursor_batch_id = 0
                     WHERE slot = $1
                     "#
                 ))

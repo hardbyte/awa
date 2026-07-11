@@ -269,6 +269,26 @@ async fn relation_exists(pool: &PgPool, qualified_relname: &str) -> bool {
         .expect("relation existence query should succeed")
 }
 
+async fn column_exists(pool: &PgPool, schema: &str, table: &str, column: &str) -> bool {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = $2
+              AND column_name = $3
+        )
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("column existence query should succeed")
+}
+
 async fn insert_runtime_instance(pool: &PgPool, capability: &str) {
     // Default each capability to a coherent operator-role pairing so existing
     // tests don't accidentally create invalid states. Tests that exercise the
@@ -1319,6 +1339,120 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
         has_done_failed_index,
         "v031 must backfill failed-row metric indexes for existing queue-storage schemas"
     );
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+}
+
+/// v041 (#246) refreshes every installed queue-storage schema so the compact
+/// deadline-claim machinery reaches schemas prepared before the upgrade: the
+/// per-slot batch deadline-rescue cursor columns on `claim_ring_slots` and
+/// the partial `(deadline_at, batch_id)` sweep index on each
+/// `lease_claim_batches` child. Simulate a pre-v041 schema by stripping both,
+/// rewind `schema_version`, and prove `run()` reinstalls them via the v023
+/// install helper the migration re-invokes.
+#[tokio::test]
+async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let schema = "awa_queue_storage_v041_deadline";
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    // Strip the v041 additions to mimic a schema installed before #246.
+    sqlx::raw_sql(&format!(
+        r#"
+        ALTER TABLE {schema}.claim_ring_slots
+            DROP COLUMN IF EXISTS batch_deadline_cursor_deadline_at,
+            DROP COLUMN IF EXISTS batch_deadline_cursor_batch_id;
+        DROP INDEX IF EXISTS {schema}.idx_{schema}_lease_claim_batches_0_deadline_cursor;
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("stripping v041 additions should succeed");
+
+    let has_cursor_before = column_exists(
+        &pool,
+        schema,
+        "claim_ring_slots",
+        "batch_deadline_cursor_batch_id",
+    )
+    .await;
+    assert!(
+        !has_cursor_before,
+        "precondition: the batch deadline cursor column must be absent before v041 reruns"
+    );
+
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 41")
+        .execute(&pool)
+        .await
+        .expect("schema_version rewind should succeed");
+
+    migrations::run(&pool)
+        .await
+        .expect("v041 should rerun cleanly");
+
+    let has_cursor_deadline = column_exists(
+        &pool,
+        schema,
+        "claim_ring_slots",
+        "batch_deadline_cursor_deadline_at",
+    )
+    .await;
+    let has_cursor_batch = column_exists(
+        &pool,
+        schema,
+        "claim_ring_slots",
+        "batch_deadline_cursor_batch_id",
+    )
+    .await;
+    assert!(
+        has_cursor_deadline && has_cursor_batch,
+        "v041 must backfill the batch deadline-rescue cursor columns on existing schemas"
+    );
+
+    // The migration contract covers EVERY lease_claim_batches child, not
+    // just child 0 — enumerate the installed children and assert the
+    // partial sweep index (deadline_at IS NOT NULL, so zero-deadline
+    // traffic never maintains entries) exists on each.
+    let child_slots: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT substring(tablename FROM 'lease_claim_batches_(\\d+)$')
+         FROM pg_tables
+         WHERE schemaname = '{schema}'
+           AND tablename ~ '^lease_claim_batches_\\d+$'
+         ORDER BY 1"
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("enumerate lease_claim_batches children");
+    assert!(
+        !child_slots.is_empty(),
+        "expected at least one lease_claim_batches child partition"
+    );
+    for slot in &child_slots {
+        let index_name = format!("idx_{schema}_lease_claim_batches_{slot}_deadline_cursor");
+        // Resolve by OID (relnames are truncated to 63 chars) and read the
+        // definition in one probe; NULL means the index is missing.
+        let index_def: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT pg_get_indexdef(to_regclass('{schema}.{index_name}')::oid)"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("index definition probe should succeed");
+        let index_def = index_def.unwrap_or_else(|| {
+            panic!(
+                "v041 must backfill the partial batch-deadline sweep index on                  lease_claim_batches child {slot}"
+            )
+        });
+        assert!(
+            index_def.contains("deadline_at IS NOT NULL"),
+            "child {slot}: the batch-deadline index must be partial on              deadline_at IS NOT NULL, got: {index_def}"
+        );
+    }
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
