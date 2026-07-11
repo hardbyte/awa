@@ -83,7 +83,9 @@ async def client():
 async def _active_queue_storage_schema(client: awa.AsyncClient) -> str | None:
     tx = await client.transaction()
     try:
-        row = await tx.fetch_one("SELECT awa.active_queue_storage_schema() AS schema_name")
+        row = await tx.fetch_one(
+            "SELECT awa.active_queue_storage_schema() AS schema_name"
+        )
         return row["schema_name"]
     finally:
         await tx.rollback()
@@ -94,17 +96,23 @@ async def _backdate_running_deadline(client: awa.AsyncClient, job_id: int) -> No
     tx = await client.transaction()
     try:
         if schema:
-            # Receipts-mode short-job claims live in `lease_claims`
-            # until they materialise (heartbeat writes to
-            # `attempt_state` only, which doesn't trigger
-            # materialisation). Backdate the deadline on whichever
-            # table is hosting the active attempt — leases for
-            # materialised claims, lease_claims for receipt-only
-            # claims. Both rescue paths read their own column.
+            # A receipt claim that hasn't materialised (heartbeat writes
+            # to `attempt_state` only, which doesn't trigger
+            # materialisation) lives on the compact `lease_claim_batches`
+            # plane since #246 — or on legacy row-local `lease_claims` for
+            # claims written before the upgrade; a materialised claim lives
+            # on `leases`. Backdate the deadline on all three so the rescue
+            # path fires regardless of which plane hosts the active attempt.
             await tx.execute(
                 f"UPDATE {schema}.leases "
                 "SET deadline_at = now() - interval '1 second' "
                 "WHERE job_id = $1 AND state = 'running'",
+                job_id,
+            )
+            await tx.execute(
+                f"UPDATE {schema}.lease_claim_batches "
+                "SET deadline_at = now() - interval '1 second' "
+                "WHERE $1 = ANY(job_ids)",
                 job_id,
             )
             await tx.execute(
@@ -138,10 +146,12 @@ async def test_worker_sigkill_job_is_rescued_and_completed(client):
         await _wait_for_job(
             client,
             job.id,
-            lambda row: row is not None
-            and row["state"] == "running"
-            and row["attempt"] == 1
-            and row["heartbeat_at"] is not None,
+            lambda row: (
+                row is not None
+                and row["state"] == "running"
+                and row["attempt"] == 1
+                and row["heartbeat_at"] is not None
+            ),
             timeout=10,
             worker=worker_a,
             description="running attempt=1 with heartbeat",
@@ -158,10 +168,12 @@ async def test_worker_sigkill_job_is_rescued_and_completed(client):
         row = await _wait_for_job(
             client,
             job.id,
-            lambda current: current is not None
-            and current["state"] == "completed"
-            and current["attempt"] == 2
-            and current["finalized_at"] is not None,
+            lambda current: (
+                current is not None
+                and current["state"] == "completed"
+                and current["attempt"] == 2
+                and current["finalized_at"] is not None
+            ),
             timeout=45,
             worker=worker_b,
             description="completed attempt=2",
@@ -186,10 +198,12 @@ async def test_worker_hang_is_cancelled_by_deadline_rescue_and_retried(client):
         await _wait_for_job(
             client,
             job.id,
-            lambda row: row is not None
-            and row["state"] == "running"
-            and row["attempt"] == 1
-            and row["heartbeat_at"] is not None,
+            lambda row: (
+                row is not None
+                and row["state"] == "running"
+                and row["attempt"] == 1
+                and row["heartbeat_at"] is not None
+            ),
             timeout=10,
             worker=worker,
             description="running attempt=1 with heartbeat",
@@ -209,10 +223,12 @@ async def test_worker_hang_is_cancelled_by_deadline_rescue_and_retried(client):
         row = await _wait_for_job(
             client,
             job.id,
-            lambda current: current is not None
-            and current["state"] == "completed"
-            and current["attempt"] == 2
-            and current["finalized_at"] is not None,
+            lambda current: (
+                current is not None
+                and current["state"] == "completed"
+                and current["attempt"] == 2
+                and current["finalized_at"] is not None
+            ),
             timeout=10,
             worker=worker,
             description="completed attempt=2",
@@ -236,9 +252,11 @@ async def test_callback_timeout_is_rescued_and_retried(client):
         row = await _wait_for_job(
             client,
             job.id,
-            lambda current: current is not None
-            and current["state"] == "waiting_external"
-            and current["attempt"] == 1,
+            lambda current: (
+                current is not None
+                and current["state"] == "waiting_external"
+                and current["attempt"] == 1
+            ),
             timeout=10,
             worker=worker,
             description="waiting_external attempt=1",
@@ -248,10 +266,12 @@ async def test_callback_timeout_is_rescued_and_retried(client):
         final_row = await _wait_for_job(
             client,
             job.id,
-            lambda current: current is not None
-            and current["state"] == "completed"
-            and current["attempt"] == 2
-            and current["finalized_at"] is not None,
+            lambda current: (
+                current is not None
+                and current["state"] == "completed"
+                and current["attempt"] == 2
+                and current["finalized_at"] is not None
+            ),
             timeout=30,
             worker=worker,
             description="completed attempt=2 after callback timeout rescue",
@@ -313,6 +333,7 @@ class ChaosWorker:
         because `expected` markers embed PIDs / job IDs / attempt numbers
         that are unique per test call.
         """
+
         async def scan() -> str:
             cursor = 0
             while True:
@@ -391,10 +412,11 @@ async def _fetch_job_row(client: awa.AsyncClient, job_id: int):
     The previous SQL queried `awa.jobs` directly, which is empty
     under queue_storage (the 0.6 default). Probe the active backend
     once and dispatch to the right shape:
-    - **queue_storage**: stitch `leases` (materialized claims) and
-      `lease_claims` + `attempt_state` (receipt-backed claims that
-      heartbeat into `attempt_state.heartbeat_at` until the lease
-      materialises).
+    - **queue_storage**: stitch `leases` (materialized claims),
+      compact `lease_claim_batches` (the #246 default for receipt
+      claims — zero-deadline and deadline-backed alike), and legacy
+      row-local `lease_claims`, each joined to `attempt_state` for the
+      heartbeat the worker writes there until the lease materialises.
     - **canonical**: keep the original `awa.jobs` query.
 
     The test predicates read `state`, `attempt`, `heartbeat_at`,
@@ -463,6 +485,51 @@ async def _fetch_job_row(client: awa.AsyncClient, job_id: int):
                             AND lease.run_lease = claims.run_lease
                       )
                 ),
+                job_batch AS (
+                    -- Since #246 receipt claims (zero-deadline AND
+                    -- deadline-backed) are written as compact
+                    -- `lease_claim_batches` rows, not one `lease_claims`
+                    -- row per job. A claim that has not materialised into
+                    -- `leases` lives here; reading `job_claim` alone misses
+                    -- it and reports the running job as absent. Expand the
+                    -- batch members (mirrors QueueStorage::load_job).
+                    SELECT $1::bigint AS id,
+                           'running'::text AS state,
+                           items.attempt,
+                           items.run_lease,
+                           ast.heartbeat_at::text AS heartbeat_at,
+                           batches.deadline_at::text AS deadline_at,
+                           NULL::text AS finalized_at,
+                           ast.progress,
+                           EXTRACT(EPOCH FROM (now() - ast.heartbeat_at))::float AS heartbeat_age_s
+                    FROM {schema}.lease_claim_batches AS batches
+                    CROSS JOIN LATERAL unnest(
+                        batches.job_ids,
+                        batches.run_leases,
+                        batches.receipt_ids,
+                        batches.attempts
+                    ) AS items(job_id, run_lease, receipt_id, attempt)
+                    LEFT JOIN {schema}.attempt_state AS ast
+                      ON ast.job_id = items.job_id
+                     AND ast.run_lease = items.run_lease
+                    WHERE items.job_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.lease_claim_closures AS cx
+                          WHERE cx.claim_slot = batches.claim_slot
+                            AND cx.job_id = items.job_id
+                            AND cx.run_lease = items.run_lease
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb
+                          WHERE cb.claim_slot = batches.claim_slot
+                            AND cb.receipt_ranges @> items.receipt_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.leases AS lease
+                          WHERE lease.job_id = items.job_id
+                            AND lease.run_lease = items.run_lease
+                      )
+                ),
                 job_done AS (
                     SELECT $1::bigint AS id,
                            state::text AS state,
@@ -492,6 +559,7 @@ async def _fetch_job_row(client: awa.AsyncClient, job_id: int):
                 merged AS (
                     SELECT * FROM job_lease
                     UNION ALL SELECT * FROM job_claim
+                    UNION ALL SELECT * FROM job_batch
                     UNION ALL SELECT * FROM job_done
                     UNION ALL SELECT * FROM job_deferred
                 )
