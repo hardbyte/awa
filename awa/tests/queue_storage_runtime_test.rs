@@ -2119,6 +2119,241 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .expect("prepare_schema should be idempotent");
 }
 
+/// Running count for `queue` as reported by the admin `/queues` overview.
+async fn queue_overview_running(pool: &sqlx::PgPool, queue: &str) -> i64 {
+    let overviews = admin::queue_overviews(pool)
+        .await
+        .expect("queue_overviews should succeed");
+    overviews
+        .into_iter()
+        .find(|overview| overview.queue == queue)
+        .map(|overview| overview.running)
+        .unwrap_or(0)
+}
+
+/// #416 regression: a receipt-plane claim that has not (yet) materialized
+/// into a mutable lease must still appear as `running` in the admin job
+/// listing and the `/queues` overview — the two paths that back the admin
+/// UI and `awa queue stats`. Before the fix, `queue_storage_current_jobs_cte`
+/// enumerated running jobs from `leases` only, so an open receipt claim was
+/// invisible to `list_jobs`/`queue_overviews` even though `load_job` (and
+/// the authoritative `queue_counts_exact`) reported it correctly.
+///
+/// This exercises the zero-deadline compact path (claim lands in
+/// `lease_claim_batches`) to lock in the `unnest(lease_claim_batches)`
+/// branch of the CTE. It is #410-independent: the same union naturally
+/// covers row-local `lease_claims` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_admin_lists_unmaterialized_receipt_claim_as_running() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_admin_receipt_visibility";
+    let schema = "awa_qs_admin_receipt_visibility";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 7 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Zero-deadline claim: routes through the compact receipt ledger and
+    // does NOT materialize a mutable lease row.
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim receipt-backed job");
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        claimed[0].claim.lease_claim_receipt,
+        "test must exercise the receipt-backed compact claim path"
+    );
+
+    // Precondition that makes the regression meaningful: the claim is real
+    // receipt-plane evidence with no materialized lease behind it.
+    assert_eq!(
+        lease_count(&pool, &store).await,
+        0,
+        "receipt claim must not have materialized a lease"
+    );
+    assert_eq!(
+        lease_claim_batch_count(&pool, &store).await,
+        1,
+        "zero-deadline receipt claim should land in lease_claim_batches"
+    );
+    assert_eq!(
+        open_receipt_claim_count(&pool, &store).await,
+        1,
+        "exactly one open receipt claim should be derivable"
+    );
+
+    // load_job has always been batch-aware; assert the inconsistency the
+    // fix removes was specifically in the list/overview path.
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("load_job should succeed")
+        .expect("load_job should see the open claim");
+    assert_eq!(loaded.state, JobState::Running);
+
+    // The fix: list_jobs and queue_overviews now agree with load_job.
+    let listed = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list_jobs should succeed");
+    let listed_job = listed
+        .iter()
+        .find(|job| job.id == job_id)
+        .expect("open receipt claim must appear in list_jobs");
+    assert_eq!(
+        listed_job.state,
+        JobState::Running,
+        "open receipt claim must list as running"
+    );
+    assert_eq!(
+        listed.iter().filter(|job| job.id == job_id).count(),
+        1,
+        "the claimed job must appear exactly once"
+    );
+
+    // The running filter alone must surface it too.
+    let running_only = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            queue: Some(queue.to_string()),
+            state: Some(JobState::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list_jobs(running) should succeed");
+    assert!(
+        running_only.iter().any(|job| job.id == job_id),
+        "running-state filter must include the open receipt claim"
+    );
+
+    assert_eq!(
+        queue_overview_running(&pool, queue).await,
+        1,
+        "queue overview must count the open receipt claim as running"
+    );
+
+    // Once the claim completes, it must leave the running listing/overview.
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete receipt-backed job");
+
+    assert_eq!(
+        open_receipt_claim_count(&pool, &store).await,
+        0,
+        "completion must close the receipt claim"
+    );
+    assert_eq!(
+        queue_overview_running(&pool, queue).await,
+        0,
+        "completed job must not count as running in the overview"
+    );
+    let after_complete = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            queue: Some(queue.to_string()),
+            state: Some(JobState::Running),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list_jobs(running) after completion should succeed");
+    assert!(
+        !after_complete.iter().any(|job| job.id == job_id),
+        "completed job must not list as running"
+    );
+}
+
+/// #416 dedupe guard: a claim that HAS materialized into a mutable lease
+/// must be reported exactly once. The lease-backed branch and the new
+/// receipt-claim branches of `queue_storage_current_jobs_cte` both anti-join
+/// against materialized leases, so a materialized job appears via the leases
+/// branch only — never double-counted in the running total or listed twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_admin_materialized_lease_appears_once() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let queue = "qs_admin_materialized_dedupe";
+    let schema = "awa_qs_admin_materialized_dedupe";
+    // Legacy (non-receipts) mode materializes a lease immediately on claim,
+    // giving us a deterministic materialized-lease fixture.
+    let store = create_store(&pool, schema).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 9 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim job into a materialized lease");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        lease_count(&pool, &store).await,
+        1,
+        "legacy claim should materialize exactly one lease"
+    );
+
+    let listed = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list_jobs should succeed");
+    assert_eq!(
+        listed.iter().filter(|job| job.id == job_id).count(),
+        1,
+        "a materialized-lease job must appear exactly once in list_jobs"
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .find(|job| job.id == job_id)
+            .map(|job| job.state),
+        Some(JobState::Running),
+    );
+    assert_eq!(
+        queue_overview_running(&pool, queue).await,
+        1,
+        "a materialized-lease job must be counted once as running"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_reset_truncates_compact_receipt_evidence() {
     let (_db_guard, pool) = setup_pool(8).await;

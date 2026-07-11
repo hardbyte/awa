@@ -321,6 +321,118 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
             UNION ALL
+            -- Receipt-plane claims that have not (yet) materialized into a
+            -- mutable lease are still running. Mirror load_job's and
+            -- queue_counts_exact's lease_claims branch: report each open
+            -- claim as running, anti-joined against every durable closure
+            -- evidence shape and against the materialized lease (which the
+            -- branch above already reports).
+            SELECT
+                claims.job_id,
+                ready.kind,
+                claims.queue,
+                'running'::awa.job_state AS state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.lease_claims AS claims
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = claims.ready_slot
+             AND ready.ready_generation = claims.ready_generation
+             AND ready.queue = claims.queue
+             AND ready.priority = claims.priority
+             AND ready.enqueue_shard = claims.enqueue_shard
+             AND ready.lane_seq = claims.lane_seq
+            WHERE claims.closed_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.claim_slot = claims.claim_slot
+                    AND closures.job_id = claims.job_id
+                    AND closures.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  WHERE closure_batches.receipt_ranges @> claims.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = claims.job_id
+                    AND done.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = claims.job_id
+                    AND deferred.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = claims.job_id
+                    AND dlq.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = claims.job_id
+                    AND lease.run_lease = claims.run_lease
+              )
+            UNION ALL
+            -- Zero-deadline compact receipt claims live in
+            -- lease_claim_batches until a cold path materializes them.
+            -- Expand the batch members and report each still-open item as
+            -- running, mirroring load_job's lease_claim_batch branch.
+            SELECT
+                items.job_id,
+                ready.kind,
+                claim_batches.queue,
+                'running'::awa.job_state AS state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.lease_claim_batches AS claim_batches
+            CROSS JOIN LATERAL unnest(
+                claim_batches.job_ids,
+                claim_batches.run_leases,
+                claim_batches.receipt_ids,
+                claim_batches.lane_seqs
+            ) AS items(job_id, run_lease, receipt_id, lane_seq)
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = claim_batches.ready_slot
+             AND ready.ready_generation = claim_batches.ready_generation
+             AND ready.queue = claim_batches.queue
+             AND ready.enqueue_shard = claim_batches.enqueue_shard
+             AND ready.lane_seq = items.lane_seq
+             AND ready.job_id = items.job_id
+            WHERE NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.claim_slot = claim_batches.claim_slot
+                    AND closures.job_id = items.job_id
+                    AND closures.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                  WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                    AND closure_batches.receipt_ranges @> items.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = items.job_id
+                    AND lease.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = items.job_id
+                    AND done.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = items.job_id
+                    AND deferred.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = items.job_id
+                    AND dlq.run_lease = items.run_lease
+              )
+            UNION ALL
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
             FROM {schema}.terminal_jobs
             UNION ALL
