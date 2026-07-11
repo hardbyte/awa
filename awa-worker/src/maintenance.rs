@@ -1168,6 +1168,35 @@ impl MaintenanceService {
             }
             Err(err) => warn!(error = %err, "failed to roll up terminal count deltas"),
         }
+
+        // #371: the append-only prune-rollup deltas and ring-rotation
+        // ledgers piggyback this tick. Both folds are horizon-gated
+        // inside queue-storage (they stand down while another backend
+        // pins the MVCC horizon), so calling them every tick is cheap.
+        match runtime.store.fold_terminal_rollup_deltas(&self.pool).await {
+            Ok(outcome) if outcome.folded_delta_rows > 0 || outcome.skipped_mvcc_pinned => {
+                debug!(
+                    folded_delta_rows = outcome.folded_delta_rows,
+                    folded_keys = outcome.folded_keys,
+                    skipped_mvcc_pinned = outcome.skipped_mvcc_pinned,
+                    "folded queue-storage terminal rollup deltas"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => warn!(error = %err, "failed to fold terminal rollup deltas"),
+        }
+
+        match runtime.store.fold_ring_rotation_ledgers(&self.pool).await {
+            Ok(outcome) if outcome.trimmed_rows > 0 || outcome.skipped_mvcc_pinned => {
+                debug!(
+                    trimmed_rows = outcome.trimmed_rows,
+                    skipped_mvcc_pinned = outcome.skipped_mvcc_pinned,
+                    "trimmed queue-storage ring rotation ledgers"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => warn!(error = %err, "failed to trim ring rotation ledgers"),
+        }
     }
 
     /// Evaluate all cron schedules and enqueue any that are due.

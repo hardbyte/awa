@@ -1456,6 +1456,16 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+
+    // Clean up so a later `migrations::run` (this or another test) does not
+    // reinstall this schema through the discovery loops. With the v042
+    // ledger loop now running alongside the v041 compact-deadline loop, a
+    // leaked probe schema multiplies the single-tx lock footprint of the
+    // reinstall and can trip max_locks_per_transaction under concurrency.
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("compact-deadline probe schema should drop cleanly");
 }
 
 async fn rollups_failed_column_exists(pool: &PgPool, schema: &str) -> bool {
@@ -1537,6 +1547,169 @@ async fn test_v032_backfills_queue_storage_pruned_failed_rollup_column() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+}
+
+async fn ring_state_cursor_columns_exist(pool: &PgPool, schema: &str) -> bool {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = 'queue_ring_state'
+              AND column_name = 'current_slot'
+        )
+        "#,
+    )
+    .bind(schema)
+    .fetch_one(pool)
+    .await
+    .expect("current_slot column probe should succeed")
+}
+
+/// #371 v042: an upgrade from a pre-v042 substrate must seed the
+/// append-only rotation ledger from the legacy `current_slot` /
+/// `generation` singleton cursor BEFORE dropping those columns, so the
+/// cursor survives the representation change exactly. The migration is a
+/// deliberate compat break (columns dropped), and a post-upgrade claim
+/// must route to the seeded slot.
+#[tokio::test]
+async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    let schema = "awa_queue_storage_v042_ledger";
+    // Drop any leftover from a prior interrupted run BEFORE migrating: the
+    // v042 discovery loop reinstalls every existing queue-storage schema,
+    // and reinstalling a stale copy here only wastes a large single-tx
+    // lock footprint (and can trip max_locks_per_transaction).
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("leftover ledger probe schema should drop cleanly");
+
+    migrations::run(&pool).await.unwrap();
+
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    // Downgrade the prepared (post-v042) substrate back to the pre-v042
+    // shape: drop the ledgers and delta table, restore the mutable cursor
+    // columns on each singleton, and restore the derivable per-slot
+    // generation column. Seed the queue cursor at a non-genesis position
+    // (current_slot = 3, generation = 19) so the seed is observable.
+    sqlx::raw_sql(&format!(
+        r#"
+        DROP TABLE {schema}.queue_ring_rotations;
+        DROP TABLE {schema}.lease_ring_rotations;
+        DROP TABLE {schema}.claim_ring_rotations;
+        DROP TABLE {schema}.queue_terminal_rollup_deltas;
+
+        ALTER TABLE {schema}.queue_ring_state
+            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
+            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE {schema}.lease_ring_state
+            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
+            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE {schema}.claim_ring_state
+            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
+            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+
+        UPDATE {schema}.queue_ring_state SET current_slot = 3, generation = 19 WHERE singleton;
+
+        ALTER TABLE {schema}.queue_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
+        ALTER TABLE {schema}.lease_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
+        ALTER TABLE {schema}.claim_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("downgrade to pre-v042 substrate shape should succeed");
+
+    assert!(
+        ring_state_cursor_columns_exist(&pool, schema).await,
+        "downgraded substrate should carry the legacy cursor columns"
+    );
+
+    // Rerun the migrations: v042's discovery loop reapplies the v023
+    // install helper against this schema, seeding the ledger and dropping
+    // the columns.
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
+        .execute(&pool)
+        .await
+        .expect("schema_version rewind should succeed");
+
+    migrations::run(&pool)
+        .await
+        .expect("v042 should rerun cleanly");
+
+    // The legacy cursor columns are gone (loud-failure compat break).
+    assert!(
+        !ring_state_cursor_columns_exist(&pool, schema).await,
+        "v042 must drop the legacy current_slot/generation cursor columns"
+    );
+
+    // The queue ledger was seeded from the legacy cursor exactly: one row
+    // carrying (generation = 19, slot = 3), which is the current cursor.
+    let (ledger_slot, ledger_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.queue_ring_rotations \
+         ORDER BY generation DESC LIMIT 1"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("queue ledger cursor should be readable after upgrade");
+    assert_eq!(
+        (ledger_slot, ledger_gen),
+        (3, 19),
+        "v042 must seed the queue ledger from the legacy cursor before dropping it"
+    );
+
+    // Lease and claim ledgers were seeded from their genesis cursors.
+    for ring in ["lease", "claim"] {
+        let (slot, generation): (i32, i64) = sqlx::query_as(&format!(
+            "SELECT slot, generation FROM {schema}.{ring}_ring_rotations \
+             ORDER BY generation DESC LIMIT 1"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("ledger cursor should be readable after upgrade");
+        assert_eq!(
+            (slot, generation),
+            (0, 0),
+            "{ring} ledger seeds from its genesis cursor"
+        );
+    }
+
+    // The delta landing table exists again and the schema reports ready.
+    assert!(
+        storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after upgrade"),
+        "upgraded substrate must be reported ready (ledgers + delta table present)"
+    );
+
+    // A claim after upgrade routes off the seeded cursor: the claim
+    // runtime reads the claim ledger's max-generation row. With no ready
+    // work the claim is empty, but the routing read must not error on the
+    // now-ledger-backed cursor.
+    let claimed: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.claim_ready_runtime(\
+         'v042_upgrade_q'::text, 8::bigint, 0::double precision, 0::double precision)"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("claim_ready_runtime must route off the ledger cursor after upgrade");
+    assert_eq!(claimed, 0, "no ready work was seeded for the upgrade probe");
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+
+    // Clean up so a later `migrations::run` (this or another test) does not
+    // reinstall this schema through the v042 discovery loop.
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("ledger probe schema should drop cleanly");
 }
 
 #[tokio::test]

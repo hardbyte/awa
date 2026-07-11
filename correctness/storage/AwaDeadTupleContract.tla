@@ -188,17 +188,47 @@ TableSpec == [
     queue_claimer_state    |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
     \* ---- Ring-state singletons ----
-    \* One row per ring; updated O(seconds) by maintenance. Pure
-    \* singletons — UPDATE in place forever, autovacuum trivially
-    \* keeps up. Listed for completeness.
+    \* One row per ring. Since #371 these are genuinely cold config
+    \* (slot_count, plus the #290 trust marker on the queue ring): the
+    \* per-rotation cursor UPDATE that historically made "cold" a lie
+    \* under a pinned MVCC horizon (~3.6k dead versions/hour/ring at a
+    \* 1s cadence) moved to the append-only rotation ledgers below.
+    \* Writes now happen at operator cadence only.
     queue_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     lease_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     claim_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
+    \* ---- Ring rotation ledgers (#371) ----
+    \* Append-only cursor ledgers: rotation INSERTs one row (the
+    \* max-generation row IS the cursor); nothing ever UPDATEs a row.
+    \* Reclaim is the maintenance leader's horizon-gated fold
+    \* (RingLedgerFoldTx): when no other backend pins the MVCC horizon
+    \* it DELETEs generations older than one full ring wrap, so the
+    \* dead versions it creates are immediately reclaimable; while a
+    \* horizon is pinned the fold stands down (RingLedgerFoldPinnedTx)
+    \* and the ledger merely grows by one live row per rotation —
+    \* bounded by rotation cadence, not job throughput, hence "cold" +
+    \* RowVacuum rather than a hot partition-truncate family.
+    queue_ring_rotations   |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    lease_ring_rotations   |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    claim_ring_rotations   |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+
+    \* ---- Terminal-rollup delta landing table (#371) ----
+    \* Queue prune appends its pruned terminal counts here instead of
+    \* upserting queue_terminal_rollups inside the prune tx (that upsert
+    \* left one unreclaimable dead rollup version per prune under a
+    \* pinned horizon). Same reclaim shape as the rotation ledgers:
+    \* horizon-gated DELETE ... RETURNING fold
+    \* (TerminalRollupDeltaFoldTx) at maintenance cadence.
+    queue_terminal_rollup_deltas
+                           |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+
     \* ---- Ring-slot rows ----
-    \* One row per slot, ~handful of slots. Queue/lease slots mutate only
-    \* generation; claim slots also carry the stale-receipt rescue cursor.
-    \* These updates happen at maintenance cadence, not per job.
+    \* One row per slot, ~handful of slots. Since #371 the queue/lease
+    \* slot rows are pure row-lock targets (per-slot generations are
+    \* derived from the rotation ledger cursor); claim slots still carry
+    \* the receipt-rescue and deadline-rescue cursors, updated at
+    \* maintenance cadence, not per job.
     queue_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     lease_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     claim_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""]
@@ -481,18 +511,26 @@ ProgressFlushTx == <<
     Mut("Update", "attempt_state")
 >>
 
-\* Rotate / prune for each ring family. Rotate updates the ring
-\* state singleton; prune TRUNCATEs the partition child.
+\* Rotate / prune for each ring family (#371). Rotate APPENDS one row
+\* to the ring's rotation ledger — the ring-state singleton is no
+\* longer written by rotation, and an idle ring (PR A's idle gate)
+\* appends nothing at all. Prune TRUNCATEs the partition child.
 
-RotateLeasesTx == << Mut("Update", "lease_ring_state") >>
+RotateLeasesTx == << Mut("Insert", "lease_ring_rotations") >>
 PruneLeasesTx  == <<
-    Mut("Update", "lease_ring_slots"),
     Mut("Truncate", "leases")
 >>
 
-RotateReadyTx == << Mut("Update", "queue_ring_state") >>
+RotateReadyTx == << Mut("Insert", "queue_ring_rotations") >>
+\* Queue prune: carried failed rows re-home into the live done segment
+\* (with their count-delta evidence), pruned terminal counts append to
+\* the rollup delta table (no queue_terminal_rollups upsert here since
+\* #371), then the sealed children are truncated and the slot's folded
+\* live-counter rows are deleted.
 PruneReadyTx  == <<
-    Mut("Update", "queue_ring_slots"),
+    Mut("Insert", "done_entries"),
+    Mut("Insert", "queue_terminal_count_deltas"),
+    Mut("Insert", "queue_terminal_rollup_deltas"),
     Mut("Truncate", "ready_entries"),
     Mut("Truncate", "ready_claim_attempt_batches"),
     Mut("Truncate", "done_entries"),
@@ -500,20 +538,46 @@ PruneReadyTx  == <<
     Mut("Truncate", "receipt_completion_tombstones"),
     Mut("Truncate", "ready_tombstones"),
     Mut("Truncate", "queue_terminal_count_deltas"),
-    Mut("Truncate", "ready_segments")
+    Mut("Truncate", "ready_segments"),
+    Mut("Delete", "queue_terminal_live_counts")
 >>
 
 TerminalDeltaRollupTx == <<
     Mut("Update", "queue_terminal_live_counts"),
     Mut("Truncate", "queue_terminal_count_deltas")
 >>
-\* If another backend pins the MVCC horizon with an open snapshot or idle
-\* transaction id, terminal-count rollup returns before mutating the folded
-\* counter or truncating the delta child. This SELECT-only shape generates no
-\* dead tuples; exact reads include the still-pending delta rows.
+\* If another backend genuinely pins the MVCC horizon — a long-lived open
+\* snapshot (older than MVCC_HORIZON_PIN_MIN_AGE) or an idle-in-transaction
+\* backend holding a write xid — terminal-count rollup returns before mutating
+\* the folded counter or truncating the delta child. (The implementation
+\* age-gates the open-snapshot case so the transient backend_xmin of ordinary
+\* hot-path statements does not count as pinning; the pinned/clear abstraction
+\* here is unchanged.) This SELECT-only shape generates no dead tuples; exact
+\* reads include the still-pending delta rows.
 TerminalDeltaRollupPinnedTx == << >>
 
-RotateClaimsTx == << Mut("Update", "claim_ring_state") >>
+\* #371 maintenance folds, both gated on the same clear-horizon check as
+\* TerminalDeltaRollupTx so every dead version they create is
+\* immediately reclaimable by autovacuum.
+\*
+\* fold_terminal_rollup_deltas: DELETE ... RETURNING the pending prune
+\* deltas and upsert them into the permanent rollups in deterministic
+\* (queue, priority) order.
+TerminalRollupDeltaFoldTx == <<
+    Mut("Delete", "queue_terminal_rollup_deltas"),
+    Mut("Update", "queue_terminal_rollups")
+>>
+\* fold_ring_rotation_ledgers: trim each ledger to one full ring wrap.
+RingLedgerFoldTx == <<
+    Mut("Delete", "queue_ring_rotations"),
+    Mut("Delete", "lease_ring_rotations"),
+    Mut("Delete", "claim_ring_rotations")
+>>
+\* Pinned-horizon stand-down shape shared by both folds: SELECT-only,
+\* no dead tuples; readers keep summing the unfolded rows.
+HorizonPinnedFoldTx == << >>
+
+RotateClaimsTx == << Mut("Insert", "claim_ring_rotations") >>
 PruneClaimsTx  == <<
     Mut("Update", "claim_ring_slots"),
     Mut("Truncate", "lease_claims"),
@@ -536,6 +600,7 @@ Transactions == {
     HeartbeatTx, ProgressFlushTx,
     RotateLeasesTx, PruneLeasesTx,
     RotateReadyTx, PruneReadyTx, TerminalDeltaRollupTx, TerminalDeltaRollupPinnedTx,
+    TerminalRollupDeltaFoldTx, RingLedgerFoldTx, HorizonPinnedFoldTx,
     RotateClaimsTx, PruneClaimsTx
 }
 
