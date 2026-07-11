@@ -2722,8 +2722,17 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'failed'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'cancelled'), 0) AS cancelled,
-                -- `waiting_external` stays leases-only: a claim only reaches it
-                -- after register_callback materialises it into `leases`.
+                -- INVARIANT: `waiting_external` is leases-only on purpose — it
+                -- needs no `lease_claim_batches` branch like `running` above.
+                -- A receipt claim cannot be `waiting_external` while it lives on
+                -- a compact batch: `QueueStorage::register_callback` runs
+                -- `ensure_mutable_running_attempt_tx` (which materialises the
+                -- claim into `{schema}.leases`) BEFORE
+                -- `enter_callback_wait_in_tx` flips `leases.state` to
+                -- `waiting_external`. So every waiting_external row is on
+                -- `leases` by construction. (Same reasoning at the worker
+                -- health-metrics gauge, maintenance.rs
+                -- publish_queue_storage_health_metrics.)
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
             "#,
             schema = store.schema(),

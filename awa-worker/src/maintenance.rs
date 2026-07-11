@@ -2861,6 +2861,16 @@ impl MaintenanceService {
                 SELECT
                     queue,
                     count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                    -- INVARIANT: the `waiting_external` FILTER is leases-only on
+                    -- purpose — unlike `running` (see receipt_running below) it
+                    -- needs no lease_claim_batches branch. A receipt claim
+                    -- cannot be `waiting_external` while it lives on a compact
+                    -- batch: `QueueStorage::register_callback` runs
+                    -- `ensure_mutable_running_attempt_tx` (materialises the
+                    -- claim into `leases`) BEFORE `enter_callback_wait_in_tx`
+                    -- flips `leases.state` to `waiting_external`. Every
+                    -- waiting_external row is therefore on `leases` by
+                    -- construction. (Same reasoning at admin::state_counts.)
                     count(*) FILTER (WHERE state = 'waiting_external')::bigint
                         AS waiting_external
                 FROM {schema}.leases
@@ -2868,9 +2878,9 @@ impl MaintenanceService {
             ),
             -- Receipt claims not yet materialised into `leases` are running too
             -- (#246): since compact claims live in `lease_claim_batches`, a
-            -- leases-only running count under-reports a saturated queue.
-            -- `waiting_external` needs no such branch — a claim only reaches it
-            -- after register_callback materialises it into `leases`.
+            -- leases-only running count under-reports a saturated queue. Only
+            -- the running leg needs this — see the waiting_external invariant
+            -- above.
             receipt_running AS (
                 SELECT queue, count(*)::bigint AS running
                 FROM ({open_running}) AS open_running
