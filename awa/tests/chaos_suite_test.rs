@@ -126,6 +126,48 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                            AND dlq.run_lease = lc.run_lease \
                        ) \
                      UNION ALL \
+                     /* Compact receipt claims (#246) live in \
+                        lease_claim_batches, not lease_claims — expand \
+                        their members so a running claim is visible before \
+                        it materialises into leases. Mirrors load_job. */ \
+                     SELECT 'running'::awa.job_state AS state \
+                     FROM {schema}.lease_claim_batches AS b \
+                     CROSS JOIN LATERAL unnest( \
+                         b.job_ids, b.run_leases, b.receipt_ids \
+                     ) AS items(job_id, run_lease, receipt_id) \
+                     WHERE b.queue = $1 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+                         WHERE cx.claim_slot = b.claim_slot \
+                           AND cx.job_id = items.job_id \
+                           AND cx.run_lease = items.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb \
+                         WHERE cb.claim_slot = b.claim_slot \
+                           AND cb.receipt_ranges @> items.receipt_id \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.leases AS lease \
+                         WHERE lease.job_id = items.job_id \
+                           AND lease.run_lease = items.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.deferred_jobs AS deferred \
+                         WHERE deferred.job_id = items.job_id \
+                           AND deferred.run_lease = items.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.terminal_jobs AS terminal \
+                         WHERE terminal.job_id = items.job_id \
+                           AND terminal.run_lease = items.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.dlq_entries AS dlq \
+                         WHERE dlq.job_id = items.job_id \
+                           AND dlq.run_lease = items.run_lease \
+                       ) \
+                     UNION ALL \
                      SELECT state FROM {schema}.terminal_jobs WHERE queue = $1 \
                      UNION ALL \
                      SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
