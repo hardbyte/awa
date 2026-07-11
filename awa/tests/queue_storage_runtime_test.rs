@@ -3233,6 +3233,123 @@ async fn test_open_receipt_claims_is_absent_after_install() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+/// Regression guard for the #246 compact-claim visibility contract: a
+/// receipt claim — zero-deadline OR deadline-backed — lands only in
+/// `lease_claim_batches`, so any "running / in-flight" enumeration that
+/// reads `lease_claims` alone sees zero jobs while several are actually
+/// claimed. This bit two test-side state readers: the OTLP dashboard
+/// helper (telemetry_test.rs) reported 0 running for a saturated queue,
+/// and the Python chaos helper (`_fetch_job_row` in test_chaos_recovery.py)
+/// returned None for a deadline-backed job that was running-with-heartbeat.
+/// Here we claim without materializing into `leases` and assert the two
+/// surfaces those helpers stand in for: the batch-expanding
+/// `open_receipt_claim_count`, and the production `QueueStorage::load_job`
+/// admin read (which the Python chaos helper mirrors and which
+/// `admin::get_job` delegates to) reporting each member as `running`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_compact_batch_claims_are_visible_as_open() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_compact_batch_visible";
+    let queue = "qs_compact_batch_visible";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claim_count: i64 = 3;
+    let mut job_ids = Vec::new();
+    for id in 0..claim_count {
+        job_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+
+    // Claim directly via the runtime function with a positive deadline so
+    // the jobs sit in `lease_claim_batches` mid-flight carrying a shared
+    // `deadline_at` (the deadline-backed shape the chaos tests exercise) —
+    // no worker runs, so nothing materializes into `leases` or closes the
+    // claim.
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(claim_count)
+    // p_deadline_secs > 0 → the batch carries a non-NULL deadline_at.
+    .bind(3600.0_f64)
+    // p_aging_secs
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("claim ready jobs into a compact batch");
+    assert_eq!(
+        claimed.len(),
+        claim_count as usize,
+        "the runtime claim should hand back every enqueued attempt"
+    );
+
+    assert_eq!(
+        lease_claim_count(&pool, &store).await,
+        0,
+        "receipt claims must not write per-job lease_claims rows"
+    );
+    assert!(
+        lease_claim_batch_count(&pool, &store).await >= 1,
+        "the claim must land as one or more compact lease_claim_batches rows"
+    );
+    assert_eq!(
+        lease_count(&pool, &store).await,
+        0,
+        "an un-materialized claim must not have a leases row"
+    );
+
+    // Surface 1 — the count/enumeration helper. The bug: a
+    // `lease_claims`-only running enumeration returns 0 here.
+    assert_eq!(
+        open_receipt_claim_count(&pool, &store).await,
+        claim_count,
+        "batch-backed claims must be visible as open/running in-flight work"
+    );
+
+    // Surface 2 — the production single-job admin read (`load_job`, behind
+    // `admin::get_job`). Every claimed member must report as `running`, and
+    // its shared batch deadline must surface. This is the exact contract the
+    // Python chaos helper's `_fetch_job_row` stands in for.
+    for job_id in &job_ids {
+        let job = store
+            .load_job(&pool, *job_id)
+            .await
+            .expect("load_job for a batch-claimed job")
+            .unwrap_or_else(|| panic!("load_job returned None for running job {job_id}"));
+        assert_eq!(
+            job.state.to_string(),
+            "running",
+            "load_job must report compact-batch claim {job_id} as running"
+        );
+        assert!(
+            job.deadline_at.is_some(),
+            "load_job must surface the batch's shared deadline for {job_id}"
+        );
+    }
+}
+
 /// Partition-routing smoke test for the ADR-023 receipt plane: a
 /// receipt-backed claim + completion cycle lands the claim in the
 /// expected claim child and records the claim slot on compact terminal
