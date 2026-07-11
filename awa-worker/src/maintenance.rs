@@ -2784,10 +2784,17 @@ impl MaintenanceService {
     ) {
         let schema = runtime.store.schema();
         // This is a high-cadence metrics path, not an admin exact-count
-        // endpoint. Keep it on queue-storage control tables and bounded
+        // endpoint. It stays on queue-storage control tables and bounded
         // lane-head probes so long retained ready/done/receipt segments do
-        // not compete with worker traffic. Admin surfaces that need exact
-        // counts still go through QueueStorage::queue_counts().
+        // not compete with worker traffic; admin surfaces that need exact
+        // counts still go through QueueStorage::queue_counts(). The one
+        // receipt-evidence read it does take is `receipt_running` below:
+        // since #246 in-flight claims live in `lease_claim_batches`, so a
+        // running gauge sourced from `leases` alone silently reads zero for
+        // receipt-short-path queues. The scan is bounded to currently-open
+        // claims (anti-joined against durable closure evidence), so it tracks
+        // in-flight depth, not retained history.
+        let open_running = awa_model::queue_storage::open_receipt_running_claims_sql(schema);
         let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
             r#"
             WITH head_signal AS (
@@ -2868,6 +2875,16 @@ impl MaintenanceService {
                 FROM {schema}.leases
                 GROUP BY queue
             ),
+            -- Receipt claims not yet materialised into `leases` are running too
+            -- (#246): since compact claims live in `lease_claim_batches`, a
+            -- leases-only running count under-reports a saturated queue.
+            -- `waiting_external` needs no such branch — a claim only reaches it
+            -- after register_callback materialises it into `leases`.
+            receipt_running AS (
+                SELECT queue, count(*)::bigint AS running
+                FROM ({open_running}) AS open_running
+                GROUP BY queue
+            ),
             deferred AS (
                 SELECT
                     queue,
@@ -2894,7 +2911,8 @@ impl MaintenanceService {
             SELECT
                 queues.queue,
                 COALESCE(ready.available, 0)::bigint AS available,
-                COALESCE(leases.running, 0)::bigint AS running,
+                (COALESCE(leases.running, 0) + COALESCE(receipt_running.running, 0))::bigint
+                    AS running,
                 COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
                 COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
                 COALESCE(deferred.retryable, 0)::bigint AS retryable,
@@ -2908,6 +2926,8 @@ impl MaintenanceService {
               ON lag.queue = queues.queue
             LEFT JOIN leases
               ON leases.queue = queues.queue
+            LEFT JOIN receipt_running
+              ON receipt_running.queue = queues.queue
             LEFT JOIN deferred
               ON deferred.queue = queues.queue
             LEFT JOIN terminal

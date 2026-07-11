@@ -3444,6 +3444,45 @@ async fn test_compact_batch_claims_are_visible_as_open() {
             "load_job must surface the batch's shared deadline for {job_id}"
         );
     }
+
+    // Surface 3 — the aggregate admin surfaces that #246 previously left
+    // blind (the list/overview CTE closed #416, and the global state_counts).
+    // All must count the un-materialized batch claims as running.
+    let counts = admin::state_counts(&pool)
+        .await
+        .expect("admin::state_counts under queue storage");
+    assert_eq!(
+        counts.get(&JobState::Running).copied().unwrap_or(0),
+        claim_count,
+        "admin::state_counts must count compact-batch claims as running"
+    );
+
+    let overview = admin::queue_overviews(&pool)
+        .await
+        .expect("admin::queue_overviews under queue storage")
+        .into_iter()
+        .find(|o| o.queue == queue)
+        .unwrap_or_else(|| panic!("queue {queue} missing from queue_overviews"));
+    assert_eq!(
+        overview.running, claim_count,
+        "queue_overviews (list/UI surface, #416) must count compact-batch claims as running"
+    );
+
+    let listed = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("admin::list_jobs under queue storage");
+    assert_eq!(
+        listed.len() as i64,
+        claim_count,
+        "list_jobs filtered on running must return every compact-batch claim"
+    );
 }
 
 /// Partition-routing smoke test for the ADR-023 receipt plane: a

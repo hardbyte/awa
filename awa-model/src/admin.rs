@@ -321,6 +321,104 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
              AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
             UNION ALL
+            -- Receipt claims that have not materialised into `leases` are
+            -- running too (#246 / #416). They live on legacy row-local
+            -- `lease_claims` or, by default, compact `lease_claim_batches`.
+            -- Report both as `running`, anti-joined against every durable
+            -- closure/terminal/materialised-lease shape. This mirrors
+            -- QueueStorage::load_job (the batch-aware single-job admin read)
+            -- and the canonical open-receipt shape in
+            -- queue_storage::open_receipt_running_claims_sql; it is spelled
+            -- out here because this view projects the full job row
+            -- (kind/created_at/run_at from `ready_entries`), not just claim
+            -- identity.
+            SELECT
+                claims.job_id,
+                ready.kind,
+                claims.queue,
+                'running'::awa.job_state AS state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.lease_claims AS claims
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = claims.ready_slot
+             AND ready.ready_generation = claims.ready_generation
+             AND ready.queue = claims.queue
+             AND ready.priority = claims.priority
+             AND ready.enqueue_shard = claims.enqueue_shard
+             AND ready.lane_seq = claims.lane_seq
+            WHERE claims.closed_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS cx
+                  WHERE cx.claim_slot = claims.claim_slot
+                    AND cx.job_id = claims.job_id
+                    AND cx.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb
+                  WHERE cb.receipt_ranges @> claims.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = claims.job_id
+                    AND lease.run_lease = claims.run_lease
+              )
+            UNION ALL
+            SELECT
+                items.job_id,
+                ready.kind,
+                batches.queue,
+                'running'::awa.job_state AS state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.lease_claim_batches AS batches
+            CROSS JOIN LATERAL unnest(
+                batches.job_ids,
+                batches.run_leases,
+                batches.receipt_ids,
+                batches.lane_seqs
+            ) AS items(job_id, run_lease, receipt_id, lane_seq)
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = batches.ready_slot
+             AND ready.ready_generation = batches.ready_generation
+             AND ready.queue = batches.queue
+             AND ready.enqueue_shard = batches.enqueue_shard
+             AND ready.lane_seq = items.lane_seq
+             AND ready.job_id = items.job_id
+            WHERE NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS cx
+                  WHERE cx.claim_slot = batches.claim_slot
+                    AND cx.job_id = items.job_id
+                    AND cx.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closure_batches AS cb
+                  WHERE cb.claim_slot = batches.claim_slot
+                    AND cb.receipt_ranges @> items.receipt_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = items.job_id
+                    AND lease.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = items.job_id
+                    AND done.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = items.job_id
+                    AND deferred.run_lease = items.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = items.job_id
+                    AND dlq.run_lease = items.run_lease
+              )
+            UNION ALL
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
             FROM {schema}.terminal_jobs
             UNION ALL
@@ -2617,15 +2715,21 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                             AND tomb.ready_generation = ready.ready_generation
                       )
                 ), 0) AS available,
-                COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0)
+                  + COALESCE((SELECT count(*)::bigint FROM ({open_running}) AS open_running), 0) AS running,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.terminal_jobs WHERE state = 'completed'), 0) AS completed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'retryable'), 0) AS retryable,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'failed'), 0)
                   + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'cancelled'), 0) AS cancelled,
+                -- `waiting_external` stays leases-only: a claim only reaches it
+                -- after register_callback materialises it into `leases`.
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
             "#,
-            schema = store.schema()
+            schema = store.schema(),
+            // Compact receipt claims (#246) live in `lease_claim_batches` until
+            // materialised; count them as running alongside the `leases` leg.
+            open_running = crate::queue_storage::open_receipt_running_claims_sql(store.schema()),
         );
 
         let (
