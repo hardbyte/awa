@@ -1415,31 +1415,44 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
         "v041 must backfill the batch deadline-rescue cursor columns on existing schemas"
     );
 
-    let index_name = format!("idx_{schema}_lease_claim_batches_0_deadline_cursor");
-    let has_index: bool = sqlx::query_scalar(&format!(
-        "SELECT to_regclass('{schema}.{index_name}') IS NOT NULL"
+    // The migration contract covers EVERY lease_claim_batches child, not
+    // just child 0 — enumerate the installed children and assert the
+    // partial sweep index (deadline_at IS NOT NULL, so zero-deadline
+    // traffic never maintains entries) exists on each.
+    let child_slots: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT substring(tablename FROM 'lease_claim_batches_(\\d+)$')
+         FROM pg_tables
+         WHERE schemaname = '{schema}'
+           AND tablename ~ '^lease_claim_batches_\\d+$'
+         ORDER BY 1"
     ))
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("batch deadline index probe should succeed");
+    .expect("enumerate lease_claim_batches children");
     assert!(
-        has_index,
-        "v041 must backfill the partial batch-deadline sweep index on lease_claim_batches children"
+        !child_slots.is_empty(),
+        "expected at least one lease_claim_batches child partition"
     );
-
-    // The refreshed index must be the partial (deadline_at IS NOT NULL) shape
-    // so zero-deadline traffic never maintains entries. Resolve the index by
-    // OID (its relname is truncated to 63 chars) and read its definition.
-    let index_def: String = sqlx::query_scalar(&format!(
-        "SELECT pg_get_indexdef(to_regclass('{schema}.{index_name}')::oid)"
-    ))
-    .fetch_one(&pool)
-    .await
-    .expect("index definition probe should succeed");
-    assert!(
-        index_def.contains("deadline_at IS NOT NULL"),
-        "the batch-deadline index must be partial on deadline_at IS NOT NULL, got: {index_def}"
-    );
+    for slot in &child_slots {
+        let index_name = format!("idx_{schema}_lease_claim_batches_{slot}_deadline_cursor");
+        // Resolve by OID (relnames are truncated to 63 chars) and read the
+        // definition in one probe; NULL means the index is missing.
+        let index_def: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT pg_get_indexdef(to_regclass('{schema}.{index_name}')::oid)"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("index definition probe should succeed");
+        let index_def = index_def.unwrap_or_else(|| {
+            panic!(
+                "v041 must backfill the partial batch-deadline sweep index on                  lease_claim_batches child {slot}"
+            )
+        });
+        assert!(
+            index_def.contains("deadline_at IS NOT NULL"),
+            "child {slot}: the batch-deadline index must be partial on              deadline_at IS NOT NULL, got: {index_def}"
+        );
+    }
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);

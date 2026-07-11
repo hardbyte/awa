@@ -7000,7 +7000,9 @@ impl QueueStorage {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
         // Canonical open-receipt-claim shape (row-local + compact batch),
-        // reused by admin state reads and the health-metrics gauge.
+        // reused by admin::state_counts. (The maintenance health gauge is
+        // deliberately NOT a consumer — it stays leases-only so it can
+        // never block on claim-ring ACCESS EXCLUSIVE locks.)
         let open_running = open_receipt_running_claims_sql(schema);
         let counter_trusted = self.terminal_counter_trusted(pool).await?;
         // The live-terminal CTE swaps between counter-fed and
@@ -7118,7 +7120,8 @@ impl QueueStorage {
                     -- plus compact `lease_claim_batches` members, #246), each
                     -- anti-joined against every durable closure/terminal/
                     -- materialised-lease shape. Shared canonical shape reused
-                    -- by admin state reads and the health-metrics gauge.
+                    -- by admin::state_counts (the health gauge stays
+                    -- leases-only by design).
                     COALESCE((
                         SELECT count(*)::bigint
                         FROM ({open_running}) AS open_running

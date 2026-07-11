@@ -364,6 +364,26 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
                   WHERE lease.job_id = claims.job_id
                     AND lease.run_lease = claims.run_lease
               )
+              -- Terminal supersession counts as closed evidence even
+              -- without an explicit closure row (mirrors the compact
+              -- branch below and open_receipt_running_claims_sql);
+              -- without these a legacy row-local claim would be listed
+              -- as running AND terminal at once.
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = claims.job_id
+                    AND done.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = claims.job_id
+                    AND deferred.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = claims.job_id
+                    AND dlq.run_lease = claims.run_lease
+              )
             UNION ALL
             SELECT
                 items.job_id,

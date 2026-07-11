@@ -3186,7 +3186,7 @@ mod tests {
             .await
             .expect("begin receipt lock transaction");
         sqlx::query(
-            "LOCK TABLE awa.lease_claims, awa.lease_claim_closures, awa.lease_claim_closure_batches IN ACCESS EXCLUSIVE MODE",
+            "LOCK TABLE awa.lease_claims, awa.lease_claim_batches, awa.lease_claim_closures, awa.lease_claim_closure_batches IN ACCESS EXCLUSIVE MODE",
         )
         .execute(receipt_lock_tx.as_mut())
         .await

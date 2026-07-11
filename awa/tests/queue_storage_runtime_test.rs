@@ -3483,6 +3483,88 @@ async fn test_compact_batch_claims_are_visible_as_open() {
         claim_count,
         "list_jobs filtered on running must return every compact-batch claim"
     );
+
+    // Terminal supersession must count as closed evidence for a legacy
+    // row-local claim even when no explicit closure row exists — the
+    // row-claims branch of current_jobs mirrors the compact branch's
+    // done/deferred/dlq anti-joins. Seed a row-local claim whose job
+    // already landed in done_entries and assert it is NOT double-listed
+    // as running.
+    let stale_job_id = 9_600_001_i64;
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.lease_claims (
+            claim_slot, receipt_id, job_id, run_lease, ready_slot,
+            ready_generation, queue, priority, attempt,
+            max_attempts, lane_seq, enqueue_shard, claimed_at, deadline_at
+        ) VALUES (0, 96001, $1, 7, 0, 0, $2,
+                  2::smallint, 1::smallint, 25::smallint, 9601::bigint,
+                  0::smallint, now(), now() + interval '5 minutes')"
+    ))
+    .bind(stale_job_id)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed legacy row-local claim");
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.ready_entries (
+            ready_slot, ready_generation, job_id, kind, queue, args, priority,
+            attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at,
+            attempted_at, created_at, unique_key, unique_states, payload
+        ) VALUES (0, 0, $1, 'stale_claim_job', $2, '{{}}'::jsonb, 2,
+                  1, 7, 25, 9601, 0, now(), now(), now(), NULL, NULL,
+                  '{{}}'::jsonb)"
+    ))
+    .bind(stale_job_id)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed matching ready row for the row-local claim");
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        ) VALUES (0, 0, $1, 'stale_claim_job', $2, 'completed'::awa.job_state,
+                  2::smallint, 1::smallint, 7::bigint, 9601::bigint,
+                  0::smallint, now(), now(), '{{}}'::jsonb)"
+    ))
+    .bind(stale_job_id)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed superseding done row (no explicit closure)");
+
+    // list_jobs self-heals (it re-verifies every candidate through the
+    // batch-aware load_job), so the counting surfaces are where the
+    // missing anti-joins would show: queue_overviews aggregates raw off
+    // the current_jobs CTE. Pre-fix this read claim_count + 1.
+    let overview = admin::queue_overviews(&pool)
+        .await
+        .expect("admin::queue_overviews after seeding superseded claim")
+        .into_iter()
+        .find(|entry| entry.queue == queue)
+        .unwrap_or_else(|| panic!("queue {queue} missing from queue_overviews"));
+    assert_eq!(
+        overview.running, claim_count,
+        "a row-local claim superseded by done_entries must not inflate \
+         the running count (terminal supersession is closed evidence)"
+    );
+
+    let relisted = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("admin::list_jobs after seeding superseded row-local claim");
+    assert!(
+        !relisted.iter().any(|job| job.id == stale_job_id),
+        "a row-local claim superseded by done_entries must not be listed \
+         as running"
+    );
 }
 
 /// Partition-routing smoke test for the ADR-023 receipt plane: a
