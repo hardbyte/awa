@@ -35,6 +35,9 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         awa_model::AwaError::SchemaNotMigrated { expected, found } => SchemaNotMigrated::new_err(
             format!("schema not migrated: expected version {expected}, found {found}"),
         ),
+        err @ awa_model::AwaError::SchemaNewerThanBinary { .. } => {
+            SchemaNotMigrated::new_err(err.to_string())
+        }
         awa_model::AwaError::UnknownJobKind { kind } => {
             UnknownJobKind::new_err(format!("unknown job kind: {kind}"))
         }

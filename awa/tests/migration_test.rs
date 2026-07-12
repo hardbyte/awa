@@ -111,6 +111,92 @@ async fn reset_schema(pool: &PgPool) {
         .expect("Failed to drop schema");
 }
 
+#[tokio::test]
+async fn test_062_forward_schema_guard_accepts_only_v042_columns_authority() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    sqlx::raw_sql(
+        r#"
+        CREATE SCHEMA awa;
+        CREATE TABLE awa.schema_version (
+            version INT PRIMARY KEY,
+            description TEXT NOT NULL
+        );
+        INSERT INTO awa.schema_version (version, description)
+        VALUES (39, '0.6.1'), (42, '0.7 additive expand');
+        CREATE TABLE awa.ring_cursor_authority (
+            singleton BOOLEAN PRIMARY KEY,
+            authority TEXT NOT NULL
+        );
+        INSERT INTO awa.ring_cursor_authority VALUES (TRUE, 'columns');
+
+        CREATE SCHEMA awa_custom;
+        CREATE TABLE awa_custom.ring_cursor_authority (
+            singleton BOOLEAN PRIMARY KEY,
+            authority TEXT NOT NULL
+        );
+        INSERT INTO awa_custom.ring_cursor_authority VALUES (TRUE, 'columns');
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("install synthetic forward-compatible v042 schema");
+
+    assert_eq!(
+        migrations::current_version(&pool)
+            .await
+            .expect("v042 columns authority is forward-compatible"),
+        42
+    );
+    migrations::run(&pool)
+        .await
+        .expect("0.6.2 migrate is a no-op on v042 columns authority");
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM awa.schema_version ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("read schema versions after compatible probe");
+    assert_eq!(versions, vec![39, 42], "compatible probe rewrites nothing");
+
+    sqlx::query("UPDATE awa_custom.ring_cursor_authority SET authority = 'ledger' WHERE singleton")
+        .execute(&pool)
+        .await
+        .expect("simulate one-way authority flip");
+    let post_flip = migrations::run(&pool)
+        .await
+        .expect_err("0.6.2 must refuse after any schema flips to ledger authority");
+    assert!(matches!(
+        post_flip,
+        awa::AwaError::SchemaNewerThanBinary {
+            found: 42,
+            supported: 39
+        }
+    ));
+
+    sqlx::query("UPDATE awa.schema_version SET version = 43 WHERE version = 42")
+        .execute(&pool)
+        .await
+        .expect("simulate unknown future schema");
+    let future = migrations::run(&pool)
+        .await
+        .expect_err("unknown newer schemas must fail closed");
+    assert!(matches!(
+        future,
+        awa::AwaError::SchemaNewerThanBinary {
+            found: 43,
+            supported: 39
+        }
+    ));
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM awa.schema_version ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("read schema versions after refusals");
+    assert_eq!(versions, vec![39, 43], "refusal paths rewrite nothing");
+}
+
 fn sqlstate_from_awa_error(err: &awa::AwaError) -> Option<String> {
     match err {
         awa::AwaError::Database(sqlx::Error::Database(db_err)) => {

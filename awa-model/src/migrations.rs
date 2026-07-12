@@ -344,6 +344,16 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 
     let raw_version = version.unwrap_or(0);
 
+    if raw_version > CURRENT_VERSION {
+        if forward_compatible_v042_columns(conn, raw_version).await? {
+            return Ok(raw_version);
+        }
+        return Err(AwaError::SchemaNewerThanBinary {
+            found: raw_version,
+            supported: CURRENT_VERSION,
+        });
+    }
+
     // If max version is within the current MIGRATIONS range and the expected
     // tables exist, this is a current install — skip legacy detection.
     if (1..=CURRENT_VERSION).contains(&raw_version) {
@@ -435,6 +445,51 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
     }
 
     Ok(raw_version)
+}
+
+/// The 0.6.2 rolling-upgrade stepping-stone recognizes exactly the additive
+/// v042 shape, and only before any queue-storage schema has flipped to ledger
+/// authority. This lets an already-rolled 0.6.2 fleet survive a migration-first
+/// 0.7 rollout. Unknown future schemas and the post-flip boundary fail closed.
+async fn forward_compatible_v042_columns(
+    conn: &mut PgConnection,
+    raw_version: i32,
+) -> Result<bool, AwaError> {
+    if raw_version != 42 {
+        return Ok(false);
+    }
+
+    // quote_ident is computed by PostgreSQL before the identifier is used in
+    // the dynamic query below. Queue-storage schema names are validated when
+    // installed, but retaining quoting here keeps this probe safe for catalogs
+    // created by external migration tooling too.
+    let schemas: Vec<String> = sqlx::query_scalar(
+        "SELECT quote_ident(n.nspname) \
+         FROM pg_namespace AS n \
+         JOIN pg_class AS c ON c.relnamespace = n.oid \
+         WHERE c.relname = 'ring_cursor_authority' \
+           AND c.relkind IN ('r', 'p') \
+         ORDER BY n.nspname",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+
+    if schemas.is_empty() {
+        return Ok(false);
+    }
+
+    for schema in schemas {
+        let authority: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
+        ))
+        .fetch_optional(&mut *conn)
+        .await?;
+        if authority.as_deref() != Some("columns") {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 /// Get the raw SQL for all migrations (for extraction / external tooling).
