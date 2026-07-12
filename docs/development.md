@@ -95,12 +95,11 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tes
 ## Authoring Schema Migrations
 
 Policy: [ADR-041 — rolling-upgrade policy](adr/041-rolling-upgrade-policy.md).
-The short version: **no stop-the-world moments**. Schema changes must be
-operable by the previous release's binaries until the fleet has rolled, and
-representation changes ship as expand → flip → contract across releases. The
-enforcement mechanics live in `awa-model/src/migrations.rs`
-(`EXCLUSIVE_WINDOW_MIGRATIONS`, the pre-flight live-runtime gate, the
-newer-schema fail-safe from #426).
+Rolling deployment is the default: schema changes must remain operable by the
+previous release's binaries until the fleet flips, and representation changes
+ship as expand → flip → contract across releases. Migration version floors,
+exclusive migrations, and the newer-schema fail-safe live in
+`awa-model/src/migrations.rs`.
 
 Checklist for any new `awa-model/migrations/vNNN_*.sql`:
 
@@ -116,6 +115,23 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
       works" — which paths it exercises and why they stay correct).
 - [ ] Safe under live load: no long `ACCESS EXCLUSIVE` holds on hot tables;
       note the expected wall time on realistic data volumes.
+- [ ] The current binary remains operable before migration, or startup applies
+      the migration before any changed path runs. Test binary-first as well as
+      migrate-first ordering.
+- [ ] External migration tooling requirements are documented. Rust preflights
+      do not run when operators apply `migration_sql()` themselves.
+
+**If compatibility first ships in an earlier-release patch**
+
+- [ ] Add `(migration_version, minimum_runtime_version)` to
+      `MIGRATION_RUNTIME_VERSION_FLOORS`. The floor names a released version
+      verified against the expanded schema; old or unparseable fresh runtimes
+      must refuse, stale runtimes must not block, and
+      `--allow-live-runtimes` must be tested.
+- [ ] Keep the preflight race-free: runtime registration and heartbeat writes
+      must not cross between the version check and migration commit.
+- [ ] Add the patch prerequisite to the CHANGELOG and upgrade guide before the
+      release that introduces the migration.
 
 **If it changes an on-disk representation or hot-path structure
 (expand → flip → contract)**
@@ -131,33 +147,44 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
       fresh-heartbeat runtime. NULL or unparseable ⇒ not capable. Manual CLI
       command plus (optionally) a maintenance auto-flip; refusal names the
       remedy; `--force` is the only override.
-- [ ] The flip **fences** returning pre-flip binaries loudly — poisoned
-      sentinel, removed function signature — never a silent misroute.
+- [ ] Under the old-writer locks, the flip treats the old representation as
+      source of truth, reconciles the complete new representation, verifies
+      exact equivalence, and changes authority atomically. Shadow writes alone
+      do not satisfy this requirement.
+- [ ] The flip **fences** returning pre-flip binaries at the database boundary.
+      Exercise the actual N−1 write path; a sentinel is insufficient if old
+      code can advance through it.
 - [ ] The **contract** migration (dropping the old representation) is deferred
-      to a later minor and tracked as its own issue.
+      to a later minor, tracked as its own issue, and independently checked
+      against that release's N−1 contract.
 - [ ] TLA+ models cover the **mixed-version interleavings** where a state
       machine changes (precedent: `AwaStorageLockOrder`'s flip model caught
       the v042 authority-read TOCTOU).
 - [ ] A **mixed-version adversarial rehearsal** passes before release: live
       enqueue + workers, failing/retrying jobs, scheduled/cron jobs, in-flight
-      jobs across the migrate step, `kill -9` during the window, old + new
-      binaries claiming concurrently, and an exact zero-loss reconciliation.
+      jobs across the migrate step, `kill -9` during the window, deadline
+      rescue, N−1-only operation on the expanded schema, old + new binaries
+      claiming concurrently, both rollout orders, the flip/fence, and an exact
+      zero-loss reconciliation. Use a released N−1 artifact, not only a source
+      compatibility shim.
       Record the evidence (`docs/adr/bench/` or the benchmarking repo);
       CI automation is [#427](https://github.com/hardbyte/awa/issues/427).
 
-**If you believe you need an exclusive (no-live-runtime) window**
+**If no rolling-compatible design is practical**
 
-- [ ] Redesign first — v042 was flagged and then made rolling; that is the
-      expected outcome, not the exception.
-- [ ] If a rolling path is genuinely impossible, add the version to
+- [ ] Record why expand/flip/contract and a runtime version floor are
+      insufficient in an ADR or equivalent design review.
+- [ ] Add the version to
       `EXCLUSIVE_WINDOW_MIGRATIONS` with the justification in the migration
-      header, a CHANGELOG operator callout, and the window procedure in that
-      release's upgrade guide.
+      header, refusal/override/stale-heartbeat tests, a CHANGELOG operator
+      callout, and the procedure in that release's upgrade guide.
 
 **Docs**
 
 - [ ] CHANGELOG entry; `docs/upgrade-X-to-Y.md` if any operator action is
-      required; `docs/stability.md` if the skew statement is affected.
+      required; `docs/stability.md` if the skew statement is affected. State
+      known mixed-version limitations explicitly; do not present a non-mixed
+      rehearsal as proof of mixed-version operation.
 
 ## Pre-commit Checks (Rust)
 

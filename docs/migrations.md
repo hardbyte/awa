@@ -299,9 +299,9 @@ Do not expect `awa migrate` to downgrade the schema.
 
 ## Breaking Changes
 
-Non-additive schema changes follow the rolling-upgrade policy ([ADR-041](adr/041-rolling-upgrade-policy.md)): the change ships as an additive **expand** migration (old binaries keep working), a runtime capability-gated **flip** once the fleet has rolled, and a **contract** migration in a later minor that drops the old representation. There is no stop-the-world moment by default.
+Representation changes follow the rolling-upgrade policy ([ADR-041](adr/041-rolling-upgrade-policy.md)): the change ships as an additive **expand** migration (old binaries remain correct), a runtime capability-gated **flip** once the fleet has rolled, and a **contract** migration in a later minor that drops the old representation.
 
-A migration that genuinely cannot offer a rolling path is flagged in `EXCLUSIVE_WINDOW_MIGRATIONS`; `awa migrate` refuses to apply it while any worker has heartbeated recently (override: `--allow-live-runtimes`), and the required window is called out explicitly in the CHANGELOG and that release's upgrade guide.
+An expand migration may declare a minimum compatible runtime patch in `MIGRATION_RUNTIME_VERSION_FLOORS`; this is preferred to refusing all live workers. A migration with no practical rolling-compatible shape may instead be flagged in `EXCLUSIVE_WINDOW_MIGRATIONS` after explicit design review. `awa migrate` enforces these checks for built-in migrations; external migration tooling must enforce the documented prerequisite independently.
 
 ## Recommended Production Flow
 
