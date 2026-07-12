@@ -49,14 +49,14 @@ transition to `finalize`, then upgrade to 0.7. A 0.7 binary will not migrate a 0
 schema directly — stepping-stone upgrades are the supported path (the same pattern Oban,
 River, and Postgres itself use).
 
-## The v042 ring-rotation ledger migration — staged, rolling, no stop-the-world
+## The v042 ring-rotation ledger migration
 
 Migration **v042** ([#371](https://github.com/hardbyte/awa/issues/371),
 [ADR-040](adr/040-append-only-ring-rotation-ledger.md)) moves the queue/lease/claim ring
 cursors out of the mutable `{ring}_ring_state` singleton columns (`current_slot`,
 `generation`) into append-only `{ring}_ring_rotations` ledgers (dead-tuple-free rotation
-under a pinned MVCC horizon). It is delivered as a **staged expand → flip → contract**
-upgrade so it needs **no stop-the-world window** and is safe for a mixed 0.6.2/0.7 fleet.
+under a pinned MVCC horizon). It is delivered as a staged **expand → flip → contract**
+upgrade supporting a mixed 0.6.2/0.7 fleet.
 
 > **Required stepping-stone:** first roll the whole fleet to **0.6.2 or later**.
 > 0.6.2 is the first 0.6 build that recognizes v042 as forward-compatible only
@@ -85,7 +85,7 @@ First roll 0.6.2 across the fleet as a normal patch release. After that, both
 orders are supported:
 
 1. **Roll binaries, then migrate**, or **migrate, then roll binaries** — either way the
-   fleet runs mixed 0.6.2/0.7 against one database with no stop-the-world window. In
+   fleet runs mixed 0.6.2/0.7 against one database. In
    compat mode a 0.6.2 rotator and a 0.7 rotator serialize on the same
    `{ring}_ring_state` row lock, so the cursor stays correct. A 0.6.2 restart also
    recognizes v042 while authority remains `columns`; it refuses rather than mutating the

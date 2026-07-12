@@ -3,9 +3,9 @@
 ## Status
 
 Accepted — implemented for 0.7 ([#371](https://github.com/hardbyte/awa/issues/371),
-from the 0.7 performance campaign). Ships as a **staged rolling upgrade**
-(expand → flip → contract) via migration v042 — **no stop-the-world window**,
-safe for a mixed 0.6.2/0.7 fleet after the required 0.6.2 stepping-stone. See the "Staged rolling upgrade" section below,
+from the 0.7 performance campaign). Ships as a staged **expand → flip → contract**
+upgrade via migration v042, supporting a mixed 0.6.2/0.7 fleet after the
+required 0.6.2 stepping-stone. See the "Staged rolling upgrade" section below,
 `docs/upgrade-0.6-to-0.7.md`, and the CHANGELOG 0.7 upgrade notes.
 
 ## Context
@@ -88,8 +88,8 @@ cursor's representation.
 ## Staged rolling upgrade (expand → flip → contract)
 
 The cutover from the mutable singleton columns to the ledger is delivered as a
-staged upgrade so it needs **no stop-the-world window** and tolerates a mixed
-0.6.2/0.7 fleet. The patched 0.6.2 stepping-stone is mandatory: older 0.6
+staged upgrade supporting a mixed 0.6.2/0.7 fleet. The patched 0.6.2
+stepping-stone is mandatory: older 0.6
 migrators can destructively misclassify a newer schema, while 0.6.2 recognizes
 v042 only in compat authority and otherwise fails closed. Each queue-storage schema carries a `ring_cursor_authority`
 control row (`columns` | `ledger`) selecting which representation is
@@ -137,10 +137,9 @@ function and the Rust rotate/prune seams branch on it.
 
 **Positive**
 
-- **No stop-the-world upgrade and no lockstep 0.7 binary/migration coupling.** After
-  the mandatory rolling 0.6.2 patch step, the additive expand + staged flip let
-  operators roll 0.7 binaries and run the migration in either order with a mixed fleet,
-  then promote to the dead-tuple-free ledger
+- **Either 0.7 rollout order is supported after the 0.6.2 stepping-stone.** Operators
+  may roll 0.7 binaries before or after applying v042 while the fleet is mixed, then
+  promote to the dead-tuple-free ledger
   once fully on 0.7.
 
 - The busy-path rotation write is an **append**, not an UPDATE: no dead tuple, so
@@ -160,7 +159,7 @@ function and the Rust rotate/prune seams branch on it.
   reaching the dead-tuple-free ledger regime is not instantaneous on upgrade — a
   cluster left in compat authority keeps the pre-#371 singleton churn (bounded by
   rotation cadence, reclaimable when the horizon is clear) until it flips. This
-  is the deliberate cost of avoiding a stop-the-world window.
+  is the deliberate cost of mixed-version compatibility.
 - Rolling a binary back **across the flip** is unsupported: the flip poisons the
   compat state and database-enforces the cursor fence, so a pre-flip binary fails
   loudly. Before the flip, rollback to the 0.6.2 stepping-stone is safe. (This

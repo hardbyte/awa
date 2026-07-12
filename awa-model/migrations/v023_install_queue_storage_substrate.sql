@@ -123,9 +123,9 @@ BEGIN
     -- Ring-state singletons (queue / lease / claim), rotation ledgers,
     -- and slot tables.
     --
-    -- #371 STAGED ROLLING UPGRADE (revises the original stop-the-world
-    -- v042). The ring cursor has two representations that coexist during a
-    -- rolling upgrade, selected per schema by `{schema}.ring_cursor_authority`:
+    -- #371 STAGED ROLLING UPGRADE. The ring cursor has two representations
+    -- that coexist during a rolling upgrade, selected per schema by
+    -- `{schema}.ring_cursor_authority`:
     --
     --   * `columns` (compat) — the pre-0.7 mutable `{ring}_ring_state`
     --     `current_slot` / `generation` singleton columns are authoritative,
@@ -137,8 +137,8 @@ BEGIN
     --     go stale (a returning pre-ledger binary is fenced off — see the flip).
     --
     -- This keeps the migration ADDITIVE: the compat columns are RESTORED,
-    -- not dropped, so a mixed 0.6.2/0.7 fleet runs against one database with
-    -- no stop-the-world window. The one-way `columns -> ledger` flip
+    -- not dropped, so a mixed 0.6.2/0.7 fleet runs against one database.
+    -- The one-way `columns -> ledger` flip
     -- (manual `awa storage flip-ring-authority` or the maintenance auto-flip
     -- once the fleet has fully rolled to 0.7) is what finally retires the
     -- columns; the 0.8 contract migration drops them. Fresh installs skip

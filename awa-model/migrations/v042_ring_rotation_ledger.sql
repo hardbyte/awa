@@ -1,5 +1,5 @@
 -- v042 (#371): append-only ring-rotation ledgers and terminal-rollup
--- deltas, delivered as a STAGED ROLLING UPGRADE (no stop-the-world).
+-- deltas, delivered as a staged expand -> flip -> contract upgrade.
 --
 -- The mutable ring-state cursor singletons (`queue_ring_state`,
 -- `lease_ring_state`, `claim_ring_state`) were UPDATEd on every rotation;
@@ -11,8 +11,7 @@
 -- append-only `queue_terminal_rollup_deltas` landing table folded by
 -- horizon-gated maintenance.
 --
--- STAGED, NOT LOCKSTEP (revises the original v042). This migration is
--- ADDITIVE: it creates + seeds the ledgers and the delta table AND keeps
+-- This migration is ADDITIVE: it creates + seeds the ledgers and the delta table AND keeps
 -- the compat `current_slot` / `generation` singleton columns (and the
 -- per-slot `generation` columns) in place, restoring them if an earlier
 -- (unreleased) shipped-v042 dev schema dropped them. Each queue-storage
