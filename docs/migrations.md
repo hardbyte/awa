@@ -299,7 +299,9 @@ Do not expect `awa migrate` to downgrade the schema.
 
 ## Breaking Changes
 
-If Awa ever needs a non-additive schema change, the intended contract is a major-version upgrade with a stop-the-world procedure documented explicitly for that release.
+Non-additive schema changes follow the rolling-upgrade policy ([ADR-041](adr/041-rolling-upgrade-policy.md)): the change ships as an additive **expand** migration (old binaries keep working), a runtime capability-gated **flip** once the fleet has rolled, and a **contract** migration in a later minor that drops the old representation. There is no stop-the-world moment by default.
+
+A migration that genuinely cannot offer a rolling path is flagged in `EXCLUSIVE_WINDOW_MIGRATIONS`; `awa migrate` refuses to apply it while any worker has heartbeated recently (override: `--allow-live-runtimes`), and the required window is called out explicitly in the CHANGELOG and that release's upgrade guide.
 
 ## Recommended Production Flow
 

@@ -92,6 +92,73 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tes
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
 ```
 
+## Authoring Schema Migrations
+
+Policy: [ADR-041 — rolling-upgrade policy](adr/041-rolling-upgrade-policy.md).
+The short version: **no stop-the-world moments**. Schema changes must be
+operable by the previous release's binaries until the fleet has rolled, and
+representation changes ship as expand → flip → contract across releases. The
+enforcement mechanics live in `awa-model/src/migrations.rs`
+(`EXCLUSIVE_WINDOW_MIGRATIONS`, the pre-flight live-runtime gate, the
+newer-schema fail-safe from #426).
+
+Checklist for any new `awa-model/migrations/vNNN_*.sql`:
+
+**Every migration**
+
+- [ ] Additive only: new tables, nullable/defaulted columns, indexes,
+      functions. No drops, type changes, or tightened constraints on anything
+      an N−1 binary touches.
+- [ ] Idempotent and safe to re-run (`IF NOT EXISTS`, guarded `DO` blocks) —
+      the runner may reapply amended earlier files before yours.
+- [ ] Header comment states the issue link, what changes, and **explicitly
+      what an N−1 binary does against the migrated schema** (not just "it
+      works" — which paths it exercises and why they stay correct).
+- [ ] Safe under live load: no long `ACCESS EXCLUSIVE` holds on hot tables;
+      note the expected wall time on realistic data volumes.
+
+**If it changes an on-disk representation or hot-path structure
+(expand → flip → contract)**
+
+- [ ] The migration is the **expand** phase only: create and seed the new
+      representation, keep the old one authoritative, and select authority via
+      an explicit control row (pattern: v042's `ring_cursor_authority`).
+      Fresh installs start on the new representation.
+- [ ] The **flip** is a runtime action gated on fleet capability:
+      a per-feature min-version SQL constant
+      (pattern: `awa.ring_authority_min_flip_version()`) checked against
+      `awa.semver_rank(runtime_instances.binary_version)` for every
+      fresh-heartbeat runtime. NULL or unparseable ⇒ not capable. Manual CLI
+      command plus (optionally) a maintenance auto-flip; refusal names the
+      remedy; `--force` is the only override.
+- [ ] The flip **fences** returning pre-flip binaries loudly — poisoned
+      sentinel, removed function signature — never a silent misroute.
+- [ ] The **contract** migration (dropping the old representation) is deferred
+      to a later minor and tracked as its own issue.
+- [ ] TLA+ models cover the **mixed-version interleavings** where a state
+      machine changes (precedent: `AwaStorageLockOrder`'s flip model caught
+      the v042 authority-read TOCTOU).
+- [ ] A **mixed-version adversarial rehearsal** passes before release: live
+      enqueue + workers, failing/retrying jobs, scheduled/cron jobs, in-flight
+      jobs across the migrate step, `kill -9` during the window, old + new
+      binaries claiming concurrently, and an exact zero-loss reconciliation.
+      Record the evidence (`docs/adr/bench/` or the benchmarking repo);
+      CI automation is [#427](https://github.com/hardbyte/awa/issues/427).
+
+**If you believe you need an exclusive (no-live-runtime) window**
+
+- [ ] Redesign first — v042 was flagged and then made rolling; that is the
+      expected outcome, not the exception.
+- [ ] If a rolling path is genuinely impossible, add the version to
+      `EXCLUSIVE_WINDOW_MIGRATIONS` with the justification in the migration
+      header, a CHANGELOG operator callout, and the window procedure in that
+      release's upgrade guide.
+
+**Docs**
+
+- [ ] CHANGELOG entry; `docs/upgrade-X-to-Y.md` if any operator action is
+      required; `docs/stability.md` if the skew statement is affected.
+
 ## Pre-commit Checks (Rust)
 
 Always run before committing Rust changes:
