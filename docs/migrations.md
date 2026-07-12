@@ -299,7 +299,7 @@ Do not expect `awa migrate` to downgrade the schema.
 
 ## Breaking Changes
 
-If Awa ever needs a non-additive schema change, the intended contract is a major-version upgrade with a stop-the-world procedure documented explicitly for that release.
+Non-additive representation changes require an explicit compatibility, authority-transition, and rollback procedure documented for that release.
 
 ## Recommended Production Flow
 

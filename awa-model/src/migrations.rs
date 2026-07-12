@@ -16,8 +16,8 @@ pub const CURRENT_VERSION: i32 = 39;
 /// - Never drop columns, change types, or tighten constraints
 ///
 /// This ensures running workers are not broken by a schema upgrade.
-/// For breaking schema changes, bump the major version and document
-/// the required stop-the-world upgrade procedure.
+/// Representation changes require a release-specific compatibility and
+/// authority-transition procedure.
 const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (1, "Canonical schema with UI indexes", &[V1_UP]),
     (2, "Runtime observability snapshots", &[V2_UP]),
@@ -272,7 +272,13 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         0
     };
 
-    if !(has_schema && current == CURRENT_VERSION) {
+    if current > CURRENT_VERSION {
+        info!(
+            schema_version = current,
+            supported_schema_version = CURRENT_VERSION,
+            "Schema is newer but forward-compatible; no migrations to apply"
+        );
+    } else if !(has_schema && current == CURRENT_VERSION) {
         for &(version, description, steps) in MIGRATIONS {
             if version <= current {
                 continue;
@@ -348,6 +354,11 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
         if forward_compatible_v042_columns(conn, raw_version).await? {
             return Ok(raw_version);
         }
+        tracing::error!(
+            schema_version = raw_version,
+            supported_schema_version = CURRENT_VERSION,
+            "This Awa binary is too old for the database schema; upgrade Awa before retrying"
+        );
         return Err(AwaError::SchemaNotMigrated {
             expected: CURRENT_VERSION,
             found: raw_version,

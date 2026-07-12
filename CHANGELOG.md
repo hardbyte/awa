@@ -4,7 +4,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [0.6.2] — 2026-07-12
 
-- **Safe 0.7 rolling-upgrade stepping-stone ([#392](https://github.com/hardbyte/awa/issues/392)).** The 0.6 migrator now refuses unknown newer schemas before legacy-version normalization can rewrite `awa.schema_version`. It recognizes exactly the additive v042 schema while every installed ring cursor remains in `columns` authority, allowing a 0.6.2/0.7 mixed fleet during the expand phase; it refuses after the one-way ledger-authority flip. Upgrade every 0.6.0/0.6.1 runtime to 0.6.2 before applying 0.7 migrations.
+- **Safe 0.7 rolling-upgrade stepping-stone ([#392](https://github.com/hardbyte/awa/issues/392)).** The 0.6 migrator now refuses unknown newer schemas before legacy-version normalization can rewrite `awa.schema_version`. It recognizes exactly the additive v042 schema while every installed ring cursor remains in `columns` authority, allowing a 0.6.2/0.7 mixed fleet during the expand phase; it refuses after the one-way ledger-authority flip. Upgrade every 0.6.0/0.6.1 runtime to 0.6.2 before applying 0.7 migrations. If migration runs first, roll 0.7 workers promptly: crash and heartbeat rescue remain available, but deadline-based rescue for jobs claimed on v042 resumes when the first 0.7 maintenance runtime starts. A 0.6.2 worker that restarts while v040-v042 are being applied may refuse the transient v040/v041 schema; it reconnects normally after v042 commits.
 
 ## [Unreleased]
 
