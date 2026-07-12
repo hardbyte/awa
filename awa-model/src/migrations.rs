@@ -348,9 +348,9 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
         if forward_compatible_v042_columns(conn, raw_version).await? {
             return Ok(raw_version);
         }
-        return Err(AwaError::SchemaNewerThanBinary {
+        return Err(AwaError::SchemaNotMigrated {
+            expected: CURRENT_VERSION,
             found: raw_version,
-            supported: CURRENT_VERSION,
         });
     }
 

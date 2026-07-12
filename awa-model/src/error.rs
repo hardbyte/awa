@@ -14,11 +14,6 @@ pub enum AwaError {
     #[error("schema not migrated: expected version {expected}, found {found}")]
     SchemaNotMigrated { expected: i32, found: i32 },
 
-    #[error(
-        "schema is at v{found} but this binary supports up to v{supported}; refusing to modify a newer schema"
-    )]
-    SchemaNewerThanBinary { found: i32, supported: i32 },
-
     #[error("unknown job kind: {kind}")]
     UnknownJobKind { kind: String },
 

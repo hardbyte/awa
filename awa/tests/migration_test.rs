@@ -116,6 +116,10 @@ async fn test_062_forward_schema_guard_accepts_only_v042_columns_authority() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
+    sqlx::query("DROP SCHEMA IF EXISTS awa_custom CASCADE")
+        .execute(&pool)
+        .await
+        .expect("reset synthetic custom schema");
 
     sqlx::raw_sql(
         r#"
@@ -169,9 +173,9 @@ async fn test_062_forward_schema_guard_accepts_only_v042_columns_authority() {
         .expect_err("0.6.2 must refuse after any schema flips to ledger authority");
     assert!(matches!(
         post_flip,
-        awa::AwaError::SchemaNewerThanBinary {
-            found: 42,
-            supported: 39
+        awa::AwaError::SchemaNotMigrated {
+            expected: 39,
+            found: 42
         }
     ));
 
@@ -184,9 +188,9 @@ async fn test_062_forward_schema_guard_accepts_only_v042_columns_authority() {
         .expect_err("unknown newer schemas must fail closed");
     assert!(matches!(
         future,
-        awa::AwaError::SchemaNewerThanBinary {
-            found: 43,
-            supported: 39
+        awa::AwaError::SchemaNotMigrated {
+            expected: 39,
+            found: 43
         }
     ));
     let versions: Vec<i32> =
