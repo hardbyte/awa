@@ -36,6 +36,20 @@ pub enum AwaError {
     },
 
     #[error(
+        "migration v{migration_version} requires all live runtimes to be version \
+         {minimum_version} or newer; incompatible live runtime count: {count}. A reported \
+         version below the floor or an unparseable version blocks migration. Roll the fleet \
+         to {minimum_version} first, or \
+         pass --allow-live-runtimes to override.{instances}"
+    )]
+    RuntimeVersionFloorNotMet {
+        migration_version: i32,
+        minimum_version: &'static str,
+        count: i64,
+        instances: String,
+    },
+
+    #[error(
         "storage transition not finalized (state: {state}): awa 0.7 refuses to apply \
          migrations while the deprecated canonical engine can still hold work (ADR-037). \
          Finalize the queue-storage transition on awa 0.6 first — `awa storage prepare \

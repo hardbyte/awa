@@ -1,7 +1,7 @@
 use crate::{
     AwaError as PyAwaError, CallbackNotFound, DatabaseError,
-    LiveRuntimesRequireExclusiveWindow, SchemaNotMigrated, SerializationError,
-    StorageNotFinalized, UniqueConflict, UnknownJobKind, ValidationError,
+    LiveRuntimesRequireExclusiveWindow, RuntimeVersionFloorNotMet, SchemaNotMigrated,
+    SerializationError, StorageNotFinalized, UniqueConflict, UnknownJobKind, ValidationError,
 };
 use pyo3::PyErr;
 
@@ -49,6 +49,9 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         err @ awa_model::AwaError::LiveRuntimesRequireExclusiveWindow { .. } => {
             LiveRuntimesRequireExclusiveWindow::new_err(err.to_string())
         }
+        err @ awa_model::AwaError::RuntimeVersionFloorNotMet { .. } => {
+            RuntimeVersionFloorNotMet::new_err(err.to_string())
+        }
         awa_model::AwaError::UnknownJobKind { kind } => {
             UnknownJobKind::new_err(format!("unknown job kind: {kind}"))
         }
@@ -88,6 +91,25 @@ mod tests {
             let message = err.to_string();
             assert!(message.contains("requires no live runtimes"));
             assert!(message.contains("stop or drain the workers"));
+        });
+    }
+
+    #[test]
+    fn runtime_version_floor_maps_to_dedicated_exception() {
+        Python::initialize();
+        let err = map_awa_error(awa_model::AwaError::RuntimeVersionFloorNotMet {
+            migration_version: 42,
+            minimum_version: "0.6.2",
+            count: 1,
+            instances: " Incompatible runtimes: worker-a: \"0.6.1\".".to_string(),
+        });
+
+        Python::attach(|py| {
+            assert!(err.is_instance_of::<RuntimeVersionFloorNotMet>(py));
+            assert!(!err.is_instance_of::<LiveRuntimesRequireExclusiveWindow>(py));
+            let message = err.to_string();
+            assert!(message.contains("version 0.6.2 or newer"));
+            assert!(message.contains("--allow-live-runtimes"));
         });
     }
 }

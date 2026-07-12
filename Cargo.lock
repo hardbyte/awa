@@ -459,6 +459,7 @@ dependencies = [
  "croner",
  "hex",
  "opentelemetry",
+ "semver",
  "serde",
  "serde_json",
  "sqlx",

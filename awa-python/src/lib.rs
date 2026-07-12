@@ -17,6 +17,7 @@ pyo3::create_exception!(_awa, UniqueConflict, AwaError);
 pyo3::create_exception!(_awa, SchemaNotMigrated, AwaError);
 pyo3::create_exception!(_awa, StorageNotFinalized, AwaError);
 pyo3::create_exception!(_awa, LiveRuntimesRequireExclusiveWindow, AwaError);
+pyo3::create_exception!(_awa, RuntimeVersionFloorNotMet, AwaError);
 pyo3::create_exception!(_awa, UnknownJobKind, AwaError);
 pyo3::create_exception!(_awa, SerializationError, AwaError);
 pyo3::create_exception!(_awa, ValidationError, AwaError);
@@ -136,6 +137,10 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "LiveRuntimesRequireExclusiveWindow",
         m.py().get_type::<LiveRuntimesRequireExclusiveWindow>(),
+    )?;
+    m.add(
+        "RuntimeVersionFloorNotMet",
+        m.py().get_type::<RuntimeVersionFloorNotMet>(),
     )?;
     m.add("UnknownJobKind", m.py().get_type::<UnknownJobKind>())?;
     m.add(

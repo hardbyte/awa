@@ -44,13 +44,11 @@ enum Commands {
         /// Auto-detect: from=current DB version, to=latest
         #[arg(long, conflicts_with_all = ["from", "version"])]
         pending: bool,
-        /// Skip the pre-flight live-runtime check.
+        /// Skip migration compatibility checks against live runtimes.
         ///
-        /// Some migrations require a stop-the-world window because a
-        /// pre-migration binary cannot operate against the resulting schema;
-        /// `migrate` refuses to apply such a migration while workers are
-        /// heartbeating. This overrides that check — use only when you have
-        /// confirmed no pre-migration binary is connected.
+        /// A migration may require a minimum runtime version or, when no
+        /// rolling-compatible shape exists, no live runtimes. This overrides
+        /// those checks; use only after independently verifying compatibility.
         #[arg(long)]
         allow_live_runtimes: bool,
     },

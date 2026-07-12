@@ -66,6 +66,11 @@ upgrade supporting a mixed 0.6.2/0.7 fleet.
 > releases contain the destructive newer-schema misclassification fixed by
 > [#392](https://github.com/hardbyte/awa/issues/392).
 
+`awa migrate` enforces this stepping-stone: v042 is refused while any runtime with a
+fresh heartbeat reports a version below 0.6.2 or an unparseable version. The
+`--allow-live-runtimes` override is available for operators who have independently verified
+the fleet; it should not be needed in the normal rollout.
+
 **v042 is additive (the expand phase).** It creates and seeds the three ledgers and the
 rollup-delta landing table, and it **keeps** the compat `current_slot` / `generation`
 columns in place. Each queue-storage schema gets a `ring_cursor_authority` control row
@@ -99,6 +104,15 @@ orders are supported:
      has reported a 0.7+ `binary_version` continuously for a stable period (default 10
      minutes; a builder knob). It logs the flip loudly.
 
+If you migrate first, roll 0.7 workers promptly. An all-0.6.2 fleet on v042 remains safe:
+crash and heartbeat rescue are batch-aware, but 0.6.2's deadline-rescue sweep does not read
+the v041 compact claim batches used for newly claimed deadline jobs. Deadline-based rescue
+for those jobs resumes when the first 0.7 maintenance runtime starts. Awa's built-in
+migrator applies v040-v042 in one transaction, so other sessions see v039 or v042, never an
+intermediate version. An external migration runner that commits each version separately can
+expose v040/v041; a restarting 0.6.2 worker refuses those transient schemas and connects
+normally once v042 is committed.
+
 The manual flip **refuses** (without `--force`) while any fresh-heartbeat runtime is not
 known to be flip-aware — i.e. a 0.6 (or pre-flip 0.7) binary might still be reading the
 compat columns. Roll the whole fleet first, or pass `--force` only once you have confirmed
@@ -118,8 +132,8 @@ skew guarantee holds and rollback to the 0.6.2 stepping-stone is safe.
 
 ### Contract (0.8)
 
-Dropping the compat columns for good is deferred to **0.8** (the contract phase), guarded
-by an exclusive window that asserts ledger authority and that no pre-flip binary is live.
+Dropping the compat columns for good is deferred to **0.8** (the contract phase), after
+ledger authority is universal and the release's capability gate excludes pre-flip binaries.
 Until then the columns remain as a cheap, cold safety net.
 
 Fresh installs are unaffected — they get ledger authority directly and never touch the

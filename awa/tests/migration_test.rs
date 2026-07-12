@@ -327,7 +327,7 @@ async fn insert_runtime_instance_with_role(pool: &PgPool, capability: &str, tran
             transition_role
         )
         VALUES (
-            $1, 'test-host', 4242, '0.6.0-test',
+            $1, 'test-host', 4242, '0.6.2',
             now() - interval '1 minute',
             now(),
             10000,
@@ -443,33 +443,13 @@ async fn test_migrate_gate_allows_active_cluster() {
     migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance(&pool, "queue_storage").await;
-    // Rewind one version so the pending range is {CURRENT_VERSION} = {v042},
-    // which crosses the flagged ring-ledger migration.
+    // Rewind one version so the pending range crosses v042. The live runtime
+    // reports the 0.6.2 compatibility floor, so migration remains rolling.
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
-    // The ADR-037 finalize gate is satisfied (state = active), but the pending
-    // range crosses v042 (flagged as requiring an exclusive window) while a
-    // worker is heartbeating: the pre-flight refuses — a live pre-v042 binary
-    // cannot survive the ring-cursor column drop. (The finalize gate alone does
-    // not cover v042's stop-the-world requirement.)
-    let err = migrations::run(&pool).await.unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            awa::AwaError::LiveRuntimesRequireExclusiveWindow { .. }
-        ),
-        "active cluster crossing v042 with a live worker must hit the pre-flight, got: {err}"
-    );
-
-    // Drain the worker (stale heartbeat) — the realistic stop-the-world state —
-    // and the same finalized cluster migrates cleanly.
-    sqlx::raw_sql("UPDATE awa.runtime_instances SET last_seen_at = now() - interval '10 minutes'")
-        .execute(&pool)
-        .await
-        .expect("age the heartbeat to drain the worker");
     migrations::run(&pool)
         .await
-        .expect("finalized (active) cluster with drained workers should migrate");
+        .expect("finalized cluster with a live 0.6.2 runtime should migrate");
     assert_eq!(
         migrations::current_version(&pool).await.unwrap(),
         migrations::CURRENT_VERSION
@@ -3796,11 +3776,9 @@ async fn test_newer_schema_guard_leaves_normal_paths_untouched() {
 
 // ── Exclusive-window pre-flight live-runtime check ───────────────
 //
-// The pre-flight refuses a migrate whose pending range crosses a migration
-// flagged in EXCLUSIVE_WINDOW_MIGRATIONS (currently {v042}) while a worker is
-// heartbeating. test_migrate_gate_allows_active_cluster covers the real run()
-// refuse-then-drain path through v042; the tests here pin the message shape and
-// the staleness/override/non-crossing behaviours.
+// The strict mechanism remains available for a future migration with no
+// rolling-compatible shape. No current migration is flagged; these tests pin
+// its message and heartbeat-staleness behavior directly.
 
 /// The pre-flight refusal names the migration, lists the live runtimes, and
 /// points at the override. The gate keys on `last_seen_at` staleness, not
@@ -3860,11 +3838,10 @@ async fn test_exclusive_window_preflight_passes_with_stale_runtime() {
     pool.close().await;
 }
 
-/// `--allow-live-runtimes` (MigrateOptions::allow_live_runtimes) skips the
-/// pre-flight in `run_with_options` even with a fresh heartbeat crossing the
-/// flagged v042.
+/// `--allow-live-runtimes` skips the version-floor pre-flight even when a live
+/// runtime reports a version below the v042 compatibility floor.
 #[tokio::test]
-async fn test_exclusive_window_override_allows_live_runtime() {
+async fn test_runtime_version_floor_override_allows_old_live_runtime() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
@@ -3873,6 +3850,10 @@ async fn test_exclusive_window_override_allows_live_runtime() {
     // a real pending range crosses v042 with the worker heartbeating.
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    sqlx::query("UPDATE awa.runtime_instances SET version = '0.6.1'")
+        .execute(&pool)
+        .await
+        .expect("set runtime below v042 floor");
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
     let options = migrations::MigrateOptions {
@@ -3885,6 +3866,71 @@ async fn test_exclusive_window_override_allows_live_runtime() {
         migrations::current_version(&pool).await.unwrap(),
         migrations::CURRENT_VERSION
     );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+    simulate_non_canonical_compat_routing(&pool).await;
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+
+    for reported in ["0.6.1", "unknown"] {
+        sqlx::query("UPDATE awa.runtime_instances SET version = $1, last_seen_at = now()")
+            .bind(reported)
+            .execute(&pool)
+            .await
+            .expect("set incompatible runtime version");
+        rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+        let err = migrations::run(&pool)
+            .await
+            .expect_err("incompatible live runtime must block v042");
+        assert!(
+            matches!(
+                &err,
+                awa::AwaError::RuntimeVersionFloorNotMet {
+                    migration_version: 42,
+                    minimum_version: "0.6.2",
+                    count: 1,
+                    ..
+                }
+            ),
+            "expected v042 runtime-version-floor refusal for {reported:?}, got: {err}"
+        );
+        assert!(
+            err.to_string().contains(reported),
+            "refusal should identify the reported version: {err}"
+        );
+    }
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_runtime_version_floor_ignores_stale_old_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+    simulate_non_canonical_compat_routing(&pool).await;
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    sqlx::raw_sql(
+        "UPDATE awa.runtime_instances \
+         SET version = '0.6.1', last_seen_at = now() - interval '10 minutes'",
+    )
+    .execute(&pool)
+    .await
+    .expect("age runtime below v042 floor");
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    migrations::run(&pool)
+        .await
+        .expect("stale runtimes do not block the migration floor");
 
     pool.close().await;
 }
