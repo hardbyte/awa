@@ -1682,7 +1682,10 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     .fetch_one(&pool)
     .await
     .expect("authority row should exist after upgrade");
-    assert_eq!(authority, "columns", "an upgrade starts in compat authority");
+    assert_eq!(
+        authority, "columns",
+        "an upgrade starts in compat authority"
+    );
 
     // The queue ledger was seeded from the legacy cursor exactly: the
     // current row carries (generation = 19, slot = 3).
@@ -1700,11 +1703,12 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     );
 
     // The authority resolver returns the compat columns (== ledger here).
-    let (cursor_slot, cursor_gen): (i32, i64) =
-        sqlx::query_as(&format!("SELECT slot, generation FROM {schema}.ring_cursor('queue')"))
-            .fetch_one(&pool)
-            .await
-            .expect("ring_cursor('queue') should resolve after upgrade");
+    let (cursor_slot, cursor_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.ring_cursor('queue')"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("ring_cursor('queue') should resolve after upgrade");
     assert_eq!(
         (cursor_slot, cursor_gen),
         (3, 19),
@@ -1807,11 +1811,12 @@ async fn test_v042_fresh_install_starts_in_ledger_authority() {
     );
 
     // ring_cursor resolves the genesis ledger cursor (0, 0).
-    let (slot, generation): (i32, i64) =
-        sqlx::query_as(&format!("SELECT slot, generation FROM {schema}.ring_cursor('queue')"))
-            .fetch_one(&pool)
-            .await
-            .expect("ring_cursor('queue') should resolve on a fresh install");
+    let (slot, generation): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.ring_cursor('queue')"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("ring_cursor('queue') should resolve on a fresh install");
     assert_eq!((slot, generation), (0, 0), "fresh genesis cursor is (0, 0)");
 
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))

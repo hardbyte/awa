@@ -3906,44 +3906,57 @@ impl QueueStorage {
         .map_err(map_sqlx_error)
     }
 
-    /// Take the per-ring rotation serialization lock for rotate ↔ prune ↔
-    /// delta-rollup.
+    /// Acquire the per-ring rotate ↔ prune ↔ delta-rollup serializer AND
+    /// resolve the authority under it, in one step.
     ///
-    /// In ledger authority this is the non-blocking per-ring
-    /// `pg_try_advisory_xact_lock`: rotate/prune/rollup are periodic ticks,
-    /// so under contention the caller skips the tick instead of queueing.
+    /// The ring-state singleton `FOR UPDATE` is taken FIRST, unconditionally,
+    /// as the universal outer gate. This is load-bearing for the #371 staged
+    /// upgrade: the one-way flip (`awa.flip_ring_authority`) also takes the
+    /// three singletons `FOR UPDATE` before promoting the authority, so
+    /// taking the singleton before reading the authority closes the TOCTOU
+    /// where a rotator reads `columns`, the flip commits, and the rotator
+    /// then advances under the stale mode (a `MixedFleet` violation the
+    /// `AwaStorageLockOrder` model flags). Whoever wins the singleton wins:
+    /// a rotator that loses the race to the flip reads `ledger` here and runs
+    /// the ledger path; the flip that loses to a rotator waits for it to
+    /// commit. In compat mode this singleton lock is also the SAME row lock a
+    /// live 0.6 rotator takes, so 0.7 and 0.6 rotators serialize.
     ///
-    /// In compat authority (#371 staged upgrade) it is instead `SELECT ...
-    /// FROM {ring}_ring_state WHERE singleton FOR UPDATE` — the SAME row
-    /// lock a live 0.6 rotator takes, so a 0.7 compat rotator serializes
-    /// against 0.6 rotators (which know nothing of the advisory lock). The
-    /// row is always present, so this always "acquires"; it can block
-    /// briefly behind a 0.6 rotator, which is acceptable on the maintenance
-    /// tick and is exactly the pre-#415 discipline.
-    async fn try_ring_rotation_lock_tx<'a>(
+    /// In ledger authority it ADDITIONALLY takes the non-blocking per-ring
+    /// `pg_try_advisory_xact_lock` so a periodic rotate skips under
+    /// contention with prune/rollup instead of queueing; `Ok((_, false))`
+    /// means "skip this tick". (Holding the singleton momentarily in ledger
+    /// mode is a cold, uncontended write-free row-share and does not
+    /// reintroduce the churn — nothing UPDATEs the singleton in ledger mode.)
+    async fn acquire_ring_serializer_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         family: RingFamily,
-        authority: RingAuthority,
-    ) -> Result<bool, AwaError> {
+    ) -> Result<(RingAuthority, bool), AwaError> {
+        let schema = self.schema();
+        let state = family.state_relname();
+
+        // Universal outer gate: serialize against the flip and against 0.6
+        // rotators, BEFORE reading the authority.
+        sqlx::query(&format!(
+            "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let authority = self.ring_authority_tx(tx).await?;
+
         match authority {
+            RingAuthority::Columns => Ok((authority, true)),
             RingAuthority::Ledger => {
-                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
-                    .bind(family.rotation_lock_name(self.schema()))
-                    .fetch_one(tx.as_mut())
-                    .await
-                    .map_err(map_sqlx_error)
-            }
-            RingAuthority::Columns => {
-                let schema = self.schema();
-                let state = family.state_relname();
-                sqlx::query(&format!(
-                    "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
-                ))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-                Ok(true)
+                let acquired: bool =
+                    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+                        .bind(family.rotation_lock_name(schema))
+                        .fetch_one(tx.as_mut())
+                        .await
+                        .map_err(map_sqlx_error)?;
+                Ok((authority, acquired))
             }
         }
     }
@@ -14320,11 +14333,10 @@ impl QueueStorage {
         // serializes rotate ↔ prune (non-blocking, skip on contention); in
         // compat mode the ring-state singleton FOR UPDATE serializes against
         // live 0.6 rotators too.
-        let authority = self.ring_authority_tx(&mut tx).await?;
-        if !self
-            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue, authority)
-            .await?
-        {
+        let (authority, acquired) = self
+            .acquire_ring_serializer_tx(&mut tx, RingFamily::Queue)
+            .await?;
+        if !acquired {
             let (current_slot, _) = self
                 .ring_cursor_tx(&mut tx, RingFamily::Queue, authority)
                 .await?;
@@ -14491,11 +14503,10 @@ impl QueueStorage {
         // CAS wastes work. `RotateLeasesPlan` in
         // `correctness/storage/AwaStorageLockOrder.tla` requires this lock
         // as the first acquired resource for the rotation tx.
-        let authority = self.ring_authority_tx(&mut tx).await?;
-        if !self
-            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Lease, authority)
-            .await?
-        {
+        let (authority, acquired) = self
+            .acquire_ring_serializer_tx(&mut tx, RingFamily::Lease)
+            .await?;
+        if !acquired {
             let (current_slot, _) = self
                 .ring_cursor_tx(&mut tx, RingFamily::Lease, authority)
                 .await?;
@@ -14879,11 +14890,10 @@ impl QueueStorage {
         // UPDATE in compat mode), then the slot row lock — the same order
         // every queue-ring maintenance tx uses (`RollupTerminalDeltasPlan`
         // in `correctness/storage/AwaStorageLockOrder.tla`).
-        let authority = self.ring_authority_tx(&mut tx).await?;
-        if !self
-            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue, authority)
-            .await?
-        {
+        let (authority, acquired) = self
+            .acquire_ring_serializer_tx(&mut tx, RingFamily::Queue)
+            .await?;
+        if !acquired {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(TerminalDeltaSlotRollup::Blocked);
         }
@@ -15260,11 +15270,10 @@ impl QueueStorage {
         // writes. Ledger mode -> advisory lock; compat mode (#371 staged
         // upgrade) -> queue_ring_state singleton FOR UPDATE, matching the
         // pre-#371 discipline and serializing against live 0.6 rotators.
-        let authority = self.ring_authority_tx(&mut tx).await?;
-        if !self
-            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue, authority)
-            .await?
-        {
+        let (authority, acquired) = self
+            .acquire_ring_serializer_tx(&mut tx, RingFamily::Queue)
+            .await?;
+        if !acquired {
             let (current_slot, generation) = self
                 .ring_cursor_tx(&mut tx, RingFamily::Queue, authority)
                 .await?;
@@ -15702,11 +15711,10 @@ impl QueueStorage {
         // check and prune what should be the active partition. Ledger mode
         // -> advisory lock; compat mode (#371 staged upgrade) -> singleton
         // FOR UPDATE.
-        let authority = self.ring_authority_tx(&mut tx).await?;
-        if !self
-            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Lease, authority)
-            .await?
-        {
+        let (authority, acquired) = self
+            .acquire_ring_serializer_tx(&mut tx, RingFamily::Lease)
+            .await?;
+        if !acquired {
             let (current_slot, generation) = self
                 .ring_cursor_tx(&mut tx, RingFamily::Lease, authority)
                 .await?;
@@ -15846,11 +15854,10 @@ impl QueueStorage {
         // parallel rotators (#371). Ledger mode -> advisory lock; compat
         // mode -> claim_ring_state singleton FOR UPDATE (also serializes vs
         // live 0.6 rotators).
-        let authority = self.ring_authority_tx(&mut tx).await?;
-        if !self
-            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Claim, authority)
-            .await?
-        {
+        let (authority, acquired) = self
+            .acquire_ring_serializer_tx(&mut tx, RingFamily::Claim)
+            .await?;
+        if !acquired {
             let (current_slot, _) = self
                 .ring_cursor_tx(&mut tx, RingFamily::Claim, authority)
                 .await?;
@@ -15995,11 +16002,10 @@ impl QueueStorage {
         // serialises with rotate_claims and parallel pruners. Ledger mode ->
         // advisory lock; compat mode -> claim_ring_state singleton FOR
         // UPDATE (also serializes vs live 0.6 rotators).
-        let authority = self.ring_authority_tx(&mut tx).await?;
-        if !self
-            .try_ring_rotation_lock_tx(&mut tx, RingFamily::Claim, authority)
-            .await?
-        {
+        let (authority, acquired) = self
+            .acquire_ring_serializer_tx(&mut tx, RingFamily::Claim)
+            .await?;
+        if !acquired {
             let (current_slot, generation) = self
                 .ring_cursor_tx(&mut tx, RingFamily::Claim, authority)
                 .await?;

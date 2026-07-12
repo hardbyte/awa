@@ -577,6 +577,43 @@ RingLedgerFoldTx == <<
 \* no dead tuples; readers keep summing the unfolded rows.
 HorizonPinnedFoldTx == << >>
 
+\* #371 STAGED-UPGRADE TRANSITION EXEMPTION. During a rolling 0.6 -> 0.7
+\* upgrade a schema runs in compat authority: 0.7 rotators (and any live 0.6
+\* rotator) advance the cursor by UPDATEing the `{ring}_ring_state` singleton
+\* columns and the per-slot `{ring}_ring_slots.generation` — reintroducing
+\* exactly the singleton churn #371 removed — while ALSO shadowing the
+\* append-only ledger. This is bounded and temporary: it exists only in the
+\* pre-flip window, and the one-way flip to ledger authority ends it, after
+\* which rotation is a bare ledger append again (RotateReadyTx etc. above).
+\* Modelled like TerminalDeltaRollupPinnedTx / HorizonPinnedFoldTx: the
+\* singleton/slot rows are RowVacuum + cold, so a low-rate UPDATE during the
+\* transition does not violate HotTablesAreNotRowVacuum, and the churn is
+\* reclaimable the moment no MVCC horizon is pinned (the same reclaim
+\* discipline the pre-#371 fleet relied on). The ledger shadow inserts are
+\* append-only.
+CompatRotateReadyTx == <<
+    Mut("Update", "queue_ring_state"),
+    Mut("Update", "queue_ring_slots"),
+    Mut("Insert", "queue_ring_rotations")
+>>
+CompatRotateLeasesTx == <<
+    Mut("Update", "lease_ring_state"),
+    Mut("Update", "lease_ring_slots"),
+    Mut("Insert", "lease_ring_rotations")
+>>
+CompatRotateClaimsTx == <<
+    Mut("Update", "claim_ring_state"),
+    Mut("Update", "claim_ring_slots"),
+    Mut("Insert", "claim_ring_rotations")
+>>
+\* The one-way flip poisons the stale compat columns (current_slot = -1) and
+\* sets the authority; a bounded one-shot UPDATE on the cold singletons.
+FlipRingAuthorityTx == <<
+    Mut("Update", "queue_ring_state"),
+    Mut("Update", "lease_ring_state"),
+    Mut("Update", "claim_ring_state")
+>>
+
 RotateClaimsTx == << Mut("Insert", "claim_ring_rotations") >>
 PruneClaimsTx  == <<
     Mut("Update", "claim_ring_slots"),
@@ -601,7 +638,9 @@ Transactions == {
     RotateLeasesTx, PruneLeasesTx,
     RotateReadyTx, PruneReadyTx, TerminalDeltaRollupTx, TerminalDeltaRollupPinnedTx,
     TerminalRollupDeltaFoldTx, RingLedgerFoldTx, HorizonPinnedFoldTx,
-    RotateClaimsTx, PruneClaimsTx
+    RotateClaimsTx, PruneClaimsTx,
+    CompatRotateReadyTx, CompatRotateLeasesTx, CompatRotateClaimsTx,
+    FlipRingAuthorityTx
 }
 
 \* ---- Invariants ----

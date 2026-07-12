@@ -127,6 +127,15 @@ Compatible(held, wanted) == held = ModeShared /\ wanted = ModeShared
 \* deadlock; two transactions on the same lane and shard reduce to
 \* the existing `LaneResource(q, p)` model.
 LaneResource(q, p) == [k |-> "queue_lane", q |-> q, p |-> p]
+\* #371 staged upgrade: in compat authority the rotate/prune/rollup paths
+\* serialize on `{ring}_ring_state WHERE singleton FOR UPDATE` (a single-row
+\* lock target -> ModeExclusive, restoring the pre-#415 discipline) instead
+\* of the advisory rotation lock, so a 0.7 compat rotator serializes against
+\* live 0.6 rotators. The one-way flip takes all three singletons FOR UPDATE
+\* before promoting the authority to ledger.
+QueueRingStateResource == [k |-> "queue_ring_state_singleton"]
+LeaseRingStateResource == [k |-> "lease_ring_state_singleton"]
+ClaimRingStateResource == [k |-> "claim_ring_state_singleton"]
 LeaseRingRotationLockResource == [k |-> "lease_ring_rotation_lock"]
 LeaseRingSlotResource(s) == [k |-> "lease_ring_slot", s |-> s]
 LeaseChildResource(s) == [k |-> "lease_child", s |-> s]
@@ -171,6 +180,9 @@ ClosureBatchChildResources == { ClosureBatchChildResource(s) : s \in ClaimSlots 
 
 Resources ==
     LaneResources \cup
+    {QueueRingStateResource} \cup
+    {LeaseRingStateResource} \cup
+    {ClaimRingStateResource} \cup
     {LeaseRingRotationLockResource} \cup
     LeaseRingSlotResources \cup
     LeaseChildResources \cup
@@ -425,12 +437,16 @@ BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
        Step(LaneResource(dstQ, dstP), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared) >>
 
-\* rotate_leases
+\* rotate_leases (ledger authority)
+\*   #371 staged upgrade: the lease-ring-state singleton FOR UPDATE is the
+\*     universal outer gate (taken before the authority is read), so a
+\*     rotator serializes against the flip; then the advisory lock.
 \*   pg_try_advisory_xact_lock on the lease-ring rotation lock
 \*   SELECT EXISTS FROM lease_child[next_slot] (AccessShare on child)
 \*   INSERT INTO lease_ring_rotations (ledger CAS; RowExclusive, elided)
 RotateLeasesPlan(nextSlot) ==
-    << Step(LeaseRingRotationLockResource, ModeExclusive),
+    << Step(LeaseRingStateResource, ModeExclusive),
+       Step(LeaseRingRotationLockResource, ModeExclusive),
        Step(LeaseChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest_leases
@@ -438,7 +454,8 @@ RotateLeasesPlan(nextSlot) ==
 \*   SELECT ... FROM lease_ring_slots[slot] FOR UPDATE
 \*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 PruneLeasesPlan(slot) ==
-    << Step(LeaseRingRotationLockResource, ModeExclusive),
+    << Step(LeaseRingStateResource, ModeExclusive),
+       Step(LeaseRingRotationLockResource, ModeExclusive),
        Step(LeaseRingSlotResource(slot), ModeExclusive),
        Step(LeaseChildResource(slot), ModeExclusive) >>
 
@@ -446,7 +463,8 @@ PruneLeasesPlan(slot) ==
 \* probes on the next and current children, then the ledger CAS insert
 \* (RowExclusive, elided).
 RotateReadyPlan(nextSlot) ==
-    << Step(QueueRingRotationLockResource, ModeExclusive),
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(QueueRingRotationLockResource, ModeExclusive),
        Step(ReadyChildResource(nextSlot), ModeShared),
        Step(ReadyClaimAttemptBatchChildResource(nextSlot), ModeShared),
        Step(ReadyTombstoneChildResource(nextSlot), ModeShared),
@@ -468,7 +486,8 @@ RotateReadyPlan(nextSlot) ==
 \*   repeat the active/pending/unclosed proofs after the exclusive child
 \*     locks before TRUNCATE
 PruneReadyPlan(slot) ==
-    << Step(QueueRingRotationLockResource, ModeExclusive),
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(QueueRingRotationLockResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
        Step(LeasesParentResource, ModeShared),
        Step(ClaimProofResource, ModeShared),
@@ -501,7 +520,8 @@ PruneReadyPlan(slot) ==
 \*   fold into queue_terminal_live_counts (RowExclusive, elided) and
 \*     TRUNCATE terminal_delta_child[slot] (already held exclusive)
 RollupTerminalDeltasPlan(slot) ==
-    << Step(QueueRingRotationLockResource, ModeExclusive),
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(QueueRingRotationLockResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
        Step(ReadyChildResource(slot), ModeShared),
        Step(TerminalDeltaChildResource(slot), ModeExclusive),
@@ -518,7 +538,8 @@ RollupTerminalDeltasPlan(slot) ==
 \*   SELECT EXISTS FROM closure_batch_child[next_slot]
 \*   INSERT INTO claim_ring_rotations (ledger CAS; RowExclusive, elided)
 RotateClaimsPlan(nextSlot) ==
-    << Step(ClaimRingRotationLockResource, ModeExclusive),
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimRingRotationLockResource, ModeExclusive),
        Step(ClaimChildResource(nextSlot), ModeShared),
        Step(ClaimBatchChildResource(nextSlot), ModeShared),
        Step(ClosureChildResource(nextSlot), ModeShared),
@@ -541,7 +562,8 @@ RotateClaimsPlan(nextSlot) ==
 \*   TRUNCATE claim_child[slot] + claim_batch_child[slot] +
 \*     closure_child[slot] + closure_batch_child[slot]
 PruneClaimsPlan(slot) ==
-    << Step(ClaimRingRotationLockResource, ModeExclusive),
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimRingRotationLockResource, ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive),
        Step(ClaimChildResource(slot), ModeShared),
        Step(ClaimBatchChildResource(slot), ModeShared),
@@ -552,13 +574,106 @@ PruneClaimsPlan(slot) ==
        Step(ClosureChildResource(slot), ModeExclusive),
        Step(ClosureBatchChildResource(slot), ModeExclusive) >>
 
+\* ---- #371 staged upgrade: compat-authority plans + the flip ----
+\*
+\* In compat authority (during a rolling 0.6 -> 0.7 upgrade) the same
+\* rotate/prune/rollup transactions serialize on the ring-state singleton
+\* `FOR UPDATE` (ModeExclusive on a single-row target) instead of the
+\* advisory rotation lock — this is the pre-#415 discipline, restored so a
+\* 0.7 compat rotator serializes against live 0.6 rotators (which know
+\* nothing of the advisory lock). The child-lock tails are identical to the
+\* ledger-mode plans; only the head resource differs. The
+\* `RingStateSingletonFor(ring)` helper maps a ring to its singleton.
+RingStateSingletonFor(ring) ==
+    CASE ring = "queue" -> QueueRingStateResource
+      [] ring = "lease" -> LeaseRingStateResource
+      [] OTHER          -> ClaimRingStateResource
+
+CompatRotateReadyPlan(nextSlot) ==
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(ReadyChildResource(nextSlot), ModeShared),
+       Step(ReadyClaimAttemptBatchChildResource(nextSlot), ModeShared),
+       Step(ReadyTombstoneChildResource(nextSlot), ModeShared),
+       Step(ReadySegmentChildResource(nextSlot), ModeShared),
+       Step(DoneChildResource(nextSlot), ModeShared),
+       Step(ReceiptBatchChildResource(nextSlot), ModeShared),
+       Step(ReceiptTombstoneChildResource(nextSlot), ModeShared),
+       Step(TerminalDeltaChildResource(nextSlot), ModeShared),
+       Step(QueueRingSlotResource(nextSlot), ModeExclusive) >>
+
+CompatRotateLeasesPlan(nextSlot) ==
+    << Step(LeaseRingStateResource, ModeExclusive),
+       Step(LeaseChildResource(nextSlot), ModeShared),
+       Step(LeaseRingSlotResource(nextSlot), ModeExclusive) >>
+
+CompatRotateClaimsPlan(nextSlot) ==
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimChildResource(nextSlot), ModeShared),
+       Step(ClaimBatchChildResource(nextSlot), ModeShared),
+       Step(ClosureChildResource(nextSlot), ModeShared),
+       Step(ClosureBatchChildResource(nextSlot), ModeShared),
+       Step(ClaimRingSlotResource(nextSlot), ModeExclusive) >>
+
+CompatPruneReadyPlan(slot) ==
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(QueueRingSlotResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared),
+       Step(ReadyChildResource(slot), ModeExclusive),
+       Step(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
+       Step(DoneChildResource(slot), ModeExclusive),
+       Step(ReadyTombstoneChildResource(slot), ModeExclusive),
+       Step(ReadySegmentChildResource(slot), ModeExclusive),
+       Step(ReceiptBatchChildResource(slot), ModeExclusive),
+       Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
+       Step(TerminalDeltaChildResource(slot), ModeExclusive) >>
+
+CompatPruneLeasesPlan(slot) ==
+    << Step(LeaseRingStateResource, ModeExclusive),
+       Step(LeaseRingSlotResource(slot), ModeExclusive),
+       Step(LeaseChildResource(slot), ModeExclusive) >>
+
+CompatPruneClaimsPlan(slot) ==
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimRingSlotResource(slot), ModeExclusive),
+       Step(ClaimChildResource(slot), ModeExclusive),
+       Step(ClaimBatchChildResource(slot), ModeExclusive),
+       Step(ClosureChildResource(slot), ModeExclusive),
+       Step(ClosureBatchChildResource(slot), ModeExclusive) >>
+
+CompatRollupTerminalDeltasPlan(slot) ==
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(QueueRingSlotResource(slot), ModeExclusive),
+       Step(ReadyChildResource(slot), ModeShared),
+       Step(TerminalDeltaChildResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared) >>
+
+\* The one-way authority flip (`awa.flip_ring_authority`): takes all three
+\* ring-state singletons FOR UPDATE (so it serializes against every in-
+\* flight compat rotator/pruner before it promotes the authority), then
+\* poisons the stale compat columns and sets authority = ledger. Modelled as
+\* the three singleton exclusive acquisitions in a fixed order.
+FlipAuthorityPlan ==
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(LeaseRingStateResource, ModeExclusive),
+       Step(ClaimRingStateResource, ModeExclusive) >>
+
 VARIABLES
     heldLocks,     \* [resource -> set of <<tx, mode>>]
     txState,       \* [tx -> "idle" | "running" | "committed"]
     txPlan,        \* [tx -> Seq]
-    txNextStep     \* [tx -> Nat]
+    txNextStep,    \* [tx -> Nat]
+    authority,     \* #371: "columns" | "ledger" — global, one-way flip
+    txMode         \* [tx -> "columns" | "ledger" | "none"] — mode a running
+                   \* ring tx observed at start (for the MixedFleet invariant)
 
-vars == <<heldLocks, txState, txPlan, txNextStep>>
+vars == <<heldLocks, txState, txPlan, txNextStep, authority, txMode>>
 
 EmptyPlan == << >>
 
@@ -567,6 +682,11 @@ Init ==
     /\ txState = [t \in TxIds |-> "idle"]
     /\ txPlan = [t \in TxIds |-> EmptyPlan]
     /\ txNextStep = [t \in TxIds |-> 0]
+    \* Start in compat authority so TLC explores the mixed-fleet window and
+    \* the flip; a fresh install (authority = ledger from the start) is the
+    \* strict subset where the compat plans are never chosen.
+    /\ authority = "columns"
+    /\ txMode = [t \in TxIds |-> "none"]
 
 ConfigOK ==
     TwoStripeQueuesOK
@@ -597,7 +717,7 @@ StartClaimReceipts(t, q, p, readySlot, claimSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = ClaimReceiptsPlan(q, p, readySlot, claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 \* Start a Claim transaction in legacy (non-receipts) mode. The two
 \* modes don't run interleaved in production — the runtime config
@@ -612,7 +732,7 @@ StartClaimLegacy(t, q, p, readySlot, leaseSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = ClaimLegacyPlan(q, p, readySlot, leaseSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartEnqueueTwoStripe(t, p) ==
     /\ t \in TxIds
@@ -621,7 +741,7 @@ StartEnqueueTwoStripe(t, p) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = EnqueueTwoStripePlan(p)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartComplete(t, claimSlot, readySlot) ==
     /\ t \in TxIds
@@ -631,70 +751,96 @@ StartComplete(t, claimSlot, readySlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = CompletePlan(claimSlot, readySlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+\* #371 staged upgrade: a ring maintenance tx ATOMICALLY takes its ring-
+\* state singleton (the universal outer gate) as it starts, and picks its
+\* mode by the authority observed AT THAT MOMENT — faithfully modelling the
+\* implementation, which takes the singleton FOR UPDATE before reading the
+\* authority (`acquire_ring_serializer_tx`). Because the acquisition is
+\* atomic with the mode choice, the flip cannot slip between "decide compat"
+\* and "hold the singleton": the flip needs the same singleton exclusively,
+\* so whoever takes it first wins, and a rotator that loses reads `ledger`
+\* and runs the ledger plan. The plan's first step is the singleton (already
+\* reflected in every *Plan above); the tx starts at step 2 with the
+\* singleton already held.
+
+\* A ring tx may start only if its singleton is currently free (no holder).
+\* Modelled by requiring no held lock on the singleton resource.
+Blocked_(res) == \E u \in TxIds : \E m \in Modes : <<u, m>> \in heldLocks[res]
+
+\* Begin a ring maintenance tx `t` holding `singletonRes` (step 1 pre-
+\* acquired), running the mode-specific `plan` chosen by current authority,
+\* starting execution at step 2.
+BeginRingTx(t, singletonRes, plan) ==
+    /\ txState[t] = "idle"
+    /\ ~ Blocked_(singletonRes)
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = plan]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 2]
+    /\ txMode' = [txMode EXCEPT ![t] = authority]
+    /\ heldLocks' = [heldLocks EXCEPT
+                        ![singletonRes] = heldLocks[singletonRes] \cup {<<t, ModeExclusive>>}]
+    /\ UNCHANGED authority
 
 StartRotateLeases(t, nextSlot) ==
-    /\ t \in TxIds
-    /\ txState[t] = "idle"
-    /\ nextSlot \in LeaseSlots
-    /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = RotateLeasesPlan(nextSlot)]
-    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ t \in TxIds /\ nextSlot \in LeaseSlots
+    /\ BeginRingTx(t, LeaseRingStateResource,
+            IF authority = "ledger" THEN RotateLeasesPlan(nextSlot)
+                                    ELSE CompatRotateLeasesPlan(nextSlot))
 
 StartPruneLeases(t, slot) ==
-    /\ t \in TxIds
-    /\ txState[t] = "idle"
-    /\ slot \in LeaseSlots
-    /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = PruneLeasesPlan(slot)]
-    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ t \in TxIds /\ slot \in LeaseSlots
+    /\ BeginRingTx(t, LeaseRingStateResource,
+            IF authority = "ledger" THEN PruneLeasesPlan(slot)
+                                    ELSE CompatPruneLeasesPlan(slot))
 
 StartRotateReady(t, nextSlot) ==
-    /\ t \in TxIds
-    /\ txState[t] = "idle"
-    /\ nextSlot \in ReadySlots
-    /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = RotateReadyPlan(nextSlot)]
-    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ t \in TxIds /\ nextSlot \in ReadySlots
+    /\ BeginRingTx(t, QueueRingStateResource,
+            IF authority = "ledger" THEN RotateReadyPlan(nextSlot)
+                                    ELSE CompatRotateReadyPlan(nextSlot))
 
 StartPruneReady(t, slot) ==
-    /\ t \in TxIds
-    /\ txState[t] = "idle"
-    /\ slot \in ReadySlots
-    /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = PruneReadyPlan(slot)]
-    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ t \in TxIds /\ slot \in ReadySlots
+    /\ BeginRingTx(t, QueueRingStateResource,
+            IF authority = "ledger" THEN PruneReadyPlan(slot)
+                                    ELSE CompatPruneReadyPlan(slot))
 
 StartRollupTerminalDeltas(t, slot) ==
-    /\ t \in TxIds
-    /\ txState[t] = "idle"
-    /\ slot \in ReadySlots
-    /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = RollupTerminalDeltasPlan(slot)]
-    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ t \in TxIds /\ slot \in ReadySlots
+    /\ BeginRingTx(t, QueueRingStateResource,
+            IF authority = "ledger" THEN RollupTerminalDeltasPlan(slot)
+                                    ELSE CompatRollupTerminalDeltasPlan(slot))
 
 StartRotateClaims(t, nextSlot) ==
-    /\ t \in TxIds
-    /\ txState[t] = "idle"
-    /\ nextSlot \in ClaimSlots
-    /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = RotateClaimsPlan(nextSlot)]
-    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ t \in TxIds /\ nextSlot \in ClaimSlots
+    /\ BeginRingTx(t, ClaimRingStateResource,
+            IF authority = "ledger" THEN RotateClaimsPlan(nextSlot)
+                                    ELSE CompatRotateClaimsPlan(nextSlot))
 
 StartPruneClaims(t, slot) ==
+    /\ t \in TxIds /\ slot \in ClaimSlots
+    /\ BeginRingTx(t, ClaimRingStateResource,
+            IF authority = "ledger" THEN PruneClaimsPlan(slot)
+                                    ELSE CompatPruneClaimsPlan(slot))
+
+\* #371 one-way flip: enabled only in compat authority; takes all three
+\* ring-state singletons exclusively (so it serializes behind every in-flight
+\* compat rotator/pruner AND blocks any new ring tx from starting until it
+\* commits), then promotes authority to ledger on commit. Unlike the ring
+\* txs it does NOT pre-acquire in the Start action — it grabs the three
+\* singletons via AcquireNext so an already-running rotator that holds one
+\* blocks it (and vice versa).
+StartFlipAuthority(t) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
-    /\ slot \in ClaimSlots
+    /\ authority = "columns"
     /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = PruneClaimsPlan(slot)]
+    /\ txPlan' = [txPlan EXCEPT ![t] = FlipAuthorityPlan]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ txMode' = [txMode EXCEPT ![t] = "flip"]
+    /\ UNCHANGED <<heldLocks, authority>>
 
 StartCloseReceipt(t, claimSlot) ==
     /\ t \in TxIds
@@ -703,7 +849,7 @@ StartCloseReceipt(t, claimSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = CloseReceiptPlan(claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartRescueReceipts(t, claimSlot) ==
     /\ t \in TxIds
@@ -712,7 +858,7 @@ StartRescueReceipts(t, claimSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = RescueReceiptsPlan(claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartRescueReceiptDeadlines(t, claimSlot) ==
     /\ t \in TxIds
@@ -721,7 +867,7 @@ StartRescueReceiptDeadlines(t, claimSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = RescueReceiptDeadlinesPlan(claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartEnsureRunning(t, claimSlot, leaseSlot) ==
     /\ t \in TxIds
@@ -731,7 +877,7 @@ StartEnsureRunning(t, claimSlot, leaseSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = EnsureRunningPlan(claimSlot, leaseSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartCancelReceiptOnly(t, claimSlot, readySlot, leaseSlot) ==
     /\ t \in TxIds
@@ -742,7 +888,7 @@ StartCancelReceiptOnly(t, claimSlot, readySlot, leaseSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartCancelRunning(t, leaseSlot, readySlot, claimSlot) ==
     /\ t \in TxIds
@@ -753,7 +899,7 @@ StartCancelRunning(t, leaseSlot, readySlot, claimSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = CancelRunningPlan(leaseSlot, readySlot, claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartTerminalDelete(t, readySlot, claimSlot) ==
     /\ t \in TxIds
@@ -763,7 +909,7 @@ StartTerminalDelete(t, readySlot, claimSlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = TerminalDeletePlan(readySlot, claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, readySlot) ==
     /\ t \in TxIds
@@ -776,7 +922,7 @@ StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, readySlot) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 \* Try to acquire the next lock in t's plan. Enabled iff no conflict.
 \* A blocked tx does not fire this — it simply sits until the blocker
@@ -793,9 +939,11 @@ AcquireNext(t) ==
        /\ heldLocks' = [heldLocks EXCEPT
                            ![step.res] = heldLocks[step.res] \cup {<<t, step.mode>>}]
        /\ txNextStep' = [txNextStep EXCEPT ![t] = txNextStep[t] + 1]
-    /\ UNCHANGED <<txState, txPlan>>
+    /\ UNCHANGED <<txState, txPlan, authority, txMode>>
 
-\* Commit once all plan steps have been acquired. Release everything.
+\* Commit once all plan steps have been acquired. Release everything. The
+\* flip tx (see FlipAuthority) promotes the authority as it commits; every
+\* other tx leaves it unchanged.
 Commit(t) ==
     /\ t \in TxIds
     /\ txState[t] = "running"
@@ -805,6 +953,8 @@ Commit(t) ==
                         {<<u, m>> \in heldLocks[r] : u # t}]
     /\ txPlan' = [txPlan EXCEPT ![t] = EmptyPlan]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 0]
+    /\ authority' = IF txMode[t] = "flip" THEN "ledger" ELSE authority
+    /\ txMode' = [txMode EXCEPT ![t] = "none"]
 
 \* Committed txs can be recycled back to idle so TLC can explore
 \* further interleavings within a bounded state space.
@@ -812,7 +962,7 @@ Recycle(t) ==
     /\ t \in TxIds
     /\ txState[t] = "committed"
     /\ txState' = [txState EXCEPT ![t] = "idle"]
-    /\ UNCHANGED <<heldLocks, txPlan, txNextStep>>
+    /\ UNCHANGED <<heldLocks, txPlan, txNextStep, authority, txMode>>
 
 Stutter == /\ UNCHANGED vars
 
@@ -849,6 +999,7 @@ Next ==
     \/ \E t \in TxIds, srcQ \in Queues, dstQ \in Queues,
          srcP \in Priorities, dstP \in Priorities, rs \in ReadySlots :
           StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)
+    \/ \E t \in TxIds : StartFlipAuthority(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -876,7 +1027,7 @@ StartCycleA(t) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = CycleAPlan]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 StartCycleB(t) ==
     /\ t \in TxIds
@@ -884,7 +1035,7 @@ StartCycleB(t) ==
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = CycleBPlan]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 NextDeadlockDemo ==
     \/ \E t \in TxIds : StartCycleA(t)
@@ -914,7 +1065,7 @@ StartOldClaimTwoStripeReceipts(t, p, readySlot, claimSlot) ==
     /\ txPlan' = [txPlan EXCEPT ![t] =
         OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
-    /\ UNCHANGED heldLocks
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
 
 NextOldStripedClaimDeadlockDemo ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
@@ -944,6 +1095,16 @@ TypeOK ==
     /\ heldLocks \in [Resources -> SUBSET (TxIds \X Modes)]
     /\ txState \in [TxIds -> {"idle", "running", "committed"}]
     /\ txNextStep \in [TxIds -> Nat]
+    /\ authority \in {"columns", "ledger"}
+    /\ txMode \in [TxIds -> {"none", "columns", "ledger", "flip"}]
+
+\* #371: a ring maintenance tx has taken its serialization lock once it has
+\* acquired its first plan step (the singleton in compat mode, the advisory
+\* rotation lock in ledger mode). `txNextStep > 1` means step 1 is held.
+HoldsRingSerializer(t) ==
+    /\ txState[t] = "running"
+    /\ txMode[t] \in {"columns", "ledger"}
+    /\ txNextStep[t] > 1
 
 \* No two incompatible locks on the same resource.
 LockCompatibility ==
@@ -993,5 +1154,23 @@ NoDeadlock ==
 NoGlobalStall ==
     \/ \A t \in TxIds : txState[t] # "running"
     \/ \E t \in TxIds : txState[t] = "running" /\ ~ IsBlocked(t)
+
+\* #371 MixedFleet safety. A single ring must never be advanced under BOTH
+\* disciplines at once: no state where one ring maintenance tx holds its
+\* serializer in compat (columns) mode while another holds its serializer in
+\* ledger mode. Because the authority is a single per-schema one-way flag
+\* and the flip serializes behind every compat rotator (it takes all three
+\* singletons exclusively before promoting authority to ledger), the moment
+\* a ledger-mode tx can start, no compat-mode tx can still hold a serializer
+\* — so a compat rotator and a ledger rotator can never overlap their
+\* critical sections. If this ever fails, a rotator picked a mode out of
+\* step with the flip and two disciplines could double-advance one cursor.
+MixedFleet ==
+    ~ ( \E t1 \in TxIds :
+          \E t2 \in TxIds :
+            /\ HoldsRingSerializer(t1)
+            /\ HoldsRingSerializer(t2)
+            /\ txMode[t1] = "columns"
+            /\ txMode[t2] = "ledger" )
 
 =============================================================================
