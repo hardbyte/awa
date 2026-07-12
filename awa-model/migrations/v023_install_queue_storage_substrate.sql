@@ -205,8 +205,13 @@ BEGIN
         p_schema
     );
 
+    -- Seed the singleton with a genesis cursor (0, 0). ON CONFLICT DO
+    -- NOTHING preserves an existing 0.6 cursor. Providing current_slot /
+    -- generation here satisfies the NOT NULL constraint a 0.6 schema still
+    -- carries on those columns (the restored columns are nullable on the
+    -- dev-shape path, where the reconcile UPDATE below fills them instead).
     EXECUTE format(
-        'INSERT INTO %I.queue_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
+        'INSERT INTO %I.queue_ring_state (singleton, slot_count, current_slot, generation) VALUES (TRUE, %s, 0, 0) ON CONFLICT (singleton) DO NOTHING',
         p_schema, p_queue_slot_count
     );
 
@@ -338,7 +343,7 @@ BEGIN
     );
 
     EXECUTE format(
-        'INSERT INTO %I.lease_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
+        'INSERT INTO %I.lease_ring_state (singleton, slot_count, current_slot, generation) VALUES (TRUE, %s, 0, 0) ON CONFLICT (singleton) DO NOTHING',
         p_schema, p_lease_slot_count
     );
 
@@ -445,7 +450,7 @@ BEGIN
     );
 
     EXECUTE format(
-        'INSERT INTO %I.claim_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
+        'INSERT INTO %I.claim_ring_state (singleton, slot_count, current_slot, generation) VALUES (TRUE, %s, 0, 0) ON CONFLICT (singleton) DO NOTHING',
         p_schema, p_claim_slot_count
     );
 
@@ -642,6 +647,10 @@ BEGIN
     -- so the columns/ledger branch lives in exactly one place. Callers wrap
     -- it in an `AS MATERIALIZED` CTE (loops=1); the function itself reads
     -- the single-row authority page plus one O(1) cursor read.
+    -- The schema is baked into the function body as a quoted literal
+    -- (`%1$L`) so the dynamic reads target this exact schema regardless of
+    -- the caller's search_path (`current_schema()` here would resolve to
+    -- pg_catalog, the first search_path entry).
     EXECUTE format(
         $fn$
         CREATE OR REPLACE FUNCTION %1$I.ring_cursor(p_ring TEXT)
@@ -667,15 +676,15 @@ BEGIN
                 -- Max-generation row of the append-only ledger (backward PK
                 -- scan, O(1)).
                 RETURN QUERY EXECUTE format(
-                    'SELECT slot, generation FROM %%I.%%I ORDER BY generation DESC LIMIT 1',
-                    current_schema(), p_ring || '_ring_rotations'
+                    'SELECT slot, generation FROM %1$I.%%I ORDER BY generation DESC LIMIT 1',
+                    p_ring || '_ring_rotations'
                 );
             ELSE
                 -- Compat: the pre-0.7 mutable singleton columns are
                 -- authoritative (a live 0.6 rotator keeps them current).
                 RETURN QUERY EXECUTE format(
-                    'SELECT current_slot, generation FROM %%I.%%I WHERE singleton',
-                    current_schema(), p_ring || '_ring_state'
+                    'SELECT current_slot, generation FROM %1$I.%%I WHERE singleton',
+                    p_ring || '_ring_state'
                 );
             END IF;
         END;

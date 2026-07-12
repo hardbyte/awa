@@ -1591,14 +1591,16 @@ async fn ring_state_cursor_columns_exist(pool: &PgPool, schema: &str) -> bool {
     .expect("current_slot column probe should succeed")
 }
 
-/// #371 v042: an upgrade from a pre-v042 substrate must seed the
-/// append-only rotation ledger from the legacy `current_slot` /
-/// `generation` singleton cursor BEFORE dropping those columns, so the
-/// cursor survives the representation change exactly. The migration is a
-/// deliberate compat break (columns dropped), and a post-upgrade claim
-/// must route to the seeded slot.
+/// #371 v042 STAGED UPGRADE: an upgrade from a pre-v042 substrate must
+/// create + seed the append-only rotation ledgers from the legacy
+/// `current_slot` / `generation` singleton cursor WITHOUT dropping those
+/// columns (the migration is additive — compat columns are retained), start
+/// the schema in `columns` authority, and route a post-upgrade cursor read
+/// off the compat columns exactly. Also covers the dev-shape v042 where the
+/// columns were previously dropped: v042 must re-ADD and re-seed them from
+/// the ledger (the inverse seed).
 #[tokio::test]
-async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() {
+async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
@@ -1617,33 +1619,32 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
 
     prepare_queue_storage_schema(&pool, schema).await;
 
-    // Downgrade the prepared (post-v042) substrate back to the pre-v042
-    // shape: drop the ledgers and delta table, restore the mutable cursor
-    // columns on each singleton, and restore the derivable per-slot
-    // generation column. Seed the queue cursor at a non-genesis position
-    // (current_slot = 3, generation = 19) so the seed is observable.
+    // Downgrade the prepared (post-v042) substrate back to a pre-v042 (0.6-
+    // shaped) substrate: drop the ledgers, the delta table, the authority
+    // control row, and the ring_cursor resolver, and restore the mutable
+    // cursor columns on each singleton. Seed the queue cursor at a
+    // non-genesis position (current_slot = 3, generation = 19) so the ledger
+    // seed is observable.
     sqlx::raw_sql(&format!(
         r#"
         DROP TABLE {schema}.queue_ring_rotations;
         DROP TABLE {schema}.lease_ring_rotations;
         DROP TABLE {schema}.claim_ring_rotations;
         DROP TABLE {schema}.queue_terminal_rollup_deltas;
+        DROP TABLE {schema}.ring_cursor_authority;
+        DROP FUNCTION {schema}.ring_cursor(text);
 
         ALTER TABLE {schema}.queue_ring_state
-            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
-            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+            ALTER COLUMN current_slot SET NOT NULL,
+            ALTER COLUMN generation   SET NOT NULL;
         ALTER TABLE {schema}.lease_ring_state
-            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
-            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+            ALTER COLUMN current_slot SET NOT NULL,
+            ALTER COLUMN generation   SET NOT NULL;
         ALTER TABLE {schema}.claim_ring_state
-            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
-            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+            ALTER COLUMN current_slot SET NOT NULL,
+            ALTER COLUMN generation   SET NOT NULL;
 
         UPDATE {schema}.queue_ring_state SET current_slot = 3, generation = 19 WHERE singleton;
-
-        ALTER TABLE {schema}.queue_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
-        ALTER TABLE {schema}.lease_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
-        ALTER TABLE {schema}.claim_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
         "#
     ))
     .execute(&pool)
@@ -1655,9 +1656,10 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
         "downgraded substrate should carry the legacy cursor columns"
     );
 
-    // Rerun the migrations: v042's discovery loop reapplies the v023
-    // install helper against this schema, seeding the ledger and dropping
-    // the columns.
+    // Rerun the migrations: v042's discovery loop reapplies the v023 install
+    // helper against this schema, seeding the ledger from the columns and
+    // installing the authority control (which defaults to 'columns' because
+    // this is an upgrade, not a fresh install).
     sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
         .execute(&pool)
         .await
@@ -1667,14 +1669,23 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
         .await
         .expect("v042 should rerun cleanly");
 
-    // The legacy cursor columns are gone (loud-failure compat break).
+    // The compat cursor columns are RETAINED (additive migration).
     assert!(
-        !ring_state_cursor_columns_exist(&pool, schema).await,
-        "v042 must drop the legacy current_slot/generation cursor columns"
+        ring_state_cursor_columns_exist(&pool, schema).await,
+        "v042 must retain the compat current_slot/generation cursor columns"
     );
 
-    // The queue ledger was seeded from the legacy cursor exactly: one row
-    // carrying (generation = 19, slot = 3), which is the current cursor.
+    // Authority defaults to 'columns' on upgrade.
+    let authority: String = sqlx::query_scalar(&format!(
+        "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("authority row should exist after upgrade");
+    assert_eq!(authority, "columns", "an upgrade starts in compat authority");
+
+    // The queue ledger was seeded from the legacy cursor exactly: the
+    // current row carries (generation = 19, slot = 3).
     let (ledger_slot, ledger_gen): (i32, i64) = sqlx::query_as(&format!(
         "SELECT slot, generation FROM {schema}.queue_ring_rotations \
          ORDER BY generation DESC LIMIT 1"
@@ -1685,24 +1696,20 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
     assert_eq!(
         (ledger_slot, ledger_gen),
         (3, 19),
-        "v042 must seed the queue ledger from the legacy cursor before dropping it"
+        "v042 must seed the queue ledger from the legacy cursor"
     );
 
-    // Lease and claim ledgers were seeded from their genesis cursors.
-    for ring in ["lease", "claim"] {
-        let (slot, generation): (i32, i64) = sqlx::query_as(&format!(
-            "SELECT slot, generation FROM {schema}.{ring}_ring_rotations \
-             ORDER BY generation DESC LIMIT 1"
-        ))
-        .fetch_one(&pool)
-        .await
-        .expect("ledger cursor should be readable after upgrade");
-        assert_eq!(
-            (slot, generation),
-            (0, 0),
-            "{ring} ledger seeds from its genesis cursor"
-        );
-    }
+    // The authority resolver returns the compat columns (== ledger here).
+    let (cursor_slot, cursor_gen): (i32, i64) =
+        sqlx::query_as(&format!("SELECT slot, generation FROM {schema}.ring_cursor('queue')"))
+            .fetch_one(&pool)
+            .await
+            .expect("ring_cursor('queue') should resolve after upgrade");
+    assert_eq!(
+        (cursor_slot, cursor_gen),
+        (3, 19),
+        "ring_cursor must resolve the compat cursor in columns authority"
+    );
 
     // The delta landing table exists again and the schema reports ready.
     assert!(
@@ -1712,18 +1719,49 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
         "upgraded substrate must be reported ready (ledgers + delta table present)"
     );
 
-    // A claim after upgrade routes off the seeded cursor: the claim
-    // runtime reads the claim ledger's max-generation row. With no ready
-    // work the claim is empty, but the routing read must not error on the
-    // now-ledger-backed cursor.
+    // A claim after upgrade routes off the resolved cursor without error.
     let claimed: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.claim_ready_runtime(\
          'v042_upgrade_q'::text, 8::bigint, 0::double precision, 0::double precision)"
     ))
     .fetch_one(&pool)
     .await
-    .expect("claim_ready_runtime must route off the ledger cursor after upgrade");
+    .expect("claim_ready_runtime must route off the resolved cursor after upgrade");
     assert_eq!(claimed, 0, "no ready work was seeded for the upgrade probe");
+
+    // ---- Dev-shape v042 (columns previously DROPPED) -> inverse seed. ----
+    // Simulate the unreleased shipped-v042 shape: drop the compat columns,
+    // leaving only the ledger. Rerun v042; it must re-ADD the columns seeded
+    // FROM the ledger max (3, 19) and keep authority 'columns'.
+    sqlx::raw_sql(&format!(
+        r#"
+        ALTER TABLE {schema}.queue_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
+        ALTER TABLE {schema}.lease_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
+        ALTER TABLE {schema}.claim_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("dev-shape column drop should succeed");
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
+        .execute(&pool)
+        .await
+        .expect("schema_version rewind should succeed");
+    migrations::run(&pool)
+        .await
+        .expect("v042 should rerun cleanly against the dev shape");
+
+    let (restored_slot, restored_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT current_slot, generation FROM {schema}.queue_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("columns should be restored from the ledger");
+    assert_eq!(
+        (restored_slot, restored_gen),
+        (3, 19),
+        "v042 must re-ADD the compat columns seeded from the ledger max (inverse seed)"
+    );
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
@@ -1734,6 +1772,52 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
         .execute(&pool)
         .await
         .expect("ledger probe schema should drop cleanly");
+}
+
+/// #371 v042 staged upgrade: a FRESH queue-storage install starts directly
+/// in `ledger` authority (no old binary can exist to read the compat
+/// columns), while the default `awa` schema installed by `awa migrate` also
+/// resolves through the authority machinery.
+#[tokio::test]
+async fn test_v042_fresh_install_starts_in_ledger_authority() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    let schema = "awa_queue_storage_v042_fresh";
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("leftover fresh probe schema should drop cleanly");
+
+    migrations::run(&pool).await.unwrap();
+
+    // Fresh install of a custom schema (never existed before).
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    let authority: String = sqlx::query_scalar(&format!(
+        "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("authority row should exist on a fresh install");
+    assert_eq!(
+        authority, "ledger",
+        "a fresh install starts directly in ledger authority"
+    );
+
+    // ring_cursor resolves the genesis ledger cursor (0, 0).
+    let (slot, generation): (i32, i64) =
+        sqlx::query_as(&format!("SELECT slot, generation FROM {schema}.ring_cursor('queue')"))
+            .fetch_one(&pool)
+            .await
+            .expect("ring_cursor('queue') should resolve on a fresh install");
+    assert_eq!((slot, generation), (0, 0), "fresh genesis cursor is (0, 0)");
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("fresh probe schema should drop cleanly");
 }
 
 #[tokio::test]
