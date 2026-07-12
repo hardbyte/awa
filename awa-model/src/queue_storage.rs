@@ -14325,8 +14325,9 @@ impl QueueStorage {
             .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue, authority)
             .await?
         {
-            let (current_slot, _) =
-                self.ring_cursor_tx(&mut tx, RingFamily::Queue, authority).await?;
+            let (current_slot, _) = self
+                .ring_cursor_tx(&mut tx, RingFamily::Queue, authority)
+                .await?;
             let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
@@ -14335,8 +14336,9 @@ impl QueueStorage {
             });
         }
 
-        let (current_slot, generation) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Queue, authority).await?;
+        let (current_slot, generation) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Queue, authority)
+            .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
         let state = (current_slot, generation, slot_count);
 
@@ -14494,8 +14496,9 @@ impl QueueStorage {
             .try_ring_rotation_lock_tx(&mut tx, RingFamily::Lease, authority)
             .await?
         {
-            let (current_slot, _) =
-                self.ring_cursor_tx(&mut tx, RingFamily::Lease, authority).await?;
+            let (current_slot, _) = self
+                .ring_cursor_tx(&mut tx, RingFamily::Lease, authority)
+                .await?;
             let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
@@ -14504,8 +14507,9 @@ impl QueueStorage {
             });
         }
 
-        let (current_slot, generation) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Lease, authority).await?;
+        let (current_slot, generation) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Lease, authority)
+            .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
         let state = (current_slot, generation, slot_count);
 
@@ -14884,8 +14888,9 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::Blocked);
         }
 
-        let (current_slot, current_generation) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Queue, authority).await?;
+        let (current_slot, current_generation) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Queue, authority)
+            .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
 
         let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
@@ -15260,8 +15265,9 @@ impl QueueStorage {
             .try_ring_rotation_lock_tx(&mut tx, RingFamily::Queue, authority)
             .await?
         {
-            let (current_slot, generation) =
-                self.ring_cursor_tx(&mut tx, RingFamily::Queue, authority).await?;
+            let (current_slot, generation) = self
+                .ring_cursor_tx(&mut tx, RingFamily::Queue, authority)
+                .await?;
             let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(
@@ -15272,8 +15278,9 @@ impl QueueStorage {
             );
         }
 
-        let (current_slot, current_generation) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Queue, authority).await?;
+        let (current_slot, current_generation) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Queue, authority)
+            .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
         let state = (current_slot,);
 
@@ -15700,8 +15707,9 @@ impl QueueStorage {
             .try_ring_rotation_lock_tx(&mut tx, RingFamily::Lease, authority)
             .await?
         {
-            let (current_slot, generation) =
-                self.ring_cursor_tx(&mut tx, RingFamily::Lease, authority).await?;
+            let (current_slot, generation) = self
+                .ring_cursor_tx(&mut tx, RingFamily::Lease, authority)
+                .await?;
             let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(
@@ -15712,8 +15720,9 @@ impl QueueStorage {
             );
         }
 
-        let (current_slot, generation) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Lease, authority).await?;
+        let (current_slot, generation) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Lease, authority)
+            .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
         let state = (current_slot, generation, slot_count);
 
@@ -15761,8 +15770,9 @@ impl QueueStorage {
         // The ring rotation serialization held above keeps the cursor
         // stable, but keep the explicit recheck to document the truncate
         // precondition.
-        let (current_slot, _) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Lease, authority).await?;
+        let (current_slot, _) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Lease, authority)
+            .await?;
 
         if current_slot == slot {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -15841,8 +15851,9 @@ impl QueueStorage {
             .try_ring_rotation_lock_tx(&mut tx, RingFamily::Claim, authority)
             .await?
         {
-            let (current_slot, _) =
-                self.ring_cursor_tx(&mut tx, RingFamily::Claim, authority).await?;
+            let (current_slot, _) = self
+                .ring_cursor_tx(&mut tx, RingFamily::Claim, authority)
+                .await?;
             let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
@@ -15851,8 +15862,9 @@ impl QueueStorage {
             });
         }
 
-        let (current_slot, generation) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Claim, authority).await?;
+        let (current_slot, generation) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Claim, authority)
+            .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
         let state = (current_slot, generation, slot_count);
 
@@ -15988,8 +16000,9 @@ impl QueueStorage {
             .try_ring_rotation_lock_tx(&mut tx, RingFamily::Claim, authority)
             .await?
         {
-            let (current_slot, generation) =
-                self.ring_cursor_tx(&mut tx, RingFamily::Claim, authority).await?;
+            let (current_slot, generation) = self
+                .ring_cursor_tx(&mut tx, RingFamily::Claim, authority)
+                .await?;
             let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(
@@ -16000,8 +16013,9 @@ impl QueueStorage {
             );
         }
 
-        let (current_slot, generation) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Claim, authority).await?;
+        let (current_slot, generation) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Claim, authority)
+            .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
         let state = (current_slot, generation, slot_count);
 
@@ -16081,8 +16095,9 @@ impl QueueStorage {
         // not the current one. The ring rotation serialization should
         // already make this stable, but keeping the explicit gate documents
         // the truncate precondition.
-        let (current_slot, _) =
-            self.ring_cursor_tx(&mut tx, RingFamily::Claim, authority).await?;
+        let (current_slot, _) = self
+            .ring_cursor_tx(&mut tx, RingFamily::Claim, authority)
+            .await?;
 
         if current_slot == slot {
             tx.commit().await.map_err(map_sqlx_error)?;
