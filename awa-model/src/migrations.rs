@@ -51,13 +51,19 @@ pub struct MigrateOptions {
 /// For breaking schema changes, bump the major version and document
 /// the required stop-the-world upgrade procedure.
 ///
-/// **Documented exception — v042 (#371):** the ring-state cursor columns
-/// (`current_slot` / `generation`) are dropped from the `{ring}_ring_state`
-/// singletons after being seeded into the append-only rotation ledgers.
-/// A pre-v042 binary reading a stale frozen cursor would silently misroute
-/// writes; the missing column makes it fail loudly instead. Binaries and
-/// migration move together across v042 — no mixed fleet on one database
-/// (see the 0.7 upgrade notes in CHANGELOG.md and ADR-040).
+/// **v042 (#371) stays additive.** The ring cursors move to append-only
+/// `{ring}_ring_rotations` ledgers, but v042 is the *expand* phase of a
+/// staged rolling upgrade: it seeds the ledgers and **keeps** the compat
+/// `current_slot` / `generation` singleton columns (and the per-slot
+/// `generation` column), selecting the authoritative representation per
+/// schema via `{schema}.ring_cursor_authority` (`columns` on upgrade,
+/// `ledger` on fresh install). A mixed 0.6/0.7 fleet is safe: no stop-the-
+/// world window. The one-way `columns -> ledger` flip
+/// (`awa.flip_ring_authority`, or the maintenance auto-flip) retires the
+/// columns' authority once the fleet is fully 0.7; the 0.8 contract
+/// migration drops them (that DROP will be the documented exception). See
+/// the 0.7 upgrade notes in CHANGELOG.md, docs/upgrade-0.6-to-0.7.md, and
+/// ADR-040.
 const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (1, "Canonical schema with UI indexes", &[V1_UP]),
     (2, "Runtime observability snapshots", &[V2_UP]),

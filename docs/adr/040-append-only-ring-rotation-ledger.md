@@ -3,8 +3,10 @@
 ## Status
 
 Accepted — implemented for 0.7 ([#371](https://github.com/hardbyte/awa/issues/371),
-from the 0.7 performance campaign). Ships with a **stop-the-world, lockstep
-binary+migration upgrade** (migration v042); see the CHANGELOG 0.7 upgrade notes.
+from the 0.7 performance campaign). Ships as a **staged rolling upgrade**
+(expand → flip → contract) via migration v042 — **no stop-the-world window**,
+safe for a mixed 0.6/0.7 fleet. See the "Staged rolling upgrade" section below,
+`docs/upgrade-0.6-to-0.7.md`, and the CHANGELOG 0.7 upgrade notes.
 
 ## Context
 
@@ -83,9 +85,58 @@ cursor's representation.
     delta landing table grow without bound for the whole run (see the Negative
     consequence below); the age gate is the fix.
 
+## Staged rolling upgrade (expand → flip → contract)
+
+The cutover from the mutable singleton columns to the ledger is delivered as a
+staged upgrade so it needs **no stop-the-world window** and tolerates a mixed
+0.6/0.7 fleet. Each queue-storage schema carries a `ring_cursor_authority`
+control row (`columns` | `ledger`) selecting which representation is
+authoritative for all three rings; the per-schema `ring_cursor(ring)` SQL
+function and the Rust rotate/prune seams branch on it.
+
+- **Expand (migration v042, additive).** Create and seed the three ledgers and
+  the rollup-delta table; **keep** the compat `current_slot` / `generation`
+  columns (restore them if an earlier unreleased shipped-v042 dev schema dropped
+  them, re-seeding from the ledger max — the inverse seed). Upgrades start in
+  `columns`; fresh installs start in `ledger` (no old binary can exist).
+- **Compat mode (`columns`).** The singleton columns are authoritative, exactly
+  as 0.6 wrote them. A 0.7 rotator takes the same `{ring}_ring_state` row
+  `FOR UPDATE` a 0.6 rotator takes (serializing the two), CASes the columns, AND
+  shadows the ledger — reconciling first by backfilling any generations an
+  interleaved 0.6 rotator advanced the columns past. Cursor reads come from the
+  columns. So a mixed fleet is correct and the ledger is a faithful, ready-to-
+  promote copy.
+- **Flip (one-way `columns → ledger`).** `awa storage flip-ring-authority`, or
+  the maintenance leader's auto-flip once the whole fresh fleet has reported a
+  0.7+ `binary_version` (an additive `awa.runtime_instances` column; 0.6 rows
+  leave it NULL) continuously for a stable period. The flip is transactional
+  across all three rings: it takes the three singletons `FOR UPDATE` (serializing
+  behind every in-flight compat rotator), promotes the authority, and **poisons**
+  the stale columns to `current_slot = -1` — a slot with no partition, so a
+  returning pre-flip binary fails loudly rather than misrouting. A manual flip
+  refuses (without `--force`) while any fresh-heartbeat runtime is not known to
+  be flip-aware.
+- **Lock discipline & the authority-read ordering.** The compat serializer is the
+  singleton `FOR UPDATE`; the ledger serializer is the per-ring advisory lock.
+  A rotator takes the singleton **before** reading the authority (and the flip
+  takes all three singletons), which closes a TOCTOU where a rotator reads
+  `columns`, the flip commits, and the rotator then advances under the stale
+  discipline. `AwaStorageLockOrder.tla` models both disciplines, the flip action,
+  and a `MixedFleet` invariant (no ring advanced under both disciplines at once);
+  the compat-mode singleton churn is a documented, bounded transition-mode
+  exemption in `AwaDeadTupleContract.tla`.
+- **Contract (0.8).** Drop the compat columns for good, guarded by an exclusive
+  window asserting ledger authority and no live pre-flip binary. Tracked as a
+  0.8 issue.
+
 ## Consequences
 
 **Positive**
+
+- **No stop-the-world upgrade and no lockstep binary/migration coupling.** The
+  additive expand + staged flip let operators roll binaries and run the migration
+  in either order with a mixed fleet, then promote to the dead-tuple-free ledger
+  once fully on 0.7.
 
 - The busy-path rotation write is an **append**, not an UPDATE: no dead tuple, so
   a pinned MVCC horizon can no longer strand ring bookkeeping. Combined with the
@@ -97,17 +148,21 @@ cursor's representation.
 - Cursor reads stay O(1) (backward PK scan); sealed-slot enumeration is pure
   arithmetic on the cursor, removing a per-slot table scan.
 
-**Negative / limits — deliberate compatibility break**
+**Negative / limits**
 
-- Dropping `current_slot` / `generation` from the singletons is an **exception to
-  the additive-only migration policy**. It is intentional: a pre-v042 binary that
-  read a now-frozen cursor would silently misroute writes into sealed slots,
-  whereas a *missing column* fails loudly and safely. **Binaries and migration
-  v042 must move together — no mixed fleet of pre-/post-v042 binaries against one
-  database.** This requires a brief stop-the-world upgrade; the CHANGELOG 0.7
-  upgrade notes document the procedure. The v023 install helper seeds each ledger
-  from the legacy cursor **before** dropping the columns, so the current cursor
-  survives the representation change exactly.
+- The upgrade is now **two operator-visible phases** (roll the fleet, then flip)
+  rather than one. The flip can be automated (the maintenance auto-flip), but
+  reaching the dead-tuple-free ledger regime is not instantaneous on upgrade — a
+  cluster left in compat authority keeps the pre-#371 singleton churn (bounded by
+  rotation cadence, reclaimable when the horizon is clear) until it flips. This
+  is the deliberate cost of avoiding a stop-the-world window.
+- Rolling a binary back **across the flip** is unsupported: the flip poisons the
+  compat columns, so a pre-flip binary fails loudly. Before the flip, rollback to
+  0.6 is safe. (This replaces the original design's hard "no mixed fleet at all"
+  constraint with a narrower "no rollback across the flip".)
+- The compat cursor columns and the per-slot `generation` columns survive until
+  the 0.8 contract migration drops them — a small, cold storage cost carried
+  through 0.7 as the safety net that makes the rolling upgrade possible.
 - Counts are exact but split across two relations (rollups + unfolded deltas)
   between folds; every count reader must sum both. This is encapsulated in the
   three read sites and covered by tests.

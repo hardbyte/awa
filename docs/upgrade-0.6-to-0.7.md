@@ -49,30 +49,67 @@ transition to `finalize`, then upgrade to 0.7. A 0.7 binary will not migrate a 0
 schema directly — stepping-stone upgrades are the supported path (the same pattern Oban,
 River, and Postgres itself use).
 
-## The v042 ring-rotation ledger migration — lockstep, no mixed fleet
+## The v042 ring-rotation ledger migration — staged, rolling, no stop-the-world
 
 Migration **v042** ([#371](https://github.com/hardbyte/awa/issues/371),
-[ADR-040](adr/040-append-only-ring-rotation-ledger.md)) is the one 0.7 migration that
-**breaks the normal binary/schema skew window**. It moves the queue/lease/claim ring
+[ADR-040](adr/040-append-only-ring-rotation-ledger.md)) moves the queue/lease/claim ring
 cursors out of the mutable `{ring}_ring_state` singleton columns (`current_slot`,
-`generation`) into append-only `{ring}_ring_rotations` ledgers, and then **drops those
-columns** after seeding the ledger from them. This is a deliberate exception to the
-otherwise additive-only migration policy: a pre-v042 binary that read a now-frozen cursor
-would silently misroute writes into sealed slots, so the migration removes the column to
-turn that into a loud, safe failure instead.
+`generation`) into append-only `{ring}_ring_rotations` ledgers (dead-tuple-free rotation
+under a pinned MVCC horizon). It is delivered as a **staged expand → flip → contract**
+upgrade so it needs **no stop-the-world window** and is safe for a mixed 0.6/0.7 fleet.
 
-**Consequence: binaries and v042 must move together. Do not run a mixed fleet of pre-
-and post-v042 binaries against one database.** Because the cursor columns are gone, a
-0.6 (or any pre-v042) binary cannot claim, enqueue, or rotate against a v042 schema — it
-fails loudly. This one migration needs a brief **stop-the-world** window:
+**v042 is additive (the expand phase).** It creates and seeds the three ledgers and the
+rollup-delta landing table, and it **keeps** the compat `current_slot` / `generation`
+columns in place. Each queue-storage schema gets a `ring_cursor_authority` control row
+that selects which representation is authoritative:
 
-1. Stop or fully drain all workers (no pre-v042 binary left connected).
-2. Run `awa migrate` (applies v042; seeds the ledgers before dropping the columns, so the
-   current cursor survives exactly).
-3. Start the 0.7 binaries.
+- `columns` (compat) — the pre-0.7 singleton columns are authoritative, exactly as 0.6
+  wrote them, so a live 0.6 binary keeps working. 0.7 rotators additionally shadow every
+  advance into the ledger, keeping it a ready-to-promote copy.
+- `ledger` — the append-only ledgers are authoritative (the #371 dead-tuple win).
 
-Fresh installs are unaffected — they get the ledger shape directly. Rolling upgrades that
-keep old binaries live across this migration are **not** supported for v042.
+An **upgrade** starts in `columns`; a **fresh install** starts directly in `ledger` (no
+old binary can exist). The flip is one-way.
+
+### Procedure (either order works)
+
+Both orders are supported, and auto-migrate at startup is fine:
+
+1. **Roll binaries, then migrate**, or **migrate, then roll binaries** — either way the
+   fleet runs mixed 0.6/0.7 against one database with no stop-the-world window. In compat
+   mode a 0.6 rotator and a 0.7 rotator serialize on the same `{ring}_ring_state` row lock,
+   so the cursor stays correct.
+2. Once **every** worker is on 0.7, promote to ledger authority to unlock the full #371
+   dead-tuple benefits — either:
+   - manually: `awa storage flip-ring-authority` (add `--schema <name>` for a custom
+     schema; `--check` prints the fleet flip-readiness and exits without changing
+     anything), or
+   - automatically: the maintenance leader auto-flips once every fresh-heartbeat runtime
+     has reported a 0.7+ `binary_version` continuously for a stable period (default 10
+     minutes; a builder knob). It logs the flip loudly.
+
+The manual flip **refuses** (without `--force`) while any fresh-heartbeat runtime is not
+known to be flip-aware — i.e. a 0.6 (or pre-flip 0.7) binary might still be reading the
+compat columns. Roll the whole fleet first, or pass `--force` only once you have confirmed
+no pre-flip binary is live.
+
+### After the flip — do not roll back to a pre-flip binary
+
+The flip **fences returning pre-flip binaries**: it poisons the now-stale compat columns
+(`current_slot = -1`, a slot with no partition) so a 0.6 (or pre-flip 0.7) binary that
+reconnects fails loudly instead of misrouting writes into a sealed or nonexistent slot.
+Rolling a binary back **across the flip** is therefore not supported; roll back only to
+another 0.7 build (which reads the ledger). **Before** the flip, the normal one-minor
+skew guarantee holds and rollback to 0.6 is safe.
+
+### Contract (0.8)
+
+Dropping the compat columns for good is deferred to **0.8** (the contract phase), guarded
+by an exclusive window that asserts ledger authority and that no pre-flip binary is live.
+Until then the columns remain as a cheap, cold safety net.
+
+Fresh installs are unaffected — they get ledger authority directly and never touch the
+compat path.
 
 ## Runtime deprecation warning
 
@@ -83,10 +120,11 @@ still works in 0.7, and is gone in 0.8.
 
 ## Rollback
 
-0.7's migrate *gate* itself changes nothing in the database. However, once migration
-**v042** has run (see above), the one-minor-version binary/schema skew window no longer
-applies: a 0.6 binary against a v042 schema fails loudly (the ring-cursor columns it reads
-are gone), so rolling back to 0.6 binaries after applying v042 is **not** supported. Roll
-back the binary only to a build that also carries the v042 ledger cursor (i.e. another 0.7
-build). Before v042 is applied, the normal skew guarantee holds. There is no schema
-downgrade path (unchanged from previous releases).
+0.7's migrate *gate* itself changes nothing in the database. Migration **v042** is
+additive (it keeps the compat cursor columns), so applying it does **not** break the
+one-minor-version skew window: a 0.6 binary keeps working against a v042 schema in compat
+authority. The skew window only ends at the **ring-authority flip** (see above): after the
+flip the stale compat columns are poisoned, so a pre-flip binary fails loudly and rolling
+back across the flip is **not** supported — roll back only to another 0.7 build. Before
+the flip, rollback to 0.6 is safe. There is no schema downgrade path (unchanged from
+previous releases).
