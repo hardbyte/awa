@@ -1,5 +1,6 @@
 use crate::{
-    AwaError as PyAwaError, CallbackNotFound, DatabaseError, SchemaNotMigrated, SerializationError,
+    AwaError as PyAwaError, CallbackNotFound, DatabaseError,
+    LiveRuntimesRequireExclusiveWindow, SchemaNotMigrated, SerializationError,
     StorageNotFinalized, UniqueConflict, UnknownJobKind, ValidationError,
 };
 use pyo3::PyErr;
@@ -45,10 +46,8 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         err @ awa_model::AwaError::StorageNotFinalized { .. } => {
             StorageNotFinalized::new_err(err.to_string())
         }
-        // Same operator-gate family as StorageNotFinalized — a pre-flight
-        // refusal with actionable guidance in the Display impl.
         err @ awa_model::AwaError::LiveRuntimesRequireExclusiveWindow { .. } => {
-            StorageNotFinalized::new_err(err.to_string())
+            LiveRuntimesRequireExclusiveWindow::new_err(err.to_string())
         }
         awa_model::AwaError::UnknownJobKind { kind } => {
             UnknownJobKind::new_err(format!("unknown job kind: {kind}"))
@@ -65,4 +64,30 @@ pub fn validation_error(message: impl Into<String>) -> PyErr {
 
 pub fn state_error(message: impl Into<String>) -> PyErr {
     PyAwaError::new_err(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::Python;
+
+    #[test]
+    fn live_runtime_migration_gate_maps_to_dedicated_exception() {
+        Python::initialize();
+        let err = map_awa_error(awa_model::AwaError::LiveRuntimesRequireExclusiveWindow {
+            migration_version: 42,
+            count: 2,
+            plural: "s",
+            newest_secs: 3,
+            instances: " Live runtimes: worker-a, worker-b.".to_string(),
+        });
+
+        Python::attach(|py| {
+            assert!(err.is_instance_of::<LiveRuntimesRequireExclusiveWindow>(py));
+            assert!(!err.is_instance_of::<StorageNotFinalized>(py));
+            let message = err.to_string();
+            assert!(message.contains("requires no live runtimes"));
+            assert!(message.contains("stop or drain the workers"));
+        });
+    }
 }

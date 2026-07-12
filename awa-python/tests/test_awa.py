@@ -11,6 +11,13 @@ import pytest
 
 import awa
 
+
+def test_live_runtime_migration_gate_has_dedicated_exception() -> None:
+    assert issubclass(awa.LiveRuntimesRequireExclusiveWindow, awa.AwaError)
+    assert not issubclass(
+        awa.LiveRuntimesRequireExclusiveWindow, awa.StorageNotFinalized
+    )
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
