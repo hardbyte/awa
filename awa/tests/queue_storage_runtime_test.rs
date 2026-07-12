@@ -4326,6 +4326,339 @@ async fn test_ring_rotation_ledger_append_is_a_generation_cas() {
     );
 }
 
+/// #371 staged upgrade helpers.
+///
+/// Force a schema into compat ('columns') authority, simulating a rolling
+/// upgrade where the ledgers were seeded but the fleet has not yet flipped.
+async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) {
+    sqlx::query(&format!(
+        "UPDATE {schema}.ring_cursor_authority SET authority = $1, \
+         flipped_at = CASE WHEN $1 = 'ledger' THEN now() ELSE NULL END \
+         WHERE singleton"
+    ))
+    .bind(authority)
+    .execute(pool)
+    .await
+    .expect("set ring authority");
+}
+
+async fn ring_authority(pool: &sqlx::PgPool, schema: &str) -> String {
+    sqlx::query_scalar::<_, String>(&format!(
+        "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read ring authority")
+}
+
+/// The compat-authority cursor: the mutable singleton columns.
+async fn ring_columns_cursor(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
+    sqlx::query_as::<_, (i32, i64)>(&format!(
+        "SELECT current_slot, generation FROM {schema}.{ring}_ring_state WHERE singleton"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("read ring columns cursor")
+}
+
+/// Register a synthetic runtime heartbeat row for the flip-gate tests.
+/// `binary_version = None` models a 0.6 (or pre-flip) binary; `stale = true`
+/// backdates `last_seen_at` past the freshness window.
+async fn insert_flip_test_runtime(
+    pool: &sqlx::PgPool,
+    binary_version: Option<&str>,
+    stale: bool,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let last_seen = if stale {
+        "now() - interval '10 minutes'"
+    } else {
+        "now()"
+    };
+    sqlx::query(&format!(
+        "INSERT INTO awa.runtime_instances ( \
+            instance_id, hostname, pid, version, binary_version, \
+            storage_capability, transition_role, started_at, last_seen_at, \
+            snapshot_interval_ms, healthy, postgres_connected, poll_loop_alive, \
+            heartbeat_alive, maintenance_alive, shutting_down, leader, \
+            global_max_workers, queues \
+         ) VALUES ( \
+            $1, 'flip-test', 100, '0.7.0-test', $2, \
+            'queue_storage', 'queue_storage_target', now() - interval '1 minute', {last_seen}, \
+            1000, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, NULL, '[]'::jsonb \
+         )"
+    ))
+    .bind(id)
+    .bind(binary_version)
+    .execute(pool)
+    .await
+    .expect("insert synthetic runtime instance");
+    id
+}
+
+/// #371 staged upgrade: in compat ('columns') authority a 0.7 rotate CASes
+/// the pre-0.7 singleton columns AND shadows the append-only ledger, so both
+/// representations advance in lock-step and stay consistent.
+#[tokio::test]
+async fn test_compat_mode_rotate_advances_columns_and_ledger_together() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_compat_rotate";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // A fresh install starts in ledger authority; force compat to model the
+    // rolling-upgrade window.
+    set_ring_authority(&pool, schema, "columns").await;
+    assert_eq!(ring_columns_cursor(&pool, schema, "queue").await, (0, 0));
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, (0, 0));
+
+    // Enqueue so the ring is non-idle, then rotate.
+    store
+        .enqueue_batch(&pool, "compat_rotate_q", 1, 3)
+        .await
+        .expect("enqueue");
+    let outcome = store.rotate(&pool).await.expect("compat rotate");
+    assert!(
+        matches!(
+            outcome,
+            awa_model::RotateOutcome::Rotated {
+                slot: 1,
+                generation: 1
+            }
+        ),
+        "compat rotate advances to (slot 1, gen 1); got {outcome:?}"
+    );
+
+    // Columns advanced (0.6 semantics) AND the ledger shadow advanced.
+    assert_eq!(
+        ring_columns_cursor(&pool, schema, "queue").await,
+        (1, 1),
+        "compat rotate CASes the singleton columns"
+    );
+    assert_eq!(
+        ring_cursor(&pool, schema, "queue").await,
+        (1, 1),
+        "compat rotate shadows the append-only ledger"
+    );
+}
+
+/// #371 staged upgrade: an interleaved old (0.6) binary advances ONLY the
+/// singleton columns (it knows nothing of the ledger). The next 0.7 compat
+/// rotate must reconcile — backfilling the ledger up to the column cursor —
+/// so the shadow is a faithful copy ready for the flip.
+#[tokio::test]
+async fn test_compat_mode_reconciles_externally_casd_columns() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_compat_reconcile";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    // Simulate a live 0.6 rotator advancing the columns twice WITHOUT
+    // touching the ledger (raw SQL, exactly the pre-#371 write path).
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 2, generation = 2 WHERE singleton"
+    ))
+    .execute(&pool)
+    .await
+    .expect("simulate 0.6 external CAS");
+    // Ledger still only holds genesis — it lags the columns by two gens.
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, (0, 0));
+    assert_eq!(ring_ledger_row_count(&pool, schema, "queue").await, 1);
+
+    // A 0.7 compat rotate advances columns to gen 3 and reconciles the
+    // ledger, backfilling the missed generations 1 and 2 plus its own 3.
+    store
+        .enqueue_batch(&pool, "compat_reconcile_q", 1, 3)
+        .await
+        .expect("enqueue");
+    store.rotate(&pool).await.expect("compat rotate reconcile");
+
+    assert_eq!(
+        ring_columns_cursor(&pool, schema, "queue").await,
+        (3, 3),
+        "compat rotate advances the columns from the external cursor"
+    );
+    assert_eq!(
+        ring_cursor(&pool, schema, "queue").await,
+        (3, 3),
+        "the ledger cursor now matches the columns"
+    );
+    assert_eq!(
+        ring_ledger_row_count(&pool, schema, "queue").await,
+        4,
+        "reconcile backfilled the ledger: genesis + gens 1, 2, 3"
+    );
+}
+
+/// #371 staged upgrade: the one-way flip poisons the stale compat columns
+/// (`current_slot = -1`) so a returning pre-flip binary fails loudly, and
+/// switches the authority so reads come from the ledger.
+#[tokio::test]
+async fn test_flip_poisons_columns_and_switches_authority() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_flip_poison";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    // Advance the cursor a bit in compat mode first.
+    store
+        .enqueue_batch(&pool, "flip_poison_q", 1, 2)
+        .await
+        .expect("enqueue");
+    store.rotate(&pool).await.expect("compat rotate");
+    assert_eq!(ring_columns_cursor(&pool, schema, "queue").await, (1, 1));
+
+    // Flip (no fresh runtimes -> allowed without force).
+    let result = storage::flip_ring_authority(&pool, schema, false)
+        .await
+        .expect("flip should succeed with no blocking runtimes");
+    assert_eq!(result, "ledger");
+    assert_eq!(ring_authority(&pool, schema).await, "ledger");
+
+    // Every ring's compat column is poisoned to the -1 sentinel.
+    for ring in ["queue", "lease", "claim"] {
+        let (poisoned_slot, _) = ring_columns_cursor(&pool, schema, ring).await;
+        assert_eq!(
+            poisoned_slot, -1,
+            "{ring} compat current_slot poisoned to -1 at flip"
+        );
+    }
+
+    // Ledger cursor is intact and now authoritative; a claim routes off it.
+    assert_eq!(
+        ring_cursor(&pool, schema, "queue").await,
+        (1, 1),
+        "the ledger cursor survives the flip"
+    );
+    let claimed = store
+        .claim_runtime_batch(&pool, "flip_poison_q", 8, Duration::from_secs(30))
+        .await
+        .expect("claim after flip must route off the ledger cursor");
+    assert_eq!(
+        claimed.len(),
+        2,
+        "the two enqueued jobs claim after the flip"
+    );
+
+    // The flip is idempotent (one-way).
+    let again = storage::flip_ring_authority(&pool, schema, false)
+        .await
+        .expect("re-flip is a no-op");
+    assert_eq!(again, "ledger");
+}
+
+/// #371 staged upgrade: a manual flip refuses while a fresh-heartbeat
+/// runtime is not known to be flip-aware (NULL `binary_version`), but a
+/// stale such runtime does not block, and `--force` overrides.
+#[tokio::test]
+async fn test_flip_gate_blocks_on_fresh_null_version_runtime() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_flip_gate";
+    let _store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    // A FRESH runtime with no binary_version (a live 0.6 / pre-flip binary)
+    // blocks the flip.
+    let blocker = insert_flip_test_runtime(&pool, None, false).await;
+    let status = storage::ring_authority_status(&pool, schema)
+        .await
+        .expect("status");
+    assert_eq!(status.blocking_instances, 1, "fresh NULL-version blocks");
+
+    let refused = storage::flip_ring_authority(&pool, schema, false).await;
+    assert!(
+        refused.is_err(),
+        "flip must refuse while a fresh non-flip-aware runtime is live"
+    );
+    assert_eq!(
+        ring_authority(&pool, schema).await,
+        "columns",
+        "authority unchanged on refusal"
+    );
+
+    // Expire the blocker; a stale NULL-version row does not block.
+    sqlx::query("UPDATE awa.runtime_instances SET last_seen_at = now() - interval '10 minutes' WHERE instance_id = $1")
+        .bind(blocker)
+        .execute(&pool)
+        .await
+        .expect("expire blocker");
+    // A fresh, flip-aware (0.7) runtime is present and does not block.
+    insert_flip_test_runtime(&pool, Some("0.7.0"), false).await;
+    let status = storage::ring_authority_status(&pool, schema)
+        .await
+        .expect("status");
+    assert_eq!(
+        status.blocking_instances, 0,
+        "stale NULL-version does not block"
+    );
+    assert_eq!(
+        status.flip_aware_instances, 1,
+        "the 0.7 runtime is flip-aware"
+    );
+
+    let ok = storage::flip_ring_authority(&pool, schema, false)
+        .await
+        .expect("flip allowed once no fresh non-flip-aware runtime remains");
+    assert_eq!(ok, "ledger");
+
+    // Force path: even with a fresh blocker, --force flips.
+    set_ring_authority(&pool, schema, "columns").await;
+    insert_flip_test_runtime(&pool, None, false).await;
+    assert!(
+        storage::flip_ring_authority(&pool, schema, false)
+            .await
+            .is_err(),
+        "still refused without force"
+    );
+    let forced = storage::flip_ring_authority(&pool, schema, true)
+        .await
+        .expect("force overrides the gate");
+    assert_eq!(forced, "ledger");
+}
+
 /// #371: queue prune appends rollup deltas instead of upserting
 /// `queue_terminal_rollups` synchronously. The maintenance fold that
 /// drains the deltas mutates the permanent rollups, so it must stand down
