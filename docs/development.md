@@ -130,7 +130,7 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
 
 **Docs**
 
-- [ ] CHANGELOG entry; `docs/upgrade-X-to-Y.md` if any operator action is required; `docs/stability.md` if the skew statement is affected. State known mixed-version limitations explicitly; do not present a non-mixed rehearsal as proof of mixed-version operation.
+- [ ] CHANGELOG entry; `docs/upgrade-X-to-Y.md` if any operator action is required; `docs/stability.md` if the skew statement is affected. Link each compatibility claim to a rehearsal that exercises the claimed version topology, and label narrower evidence by the behaviors it actually covers.
 
 ## Pre-commit Checks (Rust)
 
