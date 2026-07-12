@@ -6,6 +6,38 @@ use tracing::info;
 /// Current schema version.
 pub const CURRENT_VERSION: i32 = 42;
 
+/// Migrations that require an exclusive (no-live-runtime) upgrade window.
+///
+/// A migration belongs here when a pre-migration binary cannot operate against
+/// the post-migration schema — i.e. crossing it needs all workers stopped or
+/// drained first. The pre-flight [`check_live_runtimes_gate`] refuses to apply
+/// a pending range that includes any version in this list while a worker is
+/// heartbeating (overridable with `MigrateOptions::allow_live_runtimes`).
+///
+/// v042 (#371, ADR-040) is flagged: it drops the mutable ring-cursor columns,
+/// so a pre-v042 binary cannot claim, enqueue, or rotate against a v042 schema
+/// — crossing it needs a stop-the-world window. When the rolling-upgrade
+/// redesign (#…) makes v042 expand-only, its PR removes v042 from this list
+/// (a one-line handoff); the guard mechanism then remains for the future 0.8
+/// contract migration, which flags itself here in turn.
+const EXCLUSIVE_WINDOW_MIGRATIONS: &[i32] = &[42];
+
+/// Heartbeat-staleness window (seconds) for the pre-flight live-runtime check.
+/// Matches the window used by the ADR-037 finalize gate and
+/// `awa.storage_auto_finalize_if_fresh`.
+const LIVE_RUNTIME_WINDOW_SECS: i64 = 90;
+
+/// Options controlling a migration run.
+#[derive(Debug, Clone, Default)]
+pub struct MigrateOptions {
+    /// Skip the pre-flight live-runtime check that guards migrations flagged as
+    /// requiring an exclusive window (the CLI `--allow-live-runtimes` flag).
+    /// The check refuses to apply a pending range that includes an
+    /// [`EXCLUSIVE_WINDOW_MIGRATIONS`] version while workers are heartbeating,
+    /// because a pre-migration binary cannot operate against that schema.
+    pub allow_live_runtimes: bool,
+}
+
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
 ///
@@ -269,6 +301,15 @@ fn normalize_legacy_version(old_version: i32) -> i32 {
 ///
 /// Takes `&PgPool` for ergonomic use from Rust.
 pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
+    run_with_options(pool, MigrateOptions::default()).await
+}
+
+/// Run all pending migrations with explicit [`MigrateOptions`].
+///
+/// Identical to [`run`] except the caller can relax the v042 pre-flight
+/// live-runtime check (`allow_live_runtimes`). The CLI wires this to
+/// `--allow-live-runtimes`; the default [`run`] never overrides the check.
+pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<(), AwaError> {
     let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
 
     // Run the version check, ADR-037 finalize gate, and every migration step
@@ -299,7 +340,7 @@ pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
         .bind(lock_key)
         .execute(&mut *tx)
         .await?;
-    apply_migrations(&mut tx).await?;
+    apply_migrations(&mut tx, &options).await?;
     tx.commit().await?;
 
     // Best-effort admin-metadata cache warmup, deliberately outside the
@@ -310,11 +351,29 @@ pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
     Ok(())
 }
 
-async fn apply_migrations(conn: &mut PgConnection) -> Result<(), AwaError> {
+async fn apply_migrations(
+    conn: &mut PgConnection,
+    options: &MigrateOptions,
+) -> Result<(), AwaError> {
     let has_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
             .fetch_one(&mut *conn)
             .await?;
+
+    // Fail safe on a schema newer than this binary *before* any legacy
+    // normalization runs. `current_version_conn` rewrites `schema_version`
+    // when its legacy heuristic fires, and that heuristic also matched a
+    // schema newer than the binary — an older binary against a v>CURRENT_VERSION
+    // schema would delete the version history and re-apply migrations onto the
+    // newer physical layout, crashing mid-way and leaving split-brain metadata
+    // (#392). Refuse loudly here with the raw max version, before touching a row.
+    // This protects forward skews (e.g. a 0.7 binary against a future 0.8
+    // schema); it cannot retroactively fix binaries that predate this guard.
+    if has_schema {
+        if let Some(newer) = schema_newer_than_binary(conn).await? {
+            return Err(newer);
+        }
+    }
 
     let current = if has_schema {
         current_version_conn(conn).await?
@@ -326,16 +385,53 @@ async fn apply_migrations(conn: &mut PgConnection) -> Result<(), AwaError> {
         check_storage_finalized_gate(conn).await?;
     }
 
+    // Pre-flight: if the pending range includes a migration flagged as needing
+    // an exclusive window (a pre-migration binary cannot operate against the
+    // post-migration schema — currently v042), refuse while any worker is still
+    // heartbeating. Uses last_seen_at staleness, not the `healthy` flag, because
+    // a hard-killed worker leaves healthy=true forever (rehearsal finding).
+    // `--allow-live-runtimes` skips the check.
+    if has_schema && !options.allow_live_runtimes {
+        if let Some(exclusive) = exclusive_window_in_range(current) {
+            check_live_runtimes_gate(conn, exclusive).await?;
+        }
+    }
+
     if !(has_schema && current == CURRENT_VERSION) {
+        let pending: Vec<i32> = MIGRATIONS
+            .iter()
+            .filter(|&&(v, _, _)| v > current)
+            .map(|&(v, _, _)| v)
+            .collect();
+        // One up-front plan line so an operator sees the whole range before the
+        // first (possibly multi-second) step — some v0.7 migrations reinstall
+        // the queue-storage substrate and run ~8s each, which look like hangs
+        // without a plan and per-step timing (rehearsal finding).
+        if let (Some(&first), Some(&last)) = (pending.first(), pending.last()) {
+            info!(
+                current_version = current,
+                target_version = last,
+                pending_count = pending.len(),
+                first_pending = first,
+                "Applying pending migrations v{first}..v{last} ({} migration{})",
+                pending.len(),
+                if pending.len() == 1 { "" } else { "s" },
+            );
+        }
         for &(version, description, steps) in MIGRATIONS {
             if version <= current {
                 continue;
             }
-            info!(version, description, "Applying migration");
+            info!(version, description, "Applying migration v{version}");
+            let started = std::time::Instant::now();
             for step in steps {
                 sqlx::raw_sql(step).execute(&mut *conn).await?;
             }
-            info!(version, "Migration applied");
+            let elapsed_ms = started.elapsed().as_millis();
+            info!(
+                version,
+                elapsed_ms, "Migration v{version} applied in {elapsed_ms}ms"
+            );
         }
     } else {
         info!(version = current, "Schema is up to date");
@@ -499,6 +595,107 @@ async fn recently_live_runtimes_exist(conn: &mut PgConnection) -> Result<bool, A
     Ok(exists)
 }
 
+/// If the raw `MAX(version)` recorded in `awa.schema_version` is greater than
+/// [`CURRENT_VERSION`], return the [`AwaError::SchemaNewerThanBinary`] that a
+/// migrate path should surface; otherwise `None`. Pure read — no writes.
+///
+/// `conn` must already have the `awa` schema (callers probe `has_schema`
+/// first); a missing `schema_version` table reads as version 0.
+async fn schema_newer_than_binary(conn: &mut PgConnection) -> Result<Option<AwaError>, AwaError> {
+    let has_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'schema_version')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !has_table {
+        return Ok(None);
+    }
+    let raw: Option<i32> = sqlx::query_scalar("SELECT MAX(version) FROM awa.schema_version")
+        .fetch_one(&mut *conn)
+        .await?;
+    let raw = raw.unwrap_or(0);
+    if raw > CURRENT_VERSION {
+        return Ok(Some(AwaError::SchemaNewerThanBinary {
+            found: raw,
+            supported: CURRENT_VERSION,
+        }));
+    }
+    Ok(None)
+}
+
+/// The lowest [`EXCLUSIVE_WINDOW_MIGRATIONS`] version in the pending range
+/// `(current, CURRENT_VERSION]`, or `None` if the range crosses no flagged
+/// migration. Used to decide whether the live-runtime pre-flight applies and,
+/// if so, which migration to name in the refusal.
+fn exclusive_window_in_range(current: i32) -> Option<i32> {
+    EXCLUSIVE_WINDOW_MIGRATIONS
+        .iter()
+        .copied()
+        .filter(|&v| v > current && v <= CURRENT_VERSION)
+        .min()
+}
+
+/// Pre-flight gate for a migration that requires an exclusive upgrade window:
+/// refuse if any worker is heartbeating within [`LIVE_RUNTIME_WINDOW_SECS`].
+/// `migration_version` is the flagged migration being crossed (named in the
+/// error for the operator).
+///
+/// Liveness is measured by `last_seen_at` staleness, deliberately **not** the
+/// `runtime_instances.healthy` flag: a hard-killed (`kill -9`) worker never
+/// clears `healthy`, so it stays `true` forever and would let a live fleet
+/// slip through. `runtime_instances` may be absent on a pre-v0.6 schema, so
+/// guard with `to_regclass`.
+async fn check_live_runtimes_gate(
+    conn: &mut PgConnection,
+    migration_version: i32,
+) -> Result<(), AwaError> {
+    if !relation_exists(conn, "runtime_instances").await? {
+        return Ok(());
+    }
+
+    // One scan: the live runtimes with their heartbeat age, host, and pid for
+    // the operator. `instance_id`/`hostname`/`pid` are present since v002.
+    let live: Vec<(String, Option<String>, i32, i64)> = sqlx::query_as(
+        "SELECT instance_id::text, hostname, pid, \
+                floor(extract(epoch FROM (now() - last_seen_at)))::bigint AS age_secs \
+         FROM awa.runtime_instances \
+         WHERE last_seen_at + make_interval(secs => $1) >= now() \
+         ORDER BY last_seen_at DESC",
+    )
+    .bind(LIVE_RUNTIME_WINDOW_SECS)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    if live.is_empty() {
+        return Ok(());
+    }
+
+    let count = live.len() as i64;
+    let newest_secs = live.first().map(|(_, _, _, age)| *age).unwrap_or(0);
+    // Name up to a few instances so the operator can find them; summarize the rest.
+    const SHOWN: usize = 5;
+    let mut listed: Vec<String> = live
+        .iter()
+        .take(SHOWN)
+        .map(|(id, host, pid, age)| {
+            let host = host.as_deref().unwrap_or("?");
+            format!("{id} @ {host} pid {pid} ({age}s ago)")
+        })
+        .collect();
+    if live.len() > SHOWN {
+        listed.push(format!("… and {} more", live.len() - SHOWN));
+    }
+    let instances = format!(" Live runtimes: {}.", listed.join(", "));
+
+    Err(AwaError::LiveRuntimesRequireExclusiveWindow {
+        migration_version,
+        count,
+        plural: if count == 1 { "" } else { "s" },
+        newest_secs,
+        instances,
+    })
+}
+
 /// Read-only schema version probe: the raw `MAX(version)` with no legacy
 /// normalization and **no writes**.
 ///
@@ -529,6 +726,23 @@ pub async fn current_version_readonly(pool: &PgPool) -> Result<i32, AwaError> {
         .fetch_one(&mut *conn)
         .await?;
     Ok(version.unwrap_or(0))
+}
+
+/// Run the live-runtime pre-flight for a specific migration version, as if that
+/// version were flagged as requiring an exclusive window.
+///
+/// This is the same check `run` applies internally when the pending range
+/// includes an [`EXCLUSIVE_WINDOW_MIGRATIONS`] version (currently v042). This
+/// entry point lets the mechanism be exercised directly (tests, or tooling that
+/// wants to assert an exclusive window before a manual migration) with an
+/// arbitrary version. Read-only: no writes, no lock. Returns `Ok(())` when no
+/// worker has heartbeated within the staleness window.
+pub async fn check_exclusive_window_preflight(
+    pool: &PgPool,
+    migration_version: i32,
+) -> Result<(), AwaError> {
+    let mut conn = pool.acquire().await?;
+    check_live_runtimes_gate(&mut conn, migration_version).await
 }
 
 /// Get the current schema version.
@@ -562,6 +776,15 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
         .await?;
 
     let raw_version = version.unwrap_or(0);
+
+    // A schema newer than this binary must never be treated as legacy
+    // numbering: `normalize_legacy_version` would map e.g. v42 → 4 and the
+    // block below would destructively rewrite the version history (#392).
+    // Return the raw version untouched — no writes — and let the migrate path
+    // refuse loudly (see `schema_newer_than_binary`).
+    if raw_version > CURRENT_VERSION {
+        return Ok(raw_version);
+    }
 
     // If max version is within the current MIGRATIONS range and the expected
     // tables exist, this is a current install — skip legacy detection.

@@ -35,9 +35,19 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         awa_model::AwaError::SchemaNotMigrated { expected, found } => SchemaNotMigrated::new_err(
             format!("schema not migrated: expected version {expected}, found {found}"),
         ),
+        // Same schema-version family as SchemaNotMigrated; the Display impl
+        // carries the "upgrade the binaries" guidance — pass it through (#392).
+        err @ awa_model::AwaError::SchemaNewerThanBinary { .. } => {
+            SchemaNotMigrated::new_err(err.to_string())
+        }
         // The Display impl carries the full operator guidance (finalize
         // steps + upgrade guide links) — pass it through verbatim.
         err @ awa_model::AwaError::StorageNotFinalized { .. } => {
+            StorageNotFinalized::new_err(err.to_string())
+        }
+        // Same operator-gate family as StorageNotFinalized — a pre-flight
+        // refusal with actionable guidance in the Display impl.
+        err @ awa_model::AwaError::LiveRuntimesRequireExclusiveWindow { .. } => {
             StorageNotFinalized::new_err(err.to_string())
         }
         awa_model::AwaError::UnknownJobKind { kind } => {
