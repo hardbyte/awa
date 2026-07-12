@@ -52,6 +52,15 @@ DECLARE
     v_slot           INT;
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
+    -- #371 staged rolling upgrade: was this a FRESH install (the ring
+    -- state did not exist before this call) or an UPGRADE of an existing
+    -- schema? A fresh install has no old binaries that could still read
+    -- the compat columns, so it starts directly in ledger authority; an
+    -- upgrade starts in columns authority and flips later once the fleet
+    -- has fully rolled to 0.7. We probe the queue ring, which is present
+    -- on every installed shape (0.6, the unreleased shipped-v042 dev
+    -- shape, and fresh).
+    v_fresh_install  BOOLEAN;
 BEGIN
     IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
         RAISE EXCEPTION 'install_queue_storage_substrate: schema name must match ^[a-z_][a-z0-9_]*$; got %',
@@ -113,17 +122,30 @@ BEGIN
     -- Ring-state singletons (queue / lease / claim), rotation ledgers,
     -- and slot tables.
     --
-    -- #371: the ring cursor lives in an append-only rotation ledger
-    -- (`{ring}_ring_rotations`); the current cursor is the max-generation
-    -- row (backward PK scan, O(1)). The `{ring}_ring_state` singletons are
-    -- demoted to cold per-schema config (`slot_count`, plus the #290 trust
-    -- marker on the queue ring) and are no longer written per rotation.
-    -- The legacy `current_slot` / `generation` cursor columns are DROPPED
-    -- after being copied into the ledger: a pre-0.7 binary reading a stale
-    -- frozen cursor would silently misroute writes, while a missing column
-    -- is a loud, safe failure. This is a deliberate exception to the
-    -- additive-only migration policy — see the v042 migration notes.
+    -- #371 STAGED ROLLING UPGRADE (revises the original stop-the-world
+    -- v042). The ring cursor has two representations that coexist during a
+    -- rolling upgrade, selected per schema by `{schema}.ring_cursor_authority`:
+    --
+    --   * `columns` (compat) — the pre-0.7 mutable `{ring}_ring_state`
+    --     `current_slot` / `generation` singleton columns are authoritative,
+    --     exactly as 0.6 wrote them. 0.7 rotators additionally shadow every
+    --     advance into the append-only `{ring}_ring_rotations` ledger, so
+    --     the ledger is an eventually-consistent copy ready for the flip.
+    --   * `ledger` — the current cursor is the max-generation row of the
+    --     append-only ledger (backward PK scan, O(1)); the singleton columns
+    --     go stale (a returning 0.6 binary is fenced off — see the flip).
+    --
+    -- This keeps the migration ADDITIVE: the compat columns are RESTORED,
+    -- not dropped, so a mixed 0.6/0.7 fleet runs against one database with
+    -- no stop-the-world window. The one-way `columns -> ledger` flip
+    -- (manual `awa storage flip-ring-authority` or the maintenance auto-flip
+    -- once the fleet has fully rolled to 0.7) is what finally retires the
+    -- columns; the 0.8 contract migration drops them. Fresh installs skip
+    -- straight to `ledger` because no old binary can exist.
     --------------------------------------------------------------------
+
+    -- Fresh vs. upgrade: probe BEFORE the CREATE IF NOT EXISTS below.
+    v_fresh_install := to_regclass(format('%I.queue_ring_state', p_schema)) IS NULL;
 
     EXECUTE format(
         $ddl$
@@ -167,33 +189,71 @@ BEGIN
         p_schema
     );
 
-    -- Upgrade path: seed the ledger from the legacy singleton cursor
-    -- BEFORE dropping the columns, so the current cursor survives the
-    -- representation change exactly.
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = p_schema
-          AND table_name = 'queue_ring_state'
-          AND column_name = 'current_slot'
-    ) THEN
-        EXECUTE format(
-            'INSERT INTO %1$I.queue_ring_rotations (generation, slot) SELECT generation, current_slot FROM %1$I.queue_ring_state WHERE singleton ON CONFLICT (generation) DO NOTHING',
-            p_schema
-        );
-        EXECUTE format(
-            'ALTER TABLE %I.queue_ring_state DROP COLUMN current_slot, DROP COLUMN generation',
-            p_schema
-        );
-    END IF;
+    -- Compat columns are ADDITIVE (#371 staged upgrade). Restore the
+    -- pre-0.7 mutable cursor columns if they are absent:
+    --   * a 0.6 schema still HAS them (0.6 wrote them) — the ADD ... IF NOT
+    --     EXISTS is a no-op and the live cursor is preserved as-is;
+    --   * the unreleased shipped-v042 dev shape DROPPED them — re-ADD and
+    --     re-seed from the ledger's max-generation row (the inverse of the
+    --     original seed), so the current cursor survives either direction.
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.queue_ring_state
+            ADD COLUMN IF NOT EXISTS current_slot INT,
+            ADD COLUMN IF NOT EXISTS generation   BIGINT
+        $ddl$,
+        p_schema
+    );
 
     EXECUTE format(
         'INSERT INTO %I.queue_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
         p_schema, p_queue_slot_count
     );
 
-    -- Genesis cursor for fresh installs: slot 0, generation 0.
+    -- Genesis cursor for fresh installs: slot 0, generation 0. Runs before
+    -- the seed reconciliation below so a fresh ledger has its genesis row.
     EXECUTE format(
         'INSERT INTO %1$I.queue_ring_rotations (generation, slot) SELECT 0, 0 WHERE NOT EXISTS (SELECT 1 FROM %1$I.queue_ring_rotations)',
+        p_schema
+    );
+
+    -- Reconcile the two representations so BOTH agree on the current
+    -- cursor before any rotator runs, regardless of which one arrived
+    -- populated:
+    --   * columns NULL (fresh, or the dev-shape v042 that dropped them) ->
+    --     seed columns from the ledger's max-generation row (genesis 0/0 on
+    --     a fresh install);
+    --   * columns populated but the ledger is behind (0.6 upgrade — the
+    --     ledger was just created empty except for genesis) -> append the
+    --     column cursor as the ledger's current row. Only the current row
+    --     is needed: the ledger fold trims to one wrap anyway, and sealed-
+    --     slot enumeration derives older generations arithmetically
+    --     (`slot = generation mod slot_count`).
+    EXECUTE format(
+        $ddl$
+        UPDATE %1$I.queue_ring_state AS s
+        SET current_slot = ledger.slot,
+            generation   = ledger.generation
+        FROM (
+            SELECT slot, generation
+            FROM %1$I.queue_ring_rotations
+            ORDER BY generation DESC
+            LIMIT 1
+        ) AS ledger
+        WHERE s.singleton
+          AND s.current_slot IS NULL
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        INSERT INTO %1$I.queue_ring_rotations (generation, slot)
+        SELECT s.generation, s.current_slot
+        FROM %1$I.queue_ring_state AS s
+        WHERE s.singleton AND s.generation IS NOT NULL
+        ON CONFLICT (generation) DO NOTHING
+        $ddl$,
         p_schema
     );
 
@@ -206,12 +266,16 @@ BEGIN
         p_schema
     );
 
-    -- #371: per-slot generations are derived from the rotation ledger
-    -- (`slot = generation mod slot_count`; rotation advances both by
-    -- exactly one), so the mutable per-rotate generation column is gone.
-    -- The slot rows remain as row-lock targets and cursor holders.
+    -- #371 staged upgrade: the per-slot `generation` column is ADDITIVE.
+    -- In ledger authority it is derived from the cursor (`slot = generation
+    -- mod slot_count`; rotation advances both in lock-step) and left
+    -- untouched, but a 0.6 rotator in a mixed fleet still UPDATEs it on
+    -- every advance, so it must exist. Restore it (no-op on a 0.6 schema
+    -- that never dropped it; re-seed to the derived value on the dev-shape
+    -- v042 that dropped it). NOT NULL DEFAULT -1 matches the pre-0.7 shape:
+    -- -1 means "never rotated through".
     EXECUTE format(
-        'ALTER TABLE %I.queue_ring_slots DROP COLUMN IF EXISTS generation',
+        'ALTER TABLE %I.queue_ring_slots ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT -1',
         p_schema
     );
 
@@ -262,21 +326,16 @@ BEGIN
         p_schema
     );
 
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = p_schema
-          AND table_name = 'lease_ring_state'
-          AND column_name = 'current_slot'
-    ) THEN
-        EXECUTE format(
-            'INSERT INTO %1$I.lease_ring_rotations (generation, slot) SELECT generation, current_slot FROM %1$I.lease_ring_state WHERE singleton ON CONFLICT (generation) DO NOTHING',
-            p_schema
-        );
-        EXECUTE format(
-            'ALTER TABLE %I.lease_ring_state DROP COLUMN current_slot, DROP COLUMN generation',
-            p_schema
-        );
-    END IF;
+    -- Compat columns are additive; restore + reconcile against the ledger
+    -- (see the queue-ring block above for the full rationale).
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.lease_ring_state
+            ADD COLUMN IF NOT EXISTS current_slot INT,
+            ADD COLUMN IF NOT EXISTS generation   BIGINT
+        $ddl$,
+        p_schema
+    );
 
     EXECUTE format(
         'INSERT INTO %I.lease_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
@@ -290,6 +349,29 @@ BEGIN
 
     EXECUTE format(
         $ddl$
+        UPDATE %1$I.lease_ring_state AS s
+        SET current_slot = ledger.slot, generation = ledger.generation
+        FROM (
+            SELECT slot, generation FROM %1$I.lease_ring_rotations
+            ORDER BY generation DESC LIMIT 1
+        ) AS ledger
+        WHERE s.singleton AND s.current_slot IS NULL
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        INSERT INTO %1$I.lease_ring_rotations (generation, slot)
+        SELECT s.generation, s.current_slot FROM %1$I.lease_ring_state AS s
+        WHERE s.singleton AND s.generation IS NOT NULL
+        ON CONFLICT (generation) DO NOTHING
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
         CREATE TABLE IF NOT EXISTS %I.lease_ring_slots (
             slot INT PRIMARY KEY
         )
@@ -297,8 +379,9 @@ BEGIN
         p_schema
     );
 
+    -- Per-slot generation is additive (compat rotators still write it).
     EXECUTE format(
-        'ALTER TABLE %I.lease_ring_slots DROP COLUMN IF EXISTS generation',
+        'ALTER TABLE %I.lease_ring_slots ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT -1',
         p_schema
     );
 
@@ -350,21 +433,16 @@ BEGIN
         p_schema
     );
 
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = p_schema
-          AND table_name = 'claim_ring_state'
-          AND column_name = 'current_slot'
-    ) THEN
-        EXECUTE format(
-            'INSERT INTO %1$I.claim_ring_rotations (generation, slot) SELECT generation, current_slot FROM %1$I.claim_ring_state WHERE singleton ON CONFLICT (generation) DO NOTHING',
-            p_schema
-        );
-        EXECUTE format(
-            'ALTER TABLE %I.claim_ring_state DROP COLUMN current_slot, DROP COLUMN generation',
-            p_schema
-        );
-    END IF;
+    -- Compat columns are additive; restore + reconcile against the ledger
+    -- (see the queue-ring block above for the full rationale).
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.claim_ring_state
+            ADD COLUMN IF NOT EXISTS current_slot INT,
+            ADD COLUMN IF NOT EXISTS generation   BIGINT
+        $ddl$,
+        p_schema
+    );
 
     EXECUTE format(
         'INSERT INTO %I.claim_ring_state (singleton, slot_count) VALUES (TRUE, %s) ON CONFLICT (singleton) DO NOTHING',
@@ -373,6 +451,29 @@ BEGIN
 
     EXECUTE format(
         'INSERT INTO %1$I.claim_ring_rotations (generation, slot) SELECT 0, 0 WHERE NOT EXISTS (SELECT 1 FROM %1$I.claim_ring_rotations)',
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        UPDATE %1$I.claim_ring_state AS s
+        SET current_slot = ledger.slot, generation = ledger.generation
+        FROM (
+            SELECT slot, generation FROM %1$I.claim_ring_rotations
+            ORDER BY generation DESC LIMIT 1
+        ) AS ledger
+        WHERE s.singleton AND s.current_slot IS NULL
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        INSERT INTO %1$I.claim_ring_rotations (generation, slot)
+        SELECT s.generation, s.current_slot FROM %1$I.claim_ring_state AS s
+        WHERE s.singleton AND s.generation IS NOT NULL
+        ON CONFLICT (generation) DO NOTHING
+        $ddl$,
         p_schema
     );
 
@@ -408,8 +509,9 @@ BEGIN
         p_schema
     );
 
+    -- Per-slot generation is additive (compat rotators still write it).
     EXECUTE format(
-        'ALTER TABLE %I.claim_ring_slots DROP COLUMN IF EXISTS generation',
+        'ALTER TABLE %I.claim_ring_slots ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT -1',
         p_schema
     );
 
@@ -480,6 +582,110 @@ BEGIN
             autovacuum_vacuum_cost_delay = 2
         )
         $ddl$,
+        p_schema
+    );
+
+    --------------------------------------------------------------------
+    -- Ring-cursor authority control (#371 staged rolling upgrade).
+    --
+    -- One row per queue-storage schema selecting which representation of
+    -- the ring cursor is authoritative for every ring in this schema:
+    --   'columns' — the pre-0.7 `{ring}_ring_state` singleton columns
+    --               (compat; a mixed 0.6/0.7 fleet is safe);
+    --   'ledger'  — the append-only `{ring}_ring_rotations` ledgers
+    --               (#371 dead-tuple-free rotation).
+    -- The flip is one-way (columns -> ledger); the CHECK constraint and the
+    -- `awa.flip_ring_authority()` function enforce it. Follows the
+    -- `awa.storage_transition_state` house pattern: a tiny control row that
+    -- state-transition SQL advances, wrapped by Rust.
+    --------------------------------------------------------------------
+
+    EXECUTE format(
+        $ddl$
+        CREATE TABLE IF NOT EXISTS %I.ring_cursor_authority (
+            singleton  BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            authority  TEXT NOT NULL CHECK (authority IN ('columns', 'ledger')),
+            flipped_at TIMESTAMPTZ
+        )
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.ring_cursor_authority SET (
+            fillfactor = 50,
+            autovacuum_vacuum_scale_factor = 0.0,
+            autovacuum_vacuum_threshold = 50
+        )
+        $ddl$,
+        p_schema
+    );
+
+    -- Seed the authority. A FRESH install (the ring state did not exist
+    -- before this call) has no old binaries that could read the compat
+    -- columns, so it starts directly in ledger authority; an UPGRADE of an
+    -- existing schema (0.6, or the unreleased shipped-v042 dev shape)
+    -- starts in columns authority and flips later once the fleet has fully
+    -- rolled to 0.7. ON CONFLICT DO NOTHING preserves an already-flipped
+    -- authority across a re-run of the installer (idempotent, one-way).
+    EXECUTE format(
+        'INSERT INTO %I.ring_cursor_authority (singleton, authority, flipped_at) VALUES (TRUE, %L, %s) ON CONFLICT (singleton) DO NOTHING',
+        p_schema,
+        CASE WHEN v_fresh_install THEN 'ledger' ELSE 'columns' END,
+        CASE WHEN v_fresh_install THEN 'now()' ELSE 'NULL' END
+    );
+
+    -- Per-schema current-cursor resolver honouring the authority. Every
+    -- server-side read of a ring cursor (claim_ready_runtime, the SQL
+    -- producer path insert_job_compat, etc.) goes through this one function
+    -- so the columns/ledger branch lives in exactly one place. Callers wrap
+    -- it in an `AS MATERIALIZED` CTE (loops=1); the function itself reads
+    -- the single-row authority page plus one O(1) cursor read.
+    EXECUTE format(
+        $fn$
+        CREATE OR REPLACE FUNCTION %1$I.ring_cursor(p_ring TEXT)
+        RETURNS TABLE(slot INT, generation BIGINT)
+        LANGUAGE plpgsql
+        STABLE
+        SECURITY INVOKER
+        SET search_path = pg_catalog, %1$I, public
+        AS $body$
+        DECLARE
+            v_authority TEXT;
+        BEGIN
+            IF p_ring NOT IN ('queue', 'lease', 'claim') THEN
+                RAISE EXCEPTION 'ring_cursor: unknown ring %%', p_ring
+                    USING ERRCODE = '22023';
+            END IF;
+
+            SELECT a.authority INTO v_authority
+            FROM ring_cursor_authority AS a
+            WHERE a.singleton;
+
+            IF v_authority = 'ledger' THEN
+                -- Max-generation row of the append-only ledger (backward PK
+                -- scan, O(1)).
+                RETURN QUERY EXECUTE format(
+                    'SELECT slot, generation FROM %%I.%%I ORDER BY generation DESC LIMIT 1',
+                    current_schema(), p_ring || '_ring_rotations'
+                );
+            ELSE
+                -- Compat: the pre-0.7 mutable singleton columns are
+                -- authoritative (a live 0.6 rotator keeps them current).
+                RETURN QUERY EXECUTE format(
+                    'SELECT current_slot, generation FROM %%I.%%I WHERE singleton',
+                    current_schema(), p_ring || '_ring_state'
+                );
+            END IF;
+        END;
+        $body$
+        $fn$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'REVOKE EXECUTE ON FUNCTION %I.ring_cursor(TEXT) FROM PUBLIC',
         p_schema
     );
 
@@ -2869,18 +3075,18 @@ BEGIN
         v_claimed_cte := format(
             $cte$
             claim_ring AS MATERIALIZED (
-                -- #371: current claim cursor = max-generation ledger row
-                -- (backward PK scan, O(1)). MATERIALIZED pins it to a
-                -- single evaluation: this single-reference CTE would
-                -- otherwise be inlined and re-run the backward index
-                -- descent once per selected row (loops=N) on the inner
-                -- side of the claim_attempt_batches nested loop. The
-                -- pre-ledger claim_ring_state singleton was one cached
-                -- read; the per-row ledger descent regressed claim yield.
+                -- #371: current claim cursor via the authority resolver
+                -- (columns in compat mode, max-generation ledger row in
+                -- ledger mode). MATERIALIZED pins it to a single evaluation:
+                -- this single-reference CTE would otherwise be inlined and
+                -- re-run the resolver once per selected row (loops=N) on the
+                -- inner side of the claim_attempt_batches nested loop. The
+                -- pre-ledger claim_ring_state singleton was one cached read,
+                -- so the per-row re-execution regressed claim yield; one
+                -- authority-row read + one O(1) cursor read, materialized,
+                -- keeps loops=1.
                 SELECT slot AS claim_slot
-                FROM %1$I.claim_ring_rotations
-                ORDER BY generation DESC
-                LIMIT 1
+                FROM %1$I.ring_cursor('claim')
             ),
             claim_attempt_batches AS (
                 INSERT INTO %1$I.ready_claim_attempt_batches AS attempt_rows (
@@ -3653,18 +3859,16 @@ BEGIN
 
             RETURN QUERY
             WITH lease_ring AS MATERIALIZED (
-                -- #371: current lease cursor = max-generation ledger row
-                -- (backward PK scan, O(1)). MATERIALIZED pins it to a
-                -- single evaluation: this single-reference CTE would
-                -- otherwise be inlined and re-run the backward index
-                -- descent once per claimed row (loops=N) on the inner
-                -- side of the final CROSS JOIN. The pre-ledger
-                -- lease_ring_state singleton was one cached read; the
-                -- per-row ledger descent regressed claim yield.
+                -- #371: current lease cursor via the authority resolver
+                -- (columns in compat mode, max-generation ledger row in
+                -- ledger mode). MATERIALIZED pins it to a single evaluation:
+                -- this single-reference CTE would otherwise be inlined and
+                -- re-run the resolver once per claimed row (loops=N) on the
+                -- inner side of the final CROSS JOIN. The pre-ledger
+                -- lease_ring_state singleton was one cached read, so per-row
+                -- re-execution regressed claim yield; materialized, loops=1.
                 SELECT slot AS lease_slot, generation AS lease_generation
-                FROM %1$I.lease_ring_rotations
-                ORDER BY generation DESC
-                LIMIT 1
+                FROM %1$I.ring_cursor('lease')
             ),
             selected AS (
                 SELECT
@@ -3880,13 +4084,11 @@ BEGIN
 
     IF to_regclass('awa.lease_claims_legacy') IS NOT NULL
        OR to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
-        -- #371: the install above seeded the rotation ledger; the current
-        -- claim cursor is the max-generation row.
+        -- #371: the install above seeded both cursor representations and
+        -- the authority resolver; read the current claim cursor through it.
         SELECT slot
         INTO v_legacy_claim_slot
-        FROM awa.claim_ring_rotations
-        ORDER BY generation DESC
-        LIMIT 1;
+        FROM awa.ring_cursor('claim');
     END IF;
 
     IF to_regclass('awa.lease_claims_legacy') IS NOT NULL THEN
