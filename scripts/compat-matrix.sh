@@ -71,6 +71,16 @@ uv pip install --quiet --python .compat-venv-057 "awa-pg==0.5.7"
 
 echo "── leg: forward-0.6.0 (full lifecycle on newest schema)"
 DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-060/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
+fence_state=$(psql "${BASE_URL}/${FWD_DB}" -qAt -F '|' -c \
+  "SELECT a.authority, q.current_slot, q.generation
+   FROM awa.ring_cursor_authority AS a
+   CROSS JOIN awa.queue_ring_state AS q
+   WHERE a.singleton AND q.singleton")
+if [ "$fence_state" != "ledger|-1|-1" ]; then
+  echo "FAIL: pinned 0.6.0 maintenance crossed the ledger-authority fence ($fence_state)" >&2
+  exit 1
+fi
+echo "0.6.0 maintenance was fenced; compat cursor remains poisoned ($fence_state)"
 
 echo "── leg: forward-0.5.7 (producer routes, worker inert)"
 DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-057/bin/python "${SCRIPT_DIR}/compat/forward_057.py"

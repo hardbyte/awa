@@ -1739,6 +1739,9 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     // FROM the ledger max (3, 19) and keep authority 'columns'.
     sqlx::raw_sql(&format!(
         r#"
+        DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.queue_ring_state;
+        DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.lease_ring_state;
+        DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.claim_ring_state;
         ALTER TABLE {schema}.queue_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
         ALTER TABLE {schema}.lease_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
         ALTER TABLE {schema}.claim_ring_state DROP COLUMN current_slot, DROP COLUMN generation;

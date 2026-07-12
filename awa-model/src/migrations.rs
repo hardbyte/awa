@@ -57,7 +57,7 @@ pub struct MigrateOptions {
 /// `current_slot` / `generation` singleton columns (and the per-slot
 /// `generation` column), selecting the authoritative representation per
 /// schema via `{schema}.ring_cursor_authority` (`columns` on upgrade,
-/// `ledger` on fresh install). A mixed 0.6/0.7 fleet is safe: no stop-the-
+/// `ledger` on fresh install). A mixed 0.6.2/0.7 fleet is safe: no stop-the-
 /// world window. The one-way `columns -> ledger` flip
 /// (`awa.flip_ring_authority`, or the maintenance auto-flip) retires the
 /// columns' authority once the fleet is fully 0.7; the 0.8 contract

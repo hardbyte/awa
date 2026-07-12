@@ -109,7 +109,7 @@ where
 /// schema (#371 staged rolling upgrade). Mirrors `awa.ring_authority_status`.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq)]
 pub struct RingAuthorityStatus {
-    /// `"columns"` (compat; mixed 0.6/0.7 fleet safe) or `"ledger"`.
+    /// `"columns"` (compat; mixed 0.6.2/0.7 fleet safe) or `"ledger"`.
     pub authority: String,
     /// When the one-way flip to `ledger` happened (NULL until flipped, or
     /// set at install time for a fresh install that started in `ledger`).

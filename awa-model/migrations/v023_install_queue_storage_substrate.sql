@@ -50,6 +50,7 @@ SET search_path = pg_catalog, awa, public
 AS $install$
 DECLARE
     v_slot           INT;
+    v_ring           TEXT;
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
     -- #371 staged rolling upgrade: was this a FRESH install (the ring
@@ -133,10 +134,10 @@ BEGIN
     --     the ledger is an eventually-consistent copy ready for the flip.
     --   * `ledger` — the current cursor is the max-generation row of the
     --     append-only ledger (backward PK scan, O(1)); the singleton columns
-    --     go stale (a returning 0.6 binary is fenced off — see the flip).
+    --     go stale (a returning pre-ledger binary is fenced off — see the flip).
     --
     -- This keeps the migration ADDITIVE: the compat columns are RESTORED,
-    -- not dropped, so a mixed 0.6/0.7 fleet runs against one database with
+    -- not dropped, so a mixed 0.6.2/0.7 fleet runs against one database with
     -- no stop-the-world window. The one-way `columns -> ledger` flip
     -- (manual `awa storage flip-ring-authority` or the maintenance auto-flip
     -- once the fleet has fully rolled to 0.7) is what finally retires the
@@ -596,7 +597,7 @@ BEGIN
     -- One row per queue-storage schema selecting which representation of
     -- the ring cursor is authoritative for every ring in this schema:
     --   'columns' — the pre-0.7 `{ring}_ring_state` singleton columns
-    --               (compat; a mixed 0.6/0.7 fleet is safe);
+    --               (compat; a mixed 0.6.2/0.7 fleet is safe);
     --   'ledger'  — the append-only `{ring}_ring_rotations` ledgers
     --               (#371 dead-tuple-free rotation).
     -- The flip is one-way (columns -> ledger); the CHECK constraint and the
@@ -640,6 +641,73 @@ BEGIN
         CASE WHEN v_fresh_install THEN 'ledger' ELSE 'columns' END,
         CASE WHEN v_fresh_install THEN 'now()' ELSE 'NULL' END
     );
+
+    -- A fresh ledger-authority install has no compat window. Poison the
+    -- legacy cursor immediately so a pre-ledger binary cannot attach later
+    -- and silently route through the stale singleton columns. Upgrade
+    -- installs remain in `columns` authority and retain their live cursor.
+    IF v_fresh_install THEN
+        EXECUTE format(
+            'UPDATE %I.queue_ring_state SET current_slot = -1, generation = -1 WHERE singleton',
+            p_schema
+        );
+        EXECUTE format(
+            'UPDATE %I.lease_ring_state SET current_slot = -1, generation = -1 WHERE singleton',
+            p_schema
+        );
+        EXECUTE format(
+            'UPDATE %I.claim_ring_state SET current_slot = -1, generation = -1 WHERE singleton',
+            p_schema
+        );
+    END IF;
+
+    -- Database-enforced post-flip fence. A pre-ledger rotator computes slot
+    -- zero from the -1 sentinel, so the sentinel alone is not a fence. This
+    -- trigger rejects any old-style cursor advance once ledger authority is
+    -- active. Current code only locks these rows in ledger mode; unrelated
+    -- cold metadata updates on queue_ring_state remain allowed.
+    EXECUTE format(
+        $fn$
+        CREATE OR REPLACE FUNCTION %1$I.reject_compat_ring_cursor_update_after_flip()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SECURITY INVOKER
+        SET search_path = pg_catalog, %1$I, public
+        AS $body$
+        DECLARE
+            v_ledger_authority BOOLEAN := FALSE;
+        BEGIN
+            IF to_regclass(format('%%I.ring_cursor_authority', TG_TABLE_SCHEMA)) IS NOT NULL THEN
+                EXECUTE format(
+                    'SELECT EXISTS (SELECT 1 FROM %%I.ring_cursor_authority WHERE singleton AND authority = ''ledger'')',
+                    TG_TABLE_SCHEMA
+                ) INTO v_ledger_authority;
+            END IF;
+
+            IF (NEW.current_slot, NEW.generation)
+                   IS DISTINCT FROM (OLD.current_slot, OLD.generation)
+               AND v_ledger_authority THEN
+                RAISE EXCEPTION 'pre-ledger ring cursor update rejected after ledger-authority flip'
+                    USING ERRCODE = '55000';
+            END IF;
+            RETURN NEW;
+        END;
+        $body$
+        $fn$,
+        p_schema
+    );
+
+    FOR v_ring IN SELECT unnest(ARRAY['queue', 'lease', 'claim'])
+    LOOP
+        EXECUTE format(
+            'DROP TRIGGER IF EXISTS reject_compat_ring_cursor_update_after_flip ON %I.%I_ring_state',
+            p_schema, v_ring
+        );
+        EXECUTE format(
+            'CREATE TRIGGER reject_compat_ring_cursor_update_after_flip BEFORE UPDATE OF current_slot, generation ON %I.%I_ring_state FOR EACH ROW EXECUTE FUNCTION %I.reject_compat_ring_cursor_update_after_flip()',
+            p_schema, v_ring, p_schema
+        );
+    END LOOP;
 
     -- Per-schema current-cursor resolver honouring the authority. Every
     -- server-side read of a ring cursor (claim_ready_runtime, the SQL

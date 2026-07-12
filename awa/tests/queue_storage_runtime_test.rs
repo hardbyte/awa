@@ -4340,6 +4340,27 @@ async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) 
     .execute(pool)
     .await
     .expect("set ring authority");
+
+    // Fresh installs start in ledger authority with poisoned compat columns.
+    // Tests that explicitly model an upgrade's compat window must restore
+    // those columns from the ledger after moving authority back to columns.
+    if authority == "columns" {
+        for ring in ["queue", "lease", "claim"] {
+            sqlx::query(&format!(
+                "UPDATE {schema}.{ring}_ring_state AS state \
+                 SET current_slot = cursor.slot, generation = cursor.generation \
+                 FROM ( \
+                     SELECT slot, generation \
+                     FROM {schema}.{ring}_ring_rotations \
+                     ORDER BY generation DESC LIMIT 1 \
+                 ) AS cursor \
+                 WHERE state.singleton"
+            ))
+            .execute(pool)
+            .await
+            .expect("restore compat cursor from ledger");
+        }
+    }
 }
 
 async fn ring_authority(pool: &sqlx::PgPool, schema: &str) -> String {
@@ -4511,11 +4532,11 @@ async fn test_compat_mode_reconciles_externally_casd_columns() {
     );
 }
 
-/// #371 staged upgrade: the one-way flip poisons the stale compat columns
-/// (`current_slot = -1`) so a returning pre-flip binary fails loudly, and
-/// switches the authority so reads come from the ledger.
+/// #371 staged upgrade: the one-way flip reconciles every shadow ledger,
+/// poisons the stale compat cursor/prune metadata, and rejects a returning
+/// pre-ledger binary's old-style cursor advance at the database boundary.
 #[tokio::test]
-async fn test_flip_poisons_columns_and_switches_authority() {
+async fn test_flip_reconciles_ledgers_and_fences_old_cursor_updates() {
     let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_flip_poison";
     let store = create_store_with_config(
@@ -4540,6 +4561,25 @@ async fn test_flip_poisons_columns_and_switches_authority() {
     store.rotate(&pool).await.expect("compat rotate");
     assert_eq!(ring_columns_cursor(&pool, schema, "queue").await, (1, 1));
 
+    // Simulate a 0.6 rotator being the final writer before the flip. It
+    // advances only the compat columns, leaving every shadow ledger behind.
+    // The flip itself must reconcile this; relying on a later 0.7 rotation
+    // leaves a TOCTOU window at promotion time.
+    for (ring, slot, generation) in [
+        ("queue", 3, 3_i64),
+        ("lease", 1, 3_i64),
+        ("claim", 2, 2_i64),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE {schema}.{ring}_ring_state SET current_slot = $1, generation = $2 WHERE singleton"
+        ))
+        .bind(slot)
+        .bind(generation)
+        .execute(&pool)
+        .await
+        .expect("simulate final 0.6 cursor advance");
+    }
+
     // Flip (no fresh runtimes -> allowed without force).
     let result = storage::flip_ring_authority(&pool, schema, false)
         .await
@@ -4547,19 +4587,66 @@ async fn test_flip_poisons_columns_and_switches_authority() {
     assert_eq!(result, "ledger");
     assert_eq!(ring_authority(&pool, schema).await, "ledger");
 
-    // Every ring's compat column is poisoned to the -1 sentinel.
-    for ring in ["queue", "lease", "claim"] {
-        let (poisoned_slot, _) = ring_columns_cursor(&pool, schema, ring).await;
+    // The transaction promoted the exact final compat cursor for every ring,
+    // including every missing intermediate generation.
+    for (ring, expected_cursor, expected_rows) in [
+        ("queue", (3, 3), 4),
+        ("lease", (1, 3), 4),
+        ("claim", (2, 2), 3),
+    ] {
         assert_eq!(
-            poisoned_slot, -1,
-            "{ring} compat current_slot poisoned to -1 at flip"
+            ring_cursor(&pool, schema, ring).await,
+            expected_cursor,
+            "{ring} ledger reconciled to the final compat cursor"
+        );
+        assert_eq!(
+            ring_ledger_row_count(&pool, schema, ring).await,
+            expected_rows,
+            "{ring} ledger contains every generation through the promoted cursor"
         );
     }
+
+    // Every ring's compat cursor is fully poisoned. Generation -1 makes the
+    // old lease/claim prune arithmetic return no initialized slot.
+    for ring in ["queue", "lease", "claim"] {
+        let (poisoned_slot, poisoned_generation) = ring_columns_cursor(&pool, schema, ring).await;
+        assert_eq!(
+            (poisoned_slot, poisoned_generation),
+            (-1, -1),
+            "{ring} compat cursor poisoned at flip"
+        );
+    }
+    let initialized_queue_slots: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.queue_ring_slots WHERE generation >= 0"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count legacy queue prune candidates");
+    assert_eq!(
+        initialized_queue_slots, 0,
+        "old queue prune sees no initialized compat slots after the flip"
+    );
+
+    // This is the exact cursor mutation shape used by the pre-ledger
+    // rotator. The -1 sentinel alone would let it compute and persist slot
+    // zero; the trigger must reject that write once authority is ledger.
+    let old_rotate = sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state SET current_slot = 0, generation = 0 WHERE singleton"
+    ))
+    .execute(&pool)
+    .await
+    .expect_err("old-style cursor advance must be fenced after the flip");
+    assert!(
+        old_rotate
+            .to_string()
+            .contains("pre-ledger ring cursor update rejected"),
+        "unexpected old-rotator fence error: {old_rotate}"
+    );
 
     // Ledger cursor is intact and now authoritative; a claim routes off it.
     assert_eq!(
         ring_cursor(&pool, schema, "queue").await,
-        (1, 1),
+        (3, 3),
         "the ledger cursor survives the flip"
     );
     let claimed = store

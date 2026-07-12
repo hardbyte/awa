@@ -231,7 +231,8 @@ TableSpec == [
     \* maintenance cadence, not per job.
     queue_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     lease_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
-    claim_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""]
+    claim_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    ring_cursor_authority  |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""]
 ]
 
 Tables == DOMAIN TableSpec
@@ -606,12 +607,17 @@ CompatRotateClaimsTx == <<
     Mut("Update", "claim_ring_slots"),
     Mut("Insert", "claim_ring_rotations")
 >>
-\* The one-way flip poisons the stale compat columns (current_slot = -1) and
+\* The one-way flip reconciles the ledgers, poisons stale compat cursor/prune
+\* metadata (current_slot = generation = -1), rejects later compat advances, and
 \* sets the authority; a bounded one-shot UPDATE on the cold singletons.
 FlipRingAuthorityTx == <<
     Mut("Update", "queue_ring_state"),
     Mut("Update", "lease_ring_state"),
-    Mut("Update", "claim_ring_state")
+    Mut("Update", "claim_ring_state"),
+    Mut("Update", "queue_ring_slots"),
+    Mut("Update", "lease_ring_slots"),
+    Mut("Update", "claim_ring_slots"),
+    Mut("Update", "ring_cursor_authority")
 >>
 
 RotateClaimsTx == << Mut("Insert", "claim_ring_rotations") >>

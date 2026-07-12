@@ -5,7 +5,7 @@
 Accepted — implemented for 0.7 ([#371](https://github.com/hardbyte/awa/issues/371),
 from the 0.7 performance campaign). Ships as a **staged rolling upgrade**
 (expand → flip → contract) via migration v042 — **no stop-the-world window**,
-safe for a mixed 0.6/0.7 fleet. See the "Staged rolling upgrade" section below,
+safe for a mixed 0.6.2/0.7 fleet after the required 0.6.2 stepping-stone. See the "Staged rolling upgrade" section below,
 `docs/upgrade-0.6-to-0.7.md`, and the CHANGELOG 0.7 upgrade notes.
 
 ## Context
@@ -89,7 +89,9 @@ cursor's representation.
 
 The cutover from the mutable singleton columns to the ledger is delivered as a
 staged upgrade so it needs **no stop-the-world window** and tolerates a mixed
-0.6/0.7 fleet. Each queue-storage schema carries a `ring_cursor_authority`
+0.6.2/0.7 fleet. The patched 0.6.2 stepping-stone is mandatory: older 0.6
+migrators can destructively misclassify a newer schema, while 0.6.2 recognizes
+v042 only in compat authority and otherwise fails closed. Each queue-storage schema carries a `ring_cursor_authority`
 control row (`columns` | `ledger`) selecting which representation is
 authoritative for all three rings; the per-schema `ring_cursor(ring)` SQL
 function and the Rust rotate/prune seams branch on it.
@@ -101,9 +103,9 @@ function and the Rust rotate/prune seams branch on it.
   `columns`; fresh installs start in `ledger` (no old binary can exist).
 - **Compat mode (`columns`).** The singleton columns are authoritative, exactly
   as 0.6 wrote them. A 0.7 rotator takes the same `{ring}_ring_state` row
-  `FOR UPDATE` a 0.6 rotator takes (serializing the two), CASes the columns, AND
+  `FOR UPDATE` a 0.6.2 rotator takes (serializing the two), CASes the columns, AND
   shadows the ledger — reconciling first by backfilling any generations an
-  interleaved 0.6 rotator advanced the columns past. Cursor reads come from the
+  interleaved 0.6.2 rotator advanced the columns past. Cursor reads come from the
   columns. So a mixed fleet is correct and the ledger is a faithful, ready-to-
   promote copy.
 - **Flip (one-way `columns → ledger`).** `awa storage flip-ring-authority`, or
@@ -111,9 +113,11 @@ function and the Rust rotate/prune seams branch on it.
   0.7+ `binary_version` (an additive `awa.runtime_instances` column; 0.6 rows
   leave it NULL) continuously for a stable period. The flip is transactional
   across all three rings: it takes the three singletons `FOR UPDATE` (serializing
-  behind every in-flight compat rotator), promotes the authority, and **poisons**
-  the stale columns to `current_slot = -1` — a slot with no partition, so a
-  returning pre-flip binary fails loudly rather than misrouting. A manual flip
+  behind every in-flight compat rotator), reconciles and verifies all three
+  ledgers against the final compat cursors, **poisons** both stale cursor fields
+  and the legacy prune metadata, and activates a database trigger that rejects
+  later old-style cursor advances. A returning pre-flip binary therefore fails
+  loudly rather than rotating from -1 back to 0, misrouting, or pruning a live slot. A manual flip
   refuses (without `--force`) while any fresh-heartbeat runtime is not known to
   be flip-aware.
 - **Lock discipline & the authority-read ordering.** The compat serializer is the
@@ -133,9 +137,10 @@ function and the Rust rotate/prune seams branch on it.
 
 **Positive**
 
-- **No stop-the-world upgrade and no lockstep binary/migration coupling.** The
-  additive expand + staged flip let operators roll binaries and run the migration
-  in either order with a mixed fleet, then promote to the dead-tuple-free ledger
+- **No stop-the-world upgrade and no lockstep 0.7 binary/migration coupling.** After
+  the mandatory rolling 0.6.2 patch step, the additive expand + staged flip let
+  operators roll 0.7 binaries and run the migration in either order with a mixed fleet,
+  then promote to the dead-tuple-free ledger
   once fully on 0.7.
 
 - The busy-path rotation write is an **append**, not an UPDATE: no dead tuple, so
@@ -157,8 +162,9 @@ function and the Rust rotate/prune seams branch on it.
   rotation cadence, reclaimable when the horizon is clear) until it flips. This
   is the deliberate cost of avoiding a stop-the-world window.
 - Rolling a binary back **across the flip** is unsupported: the flip poisons the
-  compat columns, so a pre-flip binary fails loudly. Before the flip, rollback to
-  0.6 is safe. (This replaces the original design's hard "no mixed fleet at all"
+  compat state and database-enforces the cursor fence, so a pre-flip binary fails
+  loudly. Before the flip, rollback to the 0.6.2 stepping-stone is safe. (This
+  replaces the original design's hard "no mixed fleet at all"
   constraint with a narrower "no rollback across the flip".)
 - The compat cursor columns and the per-slot `generation` columns survive until
   the 0.8 contract migration drops them — a small, cold storage cost carried

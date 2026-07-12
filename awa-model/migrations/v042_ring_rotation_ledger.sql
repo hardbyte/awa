@@ -19,14 +19,15 @@
 -- schema carries a `ring_cursor_authority` control row selecting which
 -- representation is authoritative:
 --   * 'columns' — compat: the singleton columns win, exactly as 0.6 wrote
---     them, so a mixed 0.6/0.7 fleet is safe. 0.7 rotators shadow every
+--     them, so a mixed 0.6.2/0.7 fleet is safe. 0.7 rotators shadow every
 --     advance into the ledger, keeping it a ready-to-promote copy.
 --   * 'ledger' — the append-only ledgers win (dead-tuple-free rotation).
 -- Fresh installs start in 'ledger' (no old binary can exist); upgrades
 -- start in 'columns' and flip one-way to 'ledger' once the whole fleet has
 -- rolled to 0.7 — via `awa storage flip-ring-authority` or the maintenance
 -- auto-flip. The flip fences any returning pre-flip binary by poisoning the
--- stale columns (`current_slot = -1`, a slot with no partition). The 0.8
+-- stale cursor/prune metadata and rejecting old-style cursor updates in a
+-- database trigger. The 0.8
 -- contract migration drops the columns for good. See the 0.7 upgrade notes
 -- in CHANGELOG.md, docs/upgrade-0.6-to-0.7.md, and ADR-040.
 --
@@ -220,10 +221,12 @@ $$;
 --     Such a runtime may be a 0.6 (or pre-flip 0.7) binary that would read
 --     the compat columns; flipping out from under it would silently
 --     misroute its writes.
+--   * Reconciles and verifies all three shadow ledgers while the compat
+--     cursor rows are locked, so an old rotator that advanced immediately
+--     before the flip cannot leave the promoted ledger stale.
 --   * Fences any returning pre-flip binary AT flip time: the stale compat
---     columns are poisoned to `current_slot = -1`, a slot that has no
---     partition, so a 0.6 read/CAS fails loudly (see docs/ADR-040) instead
---     of routing into a sealed or nonexistent slot.
+--     cursor and prune metadata are poisoned, and a per-schema trigger
+--     rejects any old-style cursor advance after ledger authority is live.
 --   * Takes `FOR UPDATE` on the three ring-state singletons so it
 --     serializes against any in-flight compat rotator on this schema
 --     before it changes the authority they read.
@@ -238,8 +241,14 @@ SECURITY INVOKER
 SET search_path = pg_catalog, awa, public
 AS $$
 DECLARE
-    v_authority TEXT;
-    v_blocking  BIGINT;
+    v_authority         TEXT;
+    v_blocking          BIGINT;
+    v_ring              TEXT;
+    v_column_slot       INT;
+    v_column_generation BIGINT;
+    v_slot_count        INT;
+    v_ledger_slot       INT;
+    v_ledger_generation BIGINT;
 BEGIN
     IF to_regclass(format('%I.ring_cursor_authority', p_schema)) IS NULL THEN
         RAISE EXCEPTION 'flip_ring_authority: schema % has no ring_cursor_authority (not a queue-storage schema?)',
@@ -270,12 +279,74 @@ BEGIN
         END IF;
     END IF;
 
-    -- Fence returning pre-flip binaries: poison the now-stale compat cursor
-    -- columns to an invalid slot. A pre-flip binary reads current_slot = -1,
-    -- which has no partition, and fails loudly instead of misrouting.
-    EXECUTE format('UPDATE %I.queue_ring_state SET current_slot = -1 WHERE singleton', p_schema);
-    EXECUTE format('UPDATE %I.lease_ring_state SET current_slot = -1 WHERE singleton', p_schema);
-    EXECUTE format('UPDATE %I.claim_ring_state SET current_slot = -1 WHERE singleton', p_schema);
+    -- The singleton locks above establish the final compat cursor for every
+    -- ring. Reconcile each ledger through that generation, then verify the
+    -- row being promoted is exactly the authoritative column cursor. This
+    -- closes the window where a 0.6 rotator advanced columns after the last
+    -- 0.7 compat rotation but immediately before the flip.
+    FOR v_ring IN SELECT unnest(ARRAY['queue', 'lease', 'claim'])
+    LOOP
+        EXECUTE format(
+            'SELECT current_slot, generation, slot_count FROM %I.%I_ring_state WHERE singleton',
+            p_schema, v_ring
+        ) INTO v_column_slot, v_column_generation, v_slot_count;
+
+        IF v_column_generation < 0
+           OR v_column_slot < 0
+           OR v_column_slot >= v_slot_count
+           OR v_column_slot <> ((v_column_generation % v_slot_count) + v_slot_count) % v_slot_count THEN
+            RAISE EXCEPTION 'flip_ring_authority: invalid % compat cursor (slot %, generation %, slot_count %)',
+                v_ring, v_column_slot, v_column_generation, v_slot_count
+                USING ERRCODE = '55000';
+        END IF;
+
+        EXECUTE format(
+            'SELECT slot, generation FROM %I.%I_ring_rotations ORDER BY generation DESC LIMIT 1',
+            p_schema, v_ring
+        ) INTO v_ledger_slot, v_ledger_generation;
+
+        IF v_ledger_generation > v_column_generation THEN
+            RAISE EXCEPTION 'flip_ring_authority: % ledger generation % is ahead of compat generation %',
+                v_ring, v_ledger_generation, v_column_generation
+                USING ERRCODE = '55000';
+        END IF;
+
+        EXECUTE format(
+            'INSERT INTO %1$I.%2$I_ring_rotations (generation, slot) '
+            'SELECT g, ((g %% $2) + $2) %% $2 '
+            'FROM generate_series('
+            '  COALESCE((SELECT max(generation) FROM %1$I.%2$I_ring_rotations), -1) + 1, '
+            '  $1'
+            ') AS g '
+            'ON CONFLICT (generation) DO NOTHING',
+            p_schema, v_ring
+        ) USING v_column_generation, v_slot_count;
+
+        EXECUTE format(
+            'SELECT slot, generation FROM %I.%I_ring_rotations ORDER BY generation DESC LIMIT 1',
+            p_schema, v_ring
+        ) INTO v_ledger_slot, v_ledger_generation;
+
+        IF (v_ledger_slot, v_ledger_generation)
+               IS DISTINCT FROM (v_column_slot, v_column_generation) THEN
+            RAISE EXCEPTION 'flip_ring_authority: % ledger cursor (slot %, generation %) does not match compat cursor (slot %, generation %)',
+                v_ring, v_ledger_slot, v_ledger_generation,
+                v_column_slot, v_column_generation
+                USING ERRCODE = '55000';
+        END IF;
+    END LOOP;
+
+    -- Fence returning pre-ledger binaries. Poisoning BOTH cursor fields makes
+    -- the old lease/claim prune arithmetic return no initialized slot;
+    -- poisoning per-slot generations makes the old queue prune scan empty.
+    -- The trigger installed by v023 rejects an old rotator's attempt to turn
+    -- (-1, -1) back into (0, 0) after authority changes below.
+    EXECUTE format('UPDATE %I.queue_ring_state SET current_slot = -1, generation = -1 WHERE singleton', p_schema);
+    EXECUTE format('UPDATE %I.lease_ring_state SET current_slot = -1, generation = -1 WHERE singleton', p_schema);
+    EXECUTE format('UPDATE %I.claim_ring_state SET current_slot = -1, generation = -1 WHERE singleton', p_schema);
+    EXECUTE format('UPDATE %I.queue_ring_slots SET generation = -1', p_schema);
+    EXECUTE format('UPDATE %I.lease_ring_slots SET generation = -1', p_schema);
+    EXECUTE format('UPDATE %I.claim_ring_slots SET generation = -1', p_schema);
 
     EXECUTE format(
         'UPDATE %I.ring_cursor_authority SET authority = ''ledger'', flipped_at = now() WHERE singleton',
