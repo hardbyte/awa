@@ -129,7 +129,9 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
       must refuse, stale runtimes must not block, and
       `--allow-live-runtimes` must be tested.
 - [ ] Keep the preflight race-free: runtime registration and heartbeat writes
-      must not cross between the version check and migration commit.
+      must not cross between the version check and migration commit. Record the
+      expected observability-snapshot stall from the table lock; job and lease
+      heartbeats must remain unaffected.
 - [ ] Add the patch prerequisite to the CHANGELOG and upgrade guide before the
       release that introduces the migration.
 
@@ -144,9 +146,10 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
       a per-feature min-version SQL constant
       (pattern: `awa.ring_authority_min_flip_version()`) checked against
       `awa.semver_rank(runtime_instances.binary_version)` for every
-      fresh-heartbeat runtime. NULL or unparseable ⇒ not capable. Manual CLI
-      command plus (optionally) a maintenance auto-flip; refusal names the
-      remedy; `--force` is the only override.
+      fresh-heartbeat runtime. The expand migration installs this schema-owned
+      constant; binaries query rather than compile it. NULL or unparseable ⇒
+      not capable. Manual CLI command plus (optionally) a maintenance
+      auto-flip; refusal names the remedy; `--force` is the only override.
 - [ ] Under the old-writer locks, the flip treats the old representation as
       source of truth, reconciles the complete new representation, verifies
       exact equivalence, and changes authority atomically. Shadow writes alone

@@ -105,6 +105,12 @@ runtime version. Before applying that migration, the built-in migrator:
   between the check and migration commit; and
 - allows an explicit `--allow-live-runtimes` override.
 
+Because runtime registration and observability snapshots write
+`runtime_instances`, the table lock briefly stalls fleet-wide observability
+heartbeats for the duration of the migration transaction. It does not block
+job or lease heartbeats. Migration authors must account for that snapshot gap
+when estimating the impact of a long-running expand migration.
+
 This gate uses `runtime_instances.version`. That value is acceptable here as a
 defense-in-depth check over a documented patch prerequisite: the migration is
 still additive, and the operator can override the check after independent
@@ -124,6 +130,12 @@ new behavior. The current pattern is:
 - `awa.semver_rank()` with fail-closed parsing; and
 - a per-feature minimum version function such as
   `awa.ring_authority_min_flip_version()`.
+
+The per-feature minimum is schema-owned: the expand migration installs the SQL
+constant, and the feature's migration owner changes it through a later schema
+migration when a newer binary floor is required. Binaries query the constant;
+they do not compile their own copy. This keeps flip readiness consistent across
+all capability-aware binaries connected to the database.
 
 A fresh heartbeat with a NULL, unparseable, or below-minimum capability value
 blocks the flip. A stability interval before auto-flip reduces the chance that
