@@ -4076,21 +4076,21 @@ BEGIN
 
     FOR v_slot IN 0..(p_queue_slot_count - 1) LOOP
         EXECUTE format(
-            'INSERT INTO %I.queue_ring_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING',
+            'INSERT INTO %I.queue_ring_slots (slot, generation) VALUES (%s, -1) ON CONFLICT (slot) DO NOTHING',
             p_schema, v_slot
         );
     END LOOP;
 
     FOR v_slot IN 0..(p_lease_slot_count - 1) LOOP
         EXECUTE format(
-            'INSERT INTO %I.lease_ring_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING',
+            'INSERT INTO %I.lease_ring_slots (slot, generation) VALUES (%s, -1) ON CONFLICT (slot) DO NOTHING',
             p_schema, v_slot
         );
     END LOOP;
 
     FOR v_slot IN 0..(p_claim_slot_count - 1) LOOP
         EXECUTE format(
-            'INSERT INTO %I.claim_ring_slots (slot) VALUES (%s) ON CONFLICT (slot) DO NOTHING',
+            'INSERT INTO %I.claim_ring_slots (slot, generation) VALUES (%s, -1) ON CONFLICT (slot) DO NOTHING',
             p_schema, v_slot
         );
     END LOOP;

@@ -52,9 +52,8 @@ async def main() -> int:
         return 1
     print("parked job cancelled")
 
-    # Keep the pinned worker alive across several maintenance ticks. On a
-    # fresh 0.7 ledger-authority schema its pre-ledger rotator must be rejected
-    # by the database fence without moving the poisoned compat cursor.
+    # Keep the pinned worker alive across several maintenance ticks so the
+    # mixed-version compat path exercises old-style ring rotation too.
     await asyncio.sleep(3)
 
     await client.shutdown()

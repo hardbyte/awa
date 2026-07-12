@@ -1644,6 +1644,14 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
             ALTER COLUMN current_slot SET NOT NULL,
             ALTER COLUMN generation   SET NOT NULL;
 
+        -- Stable 0.6 schemas carry NOT NULL per-slot generations without a
+        -- default. INSERT(slot) ... ON CONFLICT still validates the proposed
+        -- row before conflict detection, so v042's v023 reapply must provide
+        -- an explicit generation even when every slot already exists.
+        ALTER TABLE {schema}.queue_ring_slots ALTER COLUMN generation DROP DEFAULT;
+        ALTER TABLE {schema}.lease_ring_slots ALTER COLUMN generation DROP DEFAULT;
+        ALTER TABLE {schema}.claim_ring_slots ALTER COLUMN generation DROP DEFAULT;
+
         UPDATE {schema}.queue_ring_state SET current_slot = 3, generation = 19 WHERE singleton;
         "#
     ))
