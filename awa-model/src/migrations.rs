@@ -401,8 +401,7 @@ async fn apply_migrations(
         if let Some(exclusive) = exclusive_window_in_range(current) {
             check_live_runtimes_gate(conn, exclusive).await?;
         }
-        if let Some((migration_version, minimum_version)) = runtime_version_floor_in_range(current)
-        {
+        for (migration_version, minimum_version) in runtime_version_floors_in_range(current) {
             check_runtime_version_floor(conn, migration_version, minimum_version).await?;
         }
     }
@@ -645,13 +644,12 @@ fn exclusive_window_in_range(current: i32) -> Option<i32> {
         .min()
 }
 
-/// The first minimum-runtime-version floor crossed by the pending range.
-fn runtime_version_floor_in_range(current: i32) -> Option<(i32, &'static str)> {
+/// Every minimum-runtime-version floor crossed by the pending range.
+fn runtime_version_floors_in_range(current: i32) -> impl Iterator<Item = (i32, &'static str)> {
     MIGRATION_RUNTIME_VERSION_FLOORS
         .iter()
         .copied()
-        .filter(|&(v, _)| v > current && v <= CURRENT_VERSION)
-        .min_by_key(|&(v, _)| v)
+        .filter(move |&(v, _)| v > current && v <= CURRENT_VERSION)
 }
 
 /// Refuse an additive migration while a fresh runtime reports a version below
