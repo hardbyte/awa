@@ -2,6 +2,11 @@
 
 Notable changes between releases. Detailed migration notes for storage transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## [0.6.2] — 2026-07-12
+
+- **Safe 0.7 rolling-upgrade stepping-stone ([#392](https://github.com/hardbyte/awa/issues/392)).** The 0.6 migrator now refuses unknown newer schemas before legacy-version normalization can rewrite `awa.schema_version`. It recognizes exactly the additive v043 schema while every installed ring cursor remains in `columns` authority, allowing a 0.6.2/0.7 mixed fleet during the expand phase; it refuses after the one-way ledger-authority flip. Upgrade every 0.6.0/0.6.1 runtime to 0.6.2 before applying 0.7 migrations. If migration runs first, roll 0.7 workers promptly: crash and heartbeat rescue remain available, but deadline-based rescue for jobs claimed on v043 resumes when the first 0.7 maintenance runtime starts. Awa's built-in migrator applies v041-v043 atomically, so other sessions see v040 or v043. An external runner that commits each version separately can expose v041/v042; a restarting 0.6.2 worker refuses those transient schemas and reconnects after v043 is committed.
+- **Queue-storage finalization no longer requires restarting drained workers.** Migration v040 narrows the finalization gate to live canonical-only runtimes. Pre-flip auto runtimes still report `canonical_drain_only`, but once `canonical_live_backlog()` is zero all supported writes already route to queue storage, so `awa storage finalize --wait` can complete immediately and those idle runtimes can roll normally afterward.
+
 ## [Unreleased]
 
 ## [0.6.1] — 2026-07-07

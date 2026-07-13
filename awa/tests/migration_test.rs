@@ -111,6 +111,96 @@ async fn reset_schema(pool: &PgPool) {
         .expect("Failed to drop schema");
 }
 
+#[tokio::test]
+async fn test_062_forward_schema_guard_accepts_only_v043_columns_authority() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    sqlx::query("DROP SCHEMA IF EXISTS awa_custom CASCADE")
+        .execute(&pool)
+        .await
+        .expect("reset synthetic custom schema");
+
+    sqlx::raw_sql(
+        r#"
+        CREATE SCHEMA awa;
+        CREATE TABLE awa.schema_version (
+            version INT PRIMARY KEY,
+            description TEXT NOT NULL
+        );
+        INSERT INTO awa.schema_version (version, description)
+        VALUES (40, '0.6.2'), (43, '0.7 additive expand');
+        CREATE TABLE awa.ring_cursor_authority (
+            singleton BOOLEAN PRIMARY KEY,
+            authority TEXT NOT NULL
+        );
+        INSERT INTO awa.ring_cursor_authority VALUES (TRUE, 'columns');
+
+        CREATE SCHEMA awa_custom;
+        CREATE TABLE awa_custom.ring_cursor_authority (
+            singleton BOOLEAN PRIMARY KEY,
+            authority TEXT NOT NULL
+        );
+        INSERT INTO awa_custom.ring_cursor_authority VALUES (TRUE, 'columns');
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("install synthetic forward-compatible v043 schema");
+
+    assert_eq!(
+        migrations::current_version(&pool)
+            .await
+            .expect("v043 columns authority is forward-compatible"),
+        43
+    );
+    migrations::run(&pool)
+        .await
+        .expect("0.6.2 migrate is a no-op on v043 columns authority");
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM awa.schema_version ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("read schema versions after compatible probe");
+    assert_eq!(versions, vec![40, 43], "compatible probe rewrites nothing");
+
+    sqlx::query("UPDATE awa_custom.ring_cursor_authority SET authority = 'ledger' WHERE singleton")
+        .execute(&pool)
+        .await
+        .expect("simulate one-way authority flip");
+    let post_flip = migrations::run(&pool)
+        .await
+        .expect_err("0.6.2 must refuse after any schema flips to ledger authority");
+    assert!(matches!(
+        post_flip,
+        awa::AwaError::SchemaNotMigrated {
+            expected: 40,
+            found: 43
+        }
+    ));
+
+    sqlx::query("UPDATE awa.schema_version SET version = 44 WHERE version = 43")
+        .execute(&pool)
+        .await
+        .expect("simulate unknown future schema");
+    let future = migrations::run(&pool)
+        .await
+        .expect_err("unknown newer schemas must fail closed");
+    assert!(matches!(
+        future,
+        awa::AwaError::SchemaNotMigrated {
+            expected: 40,
+            found: 44
+        }
+    ));
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM awa.schema_version ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("read schema versions after refusals");
+    assert_eq!(versions, vec![40, 44], "refusal paths rewrite nothing");
+}
+
 fn sqlstate_from_awa_error(err: &awa::AwaError) -> Option<String> {
     match err {
         awa::AwaError::Database(sqlx::Error::Database(db_err)) => {
@@ -2012,7 +2102,7 @@ async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_run
 }
 
 #[tokio::test]
-async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
+async fn test_storage_finalize_requires_empty_backlog_but_allows_drain_runtimes() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_finalize_transition";
@@ -2054,17 +2144,19 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
         .await
         .unwrap();
     insert_runtime_instance(&pool, "canonical_drain_only").await;
+    insert_runtime_instance(&pool, "canonical").await;
 
     let err = storage::finalize(&pool).await.unwrap_err();
     assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
-    assert!(err.to_string().contains("drain-only runtime"), "got {err}");
+    assert!(
+        err.to_string().contains("canonical-only runtime"),
+        "got {err}"
+    );
 
-    sqlx::query(
-        "DELETE FROM awa.runtime_instances WHERE storage_capability = 'canonical_drain_only'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE storage_capability = 'canonical'")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let status = storage::finalize(&pool).await.unwrap();
     assert_eq!(status.state, "active");
@@ -2072,6 +2164,15 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
     assert_eq!(status.active_engine, "queue_storage");
     assert_eq!(status.prepared_engine, None);
     assert!(status.finalized_at.is_some());
+
+    let live_drain: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.runtime_instances \
+         WHERE storage_capability = 'canonical_drain_only'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_drain, 1, "finalize must not rewrite runtime evidence");
 }
 
 #[tokio::test]
@@ -2159,13 +2260,18 @@ async fn test_storage_status_report_surfaces_finalize_blockers() {
         "{:?}",
         report.finalize_blockers
     );
-    assert!(
-        report
-            .finalize_blockers
-            .iter()
-            .any(|reason| reason.contains("drain-only runtime")),
-        "{:?}",
-        report.finalize_blockers
+    sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = 'report_queue'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ready = storage::status_report(&pool).await.unwrap();
+    assert!(ready.can_finalize, "{:?}", ready.finalize_blockers);
+    assert_eq!(
+        ready
+            .live_runtime_capability_counts
+            .get("canonical_drain_only"),
+        Some(&1),
+        "drain-only runtimes remain observable but do not block"
     );
 }
 

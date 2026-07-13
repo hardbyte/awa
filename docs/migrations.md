@@ -105,7 +105,7 @@ Current behavior:
 - `awa migrate` creates the default `awa` queue-storage substrate; `storage prepare-queue-storage-schema` creates custom queue-storage schemas ahead of time without changing routing
 - `storage abort` returns routing to canonical and clears a prepared or mixed-transition rollout before final activation
 - `storage enter-mixed-transition` requires prepared queue-storage metadata, a prepared queue-storage schema, and no live canonical-only runtimes
-- `storage finalize` requires zero canonical live backlog and no live canonical / drain-only runtimes
+- `storage finalize` requires zero canonical live backlog and no live canonical-only runtimes; drain-only runtimes may remain idle through finalization
 - workers continue to run the canonical engine before and after `prepare`
 
 ### `0.5.x` -> `0.6` Queue-Storage Rollout
@@ -299,7 +299,7 @@ Do not expect `awa migrate` to downgrade the schema.
 
 ## Breaking Changes
 
-If Awa ever needs a non-additive schema change, the intended contract is a major-version upgrade with a stop-the-world procedure documented explicitly for that release.
+Non-additive representation changes require an explicit compatibility, authority-transition, and rollback procedure documented for that release.
 
 ## Recommended Production Flow
 

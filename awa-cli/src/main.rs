@@ -759,8 +759,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!(
                                     "{:<8} {:<25} {:<10} {:<10} {:<5} {:<5}",
                                     job.id,
-                                    &job.kind,
-                                    &job.queue,
+                                    job.kind,
+                                    job.queue,
                                     job.state,
                                     job.attempt,
                                     job.max_attempts,
