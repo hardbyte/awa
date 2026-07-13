@@ -1,4 +1,4 @@
--- v042 (#371): append-only ring-rotation ledgers and terminal-rollup
+-- v043 (#371): append-only ring-rotation ledgers and terminal-rollup
 -- deltas, delivered as a staged expand -> flip -> contract upgrade.
 --
 -- The mutable ring-state cursor singletons (`queue_ring_state`,
@@ -14,7 +14,7 @@
 -- This migration is ADDITIVE: it creates + seeds the ledgers and the delta table AND keeps
 -- the compat `current_slot` / `generation` singleton columns (and the
 -- per-slot `generation` columns) in place, restoring them if an earlier
--- (unreleased) shipped-v042 dev schema dropped them. Each queue-storage
+-- (unreleased) shipped-v043 dev schema dropped them. Each queue-storage
 -- schema carries a `ring_cursor_authority` control row selecting which
 -- representation is authoritative:
 --   * 'columns' — compat: the singleton columns win, exactly as 0.6 wrote
@@ -359,5 +359,5 @@ $$;
 REVOKE EXECUTE ON FUNCTION awa.flip_ring_authority(TEXT, BOOLEAN, DOUBLE PRECISION) FROM PUBLIC;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (42, 'Append-only ring-rotation ledgers + terminal-rollup deltas; staged ring-cursor authority for rolling upgrades (#371)')
+VALUES (43, 'Append-only ring-rotation ledgers + terminal-rollup deltas; staged ring-cursor authority for rolling upgrades (#371)')
 ON CONFLICT (version) DO NOTHING;

@@ -18,7 +18,7 @@ applied live. The database is already the fleet's control plane.
 
 ## Decision
 
-Extend `awa.queue_meta` with **nullable override columns** (migration v040):
+Extend `awa.queue_meta` with **nullable override columns** (migration v041):
 `override_poll_interval_ms`, `override_claim_batch_size`, `override_rate_limit`
 (jobs/second), `override_deadline_ms`, plus `overrides_updated_at`.
 

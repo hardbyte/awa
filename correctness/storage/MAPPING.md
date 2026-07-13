@@ -105,7 +105,7 @@ The TLA+ lifecycle model does not represent the completed-history rollup cache, 
 
 ## Storage-transition model mapping
 
-`AwaStorageTransition.tla` maps to the transition SQL in `awa-model/migrations/v010_storage_transition_prep.sql`, `awa-model/migrations/v012_queue_storage_compat.sql`, and the executor gate in `awa-model/migrations/v014_storage_transition_role.sql`, plus the worker role/effective-storage resolution in `awa-worker/src/client.rs`.
+`AwaStorageTransition.tla` maps to the transition SQL in `awa-model/migrations/v010_storage_transition_prep.sql`, `awa-model/migrations/v012_queue_storage_compat.sql`, the executor gate in `awa-model/migrations/v014_storage_transition_role.sql`, and the narrowed finalization gate in `awa-model/migrations/v040_finalize_with_drain_runtimes.sql`, plus the worker role/effective-storage resolution in `awa-worker/src/client.rs`.
 
 | TLA+ variable / action | Rust / SQL equivalent |
 | --- | --- |
@@ -122,10 +122,10 @@ The TLA+ lifecycle model does not represent the completed-history rollup cache, 
 | `ProducerEnqueueCanonical` | `insert_job_compat()` path before `active_queue_storage_schema()` is set |
 | `ProducerEnqueueQueueStorage` | `insert_job_compat()` path after mixed transition activates the queue-storage backend |
 | `DrainCanonical` | canonical-drain workers continuing to complete `jobs_hot` / `scheduled_jobs` backlog |
-| `Finalize` | `awa.storage_finalize()`: requires `canonical_live_backlog() = 0` and no live `canonical` / `canonical_drain_only` runtimes |
+| `Finalize` | `awa.storage_finalize()`: requires `canonical_live_backlog() = 0` and no live `canonical` runtimes; v040 permits idle `canonical_drain_only` runtimes to remain |
 | `AbortMixed` | `awa.storage_abort()`: rejects rollback while live `queue_storage` runtimes or queue-storage rows exist |
 
-The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate property, not a permanent liveness invariant: a queue-storage target can stop after the transition. As of v014 the SQL gate enforces `transition_role = 'queue_storage_target' AND storage_capability = 'queue_storage'`, which is the same property `LiveQueueExecutor > 0` expresses in the model — `AwaStorageTransition.cfg` (with `RequireQueueExecutorOnEnter = TRUE`) is the configuration that matches production. `AwaStorageTransitionCurrentGate.cfg` is retained as a historical reproducer of the pre-v014 gap, where `storage_capability = 'queue_storage'` alone was used and the `MixedHasQueueExecutor` invariant could fail because an `autoPreMixedLive` runtime satisfied the gate pre-flip and downgraded to drain-only post-flip.
+The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate property, not a permanent liveness invariant: a queue-storage target can stop after the transition. As of v014 the SQL gate enforces `transition_role = 'queue_storage_target' AND storage_capability = 'queue_storage'`, which is the same property `LiveQueueExecutor > 0` expresses in the model. V040 then permits pre-flip auto runtimes to remain drain-only through finalization once the canonical backlog is empty; producer routing is already queue-storage-only in both `mixed_transition` and `active`. `AwaStorageTransition.cfg` (with `RequireQueueExecutorOnEnter = TRUE`) is the configuration that matches production. `AwaStorageTransitionCurrentGate.cfg` is retained as a historical reproducer of the pre-v014 gap, where `storage_capability = 'queue_storage'` alone was used and the `MixedHasQueueExecutor` invariant could fail because an `autoPreMixedLive` runtime satisfied the gate pre-flip and downgraded to drain-only post-flip.
 
 ## Local runtime note
 

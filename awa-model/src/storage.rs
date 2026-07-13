@@ -298,10 +298,6 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
     let live_canonical = *live_runtime_capability_counts
         .get("canonical")
         .unwrap_or(&0);
-    let live_drain = *live_runtime_capability_counts
-        .get("canonical_drain_only")
-        .unwrap_or(&0);
-
     let mut enter_mixed_transition_blockers = Vec::new();
     if status.state != "prepared" {
         enter_mixed_transition_blockers
@@ -348,10 +344,9 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
             "canonical live backlog is {canonical_live_backlog}"
         ));
     }
-    if live_canonical + live_drain > 0 {
+    if live_canonical > 0 {
         finalize_blockers.push(format!(
-            "{} canonical or drain-only runtime(s) are still live",
-            live_canonical + live_drain
+            "{live_canonical} canonical-only runtime(s) are still live"
         ));
     }
 

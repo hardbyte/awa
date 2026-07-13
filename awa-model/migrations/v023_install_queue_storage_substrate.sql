@@ -59,7 +59,7 @@ DECLARE
     -- the compat columns, so it starts directly in ledger authority; an
     -- upgrade starts in columns authority and flips later once the fleet
     -- has fully rolled to 0.7. We probe the queue ring, which is present
-    -- on every installed shape (0.6, the unreleased shipped-v042 dev
+    -- on every installed shape (0.6, the unreleased shipped-v043 dev
     -- shape, and fresh).
     v_fresh_install  BOOLEAN;
 BEGIN
@@ -194,7 +194,7 @@ BEGIN
     -- pre-0.7 mutable cursor columns if they are absent:
     --   * a 0.6 schema still HAS them (0.6 wrote them) — the ADD ... IF NOT
     --     EXISTS is a no-op and the live cursor is preserved as-is;
-    --   * the unreleased shipped-v042 dev shape DROPPED them — re-ADD and
+    --   * the unreleased shipped-v043 dev shape DROPPED them — re-ADD and
     --     re-seed from the ledger's max-generation row (the inverse of the
     --     original seed), so the current cursor survives either direction.
     EXECUTE format(
@@ -226,7 +226,7 @@ BEGIN
     -- Reconcile the two representations so BOTH agree on the current
     -- cursor before any rotator runs, regardless of which one arrived
     -- populated:
-    --   * columns NULL (fresh, or the dev-shape v042 that dropped them) ->
+    --   * columns NULL (fresh, or the dev-shape v043 that dropped them) ->
     --     seed columns from the ledger's max-generation row (genesis 0/0 on
     --     a fresh install);
     --   * columns populated but the ledger is behind (0.6 upgrade — the
@@ -278,7 +278,7 @@ BEGIN
     -- untouched, but a 0.6 rotator in a mixed fleet still UPDATEs it on
     -- every advance, so it must exist. Restore it (no-op on a 0.6 schema
     -- that never dropped it; re-seed to the derived value on the dev-shape
-    -- v042 that dropped it). NOT NULL DEFAULT -1 matches the pre-0.7 shape:
+    -- v043 that dropped it). NOT NULL DEFAULT -1 matches the pre-0.7 shape:
     -- -1 means "never rotated through".
     EXECUTE format(
         'ALTER TABLE %I.queue_ring_slots ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT -1',
@@ -631,7 +631,7 @@ BEGIN
     -- Seed the authority. A FRESH install (the ring state did not exist
     -- before this call) has no old binaries that could read the compat
     -- columns, so it starts directly in ledger authority; an UPGRADE of an
-    -- existing schema (0.6, or the unreleased shipped-v042 dev shape)
+    -- existing schema (0.6, or the unreleased shipped-v043 dev shape)
     -- starts in columns authority and flips later once the fleet has fully
     -- rolled to 0.7. ON CONFLICT DO NOTHING preserves an already-flipped
     -- authority across a re-run of the installer (idempotent, one-way).

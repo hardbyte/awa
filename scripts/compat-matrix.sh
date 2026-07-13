@@ -16,7 +16,7 @@
 #                   message content and exit code asserted.
 #
 #   backward-0.6     the newest `awa migrate` against an UNFINALIZED 0.6-final
-#                   schema with canonical work also refuses (v040 exists, so
+#                   schema with canonical work also refuses (v041 exists, so
 #                   there are pending migrations to gate), while the same
 #                   schema finalized upgrades cleanly.
 #
@@ -62,7 +62,7 @@ VALUES ('queue_storage', 'awa', now())
 ON CONFLICT (backend) DO UPDATE
 SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at;
 
--- Model an upgraded v042 schema: upgrades start in columns authority. A
+-- Model an upgraded v043 schema: upgrades start in columns authority. A
 -- fresh install starts in ledger authority, so restore the compat cursors
 -- from the seeded ledgers before exercising the mixed 0.6.0/0.7 window.
 UPDATE awa.ring_cursor_authority

@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 42;
+pub const CURRENT_VERSION: i32 = 43;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -25,7 +25,7 @@ const EXCLUSIVE_WINDOW_MIGRATIONS: &[i32] = &[];
 /// not capability proof for an irreversible authority flip: operators can
 /// override it with `--allow-live-runtimes`, while flip gates use explicit
 /// feature capability state.
-const MIGRATION_RUNTIME_VERSION_FLOORS: &[(i32, &str)] = &[(42, "0.6.2")];
+const MIGRATION_RUNTIME_VERSION_FLOORS: &[(i32, &str)] = &[(43, "0.6.2")];
 
 /// Heartbeat-staleness window (seconds) for the pre-flight live-runtime check.
 /// Matches the window used by the ADR-037 finalize gate and
@@ -53,8 +53,8 @@ pub struct MigrateOptions {
 /// Representation changes require a release-specific compatibility and
 /// authority-transition procedure.
 ///
-/// **v042 (#371) stays additive.** The ring cursors move to append-only
-/// `{ring}_ring_rotations` ledgers, but v042 is the *expand* phase of a
+/// **v043 (#371) stays additive.** The ring cursors move to append-only
+/// `{ring}_ring_rotations` ledgers, but v043 is the *expand* phase of a
 /// staged rolling upgrade: it seeds the ledgers and **keeps** the compat
 /// `current_slot` / `generation` singleton columns (and the per-slot
 /// `generation` column), selecting the authoritative representation per
@@ -227,16 +227,21 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Refresh claim_ready_runtime to cache-free ready-segment routing",
         &[V23_UP, V39_UP],
     ),
-    (40, "Per-queue runtime overrides on queue_meta", &[V40_UP]),
     (
-        41,
-        "Compact deadline receipt claims and batch deadline-rescue cursors (#246)",
-        &[V23_UP, V41_UP],
+        40,
+        "Allow queue-storage finalization with live canonical drain-only runtimes",
+        &[V40_UP],
     ),
+    (41, "Per-queue runtime overrides on queue_meta", &[V41_UP]),
     (
         42,
+        "Compact deadline receipt claims and batch deadline-rescue cursors (#246)",
+        &[V23_UP, V42_UP],
+    ),
+    (
+        43,
         "Append-only ring-rotation ledgers and terminal-rollup deltas (#371)",
-        &[V18_UP, V23_UP, V42_UP],
+        &[V18_UP, V23_UP, V43_UP],
     ),
 ];
 
@@ -278,9 +283,10 @@ const V36_UP: &str = include_str!("../migrations/v036_compact_receipt_completion
 const V37_UP: &str = include_str!("../migrations/v037_ready_segments.sql");
 const V38_UP: &str = include_str!("../migrations/v038_compact_claim_batches.sql");
 const V39_UP: &str = include_str!("../migrations/v039_claim_head_cold_routing.sql");
-const V40_UP: &str = include_str!("../migrations/v040_queue_runtime_overrides.sql");
-const V41_UP: &str = include_str!("../migrations/v041_compact_deadline_claims.sql");
-const V42_UP: &str = include_str!("../migrations/v042_ring_rotation_ledger.sql");
+const V40_UP: &str = include_str!("../migrations/v040_finalize_with_drain_runtimes.sql");
+const V41_UP: &str = include_str!("../migrations/v041_queue_runtime_overrides.sql");
+const V42_UP: &str = include_str!("../migrations/v042_compact_deadline_claims.sql");
+const V43_UP: &str = include_str!("../migrations/v043_ring_rotation_ledger.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

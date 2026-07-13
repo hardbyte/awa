@@ -49,9 +49,9 @@ transition to `finalize`, then upgrade to 0.7. A 0.7 binary will not migrate a 0
 schema directly — stepping-stone upgrades are the supported path (the same pattern Oban,
 River, and Postgres itself use).
 
-## The v042 ring-rotation ledger migration
+## The v043 ring-rotation ledger migration
 
-Migration **v042** ([#371](https://github.com/hardbyte/awa/issues/371),
+Migration **v043** ([#371](https://github.com/hardbyte/awa/issues/371),
 [ADR-040](adr/040-append-only-ring-rotation-ledger.md)) moves the queue/lease/claim ring
 cursors out of the mutable `{ring}_ring_state` singleton columns (`current_slot`,
 `generation`) into append-only `{ring}_ring_rotations` ledgers (dead-tuple-free rotation
@@ -59,19 +59,19 @@ under a pinned MVCC horizon). It is delivered as a staged **expand → flip → 
 upgrade supporting a mixed 0.6.2/0.7 fleet.
 
 > **Required stepping-stone:** first roll the whole fleet to **0.6.2 or later**.
-> 0.6.2 is the first 0.6 build that recognizes v042 as forward-compatible only
+> 0.6.2 is the first 0.6 build that recognizes v043 as forward-compatible only
 > while ring authority is `columns`, refuses unknown newer schemas without
 > modifying them, and refuses to restart after the authority flip. Do not run a
 > 0.7 migration while a 0.6.0 or 0.6.1 binary can invoke `awa migrate`; those
 > releases contain the destructive newer-schema misclassification fixed by
 > [#392](https://github.com/hardbyte/awa/issues/392).
 
-`awa migrate` enforces this stepping-stone: v042 is refused while any runtime with a
+`awa migrate` enforces this stepping-stone: v043 is refused while any runtime with a
 fresh heartbeat reports a version below 0.6.2 or an unparseable version. The
 `--allow-live-runtimes` override is available for operators who have independently verified
 the fleet; it should not be needed in the normal rollout.
 
-**v042 is additive (the expand phase).** It creates and seeds the three ledgers and the
+**v043 is additive (the expand phase).** It creates and seeds the three ledgers and the
 rollup-delta landing table, and it **keeps** the compat `current_slot` / `generation`
 columns in place. Each queue-storage schema gets a `ring_cursor_authority` control row
 that selects which representation is authoritative:
@@ -93,7 +93,7 @@ orders are supported:
    fleet runs mixed 0.6.2/0.7 against one database. In
    compat mode a 0.6.2 rotator and a 0.7 rotator serialize on the same
    `{ring}_ring_state` row lock, so the cursor stays correct. A 0.6.2 restart also
-   recognizes v042 while authority remains `columns`; it refuses rather than mutating the
+   recognizes v043 while authority remains `columns`; it refuses rather than mutating the
    schema once authority is `ledger`.
 2. Once **every** worker is on 0.7, promote to ledger authority to unlock the full #371
    dead-tuple benefits — either:
@@ -104,14 +104,14 @@ orders are supported:
      has reported a 0.7+ `binary_version` continuously for a stable period (default 10
      minutes; a builder knob). It logs the flip loudly.
 
-If you migrate first, roll 0.7 workers promptly. An all-0.6.2 fleet on v042 remains safe:
+If you migrate first, roll 0.7 workers promptly. An all-0.6.2 fleet on v043 remains safe:
 crash and heartbeat rescue are batch-aware, but 0.6.2's deadline-rescue sweep does not read
-the v041 compact claim batches used for newly claimed deadline jobs. Deadline-based rescue
+the v042 compact claim batches used for newly claimed deadline jobs. Deadline-based rescue
 for those jobs resumes when the first 0.7 maintenance runtime starts. Awa's built-in
-migrator applies v040-v042 in one transaction, so other sessions see v039 or v042, never an
+migrator applies v041-v043 in one transaction, so other sessions see v040 or v043, never an
 intermediate version. An external migration runner that commits each version separately can
-expose v040/v041; a restarting 0.6.2 worker refuses those transient schemas and connects
-normally once v042 is committed.
+expose v041/v042; a restarting 0.6.2 worker refuses those transient schemas and connects
+normally once v043 is committed.
 
 The manual flip **refuses** (without `--force`) while any fresh-heartbeat runtime is not
 known to be flip-aware — i.e. a 0.6 (or pre-flip 0.7) binary might still be reading the
@@ -148,9 +148,9 @@ still works in 0.7, and is gone in 0.8.
 
 ## Rollback
 
-0.7's migrate *gate* itself changes nothing in the database. Migration **v042** is
+0.7's migrate *gate* itself changes nothing in the database. Migration **v043** is
 additive (it keeps the compat cursor columns), so applying it does **not** break the
-one-minor-version skew window: a 0.6.2 binary keeps working against a v042 schema in compat
+one-minor-version skew window: a 0.6.2 binary keeps working against a v043 schema in compat
 authority. The skew window only ends at the **ring-authority flip** (see above): after the
 flip the stale compat columns are poisoned, so a pre-flip binary fails loudly and rolling
 back across the flip is **not** supported — roll back only to another 0.7 build. Before

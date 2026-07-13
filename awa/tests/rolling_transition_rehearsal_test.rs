@@ -605,36 +605,25 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // ── Phase 6: retire drain-only runtimes and finalize ───────────────
+    // ── Phase 6: finalize with drain-only runtimes still live ──────────
 
     // Auto-role runtimes that started before the routing flip remain
-    // canonical_drain_only. Production rolls or stops them once the
-    // canonical backlog reaches zero; replacements started during
-    // mixed_transition resolve directly to queue storage. Runtime rows
-    // intentionally remain fresh for one liveness window after exit, so
-    // poll the same readiness report used by `storage finalize --wait`.
-    auto_rust_client.shutdown(Duration::from_secs(5)).await;
-    python_worker.shutdown().await;
-
-    let finalize_deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        let report = storage::status_report(&pool)
-            .await
-            .expect("storage status report before finalize");
-        if report.can_finalize {
-            break;
-        }
-        assert!(
-            Instant::now() < finalize_deadline,
-            "finalize readiness did not clear after drain-only runtimes stopped: {:?}",
-            report.finalize_blockers
-        );
-        eprintln!(
-            "[rehearsal] phase 6: waiting to finalize: {}",
-            report.finalize_blockers.join("; ")
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    // canonical_drain_only. Once canonical backlog is zero they have no
+    // supported source of new canonical work, so v040 permits finalization
+    // without forcing a process restart or heartbeat-liveness delay.
+    let report = storage::status_report(&pool)
+        .await
+        .expect("storage status report before finalize");
+    assert!(report.can_finalize, "{:?}", report.finalize_blockers);
+    assert!(
+        report
+            .live_runtime_capability_counts
+            .get("canonical_drain_only")
+            .copied()
+            .unwrap_or(0)
+            >= 2,
+        "Rust and Python pre-flip auto runtimes must still be live"
+    );
 
     storage::finalize(&pool).await.expect("storage finalize");
     eprintln!(
@@ -780,6 +769,7 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
 
     // ── Cleanup ────────────────────────────────────────────────────────
 
+    auto_rust_client.shutdown(Duration::from_secs(5)).await;
     qs_target_client.shutdown(Duration::from_secs(5)).await;
     python_worker.shutdown().await;
     reset_schema(&pool, &qs_schema).await;

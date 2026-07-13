@@ -4,7 +4,7 @@
 
 Accepted — implemented for 0.7 ([#371](https://github.com/hardbyte/awa/issues/371),
 from the 0.7 performance campaign). Ships as a staged **expand → flip → contract**
-upgrade via migration v042, supporting a mixed 0.6.2/0.7 fleet after the
+upgrade via migration v043, supporting a mixed 0.6.2/0.7 fleet after the
 required 0.6.2 stepping-stone. See the "Staged rolling upgrade" section below,
 `docs/upgrade-0.6-to-0.7.md`, and the CHANGELOG 0.7 upgrade notes.
 
@@ -91,14 +91,14 @@ The cutover from the mutable singleton columns to the ledger is delivered as a
 staged upgrade supporting a mixed 0.6.2/0.7 fleet. The patched 0.6.2
 stepping-stone is mandatory: older 0.6
 migrators can destructively misclassify a newer schema, while 0.6.2 recognizes
-v042 only in compat authority and otherwise fails closed. Each queue-storage schema carries a `ring_cursor_authority`
+v043 only in compat authority and otherwise fails closed. Each queue-storage schema carries a `ring_cursor_authority`
 control row (`columns` | `ledger`) selecting which representation is
 authoritative for all three rings; the per-schema `ring_cursor(ring)` SQL
 function and the Rust rotate/prune seams branch on it.
 
-- **Expand (migration v042, additive).** Create and seed the three ledgers and
+- **Expand (migration v043, additive).** Create and seed the three ledgers and
   the rollup-delta table; **keep** the compat `current_slot` / `generation`
-  columns (restore them if an earlier unreleased shipped-v042 dev schema dropped
+  columns (restore them if an earlier unreleased shipped-v043 dev schema dropped
   them, re-seeding from the ledger max — the inverse seed). Upgrades start in
   `columns`; fresh installs start in `ledger` (no old binary can exist).
 - **Compat mode (`columns`).** The singleton columns are authoritative, exactly
@@ -138,7 +138,7 @@ function and the Rust rotate/prune seams branch on it.
 **Positive**
 
 - **Either 0.7 rollout order is supported after the 0.6.2 stepping-stone.** Operators
-  may roll 0.7 binaries before or after applying v042 while the fleet is mixed, then
+  may roll 0.7 binaries before or after applying v043 while the fleet is mixed, then
   promote to the dead-tuple-free ledger
   once fully on 0.7.
 

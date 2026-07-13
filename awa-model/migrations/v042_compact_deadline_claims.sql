@@ -1,4 +1,4 @@
--- v041: compact deadline receipt claims (#246).
+-- v042: compact deadline receipt claims (#246).
 --
 -- v023 owns the queue-storage substrate helper; the migration runner reapplies
 -- it before this file, so claim_ready_runtime() is already redefined to write
@@ -78,8 +78,8 @@ BEGIN
             v_schema
         ));
         v_claim_runtime_def := pg_get_functiondef(v_claim_runtime::oid);
-        -- Receipts detection extends the v039 heuristic: pre-v041 receipts
-        -- functions INSERT INTO lease_claims (row path), while v041+
+        -- Receipts detection extends the v039 heuristic: pre-v042 receipts
+        -- functions INSERT INTO lease_claims (row path), while v042+
         -- receipts functions only INSERT INTO lease_claim_batches. Checking
         -- both keeps the heuristic correct for old custom schemas AND for
         -- idempotent re-runs after this refresh has already been applied.
@@ -99,5 +99,5 @@ END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (41, 'Compact deadline receipt claims and batch deadline-rescue cursors (#246)')
+VALUES (42, 'Compact deadline receipt claims and batch deadline-rescue cursors (#246)')
 ON CONFLICT (version) DO NOTHING;
