@@ -442,14 +442,38 @@ async fn test_migrate_gate_allows_active_cluster() {
 
     migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
-    // A finalized cluster with live workers and pending migrations is the
-    // normal 0.6 → 0.7 upgrade shape.
     insert_runtime_instance(&pool, "queue_storage").await;
+    // Rewind one version so the pending range is {CURRENT_VERSION} = {v042},
+    // which crosses the flagged ring-ledger migration.
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
+    // The ADR-037 finalize gate is satisfied (state = active), but the pending
+    // range crosses v042 (flagged as requiring an exclusive window) while a
+    // worker is heartbeating: the pre-flight refuses — a live pre-v042 binary
+    // cannot survive the ring-cursor column drop. (The finalize gate alone does
+    // not cover v042's stop-the-world requirement.)
+    let err = migrations::run(&pool).await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            awa::AwaError::LiveRuntimesRequireExclusiveWindow { .. }
+        ),
+        "active cluster crossing v042 with a live worker must hit the pre-flight, got: {err}"
+    );
+
+    // Drain the worker (stale heartbeat) — the realistic stop-the-world state —
+    // and the same finalized cluster migrates cleanly.
+    sqlx::raw_sql("UPDATE awa.runtime_instances SET last_seen_at = now() - interval '10 minutes'")
+        .execute(&pool)
+        .await
+        .expect("age the heartbeat to drain the worker");
     migrations::run(&pool)
         .await
-        .expect("finalized (active) cluster should migrate");
+        .expect("finalized (active) cluster with drained workers should migrate");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
 }
 
 #[tokio::test]
@@ -3553,6 +3577,241 @@ async fn test_cancelled_run_does_not_strand_migration_lock() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+
+    pool.close().await;
+}
+
+// ── #392: fail safe on a schema newer than the binary ────────────
+
+/// A schema recorded *newer* than this binary must be refused loudly and left
+/// untouched. Before this guard, `current_version`'s legacy heuristic
+/// misclassified a future version (e.g. v42 → 4) and destructively rewrote
+/// `awa.schema_version` (DELETE version >= 3, re-seed), then re-applied
+/// migrations onto the newer physical layout and crashed mid-way, leaving
+/// split-brain metadata (#392). Assert: `SchemaNewerThanBinary`, and zero
+/// mutation of `schema_version` (count + max unchanged).
+#[tokio::test]
+async fn test_migrate_refuses_schema_newer_than_binary() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    // Bring the schema to CURRENT_VERSION the normal way.
+    migrations::run(&pool).await.expect("initial migrate");
+
+    // Record a version one past what this binary knows — the supported
+    // rolling-deploy skew (older binary, newer schema).
+    let future_version = migrations::CURRENT_VERSION + 1;
+    sqlx::query("INSERT INTO awa.schema_version (version, description) VALUES ($1, $2)")
+        .bind(future_version)
+        .bind("future migration from a newer binary")
+        .execute(&pool)
+        .await
+        .expect("seed future schema_version row");
+
+    let (count_before, max_before): (i64, i32) =
+        sqlx::query_as("SELECT count(*), MAX(version) FROM awa.schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let err = migrations::run(&pool).await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            awa::AwaError::SchemaNewerThanBinary { found, supported }
+                if *found == future_version && *supported == migrations::CURRENT_VERSION
+        ),
+        "expected SchemaNewerThanBinary, got: {err}"
+    );
+
+    // No writes on the refusal path: history intact, still points at the
+    // future version.
+    let (count_after, max_after): (i64, i32) =
+        sqlx::query_as("SELECT count(*), MAX(version) FROM awa.schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count_before, count_after,
+        "refusal must not add/remove schema_version rows"
+    );
+    assert_eq!(
+        max_before, max_after,
+        "refusal must not rewrite the max schema version"
+    );
+    assert_eq!(max_after, future_version);
+
+    // The read-only probe agrees and also stays non-mutating.
+    let probed = migrations::current_version_readonly(&pool).await.unwrap();
+    assert_eq!(probed, future_version);
+
+    pool.close().await;
+}
+
+/// The newer-schema guard must not disturb ordinary paths: a fresh migrate
+/// reaches CURRENT_VERSION, a re-run is a clean no-op, and a schema one version
+/// *behind* still upgrades.
+#[tokio::test]
+async fn test_newer_schema_guard_leaves_normal_paths_untouched() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    // Fresh install → CURRENT_VERSION.
+    migrations::run(&pool).await.expect("fresh migrate");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+
+    // Re-run at CURRENT_VERSION is a no-op success.
+    migrations::run(&pool).await.expect("no-op re-run");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+
+    // A schema exactly one behind still upgrades cleanly (the guard only
+    // triggers strictly above CURRENT_VERSION).
+    sqlx::query("DELETE FROM awa.schema_version WHERE version = $1")
+        .bind(migrations::CURRENT_VERSION)
+        .execute(&pool)
+        .await
+        .expect("drop the newest version row to simulate a one-behind schema");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION - 1
+    );
+    migrations::run(&pool)
+        .await
+        .expect("upgrade one-behind schema");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+
+    pool.close().await;
+}
+
+// ── Exclusive-window pre-flight live-runtime check ───────────────
+//
+// The pre-flight refuses a migrate whose pending range crosses a migration
+// flagged in EXCLUSIVE_WINDOW_MIGRATIONS (currently {v042}) while a worker is
+// heartbeating. test_migrate_gate_allows_active_cluster covers the real run()
+// refuse-then-drain path through v042; the tests here pin the message shape and
+// the staleness/override/non-crossing behaviours.
+
+/// The pre-flight refusal names the migration, lists the live runtimes, and
+/// points at the override. The gate keys on `last_seen_at` staleness, not
+/// `healthy` — a hard-killed (`kill -9`) worker leaves `healthy = true` forever.
+#[tokio::test]
+async fn test_exclusive_window_preflight_refuses_with_live_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+
+    // A heartbeat inside the window — healthy is TRUE, matching a still-running
+    // worker (also what a kill -9 leaves behind).
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+
+    let err = migrations::check_exclusive_window_preflight(&pool, migrations::CURRENT_VERSION)
+        .await
+        .expect_err("a live runtime must trip the exclusive-window pre-flight");
+    assert!(
+        matches!(
+            &err,
+            awa::AwaError::LiveRuntimesRequireExclusiveWindow { migration_version, count, .. }
+                if *migration_version == migrations::CURRENT_VERSION && *count >= 1
+        ),
+        "expected LiveRuntimesRequireExclusiveWindow naming v{}, got: {err}",
+        migrations::CURRENT_VERSION
+    );
+    // Migration-agnostic message that names the version and the escape hatch.
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("migration v{}", migrations::CURRENT_VERSION))
+            && msg.contains("--allow-live-runtimes"),
+        "message should name the migration and the override: {msg}"
+    );
+
+    pool.close().await;
+}
+
+/// A stale heartbeat (older than the window) is not "live": the pre-flight passes.
+#[tokio::test]
+async fn test_exclusive_window_preflight_passes_with_stale_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    sqlx::raw_sql("UPDATE awa.runtime_instances SET last_seen_at = now() - interval '10 minutes'")
+        .execute(&pool)
+        .await
+        .expect("age the heartbeat");
+
+    migrations::check_exclusive_window_preflight(&pool, migrations::CURRENT_VERSION)
+        .await
+        .expect("stale runtimes must not trip the pre-flight");
+
+    pool.close().await;
+}
+
+/// `--allow-live-runtimes` (MigrateOptions::allow_live_runtimes) skips the
+/// pre-flight in `run_with_options` even with a fresh heartbeat crossing the
+/// flagged v042.
+#[tokio::test]
+async fn test_exclusive_window_override_allows_live_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+    // Finalize (so the ADR-037 gate passes), add a live worker, then rewind so
+    // a real pending range crosses v042 with the worker heartbeating.
+    simulate_non_canonical_compat_routing(&pool).await;
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    let options = migrations::MigrateOptions {
+        allow_live_runtimes: true,
+    };
+    migrations::run_with_options(&pool, options)
+        .await
+        .expect("override must skip the live-runtime pre-flight");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+
+    pool.close().await;
+}
+
+/// A range that crosses no flagged migration (already at head) must not consult
+/// the pre-flight — a live worker is fine for a no-op run.
+#[tokio::test]
+async fn test_exclusive_window_skipped_for_noncrossing_range() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+
+    // A live worker present, but there is nothing pending to cross — the gate
+    // must not fire on an up-to-date schema.
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    migrations::run(&pool)
+        .await
+        .expect("no-op run must not consult the exclusive-window pre-flight");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
 
     pool.close().await;
 }

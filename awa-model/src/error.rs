@@ -15,6 +15,27 @@ pub enum AwaError {
     SchemaNotMigrated { expected: i32, found: i32 },
 
     #[error(
+        "schema is at v{found} but this binary supports up to v{supported} — upgrade the awa \
+         binaries (see docs/upgrade-0.6-to-0.7.md); refusing to modify a newer schema"
+    )]
+    SchemaNewerThanBinary { found: i32, supported: i32 },
+
+    #[error(
+        "migration v{migration_version} requires no live runtimes: {count} live \
+         runtime{plural} detected (newest heartbeat {newest_secs}s ago). A pre-migration \
+         binary cannot operate against the post-migration schema, so this migration needs a \
+         stop-the-world window — stop or drain the workers first, or pass \
+         --allow-live-runtimes to override.{instances}"
+    )]
+    LiveRuntimesRequireExclusiveWindow {
+        migration_version: i32,
+        count: i64,
+        plural: &'static str,
+        newest_secs: i64,
+        instances: String,
+    },
+
+    #[error(
         "storage transition not finalized (state: {state}): awa 0.7 refuses to apply \
          migrations while the deprecated canonical engine can still hold work (ADR-037). \
          Finalize the queue-storage transition on awa 0.6 first — `awa storage prepare \

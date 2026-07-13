@@ -44,6 +44,15 @@ enum Commands {
         /// Auto-detect: from=current DB version, to=latest
         #[arg(long, conflicts_with_all = ["from", "version"])]
         pending: bool,
+        /// Skip the pre-flight live-runtime check.
+        ///
+        /// Some migrations require a stop-the-world window because a
+        /// pre-migration binary cannot operate against the resulting schema;
+        /// `migrate` refuses to apply such a migration while workers are
+        /// heartbeating. This overrides that check — use only when you have
+        /// confirmed no pre-migration binary is connected.
+        #[arg(long)]
+        allow_live_runtimes: bool,
     },
     /// Job management
     Job {
@@ -542,6 +551,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             to,
             version,
             pending,
+            allow_live_runtimes,
         } => {
             // Resolve the version range.
             let current_version = awa_model::migrations::CURRENT_VERSION;
@@ -558,7 +568,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .max_connections(2)
                     .connect(&db_url)
                     .await?;
+                // `current_version` normalizes legacy pre-0.4 numbering (fine
+                // on this mutation-adjacent path, per #392) but is now bounded
+                // so it never rewrites a schema newer than the binary — it
+                // returns the raw version untouched. Refuse that loudly rather
+                // than silently reporting "up to date" (#392).
                 let db_version = awa_model::migrations::current_version(&pool).await?;
+                if db_version > current_version {
+                    eprintln!(
+                        "error: schema is at v{db_version} but this binary supports up to \
+                         v{current_version} — upgrade the awa binaries (see \
+                         docs/upgrade-0.6-to-0.7.md); refusing to migrate a newer schema"
+                    );
+                    std::process::exit(1);
+                }
                 (db_version, current_version)
             } else {
                 (from.unwrap_or(0), to.unwrap_or(current_version))
@@ -594,13 +617,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Extracted: {filename}");
                 }
             } else {
-                // Default: apply migrations to DB (sequential DDL).
+                // Default: apply migrations to DB (sequential DDL). The plan
+                // line and per-migration timing are emitted as tracing `info!`
+                // events from `apply_migrations` (see the subscriber init).
                 let db_url = require_pool(&cli.database_url)?;
                 let pool = PgPoolOptions::new()
                     .max_connections(1)
                     .connect(&db_url)
                     .await?;
-                awa_model::migrations::run(&pool).await?;
+                let options = awa_model::migrations::MigrateOptions {
+                    allow_live_runtimes,
+                };
+                awa_model::migrations::run_with_options(&pool, options).await?;
                 println!("Migrations applied successfully.");
             }
         }
