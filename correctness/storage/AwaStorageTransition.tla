@@ -94,7 +94,7 @@ CanFinalize ==
     /\ state = "mixed_transition"
     /\ preparedEngine = "queue_storage"
     /\ canonicalBacklog = 0
-    /\ LiveCanonicalCapability + LiveDrainCapability = 0
+    /\ LiveCanonicalCapability = 0
 
 CanAbortMixed ==
     /\ state = "mixed_transition"
@@ -433,9 +433,6 @@ NoMixedWithCanonicalOnlyRuntime ==
 
 FinalizeOnlyAfterDrain ==
     state = "active" => canonicalBacklog = 0
-
-FinalizeOnlyAfterNoDrainRuntimes ==
-    state = "active" => LiveCanonicalCapability + LiveDrainCapability = 0
 
 MixedHasQueueExecutor ==
     state \in {"mixed_transition", "active"} => mixedEntryHadQueueExecutor

@@ -125,30 +125,27 @@ psql "$DATABASE_URL" -c "
 # 7. Flip routing. New writes and cron enqueues go to queue storage.
 awa --database-url "$DATABASE_URL" storage enter-mixed-transition
 
-# 8. Wait for canonical_live_backlog to reach zero, then roll or stop every
-#    pre-flip auto runtime. Those processes remain canonical_drain_only for
-#    their lifetime and deliberately block finalization. Replacement auto
-#    runtimes started in mixed_transition resolve directly to queue storage.
-
-# 9. Finalize. `--wait` polls every 5s and invokes the SQL finalize after
-#    the backlog is empty and the old canonical/drain-only heartbeat rows
-#    have aged past their liveness window for two consecutive observations.
+# 8. Finalize. `--wait` polls every 5s and invokes the SQL finalize after
+#    canonical_live_backlog is empty for two consecutive observations.
+#    Pre-flip auto runtimes remain canonical_drain_only and idle; v040 no
+#    longer requires them to restart or age out before finalization. Roll
+#    them normally afterward; replacements resolve directly to queue storage.
 #    Default wait is unbounded; pass e.g. `--wait=2h` to cap. Progress is
 #    emitted via structured `tracing` logs (set `RUST_LOG=info` to see it).
 awa --database-url "$DATABASE_URL" storage finalize --wait
 #    → exits 0 once state=active; exits 2 if the wait cap expires
 #       while blockers remain.
 
-# 9a. (Optional) Dry-run the readiness gates first without changing
+# 8a. (Optional) Dry-run the readiness gates first without changing
 #     state. `--check` prints the same JSON `awa storage status`
 #     would, plus a one-line summary, and exits 2 if blocked.
 awa --database-url "$DATABASE_URL" storage finalize --check
 
-# 10. Verify active state.
+# 9. Verify active state.
 awa --database-url "$DATABASE_URL" storage status
 #    → current=queue_storage, active=queue_storage, prepared=NULL, state=active
 
-# 11. Once state=active, the queue-storage-target runtime is no longer
+# 10. Once state=active, the queue-storage-target runtime is no longer
 #     special — auto-role runtimes started from now on resolve to queue
 #     storage at startup. Either keep the explicit target running or
 #     redeploy it without --transition-role; behavior is identical
@@ -165,8 +162,7 @@ awa --database-url "$DATABASE_URL" storage status
 | start queue-storage target | `awa.runtime_instances` shows `transition_role='queue_storage_target'` and `storage_capability='queue_storage'` for the new instance; `awa storage status` lists no `enter_mixed_transition_blockers` |
 | enter-mixed-transition | `awa_maintenance_rotate_attempts_total{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
 | watch canonical drain | `awa_queue_depth{awa_job_state="available"}` on the canonical side trending to 0 |
-| roll pre-flip auto runtimes | replacement runtimes report `storage_capability='queue_storage'`; no fresh `canonical_drain_only` runtime remains |
-| finalize | `awa storage status` reports `state=active`; no canonical-state runtime instances heartbeating |
+| finalize | `awa storage status` reports `state=active`; live `canonical_drain_only` runtimes are idle and may be rolled normally |
 
 ## Watch list during the rollout
 

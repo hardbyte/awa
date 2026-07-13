@@ -183,6 +183,8 @@ The model separates three runtime populations that collapse to similar database 
 - auto 0.6 runtimes started before mixed transition, which report `queue_storage` while prepared but become `canonical_drain_only` after routing flips
 - explicit queue-storage targets, which can actually execute queue-storage work immediately after mixed transition starts
 
+Finalization requires the canonical backlog to be empty and rejects any returning canonical-only runtime. V040 deliberately allows pre-flip auto runtimes to remain `canonical_drain_only`: supported producers route to queue storage from mixed-transition entry onward, so those runtimes are idle after the backlog reaches zero and can roll normally after finalization.
+
 Configs:
 
 - [`AwaStorageTransition.cfg`](./AwaStorageTransition.cfg): desired gate, requiring a live queue-storage executor at `EnterMixedTransition`. TLC completes cleanly with **222 distinct states**.

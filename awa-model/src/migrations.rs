@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 39;
+pub const CURRENT_VERSION: i32 = 40;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -179,6 +179,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Refresh claim_ready_runtime to cache-free ready-segment routing",
         &[V23_UP, V39_UP],
     ),
+    (
+        40,
+        "Allow queue-storage finalization with live canonical drain-only runtimes",
+        &[V40_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -219,6 +224,7 @@ const V36_UP: &str = include_str!("../migrations/v036_compact_receipt_completion
 const V37_UP: &str = include_str!("../migrations/v037_ready_segments.sql");
 const V38_UP: &str = include_str!("../migrations/v038_compact_claim_batches.sql");
 const V39_UP: &str = include_str!("../migrations/v039_claim_head_cold_routing.sql");
+const V40_UP: &str = include_str!("../migrations/v040_finalize_with_drain_runtimes.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
@@ -351,7 +357,7 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
     let raw_version = version.unwrap_or(0);
 
     if raw_version > CURRENT_VERSION {
-        if forward_compatible_v042_columns(conn, raw_version).await? {
+        if forward_compatible_v043_columns(conn, raw_version).await? {
             return Ok(raw_version);
         }
         tracing::error!(
@@ -459,14 +465,14 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 }
 
 /// The 0.6.2 rolling-upgrade stepping-stone recognizes exactly the additive
-/// v042 shape, and only before any queue-storage schema has flipped to ledger
+/// v043 shape, and only before any queue-storage schema has flipped to ledger
 /// authority. This lets an already-rolled 0.6.2 fleet survive a migration-first
 /// 0.7 rollout. Unknown future schemas and the post-flip boundary fail closed.
-async fn forward_compatible_v042_columns(
+async fn forward_compatible_v043_columns(
     conn: &mut PgConnection,
     raw_version: i32,
 ) -> Result<bool, AwaError> {
-    if raw_version != 42 {
+    if raw_version != 43 {
         return Ok(false);
     }
 
