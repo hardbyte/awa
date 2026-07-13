@@ -25,7 +25,7 @@ In production, treat these as separate concerns:
 
 ## Queue Storage Cutover
 
-Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x clusters must use the staged storage-transition flow documented in [migrations.md](migrations.md) and the short operator checklist in [upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md).
+Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x clusters must follow the staged storage-transition procedure in [upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md); [migrations.md](migrations.md) covers the general migration contract and tooling.
 
 Operationally:
 
@@ -245,16 +245,7 @@ producers and migrations.
 
 ## Rolling Deployments
 
-For smooth rollouts:
-
-1. Apply additive migrations first.
-2. Roll out new worker code.
-3. Let old pods drain with `shutdown(...)`.
-4. Keep `terminationGracePeriodSeconds` slightly above that drain timeout.
-
-Code-only releases can roll normally because the schema migrations are additive-only.
-
-Storage-engine cutovers are different from normal code-only releases. Follow the staged `prepare -> enter-mixed-transition -> finalize` flow in [upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md) so the database state, producer routing, and runtime roles remain aligned.
+Let old pods drain with `shutdown(...)`, and keep `terminationGracePeriodSeconds` slightly above that drain timeout. Release-specific procedures are listed in the [migration guide](migrations.md#upgrade-an-existing-database); for the current release boundary, follow [Upgrading from 0.6 to 0.7](upgrade-0.6-to-0.7.md). Representation changes use the expand, flip, and contract policy in [ADR-041](adr/041-rolling-upgrade-policy.md).
 
 ## Queue Isolation Patterns
 
@@ -295,5 +286,4 @@ If you expose the callback receiver endpoints for `HttpWorker`, also configure `
 - [PostgreSQL roles and privileges](security.md)
 - [Migration guide](migrations.md)
 - [Configuration](configuration.md)
-- [Security notes](security.md)
 - [Troubleshooting](troubleshooting.md)
