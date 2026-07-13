@@ -2,9 +2,7 @@
 
 ## Status
 
-Proposed for adoption before 0.7.
-
-The current implementation work is split across the 0.6.2 forward-schema guard ([#428](https://github.com/hardbyte/awa/pull/428)), migration safety ([#426](https://github.com/hardbyte/awa/pull/426)), and the staged v042 ring authority change ([#425](https://github.com/hardbyte/awa/pull/425)). The migration-authoring checklist is in [`docs/development.md`](../development.md#authoring-schema-migrations), and automated mixed-version rehearsal is tracked by [#427](https://github.com/hardbyte/awa/issues/427).
+Proposed for adoption before 0.7. The migration-authoring checklist is in [`docs/development.md`](../development.md#authoring-schema-migrations), and automated mixed-version rehearsal is tracked by [#427](https://github.com/hardbyte/awa/issues/427).
 
 ## Context
 
@@ -75,8 +73,6 @@ The per-feature minimum is schema-owned: the expand migration installs the SQL c
 
 A fresh heartbeat with a NULL, unparseable, or below-minimum capability value blocks the flip. A stability interval before auto-flip reduces the chance that a temporarily absent old process is mistaken for a completed rollout. Manual override is explicit and separate from the migration override.
 
-The v010/v014 `storage_capability` and `transition_role` enums are not a general capability registry. They encode the 0.5 to 0.6 storage transition and have dynamic, transition-specific meaning. New representation changes do not extend that vocabulary.
-
 ### 5. The old representation is authoritative until flip
 
 Compatibility shadow writes are not sufficient at the flip boundary. Under a mixed fleet, the final writer may be an N-1 process that updates only the old representation.
@@ -143,7 +139,7 @@ Evidence is recorded with the release or in the benchmarking repository. #427 tr
 - Representation changes span at least two releases and carry compatibility code, dual representations, and fence state until contract.
 - Rollback has a precise boundary: N-1 before flip, flip-aware binaries after flip.
 - Migration authors must prove maintenance-path parity, not only foreground job operations.
-- Releases pay for mixed-version tests and, where relevant, larger model state spaces. #427 should make that cost repeatable rather than optional.
+- Releases pay for mixed-version tests and, where relevant, larger model state spaces.
 
 ## Alternatives considered
 

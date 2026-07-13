@@ -1,10 +1,8 @@
 # Upgrade Checklist: 0.5.x → 0.6
 
-> **Planning to run 0.7?** Finalize before upgrading: the 0.7 `awa migrate` refuses
-> unfinalized clusters ([ADR-037](adr/037-canonical-engine-deprecation.md),
-> [upgrade-0.6-to-0.7.md](upgrade-0.6-to-0.7.md)).
+> **Planning to run 0.7?** Finalize before upgrading: the 0.7 `awa migrate` refuses unfinalized clusters ([ADR-037](adr/037-canonical-engine-deprecation.md), [upgrade-0.6-to-0.7.md](upgrade-0.6-to-0.7.md)).
 
-This is the operator-facing rollout sheet for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). The companion long-form explanation is in [migrations.md](migrations.md). This file is the short version: one-screen pre-flight, two phases, an explicit rollback boundary, and the health checks to run at each step.
+This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; [migrations.md](migrations.md) covers the general migration contract and external tooling.
 
 > **Fresh installs do not need this file.** A new cluster runs `awa migrate` and starts workers; the first worker auto-finalizes via `awa.storage_auto_finalize_if_fresh()`. See migrations.md ["Fresh install"](migrations.md#fresh-install-no-prior-canonical-data). This checklist is for **upgrading existing 0.5.x clusters**, where canonical drain is unavoidable and auto-finalize correctly defers to the staged path.
 
@@ -51,18 +49,7 @@ Read this before starting Phase 2. The rollout has one explicit one-way door —
 - **mixed_transition (queue-storage rows exist) — ONE-WAY**: `awa storage abort` is rejected. From this point onward you must either finish the transition (`finalize`) or restore from backup. A pure fleet downgrade to 0.5 is **not supported** because 0.5 workers don't know how to claim queue-storage work.
 - **active → anything**: not supported by `awa storage abort`. Use database restore.
 
-The `/api/storage` dashboard card surfaces the current boundary explicitly: "Rollback is still available" on `canonical` / `prepared`, "From here it's restore-only" once the cluster has crossed into `mixed_transition`, and "Finalized" once the transition has completed.
-
-### The Storage transition card
-
-When a transition is in flight the runtime page renders a "Storage transition" card with four panels operators reload during a cutover:
-
-1. **Header row** — current engine, prepared engine, state, and the live canonical backlog. The state pill is paired with an `in <state> for Nh Mm` time-in-state stamp that ticks once per second, so a stuck transition is visually distinct from a slow one without having to compare timestamps by hand.
-2. **Backlog sparkline** — appears next to the canonical-backlog number once the cluster enters `mixed_transition`. The series is anchored to the current `transition_epoch`, so it always shows the timeline of _this_ cutover (an `abort`/re-`prepare` resets the line).
-3. **Schema-readiness warning** — if `prepared_engine = queue_storage` but the queue-storage tables are missing, a yellow alert spells out the exact `awa storage prepare-queue-storage-schema --schema <name>` command to run before the routing flip.
-4. **Rollback-boundary panel** — the wording above ("reversible via abort", "from here it's restore-only", "finalized") rendered as a coloured block so the operator never has to infer the boundary from the state string alone.
-
-Samples for the sparkline are accumulated client-side from the existing poll (no audit table, per the #180 decision); they're discarded on a tab reload and that's fine — the operator only needs the trend since they opened the page, not historical replay.
+The `/api/storage` dashboard card shows the current transition state, backlog, schema readiness, and rollback boundary.
 
 ## Phase 2 — 0.6 rollout
 
@@ -163,8 +150,8 @@ awa --database-url "$DATABASE_URL" storage status
 
 | After step | Watch for |
 | --- | --- |
-| migrate | `SELECT MAX(version) FROM awa.schema_version` advances; `\dt awa.ready_entries`, `\dt awa.ready_tombstones`, `\dt awa.ready_segments`, `\dt awa.ready_claim_attempt_batches`, `\dt awa.lease_claim_batches`, `\dt awa.receipt_completion_batches`, `\dt awa.receipt_completion_tombstones`, `\dt awa.lease_claim_closure_batches`, and `\dt awa.queue_terminal_count_deltas` exist for the default schema; `\ds awa.lease_claim_receipt_id_seq` and `\ds awa.lease_claim_batch_id_seq` exist; `\d awa.queue_claim_heads` includes the (now-unused, retained) `ready_segment_*` columns |
-| prepare custom queue-storage schema | `\dt <custom_schema>.ready_entries`, `\dt <custom_schema>.ready_tombstones`, `\dt <custom_schema>.ready_segments`, `\dt <custom_schema>.ready_claim_attempt_batches`, `\dt <custom_schema>.lease_claim_batches`, `\dt <custom_schema>.receipt_completion_batches`, `\dt <custom_schema>.receipt_completion_tombstones`, `\dt <custom_schema>.lease_claim_closure_batches`, and `\dt <custom_schema>.queue_terminal_count_deltas` exist when using a custom schema; `\ds <custom_schema>.lease_claim_receipt_id_seq` and `\ds <custom_schema>.lease_claim_batch_id_seq` exist; `\d <custom_schema>.queue_claim_heads` includes the (now-unused, retained) `ready_segment_*` columns |
+| migrate | `SELECT MAX(version) FROM awa.schema_version` advances; `awa storage status` reports no schema-readiness blocker |
+| prepare custom queue-storage schema | `awa storage status` reports no schema-readiness blocker for the configured schema |
 | prepare | `awa storage status` reports `state=prepared` |
 | start queue-storage target | `awa.runtime_instances` shows `transition_role='queue_storage_target'` and `storage_capability='queue_storage'` for the new instance; `awa storage status` lists no `enter_mixed_transition_blockers` |
 | enter-mixed-transition | `awa_maintenance_rotate_attempts_total{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
@@ -189,53 +176,9 @@ If any of these go wrong **before** any queue-storage work is accepted, `awa sto
 - **Held-tx during finalize.** A long-running canonical transaction (e.g., reporting query) blocks vacuum, which can stall partition prune in the queue-storage tables. `awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}` will rise. Identify and terminate the held-tx; prune resumes on the next maintenance tick.
 - **0.6 rollback after queue-storage work.** Not supported via `awa storage abort` once any rows exist in queue-storage tables. Plan accordingly: keep `0.6` workers available throughout the transition window. Only emergency rollback path is database restore.
 
-## v017 sharded enqueue heads — operator notes
+## Optional enqueue sharding
 
-Migration `v017` adds an `enqueue_shard` column and extends the primary keys of `queue_enqueue_heads`, `queue_claim_heads`, `ready_entries`, `leases`, and `done_entries`. `lease_claims` carries the column as a regular column; its primary key stays `(claim_slot, job_id, run_lease)`. `awa.queue_meta.enqueue_shards` is the per-queue tunable (default 1, range 1..=64). The default value is observationally identical to the pre-v017 layout — shard 0 is the only shard, and strict FIFO per `(queue, priority)` is preserved.
-
-`enqueue_shards > 1` is a semantic mode switch, comparable to choosing SQS Standard over SQS FIFO, raising Kafka partition count, or using Pub/Sub ordering keys instead of global ordering. The queue's ordering contract changes from strict FIFO per lane to **partitioned FIFO**: strict FIFO within `(queue, priority, enqueue_shard)`, no ordering promised across shards. Operators opt in per queue; the default keeps the legacy contract.
-
-When the migration runs:
-
-- **`canonical` state.** No queue-storage schema exists; the migration is a no-op for the queue-storage tables. `awa.queue_meta.enqueue_shards` is added with default 1 and the `BETWEEN 1 AND 64` constraint.
-- **`prepared` state.** Queue-storage schema exists but receives no live traffic. The PK reshape takes an `ACCESS EXCLUSIVE` lock; the tables are empty so the lock acquires immediately and the migration completes in milliseconds.
-- **`active` state.** Queue-storage is the live engine. The PK reshape still takes an `ACCESS EXCLUSIVE` lock, but on a live table it waits for in-flight enqueue and claim transactions to finish, then blocks new ones until the rewrite completes. On a quiet queue this is milliseconds; on a saturated queue with multi-million-row `ready_entries` it is longer. Run the migration during a low-traffic window.
-- **`mixed_transition` state.** The migration refuses to run and raises a 55000 error. Finalize the transition (or abort and re-enter `prepared`) first.
-
-### Raising `enqueue_shards`
-
-Opt a contended queue into multiple shards by upserting `awa.queue_meta`:
-
-```sql
-INSERT INTO awa.queue_meta (queue, enqueue_shards)
-VALUES ('my_hot_queue', 4)
-ON CONFLICT (queue)
-DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
-```
-
-The producer-side rotor picks up the new shard count on the next enqueue. Existing in-flight rows on shard 0 continue to be claimed and drained; new no-key batches spread across shards 0..S-1 over time.
-
-Ordering contract and trade-offs:
-
-- **Partitioned FIFO.** Strict FIFO is preserved within each `(queue, priority, enqueue_shard)`. Cross-shard ordering is not guaranteed. Workloads that need strict cross-producer FIFO at the lane level keep `enqueue_shards = 1`. Workloads that need per-key FIFO (per customer, per order, per account) pass `InsertOpts::ordering_key` when enqueuing — rows sharing a key hash to the same shard and inherit that shard's strict FIFO contract.
-- **Throughput** scales near-linearly with shard count up to roughly one shard per two concurrent producers on a contended queue; the next bottleneck is WAL bandwidth.
-- **Claim cost** is `O(shard count)` per claim call: the claim path scans every shard's head row to pick a candidate. With `enqueue_shards = 64` and four priorities, that's 256 candidate rows — still trivial.
-
-See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and the partitioned-FIFO contract.
-
-### Routing related jobs to the same shard
-
-For independent jobs, the default per-store rotor uses one shard pick per `(queue, priority)` sub-batch, then spreads successive batches across shards. For jobs that must observe each other in order — successive events for the same customer, sequential steps in a workflow, all writes for one account — set `InsertOpts::ordering_key` to the bytes of the partition identifier:
-
-```rust
-let opts = InsertOpts {
-    queue: "events".into(),
-    ordering_key: Some(customer_id.as_bytes().to_vec()),
-    ..Default::default()
-};
-```
-
-The key bytes are mapped by Awa's portable shard hash and reduced modulo the queue's `enqueue_shards`, so two enqueues with the same key always land on the same shard regardless of which producer or batch boundary they sit on. Rust, SQL, and Python enqueue paths use the same byte-level routing. At `enqueue_shards = 1` the key is ignored (every job lands on shard 0 anyway).
+The migration leaves `enqueue_shards = 1`, preserving strict FIFO per queue and priority without operator action. Raising it is an explicit switch to partitioned FIFO; see [configuration](configuration.md#sharding-the-enqueue-head-per-queue) and [ADR-025](adr/025-sharded-enqueue-heads.md) before changing it.
 
 ### Lowering `enqueue_shards`
 
@@ -275,7 +218,7 @@ The audit and drain contract are pinned by `test_queue_storage_lowering_enqueue_
 
 ## Cross-references
 
-- [migrations.md](migrations.md) — full migration story including SQL-level identities
+- [migrations.md](migrations.md) — general migration contract and external tooling
 - [configuration.md](configuration.md) — claim-ring / lease-ring sizing knobs
 - [`docs/adr/023-receipt-plane-ring-partitioning.md`](adr/023-receipt-plane-ring-partitioning.md) — receipt-plane partition design and reverse-migration recipe
 - [`docs/adr/025-sharded-enqueue-heads.md`](adr/025-sharded-enqueue-heads.md) — enqueue-head sharding design and partitioned-FIFO contract

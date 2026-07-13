@@ -1,23 +1,23 @@
 # Migration Guide
 
-This guide covers fresh installs, upgrades, external migration tooling, and rollback strategy.
+This guide explains how to install and upgrade the Awa schema, integrate an external migration runner, and plan rollback. Release-specific prerequisites and transition procedures live in the relevant upgrade guide.
 
-## Migration Model
+## Migration Contract
 
-Awa ships forward-only schema migrations.
+Awa schema migrations are forward-only. The built-in runner serializes migration work, applies each migration transactionally, and makes migrations safe to re-run where practical.
 
-Current guarantees from the migration layer:
+Migration behavior fails closed:
 
-- migrations are forward-only and safe to re-run where possible
-- fresh installs bootstrap the full schema
-- rerunning migrations is safe
-- older pre-0.4 version numbering is normalized during upgrade
+- a binary refuses a schema newer than it understands;
+- missing or unparseable runtime capability does not satisfy a migration gate;
+- an expand migration may require a minimum compatible runtime patch; and
+- a migration that cannot be made rolling-compatible may require an explicitly documented exclusive window.
 
-Most migrations are additive, but storage-engine migrations can be non-additive when they are protected by rollout gates. For example, queue-storage migrations reshape internal keys and drop obsolete columns. Rolling upgrades stay practical because those changes are forward-only, idempotent where possible, and gated by the storage transition state rather than by assuming every DDL step is additive.
+Representation changes follow [ADR-041](adr/041-rolling-upgrade-policy.md): expand the schema while the old representation remains authoritative, flip authority only after the fleet proves capability, and remove the old representation in a later release. The release upgrade guide defines supported ordering, capability gates, and the rollback boundary for each change.
 
-The default queue-storage substrate at `awa.*` is owned by `awa migrate` via the `v023_install_queue_storage_substrate` migration, which calls the `awa.install_queue_storage_substrate(schema, ...)` SQL helper. `prepare_schema()` (Rust) and `awa storage prepare-queue-storage-schema` (CLI) call the same helper for custom queue-storage schemas. See [Queue-storage substrate](queue-storage-substrate.md) for the full ownership contract, the rejection of `--reset --schema awa`, and how to install a custom-shaped substrate.
+The default queue-storage substrate in `awa.*` is migration-owned. Custom queue-storage schemas are installed through the same SQL helper; see [Queue-storage substrate](queue-storage-substrate.md) for ownership and configuration details.
 
-## Fresh Install
+## Fresh Install (No Prior Canonical Data)
 
 ### CLI
 
@@ -43,207 +43,49 @@ or:
 await awa.migrate(database_url)
 ```
 
-## Upgrading an Existing Database
+## Upgrade an Existing Database
 
-The normal upgrade order is:
+Read the release-specific guide before applying migrations:
 
-1. deploy the new schema with `awa migrate`
-2. roll out new application code
-3. let old workers drain and exit cleanly
+- [Upgrade 0.5 to 0.6](upgrade-0.5-to-0.6.md)
+- [Upgrade 0.6 to 0.7](upgrade-0.6-to-0.7.md)
 
-Because migrations are additive-only, old workers should continue to function during the rollout as long as your application-level payload compatibility still holds.
+Then run the migration command at the point specified by that guide:
 
-## Storage Transition Preparation
+```bash
+awa --database-url "$DATABASE_URL" migrate
+```
 
-This release introduces a generic storage-transition framework that future storage-engine upgrades can build on.
+Do not assume that every release requires schema-first deployment. A guide may require a compatibility patch before migration, permit migration and binary rollout in either order, or define a capability-gated flip after the binaries have rolled.
 
-The 0.5.x prep-release migration does **not** change the current execution engine. The 0.6 compatibility migration builds on that foundation and also adds:
-
-- the queue-storage compatibility layer
-- the active-backend selector in `awa.runtime_storage_backends`
-- the segmented DLQ table in the active queue-storage schema (`{schema}.dlq_entries`)
-- `awa.jobs` / `awa.insert_job_compat()` routing that follows the active backend when queue storage is activated
-
-New operator surfaces:
+Use the storage status command when an upgrade includes a storage transition:
 
 ```bash
 awa --database-url "$DATABASE_URL" storage status
-awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
-awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema <custom_schema>
-awa --database-url "$DATABASE_URL" storage abort
 ```
 
-Equivalent SQL for extracted-migration or direct-operator workflows:
-
-```sql
-SELECT * FROM awa.storage_status();
-
-SELECT * FROM awa.storage_prepare(
-    'queue_storage',
-    '{}'::jsonb
-);
-
-SELECT * FROM awa.storage_abort();
-```
-
-These functions are one-shot operational commands. They are not schema-migration DDL and should be run deliberately by an operator or rollout tool, not embedded into the extracted migration SQL itself.
-
-`awa migrate` materializes the default queue-storage substrate in the `awa` schema with the default slot counts. `storage prepare-queue-storage-schema` is still the operational command for custom queue-storage schemas, custom slot counts, or idempotent preflight checks. It only materializes the queue-storage schema: it does **not** change `awa.storage_transition_state` and it does **not** activate routing.
-
-Queue-storage schema preparation may also relax the physical `done_entries` body columns (`args`, `max_attempts`, `run_at`, `created_at`) to allow narrow terminal history and create compact receipt-completion history tables. This is part of the queue-storage operational DDL, not an additive canonical `awa.jobs` migration: public Awa APIs and the read-only `{schema}.terminal_jobs` compatibility view hydrate terminal jobs through the retained ready row and expand compact completion batches, while direct SQL against `done_entries` must tolerate nullable duplicated body fields and successful receipt-backed completions being absent from that table. Use `{schema}.terminal_jobs` for SQL inspection of hydrated queue-storage terminal history.
-
-On the `0.5.x` prep release these SQL identities existed as stubs. On this `0.6` branch they are implemented:
-
-- `awa.storage_enter_mixed_transition()`
-- `awa.storage_finalize()`
-
-Current behavior:
-
-- `storage status` reports the singleton row in `awa.storage_transition_state`
-- `storage status` also reports canonical live backlog, live runtime capability counts, and blocker lists for `enter-mixed-transition` / `finalize`
-- `storage prepare` records a future engine and optional metadata, but keeps enqueue routing and worker execution on canonical storage
-- `awa migrate` creates the default `awa` queue-storage substrate; `storage prepare-queue-storage-schema` creates custom queue-storage schemas ahead of time without changing routing
-- `storage abort` returns routing to canonical and clears a prepared or mixed-transition rollout before final activation
-- `storage enter-mixed-transition` requires prepared queue-storage metadata, a prepared queue-storage schema, and no live canonical-only runtimes
-- `storage finalize` requires zero canonical live backlog and no live canonical / drain-only runtimes
-- workers continue to run the canonical engine before and after `prepare`
-
-### `0.5.x` -> `0.6` Queue-Storage Rollout
-
-The 0.6 storage-engine upgrade uses the transition protocol introduced in the 0.5.x prep release. The intended operator sequence has two phases.
-
-#### Phase 1: last `0.5.x` release everywhere
-
-1. Deploy `0.5.latest` everywhere with a normal rolling deploy.
-2. Run:
-
-   ```bash
-   awa --database-url "$DATABASE_URL" migrate
-   ```
-
-3. Verify the cluster is still canonical:
-
-   ```bash
-   awa --database-url "$DATABASE_URL" storage status
-   ```
-
-   Expected:
-   - `current_engine = canonical`
-   - `active_engine = canonical`
-   - `prepared_engine = NULL`
-   - `state = canonical`
-
-4. Confirm live runtime capability is still canonical:
-
-   ```sql
-   SELECT instance_id, storage_capability, last_seen_at
-   FROM awa.runtime_instances
-   ORDER BY last_seen_at DESC;
-   ```
-
-5. This is a safe stopping point. The queue is still fully canonical and behavior is unchanged. Operators can remain here indefinitely.
-
-#### Phase 2: `0.6` rollout on top of the prep release
-
-1. Roll out `0.6` binaries. `0.5.x` and `0.6` pods may coexist at this stage. While state is still `canonical` or `prepared`, all execution and writes remain canonical.
-2. Run:
-
-   ```bash
-   awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
-   ```
-
-3. Verify prepared state:
-   - `current_engine = canonical`
-   - `active_engine = canonical`
-   - `prepared_engine = queue_storage`
-   - `state = prepared`
-
-4. Confirm every live runtime instance is now queue-storage capable before the routing flip. This is the gate that prevents canonical-only workers from surviving into `mixed_transition`.
-
-   In `0.6`, the intended worker roles are:
-   - the default `auto` role, which stays canonical before the routing flip and becomes `canonical_drain_only` once mixed transition starts
-   - an explicit queue-storage target role, which prepares the queue-storage executor before the routing flip so new work can start executing immediately after `enter-mixed-transition`
-
-   The `enter_mixed_transition()` SQL gate requires at least one live runtime running with `transition_role = 'queue_storage_target'` reporting `storage_capability = 'queue_storage'`. Auto-role runtimes that pre-date the flip will downgrade to `canonical_drain_only` after routing flips, so they cannot satisfy the gate on their own — there would be no queue-storage executor post-flip. Auto-role runtimes started _after_ `enter-mixed-transition` resolve to queue storage at startup and behave normally.
-
-   Current APIs:
-   - Rust: `Client::builder(...).transition_role(TransitionWorkerRole::QueueStorageTarget)`
-   - Python: `AsyncClient.start(..., storage_transition_role="queue_storage_target")`
-
-5. From here, the `0.6` sequence is:
-   - `awa storage enter-mixed-transition` flips new writes and cron enqueues to queue storage
-   - queue-storage-capable workers report capability for the new engine, while canonical drain work is handled by `0.6` workers in drain-only mode
-   - canonical backlog drains while new work lands in queue storage
-   - `awa storage finalize` advances the state to `active` once live capability and backlog checks pass
-
-Expected status progression during that rollout:
-
-- before `prepare`: `canonical / canonical / NULL / canonical`
-- after `prepare`: `canonical / canonical / queue_storage / prepared`
-- during mixed transition: `canonical / queue_storage / queue_storage / mixed_transition`
-- after finalization: `queue_storage / queue_storage / NULL / active`
-
-Running `storage prepare` before every worker is on `0.5.latest` is harmless. The prepared flag is dormant in `0.5.x`; it only becomes operational when `0.6` code starts acting on it.
-
-If rollout stalls because some workers never upgrade, use:
-
-```sql
-SELECT instance_id, storage_capability, last_seen_at
-FROM awa.runtime_instances
-ORDER BY last_seen_at DESC;
-```
-
-alongside `awa storage status` or the `/api/runtime` UI/API view to identify which runtime instances are still reporting canonical capability. The cluster must not enter `mixed_transition` until canonical-only workers have stopped heartbeating. Finalization must also wait until canonical backlog is empty.
-
-If you need to stop the rollout before final activation, `storage abort` is the intended primitive. In `prepared`, it returns the singleton row to `canonical` and clears the prepared engine metadata. In `mixed_transition`, `0.6` now enforces a rollback interlock: abort is only allowed while there are **no** live queue-storage runtimes and **no** rows in queue-storage tables. Once queue-storage has started accepting work, abort is rejected instead of trying to paper over a partial rollback.
-
-Current `0.5.x` fail-safe behavior if someone forces the state forward without `0.6` support:
-
-- `awa.insert_job_compat()` raises `55000`
-- batch insert and COPY insert paths also fail closed
-- the reserved `awa.storage_enter_mixed_transition()` and `awa.storage_finalize()` functions raise “requires 0.6”
-
-#### `0.6` Receipt-plane partition migration (ADR-023)
-
-The `0.6` queue-storage engine partitions the receipt plane: `lease_claims`, `lease_claim_closures`, and `lease_claim_closure_batches` are `PARTITIONED BY LIST (claim_slot)` parents with one child per claim-ring slot. Upgrading from a 0.5.x deploy where the legacy claim and closure tables were regular (non-partitioned) tables runs an in-place migration inside `prepare_schema()`:
-
-1. The legacy tables are renamed in place to `lease_claims_legacy` / `lease_claim_closures_legacy`.
-2. The new partitioned parents are created alongside the legacy tables.
-3. Rows are copied from the legacy tables into the partitioned parents, all landing in the current `claim_ring_state.current_slot` (so existing receipts close out on their normal lifecycle in that partition; the ring's natural rotation re-balances over subsequent claims).
-4. The legacy tables are dropped.
-
-Steps 3 and 4 run inside a single Postgres transaction so a crash mid-migration leaves the schema in exactly one of two states: pre-migration (legacy tables still present, partitioned parents empty) or post-migration (legacy tables gone, partitioned parents populated). On restart, `prepare_schema()` detects whichever state is current and either re-runs the migration or skips it. The `ON CONFLICT DO NOTHING` on the copy step is a defensive belt-and-braces; under the transactional shape it should never fire.
-
-If the migration is partially applied at the time of a `reset()` call, the legacy tables are dropped explicitly before the main `TRUNCATE`. Without that, `reset()` would TRUNCATE the partitioned parents but leave the legacy data intact, and the next `prepare_schema()` would re-run the migration on top and silently re-insert old rows. Operators should not normally call `reset()` during an upgrade — it's a test fixture rather than a recovery primitive — but the safety net is there.
-
-**Reverse migration** (only relevant if a production rollback fires between an ADR-023 deploy and the older runtime catching up): create unpartitioned `lease_claims` and `lease_claim_closures` tables, `INSERT ... SELECT * FROM` each partitioned parent, drop the partitioned parents, and treat `lease_claim_closure_batches` as compact closure evidence that older runtimes cannot consume. This is not committed to source — the forward path is the only supported one — but operators are expected to keep this recipe in their runbook for the rollout window.
-
-### Why This Exists
-
-If Awa needs another storage redesign in the future, the plan is to reuse the same framework:
-
-- `awa.storage_transition_state`
-- transition epochs
-- storage status / prepare / abort operator commands
-- runtime storage capability reporting
-- `awa.insert_job_compat()` as the write-routing seam
-
-Only the engine-specific install, backlog checks, and finalization logic should change between migrations.
+The [queue-storage substrate guide](queue-storage-substrate.md) documents preparation of custom schemas and non-default slot counts.
 
 ## External Migration Tooling
 
-If you manage SQL with Flyway, Liquibase, dbmate, or a homegrown process, extract the bundled SQL:
+To manage Awa SQL with Flyway, Liquibase, dbmate, or another runner, extract the bundled migrations:
 
 ```bash
 awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
 ```
 
-That writes one SQL file per migration. The same SQL is also available programmatically:
+Use `awa migrate --sql` to print the same migration set to standard output.
+
+The same SQL is available programmatically:
 
 - Rust: `awa::migrations::migration_sql()`
 - Python: `awa.migrations()`
 
-## Checking Schema Version
+Extracted SQL does not execute Rust preflights such as runtime version floors or exclusive-window checks. The external rollout must enforce the release guide's binary prerequisites and preserve the documented lock or ordering boundary before applying the SQL.
+
+Operational storage commands such as `storage prepare`, `storage enter-mixed-transition`, and `storage finalize` are not migration DDL. Run them only where the applicable upgrade guide instructs; do not append them to the extracted migration files.
+
+## Check Schema Version
 
 From SQL:
 
@@ -258,86 +100,23 @@ From Rust:
 let version = awa::migrations::current_version(&pool).await?;
 ```
 
-## Compatibility Notes
+Schema versions increase monotonically. Application code should call `awa migrate` rather than depend on a particular numeric version.
 
-Relevant behavior:
+## Rollback
 
-- pre-0.4 legacy version rows are normalized automatically during upgrade
-- schema versions increase monotonically as new migrations are added; use `awa migrate` rather than depending on a specific numeric version in application code
-- `v005` switches admin metadata maintenance from row-level to statement-level triggers
-- `SchemaNotMigrated` means your application expects a newer schema than the database currently has
-- there are no bundled down migrations
+Awa does not ship down migrations. Use a database backup, snapshot, or reverse SQL owned by your external migration system if the schema itself must be restored.
 
-## Rollback Strategy
+Application rollback depends on the release phase:
 
-There are two distinct rollback cases.
+- before an authority flip, the additive expanded schema normally remains compatible with the documented previous release;
+- after a flip, pre-flip binaries are fenced and rollback is limited to flip-aware releases; and
+- after a contract migration, follow that release's separately documented compatibility boundary.
 
-### 1. Application Rollback
+Do not infer rollback support from the presence of old tables or columns. Follow the release upgrade guide, which identifies the last reversible step and any required operator action.
 
-If a release has to be reverted but the Awa schema migration already ran:
+## Related Guides
 
-- roll back application code first
-- leave the Awa schema in place
-
-That is the expected path because the migrations are additive-only.
-
-For the planned `0.5.x` -> `0.6` storage transition, there is an additional constraint:
-
-- once the cluster has entered `mixed_transition` and `0.6` has routed jobs to queue storage, a pure fleet downgrade back to `0.5` is not supported
-- `0.5` workers do not know how to claim queue-storage work
-- `storage abort` is only a rollback path from `mixed_transition` before any queue-storage runtime is live and before any queue-storage rows exist
-- once queue-storage has accepted work, keep `0.6` workers available and treat the transition as one-way until finalize or full database restore
-
-### 2. Database Rollback
-
-Awa does not ship reverse SQL. If you need to undo the schema itself, use your normal database rollback controls:
-
-- restore from backup or snapshot
-- or own the reverse SQL in your external migration system
-
-Do not expect `awa migrate` to downgrade the schema.
-
-## Breaking Changes
-
-Representation changes follow the rolling-upgrade policy ([ADR-041](adr/041-rolling-upgrade-policy.md)): the change ships as an additive **expand** migration (old binaries remain correct), a runtime capability-gated **flip** once the fleet has rolled, and a **contract** migration in a later minor that drops the old representation.
-
-An expand migration may declare a minimum compatible runtime patch in `MIGRATION_RUNTIME_VERSION_FLOORS`; this is preferred to refusing all live workers. A migration with no practical rolling-compatible shape may instead be flagged in `EXCLUSIVE_WINDOW_MIGRATIONS` after explicit design review. `awa migrate` enforces these checks for built-in migrations; external migration tooling must enforce the documented prerequisite independently.
-
-## Recommended Production Flow
-
-The shape depends on whether you're doing a **fresh install** or **upgrading from `0.5.x`**.
-
-### Fresh install (no prior canonical data)
-
-```bash
-# 1. Apply schema
-awa --database-url "$DATABASE_URL" migrate
-
-# 2. Start workers (Rust or Python). queue-storage runs by default.
-```
-
-That's the whole flow. The first worker that comes up in `auto` mode detects the DB is fresh — `state=canonical`, `prepared_engine=NULL`, no canonical jobs ever, no other live workers — and atomically installs the queue-storage schema and advances state directly to `active` via `awa.storage_auto_finalize_if_fresh()`. Subsequent workers see `state=active` and run as queue-storage straight away.
-
-The auto-finalize fast-path **only** fires on a truly fresh DB. Any of these conditions disqualify it and force the operator down the staged `prepare → enter-mixed-transition → finalize` path:
-
-- canonical jobs exist in `awa.jobs` (even terminal-state)
-- `prepared_engine` is already set (operator started the staged path)
-- another runtime is heartbeating in `awa.runtime_instances`
-
-If you specifically want the staged path on a fresh cluster (e.g., to rehearse the transition flow), insert one canonical job before starting any worker, then follow the upgrade-from-0.5.x path.
-
-### Upgrading from `0.5.x`
-
-**Do not use the fresh-install recipe.** Live canonical data and canonical-only `0.5.x` workers must drain through `mixed_transition` before queue storage can take over. Follow the staged transition flow documented above under [`0.5.x` -> `0.6` Queue-Storage Rollout](#05x---06-queue-storage-rollout):
-
-1. Phase 1 — last `0.5.x` release everywhere with `awa migrate` applied.
-2. Phase 2 — roll out `0.6` binaries, then `prepare → enter-mixed-transition → finalize`.
-
-Rollback boundaries and `storage abort` semantics are documented in [Rollback Strategy](#rollback-strategy) below.
-
-## Next
-
+- [Queue-storage substrate](queue-storage-substrate.md)
+- [Deployment](deployment.md)
 - [PostgreSQL roles and privileges](security.md)
-- [Deployment guide](deployment.md)
-- [Configuration](configuration.md)
 - [Troubleshooting](troubleshooting.md)
