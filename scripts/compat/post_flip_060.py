@@ -1,4 +1,4 @@
-"""Assert that a pinned 0.6.0 artifact fails closed after the v042 authority flip."""
+"""Assert that a pinned 0.6.0 artifact fails closed after the v043 authority flip."""
 
 import asyncio
 import datetime

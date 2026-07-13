@@ -183,10 +183,12 @@ The model separates three runtime populations that collapse to similar database 
 - auto 0.6 runtimes started before mixed transition, which report `queue_storage` while prepared but become `canonical_drain_only` after routing flips
 - explicit queue-storage targets, which can actually execute queue-storage work immediately after mixed transition starts
 
+Finalization requires the canonical backlog to be empty and rejects any returning canonical-only runtime. V040 deliberately allows pre-flip auto runtimes to remain `canonical_drain_only`: supported producers route to queue storage from mixed-transition entry onward, so those runtimes are idle after the backlog reaches zero and can roll normally after finalization.
+
 Configs:
 
-- [`AwaStorageTransition.cfg`](./AwaStorageTransition.cfg): desired gates — a live queue-storage executor required at `EnterMixedTransition`, and the ADR-037 0.7 migrate gate (`GateMigrate07 = TRUE`) checked via `Migrate07OnlyOnQuiescedCanonical`. TLC completes cleanly with **444 distinct states**.
-- [`AwaStorageTransitionMigrate07Ungated.cfg`](./AwaStorageTransitionMigrate07Ungated.cfg): expected-counterexample witness for the ADR-037 migrate gate. With `GateMigrate07 = FALSE`, `Migrate07` fires without the finalized-or-fresh check and TLC trips `Migrate07OnlyOnQuiescedCanonical` — a 0.7 migration lands while canonical work or a canonical-capable runtime is live. The production gate is `check_storage_finalized_gate` in `awa-model/src/migrations.rs`.
+- [`AwaStorageTransition.cfg`](./AwaStorageTransition.cfg): desired gates — a live queue-storage executor required at `EnterMixedTransition`, and the ADR-037 0.7 migrate gate (`GateMigrate07 = TRUE`) checked via `Migrate07OnlyOnQuiescedCanonical`. TLC completes cleanly with **480 distinct states**.
+- [`AwaStorageTransitionMigrate07Ungated.cfg`](./AwaStorageTransitionMigrate07Ungated.cfg): expected-counterexample witness for the ADR-037 migrate gate. With `GateMigrate07 = FALSE`, `Migrate07` fires without the finalized-or-fresh check and TLC trips `Migrate07OnlyOnQuiescedCanonical` — a 0.7 migration lands while canonical work or a canonical-only runtime is live. The production gate is `check_storage_finalized_gate` in `awa-model/src/migrations.rs`.
 - [`AwaStorageTransitionCurrentGate.cfg`](./AwaStorageTransitionCurrentGate.cfg): historical pre-v014 failing witness for the old SQL-level capability-only gate. TLC trips `MixedHasQueueExecutor` in 5 steps: prepare queue storage, prepare schema, start an auto pre-mixed runtime, enter mixed transition, and end up with queue-storage routing but no queue executor.
 
 Run:

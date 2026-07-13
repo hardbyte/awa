@@ -98,7 +98,7 @@ mod tests {
     fn runtime_version_floor_maps_to_dedicated_exception() {
         Python::initialize();
         let err = map_awa_error(awa_model::AwaError::RuntimeVersionFloorNotMet {
-            migration_version: 42,
+            migration_version: 43,
             minimum_version: "0.6.2",
             count: 1,
             instances: " Incompatible runtimes: worker-a: \"0.6.1\".".to_string(),

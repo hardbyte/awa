@@ -443,7 +443,7 @@ async fn test_migrate_gate_allows_active_cluster() {
     migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance(&pool, "queue_storage").await;
-    // Rewind one version so the pending range crosses v042. The live runtime
+    // Rewind one version so the pending range crosses v043. The live runtime
     // reports the 0.6.2 compatibility floor, so migration remains rolling.
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
@@ -1348,25 +1348,25 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
     assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
-/// v041 (#246) refreshes every installed queue-storage schema so the compact
+/// v042 (#246) refreshes every installed queue-storage schema so the compact
 /// deadline-claim machinery reaches schemas prepared before the upgrade: the
 /// per-slot batch deadline-rescue cursor columns on `claim_ring_slots` and
 /// the partial `(deadline_at, batch_id)` sweep index on each
-/// `lease_claim_batches` child. Simulate a pre-v041 schema by stripping both,
+/// `lease_claim_batches` child. Simulate a pre-v042 schema by stripping both,
 /// rewind `schema_version`, and prove `run()` reinstalls them via the v023
 /// install helper the migration re-invokes.
 #[tokio::test]
-async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
+async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
     migrations::run(&pool).await.unwrap();
 
-    let schema = "awa_queue_storage_v041_deadline";
+    let schema = "awa_queue_storage_v042_deadline";
     prepare_queue_storage_schema(&pool, schema).await;
 
-    // Strip the v041 additions to mimic a schema installed before #246.
+    // Strip the v042 additions to mimic a schema installed before #246.
     sqlx::raw_sql(&format!(
         r#"
         ALTER TABLE {schema}.claim_ring_slots
@@ -1377,7 +1377,7 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     ))
     .execute(&pool)
     .await
-    .expect("stripping v041 additions should succeed");
+    .expect("stripping v042 additions should succeed");
 
     let has_cursor_before = column_exists(
         &pool,
@@ -1388,17 +1388,17 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     .await;
     assert!(
         !has_cursor_before,
-        "precondition: the batch deadline cursor column must be absent before v041 reruns"
+        "precondition: the batch deadline cursor column must be absent before v042 reruns"
     );
 
-    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 41")
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
         .execute(&pool)
         .await
         .expect("schema_version rewind should succeed");
 
     migrations::run(&pool)
         .await
-        .expect("v041 should rerun cleanly");
+        .expect("v042 should rerun cleanly");
 
     let has_cursor_deadline = column_exists(
         &pool,
@@ -1416,7 +1416,7 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     .await;
     assert!(
         has_cursor_deadline && has_cursor_batch,
-        "v041 must backfill the batch deadline-rescue cursor columns on existing schemas"
+        "v042 must backfill the batch deadline-rescue cursor columns on existing schemas"
     );
 
     // The migration contract covers EVERY lease_claim_batches child, not
@@ -1449,7 +1449,7 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
         .expect("index definition probe should succeed");
         let index_def = index_def.unwrap_or_else(|| {
             panic!(
-                "v041 must backfill the partial batch-deadline sweep index on                  lease_claim_batches child {slot}"
+                "v042 must backfill the partial batch-deadline sweep index on                  lease_claim_batches child {slot}"
             )
         });
         assert!(
@@ -1462,8 +1462,8 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     assert_eq!(version, migrations::CURRENT_VERSION);
 
     // Clean up so a later `migrations::run` (this or another test) does not
-    // reinstall this schema through the discovery loops. With the v042
-    // ledger loop now running alongside the v041 compact-deadline loop, a
+    // reinstall this schema through the discovery loops. With the v043
+    // ledger loop now running alongside the v042 compact-deadline loop, a
     // leaked probe schema multiplies the single-tx lock footprint of the
     // reinstall and can trip max_locks_per_transaction under concurrency.
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -1571,23 +1571,23 @@ async fn ring_state_cursor_columns_exist(pool: &PgPool, schema: &str) -> bool {
     .expect("current_slot column probe should succeed")
 }
 
-/// #371 v042 STAGED UPGRADE: an upgrade from a pre-v042 substrate must
+/// #371 v043 STAGED UPGRADE: an upgrade from a pre-v043 substrate must
 /// create + seed the append-only rotation ledgers from the legacy
 /// `current_slot` / `generation` singleton cursor WITHOUT dropping those
 /// columns (the migration is additive — compat columns are retained), start
 /// the schema in `columns` authority, and route a post-upgrade cursor read
-/// off the compat columns exactly. Also covers the dev-shape v042 where the
-/// columns were previously dropped: v042 must re-ADD and re-seed them from
+/// off the compat columns exactly. Also covers the dev-shape v043 where the
+/// columns were previously dropped: v043 must re-ADD and re-seed them from
 /// the ledger (the inverse seed).
 #[tokio::test]
-async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
+async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
-    let schema = "awa_queue_storage_v042_ledger";
+    let schema = "awa_queue_storage_v043_ledger";
     // Drop any leftover from a prior interrupted run BEFORE migrating: the
-    // v042 discovery loop reinstalls every existing queue-storage schema,
+    // v043 discovery loop reinstalls every existing queue-storage schema,
     // and reinstalling a stale copy here only wastes a large single-tx
     // lock footprint (and can trip max_locks_per_transaction).
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -1599,7 +1599,7 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
 
     prepare_queue_storage_schema(&pool, schema).await;
 
-    // Downgrade the prepared (post-v042) substrate back to a pre-v042 (0.6-
+    // Downgrade the prepared (post-v043) substrate back to a pre-v043 (0.6-
     // shaped) substrate: drop the ledgers, the delta table, the authority
     // control row, and the ring_cursor resolver, and restore the mutable
     // cursor columns on each singleton. Seed the queue cursor at a
@@ -1626,7 +1626,7 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
 
         -- Stable 0.6 schemas carry NOT NULL per-slot generations without a
         -- default. INSERT(slot) ... ON CONFLICT still validates the proposed
-        -- row before conflict detection, so v042's v023 reapply must provide
+        -- row before conflict detection, so v043's v023 reapply must provide
         -- an explicit generation even when every slot already exists.
         ALTER TABLE {schema}.queue_ring_slots ALTER COLUMN generation DROP DEFAULT;
         ALTER TABLE {schema}.lease_ring_slots ALTER COLUMN generation DROP DEFAULT;
@@ -1637,30 +1637,30 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     ))
     .execute(&pool)
     .await
-    .expect("downgrade to pre-v042 substrate shape should succeed");
+    .expect("downgrade to pre-v043 substrate shape should succeed");
 
     assert!(
         ring_state_cursor_columns_exist(&pool, schema).await,
         "downgraded substrate should carry the legacy cursor columns"
     );
 
-    // Rerun the migrations: v042's discovery loop reapplies the v023 install
+    // Rerun the migrations: v043's discovery loop reapplies the v023 install
     // helper against this schema, seeding the ledger from the columns and
     // installing the authority control (which defaults to 'columns' because
     // this is an upgrade, not a fresh install).
-    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 43")
         .execute(&pool)
         .await
         .expect("schema_version rewind should succeed");
 
     migrations::run(&pool)
         .await
-        .expect("v042 should rerun cleanly");
+        .expect("v043 should rerun cleanly");
 
     // The compat cursor columns are RETAINED (additive migration).
     assert!(
         ring_state_cursor_columns_exist(&pool, schema).await,
-        "v042 must retain the compat current_slot/generation cursor columns"
+        "v043 must retain the compat current_slot/generation cursor columns"
     );
 
     // Authority defaults to 'columns' on upgrade.
@@ -1687,7 +1687,7 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     assert_eq!(
         (ledger_slot, ledger_gen),
         (3, 19),
-        "v042 must seed the queue ledger from the legacy cursor"
+        "v043 must seed the queue ledger from the legacy cursor"
     );
 
     // The authority resolver returns the compat columns (== ledger here).
@@ -1714,16 +1714,16 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     // A claim after upgrade routes off the resolved cursor without error.
     let claimed: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.claim_ready_runtime(\
-         'v042_upgrade_q'::text, 8::bigint, 0::double precision, 0::double precision)"
+         'v043_upgrade_q'::text, 8::bigint, 0::double precision, 0::double precision)"
     ))
     .fetch_one(&pool)
     .await
     .expect("claim_ready_runtime must route off the resolved cursor after upgrade");
     assert_eq!(claimed, 0, "no ready work was seeded for the upgrade probe");
 
-    // ---- Dev-shape v042 (columns previously DROPPED) -> inverse seed. ----
-    // Simulate the unreleased shipped-v042 shape: drop the compat columns,
-    // leaving only the ledger. Rerun v042; it must re-ADD the columns seeded
+    // ---- Dev-shape v043 (columns previously DROPPED) -> inverse seed. ----
+    // Simulate the unreleased shipped-v043 shape: drop the compat columns,
+    // leaving only the ledger. Rerun v043; it must re-ADD the columns seeded
     // FROM the ledger max (3, 19) and keep authority 'columns'.
     sqlx::raw_sql(&format!(
         r#"
@@ -1738,13 +1738,13 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     .execute(&pool)
     .await
     .expect("dev-shape column drop should succeed");
-    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 43")
         .execute(&pool)
         .await
         .expect("schema_version rewind should succeed");
     migrations::run(&pool)
         .await
-        .expect("v042 should rerun cleanly against the dev shape");
+        .expect("v043 should rerun cleanly against the dev shape");
 
     let (restored_slot, restored_gen): (i32, i64) = sqlx::query_as(&format!(
         "SELECT current_slot, generation FROM {schema}.queue_ring_state WHERE singleton"
@@ -1755,31 +1755,31 @@ async fn test_v042_expand_only_restores_compat_columns_and_seeds_ledger() {
     assert_eq!(
         (restored_slot, restored_gen),
         (3, 19),
-        "v042 must re-ADD the compat columns seeded from the ledger max (inverse seed)"
+        "v043 must re-ADD the compat columns seeded from the ledger max (inverse seed)"
     );
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
 
     // Clean up so a later `migrations::run` (this or another test) does not
-    // reinstall this schema through the v042 discovery loop.
+    // reinstall this schema through the v043 discovery loop.
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(&pool)
         .await
         .expect("ledger probe schema should drop cleanly");
 }
 
-/// #371 v042 staged upgrade: a FRESH queue-storage install starts directly
+/// #371 v043 staged upgrade: a FRESH queue-storage install starts directly
 /// in `ledger` authority (no old binary can exist to read the compat
 /// columns), while the default `awa` schema installed by `awa migrate` also
 /// resolves through the authority machinery.
 #[tokio::test]
-async fn test_v042_fresh_install_starts_in_ledger_authority() {
+async fn test_v043_fresh_install_starts_in_ledger_authority() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
-    let schema = "awa_queue_storage_v042_fresh";
+    let schema = "awa_queue_storage_v043_fresh";
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(&pool)
         .await
@@ -2612,7 +2612,7 @@ async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_run
 }
 
 #[tokio::test]
-async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
+async fn test_storage_finalize_requires_empty_backlog_but_allows_drain_runtimes() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_finalize_transition";
@@ -2654,17 +2654,19 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
         .await
         .unwrap();
     insert_runtime_instance(&pool, "canonical_drain_only").await;
+    insert_runtime_instance(&pool, "canonical").await;
 
     let err = storage::finalize(&pool).await.unwrap_err();
     assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
-    assert!(err.to_string().contains("drain-only runtime"), "got {err}");
+    assert!(
+        err.to_string().contains("canonical-only runtime"),
+        "got {err}"
+    );
 
-    sqlx::query(
-        "DELETE FROM awa.runtime_instances WHERE storage_capability = 'canonical_drain_only'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE storage_capability = 'canonical'")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let status = storage::finalize(&pool).await.unwrap();
     assert_eq!(status.state, "active");
@@ -2672,6 +2674,15 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
     assert_eq!(status.active_engine, "queue_storage");
     assert_eq!(status.prepared_engine, None);
     assert!(status.finalized_at.is_some());
+
+    let live_drain: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.runtime_instances \
+         WHERE storage_capability = 'canonical_drain_only'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_drain, 1, "finalize must not rewrite runtime evidence");
 }
 
 #[tokio::test]
@@ -2759,13 +2770,18 @@ async fn test_storage_status_report_surfaces_finalize_blockers() {
         "{:?}",
         report.finalize_blockers
     );
-    assert!(
-        report
-            .finalize_blockers
-            .iter()
-            .any(|reason| reason.contains("drain-only runtime")),
-        "{:?}",
-        report.finalize_blockers
+    sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = 'report_queue'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ready = storage::status_report(&pool).await.unwrap();
+    assert!(ready.can_finalize, "{:?}", ready.finalize_blockers);
+    assert_eq!(
+        ready
+            .live_runtime_capability_counts
+            .get("canonical_drain_only"),
+        Some(&1),
+        "drain-only runtimes remain observable but do not block"
     );
 }
 
@@ -3839,7 +3855,7 @@ async fn test_exclusive_window_preflight_passes_with_stale_runtime() {
 }
 
 /// `--allow-live-runtimes` skips the version-floor pre-flight even when a live
-/// runtime reports a version below the v042 compatibility floor.
+/// runtime reports a version below the v043 compatibility floor.
 #[tokio::test]
 async fn test_runtime_version_floor_override_allows_old_live_runtime() {
     let _guard = acquire_migration_guard().await;
@@ -3847,13 +3863,13 @@ async fn test_runtime_version_floor_override_allows_old_live_runtime() {
     reset_schema(&pool).await;
     migrations::run(&pool).await.expect("migrate to head");
     // Finalize (so the ADR-037 gate passes), add a live worker, then rewind so
-    // a real pending range crosses v042 with the worker heartbeating.
+    // a real pending range crosses v043 with the worker heartbeating.
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
     sqlx::query("UPDATE awa.runtime_instances SET version = '0.6.1'")
         .execute(&pool)
         .await
-        .expect("set runtime below v042 floor");
+        .expect("set runtime below v043 floor");
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
     let options = migrations::MigrateOptions {
@@ -3889,18 +3905,18 @@ async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
 
         let err = migrations::run(&pool)
             .await
-            .expect_err("incompatible live runtime must block v042");
+            .expect_err("incompatible live runtime must block v043");
         assert!(
             matches!(
                 &err,
                 awa::AwaError::RuntimeVersionFloorNotMet {
-                    migration_version: 42,
+                    migration_version: 43,
                     minimum_version: "0.6.2",
                     count: 1,
                     ..
                 }
             ),
-            "expected v042 runtime-version-floor refusal for {reported:?}, got: {err}"
+            "expected v043 runtime-version-floor refusal for {reported:?}, got: {err}"
         );
         assert!(
             err.to_string().contains(reported),
@@ -3925,7 +3941,7 @@ async fn test_runtime_version_floor_ignores_stale_old_runtime() {
     )
     .execute(&pool)
     .await
-    .expect("age runtime below v042 floor");
+    .expect("age runtime below v043 floor");
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
     migrations::run(&pool)
