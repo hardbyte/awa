@@ -1061,7 +1061,16 @@ async fn test_queue_storage_transition_soak_finalize_path() {
             report.status.state == "mixed_transition" && report.canonical_live_backlog == 0
         })
         .await;
-        wait_for_status_report(&pool, Duration::from_secs(10), |report| report.can_finalize).await;
+        wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+            report.can_finalize
+                && report
+                    .live_runtime_capability_counts
+                    .get("canonical_drain_only")
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1
+        })
+        .await;
         storage::finalize(&pool)
             .await
             .expect("Failed to finalize transition soak during tail cleanup");
