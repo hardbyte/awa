@@ -44,13 +44,11 @@ enum Commands {
         /// Auto-detect: from=current DB version, to=latest
         #[arg(long, conflicts_with_all = ["from", "version"])]
         pending: bool,
-        /// Skip the pre-flight live-runtime check.
+        /// Skip migration compatibility checks against live runtimes.
         ///
-        /// Some migrations require a stop-the-world window because a
-        /// pre-migration binary cannot operate against the resulting schema;
-        /// `migrate` refuses to apply such a migration while workers are
-        /// heartbeating. This overrides that check — use only when you have
-        /// confirmed no pre-migration binary is connected.
+        /// A migration may require a minimum runtime version or, when no
+        /// rolling-compatible shape exists, no live runtimes. This overrides
+        /// those checks; use only after independently verifying compatibility.
         #[arg(long)]
         allow_live_runtimes: bool,
     },
@@ -453,6 +451,31 @@ enum StorageCommands {
     /// on counter-fed reads for billing-grade accuracy. Wraps the rebuild in
     /// an advisory lock; best run on a quiesced fleet.
     RebuildTerminalCounters,
+    /// Flip the #371 ring-cursor authority `columns -> ledger` for a
+    /// queue-storage schema (one-way, idempotent).
+    ///
+    /// After a rolling 0.6 -> 0.7 upgrade the ring cursors run in `columns`
+    /// (compat) mode so a mixed fleet is safe. Once every worker is on 0.7,
+    /// flipping to `ledger` mode enables the dead-tuple-free rotation of
+    /// #371. Refuses if any fresh-heartbeat runtime is not known to be
+    /// flip-aware (an old or pre-flip binary may still be reading the compat
+    /// columns) unless `--force` is given. The maintenance loop also
+    /// auto-flips once the fleet has been fully 0.7 for a stable period.
+    FlipRingAuthority {
+        /// Queue-storage schema to flip.
+        #[arg(long, default_value = "awa")]
+        schema: String,
+        /// Print the authority + fleet flip-readiness and exit without
+        /// changing anything. Exits 0 when a flip would be allowed, 2 when
+        /// blocking runtimes remain.
+        #[arg(long, conflicts_with = "force")]
+        check: bool,
+        /// Flip even while fresh-heartbeat runtimes are not known to be
+        /// flip-aware. Only safe once you have confirmed no pre-flip binary
+        /// is live.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1294,6 +1317,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                              {inserted} folded counter row(s) populated from terminal_jobs; \
                              pending deltas cleared"
                         );
+                    }
+                    StorageCommands::FlipRingAuthority {
+                        schema,
+                        check,
+                        force,
+                    } => {
+                        let status =
+                            awa_model::storage::ring_authority_status(&pool, &schema).await?;
+                        if check {
+                            println!(
+                                "schema '{schema}': authority={} live={} flip_aware={} blocking={}",
+                                status.authority,
+                                status.live_instances,
+                                status.flip_aware_instances,
+                                status.blocking_instances,
+                            );
+                            if status.authority == "ledger" {
+                                println!("already flipped to ledger authority");
+                            } else if status.blocking_instances > 0 {
+                                eprintln!(
+                                    "{} fresh runtime(s) are not known to be flip-aware; \
+                                     roll the whole fleet to 0.7 (or use --force)",
+                                    status.blocking_instances
+                                );
+                                std::process::exit(2);
+                            } else {
+                                println!("ready to flip: no blocking runtimes");
+                            }
+                        } else {
+                            let result =
+                                awa_model::storage::flip_ring_authority(&pool, &schema, force)
+                                    .await?;
+                            eprintln!(
+                                "ring-cursor authority for schema '{schema}' is now '{result}' \
+                                 (was '{}'){}",
+                                status.authority,
+                                if force { " [--force]" } else { "" },
+                            );
+                        }
                     }
                 },
 

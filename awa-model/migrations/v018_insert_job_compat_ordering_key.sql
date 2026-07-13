@@ -229,14 +229,14 @@ BEGIN
             INTO v_lane_seq;
         END IF;
 
-        -- #371: the queue-ring cursor is the max-generation row of the
-        -- append-only rotation ledger (resolved against the active
-        -- queue-storage schema via the search_path set above).
-        SELECT ledger.slot, ledger.generation
+        -- #371: resolve the queue-ring cursor through the per-schema
+        -- authority function (compat columns vs. append-only ledger),
+        -- against the active queue-storage schema via the search_path set
+        -- above. Keeps the SQL producer path in lock-step with the Rust
+        -- and claim_ready_runtime cursor reads across the staged flip.
+        SELECT rc.slot, rc.generation
         INTO v_ready_slot, v_ready_generation
-        FROM queue_ring_rotations AS ledger
-        ORDER BY ledger.generation DESC
-        LIMIT 1;
+        FROM ring_cursor('queue') AS rc;
 
         INSERT INTO ready_entries (
             ready_slot,

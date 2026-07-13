@@ -16,6 +16,7 @@ awa-macros.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 blake3.workspace = true

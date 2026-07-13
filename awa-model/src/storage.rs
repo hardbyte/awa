@@ -105,6 +105,59 @@ where
         .map_err(AwaError::from)
 }
 
+/// Ring-cursor authority + fleet flip-readiness for one queue-storage
+/// schema (#371 staged rolling upgrade). Mirrors `awa.ring_authority_status`.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq)]
+pub struct RingAuthorityStatus {
+    /// `"columns"` (compat; mixed 0.6.2/0.7 fleet safe) or `"ledger"`.
+    pub authority: String,
+    /// When the one-way flip to `ledger` happened (NULL until flipped, or
+    /// set at install time for a fresh install that started in `ledger`).
+    pub flipped_at: Option<DateTime<Utc>>,
+    /// Fresh-heartbeat runtimes (within the freshness window).
+    pub live_instances: i64,
+    /// Fresh runtimes whose `binary_version` is >= the min flip version.
+    pub flip_aware_instances: i64,
+    /// Fresh runtimes NOT known to be flip-aware (NULL or old
+    /// `binary_version`) — a manual flip refuses while this is > 0 unless
+    /// forced.
+    pub blocking_instances: i64,
+}
+
+/// Read the ring-cursor authority and flip-readiness for a schema.
+pub async fn ring_authority_status<'e, E>(
+    executor: E,
+    schema: &str,
+) -> Result<RingAuthorityStatus, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as::<_, RingAuthorityStatus>("SELECT * FROM awa.ring_authority_status($1)")
+        .bind(schema)
+        .fetch_one(executor)
+        .await
+        .map_err(AwaError::from)
+}
+
+/// Flip a schema's ring-cursor authority `columns -> ledger` (one-way,
+/// idempotent). Refuses unless `force` when a fresh-heartbeat runtime is not
+/// known to be flip-aware. Returns the resulting authority (`"ledger"`).
+pub async fn flip_ring_authority<'e, E>(
+    executor: E,
+    schema: &str,
+    force: bool,
+) -> Result<String, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_scalar::<_, String>("SELECT awa.flip_ring_authority($1, $2)")
+        .bind(schema)
+        .bind(force)
+        .fetch_one(executor)
+        .await
+        .map_err(AwaError::from)
+}
+
 fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
     let queue_storage_involved = status.prepared_engine.as_deref() == Some("queue_storage")
         || status.active_engine == "queue_storage";
@@ -245,10 +298,6 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
     let live_canonical = *live_runtime_capability_counts
         .get("canonical")
         .unwrap_or(&0);
-    let live_drain = *live_runtime_capability_counts
-        .get("canonical_drain_only")
-        .unwrap_or(&0);
-
     let mut enter_mixed_transition_blockers = Vec::new();
     if status.state != "prepared" {
         enter_mixed_transition_blockers
@@ -295,10 +344,9 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
             "canonical live backlog is {canonical_live_backlog}"
         ));
     }
-    if live_canonical + live_drain > 0 {
+    if live_canonical > 0 {
         finalize_blockers.push(format!(
-            "{} canonical or drain-only runtime(s) are still live",
-            live_canonical + live_drain
+            "{live_canonical} canonical-only runtime(s) are still live"
         ));
     }
 

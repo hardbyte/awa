@@ -1,4 +1,4 @@
--- v040: per-queue runtime overrides (ADR-038, #385/#396).
+-- v041: per-queue runtime overrides (ADR-038, #385/#396).
 --
 -- Nullable override columns on the existing control-plane row. Dispatchers
 -- already poll queue_meta for `paused`; they additionally refresh these on
@@ -16,5 +16,5 @@ ALTER TABLE awa.queue_meta
     ADD COLUMN IF NOT EXISTS overrides_updated_at TIMESTAMPTZ;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (40, 'Per-queue runtime overrides on queue_meta')
+VALUES (41, 'Per-queue runtime overrides on queue_meta')
 ON CONFLICT (version) DO NOTHING;

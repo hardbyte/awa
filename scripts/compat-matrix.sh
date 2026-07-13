@@ -16,7 +16,7 @@
 #                   message content and exit code asserted.
 #
 #   backward-0.6     the newest `awa migrate` against an UNFINALIZED 0.6-final
-#                   schema with canonical work also refuses (v040 exists, so
+#                   schema with canonical work also refuses (v041 exists, so
 #                   there are pending migrations to gate), while the same
 #                   schema finalized upgrades cleanly.
 #
@@ -61,6 +61,25 @@ INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
 VALUES ('queue_storage', 'awa', now())
 ON CONFLICT (backend) DO UPDATE
 SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at;
+
+-- Model an upgraded v043 schema: upgrades start in columns authority. A
+-- fresh install starts in ledger authority, so restore the compat cursors
+-- from the seeded ledgers before exercising the mixed 0.6.0/0.7 window.
+UPDATE awa.ring_cursor_authority
+SET authority = 'columns', flipped_at = NULL
+WHERE singleton;
+UPDATE awa.queue_ring_state AS state
+SET current_slot = cursor.slot, generation = cursor.generation
+FROM (SELECT slot, generation FROM awa.queue_ring_rotations ORDER BY generation DESC LIMIT 1) AS cursor
+WHERE state.singleton;
+UPDATE awa.lease_ring_state AS state
+SET current_slot = cursor.slot, generation = cursor.generation
+FROM (SELECT slot, generation FROM awa.lease_ring_rotations ORDER BY generation DESC LIMIT 1) AS cursor
+WHERE state.singleton;
+UPDATE awa.claim_ring_state AS state
+SET current_slot = cursor.slot, generation = cursor.generation
+FROM (SELECT slot, generation FROM awa.claim_ring_rotations ORDER BY generation DESC LIMIT 1) AS cursor
+WHERE state.singleton;
 SQL
 
 echo "── setup: pinned release artifacts (PyPI wheels)"
@@ -71,6 +90,20 @@ uv pip install --quiet --python .compat-venv-057 "awa-pg==0.5.7"
 
 echo "── leg: forward-0.6.0 (full lifecycle on newest schema)"
 DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-060/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
+
+echo "── leg: post-flip 0.6.0 is fenced"
+"$AWA_BIN" --database-url "${BASE_URL}/${FWD_DB}" storage flip-ring-authority --force
+DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-060/bin/python "${SCRIPT_DIR}/compat/post_flip_060.py"
+fence_state=$(psql "${BASE_URL}/${FWD_DB}" -qAt -F '|' -c \
+  "SELECT a.authority, q.current_slot, q.generation
+   FROM awa.ring_cursor_authority AS a
+   CROSS JOIN awa.queue_ring_state AS q
+   WHERE a.singleton AND q.singleton")
+if [ "$fence_state" != "ledger|-1|-1" ]; then
+  echo "FAIL: pinned 0.6.0 maintenance crossed the ledger-authority fence ($fence_state)" >&2
+  exit 1
+fi
+echo "0.6.0 was fenced; compat cursor remains poisoned ($fence_state)"
 
 echo "── leg: forward-0.5.7 (producer routes, worker inert)"
 DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-057/bin/python "${SCRIPT_DIR}/compat/forward_057.py"

@@ -41,11 +41,11 @@
 //!
 //!   8. Drain. Stop producer. Wait for in-flight to settle.
 //!
-//! Final assertion: total seeded count was reached or exceeded by the
-//! sum of Rust + Python handler invocations. We use ≥ rather than ==
-//! because the heartbeat-rescue cycle can re-execute a job that was
-//! in flight at the routing flip; that's at-least-once semantics, not
-//! a bug.
+//! Final assertions: every accepted sequence was observed by at least
+//! one handler, every accepted job reached a completed terminal record,
+//! and both canonical and queue-storage backlogs are empty. Duplicate
+//! handler invocations remain valid under at-least-once semantics but
+//! cannot mask a missing job.
 //!
 //! Marked `#[ignore]` so it runs only via the nightly-chaos workflow.
 //! Local run:
@@ -62,11 +62,12 @@ use awa::worker::TransitionWorkerRole;
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -106,6 +107,8 @@ struct SimpleChaosJob {
 #[derive(Clone)]
 struct CountingWorker {
     handled: Arc<AtomicI64>,
+    handled_seqs: Arc<Mutex<HashSet<i64>>>,
+    delay: Duration,
 }
 
 #[async_trait]
@@ -114,24 +117,37 @@ impl Worker for CountingWorker {
         "simple_chaos_job"
     }
 
-    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let seq = ctx
+            .job
+            .args
+            .get("seq")
+            .and_then(serde_json::Value::as_i64)
+            .expect("simple_chaos_job args must contain an integer seq");
+        tokio::time::sleep(self.delay).await;
         self.handled.fetch_add(1, Ordering::Relaxed);
+        self.handled_seqs.lock().unwrap().insert(seq);
         Ok(JobResult::Completed)
     }
 }
 
 struct PythonHelper {
     child: Child,
-    handled_seqs: Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+    handled: Arc<AtomicI64>,
+    handled_seqs: Arc<Mutex<HashSet<i64>>>,
     _stdout_reader: tokio::task::JoinHandle<()>,
 }
 
 impl PythonHelper {
     fn handler_count(&self) -> i64 {
-        self.handled_seqs.lock().unwrap().len() as i64
+        self.handled.load(Ordering::Relaxed)
     }
 
-    async fn shutdown(mut self) {
+    fn handled_seqs(&self) -> HashSet<i64> {
+        self.handled_seqs.lock().unwrap().clone()
+    }
+
+    async fn shutdown(&mut self) {
         let _ = self.child.kill().await;
     }
 }
@@ -160,7 +176,7 @@ async fn spawn_python_worker(
         .env("DATABASE_URL", database_url())
         .env("MIXED_QUEUE", queue)
         .env("MIXED_MODE", "worker_simple_chaos_job")
-        .env("MIXED_SIMPLE_SLEEP_MS", "1")
+        .env("MIXED_SIMPLE_SLEEP_MS", "100")
         .env("MIXED_LEADER_ELECTION_INTERVAL_MS", "200")
         // Register as queue_storage-capable so the mixed_transition
         // gate is satisfied when we flip state mid-test.
@@ -173,7 +189,9 @@ async fn spawn_python_worker(
 
     let mut child = command.spawn().expect("Failed to spawn python helper");
     let stdout = child.stdout.take().expect("python helper stdout missing");
-    let handled_seqs = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let handled = Arc::new(AtomicI64::new(0));
+    let handled_reader = handled.clone();
+    let handled_seqs = Arc::new(Mutex::new(HashSet::new()));
     let handled_seqs_reader = handled_seqs.clone();
 
     let stdout_reader = tokio::spawn(async move {
@@ -188,6 +206,7 @@ async fn spawn_python_worker(
             } else if let Some(seq_str) = line.split("seq=").nth(1) {
                 if line.starts_with("COMPLETE") {
                     if let Ok(seq) = seq_str.trim().parse::<i64>() {
+                        handled_reader.fetch_add(1, Ordering::Relaxed);
                         handled_seqs_reader.lock().unwrap().insert(seq);
                     }
                 }
@@ -197,6 +216,7 @@ async fn spawn_python_worker(
 
     PythonHelper {
         child,
+        handled,
         handled_seqs,
         _stdout_reader: stdout_reader,
     }
@@ -270,12 +290,49 @@ async fn storage_state_summary(pool: &sqlx::PgPool) -> String {
     )
 }
 
+async fn canonical_terminal_counts(pool: &sqlx::PgPool, queue: &str) -> (i64, i64) {
+    sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT
+            count(*) FILTER (
+                WHERE state IN ('completed', 'failed', 'cancelled')
+            )::bigint AS terminal,
+            count(*) FILTER (
+                WHERE state IN ('failed', 'cancelled')
+            )::bigint AS non_completed_terminal
+        FROM awa.jobs_hot
+        WHERE queue = $1
+        "#,
+    )
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("canonical terminal counts")
+}
+
+async fn queue_storage_non_completed_terminal_count(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {schema}.terminal_jobs \
+         WHERE queue = $1 AND state IN ('failed', 'cancelled')"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("queue-storage non-completed terminal count")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_rolling_transition_with_live_producers_rust_and_python() {
     let suffix = &Uuid::new_v4().simple().to_string()[..8];
     let queue = format!("rolling_transition_{suffix}");
-    let qs_schema = format!("awa_rolling_transition_{suffix}");
+    // Production upgrades normally use the migration-owned default
+    // substrate. Custom-schema installation is covered separately.
+    let qs_schema = "awa".to_string();
 
     let pool = pool().await;
     reset_schema(&pool, &qs_schema).await;
@@ -288,26 +345,30 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     // ── Phase 1: canonical baseline ────────────────────────────────────
 
     let seeded = Arc::new(AtomicI64::new(0));
+    let accepted_seqs = Arc::new(Mutex::new(HashSet::new()));
 
-    // Pre-seed a single canonical job before any worker starts. This
-    // suppresses the fresh-install auto-finalize path
+    // Pre-seed a banked canonical backlog before any worker starts. This
+    // both suppresses the fresh-install auto-finalize path
     // (awa.storage_auto_finalize_if_fresh: any job in awa.jobs blocks
-    // it). Without this, the first worker to start would auto-promote
-    // the cluster directly to active/queue_storage and the rehearsal
-    // would never get the chance to drive the transition manually.
-    // The fleet picks this seed up as part of normal canonical
-    // processing — it counts toward `seeded` like any other job.
-    insert_with(
-        &pool,
-        &SimpleChaosJob { seq: -1 },
-        InsertOpts {
-            queue: queue.clone(),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("seed canonical job to suppress auto-finalize");
-    seeded.fetch_add(1, Ordering::Relaxed);
+    // it) and guarantees that canonical jobs remain live across prepare
+    // and the routing flip. Without it, the first worker would auto-promote
+    // a fresh cluster and fast local handlers could drain all canonical
+    // work before the transition begins.
+    const BANKED_JOBS: i64 = 500;
+    for seq in -BANKED_JOBS..0 {
+        insert_with(
+            &pool,
+            &SimpleChaosJob { seq },
+            InsertOpts {
+                queue: queue.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed canonical backlog");
+        seeded.fetch_add(1, Ordering::Relaxed);
+        accepted_seqs.lock().unwrap().insert(seq);
+    }
 
     // Producer task: continuous insert at ~50/s. We track total seeded
     // via an atomic so the final assertion compares against actual
@@ -317,6 +378,7 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     let producer_queue = queue.clone();
     let producer_running_handle = producer_running.clone();
     let producer_seeded = seeded.clone();
+    let producer_accepted_seqs = accepted_seqs.clone();
     let producer = tokio::spawn(async move {
         let mut seq: i64 = 0;
         while producer_running_handle.load(Ordering::Relaxed) {
@@ -331,6 +393,7 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
             .await;
             match res {
                 Ok(_) => {
+                    producer_accepted_seqs.lock().unwrap().insert(seq);
                     seq += 1;
                     producer_seeded.fetch_add(1, Ordering::Relaxed);
                 }
@@ -348,6 +411,7 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     });
 
     let rust_handled = Arc::new(AtomicI64::new(0));
+    let rust_handled_seqs = Arc::new(Mutex::new(HashSet::new()));
     // Configure with queue_storage so heartbeats register as
     // queue_storage-capable. Auto role + state=canonical means the
     // resolved engine is still canonical until the operator flips the
@@ -388,16 +452,22 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         .transition_role(TransitionWorkerRole::Auto)
         .register_worker(CountingWorker {
             handled: rust_handled.clone(),
+            handled_seqs: rust_handled_seqs.clone(),
+            delay: Duration::from_millis(100),
         })
         .build()
         .expect("auto rust client build");
     auto_rust_client.start().await.expect("auto rust start");
 
     let (py_ready_tx, mut py_ready_rx) = mpsc::unbounded_channel();
-    let python_worker = spawn_python_worker(&queue, &qs_schema, py_ready_tx).await;
-    tokio::time::timeout(Duration::from_secs(20), py_ready_rx.recv())
+    let mut python_worker = spawn_python_worker(&queue, &qs_schema, py_ready_tx).await;
+    let python_ready = tokio::time::timeout(Duration::from_secs(20), py_ready_rx.recv())
         .await
         .expect("python worker should signal READY within 20s");
+    assert!(
+        python_ready.is_some(),
+        "python worker exited before signalling READY"
+    );
     eprintln!("[rehearsal] phase 1: producer + auto Rust + auto Python all up");
 
     // Let the canonical baseline run for a few seconds so we have
@@ -406,14 +476,18 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     let pre_prepare_canonical_processed: i64 =
         rust_handled.load(Ordering::Relaxed) + python_worker.handler_count();
     let pre_prepare_seeded = seeded.load(Ordering::Relaxed);
+    let pre_prepare_backlog = canonical_backlog_count(&pool, &queue).await;
     eprintln!(
         "[rehearsal] phase 1 end: seeded={pre_prepare_seeded} processed={pre_prepare_canonical_processed} \
-         canonical_backlog={}",
-        canonical_backlog_count(&pool, &queue).await
+         canonical_backlog={pre_prepare_backlog}",
     );
     assert!(
         pre_prepare_canonical_processed > 0,
         "canonical phase should have processed at least one job before prepare"
+    );
+    assert!(
+        pre_prepare_backlog > 0,
+        "banked canonical work must remain live when prepare begins"
     );
 
     // ── Phase 2: prepare ───────────────────────────────────────────────
@@ -482,6 +556,8 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         .transition_role(TransitionWorkerRole::QueueStorageTarget)
         .register_worker(CountingWorker {
             handled: qs_target_handled.clone(),
+            handled_seqs: rust_handled_seqs.clone(),
+            delay: Duration::from_millis(100),
         })
         .build()
         .expect("queue_storage_target client build");
@@ -529,7 +605,25 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // ── Phase 6: finalize ──────────────────────────────────────────────
+    // ── Phase 6: finalize with drain-only runtimes still live ──────────
+
+    // Auto-role runtimes that started before the routing flip remain
+    // canonical_drain_only. Once canonical backlog is zero they have no
+    // supported source of new canonical work, so v040 permits finalization
+    // without forcing a process restart or heartbeat-liveness delay.
+    let report = storage::status_report(&pool)
+        .await
+        .expect("storage status report before finalize");
+    assert!(report.can_finalize, "{:?}", report.finalize_blockers);
+    assert!(
+        report
+            .live_runtime_capability_counts
+            .get("canonical_drain_only")
+            .copied()
+            .unwrap_or(0)
+            >= 2,
+        "Rust and Python pre-flip auto runtimes must still be live"
+    );
 
     storage::finalize(&pool).await.expect("storage finalize");
     eprintln!(
@@ -552,25 +646,52 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     producer_running.store(false, Ordering::Relaxed);
     producer.await.expect("producer joined");
     let total_seeded = seeded.load(Ordering::Relaxed);
+    assert_eq!(
+        accepted_seqs.lock().unwrap().len() as i64,
+        total_seeded,
+        "accepted sequence accounting must match successful inserts"
+    );
 
-    // Wait for in-flight to settle. New work goes to queue_storage now,
-    // so canonical workers won't pick anything up. The QueueStorageTarget
-    // worker drains the rest.
+    // Wait for handlers and durable terminal state to settle. New work
+    // goes to queue_storage now, so canonical workers won't pick anything
+    // up. The QueueStorageTarget worker drains the rest.
     let settle_deadline = Instant::now() + Duration::from_secs(30);
     let mut prior_total: i64 = -1;
     loop {
         let total = rust_handled.load(Ordering::Relaxed)
             + python_worker.handler_count()
             + qs_target_handled.load(Ordering::Relaxed);
-        if total >= total_seeded {
+        let mut observed_seqs = rust_handled_seqs.lock().unwrap().clone();
+        observed_seqs.extend(python_worker.handled_seqs());
+        let accepted_count = accepted_seqs.lock().unwrap().len() as i64;
+        let canonical_backlog = canonical_backlog_count(&pool, &queue).await;
+        let (canonical_terminal, _) = canonical_terminal_counts(&pool, &queue).await;
+        let queue_storage_counts = qs_store
+            .queue_counts(&pool, &queue)
+            .await
+            .expect("queue-storage counts");
+        if observed_seqs.len() as i64 == accepted_count
+            && canonical_backlog == 0
+            && queue_storage_counts.available == 0
+            && queue_storage_counts.running == 0
+            && canonical_terminal + queue_storage_counts.terminal == accepted_count
+        {
             break;
         }
         if Instant::now() >= settle_deadline {
             panic!(
-                "settle timeout: total handler invocations {} < seeded {}; \
+                "settle timeout: handler invocations={} unique_observed={} accepted={}; \
+                 canonical_backlog={} queue_storage_available={} queue_storage_running={} \
+                 canonical_terminal={} queue_storage_terminal={}; \
                  rust={} python={} qs_target={}",
                 total,
-                total_seeded,
+                observed_seqs.len(),
+                accepted_count,
+                canonical_backlog,
+                queue_storage_counts.available,
+                queue_storage_counts.running,
+                canonical_terminal,
+                queue_storage_counts.terminal,
                 rust_handled.load(Ordering::Relaxed),
                 python_worker.handler_count(),
                 qs_target_handled.load(Ordering::Relaxed)
@@ -578,8 +699,10 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         }
         if total != prior_total {
             eprintln!(
-                "[rehearsal] phase 8: settling; processed {total}/{total_seeded} \
-                 (rust={}, python={}, qs_target={})",
+                "[rehearsal] phase 8: settling; invocations={total} \
+                 unique_observed={}/{} (rust={}, python={}, qs_target={})",
+                observed_seqs.len(),
+                accepted_count,
                 rust_handled.load(Ordering::Relaxed),
                 python_worker.handler_count(),
                 qs_target_handled.load(Ordering::Relaxed),
@@ -592,11 +715,16 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     let rust_final = rust_handled.load(Ordering::Relaxed);
     let py_final = python_worker.handler_count();
     let qs_final = qs_target_handled.load(Ordering::Relaxed);
+    let raw_invocations = rust_final + py_final + qs_final;
+    let accepted_final = accepted_seqs.lock().unwrap().clone();
+    let mut observed_final = rust_handled_seqs.lock().unwrap().clone();
+    observed_final.extend(python_worker.handled_seqs());
     eprintln!(
         "[rehearsal] DONE seeded={total_seeded} \
          rust_canonical={rust_final} python_canonical={py_final} qs_target={qs_final} \
-         total={}",
-        rust_final + py_final + qs_final
+         invocations={raw_invocations} unique_observed={} duplicates={}",
+        observed_final.len(),
+        raw_invocations - observed_final.len() as i64
     );
 
     // ── Final assertions ───────────────────────────────────────────────
@@ -615,14 +743,28 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         "queue_storage_target worker never processed a queue-storage job (qs_final={qs_final})"
     );
 
-    // No jobs lost. We accept ≥ rather than == because heartbeat-rescue
-    // can re-execute a job that was in flight at the routing flip;
-    // that's at-least-once semantics.
-    assert!(
-        rust_final + py_final + qs_final >= total_seeded,
-        "lost jobs: total processed {} < total seeded {}",
-        rust_final + py_final + qs_final,
-        total_seeded
+    assert_eq!(
+        observed_final, accepted_final,
+        "accepted and observed job sequences differ"
+    );
+
+    let (canonical_terminal, canonical_non_completed) =
+        canonical_terminal_counts(&pool, &queue).await;
+    let queue_storage_counts = qs_store
+        .queue_counts(&pool, &queue)
+        .await
+        .expect("final queue-storage counts");
+    let queue_storage_non_completed =
+        queue_storage_non_completed_terminal_count(&pool, &qs_schema, &queue).await;
+    assert_eq!(
+        canonical_terminal + queue_storage_counts.terminal,
+        accepted_final.len() as i64,
+        "every accepted job must have exactly one durable terminal record"
+    );
+    assert_eq!(
+        canonical_non_completed + queue_storage_non_completed,
+        0,
+        "all terminal jobs must be completed"
     );
 
     // ── Cleanup ────────────────────────────────────────────────────────

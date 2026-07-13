@@ -1,34 +1,31 @@
--- v042 (#371): append-only ring-rotation ledgers and terminal-rollup deltas.
+-- v042: compact deadline receipt claims (#246).
 --
--- The mutable ring-state cursor singletons (`queue_ring_state`,
--- `lease_ring_state`, `claim_ring_state`) were UPDATEd on every rotation;
--- under a pinned MVCC horizon those dead row versions accumulate
--- (~3.6k/hour/ring at a 1s cadence) and every hot-path claim/enqueue reads
--- these rows. The cursor now lives in an append-only per-ring rotation
--- ledger (`{ring}_ring_rotations`); the current cursor is the
--- max-generation row (backward PK scan, O(1)). Rotation appends one row;
--- the maintenance leader trims the ledger to one full ring wrap when the
--- MVCC horizon is clear. Similarly, queue prune appends its pruned
--- terminal counts to `queue_terminal_rollup_deltas` instead of upserting
--- `queue_terminal_rollups` in the prune transaction; the maintenance
--- leader folds the deltas when the horizon is clear.
+-- v023 owns the queue-storage substrate helper; the migration runner reapplies
+-- it before this file, so claim_ready_runtime() is already redefined to write
+-- deadline-backed claims as compact lease_claim_batches rows (with the batch's
+-- single deadline_at populated) instead of one row-local lease_claims row per
+-- job. Every job claimed by one call shares claimed_at, so a batch carries
+-- exactly one deadline value; at claim saturation this collapses the
+-- receipt-plane write volume for deadline-backed queues from one row per job
+-- to one row per claimed batch, which is what removed the e2e latency
+-- regression measured in #246.
 --
--- DELIBERATE COMPATIBILITY BREAK (exception to the additive-only
--- migration policy in migrations.rs): the `current_slot` / `generation`
--- columns are DROPPED from the ring-state singletons after the ledger is
--- seeded from them. A pre-v042 binary reading a stale frozen cursor would
--- silently misroute writes into sealed slots; a missing column is a loud,
--- safe failure. Binaries and this migration must move together — do not
--- run a mixed fleet of pre-/post-v042 binaries against one database. See
--- the 0.7 upgrade notes in CHANGELOG.md and ADR-040.
+-- The refreshed helper also adds, per installed schema:
+--   * claim_ring_slots.batch_deadline_cursor_deadline_at /
+--     batch_deadline_cursor_batch_id — the per-slot sweep cursor for the new
+--     compact-batch deadline rescue (pattern follows the v035 row-local
+--     deadline cursor),
+--   * a partial (deadline_at, batch_id) WHERE deadline_at IS NOT NULL index
+--     on every lease_claim_batches child so the batch deadline sweep is
+--     index-backed and free for zero-deadline traffic.
 --
--- v023 owns the substrate helper; the migration runner reapplies the
--- amended v018 (insert_job_compat) and v023 (install helper + default
--- `awa` install) files before this one, so the default `awa` substrate is
--- already converted. This migration refreshes every OTHER already-installed
--- queue-storage schema (v039-style discovery loop) so custom schemas and
--- in-transition schemas get the ledger, the seeded cursor, and the
--- column drops too.
+-- Additive only: the row-local lease_claims deadline machinery (columns,
+-- indexes, cursors, rescue scan) is retained for claims materialized into
+-- mutable leases and for legacy in-flight rows written before this upgrade.
+--
+-- This migration refreshes every already-installed queue-storage schema so
+-- the compact claim function and the new cursor columns reach awa and any
+-- in-transition custom substrate.
 
 DO $$
 DECLARE
@@ -81,6 +78,11 @@ BEGIN
             v_schema
         ));
         v_claim_runtime_def := pg_get_functiondef(v_claim_runtime::oid);
+        -- Receipts detection extends the v039 heuristic: pre-v042 receipts
+        -- functions INSERT INTO lease_claims (row path), while v042+
+        -- receipts functions only INSERT INTO lease_claim_batches. Checking
+        -- both keeps the heuristic correct for old custom schemas AND for
+        -- idempotent re-runs after this refresh has already been applied.
         v_lease_claim_receipts := v_schema = 'awa'
             OR position(format('INSERT INTO %I.lease_claims', v_schema) IN v_claim_runtime_def) > 0
             OR position(format('INSERT INTO %I.lease_claim_batches', v_schema) IN v_claim_runtime_def) > 0;
@@ -97,5 +99,5 @@ END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (42, 'Append-only ring-rotation ledgers and terminal-rollup deltas (#371)')
+VALUES (42, 'Compact deadline receipt claims and batch deadline-rescue cursors (#246)')
 ON CONFLICT (version) DO NOTHING;

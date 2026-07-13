@@ -209,14 +209,37 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
         "documented SQL gate must report empty backlog before finalize"
     );
 
-    // Second documented gate: no live canonical / canonical_drain_only
-    // runtimes. The only stamped runtime is queue_storage_target, so
-    // this should already be zero; assert it so any future change to
-    // the test setup that introduces a canonical-mode runtime fails
-    // loudly here rather than inside the storage_finalize RAISE.
+    // Second documented gate: no live canonical-only runtimes. Drain-only
+    // runtimes have no supported source of new canonical work once the
+    // backlog is empty, so v040 deliberately permits them to remain.
+    let drain_instance = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_instances (
+            instance_id, hostname, pid, version, storage_capability,
+            transition_role, started_at, last_seen_at, snapshot_interval_ms,
+            healthy, postgres_connected, poll_loop_alive, heartbeat_alive,
+            maintenance_alive, shutting_down, leader, global_max_workers,
+            queues, queue_descriptor_hashes, job_kind_descriptor_hashes
+        )
+        SELECT
+            $1, 'sql-only-drain-test', 1, version, 'canonical_drain_only',
+            'auto', now(), now(), snapshot_interval_ms,
+            healthy, postgres_connected, poll_loop_alive, heartbeat_alive,
+            maintenance_alive, shutting_down, FALSE, global_max_workers,
+            queues, queue_descriptor_hashes, job_kind_descriptor_hashes
+        FROM awa.runtime_instances
+        WHERE instance_id = $2
+        "#,
+    )
+    .bind(drain_instance)
+    .bind(target_instance)
+    .execute(&pool)
+    .await
+    .expect("stamp canonical_drain_only runtime");
     let live_canonical: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM awa.runtime_instances \
-         WHERE storage_capability IN ('canonical', 'canonical_drain_only') \
+         WHERE storage_capability = 'canonical' \
            AND last_seen_at + make_interval( \
                  secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30) \
                ) >= now()",
@@ -226,7 +249,7 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
     .expect("count live canonical runtimes");
     assert_eq!(
         live_canonical, 0,
-        "documented SQL gate must report no live canonical / drain-only runtimes before finalize"
+        "documented SQL gate must report no live canonical-only runtimes before finalize"
     );
 
     sqlx::query("SELECT awa.storage_finalize()")
@@ -237,6 +260,14 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
     let (final_state, final_engine, _) = read_status(&pool).await;
     assert_eq!(final_state, "active");
     assert_eq!(final_engine, "queue_storage");
+    let live_drain: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.runtime_instances \
+         WHERE storage_capability = 'canonical_drain_only'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count drain-only runtimes after finalize");
+    assert_eq!(live_drain, 1);
 
     // Cleanup so other tests aren't poisoned.
     sqlx::query("DELETE FROM awa.runtime_instances WHERE instance_id = $1")

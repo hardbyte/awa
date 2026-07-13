@@ -53,9 +53,12 @@ Rolling deploys create windows where an older binary runs against a newer schema
 statement, asserted nightly by `scripts/compat-matrix.sh` against **pinned release
 artifacts** ([#367](https://github.com/hardbyte/awa/issues/367)):
 
-- **One minor behind (0.6.x binary, 0.7 schema):** full lifecycle supported — enqueue,
-  claim, complete, cancel — on a finalized cluster. Asserted with the published
-  `awa-pg==0.6.0` wheel.
+- **One minor behind (0.6.2 binary, 0.7 schema in `columns` authority):** full
+  lifecycle supported — enqueue, claim, complete, cancel — on a finalized cluster.
+  0.6.2 is the required stepping-stone and recognizes this exact forward-compatible
+  schema shape. The pinned `awa-pg==0.6.0` wheel remains a data-plane regression leg,
+  but 0.6.0/0.6.1 must never invoke `awa migrate` on a 0.7 schema. After the one-way
+  ring-authority flip, pre-ledger binaries are deliberately fenced and unsupported.
 - **Two minors behind (0.5.x binary, finalized schema):** asymmetric. *Producers* keep
   working — the `awa.jobs` compatibility routing sends their inserts to the active engine.
   *Workers* are inert: they claim from the canonical hot table, which is empty on a

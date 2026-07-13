@@ -40,7 +40,9 @@ claimable.
 4. **Model coverage.** `correctness/storage/AwaStorageTransition.tla` gains a `Migrate07`
    action gated by `Migrate07GateOpen`, with the invariant
    `Migrate07OnlyOnQuiescedCanonical`: a 0.7 migration never lands while canonical work
-   exists or a canonical-capable runtime is live. The
+   exists or a canonical-only runtime is live. A finalized cluster may retain an idle
+   `canonical_drain_only` runtime because supported writes already route exclusively to
+   queue storage. The
    `AwaStorageTransitionMigrate07Ungated.cfg` expected-counterexample config witnesses why
    the gate is load-bearing.
 

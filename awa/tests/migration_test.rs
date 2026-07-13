@@ -327,7 +327,7 @@ async fn insert_runtime_instance_with_role(pool: &PgPool, capability: &str, tran
             transition_role
         )
         VALUES (
-            $1, 'test-host', 4242, '0.6.0-test',
+            $1, 'test-host', 4242, '0.6.2',
             now() - interval '1 minute',
             now(),
             10000,
@@ -443,33 +443,13 @@ async fn test_migrate_gate_allows_active_cluster() {
     migrations::run(&pool).await.unwrap();
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance(&pool, "queue_storage").await;
-    // Rewind one version so the pending range is {CURRENT_VERSION} = {v042},
-    // which crosses the flagged ring-ledger migration.
+    // Rewind one version so the pending range crosses v043. The live runtime
+    // reports the 0.6.2 compatibility floor, so migration remains rolling.
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
-    // The ADR-037 finalize gate is satisfied (state = active), but the pending
-    // range crosses v042 (flagged as requiring an exclusive window) while a
-    // worker is heartbeating: the pre-flight refuses — a live pre-v042 binary
-    // cannot survive the ring-cursor column drop. (The finalize gate alone does
-    // not cover v042's stop-the-world requirement.)
-    let err = migrations::run(&pool).await.unwrap_err();
-    assert!(
-        matches!(
-            &err,
-            awa::AwaError::LiveRuntimesRequireExclusiveWindow { .. }
-        ),
-        "active cluster crossing v042 with a live worker must hit the pre-flight, got: {err}"
-    );
-
-    // Drain the worker (stale heartbeat) — the realistic stop-the-world state —
-    // and the same finalized cluster migrates cleanly.
-    sqlx::raw_sql("UPDATE awa.runtime_instances SET last_seen_at = now() - interval '10 minutes'")
-        .execute(&pool)
-        .await
-        .expect("age the heartbeat to drain the worker");
     migrations::run(&pool)
         .await
-        .expect("finalized (active) cluster with drained workers should migrate");
+        .expect("finalized cluster with a live 0.6.2 runtime should migrate");
     assert_eq!(
         migrations::current_version(&pool).await.unwrap(),
         migrations::CURRENT_VERSION
@@ -1368,25 +1348,25 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
     assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
-/// v041 (#246) refreshes every installed queue-storage schema so the compact
+/// v042 (#246) refreshes every installed queue-storage schema so the compact
 /// deadline-claim machinery reaches schemas prepared before the upgrade: the
 /// per-slot batch deadline-rescue cursor columns on `claim_ring_slots` and
 /// the partial `(deadline_at, batch_id)` sweep index on each
-/// `lease_claim_batches` child. Simulate a pre-v041 schema by stripping both,
+/// `lease_claim_batches` child. Simulate a pre-v042 schema by stripping both,
 /// rewind `schema_version`, and prove `run()` reinstalls them via the v023
 /// install helper the migration re-invokes.
 #[tokio::test]
-async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
+async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
     migrations::run(&pool).await.unwrap();
 
-    let schema = "awa_queue_storage_v041_deadline";
+    let schema = "awa_queue_storage_v042_deadline";
     prepare_queue_storage_schema(&pool, schema).await;
 
-    // Strip the v041 additions to mimic a schema installed before #246.
+    // Strip the v042 additions to mimic a schema installed before #246.
     sqlx::raw_sql(&format!(
         r#"
         ALTER TABLE {schema}.claim_ring_slots
@@ -1397,7 +1377,7 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     ))
     .execute(&pool)
     .await
-    .expect("stripping v041 additions should succeed");
+    .expect("stripping v042 additions should succeed");
 
     let has_cursor_before = column_exists(
         &pool,
@@ -1408,17 +1388,17 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     .await;
     assert!(
         !has_cursor_before,
-        "precondition: the batch deadline cursor column must be absent before v041 reruns"
+        "precondition: the batch deadline cursor column must be absent before v042 reruns"
     );
 
-    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 41")
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
         .execute(&pool)
         .await
         .expect("schema_version rewind should succeed");
 
     migrations::run(&pool)
         .await
-        .expect("v041 should rerun cleanly");
+        .expect("v042 should rerun cleanly");
 
     let has_cursor_deadline = column_exists(
         &pool,
@@ -1436,7 +1416,7 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     .await;
     assert!(
         has_cursor_deadline && has_cursor_batch,
-        "v041 must backfill the batch deadline-rescue cursor columns on existing schemas"
+        "v042 must backfill the batch deadline-rescue cursor columns on existing schemas"
     );
 
     // The migration contract covers EVERY lease_claim_batches child, not
@@ -1469,7 +1449,7 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
         .expect("index definition probe should succeed");
         let index_def = index_def.unwrap_or_else(|| {
             panic!(
-                "v041 must backfill the partial batch-deadline sweep index on                  lease_claim_batches child {slot}"
+                "v042 must backfill the partial batch-deadline sweep index on                  lease_claim_batches child {slot}"
             )
         });
         assert!(
@@ -1482,8 +1462,8 @@ async fn test_v041_refreshes_compact_deadline_cursors_and_index() {
     assert_eq!(version, migrations::CURRENT_VERSION);
 
     // Clean up so a later `migrations::run` (this or another test) does not
-    // reinstall this schema through the discovery loops. With the v042
-    // ledger loop now running alongside the v041 compact-deadline loop, a
+    // reinstall this schema through the discovery loops. With the v043
+    // ledger loop now running alongside the v042 compact-deadline loop, a
     // leaked probe schema multiplies the single-tx lock footprint of the
     // reinstall and can trip max_locks_per_transaction under concurrency.
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -1591,21 +1571,23 @@ async fn ring_state_cursor_columns_exist(pool: &PgPool, schema: &str) -> bool {
     .expect("current_slot column probe should succeed")
 }
 
-/// #371 v042: an upgrade from a pre-v042 substrate must seed the
-/// append-only rotation ledger from the legacy `current_slot` /
-/// `generation` singleton cursor BEFORE dropping those columns, so the
-/// cursor survives the representation change exactly. The migration is a
-/// deliberate compat break (columns dropped), and a post-upgrade claim
-/// must route to the seeded slot.
+/// #371 v043 STAGED UPGRADE: an upgrade from a pre-v043 substrate must
+/// create + seed the append-only rotation ledgers from the legacy
+/// `current_slot` / `generation` singleton cursor WITHOUT dropping those
+/// columns (the migration is additive — compat columns are retained), start
+/// the schema in `columns` authority, and route a post-upgrade cursor read
+/// off the compat columns exactly. Also covers the dev-shape v043 where the
+/// columns were previously dropped: v043 must re-ADD and re-seed them from
+/// the ledger (the inverse seed).
 #[tokio::test]
-async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() {
+async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
-    let schema = "awa_queue_storage_v042_ledger";
+    let schema = "awa_queue_storage_v043_ledger";
     // Drop any leftover from a prior interrupted run BEFORE migrating: the
-    // v042 discovery loop reinstalls every existing queue-storage schema,
+    // v043 discovery loop reinstalls every existing queue-storage schema,
     // and reinstalling a stale copy here only wastes a large single-tx
     // lock footprint (and can trip max_locks_per_transaction).
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -1617,64 +1599,84 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
 
     prepare_queue_storage_schema(&pool, schema).await;
 
-    // Downgrade the prepared (post-v042) substrate back to the pre-v042
-    // shape: drop the ledgers and delta table, restore the mutable cursor
-    // columns on each singleton, and restore the derivable per-slot
-    // generation column. Seed the queue cursor at a non-genesis position
-    // (current_slot = 3, generation = 19) so the seed is observable.
+    // Downgrade the prepared (post-v043) substrate back to a pre-v043 (0.6-
+    // shaped) substrate: drop the ledgers, the delta table, the authority
+    // control row, and the ring_cursor resolver, and restore the mutable
+    // cursor columns on each singleton. Seed the queue cursor at a
+    // non-genesis position (current_slot = 3, generation = 19) so the ledger
+    // seed is observable.
     sqlx::raw_sql(&format!(
         r#"
         DROP TABLE {schema}.queue_ring_rotations;
         DROP TABLE {schema}.lease_ring_rotations;
         DROP TABLE {schema}.claim_ring_rotations;
         DROP TABLE {schema}.queue_terminal_rollup_deltas;
+        DROP TABLE {schema}.ring_cursor_authority;
+        DROP FUNCTION {schema}.ring_cursor(text);
 
         ALTER TABLE {schema}.queue_ring_state
-            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
-            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+            ALTER COLUMN current_slot SET NOT NULL,
+            ALTER COLUMN generation   SET NOT NULL;
         ALTER TABLE {schema}.lease_ring_state
-            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
-            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+            ALTER COLUMN current_slot SET NOT NULL,
+            ALTER COLUMN generation   SET NOT NULL;
         ALTER TABLE {schema}.claim_ring_state
-            ADD COLUMN current_slot INT NOT NULL DEFAULT 0,
-            ADD COLUMN generation   BIGINT NOT NULL DEFAULT 0;
+            ALTER COLUMN current_slot SET NOT NULL,
+            ALTER COLUMN generation   SET NOT NULL;
+
+        -- Stable 0.6 schemas carry NOT NULL per-slot generations without a
+        -- default. INSERT(slot) ... ON CONFLICT still validates the proposed
+        -- row before conflict detection, so v043's v023 reapply must provide
+        -- an explicit generation even when every slot already exists.
+        ALTER TABLE {schema}.queue_ring_slots ALTER COLUMN generation DROP DEFAULT;
+        ALTER TABLE {schema}.lease_ring_slots ALTER COLUMN generation DROP DEFAULT;
+        ALTER TABLE {schema}.claim_ring_slots ALTER COLUMN generation DROP DEFAULT;
 
         UPDATE {schema}.queue_ring_state SET current_slot = 3, generation = 19 WHERE singleton;
-
-        ALTER TABLE {schema}.queue_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
-        ALTER TABLE {schema}.lease_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
-        ALTER TABLE {schema}.claim_ring_slots ADD COLUMN generation BIGINT NOT NULL DEFAULT -1;
         "#
     ))
     .execute(&pool)
     .await
-    .expect("downgrade to pre-v042 substrate shape should succeed");
+    .expect("downgrade to pre-v043 substrate shape should succeed");
 
     assert!(
         ring_state_cursor_columns_exist(&pool, schema).await,
         "downgraded substrate should carry the legacy cursor columns"
     );
 
-    // Rerun the migrations: v042's discovery loop reapplies the v023
-    // install helper against this schema, seeding the ledger and dropping
-    // the columns.
-    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 42")
+    // Rerun the migrations: v043's discovery loop reapplies the v023 install
+    // helper against this schema, seeding the ledger from the columns and
+    // installing the authority control (which defaults to 'columns' because
+    // this is an upgrade, not a fresh install).
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 43")
         .execute(&pool)
         .await
         .expect("schema_version rewind should succeed");
 
     migrations::run(&pool)
         .await
-        .expect("v042 should rerun cleanly");
+        .expect("v043 should rerun cleanly");
 
-    // The legacy cursor columns are gone (loud-failure compat break).
+    // The compat cursor columns are RETAINED (additive migration).
     assert!(
-        !ring_state_cursor_columns_exist(&pool, schema).await,
-        "v042 must drop the legacy current_slot/generation cursor columns"
+        ring_state_cursor_columns_exist(&pool, schema).await,
+        "v043 must retain the compat current_slot/generation cursor columns"
     );
 
-    // The queue ledger was seeded from the legacy cursor exactly: one row
-    // carrying (generation = 19, slot = 3), which is the current cursor.
+    // Authority defaults to 'columns' on upgrade.
+    let authority: String = sqlx::query_scalar(&format!(
+        "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("authority row should exist after upgrade");
+    assert_eq!(
+        authority, "columns",
+        "an upgrade starts in compat authority"
+    );
+
+    // The queue ledger was seeded from the legacy cursor exactly: the
+    // current row carries (generation = 19, slot = 3).
     let (ledger_slot, ledger_gen): (i32, i64) = sqlx::query_as(&format!(
         "SELECT slot, generation FROM {schema}.queue_ring_rotations \
          ORDER BY generation DESC LIMIT 1"
@@ -1685,24 +1687,21 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
     assert_eq!(
         (ledger_slot, ledger_gen),
         (3, 19),
-        "v042 must seed the queue ledger from the legacy cursor before dropping it"
+        "v043 must seed the queue ledger from the legacy cursor"
     );
 
-    // Lease and claim ledgers were seeded from their genesis cursors.
-    for ring in ["lease", "claim"] {
-        let (slot, generation): (i32, i64) = sqlx::query_as(&format!(
-            "SELECT slot, generation FROM {schema}.{ring}_ring_rotations \
-             ORDER BY generation DESC LIMIT 1"
-        ))
-        .fetch_one(&pool)
-        .await
-        .expect("ledger cursor should be readable after upgrade");
-        assert_eq!(
-            (slot, generation),
-            (0, 0),
-            "{ring} ledger seeds from its genesis cursor"
-        );
-    }
+    // The authority resolver returns the compat columns (== ledger here).
+    let (cursor_slot, cursor_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.ring_cursor('queue')"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("ring_cursor('queue') should resolve after upgrade");
+    assert_eq!(
+        (cursor_slot, cursor_gen),
+        (3, 19),
+        "ring_cursor must resolve the compat cursor in columns authority"
+    );
 
     // The delta landing table exists again and the schema reports ready.
     assert!(
@@ -1712,28 +1711,109 @@ async fn test_v042_seeds_rotation_ledger_from_legacy_cursor_and_drops_columns() 
         "upgraded substrate must be reported ready (ledgers + delta table present)"
     );
 
-    // A claim after upgrade routes off the seeded cursor: the claim
-    // runtime reads the claim ledger's max-generation row. With no ready
-    // work the claim is empty, but the routing read must not error on the
-    // now-ledger-backed cursor.
+    // A claim after upgrade routes off the resolved cursor without error.
     let claimed: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.claim_ready_runtime(\
-         'v042_upgrade_q'::text, 8::bigint, 0::double precision, 0::double precision)"
+         'v043_upgrade_q'::text, 8::bigint, 0::double precision, 0::double precision)"
     ))
     .fetch_one(&pool)
     .await
-    .expect("claim_ready_runtime must route off the ledger cursor after upgrade");
+    .expect("claim_ready_runtime must route off the resolved cursor after upgrade");
     assert_eq!(claimed, 0, "no ready work was seeded for the upgrade probe");
+
+    // ---- Dev-shape v043 (columns previously DROPPED) -> inverse seed. ----
+    // Simulate the unreleased shipped-v043 shape: drop the compat columns,
+    // leaving only the ledger. Rerun v043; it must re-ADD the columns seeded
+    // FROM the ledger max (3, 19) and keep authority 'columns'.
+    sqlx::raw_sql(&format!(
+        r#"
+        DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.queue_ring_state;
+        DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.lease_ring_state;
+        DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.claim_ring_state;
+        ALTER TABLE {schema}.queue_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
+        ALTER TABLE {schema}.lease_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
+        ALTER TABLE {schema}.claim_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("dev-shape column drop should succeed");
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 43")
+        .execute(&pool)
+        .await
+        .expect("schema_version rewind should succeed");
+    migrations::run(&pool)
+        .await
+        .expect("v043 should rerun cleanly against the dev shape");
+
+    let (restored_slot, restored_gen): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT current_slot, generation FROM {schema}.queue_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("columns should be restored from the ledger");
+    assert_eq!(
+        (restored_slot, restored_gen),
+        (3, 19),
+        "v043 must re-ADD the compat columns seeded from the ledger max (inverse seed)"
+    );
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
 
     // Clean up so a later `migrations::run` (this or another test) does not
-    // reinstall this schema through the v042 discovery loop.
+    // reinstall this schema through the v043 discovery loop.
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(&pool)
         .await
         .expect("ledger probe schema should drop cleanly");
+}
+
+/// #371 v043 staged upgrade: a FRESH queue-storage install starts directly
+/// in `ledger` authority (no old binary can exist to read the compat
+/// columns), while the default `awa` schema installed by `awa migrate` also
+/// resolves through the authority machinery.
+#[tokio::test]
+async fn test_v043_fresh_install_starts_in_ledger_authority() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    let schema = "awa_queue_storage_v043_fresh";
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("leftover fresh probe schema should drop cleanly");
+
+    migrations::run(&pool).await.unwrap();
+
+    // Fresh install of a custom schema (never existed before).
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    let authority: String = sqlx::query_scalar(&format!(
+        "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("authority row should exist on a fresh install");
+    assert_eq!(
+        authority, "ledger",
+        "a fresh install starts directly in ledger authority"
+    );
+
+    // ring_cursor resolves the genesis ledger cursor (0, 0).
+    let (slot, generation): (i32, i64) = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.ring_cursor('queue')"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("ring_cursor('queue') should resolve on a fresh install");
+    assert_eq!((slot, generation), (0, 0), "fresh genesis cursor is (0, 0)");
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("fresh probe schema should drop cleanly");
 }
 
 #[tokio::test]
@@ -2532,7 +2612,7 @@ async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_run
 }
 
 #[tokio::test]
-async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
+async fn test_storage_finalize_requires_empty_backlog_but_allows_drain_runtimes() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_finalize_transition";
@@ -2574,17 +2654,19 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
         .await
         .unwrap();
     insert_runtime_instance(&pool, "canonical_drain_only").await;
+    insert_runtime_instance(&pool, "canonical").await;
 
     let err = storage::finalize(&pool).await.unwrap_err();
     assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
-    assert!(err.to_string().contains("drain-only runtime"), "got {err}");
+    assert!(
+        err.to_string().contains("canonical-only runtime"),
+        "got {err}"
+    );
 
-    sqlx::query(
-        "DELETE FROM awa.runtime_instances WHERE storage_capability = 'canonical_drain_only'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE storage_capability = 'canonical'")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let status = storage::finalize(&pool).await.unwrap();
     assert_eq!(status.state, "active");
@@ -2592,6 +2674,15 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
     assert_eq!(status.active_engine, "queue_storage");
     assert_eq!(status.prepared_engine, None);
     assert!(status.finalized_at.is_some());
+
+    let live_drain: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.runtime_instances \
+         WHERE storage_capability = 'canonical_drain_only'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_drain, 1, "finalize must not rewrite runtime evidence");
 }
 
 #[tokio::test]
@@ -2679,13 +2770,18 @@ async fn test_storage_status_report_surfaces_finalize_blockers() {
         "{:?}",
         report.finalize_blockers
     );
-    assert!(
-        report
-            .finalize_blockers
-            .iter()
-            .any(|reason| reason.contains("drain-only runtime")),
-        "{:?}",
-        report.finalize_blockers
+    sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = 'report_queue'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ready = storage::status_report(&pool).await.unwrap();
+    assert!(ready.can_finalize, "{:?}", ready.finalize_blockers);
+    assert_eq!(
+        ready
+            .live_runtime_capability_counts
+            .get("canonical_drain_only"),
+        Some(&1),
+        "drain-only runtimes remain observable but do not block"
     );
 }
 
@@ -3696,11 +3792,9 @@ async fn test_newer_schema_guard_leaves_normal_paths_untouched() {
 
 // ── Exclusive-window pre-flight live-runtime check ───────────────
 //
-// The pre-flight refuses a migrate whose pending range crosses a migration
-// flagged in EXCLUSIVE_WINDOW_MIGRATIONS (currently {v042}) while a worker is
-// heartbeating. test_migrate_gate_allows_active_cluster covers the real run()
-// refuse-then-drain path through v042; the tests here pin the message shape and
-// the staleness/override/non-crossing behaviours.
+// The strict mechanism remains available for a future migration with no
+// rolling-compatible shape. No current migration is flagged; these tests pin
+// its message and heartbeat-staleness behavior directly.
 
 /// The pre-flight refusal names the migration, lists the live runtimes, and
 /// points at the override. The gate keys on `last_seen_at` staleness, not
@@ -3760,19 +3854,22 @@ async fn test_exclusive_window_preflight_passes_with_stale_runtime() {
     pool.close().await;
 }
 
-/// `--allow-live-runtimes` (MigrateOptions::allow_live_runtimes) skips the
-/// pre-flight in `run_with_options` even with a fresh heartbeat crossing the
-/// flagged v042.
+/// `--allow-live-runtimes` skips the version-floor pre-flight even when a live
+/// runtime reports a version below the v043 compatibility floor.
 #[tokio::test]
-async fn test_exclusive_window_override_allows_live_runtime() {
+async fn test_runtime_version_floor_override_allows_old_live_runtime() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
     migrations::run(&pool).await.expect("migrate to head");
     // Finalize (so the ADR-037 gate passes), add a live worker, then rewind so
-    // a real pending range crosses v042 with the worker heartbeating.
+    // a real pending range crosses v043 with the worker heartbeating.
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    sqlx::query("UPDATE awa.runtime_instances SET version = '0.6.1'")
+        .execute(&pool)
+        .await
+        .expect("set runtime below v043 floor");
     rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
 
     let options = migrations::MigrateOptions {
@@ -3785,6 +3882,71 @@ async fn test_exclusive_window_override_allows_live_runtime() {
         migrations::current_version(&pool).await.unwrap(),
         migrations::CURRENT_VERSION
     );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+    simulate_non_canonical_compat_routing(&pool).await;
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+
+    for reported in ["0.6.1", "unknown"] {
+        sqlx::query("UPDATE awa.runtime_instances SET version = $1, last_seen_at = now()")
+            .bind(reported)
+            .execute(&pool)
+            .await
+            .expect("set incompatible runtime version");
+        rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+        let err = migrations::run(&pool)
+            .await
+            .expect_err("incompatible live runtime must block v043");
+        assert!(
+            matches!(
+                &err,
+                awa::AwaError::RuntimeVersionFloorNotMet {
+                    migration_version: 43,
+                    minimum_version: "0.6.2",
+                    count: 1,
+                    ..
+                }
+            ),
+            "expected v043 runtime-version-floor refusal for {reported:?}, got: {err}"
+        );
+        assert!(
+            err.to_string().contains(reported),
+            "refusal should identify the reported version: {err}"
+        );
+    }
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_runtime_version_floor_ignores_stale_old_runtime() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+    simulate_non_canonical_compat_routing(&pool).await;
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    sqlx::raw_sql(
+        "UPDATE awa.runtime_instances \
+         SET version = '0.6.1', last_seen_at = now() - interval '10 minutes'",
+    )
+    .execute(&pool)
+    .await
+    .expect("age runtime below v043 floor");
+    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+
+    migrations::run(&pool)
+        .await
+        .expect("stale runtimes do not block the migration floor");
 
     pool.close().await;
 }

@@ -557,6 +557,19 @@ pub struct MaintenanceService {
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
     descriptor_retention: Duration,
+    /// #371 staged upgrade: when true, the maintenance leader auto-flips the
+    /// ring-cursor authority `columns -> ledger` once the whole fresh fleet
+    /// has reported flip-aware (0.7+) continuously for
+    /// `ring_authority_auto_flip_stable_period`. Default: true.
+    ring_authority_auto_flip: bool,
+    /// How long the fleet must be continuously flip-aware (no fresh
+    /// NULL-version runtimes) before the leader auto-flips. Default: 10min.
+    ring_authority_auto_flip_stable_period: Duration,
+    /// Earliest wall-clock instant at which the fleet has been continuously
+    /// flip-aware. `None` while any fresh runtime is not flip-aware; reset
+    /// whenever a blocking runtime reappears. The auto-flip fires once
+    /// `now - since >= stable_period`.
+    ring_authority_flip_aware_since: std::sync::Mutex<Option<Instant>>,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -619,7 +632,29 @@ impl MaintenanceService {
             batch_operations_interval: Duration::from_secs(1),
             terminal_count_rollup_interval: Duration::from_secs(30),
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
+            ring_authority_auto_flip: true,
+            ring_authority_auto_flip_stable_period: Duration::from_secs(600), // 10min
+            ring_authority_flip_aware_since: std::sync::Mutex::new(None),
         }
+    }
+
+    /// #371 staged upgrade: enable/disable the maintenance auto-flip of the
+    /// ring-cursor authority `columns -> ledger` (default: enabled). Disable
+    /// if you want to drive the flip manually with
+    /// `awa storage flip-ring-authority`.
+    pub fn ring_authority_auto_flip(mut self, enabled: bool) -> Self {
+        self.ring_authority_auto_flip = enabled;
+        self
+    }
+
+    /// #371 staged upgrade: how long the fleet must be continuously
+    /// flip-aware (every fresh runtime reporting a 0.7+ `binary_version`)
+    /// before the maintenance leader auto-flips the ring-cursor authority
+    /// (default: 10min). A conservative window absorbs a slow rolling deploy
+    /// where an old binary briefly disappears and reappears.
+    pub fn ring_authority_auto_flip_stable_period(mut self, period: Duration) -> Self {
+        self.ring_authority_auto_flip_stable_period = period;
+        self
     }
 
     /// Set the priority aging interval (default: 60s).
@@ -1196,6 +1231,86 @@ impl MaintenanceService {
             }
             Ok(_) => {}
             Err(err) => warn!(error = %err, "failed to trim ring rotation ledgers"),
+        }
+
+        // #371 staged upgrade: piggyback the leader's rollup tick to
+        // consider auto-flipping the ring-cursor authority once the fleet
+        // has fully rolled to 0.7.
+        self.maybe_auto_flip_ring_authority(runtime.store.schema())
+            .await;
+    }
+
+    /// #371 staged rolling upgrade. On the maintenance leader, flip the
+    /// ring-cursor authority `columns -> ledger` once every fresh-heartbeat
+    /// runtime has reported flip-aware (a non-NULL `binary_version` >= the
+    /// min flip version) continuously for the configured stable period.
+    ///
+    /// The stable window is tracked in-process: the first tick that sees a
+    /// clean fleet stamps `ring_authority_flip_aware_since`; any tick that
+    /// sees a blocking (fresh, not-flip-aware) runtime resets it. This
+    /// absorbs a slow rolling deploy where an old binary briefly disappears
+    /// and reappears without prematurely flipping out from under it. The
+    /// flip itself re-checks the gate transactionally in
+    /// `awa.flip_ring_authority` (without `--force`), so a race between the
+    /// window expiring here and a fresh old binary registering cannot flip
+    /// unsafely.
+    async fn maybe_auto_flip_ring_authority(&self, schema: &str) {
+        if !self.ring_authority_auto_flip {
+            return;
+        }
+
+        let status = match awa_model::storage::ring_authority_status(&self.pool, schema).await {
+            Ok(status) => status,
+            Err(err) => {
+                debug!(error = %err, schema, "ring authority status unavailable; skipping auto-flip");
+                return;
+            }
+        };
+
+        if status.authority == "ledger" {
+            return; // already flipped (one-way); nothing to do
+        }
+
+        // Track the continuously-clean window in-process.
+        let ready_since = {
+            let mut since = self
+                .ring_authority_flip_aware_since
+                .lock()
+                .expect("ring_authority_flip_aware_since poisoned");
+            if status.blocking_instances > 0 || status.live_instances == 0 {
+                // A pre-flip binary is live (or the fleet is momentarily
+                // empty — never flip a fleet we cannot see). Reset the
+                // window.
+                *since = None;
+                return;
+            }
+            *since.get_or_insert_with(Instant::now)
+        };
+
+        if ready_since.elapsed() < self.ring_authority_auto_flip_stable_period {
+            return; // fleet clean, but not yet for long enough
+        }
+
+        match awa_model::storage::flip_ring_authority(&self.pool, schema, false).await {
+            Ok(result) => {
+                warn!(
+                    schema,
+                    authority = %result,
+                    flip_aware_instances = status.flip_aware_instances,
+                    stable_period_secs = self.ring_authority_auto_flip_stable_period.as_secs(),
+                    "#371 auto-flipped ring-cursor authority columns -> ledger: fleet fully \
+                     flip-aware for the stable period; dead-tuple-free rotation now active"
+                );
+            }
+            Err(err) => {
+                // A blocking binary re-registered between the window check
+                // and the transactional gate: reset and wait again.
+                warn!(error = %err, schema, "auto-flip refused by the transactional gate; will retry");
+                *self
+                    .ring_authority_flip_aware_since
+                    .lock()
+                    .expect("ring_authority_flip_aware_since poisoned") = None;
+            }
         }
     }
 

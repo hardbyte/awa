@@ -1912,6 +1912,7 @@ where
             hostname,
             pid,
             version,
+            binary_version,
             storage_capability,
             transition_role,
             started_at,
@@ -1930,12 +1931,17 @@ where
             job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+            $1, $2, $3, $4, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
             pid = EXCLUDED.pid,
             version = EXCLUDED.version,
+            -- #371 staged upgrade: a 0.7+ binary stamps binary_version (=
+            -- its semver) so the flip gate can tell the fleet is flip-aware.
+            -- A 0.6 binary's UPSERT does not name this column, so its rows
+            -- stay NULL — the unambiguous "pre-flip binary" signal.
+            binary_version = EXCLUDED.binary_version,
             storage_capability = EXCLUDED.storage_capability,
             transition_role = EXCLUDED.transition_role,
             started_at = EXCLUDED.started_at,

@@ -973,11 +973,15 @@ async fn test_queue_storage_transition_soak_finalize_path() {
             })
             .await;
 
-            auto_client.shutdown(Duration::from_secs(5)).await;
-            clear_runtime_capability(&pool, "canonical_drain_only").await;
-
             wait_for_status_report(&pool, Duration::from_secs(10), |report| {
-                report.status.state == "mixed_transition" && report.can_finalize
+                report.status.state == "mixed_transition"
+                    && report.can_finalize
+                    && report
+                        .live_runtime_capability_counts
+                        .get("canonical_drain_only")
+                        .copied()
+                        .unwrap_or(0)
+                        >= 1
             })
             .await;
 
@@ -1057,9 +1061,16 @@ async fn test_queue_storage_transition_soak_finalize_path() {
             report.status.state == "mixed_transition" && report.canonical_live_backlog == 0
         })
         .await;
-        auto_client.shutdown(Duration::from_secs(5)).await;
-        clear_runtime_capability(&pool, "canonical_drain_only").await;
-        wait_for_status_report(&pool, Duration::from_secs(10), |report| report.can_finalize).await;
+        wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+            report.can_finalize
+                && report
+                    .live_runtime_capability_counts
+                    .get("canonical_drain_only")
+                    .copied()
+                    .unwrap_or(0)
+                    >= 1
+        })
+        .await;
         storage::finalize(&pool)
             .await
             .expect("Failed to finalize transition soak during tail cleanup");
@@ -1090,7 +1101,9 @@ async fn test_queue_storage_transition_soak_finalize_path() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    auto_client.shutdown(Duration::from_secs(5)).await;
     target_client.shutdown(Duration::from_secs(5)).await;
+    clear_runtime_capability(&pool, "canonical_drain_only").await;
     clear_runtime_capability(&pool, "queue_storage").await;
 
     let exact = exact_dead_tuples(&pool, &store).await;
@@ -1304,10 +1317,16 @@ async fn test_queue_storage_transition_survives_target_restart() {
     })
     .await;
 
-    auto_client.shutdown(Duration::from_secs(5)).await;
-    clear_runtime_capability(&pool, "canonical_drain_only").await;
-
-    wait_for_status_report(&pool, Duration::from_secs(10), |report| report.can_finalize).await;
+    wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+        report.can_finalize
+            && report
+                .live_runtime_capability_counts
+                .get("canonical_drain_only")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+    })
+    .await;
     storage::finalize(&pool)
         .await
         .expect("Failed to finalize transition restart soak");
@@ -1333,6 +1352,8 @@ async fn test_queue_storage_transition_survives_target_restart() {
     if let Some(target_b) = replacement_target {
         target_b.shutdown(Duration::from_secs(5)).await;
     }
+    auto_client.shutdown(Duration::from_secs(5)).await;
+    clear_runtime_capability(&pool, "canonical_drain_only").await;
     clear_runtime_capability(&pool, "queue_storage").await;
     let final_report = storage::status_report(&pool)
         .await

@@ -1,10 +1,11 @@
 use crate::error::AwaError;
+use semver::Version;
 use sqlx::postgres::PgConnection;
 use sqlx::{Connection, PgPool};
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 42;
+pub const CURRENT_VERSION: i32 = 43;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -14,13 +15,17 @@ pub const CURRENT_VERSION: i32 = 42;
 /// a pending range that includes any version in this list while a worker is
 /// heartbeating (overridable with `MigrateOptions::allow_live_runtimes`).
 ///
-/// v042 (#371, ADR-040) is flagged: it drops the mutable ring-cursor columns,
-/// so a pre-v042 binary cannot claim, enqueue, or rotate against a v042 schema
-/// — crossing it needs a stop-the-world window. When the rolling-upgrade
-/// redesign (#…) makes v042 expand-only, its PR removes v042 from this list
-/// (a one-line handoff); the guard mechanism then remains for the future 0.8
-/// contract migration, which flags itself here in turn.
-const EXCLUSIVE_WINDOW_MIGRATIONS: &[i32] = &[42];
+/// Prefer an additive migration plus a minimum-runtime-version pre-flight when
+/// the previous patch release can operate the expanded schema. Reserve this
+/// list for migrations for which no rolling path exists.
+const EXCLUSIVE_WINDOW_MIGRATIONS: &[i32] = &[];
+
+/// Minimum runtime versions for additive migrations whose compatibility shim
+/// first shipped in a patch release. This is a defense-in-depth rollout check,
+/// not capability proof for an irreversible authority flip: operators can
+/// override it with `--allow-live-runtimes`, while flip gates use explicit
+/// feature capability state.
+const MIGRATION_RUNTIME_VERSION_FLOORS: &[(i32, &str)] = &[(43, "0.6.2")];
 
 /// Heartbeat-staleness window (seconds) for the pre-flight live-runtime check.
 /// Matches the window used by the ADR-037 finalize gate and
@@ -30,11 +35,8 @@ const LIVE_RUNTIME_WINDOW_SECS: i64 = 90;
 /// Options controlling a migration run.
 #[derive(Debug, Clone, Default)]
 pub struct MigrateOptions {
-    /// Skip the pre-flight live-runtime check that guards migrations flagged as
-    /// requiring an exclusive window (the CLI `--allow-live-runtimes` flag).
-    /// The check refuses to apply a pending range that includes an
-    /// [`EXCLUSIVE_WINDOW_MIGRATIONS`] version while workers are heartbeating,
-    /// because a pre-migration binary cannot operate against that schema.
+    /// Skip live-runtime pre-flights (the CLI `--allow-live-runtimes` flag),
+    /// including exclusive-window checks and minimum runtime-version floors.
     pub allow_live_runtimes: bool,
 }
 
@@ -48,16 +50,22 @@ pub struct MigrateOptions {
 /// - Never drop columns, change types, or tighten constraints
 ///
 /// This ensures running workers are not broken by a schema upgrade.
-/// For breaking schema changes, bump the major version and document
-/// the required stop-the-world upgrade procedure.
+/// Representation changes require a release-specific compatibility and
+/// authority-transition procedure.
 ///
-/// **Documented exception — v042 (#371):** the ring-state cursor columns
-/// (`current_slot` / `generation`) are dropped from the `{ring}_ring_state`
-/// singletons after being seeded into the append-only rotation ledgers.
-/// A pre-v042 binary reading a stale frozen cursor would silently misroute
-/// writes; the missing column makes it fail loudly instead. Binaries and
-/// migration move together across v042 — no mixed fleet on one database
-/// (see the 0.7 upgrade notes in CHANGELOG.md and ADR-040).
+/// **v043 (#371) stays additive.** The ring cursors move to append-only
+/// `{ring}_ring_rotations` ledgers, but v043 is the *expand* phase of a
+/// staged rolling upgrade: it seeds the ledgers and **keeps** the compat
+/// `current_slot` / `generation` singleton columns (and the per-slot
+/// `generation` column), selecting the authoritative representation per
+/// schema via `{schema}.ring_cursor_authority` (`columns` on upgrade,
+/// `ledger` on fresh install). A mixed 0.6.2/0.7 fleet remains operable while
+/// authority is `columns`. The one-way `columns -> ledger` flip
+/// (`awa.flip_ring_authority`, or the maintenance auto-flip) retires the
+/// columns' authority once the fleet is fully 0.7; the 0.8 contract
+/// migration drops them (that DROP will be the documented exception). See
+/// the 0.7 upgrade notes in CHANGELOG.md, docs/upgrade-0.6-to-0.7.md, and
+/// ADR-040.
 const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (1, "Canonical schema with UI indexes", &[V1_UP]),
     (2, "Runtime observability snapshots", &[V2_UP]),
@@ -219,16 +227,21 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Refresh claim_ready_runtime to cache-free ready-segment routing",
         &[V23_UP, V39_UP],
     ),
-    (40, "Per-queue runtime overrides on queue_meta", &[V40_UP]),
     (
-        41,
-        "Compact deadline receipt claims and batch deadline-rescue cursors (#246)",
-        &[V23_UP, V41_UP],
+        40,
+        "Allow queue-storage finalization with live canonical drain-only runtimes",
+        &[V40_UP],
     ),
+    (41, "Per-queue runtime overrides on queue_meta", &[V41_UP]),
     (
         42,
+        "Compact deadline receipt claims and batch deadline-rescue cursors (#246)",
+        &[V23_UP, V42_UP],
+    ),
+    (
+        43,
         "Append-only ring-rotation ledgers and terminal-rollup deltas (#371)",
-        &[V18_UP, V23_UP, V42_UP],
+        &[V18_UP, V23_UP, V43_UP],
     ),
 ];
 
@@ -270,9 +283,10 @@ const V36_UP: &str = include_str!("../migrations/v036_compact_receipt_completion
 const V37_UP: &str = include_str!("../migrations/v037_ready_segments.sql");
 const V38_UP: &str = include_str!("../migrations/v038_compact_claim_batches.sql");
 const V39_UP: &str = include_str!("../migrations/v039_claim_head_cold_routing.sql");
-const V40_UP: &str = include_str!("../migrations/v040_queue_runtime_overrides.sql");
-const V41_UP: &str = include_str!("../migrations/v041_compact_deadline_claims.sql");
-const V42_UP: &str = include_str!("../migrations/v042_ring_rotation_ledger.sql");
+const V40_UP: &str = include_str!("../migrations/v040_finalize_with_drain_runtimes.sql");
+const V41_UP: &str = include_str!("../migrations/v041_queue_runtime_overrides.sql");
+const V42_UP: &str = include_str!("../migrations/v042_compact_deadline_claims.sql");
+const V43_UP: &str = include_str!("../migrations/v043_ring_rotation_ledger.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
@@ -306,9 +320,9 @@ pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
 
 /// Run all pending migrations with explicit [`MigrateOptions`].
 ///
-/// Identical to [`run`] except the caller can relax the v042 pre-flight
-/// live-runtime check (`allow_live_runtimes`). The CLI wires this to
-/// `--allow-live-runtimes`; the default [`run`] never overrides the check.
+/// Identical to [`run`] except the caller can relax live-runtime compatibility
+/// pre-flights (`allow_live_runtimes`). The CLI wires this to
+/// `--allow-live-runtimes`; the default [`run`] never overrides the checks.
 pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<(), AwaError> {
     let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
 
@@ -385,15 +399,16 @@ async fn apply_migrations(
         check_storage_finalized_gate(conn).await?;
     }
 
-    // Pre-flight: if the pending range includes a migration flagged as needing
-    // an exclusive window (a pre-migration binary cannot operate against the
-    // post-migration schema — currently v042), refuse while any worker is still
-    // heartbeating. Uses last_seen_at staleness, not the `healthy` flag, because
-    // a hard-killed worker leaves healthy=true forever (rehearsal finding).
-    // `--allow-live-runtimes` skips the check.
+    // Live-runtime pre-flights run before any migration SQL. An exclusive
+    // migration rejects every fresh runtime. An additive migration with a
+    // version floor only rejects fresh runtimes that cannot operate its
+    // compatibility shape. `--allow-live-runtimes` skips both checks.
     if has_schema && !options.allow_live_runtimes {
         if let Some(exclusive) = exclusive_window_in_range(current) {
             check_live_runtimes_gate(conn, exclusive).await?;
+        }
+        for (migration_version, minimum_version) in runtime_version_floors_in_range(current) {
+            check_runtime_version_floor(conn, migration_version, minimum_version).await?;
         }
     }
 
@@ -635,6 +650,81 @@ fn exclusive_window_in_range(current: i32) -> Option<i32> {
         .min()
 }
 
+/// Every minimum-runtime-version floor crossed by the pending range.
+fn runtime_version_floors_in_range(current: i32) -> impl Iterator<Item = (i32, &'static str)> {
+    MIGRATION_RUNTIME_VERSION_FLOORS
+        .iter()
+        .copied()
+        .filter(move |&(v, _)| v > current && v <= CURRENT_VERSION)
+}
+
+/// Refuse an additive migration while a fresh runtime reports a version below
+/// its compatibility floor. Unknown and non-semver values fail closed.
+async fn check_runtime_version_floor(
+    conn: &mut PgConnection,
+    migration_version: i32,
+    minimum_version: &'static str,
+) -> Result<(), AwaError> {
+    if !relation_exists(conn, "runtime_instances").await? {
+        return Ok(());
+    }
+
+    // Close the scan-to-migrate race: runtime registration and heartbeat both
+    // write this table. Holding SHARE through the migration transaction lets
+    // readers continue but prevents an old runtime from appearing after the
+    // version scan and before the expanded schema commits. Existing compatible
+    // heartbeats wait briefly, then resume after commit.
+    sqlx::query("LOCK TABLE awa.runtime_instances IN SHARE MODE")
+        .execute(&mut *conn)
+        .await?;
+
+    let minimum = Version::parse(minimum_version)
+        .expect("migration runtime version floors must be valid semver");
+    let live: Vec<(String, Option<String>, i32, String, i64)> = sqlx::query_as(
+        "SELECT instance_id::text, hostname, pid, version, \
+                floor(extract(epoch FROM (now() - last_seen_at)))::bigint AS age_secs \
+         FROM awa.runtime_instances \
+         WHERE last_seen_at + make_interval(secs => $1) >= now() \
+         ORDER BY last_seen_at DESC",
+    )
+    .bind(LIVE_RUNTIME_WINDOW_SECS)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let below_floor: Vec<_> = live
+        .into_iter()
+        .filter(|(_, _, _, version, _)| {
+            Version::parse(version)
+                .map(|reported| reported.cmp(&minimum).is_lt())
+                .unwrap_or(true)
+        })
+        .collect();
+    if below_floor.is_empty() {
+        return Ok(());
+    }
+
+    const SHOWN: usize = 5;
+    let count = below_floor.len() as i64;
+    let mut listed: Vec<String> = below_floor
+        .iter()
+        .take(SHOWN)
+        .map(|(id, host, pid, version, age)| {
+            let host = host.as_deref().unwrap_or("?");
+            format!("{id} @ {host} pid {pid}: {version:?} ({age}s ago)")
+        })
+        .collect();
+    if below_floor.len() > SHOWN {
+        listed.push(format!("… and {} more", below_floor.len() - SHOWN));
+    }
+
+    Err(AwaError::RuntimeVersionFloorNotMet {
+        migration_version,
+        minimum_version,
+        count,
+        instances: format!(" Incompatible runtimes: {}.", listed.join(", ")),
+    })
+}
+
 /// Pre-flight gate for a migration that requires an exclusive upgrade window:
 /// refuse if any worker is heartbeating within [`LIVE_RUNTIME_WINDOW_SECS`].
 /// `migration_version` is the flagged migration being crossed (named in the
@@ -732,8 +822,8 @@ pub async fn current_version_readonly(pool: &PgPool) -> Result<i32, AwaError> {
 /// version were flagged as requiring an exclusive window.
 ///
 /// This is the same check `run` applies internally when the pending range
-/// includes an [`EXCLUSIVE_WINDOW_MIGRATIONS`] version (currently v042). This
-/// entry point lets the mechanism be exercised directly (tests, or tooling that
+/// includes an [`EXCLUSIVE_WINDOW_MIGRATIONS`] version. This entry point lets
+/// the mechanism be exercised directly (tests, or tooling that
 /// wants to assert an exclusive window before a manual migration) with an
 /// arbitrary version. Read-only: no writes, no lock. Returns `Ok(())` when no
 /// worker has heartbeated within the staleness window.

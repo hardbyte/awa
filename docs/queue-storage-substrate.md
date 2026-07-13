@@ -94,17 +94,17 @@ SELECT awa.storage_enter_mixed_transition();
 --
 --       SELECT count(*)
 --       FROM awa.runtime_instances
---       WHERE storage_capability IN ('canonical', 'canonical_drain_only')
+--       WHERE storage_capability = 'canonical'
 --         AND last_seen_at + make_interval(
 --               secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
 --             ) >= now();
---       -- must also be 0 (no live canonical or drain-only runtimes).
+--       -- must also be 0 (no live canonical-only runtimes).
 --
 --     When both are 0, finalize:
 SELECT awa.storage_finalize();
 ```
 
-`storage_enter_mixed_transition` will reject the call until at least one live `queue_storage_target` runtime is heartbeating. `storage_finalize` will reject the call while `awa.canonical_live_backlog() > 0` or while any canonical / canonical-drain-only runtime is still inside its liveness window. Both gates are deliberate — they prevent operators from flipping routing onto a substrate that has no executor or while canonical work or canonical-mode workers are still active.
+`storage_enter_mixed_transition` rejects the call until at least one live `queue_storage_target` runtime is heartbeating. `storage_finalize` rejects while `awa.canonical_live_backlog() > 0` or a canonical-only runtime is live. Pre-flip auto runtimes report `canonical_drain_only` after routing flips; once the backlog is empty they are idle and v040 allows finalization without waiting for those processes to restart or their heartbeat rows to expire.
 
 The orchestration (start new-mode workers, stop old-mode workers, wait for drain) is unchanged from the CLI flow — only the invocation surface is different.
 

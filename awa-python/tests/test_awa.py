@@ -14,6 +14,7 @@ import awa
 
 def test_live_runtime_migration_gate_has_dedicated_exception() -> None:
     assert issubclass(awa.LiveRuntimesRequireExclusiveWindow, awa.AwaError)
+    assert issubclass(awa.RuntimeVersionFloorNotMet, awa.AwaError)
     assert not issubclass(
         awa.LiveRuntimesRequireExclusiveWindow, awa.StorageNotFinalized
     )
