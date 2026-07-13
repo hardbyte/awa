@@ -245,7 +245,7 @@ producers and migrations.
 
 ## Rolling Deployments
 
-Let old pods drain with `shutdown(...)`, and keep `terminationGracePeriodSeconds` slightly above that drain timeout. Follow the release upgrade guide for migration ordering and capability gates; representation changes use the expand, flip, and contract policy in [ADR-041](adr/041-rolling-upgrade-policy.md).
+Let old pods drain with `shutdown(...)`, and keep `terminationGracePeriodSeconds` slightly above that drain timeout. Release-specific procedures are listed in the [migration guide](migrations.md#upgrade-an-existing-database); for the current release boundary, follow [Upgrading from 0.6 to 0.7](upgrade-0.6-to-0.7.md). Representation changes use the expand, flip, and contract policy in [ADR-041](adr/041-rolling-upgrade-policy.md).
 
 ## Queue Isolation Patterns
 
