@@ -434,15 +434,17 @@ Migrate07GateOpen ==
        /\ oldCanonicalLive + autoPreMixedLive + queueTargetLive + explicitDrainLive = 0
 
 \* Ghost record of what the gate is meant to guarantee at the moment the
-\* migration lands: no canonical work and no runtime that could still
-\* execute canonical work. Checked by Migrate07OnlyOnQuiescedCanonical;
-\* the Ungated config demonstrates the counterexample without the gate.
+\* migration lands: no canonical work and no canonical-only runtime. A
+\* drain-only runtime may remain after finalization because supported writes
+\* route exclusively to queue storage and the canonical backlog is empty.
+\* Checked by Migrate07OnlyOnQuiescedCanonical; the Ungated config
+\* demonstrates the counterexample without the gate.
 Migrate07 ==
     /\ ~migrated07
     /\ IF GateMigrate07 THEN Migrate07GateOpen ELSE TRUE
     /\ migrated07' = TRUE
     /\ migrate07EntryClean' =
-           (canonicalBacklog = 0 /\ LiveCanonicalCapability + LiveDrainCapability = 0)
+           (canonicalBacklog = 0 /\ LiveCanonicalCapability = 0)
     /\ UNCHANGED <<state,
                    currentEngine,
                    preparedEngine,
