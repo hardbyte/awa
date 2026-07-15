@@ -255,7 +255,8 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V1 | Broad integration suite green under `AWA_TEST_ENGINE=queue_storage` | ✓ | ✓ | #360 |
 | V2 | Engine guard rejects canonical-only raw-SQL helpers under queue_storage | ✓ |  | #360 |
 | V3 | Pinned 0.6.2 binary: enqueue→claim→complete→cancel against the 0.7 schema in columns authority, then fail after flip | | ✓ | #367/#427 — nightly `scripts/compat-matrix.sh`; the 0.6.0 wheel remains an additional data-plane regression leg |
-| V3a | Released 0.6.3 worker plus current worker under live traffic: migrate v040→v043, mixed completions, old-only final rotation, guarded flip/reconciliation, returning-old fence, exact drain | ✓ | ✓ | #427 — nightly `rolling_upgrade_rehearsal_test`; binary-first, deadline-boundary, and hard-kill cells remain |
+| V3a | Released 0.6.3 plus current under live traffic: migrate v040→v043, mixed completions, old-only final rotation, guarded flip/reconciliation, returning-old fence, exact drain, and hard-killed old-leader deadline rescue | ✓ | ✓ | #427 — nightly `rolling_upgrade_rehearsal_test`; binary-first and full workload cells remain |
+| V3b | Live v043 migration deadlock rolls back and retries the complete atomic transaction | ✓ | | #427 — `migration_test::test_live_migration_retries_hot_table_deadlock` |
 | V4 | Newest binary against a pre-migrate old schema fails loudly (message + exit code asserted) | ✓ |  | #367 — asserted against a 0.5.7 schema with canonical work; the 0.6-schema variant activates with the first 0.7 migration |
 | V5 | `awa migrate` refuses non-`active` storage state, names finalize steps | ✓ |  | #370 — `migration_test` gate tests + the nightly backward-guard leg |
 

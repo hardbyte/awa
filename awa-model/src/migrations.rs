@@ -2,7 +2,7 @@ use crate::error::AwaError;
 use semver::Version;
 use sqlx::postgres::PgConnection;
 use sqlx::{Connection, PgPool};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Current schema version.
 pub const CURRENT_VERSION: i32 = 43;
@@ -31,6 +31,13 @@ const MIGRATION_RUNTIME_VERSION_FLOORS: &[(i32, &str)] = &[(43, "0.6.2")];
 /// Matches the window used by the ADR-037 finalize gate and
 /// `awa.storage_auto_finalize_if_fresh`.
 const LIVE_RUNTIME_WINDOW_SECS: i64 = 90;
+
+/// Live workers can deadlock with a migration that refreshes several hot
+/// relations in one transaction: an old transaction may hold relation A and
+/// wait for B while the migration has already changed B and is waiting for A.
+/// PostgreSQL aborts one participant, so retry the complete atomic migration
+/// transaction after the short worker transaction has cleared.
+const MIGRATION_DEADLOCK_RETRIES: u32 = 5;
 
 /// Options controlling a migration run.
 #[derive(Debug, Clone, Default)]
@@ -349,13 +356,24 @@ pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<
     // atomic: a failed or cancelled run leaves no half-applied step. This is
     // only sound because every migration is transaction-safe (no
     // `CREATE INDEX CONCURRENTLY`, `VACUUM`, or explicit transaction control).
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(lock_key)
-        .execute(&mut *tx)
-        .await?;
-    apply_migrations(&mut tx, &options).await?;
-    tx.commit().await?;
+    let mut retry = 0;
+    loop {
+        match run_migration_transaction(pool, &options, lock_key).await {
+            Ok(()) => break,
+            Err(error) if is_migration_deadlock(&error) && retry < MIGRATION_DEADLOCK_RETRIES => {
+                retry += 1;
+                let delay = std::time::Duration::from_millis(50 * (1 << (retry - 1)));
+                warn!(
+                    retry,
+                    max_retries = MIGRATION_DEADLOCK_RETRIES,
+                    delay_ms = delay.as_millis(),
+                    "Migration deadlocked with live traffic; retrying the atomic transaction"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 
     // Best-effort admin-metadata cache warmup, deliberately outside the
     // migration transaction: it must not extend the lock hold, and a slow or
@@ -363,6 +381,29 @@ pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<
     warm_admin_metadata_cache(pool).await;
 
     Ok(())
+}
+
+async fn run_migration_transaction(
+    pool: &PgPool,
+    options: &MigrateOptions,
+    lock_key: i64,
+) -> Result<(), AwaError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+    apply_migrations(&mut tx, options).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+fn is_migration_deadlock(error: &AwaError) -> bool {
+    matches!(
+        error,
+        AwaError::Database(sqlx::Error::Database(database))
+            if database.code().as_deref() == Some("40P01")
+    )
 }
 
 async fn apply_migrations(
