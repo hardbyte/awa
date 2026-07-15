@@ -34,9 +34,14 @@ fn workspace_root() -> PathBuf {
 }
 
 fn released_python() -> PathBuf {
-    env::var_os("AWA_N_MINUS_ONE_PYTHON")
+    let path = env::var_os("AWA_N_MINUS_ONE_PYTHON")
         .map(PathBuf::from)
-        .expect("AWA_N_MINUS_ONE_PYTHON must name the released-artifact interpreter")
+        .expect("AWA_N_MINUS_ONE_PYTHON must name the released-artifact interpreter");
+    if path.is_absolute() {
+        path
+    } else {
+        workspace_root().join(path)
+    }
 }
 
 fn mixed_fleet_helper() -> PathBuf {
