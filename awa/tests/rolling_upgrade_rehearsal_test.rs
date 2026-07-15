@@ -23,6 +23,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+static REHEARSAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn database_url() -> String {
     env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:5432/awa_test".to_string())
@@ -478,6 +480,7 @@ async fn wait_for_drain(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
 async fn test_migrate_first_mixed_fleet_flip_and_fence() {
+    let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let pool = pool().await;
     reset_database(&pool).await;
     let queue = format!("upgrade_rehearsal_{}", Uuid::new_v4().simple());
@@ -618,6 +621,7 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
 async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
+    let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
     let pool = pool().await;
     reset_database(&pool).await;
     let queue = format!("upgrade_deadline_{}", Uuid::new_v4().simple());
