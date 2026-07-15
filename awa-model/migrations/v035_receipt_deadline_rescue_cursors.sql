@@ -21,10 +21,14 @@ BEGIN
     FOR v_schema IN
         SELECT n.nspname
         FROM pg_namespace AS n
-        WHERE to_regprocedure(format(
-            '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
-            n.nspname
-        )) IS NOT NULL
+        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
+          AND EXISTS (
+              SELECT 1 FROM pg_proc AS awa_p
+              WHERE awa_p.pronamespace = n.oid
+                AND awa_p.proname = 'claim_ready_runtime'
+                AND oidvectortypes(awa_p.proargtypes)
+                    = 'text, bigint, double precision, double precision'
+          )
     LOOP
         IF to_regclass(format('%I.queue_ring_state', v_schema)) IS NULL
            OR to_regclass(format('%I.lease_ring_state', v_schema)) IS NULL

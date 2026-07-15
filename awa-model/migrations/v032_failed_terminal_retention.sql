@@ -14,12 +14,22 @@ BEGIN
     FOR v_schema IN
         SELECT n.nspname
         FROM pg_namespace AS n
-        WHERE to_regclass(format('%I.queue_ring_state', n.nspname)) IS NOT NULL
-          AND to_regclass(format('%I.queue_terminal_rollups', n.nspname)) IS NOT NULL
-          AND to_regprocedure(format(
-              '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
-              n.nspname
-          )) IS NOT NULL
+        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
+          AND EXISTS (
+              SELECT 1 FROM pg_class AS awa_c
+              WHERE awa_c.relnamespace = n.oid AND awa_c.relname = 'queue_ring_state'
+          )
+          AND EXISTS (
+              SELECT 1 FROM pg_class AS awa_c
+              WHERE awa_c.relnamespace = n.oid AND awa_c.relname = 'queue_terminal_rollups'
+          )
+          AND EXISTS (
+              SELECT 1 FROM pg_proc AS awa_p
+              WHERE awa_p.pronamespace = n.oid
+                AND awa_p.proname = 'claim_ready_runtime'
+                AND oidvectortypes(awa_p.proargtypes)
+                    = 'text, bigint, double precision, double precision'
+          )
     LOOP
         IF NOT EXISTS (
             SELECT 1
