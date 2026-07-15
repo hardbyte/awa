@@ -365,6 +365,7 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                                     COALESCE(lanes.pruned_completed_count, 0), \
                                     COALESCE(rollups.pruned_completed_count, 0) \
                                 ) \
+                                + COALESCE(pending.pruned_completed_delta, 0) \
                             ), \
                             0 \
                         )::bigint AS count \
@@ -378,6 +379,14 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                      FROM {schema}.queue_terminal_rollups \
                      WHERE queue = $1 \
                  ) AS rollups \
+                 USING (queue, priority) \
+                 FULL OUTER JOIN ( \
+                     SELECT queue, priority, \
+                            sum(pruned_completed_delta)::bigint AS pruned_completed_delta \
+                     FROM {schema}.queue_terminal_rollup_deltas \
+                     WHERE queue = $1 \
+                     GROUP BY queue, priority \
+                 ) AS pending \
                  USING (queue, priority) \
              ) \
              SELECT state, sum(count)::bigint AS count \
@@ -485,6 +494,12 @@ async fn storage_debug(pool: &sqlx::PgPool, queue: &str) -> String {
                   WHERE lc.queue = $1) + \
                  (SELECT count(*)::bigint FROM {schema}.terminal_jobs WHERE queue = $1) + \
                  (SELECT COALESCE( \
+                     sum(pruned_completed_delta + pruned_failed_delta), \
+                     0 \
+                  )::bigint \
+                  FROM {schema}.queue_terminal_rollup_deltas \
+                  WHERE queue = $1) + \
+                 (SELECT COALESCE( \
                      sum( \
                          GREATEST( \
                              COALESCE(lanes.pruned_completed_count, 0), \
@@ -517,6 +532,29 @@ async fn storage_debug(pool: &sqlx::PgPool, queue: &str) -> String {
     format!(
         "transition={storage:?}, canonical_rows={canonical_count}, queue_storage_rows={queue_storage_count}"
     )
+}
+
+async fn assert_unfolded_terminal_rollup_is_visible(pool: &sqlx::PgPool) {
+    let schema = active_queue_storage_schema(pool)
+        .await
+        .expect("failover smoke should use queue storage");
+    let queue = format!("failover_rollup_probe_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.queue_terminal_rollup_deltas ( \
+             queue, priority, pruned_completed_delta, pruned_failed_delta \
+         ) VALUES ($1, 0, 3, 0)"
+    ))
+    .bind(&queue)
+    .execute(pool)
+    .await
+    .expect("failed to seed unfolded terminal rollup probe");
+
+    let counts = queue_state_counts(pool, &queue).await;
+    assert_eq!(
+        state_count(&counts, "completed"),
+        3,
+        "failover count helper must include unfolded terminal rollup deltas"
+    );
 }
 
 async fn wait_for_client_postgres_recovery(client: &Client, timeout: Duration) {
@@ -594,6 +632,7 @@ async fn test_postgres_hot_standby_promotion_keeps_awa_working() {
     let client_pool = connect_pool(&url).await;
     let client = failover_client(client_pool, &queue);
     client.start().await.expect("client should start");
+    assert_unfolded_terminal_rollup_is_visible(&app_pool).await;
 
     app_pool.close().await;
     app_pool = connect_pool_with(&url, 1).await;
