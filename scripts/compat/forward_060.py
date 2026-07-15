@@ -1,7 +1,4 @@
-"""Forward-compat leg: a pinned awa-pg 0.6.x release runs the full job
-lifecycle against the newest schema (enqueue -> claim -> complete, plus
-cancel). Runs under the 0.6.0 wheel from PyPI — a real release artifact,
-not a source build. Exits non-zero on any contract violation."""
+"""A pinned awa-pg 0.6.x wheel runs the full lifecycle on the newest schema."""
 
 import asyncio
 import os
@@ -18,14 +15,16 @@ class CompatJob:
 
 async def main() -> int:
     client = awa.AsyncClient(os.environ["DATABASE_URL"])
+    version = os.environ["COMPAT_VERSION"]
+    queue = os.environ["COMPAT_QUEUE"]
     done = asyncio.Event()
 
-    @client.task(CompatJob, queue="compat_forward")
+    @client.task(CompatJob, queue=queue)
     async def handle(job: CompatJob):
         if job.args.marker == "lifecycle":
             done.set()
 
-    inserted = await client.insert(CompatJob(marker="lifecycle"), queue="compat_forward")
+    inserted = await client.insert(CompatJob(marker="lifecycle"), queue=queue)
     print(f"inserted job {inserted.id}")
 
     # A parked job to exercise admin cancel against the new schema.
@@ -33,18 +32,18 @@ async def main() -> int:
 
     parked = await client.insert(
         CompatJob(marker="parked"),
-        queue="compat_forward_parked",
+        queue=f"{queue}_parked",
         run_at=datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(hours=1),
     )
 
-    await client.start([("compat_forward", 2)])
+    await client.start([(queue, 2)])
     try:
         await asyncio.wait_for(done.wait(), timeout=60)
     except asyncio.TimeoutError:
-        print("FAIL: 0.6.0 worker never completed the job", file=sys.stderr)
+        print(f"FAIL: {version} worker never completed the job", file=sys.stderr)
         return 1
-    print("lifecycle job completed by 0.6.0 worker")
+    print(f"lifecycle job completed by {version} worker")
 
     cancelled = await client.cancel(parked.id)
     if cancelled is None or str(cancelled.state) not in ("JobState.CANCELLED", "cancelled"):
@@ -57,7 +56,7 @@ async def main() -> int:
     await asyncio.sleep(3)
 
     await client.shutdown()
-    print("FORWARD-0.6.0 PASS")
+    print(f"FORWARD-{version} PASS")
     return 0
 
 

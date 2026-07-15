@@ -1,4 +1,4 @@
-"""Assert that a pinned 0.6.0 artifact fails closed after the v043 authority flip."""
+"""Assert that a pinned pre-ledger 0.6.x artifact fails after authority flips."""
 
 import asyncio
 import datetime
@@ -16,9 +16,11 @@ class PostFlipJob:
 
 async def main() -> int:
     client = awa.AsyncClient(os.environ["DATABASE_URL"])
+    version = os.environ["COMPAT_VERSION"]
+    queue = os.environ["COMPAT_QUEUE"]
     parked = await client.insert(
         PostFlipJob(marker="must-not-cancel"),
-        queue="compat_post_flip",
+        queue=queue,
         run_at=datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(hours=1),
     )
@@ -29,10 +31,10 @@ async def main() -> int:
         if "no partition" not in str(error):
             print(f"FAIL: unexpected post-flip refusal: {error}", file=sys.stderr)
             return 1
-        print(f"0.6.0 post-flip operation refused loudly: {error}")
+        print(f"{version} post-flip operation refused loudly: {error}")
         return 0
 
-    print("FAIL: 0.6.0 cancel crossed the ledger-authority fence", file=sys.stderr)
+    print(f"FAIL: {version} cancel crossed the ledger-authority fence", file=sys.stderr)
     return 1
 
 
