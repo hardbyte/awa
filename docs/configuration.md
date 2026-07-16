@@ -774,6 +774,8 @@ awa --database-url "$AWA_CLOUDSQL_URL" serve \
 | `--instance-color` | `AWA_INSTANCE_COLOR` | Accent color (CSS hex, e.g. `#0ea5e9`) tinting the header badge and favicon |
 | `--peer NAME=URL` (repeatable) | — | Plain links to peer Awa UIs in the header — a zero-data-plane "switcher" |
 
+![Awa UI with an instance identity configured: tinted header badge naming the instance, a peer link beside it, and the instance name in the tab title](images/awa-ui-instance-identity.png)
+
 The identity is exposed via `/api/capabilities` (`instance_name`, `instance_color`, `peers`). There is deliberately no multi-database mode: every identifier in the UI (job ids, queue names, kinds) is database-scoped, so a merged view would need a backend qualifier on every route and mutation — and would double the consequence of a mis-click. Two labeled tabs fail into confusion; one merged UI fails into mutating the wrong production database.
 
 If peers are reachable from less-trusted networks, pair this with read-only mode (above) so instance links don't encourage exposing writable UIs.

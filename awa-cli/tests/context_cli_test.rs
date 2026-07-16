@@ -145,3 +145,33 @@ fn production_context_with_yes_proceeds_and_echoes_target() {
         .assert()
         .success();
 }
+
+#[test]
+fn broken_config_with_explicit_database_url_still_works() {
+    // The documented escape hatch: a typo or permission problem in the
+    // context config must not lock the operator out when --database-url
+    // is given explicitly. The load failure downgrades to a warning.
+    let config = write_config("broken-escape", "default_context = [not; valid toml");
+    let assert = awa(&config)
+        .args(["--database-url", &database_url(), "queue", "stats"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("ignoring unreadable context config"),
+        "must warn about the broken config: {stderr}"
+    );
+}
+
+#[test]
+fn broken_config_without_database_url_fails_loudly() {
+    // Without the explicit flag a broken config stays fatal: silently
+    // ignoring it could route a command at the wrong database via the
+    // DATABASE_URL fallback.
+    let config = write_config("broken-fatal", "default_context = [not; valid toml");
+    awa(&config)
+        .env("DATABASE_URL", database_url())
+        .args(["queue", "stats"])
+        .assert()
+        .failure();
+}

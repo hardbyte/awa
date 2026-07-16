@@ -851,7 +851,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return run_context_command(command);
     }
 
-    let loaded_config = context::load_from_default_path()?;
+    // An explicit --database-url is the documented highest-priority override
+    // and must stay usable as the escape hatch even when the context config
+    // itself is broken (typo, permissions): downgrade a load failure to a
+    // warning in that case rather than aborting. Without the flag, a broken
+    // config is fatal — silently ignoring it could route a command at the
+    // wrong database via the DATABASE_URL fallback.
+    let loaded_config = match context::load_from_default_path() {
+        Ok(loaded) => loaded,
+        Err(error) if cli.database_url.is_some() => {
+            eprintln!(
+                "warning: ignoring unreadable context config (--database-url given): {error}"
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(warning) = loaded_config.as_ref().and_then(|l| l.warning.as_deref()) {
         eprintln!("{warning}");
     }

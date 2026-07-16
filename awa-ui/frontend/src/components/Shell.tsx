@@ -460,16 +460,18 @@ export function Shell() {
       </Sidebar>
 
       <SidebarInset>
-        <header className="sticky top-0 z-10 flex items-center gap-2 border-b bg-bg/70 px-4 py-2.5 backdrop-blur sm:px-6">
+        {/* Opaque: any translucency lets scrolled table text ghost through
+            the sticky bar and fight the header content for legibility. */}
+        <header className="sticky top-0 z-10 flex items-center gap-2 border-b bg-bg px-4 py-2.5 sm:px-6">
           <SidebarTrigger className="-ml-1" />
           {instanceName && (
             <span
-              className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium text-fg"
+              className="ml-1 inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs/none font-medium text-fg"
               style={instanceColor ? { borderColor: instanceColor } : undefined}
               title="Awa instance"
             >
               <span
-                className="size-2 rounded-full bg-primary"
+                className="size-2 shrink-0 rounded-full bg-primary"
                 style={
                   instanceColor ? { backgroundColor: instanceColor } : undefined
                 }
@@ -480,7 +482,7 @@ export function Shell() {
           {peers.length > 0 && (
             <nav
               aria-label="Peer Awa instances"
-              className="hidden items-center gap-2 text-xs text-muted-fg sm:flex"
+              className="ml-2 hidden items-center gap-3 text-xs/none text-muted-fg sm:flex"
             >
               {/* Plain full-page links to other origins — deliberately not
                   client-side routing; each peer is a separate backend. */}
@@ -490,7 +492,7 @@ export function Shell() {
                   href={peer.url}
                   className="underline-offset-2 hover:text-fg hover:underline"
                 >
-                  {peer.name} ↗
+                  {peer.name}&nbsp;<span aria-hidden="true">↗</span>
                 </a>
               ))}
             </nav>
