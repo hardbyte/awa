@@ -7,6 +7,30 @@ use sqlx::PgPool;
 use crate::cache::DashboardCache;
 use crate::error::ApiError;
 
+/// Operator-assigned identity for this UI instance (#437).
+///
+/// The UI is single-backend by design — one `awa serve` per database. This
+/// identity is what lets an operator with several instances open tell the
+/// tabs (and mutation targets) apart: it is exposed via `/api/capabilities`
+/// and rendered in the header badge, browser tab title, and favicon tint.
+#[derive(Clone, Debug, Default)]
+pub struct InstanceIdentity {
+    /// Human-readable name, e.g. "cloudsql-prod".
+    pub name: Option<String>,
+    /// Accent color as a CSS hex value, e.g. "#0ea5e9". Validated by the
+    /// CLI before it gets here.
+    pub color: Option<String>,
+    /// Static links to peer Awa UIs — a zero-data-plane "switcher".
+    pub peers: Vec<PeerLink>,
+}
+
+/// A named link to a peer Awa UI serving a different database.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PeerLink {
+    pub name: String,
+    pub url: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -20,6 +44,9 @@ pub struct AppState {
     /// full instrument set on every call, so we construct it once here and
     /// share it across request handlers.
     pub metrics: AwaMetrics,
+    /// Identity shown by the frontend; `Arc` keeps per-request state clones
+    /// cheap.
+    pub instance: std::sync::Arc<InstanceIdentity>,
 }
 
 impl AppState {
@@ -37,7 +64,14 @@ impl AppState {
             callback_hmac_secret,
             poll_interval_ms,
             metrics: AwaMetrics::from_global(),
+            instance: std::sync::Arc::new(InstanceIdentity::default()),
         }
+    }
+
+    /// Attach an operator-assigned instance identity (#437).
+    pub fn with_instance(mut self, instance: InstanceIdentity) -> Self {
+        self.instance = std::sync::Arc::new(instance);
+        self
     }
 
     pub fn require_writable(&self) -> Result<(), ApiError> {
@@ -106,4 +140,10 @@ pub struct Capabilities {
     /// Suggested polling interval in milliseconds. The server sets this
     /// higher for read-only replicas where data is inherently stale.
     pub poll_interval_ms: u64,
+    /// Operator-assigned name identifying this instance/database (#437).
+    pub instance_name: Option<String>,
+    /// Accent color (CSS hex) tinting the header badge and favicon.
+    pub instance_color: Option<String>,
+    /// Static links to peer Awa UIs, rendered as plain links.
+    pub peers: Vec<PeerLink>,
 }

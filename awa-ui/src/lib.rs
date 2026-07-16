@@ -18,7 +18,7 @@ use rust_embed::Embed;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 
-use crate::state::{AppState, ReadOnlyMode};
+use crate::state::{AppState, InstanceIdentity, ReadOnlyMode};
 
 #[derive(Embed)]
 #[folder = "static/"]
@@ -59,8 +59,31 @@ pub async fn router_with(
     callback_hmac_secret: Option<[u8; 32]>,
     read_only_mode: ReadOnlyMode,
 ) -> Result<Router, sqlx::Error> {
+    router_with_identity(
+        pool,
+        cache_ttl,
+        callback_hmac_secret,
+        read_only_mode,
+        InstanceIdentity::default(),
+    )
+    .await
+}
+
+/// [`router_with`] plus an operator-assigned [`InstanceIdentity`] (#437).
+///
+/// The UI stays single-backend; the identity only labels it — name, accent
+/// color, and static peer links surfaced via `/api/capabilities` and
+/// rendered in the frontend header, tab title, and favicon.
+pub async fn router_with_identity(
+    pool: PgPool,
+    cache_ttl: Duration,
+    callback_hmac_secret: Option<[u8; 32]>,
+    read_only_mode: ReadOnlyMode,
+    instance: InstanceIdentity,
+) -> Result<Router, sqlx::Error> {
     let read_only = read_only_mode.resolve(&pool).await?;
-    let state = AppState::new(pool, read_only, cache_ttl, callback_hmac_secret);
+    let state =
+        AppState::new(pool, read_only, cache_ttl, callback_hmac_secret).with_instance(instance);
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
