@@ -198,10 +198,20 @@ class HealthCheck:
     def queues(self) -> dict[str, QueueHealth]: ...
 
 class RetryAfter:
+    """Retry this failed attempt after a caller-chosen delay.
+
+    Increments ``attempt`` and counts against ``max_attempts``: a retry
+    requested on the final attempt exhausts the job into failed/DLQ. For
+    indefinite rescheduling that must not consume the attempt budget,
+    return ``Snooze`` instead.
+    """
+
     seconds: float
     def __init__(self, seconds: float) -> None: ...
 
 class Snooze:
+    """Reschedule without counting a failed attempt (``attempt`` unchanged)."""
+
     seconds: float
     def __init__(self, seconds: float) -> None: ...
 

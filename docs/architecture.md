@@ -171,7 +171,7 @@ Handler results finalize through guarded storage transitions:
 ```text
 handler result
     ├── Completed      -> close attempt, append receipt_completion_batches or done_entries
-    ├── RetryAfter     -> close attempt, append deferred_jobs(retryable)
+    ├── RetryAfter     -> close attempt, append deferred retry or terminal failure
     ├── Snooze         -> close attempt, append deferred_jobs without attempt bump
     ├── Cancel         -> close attempt, append done_entries(cancelled)
     ├── Terminal error -> close attempt, append done_entries(failed) or dlq_entries

@@ -96,6 +96,36 @@ async def test_work_one_retry_after(tc):
 
 
 @pytest.mark.asyncio
+async def test_work_one_retry_after_final_attempt_exhausts(tc):
+    """RetryAfter on the final attempt exhausts the job, mirroring the executor."""
+    await tc.insert(
+        SendEmail(to="exhaust@test.com", subject="Exhaust"), max_attempts=1
+    )
+
+    async def handler(job):
+        return awa.RetryAfter(seconds=60)
+
+    result = await tc.work_one(SendEmail, handler=handler)
+    assert result.is_failed()
+    assert result.job.state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_work_one_retryable_error_final_attempt_exhausts(tc):
+    """A retryable exception on the final attempt exhausts the job."""
+    await tc.insert(
+        SendEmail(to="exhaust2@test.com", subject="Exhaust"), max_attempts=1
+    )
+
+    async def handler(job):
+        raise ValueError("still failing")
+
+    result = await tc.work_one(SendEmail, handler=handler)
+    assert result.is_failed()
+    assert "still failing" in result.error
+
+
+@pytest.mark.asyncio
 async def test_work_one_snooze(tc):
     """work_one returns snoozed when handler returns Snooze."""
     await tc.insert(SendEmail(to="snooze@test.com", subject="Snooze"))

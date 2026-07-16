@@ -136,6 +136,21 @@ impl TestClient {
                 Ok(WorkResult::Cancelled(job, reason.clone()))
             }
             Ok(JobResult::RetryAfter(_)) | Err(JobError::Retryable(_)) => {
+                // Both primitives report a failed attempt; the final attempt
+                // exhausts the job, mirroring the real executor.
+                if job.attempt >= job.max_attempts {
+                    sqlx::query(
+                        "UPDATE awa.jobs SET state = 'failed', finalized_at = now(), progress = $2 WHERE id = $1",
+                    )
+                    .bind(job.id)
+                    .bind(&progress_snapshot)
+                    .execute(&self.pool)
+                    .await?;
+                    return Ok(WorkResult::Failed(
+                        job,
+                        "max_attempts exhausted".to_string(),
+                    ));
+                }
                 sqlx::query(
                     "UPDATE awa.jobs SET state = 'retryable', finalized_at = now(), progress = $2 WHERE id = $1",
                 )
@@ -285,12 +300,46 @@ impl TestClient {
                 Ok(WorkResult::Cancelled(job, reason.clone()))
             }
             Ok(JobResult::RetryAfter(delay)) => {
+                // The final attempt exhausts the job, mirroring the real
+                // executor.
+                if job.attempt >= job.max_attempts {
+                    store
+                        .fail_terminal(
+                            &self.pool,
+                            job.id,
+                            job.run_lease,
+                            "max_attempts exhausted",
+                            progress_snapshot,
+                        )
+                        .await?;
+                    return Ok(WorkResult::Failed(
+                        job,
+                        "max_attempts exhausted".to_string(),
+                    ));
+                }
                 store
                     .retry_after(&self.pool, job.id, job.run_lease, *delay, progress_snapshot)
                     .await?;
                 Ok(WorkResult::Retryable(job))
             }
             Err(JobError::Retryable(_)) => {
+                // The final attempt exhausts the job, mirroring the real
+                // executor.
+                if job.attempt >= job.max_attempts {
+                    store
+                        .fail_terminal(
+                            &self.pool,
+                            job.id,
+                            job.run_lease,
+                            "max_attempts exhausted",
+                            progress_snapshot,
+                        )
+                        .await?;
+                    return Ok(WorkResult::Failed(
+                        job,
+                        "max_attempts exhausted".to_string(),
+                    ));
+                }
                 // A retryable error reschedules the job. Canonical leaves it in
                 // a finalized `retryable` state (not re-claimable by a later
                 // `work_one`); the store needs an explicit delay, so use a long
