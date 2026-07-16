@@ -911,10 +911,15 @@ async fn current_leader_backend_pid(pool: &sqlx::PgPool) -> Option<i32> {
 /// for the leader nor trip on seeing two holders.
 async fn hold_unrelated_advisory_lock() -> sqlx::PgConnection {
     use sqlx::Connection;
+    // Distinct key per invocation: pg_advisory_lock blocks until granted, so
+    // a shared key would serialize tests that run concurrently.
+    static DECOY_LOCK_KEY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(424242);
+    let lock_key = DECOY_LOCK_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut conn = sqlx::PgConnection::connect(&database_url())
         .await
         .expect("connect decoy advisory lock session");
-    sqlx::query("SELECT pg_advisory_lock(424242)")
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_key)
         .execute(&mut conn)
         .await
         .expect("hold decoy advisory lock");
