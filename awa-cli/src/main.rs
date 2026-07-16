@@ -242,7 +242,9 @@ fn access_for(command: &Commands) -> context::Access {
     use context::Access::{Mutating, ReadOnly};
     match command {
         // `migrate` only mutates when it applies; --sql / --extract-to
-        // render SQL (the --pending probe is a read).
+        // render SQL without connecting. `--pending` is an apply-modifier
+        // (it selects the range), so alone it stays Mutating; combined
+        // with --sql it renders and the ReadOnly arm already wins.
         Commands::Migrate {
             sql, extract_to, ..
         } => {
