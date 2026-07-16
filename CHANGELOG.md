@@ -13,6 +13,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Added
+
+- **UI instance identity ([#437](https://github.com/hardbyte/awa/issues/437)).** The UI stays single-backend by design (one `awa serve` per database — the 0.7 roadmap non-goal stands), but it can now say *which* backend it is: `awa serve --instance-name` / `AWA_INSTANCE_NAME` (plus optional `--instance-color` / `AWA_INSTANCE_COLOR` and repeatable `--peer NAME=URL` links) surface via `/api/capabilities` and render as a header badge, the browser tab title, and a tinted favicon, with peers as plain links — a zero-data-plane "switcher" between per-database instances. No multiple pools, no backend switcher, no per-request backend selection.
+- **CLI named contexts ([#437](https://github.com/hardbyte/awa/issues/437)).** `~/.config/awa/config.toml` defines kubectl-style contexts (`url` or `url_env` indirection, `production = true`), resolved as `--database-url` > `--context`/`AWA_CONTEXT` > `DATABASE_URL` env > `default_context` — deliberately with **no sticky current-context for mutations**: once more than one context is defined, mutating commands (migrate apply, storage transitions/flips, dlq retry/purge/move, queue drain/pause, batch-ops submit, cron remove, and every other write) require an explicit `--context` or `--database-url`, while read-only commands may still fall back. Every command echoes its password-stripped target to stderr before acting; `production = true` gates mutations behind an interactive y/N (`--yes` for automation); a plaintext-password `url` in a group/other-readable config file warns. New `awa context list|show` inspect the config. With no config file, behaviour is unchanged.
+
 ### Breaking changes
 
 - **0.7 migrate gate ([#370](https://github.com/hardbyte/awa/issues/370), [ADR-037](docs/adr/037-canonical-engine-deprecation.md)).** `awa migrate` (and `awa_model::migrations::run`) now refuses to apply pending migrations unless the storage transition is finalized (`state = active`) or the install is fresh (no jobs, no recently-live runtimes — the same conditions as worker-startup auto-finalize). Nothing is applied on refusal; the error names the finalize steps. Complete the staged transition on 0.6 binaries first: see [`docs/upgrade-0.6-to-0.7.md`](docs/upgrade-0.6-to-0.7.md).

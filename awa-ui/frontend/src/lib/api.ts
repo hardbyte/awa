@@ -189,10 +189,22 @@ export interface TimeseriesBucket {
   count: number;
 }
 
+/** A named link to a peer Awa UI serving a different database. */
+export interface PeerLink {
+  name: string;
+  url: string;
+}
+
 export interface Capabilities {
   read_only: boolean;
   /** Server-suggested polling interval in milliseconds. */
   poll_interval_ms: number;
+  /** Operator-assigned name identifying this instance/database. */
+  instance_name: string | null;
+  /** Accent color (CSS hex) tinting the header badge and favicon. */
+  instance_color: string | null;
+  /** Static links to peer Awa UIs, rendered as plain links. */
+  peers: PeerLink[];
 }
 
 export type BatchOperationKind = "set_priority" | "move_queue";

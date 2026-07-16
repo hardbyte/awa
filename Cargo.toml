@@ -74,6 +74,8 @@ cel = { version = "0.13", features = ["json"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+url = "2"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }

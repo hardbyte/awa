@@ -58,5 +58,8 @@ pub async fn get_capabilities(
     Ok(Json(Capabilities {
         read_only: state.read_only,
         poll_interval_ms: state.poll_interval_ms,
+        instance_name: state.instance.name.clone(),
+        instance_color: state.instance.color.clone(),
+        peers: state.instance.peers.clone(),
     }))
 }

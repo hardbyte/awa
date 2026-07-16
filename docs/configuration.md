@@ -708,7 +708,7 @@ Queue-policy declaration is still a runtime-side concern; the UI / API report st
 
 ## CLI and `awa serve`
 
-The CLI reads `DATABASE_URL` from the environment or `--database-url`. All subcommands except `serve` use a single database connection.
+The CLI resolves its database target in this order: `--database-url` > `--context`/`AWA_CONTEXT` > the `DATABASE_URL` environment variable > `default_context` from the config file (see [Named contexts](#named-contexts) below). The resolved target is echoed, password-stripped, to stderr before any command acts. All subcommands except `serve` use a single database connection.
 
 `awa serve` starts the admin UI and API. It has its own connection pool and response cache, configurable via CLI flags or environment variables:
 
@@ -756,6 +756,56 @@ AWA_READ_ONLY=1 awa --database-url "$DATABASE_URL" serve
 ```
 
 Once forced, there is no way for a frontend user to flip back to writable without restarting the server — that's the whole point.
+
+### Instance identity
+
+The UI is single-backend by design — run one `awa serve` per database ([#437](https://github.com/hardbyte/awa/issues/437)). When you operate several databases (say Cloud SQL and AlloyDB production instances), give each UI a name so open tabs — and mutation targets — are distinguishable at a glance:
+
+```bash
+awa --database-url "$AWA_CLOUDSQL_URL" serve \
+  --instance-name cloudsql-prod \
+  --instance-color '#0ea5e9' \
+  --peer alloydb=https://awa-alloydb.internal
+```
+
+| Flag | Env var | Purpose |
+| --- | --- | --- |
+| `--instance-name` | `AWA_INSTANCE_NAME` | Name rendered in the header badge and browser tab title |
+| `--instance-color` | `AWA_INSTANCE_COLOR` | Accent color (CSS hex, e.g. `#0ea5e9`) tinting the header badge and favicon |
+| `--peer NAME=URL` (repeatable) | — | Plain links to peer Awa UIs in the header — a zero-data-plane "switcher" |
+
+The identity is exposed via `/api/capabilities` (`instance_name`, `instance_color`, `peers`). There is deliberately no multi-database mode: every identifier in the UI (job ids, queue names, kinds) is database-scoped, so a merged view would need a backend qualifier on every route and mutation — and would double the consequence of a mis-click. Two labeled tabs fail into confusion; one merged UI fails into mutating the wrong production database.
+
+If peers are reachable from less-trusted networks, pair this with read-only mode (above) so instance links don't encourage exposing writable UIs.
+
+### Named contexts
+
+Operating several Awa databases from one workstation with a bare `DATABASE_URL` is a foot-gun: nothing tells you *which* database `awa migrate` or `awa dlq purge` is about to hit. Named contexts ([#437](https://github.com/hardbyte/awa/issues/437)) fix that with a kubectl-style config file at `~/.config/awa/config.toml` (override with `$AWA_CONFIG`; `$XDG_CONFIG_HOME` is honored) — but deliberately **without** a sticky "use-context" for mutations, because a sticky current context is exactly how people mutate the wrong production cluster:
+
+```toml
+default_context = "cloudsql"   # honored by read-only commands only
+
+[contexts.cloudsql]
+url_env = "AWA_CLOUDSQL_URL"   # indirection: no secret in the file
+production = true
+
+[contexts.alloydb]
+url_env = "AWA_ALLOYDB_URL"
+production = true
+
+[contexts.local]
+url = "postgres://postgres:test@localhost:15432/awa_test"
+```
+
+Each context sets exactly one of `url` (inline) or `url_env` (the named environment variable is read at resolution time — fits Cloud SQL / AlloyDB IAM connector auth, and keeps secrets out of the file). If a plaintext `url` embeds a password and the file is group/other-readable, the CLI warns and suggests `chmod 600` or `url_env`.
+
+Resolution order: `--database-url` > `--context`/`AWA_CONTEXT` > `DATABASE_URL` env > `default_context`. Three safety rules carry the weight:
+
+1. **Read/write asymmetry.** Read-only commands (`job list`, `queue stats`, `dlq depth`, `health`, `storage status`, …) may fall back to `DATABASE_URL` or `default_context`. Mutating commands (`migrate`, storage transitions and flips, `dlq retry`/`purge`/`move`, `queue drain`/`pause`, `batch-ops submit`, `cron remove`, and every other write) require an explicit `--context` or `--database-url` whenever more than one context is defined.
+2. **Target echo.** The password-stripped target is printed to stderr before any command acts: `target: context 'alloydb' [production] — postgres://app@10.0.0.9:5432/awa`.
+3. **Production gate.** Mutating commands against a context marked `production = true` prompt for interactive y/N confirmation; pass `--yes` for automation (a non-interactive stdin without `--yes` refuses rather than hanging).
+
+Inspect the config with `awa context list` (marks the default and production contexts, shows password-stripped targets) and `awa context show [name]`. With no config file, behaviour is unchanged: `--database-url` and `DATABASE_URL` work exactly as before.
 
 ## Next
 

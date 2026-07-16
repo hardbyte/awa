@@ -193,6 +193,8 @@ _HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not 
 | --- | --- | --- |
 | RO1-RO3 | Read-only serve: capabilities, mutations blocked, UI disables | ✓ |
 | UIB1-UIB3 | Batch operations page: set-priority preview/submit, move-queue payload, cancellation request | ✓ |
+| UII1 | Instance identity: `--instance-name`/`--instance-color`/`--peer` parse and validate (hex color, http(s) peers only), surfaced via `/api/capabilities` (#437) | ✓ |
+| UII2 | Frontend identity helpers: tab title, hex-color normalization (style-injection rejected), tinted favicon data URI (vitest) | ✓ |
 
 ### Admin Metadata Guardrails
 
@@ -277,6 +279,18 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V12 | `awa doctor` checks cover every troubleshooting.md scenario; `--json` schema asserted | ✓ |  | #373 |
 | V13 | Integration suite through pgbouncer session mode; transaction mode engages NOTIFY fallback + warning | ✓ | ✓ | #374 |
 | V14 | Helm chart kind smoke: four-surface topology installs, probes pass, migration hook runs | ✓ |  | #344 |
+
+### CLI contexts
+
+| # | Test | Rust | Py | Ref |
+| --- | --- | --- | --- | --- |
+| CTX1 | Config parsing: exactly one of `url`/`url_env` per context, unknown keys and unknown `default_context` rejected loudly | ✓ |  | #437 |
+| CTX2 | Resolution order: `--database-url` > `--context` > `DATABASE_URL` env > `default_context`; no config file → pre-context behaviour unchanged | ✓ |  | #437 |
+| CTX3 | Read/write asymmetry: with >1 contexts, mutating commands refuse `DATABASE_URL`/`default_context` fallback; read-only commands and single-context configs are unaffected | ✓ |  | #437 |
+| CTX4 | Access classification matrix: the #437 destructive set (migrate apply, storage transitions/flip, dlq retry/purge/move, queue drain/pause, batch-ops submit, cron remove) and all other writes classify as mutating; status/list/`--check` variants as read-only | ✓ |  | #437 |
+| CTX5 | Target echo redaction: userinfo password and `password=` query param stripped; unparseable URLs never echoed | ✓ |  | #437 |
+| CTX6 | Production gate: `production = true` + mutation prompts y/N; `--yes` skips; non-interactive stdin without `--yes` refuses | ✓ |  | #437 |
+| CTX7 | Plaintext-password `url` in a non-0600 config file warns (secret not echoed); `url_env` indirection never warns | ✓ |  | #437 |
 
 ### Observability
 

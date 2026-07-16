@@ -13,6 +13,10 @@ import {
   type RuntimeOverview,
   type StorageStatusReport,
 } from "@/lib/api";
+import {
+  applyInstanceIdentity,
+  normalizeInstanceColor,
+} from "@/lib/instance";
 import { Button } from "@/components/ui/button";
 import {
   Sidebar,
@@ -367,6 +371,19 @@ export function Shell() {
   });
   const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
 
+  // Instance identity (#437): the UI is single-backend by design; when the
+  // operator names this instance we label the header, tab title, and
+  // favicon so multiple open instances are distinguishable.
+  const instanceName = capabilitiesQuery.data?.instance_name ?? null;
+  const instanceColor = normalizeInstanceColor(
+    capabilitiesQuery.data?.instance_color ?? null
+  );
+  const peers = capabilitiesQuery.data?.peers ?? [];
+  useEffect(() => {
+    if (!capabilitiesQuery.isSuccess) return;
+    applyInstanceIdentity(instanceName, instanceColor);
+  }, [capabilitiesQuery.isSuccess, instanceName, instanceColor]);
+
   // Cluster status for the sidebar footer; poll-aligned with other pages.
   const runtimeQuery = useQuery({
     queryKey: ["runtime"],
@@ -445,6 +462,39 @@ export function Shell() {
       <SidebarInset>
         <header className="sticky top-0 z-10 flex items-center gap-2 border-b bg-bg/70 px-4 py-2.5 backdrop-blur sm:px-6">
           <SidebarTrigger className="-ml-1" />
+          {instanceName && (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium text-fg"
+              style={instanceColor ? { borderColor: instanceColor } : undefined}
+              title="Awa instance"
+            >
+              <span
+                className="size-2 rounded-full bg-primary"
+                style={
+                  instanceColor ? { backgroundColor: instanceColor } : undefined
+                }
+              />
+              {instanceName}
+            </span>
+          )}
+          {peers.length > 0 && (
+            <nav
+              aria-label="Peer Awa instances"
+              className="hidden items-center gap-2 text-xs text-muted-fg sm:flex"
+            >
+              {/* Plain full-page links to other origins — deliberately not
+                  client-side routing; each peer is a separate backend. */}
+              {peers.map((peer) => (
+                <a
+                  key={peer.name}
+                  href={peer.url}
+                  className="underline-offset-2 hover:text-fg hover:underline"
+                >
+                  {peer.name} ↗
+                </a>
+              ))}
+            </nav>
+          )}
           <div className="flex-1" />
           <div className="flex items-center gap-1">
             <RefreshControl />

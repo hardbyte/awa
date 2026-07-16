@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
+mod context;
 mod health;
 mod storage_wait;
 
@@ -14,9 +15,21 @@ mod storage_wait;
     about = "Awa — Postgres-native background job queue"
 )]
 struct Cli {
-    /// Database URL (not required for migrate --sql without --pending)
-    #[arg(long, env = "DATABASE_URL")]
+    /// Database URL (not required for migrate --sql without --pending).
+    ///
+    /// Resolution order: --database-url > --context/AWA_CONTEXT >
+    /// DATABASE_URL env > default_context from ~/.config/awa/config.toml.
+    #[arg(long)]
     database_url: Option<String>,
+
+    /// Named context from ~/.config/awa/config.toml (see `awa context list`)
+    #[arg(long, global = true, env = "AWA_CONTEXT")]
+    context: Option<String>,
+
+    /// Skip the interactive confirmation for contexts marked
+    /// `production = true` (for automation)
+    #[arg(long, global = true)]
+    yes: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -121,11 +134,35 @@ enum Commands {
         /// instances, or public UI sessions against a writable DB.
         #[arg(long, env = "AWA_READ_ONLY")]
         read_only: bool,
+        /// Human-readable name identifying this instance/database.
+        ///
+        /// The UI is single-backend by design — run one `awa serve` per
+        /// database. This name is exposed via `/api/capabilities` and
+        /// rendered in the header, browser tab title, and favicon so
+        /// operators with several instances open can tell them apart.
+        #[arg(long, env = "AWA_INSTANCE_NAME")]
+        instance_name: Option<String>,
+        /// Accent color for this instance as a CSS hex value
+        /// (e.g. '#0ea5e9'). Tints the UI header badge and favicon.
+        #[arg(long, env = "AWA_INSTANCE_COLOR")]
+        instance_color: Option<String>,
+        /// Link to a peer Awa UI, as NAME=URL (repeatable).
+        ///
+        /// Rendered as plain links in the UI header — a zero-data-plane
+        /// "switcher" between per-database instances. Example:
+        /// `--peer alloydb=https://awa-alloydb.internal`.
+        #[arg(long = "peer", value_name = "NAME=URL")]
+        peer: Vec<String>,
     },
     /// Callback receiver subcommands
     Callbacks {
         #[command(subcommand)]
         command: CallbackCommands,
+    },
+    /// Inspect named contexts from ~/.config/awa/config.toml
+    Context {
+        #[command(subcommand)]
+        command: ContextCommands,
     },
     /// Cluster readiness probe: database reachable, schema migrated, fleet heartbeats
     Health {
@@ -185,6 +222,257 @@ enum CallbackCommands {
         #[arg(long, env = "AWA_CALLBACK_ALLOW_UNSIGNED")]
         allow_unsigned: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ContextCommands {
+    /// List contexts defined in the awa config file
+    List,
+    /// Show one context in detail (defaults to default_context)
+    Show { name: Option<String> },
+}
+
+/// Classify a command as read-only or mutating for context resolution.
+///
+/// Read-only commands may fall back to `DATABASE_URL` or `default_context`;
+/// mutating commands require an explicit `--context` or `--database-url`
+/// once more than one context is defined, and are confirmation-gated on
+/// contexts marked `production = true`.
+fn access_for(command: &Commands) -> context::Access {
+    use context::Access::{Mutating, ReadOnly};
+    match command {
+        // `migrate` only mutates when it applies; --sql / --extract-to
+        // render SQL (the --pending probe is a read).
+        Commands::Migrate {
+            sql, extract_to, ..
+        } => {
+            if *sql || extract_to.is_some() {
+                ReadOnly
+            } else {
+                Mutating
+            }
+        }
+        // Long-running servers; the UI has its own read-only enforcement.
+        Commands::Serve { .. } | Commands::Callbacks { .. } => ReadOnly,
+        Commands::Health { .. } | Commands::Context { .. } => ReadOnly,
+        Commands::Job { command } => match command {
+            JobCommands::Dump { .. } | JobCommands::DumpRun { .. } | JobCommands::List { .. } => {
+                ReadOnly
+            }
+            JobCommands::Retry { .. }
+            | JobCommands::Cancel { .. }
+            | JobCommands::RetryFailed(_)
+            | JobCommands::Discard { .. } => Mutating,
+        },
+        Commands::Queue { command } => match command {
+            QueueCommands::Stats => ReadOnly,
+            QueueCommands::Overrides {
+                command: OverrideCommands::Show { .. },
+            } => ReadOnly,
+            QueueCommands::Pause { .. }
+            | QueueCommands::Resume { .. }
+            | QueueCommands::Drain { .. }
+            | QueueCommands::Overrides { .. } => Mutating,
+        },
+        Commands::Cron { command } => match command {
+            CronCommands::List => ReadOnly,
+            CronCommands::Remove { .. } => Mutating,
+        },
+        Commands::Storage { command } => match command {
+            StorageCommands::Status => ReadOnly,
+            StorageCommands::Finalize { check: true, .. } => ReadOnly,
+            StorageCommands::FlipRingAuthority { check: true, .. } => ReadOnly,
+            StorageCommands::Prepare { .. }
+            | StorageCommands::PrepareQueueStorageSchema { .. }
+            | StorageCommands::Abort
+            | StorageCommands::EnterMixedTransition
+            | StorageCommands::Finalize { .. }
+            | StorageCommands::RebuildTerminalCounters
+            | StorageCommands::FlipRingAuthority { .. } => Mutating,
+        },
+        Commands::Dlq { command } => match command {
+            DlqCommands::List { .. } | DlqCommands::Depth { .. } => ReadOnly,
+            DlqCommands::Retry { .. }
+            | DlqCommands::RetryBulk { .. }
+            | DlqCommands::Move { .. }
+            | DlqCommands::Purge { .. } => Mutating,
+        },
+        Commands::BatchOps { command } => match command {
+            BatchOpsCommands::List { .. }
+            | BatchOpsCommands::Get { .. }
+            | BatchOpsCommands::Preview { .. } => ReadOnly,
+            BatchOpsCommands::Submit { .. }
+            | BatchOpsCommands::Cancel { .. }
+            | BatchOpsCommands::Purge { .. } => Mutating,
+        },
+    }
+}
+
+/// Interactive y/N gate for mutating commands against a `production = true`
+/// context. `--yes` skips it; a non-interactive stdin without `--yes`
+/// refuses rather than hanging (or silently proceeding) in automation.
+fn confirm_production(
+    target: &context::ResolvedTarget,
+    assume_yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    if assume_yes {
+        return Ok(());
+    }
+    let name = target.context.as_deref().unwrap_or("<unnamed>");
+    if !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "context '{name}' is marked production = true and this command mutates the \
+             database; re-run with --yes to proceed non-interactively"
+        )
+        .into());
+    }
+    eprint!("context '{name}' is marked production = true — proceed? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    let answer = answer.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        Ok(())
+    } else {
+        Err(format!("aborted: not confirmed for production context '{name}'").into())
+    }
+}
+
+/// Validate an instance accent color: '#' followed by 3, 4, 6, or 8 hex
+/// digits. Rejecting anything else keeps arbitrary strings out of the UI's
+/// inline styles.
+fn parse_instance_color(color: &str) -> Result<String, String> {
+    let trimmed = color.trim();
+    let hex = trimmed.strip_prefix('#').ok_or_else(|| {
+        format!("instance color must be a hex value like '#0ea5e9', got {trimmed:?}")
+    })?;
+    let valid_len = matches!(hex.len(), 3 | 4 | 6 | 8);
+    if !valid_len || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "instance color must be '#' followed by 3, 4, 6, or 8 hex digits, got {trimmed:?}"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Parse a `--peer NAME=URL` spec into a link rendered by the UI header.
+fn parse_peer_spec(spec: &str) -> Result<awa_ui::state::PeerLink, String> {
+    let (name, url) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--peer expects NAME=URL, got {spec:?}"))?;
+    let name = name.trim();
+    let url = url.trim();
+    if name.is_empty() {
+        return Err(format!("--peer name must not be empty in {spec:?}"));
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!(
+            "--peer URL must start with http:// or https://, got {url:?}"
+        ));
+    }
+    Ok(awa_ui::state::PeerLink {
+        name: name.to_string(),
+        url: url.to_string(),
+    })
+}
+
+/// `awa context list|show` — config inspection, no database involved.
+fn run_context_command(command: &ContextCommands) -> Result<(), Box<dyn std::error::Error>> {
+    let loaded = context::load_from_default_path()?;
+    let Some(loaded) = loaded else {
+        let path = context::default_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.config/awa/config.toml".to_string());
+        println!("No awa config file found at {path}.");
+        println!("Define [contexts.<name>] tables there to name your databases — see docs/configuration.md.");
+        return Ok(());
+    };
+    if let Some(warning) = &loaded.warning {
+        eprintln!("{warning}");
+    }
+    let config = &loaded.config;
+
+    // Resolved, password-stripped display target for one context.
+    let display_target = |entry: &context::ContextEntry| -> String {
+        if let Some(url) = &entry.url {
+            return context::redact_url(url);
+        }
+        let var = entry.url_env.as_deref().unwrap_or_default();
+        match std::env::var(var) {
+            Ok(url) => context::redact_url(&url),
+            Err(_) => format!("(env {var} unset)"),
+        }
+    };
+
+    match command {
+        ContextCommands::List => {
+            println!("# {}", loaded.path.display());
+            if config.contexts.is_empty() {
+                println!("No contexts defined.");
+                return Ok(());
+            }
+            println!(
+                "{:<2} {:<20} {:<11} {:<28} TARGET",
+                "", "NAME", "PRODUCTION", "SOURCE"
+            );
+            for (name, entry) in &config.contexts {
+                let default_marker = if config.default_context.as_deref() == Some(name) {
+                    "*"
+                } else {
+                    ""
+                };
+                let source = entry
+                    .url_env
+                    .as_deref()
+                    .map(|var| format!("env {var}"))
+                    .unwrap_or_else(|| "url (in config file)".to_string());
+                println!(
+                    "{:<2} {:<20} {:<11} {:<28} {}",
+                    default_marker,
+                    name,
+                    if entry.production { "yes" } else { "no" },
+                    source,
+                    display_target(entry),
+                );
+            }
+            println!("\n* = default_context (honored by read-only commands only)");
+        }
+        ContextCommands::Show { name } => {
+            let name = name
+                .as_deref()
+                .or(config.default_context.as_deref())
+                .ok_or("no context name given and no default_context is set")?;
+            let entry = config.contexts.get(name).ok_or_else(|| {
+                format!("unknown context '{name}' — run `awa context list` to see defined contexts")
+            })?;
+            println!("name:        {name}");
+            println!(
+                "default:     {}",
+                if config.default_context.as_deref() == Some(name) {
+                    "yes (read-only commands only)"
+                } else {
+                    "no"
+                }
+            );
+            println!(
+                "production:  {}",
+                if entry.production {
+                    "yes (mutations require confirmation or --yes)"
+                } else {
+                    "no"
+                }
+            );
+            match &entry.url_env {
+                Some(var) => println!("source:      env {var}"),
+                None => println!("source:      url (in config file)"),
+            }
+            println!("target:      {}", display_target(entry));
+            println!("config:      {}", loaded.path.display());
+        }
+    }
+    Ok(())
 }
 
 fn parse_callback_hmac_secret(secret: &str) -> Result<[u8; 32], String> {
@@ -558,12 +846,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // Build the pool lazily — some commands (migrate --sql) don't need a DB.
-    let require_pool = |url: &Option<String>| -> Result<String, Box<dyn std::error::Error>> {
-        url.clone().ok_or_else(|| {
-            "DATABASE_URL is required for this command. Set --database-url or DATABASE_URL env var."
-                .into()
-        })
+    // `awa context ...` inspects the config file only — no database.
+    if let Commands::Context { command } = &cli.command {
+        return run_context_command(command);
+    }
+
+    let loaded_config = context::load_from_default_path()?;
+    if let Some(warning) = loaded_config.as_ref().and_then(|l| l.warning.as_deref()) {
+        eprintln!("{warning}");
+    }
+    let access = access_for(&cli.command);
+
+    // Resolve the database target lazily — some commands (migrate --sql)
+    // don't need a DB. Resolution order: --database-url > --context/
+    // AWA_CONTEXT > DATABASE_URL env > default_context, with the read/write
+    // asymmetry and production gate enforced in `context` (#437). The
+    // password-stripped target is echoed to stderr before acting. Memoized
+    // so commands that connect twice (migrate --pending) echo and confirm
+    // once.
+    let resolved_db: std::cell::OnceCell<String> = std::cell::OnceCell::new();
+    let resolve_db = || -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(url) = resolved_db.get() {
+            return Ok(url.clone());
+        }
+        let env_database_url = std::env::var("DATABASE_URL").ok();
+        let target = context::resolve_target(
+            cli.database_url.as_deref(),
+            cli.context.as_deref(),
+            env_database_url.as_deref(),
+            loaded_config.as_ref().map(|l| &l.config),
+            access,
+            |var| std::env::var(var).ok(),
+        )?;
+        eprintln!("{}", target.describe());
+        if access == context::Access::Mutating && target.production {
+            confirm_production(&target, cli.yes)?;
+        }
+        Ok(resolved_db.get_or_init(|| target.url).clone())
     };
 
     match cli.command {
@@ -586,7 +905,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (v - 1, v)
             } else if pending {
-                let db_url = require_pool(&cli.database_url)?;
+                let db_url = resolve_db()?;
                 let pool = PgPoolOptions::new()
                     .max_connections(2)
                     .connect(&db_url)
@@ -643,7 +962,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Default: apply migrations to DB (sequential DDL). The plan
                 // line and per-migration timing are emitted as tracing `info!`
                 // events from `apply_migrations` (see the subscriber init).
-                let db_url = require_pool(&cli.database_url)?;
+                let db_url = resolve_db()?;
                 let pool = PgPoolOptions::new()
                     .max_connections(1)
                     .connect(&db_url)
@@ -668,8 +987,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cache_ttl,
             callback_hmac_secret,
             read_only,
+            instance_name,
+            instance_color,
+            peer,
         } => {
-            let db_url = require_pool(&cli.database_url)?;
+            // Validate identity flags before touching the database so a
+            // typo'd color or peer spec fails fast.
+            let instance = awa_ui::state::InstanceIdentity {
+                name: instance_name
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty()),
+                color: instance_color
+                    .as_deref()
+                    .map(parse_instance_color)
+                    .transpose()?,
+                peers: peer
+                    .iter()
+                    .map(|spec| parse_peer_spec(spec))
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            let db_url = resolve_db()?;
             let pool = PgPoolOptions::new()
                 .max_connections(pool_max)
                 .min_connections(pool_min)
@@ -690,9 +1027,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 awa_ui::state::ReadOnlyMode::Auto
             };
-            let app =
-                awa_ui::router_with(pool, cache_duration, callback_hmac_secret, read_only_mode)
-                    .await?;
+            let app = awa_ui::router_with_identity(
+                pool,
+                cache_duration,
+                callback_hmac_secret,
+                read_only_mode,
+                instance,
+            )
+            .await?;
             let addr = format!("{host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             if read_only {
@@ -739,7 +1081,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let db_url = require_pool(&cli.database_url)?;
+            let db_url = resolve_db()?;
             let pool = PgPoolOptions::new()
                 .max_connections(pool_max)
                 .min_connections(pool_min)
@@ -767,7 +1109,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             json,
             connect_timeout,
         } => {
-            let db_url = require_pool(&cli.database_url)?;
+            let db_url = resolve_db()?;
             let pool_result = PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(Duration::from_secs(connect_timeout))
@@ -798,7 +1140,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Allow up to 4 connections so the lock connection and the DDL
         // executor coexist.
         command => {
-            let db_url = require_pool(&cli.database_url)?;
+            let db_url = resolve_db()?;
             let pool = PgPoolOptions::new()
                 .max_connections(4)
                 .connect(&db_url)
@@ -808,7 +1150,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Commands::Migrate { .. }
                 | Commands::Serve { .. }
                 | Commands::Callbacks { .. }
-                | Commands::Health { .. } => {
+                | Commands::Health { .. }
+                | Commands::Context { .. } => {
                     unreachable!()
                 }
 
@@ -1497,6 +1840,160 @@ mod tests {
             ])
             .is_err(),
             "retry-failed must reject ambiguous filters"
+        );
+    }
+
+    #[test]
+    fn serve_accepts_instance_identity_flags() {
+        let cli = Cli::try_parse_from([
+            "awa",
+            "serve",
+            "--instance-name",
+            "cloudsql-prod",
+            "--instance-color",
+            "#0ea5e9",
+            "--peer",
+            "alloydb=https://awa-alloydb.internal",
+            "--peer",
+            "staging=http://localhost:3001",
+        ])
+        .expect("serve should accept identity flags");
+        match cli.command {
+            Commands::Serve {
+                instance_name,
+                instance_color,
+                peer,
+                ..
+            } => {
+                assert_eq!(instance_name.as_deref(), Some("cloudsql-prod"));
+                assert_eq!(instance_color.as_deref(), Some("#0ea5e9"));
+                assert_eq!(peer.len(), 2);
+            }
+            _ => panic!("expected serve"),
+        }
+    }
+
+    #[test]
+    fn context_flag_is_global_and_yes_is_global() {
+        let cli = Cli::try_parse_from([
+            "awa",
+            "queue",
+            "drain",
+            "default",
+            "--context",
+            "alloydb",
+            "--yes",
+        ])
+        .expect("--context/--yes should parse after the subcommand");
+        assert_eq!(cli.context.as_deref(), Some("alloydb"));
+        assert!(cli.yes);
+    }
+
+    #[test]
+    fn instance_color_validation() {
+        assert_eq!(parse_instance_color("#0ea5e9").unwrap(), "#0ea5e9");
+        assert_eq!(parse_instance_color(" #abc ").unwrap(), "#abc");
+        assert!(
+            parse_instance_color("#abcde").is_err(),
+            "5 hex digits invalid"
+        );
+        assert!(
+            parse_instance_color("red").is_err(),
+            "named colors rejected"
+        );
+        assert!(
+            parse_instance_color("#0ea5e9;background:url(x)").is_err(),
+            "style injection rejected"
+        );
+    }
+
+    #[test]
+    fn peer_spec_parsing() {
+        let peer = parse_peer_spec("alloydb=https://awa-alloydb.internal").unwrap();
+        assert_eq!(peer.name, "alloydb");
+        assert_eq!(peer.url, "https://awa-alloydb.internal");
+        assert!(parse_peer_spec("no-equals").is_err());
+        assert!(
+            parse_peer_spec("=https://x").is_err(),
+            "empty name rejected"
+        );
+        assert!(
+            parse_peer_spec("x=javascript:alert(1)").is_err(),
+            "non-http scheme rejected"
+        );
+    }
+
+    #[test]
+    fn access_classification_matches_the_safety_matrix() {
+        use context::Access::{Mutating, ReadOnly};
+
+        let access = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["awa"], args].concat())
+                .unwrap_or_else(|e| panic!("args {args:?} should parse: {e}"));
+            access_for(&cli.command)
+        };
+
+        // Read-only surface honors default_context / DATABASE_URL.
+        assert_eq!(access(&["job", "list"]), ReadOnly);
+        assert_eq!(access(&["queue", "stats"]), ReadOnly);
+        assert_eq!(access(&["dlq", "depth"]), ReadOnly);
+        assert_eq!(access(&["health"]), ReadOnly);
+        assert_eq!(access(&["storage", "status"]), ReadOnly);
+        assert_eq!(access(&["storage", "finalize", "--check"]), ReadOnly);
+        assert_eq!(
+            access(&["storage", "flip-ring-authority", "--check"]),
+            ReadOnly
+        );
+        assert_eq!(access(&["migrate", "--sql"]), ReadOnly);
+        assert_eq!(
+            access(&[
+                "batch-ops",
+                "preview",
+                "--op-kind",
+                "set_priority",
+                "--spec",
+                "{}"
+            ]),
+            ReadOnly
+        );
+        assert_eq!(access(&["queue", "overrides", "show", "q"]), ReadOnly);
+
+        // The issue's destructive set is all mutating.
+        assert_eq!(access(&["migrate"]), Mutating);
+        assert_eq!(access(&["migrate", "--pending"]), Mutating);
+        assert_eq!(access(&["storage", "enter-mixed-transition"]), Mutating);
+        assert_eq!(access(&["storage", "finalize"]), Mutating);
+        assert_eq!(access(&["storage", "flip-ring-authority"]), Mutating);
+        assert_eq!(access(&["dlq", "retry", "1"]), Mutating);
+        assert_eq!(access(&["dlq", "purge", "--all"]), Mutating);
+        assert_eq!(access(&["dlq", "move", "--all"]), Mutating);
+        assert_eq!(access(&["queue", "drain", "q"]), Mutating);
+        assert_eq!(access(&["queue", "pause", "q"]), Mutating);
+        assert_eq!(
+            access(&[
+                "batch-ops",
+                "submit",
+                "--op-kind",
+                "set_priority",
+                "--spec",
+                "{}",
+                "--all"
+            ]),
+            Mutating
+        );
+        assert_eq!(access(&["cron", "remove", "nightly"]), Mutating);
+
+        // Other write commands are held to the same rules.
+        assert_eq!(access(&["job", "retry", "1"]), Mutating);
+        assert_eq!(access(&["job", "cancel", "1"]), Mutating);
+        assert_eq!(access(&["queue", "overrides", "clear", "q"]), Mutating);
+        assert_eq!(
+            access(&[
+                "batch-ops",
+                "cancel",
+                "00000000-0000-0000-0000-000000000000"
+            ]),
+            Mutating
         );
     }
 }
