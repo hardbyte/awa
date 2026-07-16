@@ -90,11 +90,18 @@ First roll 0.6.2 across the fleet as a normal patch release. After that, both
 orders are supported:
 
 1. **Roll binaries, then migrate**, or **migrate, then roll binaries** — either way the
-   fleet runs mixed 0.6.2/0.7 against one database. In
+   fleet runs mixed 0.6.2/0.7 against one database once v043 is applied. In
    compat mode a 0.6.2 rotator and a 0.7 rotator serialize on the same
    `{ring}_ring_state` row lock, so the cursor stays correct. A 0.6.2 restart also
    recognizes v043 while authority remains `columns`; it refuses rather than mutating the
    schema once authority is `ledger`.
+
+   If you roll binaries first, a 0.7 worker **refuses to start** on the
+   pre-migration v040 schema — it fails closed at startup naming `awa migrate`
+   as the fix, and completes no work. Under a rolling deployment the new pods
+   crash-loop harmlessly while the remaining 0.6.2 workers keep draining
+   traffic, and come up unaided the moment the migration commits. Plan
+   capacity for that window, or migrate first to avoid it.
 2. Once **every** worker is on 0.7, promote to ledger authority to unlock the full #371
    dead-tuple benefits — either:
    - manually: `awa storage flip-ring-authority` (add `--schema <name>` for a custom

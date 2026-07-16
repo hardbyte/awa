@@ -6,9 +6,12 @@
 
 use async_trait::async_trait;
 use awa::model::{
-    insert_with, migrations, storage, InsertOpts, JobState, QueueStorage, QueueStorageConfig,
+    admin,
+    cron::{trigger_cron_job, upsert_cron_job, PeriodicJob},
+    dlq, insert_with, migrations, storage, InsertOpts, JobState, QueueStorage, QueueStorageConfig,
 };
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashSet;
@@ -71,6 +74,71 @@ async fn reset_database(pool: &sqlx::PgPool) {
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct SimpleChaosJob {
     seq: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct UpgradeWorkloadJob {
+    seq: i64,
+    mode: String,
+}
+
+/// Runs every designed workload outcome. Each mode maps to exactly one
+/// expected terminal `(state, attempt)` pair, asserted at reconciliation.
+#[derive(Clone, Default)]
+struct WorkloadWorker {
+    snoozed: Arc<Mutex<HashSet<i64>>>,
+}
+
+#[async_trait]
+impl Worker for WorkloadWorker {
+    fn kind(&self) -> &'static str {
+        "upgrade_workload_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: UpgradeWorkloadJob = serde_json::from_value(ctx.job.args.clone())
+            .map_err(|err| JobError::terminal(format!("failed to decode workload args: {err}")))?;
+        match args.mode.as_str() {
+            "complete" => Ok(JobResult::Completed),
+            "retry_once" => {
+                if ctx.job.attempt == 1 {
+                    Ok(JobResult::RetryAfter(Duration::from_millis(100)))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            "fail_terminal" => Err(JobError::terminal("designed terminal failure")),
+            // Exhaustion must use the error path: `max_attempts` bounds
+            // handler failures, and only failures move a job to the DLQ.
+            "exhaust_retries" => Err(JobError::retryable_msg("designed retryable failure")),
+            "snooze_once" => {
+                if self.snoozed.lock().unwrap().insert(args.seq) {
+                    Ok(JobResult::Snooze(Duration::from_millis(100)))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            "cancel_self" => Ok(JobResult::Cancel("designed handler cancellation".into())),
+            "callback_then_complete" => {
+                if ctx.job.attempt == 1 {
+                    let callback = ctx
+                        .register_callback(Duration::from_millis(150))
+                        .await
+                        .map_err(JobError::retryable)?;
+                    Ok(JobResult::WaitForCallback(callback))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            "multi_second" => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(JobResult::Completed)
+            }
+            other => Err(JobError::terminal(format!(
+                "unknown workload mode: {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -315,6 +383,10 @@ fn current_client_with_heartbeat_rescue(
         .promote_interval(Duration::from_millis(50))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
+        // Both fleets heartbeat their claims every 50ms, so 500ms of silence
+        // means a dead worker; a hard-killed released worker's in-flight job
+        // must be rescued well inside the drain windows below.
+        .heartbeat_staleness(Duration::from_millis(500))
         .heartbeat_rescue_interval(heartbeat_rescue_interval)
         .deadline_rescue_interval(Duration::from_millis(100))
         .register_worker(RecordingWorker {
@@ -323,6 +395,171 @@ fn current_client_with_heartbeat_rescue(
         })
         .build()
         .expect("build current worker")
+}
+
+/// A current-build runtime serving the shared simple queue alongside the
+/// full designed-outcome workload queue.
+fn workload_client(
+    pool: sqlx::PgPool,
+    simple_queue: &str,
+    workload_queue: &str,
+    simple_completed: Arc<Mutex<HashSet<i64>>>,
+) -> Client {
+    Client::builder(pool)
+        .queue(
+            simple_queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(20),
+                ..QueueConfig::default()
+            },
+        )
+        .queue(
+            workload_queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(20),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: "awa".to_string(),
+                ..Default::default()
+            },
+            // Rotation must not fire inside this cell: reconciliation loads
+            // every job's terminal row back from hot storage at the end, and
+            // ring rotation prunes aged done-partitions. The other cells keep
+            // the aggressive one-second cadence, so rotation churn during the
+            // upgrade window stays covered there.
+            Duration::from_secs(600),
+            Duration::from_millis(50),
+        )
+        .heartbeat_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(100))
+        .heartbeat_staleness(Duration::from_millis(500))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(100))
+        .register_worker(RecordingWorker {
+            completed: simple_completed,
+            delay: Duration::from_millis(80),
+        })
+        .register_worker(WorkloadWorker::default())
+        .build()
+        .expect("build workload worker")
+}
+
+/// One designed workload job and the exact terminal outcome it must reach.
+struct WorkloadExpectation {
+    id: i64,
+    mode: &'static str,
+    state: JobState,
+    /// Expected terminal attempt; `None` where the design never claims the
+    /// job (admin-cancelled parked work).
+    attempt: Option<i64>,
+}
+
+/// Insert one batch of every designed workload outcome and record each job's
+/// expected terminal `(state, attempt)`. Returns the ids of the parked jobs
+/// the caller must admin-cancel.
+async fn bank_workload_batch(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    seq_base: i64,
+    expectations: &mut Vec<WorkloadExpectation>,
+) -> Vec<i64> {
+    // (insertion label, handler mode, count, expected state, expected attempt)
+    let plan: &[(&'static str, &'static str, i64, JobState, Option<i64>)] = &[
+        ("complete", "complete", 3, JobState::Completed, Some(1)),
+        ("retry_once", "retry_once", 3, JobState::Completed, Some(2)),
+        (
+            "fail_terminal",
+            "fail_terminal",
+            3,
+            JobState::Failed,
+            Some(1),
+        ),
+        (
+            "exhaust_retries",
+            "exhaust_retries",
+            3,
+            JobState::Failed,
+            Some(2),
+        ),
+        (
+            "snooze_once",
+            "snooze_once",
+            3,
+            JobState::Completed,
+            Some(1),
+        ),
+        (
+            "cancel_self",
+            "cancel_self",
+            3,
+            JobState::Cancelled,
+            Some(1),
+        ),
+        (
+            "callback_then_complete",
+            "callback_then_complete",
+            3,
+            JobState::Completed,
+            Some(2),
+        ),
+        (
+            "multi_second",
+            "multi_second",
+            2,
+            JobState::Completed,
+            Some(1),
+        ),
+        ("scheduled", "complete", 3, JobState::Completed, Some(1)),
+        ("parked", "complete", 3, JobState::Cancelled, None),
+        ("deadline", "complete", 3, JobState::Completed, Some(1)),
+    ];
+
+    let mut parked_ids = Vec::new();
+    let mut seq = seq_base;
+    for &(label, handler_mode, count, state, attempt) in plan {
+        for _ in 0..count {
+            seq += 1;
+            let mut opts = InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            };
+            match label {
+                "exhaust_retries" => opts.max_attempts = 2,
+                "scheduled" => opts.run_at = Some(Utc::now() + chrono::Duration::seconds(3)),
+                "parked" => opts.run_at = Some(Utc::now() + chrono::Duration::hours(1)),
+                "deadline" => opts.deadline_duration = Some(chrono::Duration::seconds(10)),
+                _ => {}
+            }
+            let inserted = insert_with(
+                pool,
+                &UpgradeWorkloadJob {
+                    seq,
+                    mode: handler_mode.to_string(),
+                },
+                opts,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("insert workload job {label}: {error}"));
+            if label == "parked" {
+                parked_ids.push(inserted.id);
+            }
+            expectations.push(WorkloadExpectation {
+                id: inserted.id,
+                mode: label,
+                state,
+                attempt,
+            });
+        }
+    }
+    parked_ids
 }
 
 struct Producer {
@@ -438,11 +675,14 @@ async fn wait_for_mixed_fleet(
     old: &ReleasedWorker,
     old_before_migration: usize,
     current: &Arc<Mutex<HashSet<i64>>>,
+    current_before_migration: usize,
     timeout: Duration,
 ) {
     let start = Instant::now();
     loop {
-        if old.completed().len() > old_before_migration && !current.lock().unwrap().is_empty() {
+        if old.completed().len() > old_before_migration
+            && current.lock().unwrap().len() > current_before_migration
+        {
             return;
         }
         assert!(
@@ -451,6 +691,20 @@ async fn wait_for_mixed_fleet(
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Flip ring authority once every pre-flip (NULL `binary_version`) heartbeat
+/// is stale, while stamped current heartbeats may remain fresh. Mirrors the
+/// operator flow the migrate-first cell proved: refusal is asserted there;
+/// these cells assert a live stamped fleet does not block the flip.
+async fn flip_after_released_heartbeats_stale(pool: &sqlx::PgPool) {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let flipped: String = sqlx::query_scalar("SELECT awa.flip_ring_authority($1, FALSE, 0.5)")
+        .bind("awa")
+        .fetch_one(pool)
+        .await
+        .expect("flip after released heartbeats become stale");
+    assert_eq!(flipped, "ledger");
 }
 
 async fn wait_for_drain(
@@ -518,6 +772,7 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
         &old_worker,
         old_before_migration,
         &current_completed,
+        0,
         Duration::from_secs(30),
     )
     .await;
@@ -736,5 +991,484 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     assert!(
         !old_worker.completed().contains(&seq),
         "released worker must not report a competing completion"
+    );
+}
+
+/// Binary-first upgrade order: the current binary is deployed before
+/// v041-v043 apply. The current runtime requires relations those migrations
+/// add, so on the released artifact's v040 schema it must refuse startup
+/// loudly — naming pending migrations, not silently degrading — while the
+/// released fleet keeps draining traffic. The roll completes only after the
+/// migration lands; the released worker is then hard-killed (SIGKILL)
+/// mid-traffic, and the current fleet must rescue its in-flight work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a released awa-pg 0.6.3 environment"]
+async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
+    let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let pool = pool().await;
+    reset_database(&pool).await;
+    let queue = format!("upgrade_binary_first_{}", Uuid::new_v4().simple());
+
+    // The released artifact owns the install, proving the starting schema is
+    // the real N-1 artifact's v040 shape, and banks a completion baseline.
+    let mut old_worker = spawn_released_worker(&queue).await;
+    assert_eq!(schema_version(&pool).await, 40);
+
+    let producer = start_producer(pool.clone(), queue.clone());
+    wait_for_accepted(&producer, 25, Duration::from_secs(20)).await;
+
+    // A current runtime deployed before the migration must fail closed with
+    // operator guidance, not claim work against relations that don't exist.
+    let refused_completions = Arc::new(Mutex::new(HashSet::new()));
+    let refused = current_client(pool.clone(), &queue, refused_completions.clone());
+    let refusal = refused
+        .start()
+        .await
+        .expect_err("current runtime must refuse to start on a v040 schema");
+    let refusal_message = refusal.to_string();
+    assert!(
+        refusal_message.contains("awa migrate"),
+        "startup refusal must direct the operator to pending migrations: {refusal_message}"
+    );
+    assert!(
+        refused_completions.lock().unwrap().is_empty(),
+        "a refused runtime must not complete any work"
+    );
+
+    // The released fleet alone must keep draining traffic while the current
+    // deployment is refused.
+    let old_during_refusal = old_worker.completed().len();
+    let refusal_window = Instant::now();
+    loop {
+        if old_worker.completed().len() > old_during_refusal + 10 {
+            break;
+        }
+        assert!(
+            refusal_window.elapsed() < Duration::from_secs(30),
+            "released fleet must keep completing while the current deployment is refused"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let old_before_migration = old_worker.completed().len();
+    migrations::run(&pool)
+        .await
+        .expect("migration must apply with the released fleet live");
+    assert_eq!(schema_version(&pool).await, 43);
+    let authority: String =
+        sqlx::query_scalar("SELECT authority FROM awa.ring_cursor_authority WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("read ring authority");
+    assert_eq!(authority, "columns");
+
+    // The roll now completes: the same binary that was refused on v040 must
+    // start unaided and join the released fleet.
+    let current_completed = Arc::new(Mutex::new(HashSet::new()));
+    let current = current_client(pool.clone(), &queue, current_completed.clone());
+    current
+        .start()
+        .await
+        .expect("current worker must start once the migration has applied");
+    wait_for_mixed_fleet(
+        &old_worker,
+        old_before_migration,
+        &current_completed,
+        0,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Retire the released fleet the adversarial way: SIGKILL mid-traffic.
+    // Any in-flight released claim must be rescued by the current fleet for
+    // the exact drain below to hold.
+    old_worker.shutdown().await;
+
+    let accepted = producer.stop().await;
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: "awa".to_string(),
+        ..Default::default()
+    })
+    .expect("queue storage");
+    wait_for_drain(
+        &store,
+        &pool,
+        &queue,
+        accepted.len(),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Flip while the stamped current fleet stays live: only fresh NULL
+    // binary_version heartbeats (pre-flip binaries) may block the flip.
+    flip_after_released_heartbeats_stale(&pool).await;
+
+    assert_released_worker_is_fenced(&queue).await;
+
+    // The same current runtime keeps operating across the flip, with no
+    // restart, and drains post-flip traffic in ledger authority.
+    let mut all_accepted = accepted;
+    let first_post_flip = all_accepted.iter().max().copied().unwrap_or(0) + 1;
+    for seq in first_post_flip..first_post_flip + 20 {
+        insert_with(
+            &pool,
+            &SimpleChaosJob { seq },
+            InsertOpts {
+                queue: queue.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("post-flip insert");
+        all_accepted.insert(seq);
+    }
+    wait_for_drain(
+        &store,
+        &pool,
+        &queue,
+        all_accepted.len(),
+        Duration::from_secs(60),
+    )
+    .await;
+    current.shutdown(Duration::from_secs(5)).await;
+
+    let mut observed = old_worker.completed();
+    observed.extend(current_completed.lock().unwrap().iter().copied());
+    assert_eq!(
+        observed, all_accepted,
+        "accepted and observed job sets differ"
+    );
+}
+
+/// Migrate-first upgrade under the full designed-outcome workload: a backlog
+/// banked on the released artifact's v040 schema covers normal completions,
+/// controlled retries, terminal and exhausted failures, snoozes, handler and
+/// admin cancellations, callback waits, future-scheduled work,
+/// deadline-bearing jobs, and multi-second jobs; cron fires before and after
+/// the authority flip. Simple traffic keeps flowing on a shared queue and the
+/// released worker is hard-killed mid-window. Reconciliation loads every
+/// workload job from the discrete storage tables and requires its exact
+/// designed terminal state and attempt, and the DLQ to hold exactly the
+/// designed failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a released awa-pg 0.6.3 environment"]
+async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
+    let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let pool = pool().await;
+    reset_database(&pool).await;
+    let run_id = Uuid::new_v4().simple().to_string();
+    let queue = format!("upgrade_workload_simple_{run_id}");
+    let workload_queue = format!("upgrade_workload_outcomes_{run_id}");
+
+    let mut old_worker = spawn_released_worker(&queue).await;
+    assert_eq!(schema_version(&pool).await, 40);
+
+    let producer = start_producer(pool.clone(), queue.clone());
+    wait_for_accepted(&producer, 25, Duration::from_secs(20)).await;
+    let old_before_migration = old_worker.completed().len();
+
+    // Bank the full designed backlog on the real v040 schema. Nothing serves
+    // the workload queue yet, so every one of these jobs crosses the
+    // migration boundary in a pre-terminal state.
+    let mut expectations = Vec::new();
+    let pre_flip_parked = bank_workload_batch(&pool, &workload_queue, 0, &mut expectations).await;
+
+    migrations::run(&pool)
+        .await
+        .expect("migration must apply with the released fleet and banked backlog live");
+    assert_eq!(schema_version(&pool).await, 43);
+
+    let simple_completed = Arc::new(Mutex::new(HashSet::new()));
+    let current = workload_client(
+        pool.clone(),
+        &queue,
+        &workload_queue,
+        simple_completed.clone(),
+    );
+    current
+        .start()
+        .await
+        .expect("start current workload runtime on v043");
+    wait_for_mixed_fleet(
+        &old_worker,
+        old_before_migration,
+        &simple_completed,
+        0,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Cron work fires while both fleets are live, before any flip.
+    let cron_name = format!("upgrade_rehearsal_cron_{run_id}");
+    let cron_job = PeriodicJob::builder(cron_name.clone(), "*/5 * * * *")
+        .queue(workload_queue.clone())
+        .build(&UpgradeWorkloadJob {
+            seq: -1,
+            mode: "complete".to_string(),
+        })
+        .expect("build cron job");
+    upsert_cron_job(&pool, &cron_job)
+        .await
+        .expect("upsert cron job");
+    let pre_flip_fire = trigger_cron_job(&pool, &cron_name)
+        .await
+        .expect("trigger cron before flip");
+    expectations.push(WorkloadExpectation {
+        id: pre_flip_fire.id,
+        mode: "cron",
+        state: JobState::Completed,
+        attempt: Some(1),
+    });
+
+    // Admin cancellation must terminate parked scheduled work exactly once.
+    for job_id in pre_flip_parked {
+        let cancelled = admin::cancel(&pool, job_id)
+            .await
+            .expect("admin cancel parked job")
+            .expect("parked job must exist when cancelled");
+        assert_eq!(cancelled.state, JobState::Cancelled);
+    }
+
+    // Hard-kill the released worker mid-traffic; its in-flight simple job
+    // must be rescued by the current fleet for the exact drains below.
+    old_worker.shutdown().await;
+
+    let accepted = producer.stop().await;
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: "awa".to_string(),
+        ..Default::default()
+    })
+    .expect("queue storage");
+    wait_for_drain(
+        &store,
+        &pool,
+        &queue,
+        accepted.len(),
+        Duration::from_secs(60),
+    )
+    .await;
+    wait_for_drain(
+        &store,
+        &pool,
+        &workload_queue,
+        expectations.len(),
+        Duration::from_secs(120),
+    )
+    .await;
+
+    flip_after_released_heartbeats_stale(&pool).await;
+    assert_released_worker_is_fenced(&queue).await;
+
+    // The same designed workload must reconcile identically in ledger
+    // authority, including a post-flip cron fire.
+    let post_flip_parked =
+        bank_workload_batch(&pool, &workload_queue, 1_000, &mut expectations).await;
+    let post_flip_fire = trigger_cron_job(&pool, &cron_name)
+        .await
+        .expect("trigger cron after flip");
+    expectations.push(WorkloadExpectation {
+        id: post_flip_fire.id,
+        mode: "cron",
+        state: JobState::Completed,
+        attempt: Some(1),
+    });
+    for job_id in post_flip_parked {
+        let cancelled = admin::cancel(&pool, job_id)
+            .await
+            .expect("admin cancel parked job after flip")
+            .expect("post-flip parked job must exist when cancelled");
+        assert_eq!(cancelled.state, JobState::Cancelled);
+    }
+    wait_for_drain(
+        &store,
+        &pool,
+        &workload_queue,
+        expectations.len(),
+        Duration::from_secs(120),
+    )
+    .await;
+    current.shutdown(Duration::from_secs(5)).await;
+
+    // Every workload job must land on its designed terminal outcome, read
+    // back from the discrete storage tables.
+    for expectation in &expectations {
+        let job = store
+            .load_job(&pool, expectation.id)
+            .await
+            .expect("load workload job")
+            .unwrap_or_else(|| {
+                panic!(
+                    "workload job {} ({}) must remain visible",
+                    expectation.id, expectation.mode
+                )
+            });
+        assert_eq!(
+            job.state, expectation.state,
+            "job {} ({}) terminal state",
+            expectation.id, expectation.mode
+        );
+        if let Some(attempt) = expectation.attempt {
+            assert_eq!(
+                i64::from(job.attempt),
+                attempt,
+                "job {} ({}) terminal attempt",
+                expectation.id,
+                expectation.mode
+            );
+        }
+    }
+
+    // Failed rows enter the durable DLQ archive when ring rotation prunes
+    // them out of hot storage. Rotation is disabled in this cell (the per-job
+    // loads above depend on it), so designed failures normally stay visible
+    // as `failed` rows — but any row that does reach the archive must be a
+    // designed failure, and nothing else may.
+    let designed_failure_ids: HashSet<i64> = expectations
+        .iter()
+        .filter(|expectation| expectation.state == JobState::Failed)
+        .map(|expectation| expectation.id)
+        .collect();
+    let archived = dlq::list_dlq(
+        &pool,
+        &dlq::ListDlqFilter {
+            queue: Some(workload_queue.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list workload DLQ archive");
+    for row in &archived {
+        assert!(
+            designed_failure_ids.contains(&row.job.id),
+            "DLQ archive holds job {} which was not a designed failure",
+            row.job.id
+        );
+    }
+
+    let mut observed = old_worker.completed();
+    observed.extend(simple_completed.lock().unwrap().iter().copied());
+    assert_eq!(
+        observed, accepted,
+        "accepted and observed simple job sets differ"
+    );
+}
+
+/// Overlapped upgrade order: the current deployment and the migration race
+/// under live released traffic. A rolling deployment keeps restarting its new
+/// pods, so the current runtime start-retries through its schema refusal and
+/// must come up unaided the moment v041-v043 commit. Both versions must then
+/// claim and complete work concurrently before any flip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a released awa-pg 0.6.3 environment"]
+async fn test_overlap_current_roll_races_live_migration() {
+    let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let pool = pool().await;
+    reset_database(&pool).await;
+    let queue = format!("upgrade_overlap_{}", Uuid::new_v4().simple());
+
+    let mut old_worker = spawn_released_worker(&queue).await;
+    assert_eq!(schema_version(&pool).await, 40);
+
+    let producer = start_producer(pool.clone(), queue.clone());
+    wait_for_accepted(&producer, 25, Duration::from_secs(20)).await;
+    let old_before_migration = old_worker.completed().len();
+
+    // Roll and migrate concurrently. Each refused start is a crash-loop
+    // iteration; only the schema-pending refusal is an acceptable reason.
+    let current_completed = Arc::new(Mutex::new(HashSet::new()));
+    let start_retry_pool = pool.clone();
+    let start_retry_queue = queue.clone();
+    let start_retry_completed = current_completed.clone();
+    let start_retry = async move {
+        let deadline = Instant::now();
+        loop {
+            let candidate = current_client(
+                start_retry_pool.clone(),
+                &start_retry_queue,
+                start_retry_completed.clone(),
+            );
+            match candidate.start().await {
+                Ok(()) => return candidate,
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("awa migrate"),
+                        "mid-roll start may only be refused for pending migrations: {message}"
+                    );
+                    assert!(
+                        deadline.elapsed() < Duration::from_secs(30),
+                        "current worker never came up after the live migration"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    };
+    let (current, migration_result) = tokio::join!(start_retry, migrations::run(&pool));
+    migration_result.expect("migration must apply with both fleets and the producer live");
+    assert_eq!(schema_version(&pool).await, 43);
+
+    // Both versions claim and complete concurrently after migration, before
+    // any flip.
+    wait_for_mixed_fleet(
+        &old_worker,
+        old_before_migration,
+        &current_completed,
+        0,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let accepted = producer.stop().await;
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: "awa".to_string(),
+        ..Default::default()
+    })
+    .expect("queue storage");
+    wait_for_drain(
+        &store,
+        &pool,
+        &queue,
+        accepted.len(),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Retire the released fleet (hard kill), flip with the stamped current
+    // fleet still live, and fence the returning released artifact.
+    old_worker.shutdown().await;
+    flip_after_released_heartbeats_stale(&pool).await;
+    assert_released_worker_is_fenced(&queue).await;
+
+    let mut all_accepted = accepted;
+    let first_post_flip = all_accepted.iter().max().copied().unwrap_or(0) + 1;
+    for seq in first_post_flip..first_post_flip + 20 {
+        insert_with(
+            &pool,
+            &SimpleChaosJob { seq },
+            InsertOpts {
+                queue: queue.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("post-flip insert");
+        all_accepted.insert(seq);
+    }
+    wait_for_drain(
+        &store,
+        &pool,
+        &queue,
+        all_accepted.len(),
+        Duration::from_secs(60),
+    )
+    .await;
+    current.shutdown(Duration::from_secs(5)).await;
+
+    let mut observed = old_worker.completed();
+    observed.extend(current_completed.lock().unwrap().iter().copied());
+    assert_eq!(
+        observed, all_accepted,
+        "accepted and observed job sets differ"
     );
 }

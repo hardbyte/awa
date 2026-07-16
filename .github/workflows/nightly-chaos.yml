@@ -111,11 +111,26 @@ jobs:
         run: |
           uv venv --quiet --clear .compat-venv-063
           uv pip install --quiet --python .compat-venv-063 "awa-pg==0.6.3"
-      - name: Run migrate-first mixed-version rehearsal
-        run: cargo test --package awa --test rolling_upgrade_rehearsal_test -- --ignored --nocapture
+      - name: Run mixed-version upgrade rehearsal
+        run: |
+          set -o pipefail
+          cargo test --package awa --test rolling_upgrade_rehearsal_test -- --ignored --nocapture 2>&1 \
+            | tee rehearsal-output.log
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
           AWA_N_MINUS_ONE_PYTHON: .compat-venv-063/bin/python
+      - name: Collect Postgres logs
+        if: failure()
+        run: docker logs "${{ job.services.postgres.id }}" > postgres.log 2>&1 || true
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rolling-upgrade-rehearsal-failure
+          path: |
+            rehearsal-output.log
+            postgres.log
+          retention-days: 14
 
   rust-nightly:
     name: Rust nightly benchmarks
