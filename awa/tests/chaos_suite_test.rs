@@ -20,6 +20,15 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Serializes the chaos tests: the maintenance leader-election advisory lock
+/// is global per database, so any test's live client can hold leadership
+/// while another test waits for one of ITS clients to be elected. Running
+/// the suite in parallel therefore starves the leader-assertion tests
+/// nondeterministically (the run-to-run winner depends on scheduling and
+/// `--test-threads`). Each test creates its own queues, so serialization
+/// loses nothing but wall-clock.
+static CHAOS_SUITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
@@ -311,11 +320,18 @@ async fn wait_for_kind_state_count(
 async fn kind_state_count(pool: &sqlx::PgPool, queue: &str, kind: &str, state: &str) -> i64 {
     if state == "running" {
         if let Some(schema) = active_queue_storage_schema(pool).await {
+            // Running work is the union of materialised `leases` rows and
+            // open receipt claims. Compose the canonical open-claim shape
+            // from awa-model rather than hand-rolling it: compact
+            // `lease_claim_batches` claims never materialise into `leases`
+            // for their whole execution, so any query that only reads the
+            // row-local tables reports a running job as absent.
+            let open_claims = awa::model::queue_storage::open_receipt_running_claims_sql(&schema);
             let sql = format!(
                 r#"
                 SELECT count(*)::bigint
                 FROM (
-                    SELECT 1
+                    SELECT lease.job_id
                     FROM {schema}.leases AS lease
                     JOIN {schema}.ready_entries AS ready
                       ON ready.ready_slot = lease.ready_slot
@@ -331,38 +347,14 @@ async fn kind_state_count(pool: &sqlx::PgPool, queue: &str, kind: &str, state: &
 
                     UNION ALL
 
-                    SELECT 1
-                    FROM {schema}.lease_claims AS claims
-                    JOIN {schema}.ready_entries AS ready
-                      ON ready.ready_slot = claims.ready_slot
-                     AND ready.ready_generation = claims.ready_generation
-                     AND ready.queue = claims.queue
-                     AND ready.priority = claims.priority
-                     AND ready.enqueue_shard = claims.enqueue_shard
-                     AND ready.lane_seq = claims.lane_seq
-                     AND ready.job_id = claims.job_id
-                    WHERE claims.queue = $1
-                      AND ready.kind = $2
-                      AND claims.closed_at IS NULL
-                      AND NOT EXISTS (
-                        SELECT 1 FROM {schema}.lease_claim_closures AS closures
-                        WHERE closures.claim_slot = claims.claim_slot
-                          AND closures.job_id = claims.job_id
-                          AND closures.run_lease = claims.run_lease
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
-                        WHERE closure_batches.receipt_ranges @> claims.receipt_id
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM {schema}.leases AS lease
-                        WHERE lease.job_id = claims.job_id
-                          AND lease.run_lease = claims.run_lease
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM {schema}.terminal_jobs AS terminal
-                        WHERE terminal.job_id = claims.job_id
-                          AND terminal.run_lease = claims.run_lease
+                    SELECT open_claims.job_id
+                    FROM ({open_claims}) AS open_claims
+                    WHERE open_claims.queue = $1
+                      AND EXISTS (
+                        SELECT 1 FROM {schema}.ready_entries AS ready
+                        WHERE ready.job_id = open_claims.job_id
+                          AND ready.queue = open_claims.queue
+                          AND ready.kind = $2
                       )
                 ) AS running_jobs
                 "#,
@@ -393,8 +385,153 @@ async fn kind_state_count(pool: &sqlx::PgPool, queue: &str, kind: &str, state: &
     .expect("Failed to query job kind state count")
 }
 
+/// Age a queue's open compact receipt claims (`lease_claim_batches` members,
+/// optionally filtered by kind) so the heartbeat-rescue sweep treats them as
+/// stale. The sweep pre-filters candidates on the batch's `claimed_at` cursor
+/// and derives per-member staleness from
+/// `COALESCE(attempt_state.heartbeat_at, claimed_at)`, so both must be aged.
+/// The batch `deadline_at` is deliberately untouched: it is shared by every
+/// member, and forcing it would deadline-rescue healthy members of other
+/// kinds sharing the batch. Returns the number of members aged.
+async fn backdate_compact_claims(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+    kind: Option<&str>,
+) -> u64 {
+    // Canonical open-member predicate: not closed by row or range closure
+    // evidence, not materialised into `leases`, and not already terminal or
+    // deferred (completion closes via done_entries / deferred_jobs /
+    // dlq_entries, not lease_claim_closures).
+    let open_member = format!(
+        r#"
+          NOT EXISTS (
+              SELECT 1 FROM {schema}.lease_claim_closures AS closures
+              WHERE closures.claim_slot = batches.claim_slot
+                AND closures.job_id = items.job_id
+                AND closures.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+              WHERE closure_batches.claim_slot = batches.claim_slot
+                AND closure_batches.receipt_ranges @> items.receipt_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.leases AS lease
+              WHERE lease.job_id = items.job_id
+                AND lease.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.done_entries AS done
+              WHERE done.job_id = items.job_id
+                AND done.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.deferred_jobs AS deferred
+              WHERE deferred.job_id = items.job_id
+                AND deferred.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.dlq_entries AS dlq
+              WHERE dlq.job_id = items.job_id
+                AND dlq.run_lease = items.run_lease
+          )
+        "#,
+    );
+
+    // Rescue staleness is COALESCE(attempt_state.heartbeat_at, claimed_at),
+    // and the batch `claimed_at` we age below is shared by every member.
+    // Pin every untargeted open member's effective heartbeat to now first
+    // (DO NOTHING preserves an existing fresher row) so only the targeted
+    // members read as stale after the cursor moves.
+    let shield_sql = format!(
+        r#"
+        INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+        SELECT items.job_id, items.run_lease, clock_timestamp(), clock_timestamp()
+        FROM {schema}.lease_claim_batches AS batches
+        CROSS JOIN LATERAL unnest(
+            batches.job_ids, batches.run_leases, batches.receipt_ids
+        ) AS items(job_id, run_lease, receipt_id)
+        WHERE batches.queue = $1
+          AND $2::text IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.ready_entries AS ready
+              WHERE ready.job_id = items.job_id
+                AND ready.queue = batches.queue
+                AND ready.kind = $2
+          )
+          AND {open_member}
+        ON CONFLICT (job_id, run_lease) DO NOTHING
+        "#,
+    );
+    sqlx::query(&shield_sql)
+        .bind(queue)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .expect("Failed to pin untargeted compact claim heartbeats");
+
+    let attempt_sql = format!(
+        r#"
+        INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+        SELECT items.job_id, items.run_lease,
+               clock_timestamp() - interval '10 minutes', clock_timestamp()
+        FROM {schema}.lease_claim_batches AS batches
+        CROSS JOIN LATERAL unnest(
+            batches.job_ids, batches.run_leases, batches.receipt_ids
+        ) AS items(job_id, run_lease, receipt_id)
+        WHERE batches.queue = $1
+          AND ($2::text IS NULL OR EXISTS (
+              SELECT 1 FROM {schema}.ready_entries AS ready
+              WHERE ready.job_id = items.job_id
+                AND ready.queue = batches.queue
+                AND ready.kind = $2
+          ))
+          AND {open_member}
+        ON CONFLICT (job_id, run_lease)
+        DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at,
+                      updated_at = EXCLUDED.updated_at
+        "#,
+    );
+    let member_rows = sqlx::query(&attempt_sql)
+        .bind(queue)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate compact claim attempt heartbeats")
+        .rows_affected();
+
+    let batch_sql = format!(
+        r#"
+        UPDATE {schema}.lease_claim_batches AS batches
+        SET claimed_at = clock_timestamp() - interval '10 minutes'
+        WHERE batches.queue = $1
+          AND ($2::text IS NULL OR EXISTS (
+              SELECT 1
+              FROM unnest(
+                  batches.job_ids, batches.run_leases, batches.receipt_ids
+              ) AS items(job_id, run_lease, receipt_id)
+              JOIN {schema}.ready_entries AS ready
+                ON ready.job_id = items.job_id
+               AND ready.queue = batches.queue
+              WHERE ready.kind = $2
+                AND {open_member}
+          ))
+        "#,
+    );
+    sqlx::query(&batch_sql)
+        .bind(queue)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate compact claim batch cursors");
+
+    member_rows
+}
+
 async fn backdate_running_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> u64 {
     if let Some(schema) = active_queue_storage_schema(pool).await {
+        let compact_rows = backdate_compact_claims(pool, &schema, queue, Some(kind)).await;
         let receipt_sql = format!(
             r#"
             UPDATE {schema}.lease_claims AS claims
@@ -473,7 +610,7 @@ async fn backdate_running_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> 
             .expect("Failed to backdate queue-storage materialized leases")
             .rows_affected();
 
-        return receipt_rows + lease_rows;
+        return compact_rows + receipt_rows + lease_rows;
     }
 
     sqlx::query(
@@ -496,6 +633,7 @@ async fn backdate_running_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> 
 
 async fn backdate_running_jobs(pool: &sqlx::PgPool, queue: &str) -> u64 {
     if let Some(schema) = active_queue_storage_schema(pool).await {
+        let compact_rows = backdate_compact_claims(pool, &schema, queue, None).await;
         let receipt_sql = format!(
             r#"
             UPDATE {schema}.lease_claims AS claims
@@ -554,7 +692,7 @@ async fn backdate_running_jobs(pool: &sqlx::PgPool, queue: &str) -> u64 {
             .expect("Failed to backdate queue-storage materialized leases")
             .rows_affected();
 
-        return receipt_rows + lease_rows;
+        return compact_rows + receipt_rows + lease_rows;
     }
 
     sqlx::query(
@@ -1205,6 +1343,7 @@ impl Worker for MixedFleetRustWorker {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_mixed");
     clean_queue(&pool, &queue).await;
@@ -1332,6 +1471,7 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let pool = setup(40).await;
     let admin_pool = pool_with(4).await;
     let queue = chaos_queue("chaos_node_fail");
@@ -1643,6 +1783,7 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_mixed_rust_and_python_workers_share_same_queue() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_mixed_lang");
     clean_queue(&pool, &queue).await;
@@ -1837,6 +1978,7 @@ fn mixed_fleet_marker_from_line(line: &str) -> Option<&str> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_runtime_recovers_after_terminating_postgres_connections() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let app_name = format!(
         "chaos_disconnect_{}",
         &Uuid::new_v4().simple().to_string()[..8]
@@ -1949,6 +2091,7 @@ async fn test_runtime_recovers_after_terminating_postgres_connections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_leader_failover_during_scheduled_promotion() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_promotion");
     clean_queue(&pool, &queue).await;
@@ -2031,6 +2174,7 @@ async fn test_leader_failover_during_scheduled_promotion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_leader_connection_loss_re_elects_and_finishes_scheduled_promotion() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_conn_drop");
     clean_queue(&pool, &queue).await;
@@ -2110,6 +2254,7 @@ async fn test_leader_connection_loss_re_elects_and_finishes_scheduled_promotion(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_leader_failover_rescues_callback_timeouts() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_callback_failover");
     clean_queue(&pool, &queue).await;
@@ -2237,6 +2382,7 @@ async fn test_leader_failover_rescues_callback_timeouts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_full_postgres_outage_recovers_with_metrics() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
     let app_name = format!("chaos_outage_{}", &Uuid::new_v4().simple().to_string()[..8]);
     let app_pool = pool_with_url(&database_url_with_app_name(&app_name), 20).await;
     migrations::run(&app_pool)
