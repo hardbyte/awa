@@ -192,10 +192,18 @@ const OVERRUN_UPPER_DEN: u32 = 2;
 const OVERRUN_LOWER_NUM: u32 = 7;
 const OVERRUN_LOWER_DEN: u32 = 10;
 
-/// Number of ticks to suppress a delayed branch's body. At the default
-/// `lease_rotate_interval = 1000ms`, 120 ticks = 120s wall time of quiet
-/// before the branch tries again. Re-armed on every overrun
-/// observation while still delayed.
+/// Upper bound on the ticks a delayed branch's body is suppressed.
+///
+/// The actual cooldown is paced by the branch's own duration —
+/// `2 × ceil(last_duration / tick_interval)` ticks, capped here — so a
+/// branch that merely runs slower than its configured interval settles at
+/// roughly one-third duty cycle instead of going near-silent. A fixed
+/// 120-tick penalty re-armed on every overrun let a rescue sweep whose
+/// body consistently exceeded 1.5× a short interval run at 1/120 duty:
+/// with `deadline_rescue_interval = 100ms` and a ~250ms sweep, expired
+/// deadline claims waited 12s+ between rescue passes, starving
+/// deadline-based cancellation entirely. The cap still bounds pathological
+/// bodies (minutes-long) to this many quiet ticks.
 const BRANCH_COOLDOWN_TICKS: u32 = 120;
 
 /// Records the start of one branch body and emits observability when the
@@ -310,6 +318,18 @@ impl MaintenanceBranchTracker {
         // forever. The branch would never run its body again until
         // the worker restarts. Codex + CodeRabbit both flagged this
         // on PR #318.
+        //
+        // Cooldowns are paced by the offending body's own duration so a
+        // consistently slow branch keeps a bounded duty cycle (~1/3)
+        // rather than collapsing to 1/BRANCH_COOLDOWN_TICKS.
+        let paced_cooldown = |last_duration: Duration| -> u32 {
+            if cooldown_ticks == 0 {
+                return 0;
+            }
+            let interval_ms = tick_interval.as_millis().max(1);
+            let ticks = (2 * last_duration.as_millis()).div_ceil(interval_ms) as u32;
+            ticks.clamp(1, cooldown_ticks)
+        };
         if let Some(last_duration) = state.last_duration.take() {
             // Integer-ratio thresholds — avoid f64 in the hot path.
             let upper_threshold = tick_interval * OVERRUN_UPPER_NUM / OVERRUN_UPPER_DEN;
@@ -321,24 +341,25 @@ impl MaintenanceBranchTracker {
                 let cross_threshold = state.consecutive_overrun >= OVERRUN_HYSTERESIS_K;
                 if cross_threshold && !state.is_delayed {
                     state.is_delayed = true;
-                    state.cooldown_ticks_remaining = cooldown_ticks;
+                    state.cooldown_ticks_remaining = paced_cooldown(last_duration);
                     warn!(
                         branch,
                         last_duration_ms = last_duration.as_millis() as u64,
                         tick_interval_ms = tick_interval.as_millis() as u64,
                         upper_threshold_ms = upper_threshold.as_millis() as u64,
                         consecutive_overrun = state.consecutive_overrun,
-                        cooldown_ticks,
+                        cooldown_ticks = state.cooldown_ticks_remaining,
                         "maintenance branch overran tick interval",
                     );
                     metrics.record_maintenance_branch_overrun(branch);
-                    if cooldown_ticks > 0 {
+                    if state.cooldown_ticks_remaining > 0 {
                         return None;
                     }
                 } else if cross_threshold && state.is_delayed && cooldown_ticks > 0 {
                     // Already delayed and another overrun arrived —
-                    // re-arm cooldown but stay quiet about it.
-                    state.cooldown_ticks_remaining = cooldown_ticks;
+                    // re-arm a duration-paced cooldown but stay quiet
+                    // about it.
+                    state.cooldown_ticks_remaining = paced_cooldown(last_duration);
                     return None;
                 }
             } else if last_duration < lower_threshold {
@@ -3478,10 +3499,59 @@ mod tests {
         let (cooldown, overrun, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
         assert!(tracker.snapshot("cleanup").unwrap().1, "flipped to delayed");
         assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
-        assert_eq!(
-            cooldown, BRANCH_COOLDOWN_TICKS,
-            "cooldown armed to BRANCH_COOLDOWN_TICKS at flip"
+        // Cooldown is paced by the offending duration: 2 × ceil(250/100)
+        // ticks — a slow branch backs off proportionally, it does not go
+        // near-silent for BRANCH_COOLDOWN_TICKS.
+        assert_eq!(cooldown, 5, "cooldown paced to 2×duration/interval");
+    }
+
+    /// A branch whose body always overruns keeps a bounded duty cycle:
+    /// each post-cooldown run re-arms a duration-paced cooldown, so the
+    /// body still executes roughly every `2×duration` — never once per
+    /// `BRANCH_COOLDOWN_TICKS`. This is the regression shape behind the
+    /// starved deadline-rescue sweep: a ~250ms sweep on a 100ms interval
+    /// must keep rescuing, not fall to a 12s cadence.
+    #[test]
+    fn branch_tracker_persistent_overrun_keeps_bounded_duty_cycle() {
+        let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
         );
+
+        // 40 further ticks with every executed body still overrunning.
+        let ran = replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            40,
+        );
+        let executed = ran.iter().filter(|&&r| r).count();
+        assert!(
+            executed >= 5,
+            "an always-overrunning branch must keep a ~1-in-6 duty cycle, ran {executed}/40"
+        );
+    }
+
+    /// Pathologically long bodies still clamp at BRANCH_COOLDOWN_TICKS.
+    #[test]
+    fn branch_tracker_paced_cooldown_clamps_at_cap() {
+        let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_secs(60));
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
+        );
+        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(cooldown, BRANCH_COOLDOWN_TICKS, "cap bounds the cooldown");
     }
 
     #[test]
@@ -3539,15 +3609,16 @@ mod tests {
             Duration::from_millis(100),
             OVERRUN_HYSTERESIS_K,
         );
-        // Subsequent ticks return None until cooldown drains. We pass
-        // 50ms as the body_duration but it's unused — `record_finish`
-        // is only called when a body actually runs.
+        // Subsequent ticks return None until the paced cooldown
+        // (2 × ceil(250/100) = 5 ticks) drains. We pass 50ms as the
+        // body_duration but it's unused — `record_finish` is only
+        // called when a body actually runs.
         let ran = replay_ticks(
             &tracker,
             "cleanup",
             Duration::from_millis(50),
             Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
+            5,
         );
         assert!(
             ran.iter().all(|&r| !r),
@@ -3579,7 +3650,7 @@ mod tests {
             "cleanup",
             Duration::from_millis(50),
             Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
+            5,
         );
         let ran = replay_ticks(
             &tracker,
@@ -3625,7 +3696,7 @@ mod tests {
             "cleanup",
             Duration::from_millis(50),
             Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
+            5,
         );
 
         // Tick 1 post-cooldown: take None, no eval, body runs slow.
@@ -3644,7 +3715,7 @@ mod tests {
             "first tick runs body; second tick re-arms cooldown"
         );
         let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, BRANCH_COOLDOWN_TICKS, "cooldown re-armed");
+        assert_eq!(cooldown, 5, "cooldown re-armed, paced by the slow body");
         assert!(
             tracker.snapshot("cleanup").unwrap().1,
             "still delayed across re-arm"
@@ -3693,7 +3764,7 @@ mod tests {
             "cleanup",
             Duration::from_millis(50),
             Duration::from_millis(100),
-            BRANCH_COOLDOWN_TICKS,
+            5,
         );
 
         // K post-cooldown ticks: tick 1 seeds, ticks 2..K evaluate K-1
