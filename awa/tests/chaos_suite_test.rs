@@ -862,6 +862,19 @@ async fn run_python_helper(mode: &str, queue: &str, extra_env: &[(&str, String)]
     String::from_utf8(output.stdout).expect("Python helper output was not valid UTF-8")
 }
 
+/// The maintenance leader-election advisory lock key ("AWA_MAIN"). Mirrors
+/// `MaintenanceService::LOCK_KEY` in `awa-worker/src/maintenance.rs`; the
+/// value is load-bearing across versions (a mixed fleet elects on it), so it
+/// cannot drift.
+const MAINTENANCE_LEADER_LOCK_KEY: i64 = 0x_4157_415f_4d41_494e;
+
+/// The backend pid currently holding the maintenance leader lock.
+///
+/// Filters `pg_locks` to the leader key: ring-rotation serializers, the
+/// migration lock, and the batch-runner lock are also session/xact advisory
+/// locks, and an unfiltered scan mistakes them for (or double-counts them
+/// with) the leader. A single-bigint advisory key appears in `pg_locks` as
+/// `classid` = high 32 bits, `objid` = low 32 bits, `objsubid` = 1.
 async fn current_leader_backend_pid(pool: &sqlx::PgPool) -> Option<i32> {
     let rows: Vec<(i32,)> = sqlx::query_as(
         r#"
@@ -869,9 +882,12 @@ async fn current_leader_backend_pid(pool: &sqlx::PgPool) -> Option<i32> {
         FROM pg_locks
         WHERE locktype = 'advisory'
           AND granted
+          AND objsubid = 1
+          AND (classid::bigint << 32) | objid::bigint = $1
         ORDER BY pid
         "#,
     )
+    .bind(MAINTENANCE_LEADER_LOCK_KEY)
     .fetch_all(pool)
     .await
     .expect("Failed to query advisory lock holders");
@@ -882,9 +898,32 @@ async fn current_leader_backend_pid(pool: &sqlx::PgPool) -> Option<i32> {
     assert_eq!(
         rows.len(),
         1,
-        "Expected exactly one advisory lock holder, got {rows:?}"
+        "Expected exactly one leader lock holder, got {rows:?}"
     );
     Some(rows[0].0)
+}
+
+/// Hold an unrelated session advisory lock for the duration of a test.
+///
+/// Regression guard for the leader-election helpers: with ledger-authority
+/// rotation, per-ring rotation serializers routinely hold advisory locks
+/// concurrently with the leader, and the helpers must neither mistake one
+/// for the leader nor trip on seeing two holders.
+async fn hold_unrelated_advisory_lock() -> sqlx::PgConnection {
+    use sqlx::Connection;
+    // Distinct key per invocation: pg_advisory_lock blocks until granted, so
+    // a shared key would serialize tests that run concurrently.
+    static DECOY_LOCK_KEY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(424242);
+    let lock_key = DECOY_LOCK_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut conn = sqlx::PgConnection::connect(&database_url())
+        .await
+        .expect("connect decoy advisory lock session");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_key)
+        .execute(&mut conn)
+        .await
+        .expect("hold decoy advisory lock");
+    conn
 }
 
 async fn wait_for_new_leader_backend_pid(
@@ -1913,6 +1952,7 @@ async fn test_leader_failover_during_scheduled_promotion() {
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_promotion");
     clean_queue(&pool, &queue).await;
+    let _decoy_advisory_lock = hold_unrelated_advisory_lock().await;
 
     let client_a = complete_client(pool.clone(), &queue);
     let client_b = complete_client(pool.clone(), &queue);
@@ -1994,6 +2034,7 @@ async fn test_leader_connection_loss_re_elects_and_finishes_scheduled_promotion(
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_conn_drop");
     clean_queue(&pool, &queue).await;
+    let _decoy_advisory_lock = hold_unrelated_advisory_lock().await;
 
     let client_a = complete_client(pool.clone(), &queue);
     let client_b = complete_client(pool.clone(), &queue);
@@ -2072,6 +2113,7 @@ async fn test_leader_failover_rescues_callback_timeouts() {
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_callback_failover");
     clean_queue(&pool, &queue).await;
+    let _decoy_advisory_lock = hold_unrelated_advisory_lock().await;
     let active_queue_storage_schema = active_queue_storage_schema(&pool).await;
 
     let build_callback_client = |pool: sqlx::PgPool| {
