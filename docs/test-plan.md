@@ -255,7 +255,12 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | --- | --- | --- | --- | --- |
 | V1 | Broad integration suite green under `AWA_TEST_ENGINE=queue_storage` | ✓ | ✓ | #360 |
 | V2 | Engine guard rejects canonical-only raw-SQL helpers under queue_storage | ✓ |  | #360 |
-| V3 | Pinned 0.6.0 binary: enqueue→claim→complete→cancel against 0.7 schema | | ✓ | #367 — nightly `scripts/compat-matrix.sh` (awa-pg 0.6.0 wheel; a pinned native-binary leg can extend it) |
+| V3 | Pinned 0.6.2 binary: enqueue→claim→complete→cancel against the 0.7 schema in columns authority, then fail after flip | | ✓ | #367/#427 — nightly `scripts/compat-matrix.sh`; the 0.6.0 wheel remains an additional data-plane regression leg |
+| V3a | Released 0.6.3 plus current under live traffic: migrate v040→v043, mixed completions, old-only final rotation, guarded flip/reconciliation, returning-old fence, exact drain, and hard-killed old-leader deadline rescue | ✓ | ✓ | #427 — nightly `rolling_upgrade_rehearsal_test` |
+| V3b | Live v043 migration deadlock rolls back and retries the complete atomic transaction | ✓ | | #427 — `migration_test::test_live_migration_retries_hot_table_deadlock` |
+| V3c | Binary-first order: current runtime refuses the v040 schema loudly (naming `awa migrate`), released fleet keeps draining through the refusal, the roll completes unaided after migration, and a hard-killed released worker's in-flight work is rescued | ✓ | ✓ | #427 — nightly `rolling_upgrade_rehearsal_test` binary-first cell |
+| V3d | Overlapped order: a crash-looping current deployment races the live v041→v043 migration, comes up unaided at commit, and both versions complete concurrently before the flip | ✓ | ✓ | #427 — nightly `rolling_upgrade_rehearsal_test` overlap cell |
+| V3e | Designed-outcome workload across migrate-first: v040-banked backlog of retries, terminal/exhausted failures with exact DLQ depth, snoozes, handler and admin cancellations, callback waits, scheduled/deadline/multi-second jobs, and cron fires on both sides of the flip, each reconciled to its exact terminal state and attempt | ✓ | ✓ | #427 — nightly `rolling_upgrade_rehearsal_test` workload cell |
 | V4 | Newest binary against a pre-migrate old schema fails loudly (message + exit code asserted) | ✓ |  | #367 — asserted against a 0.5.7 schema with canonical work; the 0.6-schema variant activates with the first 0.7 migration |
 | V5 | `awa migrate` refuses non-`active` storage state, names finalize steps | ✓ |  | #370 — `migration_test` gate tests + the nightly backward-guard leg |
 

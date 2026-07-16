@@ -6,8 +6,11 @@
 # those skews with PINNED RELEASE ARTIFACTS (awa-pg wheels from PyPI — the
 # compiled runtime, not a source build of an old tag):
 #
-#   forward-0.6.0   full lifecycle (enqueue/claim/complete/cancel) against
-#                   the newest schema, finalized to queue storage.
+#   forward-0.6.2   supported N-1 lifecycle (enqueue/claim/complete/cancel)
+#                   against the newest schema in columns authority, followed
+#                   by a post-flip fence check.
+#   forward-0.6.0   older data-plane regression leg against columns authority;
+#                   0.6.0 must not run migrate against the newer schema.
 #   forward-0.5.7   producers still route through the compat layer to the
 #                   active engine; workers are inert (canonical hot table is
 #                   empty on a finalized cluster). Asserted, not assumed.
@@ -64,7 +67,7 @@ SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at;
 
 -- Model an upgraded v043 schema: upgrades start in columns authority. A
 -- fresh install starts in ledger authority, so restore the compat cursors
--- from the seeded ledgers before exercising the mixed 0.6.0/0.7 window.
+-- from the seeded ledgers before exercising the 0.6.x/0.7 compatibility window.
 UPDATE awa.ring_cursor_authority
 SET authority = 'columns', flipped_at = NULL
 WHERE singleton;
@@ -85,25 +88,33 @@ SQL
 echo "── setup: pinned release artifacts (PyPI wheels)"
 uv venv --quiet --clear .compat-venv-060
 uv pip install --quiet --python .compat-venv-060 "awa-pg==0.6.0"
+uv venv --quiet --clear .compat-venv-062
+uv pip install --quiet --python .compat-venv-062 "awa-pg==0.6.2"
 uv venv --quiet --clear .compat-venv-057
 uv pip install --quiet --python .compat-venv-057 "awa-pg==0.5.7"
 
-echo "── leg: forward-0.6.0 (full lifecycle on newest schema)"
-DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-060/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
+echo "── leg: forward-0.6.2 (supported N-1 lifecycle on newest schema)"
+DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.2 COMPAT_QUEUE=compat_forward_062 \
+  .compat-venv-062/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
 
-echo "── leg: post-flip 0.6.0 is fenced"
+echo "── leg: forward-0.6.0 (full lifecycle on newest schema)"
+DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.0 COMPAT_QUEUE=compat_forward_060 \
+  .compat-venv-060/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
+
+echo "── leg: post-flip 0.6.2 is fenced"
 "$AWA_BIN" --database-url "${BASE_URL}/${FWD_DB}" storage flip-ring-authority --force
-DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-060/bin/python "${SCRIPT_DIR}/compat/post_flip_060.py"
+DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.2 COMPAT_QUEUE=compat_post_flip_062 \
+  .compat-venv-062/bin/python "${SCRIPT_DIR}/compat/post_flip_060.py"
 fence_state=$(psql "${BASE_URL}/${FWD_DB}" -qAt -F '|' -c \
   "SELECT a.authority, q.current_slot, q.generation
    FROM awa.ring_cursor_authority AS a
    CROSS JOIN awa.queue_ring_state AS q
    WHERE a.singleton AND q.singleton")
 if [ "$fence_state" != "ledger|-1|-1" ]; then
-  echo "FAIL: pinned 0.6.0 maintenance crossed the ledger-authority fence ($fence_state)" >&2
+  echo "FAIL: pinned 0.6.2 maintenance crossed the ledger-authority fence ($fence_state)" >&2
   exit 1
 fi
-echo "0.6.0 was fenced; compat cursor remains poisoned ($fence_state)"
+echo "0.6.2 was fenced; compat cursor remains poisoned ($fence_state)"
 
 echo "── leg: forward-0.5.7 (producer routes, worker inert)"
 DATABASE_URL="${BASE_URL}/${FWD_DB}" .compat-venv-057/bin/python "${SCRIPT_DIR}/compat/forward_057.py"

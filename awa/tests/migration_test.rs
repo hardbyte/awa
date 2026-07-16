@@ -3951,6 +3951,99 @@ async fn test_runtime_version_floor_ignores_stale_old_runtime() {
     pool.close().await;
 }
 
+/// A v043 substrate refresh touches several hot relations in one atomic
+/// transaction. A released worker can hold one of those relations and then
+/// read another that the migration already changed, producing SQLSTATE 40P01.
+/// The runner must retry the whole transaction rather than making operators
+/// rerun `awa migrate` during normal live traffic.
+#[tokio::test]
+async fn test_live_migration_retries_hot_table_deadlock() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("migrate to head");
+    simulate_non_canonical_compat_routing(&pool).await;
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
+    rewind_schema_version(&pool, 43).await;
+    let deadlocks_before: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read initial deadlock counter");
+
+    let mut blocker = PgConnection::connect(&migration_database_url())
+        .await
+        .expect("connect deadlock blocker");
+    sqlx::raw_sql("BEGIN; LOCK TABLE awa.deferred_jobs IN ROW EXCLUSIVE MODE")
+        .execute(&mut blocker)
+        .await
+        .expect("hold deferred_jobs ahead of migration");
+
+    let observer_pool = pool.clone();
+    let create_deadlock = async move {
+        let wait_started = std::time::Instant::now();
+        loop {
+            let migration_waits_with_ring_lock: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_locks AS waiting
+                    JOIN pg_locks AS held
+                      ON held.pid = waiting.pid
+                    WHERE waiting.relation = 'awa.deferred_jobs'::regclass
+                      AND waiting.mode = 'AccessExclusiveLock'
+                      AND NOT waiting.granted
+                      AND held.relation = 'awa.queue_ring_state'::regclass
+                      AND held.mode = 'AccessExclusiveLock'
+                      AND held.granted
+                )
+                "#,
+            )
+            .fetch_one(&observer_pool)
+            .await
+            .expect("inspect migration locks");
+            if migration_waits_with_ring_lock {
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < std::time::Duration::from_secs(20),
+                "migration never reached the controlled deferred_jobs lock wait"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Let the migration's deadlock timer start first so PostgreSQL selects
+        // that transaction as the victim. This read completes when the aborted
+        // attempt releases its queue-ring lock.
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        sqlx::query("SELECT count(*) FROM awa.queue_ring_state")
+            .execute(&mut blocker)
+            .await
+            .expect("blocker should survive while migration retries");
+        sqlx::raw_sql("COMMIT")
+            .execute(&mut blocker)
+            .await
+            .expect("release deferred_jobs for the retry");
+    };
+
+    let (migration_result, ()) = tokio::join!(migrations::run(&pool), create_deadlock);
+    migration_result.expect("migration should retry the deadlock and reach v043");
+    assert_eq!(migrations::current_version(&pool).await.unwrap(), 43);
+    let deadlocks_after: i64 = sqlx::query_scalar(
+        "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read final deadlock counter");
+    assert!(
+        deadlocks_after > deadlocks_before,
+        "the controlled lock cycle must trigger PostgreSQL deadlock detection"
+    );
+
+    pool.close().await;
+}
+
 /// A range that crosses no flagged migration (already at head) must not consult
 /// the pre-flight — a live worker is fine for a no-op run.
 #[tokio::test]

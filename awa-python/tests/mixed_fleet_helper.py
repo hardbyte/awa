@@ -54,6 +54,9 @@ async def main() -> None:
 
     if mode == "worker_simple_chaos_job":
         sleep_ms = int(os.environ.get("MIXED_SIMPLE_SLEEP_MS", "250"))
+        deadline_duration_ms = int(
+            os.environ.get("MIXED_DEADLINE_DURATION_MS", "0")
+        )
         leader_election_interval_ms = int(
             os.environ.get("MIXED_LEADER_ELECTION_INTERVAL_MS", "60000")
         )
@@ -87,12 +90,19 @@ async def main() -> None:
             start_kwargs["queue_storage_schema"] = qs_schema
         if transition_role:
             start_kwargs["storage_transition_role"] = transition_role
+        queue_config = {"name": queue, "max_workers": 1}
+        if deadline_duration_ms:
+            queue_config["deadline_duration_ms"] = deadline_duration_ms
         await client.start(
-            [(queue, 1)],
+            [queue_config],
+            heartbeat_rescue_interval_ms=100,
+            heartbeat_staleness_ms=500,
+            deadline_rescue_interval_ms=100,
             **start_kwargs,
         )
         print(
             f"READY mode={mode} pid={os.getpid()} sleep_ms={sleep_ms} "
+            f"deadline_duration_ms={deadline_duration_ms} "
             f"leader_election_interval_ms={leader_election_interval_ms}",
             flush=True,
         )
