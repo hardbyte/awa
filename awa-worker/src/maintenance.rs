@@ -438,6 +438,10 @@ struct PruneBackoffState {
     /// Last backoff exponent applied. Used to set `skip_remaining` to
     /// `1 << level` on the next failure. Reset to 0 on `Pruned`.
     backoff_level: u8,
+    /// Last destructive prune committed by this maintenance leader. An idle
+    /// cursor derives its oldest sealed target and skips only on an exact
+    /// slot/generation match.
+    last_pruned: Option<(i32, i64)>,
 }
 
 /// Cap on the backoff exponent. `2^5 = 32` ticks; at the 1000ms default
@@ -466,14 +470,17 @@ impl PruneBackoffTracker {
     }
 
     /// Update backoff state for a completed prune call. `Pruned` resets;
-    /// `SkippedActive` / `Blocked` doubles; `Noop` is neutral.
+    /// `SkippedActive` / `Blocked` doubles; no-work outcomes are neutral.
     fn record_outcome(&self, branch: &'static str, outcome: &PruneOutcome) {
         let mut branches = self.branches.lock().expect("prune backoff tracker mutex");
         let state = branches.entry(branch).or_default();
         match outcome {
-            PruneOutcome::Pruned { .. } => {
+            PruneOutcome::Pruned {
+                slot, generation, ..
+            } => {
                 state.skip_remaining = 0;
                 state.backoff_level = 0;
+                state.last_pruned = Some((*slot, *generation));
             }
             PruneOutcome::SkippedActive { .. } | PruneOutcome::Blocked { .. } => {
                 state.backoff_level = state
@@ -482,8 +489,28 @@ impl PruneBackoffTracker {
                     .min(MAX_PRUNE_BACKOFF_LEVEL);
                 state.skip_remaining = 1u32 << state.backoff_level;
             }
-            PruneOutcome::Noop => {}
+            PruneOutcome::Noop | PruneOutcome::AlreadyPruned { .. } => {}
         }
+    }
+
+    fn already_pruned_for_idle_cursor(
+        &self,
+        branch: &'static str,
+        current_slot: i32,
+        cursor_generation: i64,
+        slot_count: usize,
+    ) -> Option<PruneOutcome> {
+        let initialized_slots = (cursor_generation + 1).min(slot_count as i64);
+        if initialized_slots <= 1 {
+            return None;
+        }
+        let offset = initialized_slots - 1;
+        let target_generation = cursor_generation - offset;
+        let target_slot = (i64::from(current_slot) - offset).rem_euclid(slot_count as i64) as i32;
+        let branches = self.branches.lock().expect("prune backoff tracker mutex");
+        let (slot, generation) = branches.get(branch)?.last_pruned?;
+        (slot == target_slot && generation == target_generation)
+            .then_some(PruneOutcome::AlreadyPruned { slot, generation })
     }
 
     #[cfg(test)]
@@ -2221,9 +2248,13 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate(&self.pool).await {
+        let idle_cursor = match runtime.store.rotate(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("queue", &outcome);
+                let idle_cursor = match &outcome {
+                    RotateOutcome::SkippedIdle { slot, generation } => Some((*slot, *generation)),
+                    _ => None,
+                };
                 match outcome {
                     RotateOutcome::Rotated { slot, generation } => {
                         debug!(slot, generation, "Rotated queue storage queue segment");
@@ -2241,15 +2272,34 @@ impl MaintenanceService {
                             "Skipped busy queue storage queue segment",
                         );
                     }
-                    RotateOutcome::SkippedIdle { slot } => {
-                        debug!(slot, "Skipped idle queue storage queue segment");
+                    RotateOutcome::SkippedIdle { slot, generation } => {
+                        debug!(slot, generation, "Skipped idle queue storage queue segment");
                     }
                 }
+                idle_cursor
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage queue segments");
                 return;
             }
+        };
+
+        if let Some(outcome) = idle_cursor.and_then(|(slot, generation)| {
+            prune_tracker.already_pruned_for_idle_cursor(
+                PRUNE_BRANCH_QUEUE,
+                slot,
+                generation,
+                runtime.store.queue_slot_count(),
+            )
+        }) {
+            self.metrics.record_prune_outcome("queue", &outcome);
+            if let PruneOutcome::AlreadyPruned { slot, generation } = outcome {
+                debug!(
+                    slot,
+                    generation, "Queue storage queue segment already pruned"
+                );
+            }
+            return;
         }
 
         if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
@@ -2267,13 +2317,26 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_QUEUE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
+                    PruneOutcome::AlreadyPruned { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage queue segment already pruned"
+                        );
+                    }
                     PruneOutcome::Pruned {
                         slot,
+                        generation,
                         carried_failed_rows,
+                        durations,
                     } => {
                         debug!(
                             slot,
-                            carried_failed_rows, "Pruned queue storage queue segment"
+                            generation,
+                            carried_failed_rows,
+                            lock_ms = durations.lock.as_secs_f64() * 1000.0,
+                            truncate_ms = durations.truncate.as_secs_f64() * 1000.0,
+                            commit_ms = durations.commit.as_secs_f64() * 1000.0,
+                            "Pruned queue storage queue segment"
                         );
                     }
                     PruneOutcome::Blocked { slot } => {
@@ -2304,9 +2367,13 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate_leases(&self.pool).await {
+        let idle_cursor = match runtime.store.rotate_leases(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("lease", &outcome);
+                let idle_cursor = match &outcome {
+                    RotateOutcome::SkippedIdle { slot, generation } => Some((*slot, *generation)),
+                    _ => None,
+                };
                 match outcome {
                     RotateOutcome::Rotated { slot, generation } => {
                         debug!(slot, generation, "Rotated queue storage lease segment");
@@ -2318,15 +2385,34 @@ impl MaintenanceService {
                             "Skipped busy queue storage lease segment",
                         );
                     }
-                    RotateOutcome::SkippedIdle { slot } => {
-                        debug!(slot, "Skipped idle queue storage lease segment");
+                    RotateOutcome::SkippedIdle { slot, generation } => {
+                        debug!(slot, generation, "Skipped idle queue storage lease segment");
                     }
                 }
+                idle_cursor
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage lease segments");
                 return;
             }
+        };
+
+        if let Some(outcome) = idle_cursor.and_then(|(slot, generation)| {
+            prune_tracker.already_pruned_for_idle_cursor(
+                PRUNE_BRANCH_LEASE,
+                slot,
+                generation,
+                runtime.store.lease_slot_count(),
+            )
+        }) {
+            self.metrics.record_prune_outcome("lease", &outcome);
+            if let PruneOutcome::AlreadyPruned { slot, generation } = outcome {
+                debug!(
+                    slot,
+                    generation, "Queue storage lease segment already pruned"
+                );
+            }
+            return;
         }
 
         if prune_tracker.should_skip(PRUNE_BRANCH_LEASE) {
@@ -2340,6 +2426,12 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_LEASE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
+                    PruneOutcome::AlreadyPruned { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage lease segment already pruned"
+                        );
+                    }
                     PruneOutcome::Pruned { slot, .. } => {
                         debug!(slot, "Pruned queue storage lease segment");
                     }
@@ -2374,9 +2466,13 @@ impl MaintenanceService {
             return;
         };
 
-        match runtime.store.rotate_claims(&self.pool).await {
+        let idle_cursor = match runtime.store.rotate_claims(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("claim", &outcome);
+                let idle_cursor = match &outcome {
+                    RotateOutcome::SkippedIdle { slot, generation } => Some((*slot, *generation)),
+                    _ => None,
+                };
                 match outcome {
                     RotateOutcome::Rotated { slot, generation } => {
                         debug!(slot, generation, "Rotated queue storage claim segment");
@@ -2390,15 +2486,34 @@ impl MaintenanceService {
                             "Skipped busy queue storage claim segment",
                         );
                     }
-                    RotateOutcome::SkippedIdle { slot } => {
-                        debug!(slot, "Skipped idle queue storage claim segment");
+                    RotateOutcome::SkippedIdle { slot, generation } => {
+                        debug!(slot, generation, "Skipped idle queue storage claim segment");
                     }
                 }
+                idle_cursor
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage claim segments");
                 return;
             }
+        };
+
+        if let Some(outcome) = idle_cursor.and_then(|(slot, generation)| {
+            prune_tracker.already_pruned_for_idle_cursor(
+                PRUNE_BRANCH_CLAIM,
+                slot,
+                generation,
+                runtime.store.claim_slot_count(),
+            )
+        }) {
+            self.metrics.record_prune_outcome("claim", &outcome);
+            if let PruneOutcome::AlreadyPruned { slot, generation } = outcome {
+                debug!(
+                    slot,
+                    generation, "Queue storage claim segment already pruned"
+                );
+            }
+            return;
         }
 
         if prune_tracker.should_skip(PRUNE_BRANCH_CLAIM) {
@@ -2412,6 +2527,12 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_CLAIM, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
+                    PruneOutcome::AlreadyPruned { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage claim segment already pruned"
+                        );
+                    }
                     PruneOutcome::Pruned { slot, .. } => {
                         debug!(slot, "Pruned queue storage claim segment");
                     }
@@ -3791,7 +3912,9 @@ mod tests {
             PRUNE_BRANCH_LEASE,
             &PruneOutcome::Pruned {
                 slot: 0,
+                generation: 0,
                 carried_failed_rows: 0,
+                durations: Default::default(),
             },
         );
         assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((0, 0)));
@@ -3818,6 +3941,42 @@ mod tests {
         assert_eq!(
             before, after,
             "Noop must not change backoff state — there was nothing to do, not a failure"
+        );
+    }
+
+    #[test]
+    fn idle_prune_suppression_requires_exact_oldest_generation() {
+        let tracker = PruneBackoffTracker::new();
+        tracker.record_outcome(
+            PRUNE_BRANCH_QUEUE,
+            &PruneOutcome::Pruned {
+                slot: 0,
+                generation: 0,
+                carried_failed_rows: 0,
+                durations: Default::default(),
+            },
+        );
+
+        assert_eq!(
+            tracker.already_pruned_for_idle_cursor(PRUNE_BRANCH_QUEUE, 3, 3, 4),
+            Some(PruneOutcome::AlreadyPruned {
+                slot: 0,
+                generation: 0,
+            }),
+            "a frozen fully initialized cursor must suppress the repeated prune"
+        );
+        assert_eq!(
+            tracker.already_pruned_for_idle_cursor(PRUNE_BRANCH_QUEUE, 0, 4, 4),
+            None,
+            "a cursor advance changes the oldest target and must re-enable prune"
+        );
+        assert_eq!(
+            tracker.already_pruned_for_idle_cursor(PRUNE_BRANCH_QUEUE, 1, 1, 4),
+            Some(PruneOutcome::AlreadyPruned {
+                slot: 0,
+                generation: 0,
+            }),
+            "partial-ring startup derives the same generation as storage prune"
         );
     }
 

@@ -563,6 +563,7 @@ async fn maintenance_loop(
 
                 match store.prune_oldest(&pool, Duration::ZERO).await {
                     Ok(PruneOutcome::Noop) => {}
+                    Ok(PruneOutcome::AlreadyPruned { .. }) => {}
                     Ok(PruneOutcome::Pruned { .. }) => {
                         counters.queue_prune_ok.fetch_add(1, Ordering::Relaxed);
                     }
@@ -599,6 +600,7 @@ async fn maintenance_loop(
 
                 match store.prune_oldest_leases(&pool).await {
                     Ok(PruneOutcome::Noop) => {}
+                    Ok(PruneOutcome::AlreadyPruned { .. }) => {}
                     Ok(PruneOutcome::Pruned { .. }) => {
                         counters.lease_prune_ok.fetch_add(1, Ordering::Relaxed);
                     }

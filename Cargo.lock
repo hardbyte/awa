@@ -445,6 +445,7 @@ version = "0.6.1"
 dependencies = [
  "awa-model",
  "opentelemetry",
+ "opentelemetry_sdk",
 ]
 
 [[package]]
