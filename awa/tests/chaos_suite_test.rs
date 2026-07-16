@@ -399,6 +399,78 @@ async fn backdate_compact_claims(
     queue: &str,
     kind: Option<&str>,
 ) -> u64 {
+    // Canonical open-member predicate: not closed by row or range closure
+    // evidence, not materialised into `leases`, and not already terminal or
+    // deferred (completion closes via done_entries / deferred_jobs /
+    // dlq_entries, not lease_claim_closures).
+    let open_member = format!(
+        r#"
+          NOT EXISTS (
+              SELECT 1 FROM {schema}.lease_claim_closures AS closures
+              WHERE closures.claim_slot = batches.claim_slot
+                AND closures.job_id = items.job_id
+                AND closures.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+              WHERE closure_batches.claim_slot = batches.claim_slot
+                AND closure_batches.receipt_ranges @> items.receipt_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.leases AS lease
+              WHERE lease.job_id = items.job_id
+                AND lease.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.done_entries AS done
+              WHERE done.job_id = items.job_id
+                AND done.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.deferred_jobs AS deferred
+              WHERE deferred.job_id = items.job_id
+                AND deferred.run_lease = items.run_lease
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.dlq_entries AS dlq
+              WHERE dlq.job_id = items.job_id
+                AND dlq.run_lease = items.run_lease
+          )
+        "#,
+    );
+
+    // Rescue staleness is COALESCE(attempt_state.heartbeat_at, claimed_at),
+    // and the batch `claimed_at` we age below is shared by every member.
+    // Pin every untargeted open member's effective heartbeat to now first
+    // (DO NOTHING preserves an existing fresher row) so only the targeted
+    // members read as stale after the cursor moves.
+    let shield_sql = format!(
+        r#"
+        INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+        SELECT items.job_id, items.run_lease, clock_timestamp(), clock_timestamp()
+        FROM {schema}.lease_claim_batches AS batches
+        CROSS JOIN LATERAL unnest(
+            batches.job_ids, batches.run_leases, batches.receipt_ids
+        ) AS items(job_id, run_lease, receipt_id)
+        WHERE batches.queue = $1
+          AND $2::text IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM {schema}.ready_entries AS ready
+              WHERE ready.job_id = items.job_id
+                AND ready.queue = batches.queue
+                AND ready.kind = $2
+          )
+          AND {open_member}
+        ON CONFLICT (job_id, run_lease) DO NOTHING
+        "#,
+    );
+    sqlx::query(&shield_sql)
+        .bind(queue)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .expect("Failed to pin untargeted compact claim heartbeats");
+
     let attempt_sql = format!(
         r#"
         INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
@@ -415,22 +487,7 @@ async fn backdate_compact_claims(
                 AND ready.queue = batches.queue
                 AND ready.kind = $2
           ))
-          AND NOT EXISTS (
-              SELECT 1 FROM {schema}.lease_claim_closures AS closures
-              WHERE closures.claim_slot = batches.claim_slot
-                AND closures.job_id = items.job_id
-                AND closures.run_lease = items.run_lease
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
-              WHERE closure_batches.claim_slot = batches.claim_slot
-                AND closure_batches.receipt_ranges @> items.receipt_id
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM {schema}.leases AS lease
-              WHERE lease.job_id = items.job_id
-                AND lease.run_lease = items.run_lease
-          )
+          AND {open_member}
         ON CONFLICT (job_id, run_lease)
         DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at,
                       updated_at = EXCLUDED.updated_at
@@ -451,11 +508,14 @@ async fn backdate_compact_claims(
         WHERE batches.queue = $1
           AND ($2::text IS NULL OR EXISTS (
               SELECT 1
-              FROM unnest(batches.job_ids) AS members(job_id)
+              FROM unnest(
+                  batches.job_ids, batches.run_leases, batches.receipt_ids
+              ) AS items(job_id, run_lease, receipt_id)
               JOIN {schema}.ready_entries AS ready
-                ON ready.job_id = members.job_id
+                ON ready.job_id = items.job_id
                AND ready.queue = batches.queue
               WHERE ready.kind = $2
+                AND {open_member}
           ))
         "#,
     );

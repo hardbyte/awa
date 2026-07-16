@@ -327,8 +327,8 @@ impl MaintenanceBranchTracker {
                 return 0;
             }
             let interval_ms = tick_interval.as_millis().max(1);
-            let ticks = (2 * last_duration.as_millis()).div_ceil(interval_ms) as u32;
-            ticks.clamp(1, cooldown_ticks)
+            let ticks = (2 * last_duration.as_millis()).div_ceil(interval_ms);
+            ticks.clamp(1, cooldown_ticks as u128) as u32
         };
         if let Some(last_duration) = state.last_duration.take() {
             // Integer-ratio thresholds — avoid f64 in the hot path.
