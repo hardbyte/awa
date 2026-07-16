@@ -45,7 +45,7 @@ How `JobResult` / outcomes map to events:
 | claim commits | `Started` |
 | `Ok(Completed)` | `Completed` |
 | `Ok(RetryAfter)` / retryable `Err` (retries left) | `Retried` |
-| retries exhausted, or `Err(Terminal)` | `Exhausted` |
+| retries exhausted (final attempt returned `RetryAfter` or a retryable `Err`), or `Err(Terminal)` | `Exhausted` |
 | `Ok(Cancel)` | `Cancelled` |
 | `Ok(Snooze)` | none — an internal reschedule, not an outcome |
 | `Ok(WaitForCallback)` | `WaitingForCallback` |

@@ -374,6 +374,229 @@ async fn test_typed_exhausted_event_handler_runs() {
     assert_eq!(stored.state, JobState::Failed);
 }
 
+/// A handler that always requests `RetryAfter` must exhaust at
+/// `max_attempts`: RetryAfter reports a failed attempt, so the attempt
+/// budget bounds it exactly like a retryable error. The job gets exactly
+/// `max_attempts` executions and then fails with an `Exhausted` event.
+#[tokio::test]
+async fn test_retry_after_on_final_attempt_exhausts() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let pool = setup_pool().await;
+    let queue = "lifecycle_retry_after_exhaust";
+    clean_queue(&pool, queue).await;
+
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_executions = executions.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<HookJob, _, _>(move |_args, _ctx| {
+            let executions = handler_executions.clone();
+            async move {
+                executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(JobResult::RetryAfter(Duration::from_millis(50)))
+            }
+        })
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                if let JobEvent::Exhausted {
+                    job,
+                    error,
+                    attempt,
+                    ..
+                } = event
+                {
+                    tx.send((job.state, error, attempt)).unwrap();
+                }
+            }
+        })
+        .build()
+        .unwrap();
+
+    let inserted = awa::insert_with(
+        &pool,
+        &HookJob {
+            action: "retry_after".into(),
+            value: "delta".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            max_attempts: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let (event_state, error, attempt) = recv_event(&mut rx).await;
+    // Give a would-be third execution time to surface before shutdown.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(event_state, JobState::Failed);
+    assert_eq!(attempt, 2);
+    assert!(
+        error.contains("max_attempts exhausted"),
+        "exhaustion error must name the cause: {error}"
+    );
+    assert_eq!(
+        executions.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a job gets exactly max_attempts executions"
+    );
+
+    let stored = admin::get_job(&pool, inserted.id).await.unwrap();
+    assert_eq!(stored.state, JobState::Failed);
+    assert_eq!(stored.attempt, 2);
+}
+
+/// With the DLQ enabled, a RetryAfter exhaustion lands in `dlq_entries`
+/// with the same `max_attempts_exhausted` reason as a retryable-error
+/// exhaustion.
+#[tokio::test]
+async fn test_retry_after_exhaustion_lands_in_dlq() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let pool = setup_pool().await;
+    let queue = "lifecycle_retry_after_dlq";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .dlq_enabled_by_default(true)
+        .register::<HookJob, _, _>(|_args, _ctx| async move {
+            Ok(JobResult::RetryAfter(Duration::from_millis(50)))
+        })
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                if let JobEvent::Exhausted { attempt, .. } = event {
+                    tx.send(attempt).unwrap();
+                }
+            }
+        })
+        .build()
+        .unwrap();
+
+    let inserted = awa::insert_with(
+        &pool,
+        &HookJob {
+            action: "retry_after".into(),
+            value: "epsilon".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            max_attempts: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let attempt = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(attempt, 1);
+    let dlq_row = awa::model::dlq::get_dlq_job(&pool, inserted.id)
+        .await
+        .unwrap()
+        .expect("exhausted RetryAfter job must be in the DLQ");
+    assert_eq!(dlq_row.reason, "max_attempts_exhausted");
+}
+
+/// A RetryAfter below the bound keeps its documented meaning: the attempt
+/// is rescheduled with a `Retried` event and the next attempt runs.
+#[tokio::test]
+async fn test_retry_after_below_bound_still_retries() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let pool = setup_pool().await;
+    let queue = "lifecycle_retry_after_retries";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<HookJob, _, _>(|_args, ctx| {
+            let attempt = ctx.job.attempt;
+            async move {
+                if attempt == 1 {
+                    Ok(JobResult::RetryAfter(Duration::from_millis(50)))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+        })
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                match event {
+                    JobEvent::Retried { attempt, .. } => tx.send(("retried", attempt)).unwrap(),
+                    JobEvent::Completed { job, .. } => tx.send(("completed", job.attempt)).unwrap(),
+                    _ => {}
+                }
+            }
+        })
+        .build()
+        .unwrap();
+
+    let inserted = awa::insert_with(
+        &pool,
+        &HookJob {
+            action: "retry_after".into(),
+            value: "zeta".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let first = recv_event(&mut rx).await;
+    let second = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(first.0, "retried");
+    assert_eq!(second, ("completed", 2));
+
+    let stored = admin::get_job(&pool, inserted.id).await.unwrap();
+    assert_eq!(stored.state, JobState::Completed);
+    assert_eq!(stored.attempt, 2);
+}
+
 #[tokio::test]
 async fn test_typed_cancelled_event_handler_runs() {
     let _permit = test_gate()
