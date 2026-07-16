@@ -1321,6 +1321,33 @@ impl Client {
         }
     }
 
+    /// The queue-storage readiness probe checks every relation this binary
+    /// touches, so it fails both when queue-storage preparation never ran and
+    /// when an active schema simply predates this binary's migrations (a
+    /// binary-first rolling upgrade). The operator fix differs, so name the
+    /// actual cause.
+    async fn queue_storage_not_ready_error(
+        &self,
+        schema: &str,
+        role_hint: &str,
+    ) -> awa_model::AwaError {
+        let version = awa_model::migrations::current_version_readonly(&self.pool)
+            .await
+            .unwrap_or(0);
+        if version > 0 && version < awa_model::migrations::CURRENT_VERSION {
+            return awa_model::AwaError::Validation(format!(
+                "queue storage schema '{schema}' is missing relations this runtime requires: \
+                 schema version {version} is older than this binary's version {}; \
+                 run `awa migrate` before starting this runtime",
+                awa_model::migrations::CURRENT_VERSION
+            ));
+        }
+        awa_model::AwaError::Validation(format!(
+            "queue storage schema '{schema}' is not prepared; \
+             run schema preparation before starting {role_hint} runtimes"
+        ))
+    }
+
     async fn resolve_effective_storage(&self) -> Result<RuntimeStorage, awa_model::AwaError> {
         let Some(runtime) = self.storage.queue_storage() else {
             return Ok(RuntimeStorage::Canonical);
@@ -1350,18 +1377,16 @@ impl Client {
                     )
                 })?;
                 if !prepared_schema_ready {
-                    return Err(awa_model::AwaError::Validation(format!(
-                        "queue storage schema '{schema}' is not prepared; run schema preparation before starting queue-storage-target runtimes"
-                    )));
+                    return Err(self
+                        .queue_storage_not_ready_error(&schema, "queue-storage-target")
+                        .await);
                 }
                 Ok(RuntimeStorage::QueueStorage(runtime.clone()))
             }
             TransitionWorkerRole::Auto => {
                 if let Some(schema) = expected_schema.as_deref() {
                     if !prepared_schema_ready {
-                        return Err(awa_model::AwaError::Validation(format!(
-                            "queue storage schema '{schema}' is not prepared; run schema preparation before starting 0.6 runtimes"
-                        )));
+                        return Err(self.queue_storage_not_ready_error(schema, "0.6").await);
                     }
                 }
 
