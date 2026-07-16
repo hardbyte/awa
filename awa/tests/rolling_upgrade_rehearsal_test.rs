@@ -28,6 +28,78 @@ use uuid::Uuid;
 
 static REHEARSAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Machine-readable evidence for one rehearsal cell (#427): phase
+/// transitions, census watermarks, flip status, and the final
+/// reconciliation, written as JSON when `AWA_REHEARSAL_ARTIFACT_DIR` is
+/// set (each cell writes `<dir>/<cell>.json`). The release gate uploads
+/// the directory as a workflow artifact, so a failed pre-tag run leaves
+/// inspectable evidence rather than only scrollback. Without the env var
+/// this is a no-op, so local `cargo test` runs are unaffected.
+struct RehearsalReport {
+    cell: &'static str,
+    started: Instant,
+    phases: Vec<serde_json::Value>,
+    facts: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RehearsalReport {
+    fn new(cell: &'static str) -> Self {
+        Self {
+            cell,
+            started: Instant::now(),
+            phases: Vec::new(),
+            facts: serde_json::Map::new(),
+        }
+    }
+
+    /// Record a phase transition with elapsed-ms watermark.
+    fn phase(&mut self, name: &str) {
+        eprintln!("[rehearsal:{}] phase: {name}", self.cell);
+        self.phases.push(serde_json::json!({
+            "name": name,
+            "elapsed_ms": self.started.elapsed().as_millis() as u64,
+        }));
+    }
+
+    /// Record a named fact (census count, flip outcome, version…).
+    fn fact(&mut self, key: &str, value: impl Into<serde_json::Value>) {
+        self.facts.insert(key.to_string(), value.into());
+    }
+
+    /// Write the cell report. Called on the success path only — a panic
+    /// means no report file, which the gate treats as failure evidence in
+    /// combination with the captured test output.
+    fn finish(mut self) {
+        self.phase("complete");
+        let Some(dir) = env::var_os("AWA_REHEARSAL_ARTIFACT_DIR") else {
+            return;
+        };
+        let report = serde_json::json!({
+            "cell": self.cell,
+            "result": "pass",
+            "current_version": env!("CARGO_PKG_VERSION"),
+            "git_sha": option_env!("GITHUB_SHA"),
+            "released_python": env::var("AWA_N_MINUS_ONE_PYTHON").ok(),
+            "duration_ms": self.started.elapsed().as_millis() as u64,
+            "phases": self.phases,
+            "facts": serde_json::Value::Object(self.facts),
+        });
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("create rehearsal artifact dir");
+        let path = dir.join(format!("{}.json", self.cell));
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&report).expect("serialize report"),
+        )
+        .expect("write rehearsal report");
+        eprintln!(
+            "[rehearsal:{}] report written to {}",
+            self.cell,
+            path.display()
+        );
+    }
+}
+
 fn database_url() -> String {
     env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:5432/awa_test".to_string())
@@ -735,6 +807,8 @@ async fn wait_for_drain(
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
 async fn test_migrate_first_mixed_fleet_flip_and_fence() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let mut report = RehearsalReport::new("migrate_first_mixed_fleet_flip_and_fence");
+    report.phase("start");
     let pool = pool().await;
     reset_database(&pool).await;
     let queue = format!("upgrade_rehearsal_{}", Uuid::new_v4().simple());
@@ -748,6 +822,7 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
         .expect("initial storage status");
     assert_eq!(initial_status.state, "active");
     assert_eq!(initial_status.active_engine, "queue_storage");
+    report.phase("released_v040_installed");
 
     let producer = start_producer(pool.clone(), queue.clone());
     wait_for_accepted(&producer, 25, Duration::from_secs(20)).await;
@@ -764,6 +839,7 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
             .await
             .expect("read ring authority");
     assert_eq!(authority, "columns");
+    report.phase("migrated_to_v043_columns_authority");
 
     let current_completed = Arc::new(Mutex::new(HashSet::new()));
     let current = current_client(pool.clone(), &queue, current_completed.clone());
@@ -776,11 +852,13 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
         Duration::from_secs(30),
     )
     .await;
+    report.phase("mixed_fleet_both_completing");
 
     // Leave the released runtime as the only rotator and prove it can advance
     // the authoritative columns after the current worker's last shadow write.
     current.shutdown(Duration::from_secs(5)).await;
     wait_for_old_only_rotation(&pool, Duration::from_secs(30)).await;
+    report.phase("released_only_rotation_advanced_columns");
 
     let accepted = producer.stop().await;
     let store = QueueStorage::new(QueueStorageConfig {
@@ -815,6 +893,8 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
         .await
         .expect_err("flip must refuse while the released heartbeat is fresh");
     assert!(refusal.to_string().contains("refusing to flip"));
+    report.phase("flip_refused_while_released_heartbeat_fresh");
+    report.fact("flip_blocking_instances", status.blocking_instances);
 
     tokio::time::sleep(Duration::from_secs(1)).await;
     let flipped: String = sqlx::query_scalar("SELECT awa.flip_ring_authority($1, FALSE, 0.5)")
@@ -823,6 +903,8 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
         .await
         .expect("flip after released heartbeat becomes stale");
     assert_eq!(flipped, "ledger");
+    report.phase("authority_flipped");
+    report.fact("authority", "ledger");
 
     for (ring, expected) in final_columns {
         let (_, ledger) = ring_cursor_pair(&pool, ring).await;
@@ -833,6 +915,7 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
     }
 
     assert_released_worker_is_fenced(&queue).await;
+    report.phase("returning_released_artifact_fenced");
 
     let current_after_flip = current_client(pool.clone(), &queue, current_completed.clone());
     current_after_flip
@@ -867,16 +950,22 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
 
     let mut observed = old_worker.completed();
     observed.extend(current_completed.lock().unwrap().iter().copied());
+    report.fact("accepted", all_accepted.len());
+    report.fact("observed", observed.len());
     assert_eq!(
         observed, all_accepted,
         "accepted and observed job sets differ"
     );
+    report.phase("reconciled_exact");
+    report.finish();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
 async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let mut report = RehearsalReport::new("migrate_first_deadline_rescue_handoff");
+    report.phase("start");
     let pool = pool().await;
     reset_database(&pool).await;
     let queue = format!("upgrade_deadline_{}", Uuid::new_v4().simple());
@@ -887,10 +976,12 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300)).await;
     assert_eq!(schema_version(&pool).await, 40);
 
+    report.phase("released_v040_installed");
     migrations::run(&pool)
         .await
         .expect("migrate with released deadline worker live");
     assert_eq!(schema_version(&pool).await, 43);
+    report.phase("migrated_to_v043");
 
     let inserted = insert_with(
         &pool,
@@ -904,6 +995,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     .expect("insert deadline-bound job after migration");
     wait_for_released_start(&old_worker, seq, Duration::from_secs(20)).await;
     wait_for_expired_compact_claim(&pool, inserted.id, Duration::from_secs(10)).await;
+    report.phase("compact_claim_expired_under_released_leader");
 
     // The released runtime runs its deadline maintenance every 100ms, but
     // that implementation only scans row-local claims. The v043 SQL claim
@@ -960,6 +1052,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
         .expect("claim must remain visible during mixed-version leadership");
     assert_eq!(still_pending.state, JobState::Running);
     assert_eq!(still_pending.attempt, 1);
+    report.phase("claim_pending_while_released_holds_leadership");
 
     // Hard-kill the released maintenance leader mid-job. Current must take
     // leadership and rescue the expired compact claim via the deadline path.
@@ -992,6 +1085,9 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
         !old_worker.completed().contains(&seq),
         "released worker must not report a competing completion"
     );
+    report.phase("rescued_exactly_once_by_current_leader");
+    report.fact("rescued_attempt", 2);
+    report.finish();
 }
 
 /// Binary-first upgrade order: the current binary is deployed before
@@ -1005,6 +1101,8 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
 async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let mut report = RehearsalReport::new("binary_first_refusal_then_roll");
+    report.phase("start");
     let pool = pool().await;
     reset_database(&pool).await;
     let queue = format!("upgrade_binary_first_{}", Uuid::new_v4().simple());
@@ -1034,6 +1132,7 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
         refused_completions.lock().unwrap().is_empty(),
         "a refused runtime must not complete any work"
     );
+    report.phase("current_refused_on_v040");
 
     // The released fleet alone must keep draining traffic while the current
     // deployment is refused.
@@ -1061,6 +1160,7 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
             .await
             .expect("read ring authority");
     assert_eq!(authority, "columns");
+    report.phase("migrated_with_released_fleet_live");
 
     // The roll now completes: the same binary that was refused on v040 must
     // start unaided and join the released fleet.
@@ -1078,6 +1178,7 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
         Duration::from_secs(30),
     )
     .await;
+    report.phase("roll_completed_unaided_mixed_fleet");
 
     // Retire the released fleet the adversarial way: SIGKILL mid-traffic.
     // Any in-flight released claim must be rescued by the current fleet for
@@ -1101,9 +1202,12 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
 
     // Flip while the stamped current fleet stays live: only fresh NULL
     // binary_version heartbeats (pre-flip binaries) may block the flip.
+    report.phase("released_fleet_hard_killed");
     flip_after_released_heartbeats_stale(&pool).await;
+    report.phase("authority_flipped_with_stamped_fleet_live");
 
     assert_released_worker_is_fenced(&queue).await;
+    report.phase("returning_released_artifact_fenced");
 
     // The same current runtime keeps operating across the flip, with no
     // restart, and drains post-flip traffic in ledger authority.
@@ -1134,10 +1238,14 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
 
     let mut observed = old_worker.completed();
     observed.extend(current_completed.lock().unwrap().iter().copied());
+    report.fact("accepted", all_accepted.len());
+    report.fact("observed", observed.len());
     assert_eq!(
         observed, all_accepted,
         "accepted and observed job sets differ"
     );
+    report.phase("reconciled_exact");
+    report.finish();
 }
 
 /// Migrate-first upgrade under the full designed-outcome workload: a backlog
@@ -1154,6 +1262,8 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
 async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let mut report = RehearsalReport::new("migrate_first_full_workload");
+    report.phase("start");
     let pool = pool().await;
     reset_database(&pool).await;
     let run_id = Uuid::new_v4().simple().to_string();
@@ -1173,6 +1283,7 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     let mut expectations = Vec::new();
     let pre_flip_parked = bank_workload_batch(&pool, &workload_queue, 0, &mut expectations).await;
 
+    report.phase("workload_banked_on_v040");
     migrations::run(&pool)
         .await
         .expect("migration must apply with the released fleet and banked backlog live");
@@ -1197,6 +1308,7 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
         Duration::from_secs(30),
     )
     .await;
+    report.phase("migrated_mixed_fleet_completing");
 
     // Cron work fires while both fleets are live, before any flip.
     let cron_name = format!("upgrade_rehearsal_cron_{run_id}");
@@ -1256,8 +1368,10 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     )
     .await;
 
+    report.phase("pre_flip_workload_drained");
     flip_after_released_heartbeats_stale(&pool).await;
     assert_released_worker_is_fenced(&queue).await;
+    report.phase("flipped_and_fenced");
 
     // The same designed workload must reconcile identically in ledger
     // authority, including a post-flip cron fire.
@@ -1347,10 +1461,16 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
 
     let mut observed = old_worker.completed();
     observed.extend(simple_completed.lock().unwrap().iter().copied());
+    report.fact("workload_jobs", expectations.len());
+    report.fact("designed_failures", designed_failure_ids.len());
+    report.fact("simple_accepted", accepted.len());
+    report.fact("simple_observed", observed.len());
     assert_eq!(
         observed, accepted,
         "accepted and observed simple job sets differ"
     );
+    report.phase("designed_outcomes_reconciled");
+    report.finish();
 }
 
 /// Overlapped upgrade order: the current deployment and the migration race
@@ -1362,6 +1482,8 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
 async fn test_overlap_current_roll_races_live_migration() {
     let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let mut report = RehearsalReport::new("overlap_roll_races_migration");
+    report.phase("start");
     let pool = pool().await;
     reset_database(&pool).await;
     let queue = format!("upgrade_overlap_{}", Uuid::new_v4().simple());
@@ -1406,6 +1528,7 @@ async fn test_overlap_current_roll_races_live_migration() {
     };
     let (current, migration_result) = tokio::join!(start_retry, migrations::run(&pool));
     migration_result.expect("migration must apply with both fleets and the producer live");
+    report.phase("migration_committed_during_roll");
     assert_eq!(schema_version(&pool).await, 43);
 
     // Both versions claim and complete concurrently after migration, before
@@ -1418,6 +1541,7 @@ async fn test_overlap_current_roll_races_live_migration() {
         Duration::from_secs(30),
     )
     .await;
+    report.phase("both_versions_completing_pre_flip");
 
     let accepted = producer.stop().await;
     let store = QueueStorage::new(QueueStorageConfig {
@@ -1439,6 +1563,7 @@ async fn test_overlap_current_roll_races_live_migration() {
     old_worker.shutdown().await;
     flip_after_released_heartbeats_stale(&pool).await;
     assert_released_worker_is_fenced(&queue).await;
+    report.phase("flipped_and_fenced");
 
     let mut all_accepted = accepted;
     let first_post_flip = all_accepted.iter().max().copied().unwrap_or(0) + 1;
@@ -1467,8 +1592,12 @@ async fn test_overlap_current_roll_races_live_migration() {
 
     let mut observed = old_worker.completed();
     observed.extend(current_completed.lock().unwrap().iter().copied());
+    report.fact("accepted", all_accepted.len());
+    report.fact("observed", observed.len());
     assert_eq!(
         observed, all_accepted,
         "accepted and observed job sets differ"
     );
+    report.phase("reconciled_exact");
+    report.finish();
 }

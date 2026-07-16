@@ -1,0 +1,124 @@
+# Release gate (#427 / #383): the adversarial mixed-version rehearsal that
+# must pass on the exact release-candidate SHA before artifacts publish.
+#
+# Two entry points:
+#   * workflow_dispatch — run manually against a candidate ref BEFORE
+#     tagging (the required pre-tag check in the release process).
+#   * workflow_call — invoked by release.yml on tag push, so even a tag
+#     created without the manual pre-check cannot publish until the same
+#     rehearsal passes on the tagged commit. Publishing is gated, not
+#     merely observed.
+#
+# Evidence: each rehearsal cell writes a machine-readable JSON report
+# (phases with elapsed-ms watermarks, census counts, flip status, exact
+# reconciliation) via AWA_REHEARSAL_ARTIFACT_DIR; the directory is
+# uploaded on success AND failure, alongside test output and Postgres
+# logs on failure.
+
+name: Release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      n_minus_one:
+        description: "Released N-1 awa-pg version to rehearse against"
+        required: false
+        default: "0.6.3"
+  workflow_call:
+    inputs:
+      n_minus_one:
+        description: "Released N-1 awa-pg version to rehearse against"
+        required: false
+        default: "0.6.3"
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  rolling-upgrade-rehearsal:
+    name: Released N-1 → candidate upgrade rehearsal
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: astral-sh/setup-uv@v5
+      - name: Install released N-1 artifact
+        run: |
+          uv venv --quiet --clear .compat-venv-gate
+          uv pip install --quiet --python .compat-venv-gate \
+            "awa-pg==${{ inputs.n_minus_one || github.event.inputs.n_minus_one || '0.6.3' }}"
+      - name: Run mixed-version upgrade rehearsal
+        run: |
+          set -o pipefail
+          cargo test --package awa --test rolling_upgrade_rehearsal_test -- --ignored --nocapture 2>&1 \
+            | tee rehearsal-output.log
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+          AWA_N_MINUS_ONE_PYTHON: .compat-venv-gate/bin/python
+          AWA_REHEARSAL_ARTIFACT_DIR: ${{ github.workspace }}/rehearsal-artifacts
+      - name: Collect Postgres logs
+        if: failure()
+        run: docker logs "${{ job.services.postgres.id }}" > postgres.log 2>&1 || true
+      - name: Upload rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-rehearsal-${{ github.sha }}
+          path: |
+            rehearsal-artifacts/
+            rehearsal-output.log
+            postgres.log
+          retention-days: 90
+          if-no-files-found: warn
+
+  compat-matrix:
+    name: Pinned release-artifact compat matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: astral-sh/setup-uv@v5
+      - name: Build current awa CLI
+        run: cargo build -p awa-cli
+      - name: Run compat matrix (pinned release artifacts vs newest schema)
+        run: ./scripts/compat-matrix.sh
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
