@@ -89,6 +89,15 @@ jobs:
           PY
 
   # ─── Cross-compile CLI binaries ──────────────────────────────────────
+  # ─── Adversarial upgrade rehearsal gate (#427 / #383) ───────────────
+  # The mixed-version rehearsal must pass on the exact tagged commit
+  # before anything publishes. Tagging without the manual pre-tag
+  # dispatch of release-gate.yml therefore cannot ship artifacts.
+  release-gate:
+    name: Release gate — upgrade rehearsal
+    needs: [version-check]
+    uses: ./.github/workflows/release-gate.yml
+
   build-binaries:
     name: Build — ${{ matrix.target }}
     needs: [version-check]
@@ -280,7 +289,7 @@ jobs:
   # ─── Multi-arch Docker image ─────────────────────────────────────────
   docker:
     name: Docker — CLI
-    needs: [build-binaries]
+    needs: [build-binaries, release-gate]
     runs-on: ubuntu-latest
     env:
       IMAGE_NAME: awa
@@ -425,7 +434,7 @@ jobs:
   # ─── GitHub Release ──────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [build-binaries, python-wheels, cli-wheels]
+    needs: [build-binaries, python-wheels, cli-wheels, release-gate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -584,7 +593,7 @@ jobs:
   # ─── Publish Python SDK to PyPI ──────────────────────────────────────
   publish-pypi-sdk:
     name: Publish SDK to PyPI
-    needs: [python-wheels]
+    needs: [python-wheels, release-gate]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -603,7 +612,7 @@ jobs:
   # ─── Publish CLI to PyPI ────────────────────────────────────────────
   publish-pypi-cli:
     name: Publish CLI to PyPI
-    needs: [cli-wheels]
+    needs: [cli-wheels, release-gate]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -631,7 +640,7 @@ jobs:
   # first publish.
   publish-crates:
     name: Publish to crates.io
-    needs: [version-check]
+    needs: [version-check, release-gate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
