@@ -673,7 +673,7 @@
           "id": 704,
           "type": "timeseries",
           "title": "Prune rate by ring + outcome",
-          "description": "Ring prune attempts/sec by outcome. `pruned` advancing = ring reclaiming partitions. `skipped_active` rising = target slot still has live state. `blocked` = lock contention (held-tx, autovacuum).",
+          "description": "Ring prune attempts/sec by outcome. `pruned` = destructive reclaim. `already_pruned` = idle tick avoided repeat DDL. `skipped_active` = target still live. `blocked` = lock contention.",
           "gridPos": {
             "x": 12,
             "y": 50,
@@ -761,6 +761,37 @@
           "datasource": {
             "uid": "${DS_PROMETHEUS}"
           }
+        },
+        {
+          "id": 707,
+          "type": "timeseries",
+          "title": "Prune database phase latency p99",
+          "description": "Successful destructive prune latency split by explicit child lock, TRUNCATE, and COMMIT. A high truncate phase with low lock time points to database storage/WAL latency rather than relation contention.",
+          "gridPos": {
+            "x": 0,
+            "y": 66,
+            "w": 24,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "s"
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by(le, awa_ring, awa_maintenance_phase) (rate(awa_maintenance_prune_duration_seconds_bucket[5m])))",
+              "legendFormat": "{{awa_ring}} · {{awa_maintenance_phase}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
         }
       ]
     }
@@ -772,6 +803,6 @@
   "timezone": "",
   "title": "Awa Job Queue",
   "uid": "awa-job-queue",
-  "version": 4,
+  "version": 5,
   "refresh": "30s"
 }

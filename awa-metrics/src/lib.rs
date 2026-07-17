@@ -69,6 +69,7 @@ pub mod names {
     pub const MAINTENANCE_ROTATE_SKIPPED_ROWS: &str = "awa.maintenance.rotate.skipped_rows";
     pub const MAINTENANCE_PRUNE_ATTEMPTS: &str = "awa.maintenance.prune.attempts";
     pub const MAINTENANCE_PRUNE_SKIPPED_ROWS: &str = "awa.maintenance.prune.skipped_rows";
+    pub const MAINTENANCE_PRUNE_DURATION: &str = "awa.maintenance.prune.duration";
     pub const STORAGE_TRANSITION_READY: &str = "awa.storage.transition_ready";
     pub const STORAGE_CANONICAL_LIVE_BACKLOG: &str = "awa.storage.canonical_live_backlog";
     pub const STORAGE_LIVE_RUNTIME_CAPABILITY: &str = "awa.storage.live_runtime_capability";
@@ -204,6 +205,9 @@ pub struct AwaMetrics {
     pub maintenance_prune_attempts: Counter<u64>,
     /// Magnitude of the reason count when prune returns SkippedActive.
     pub maintenance_prune_skipped_rows: Histogram<u64>,
+    /// Successful destructive prune phase latency, attributed by ring and
+    /// phase (`lock`, `truncate`, `commit`).
+    pub maintenance_prune_duration_seconds: Histogram<f64>,
     /// Per-branch wall-clock duration for the maintenance leader's main
     /// `tokio::select!` loop, attributed by `awa.maintenance.branch`. Records
     /// the time from the moment a select arm fires to the moment its body
@@ -479,6 +483,14 @@ impl AwaMetrics {
                 .u64_histogram(names::MAINTENANCE_PRUNE_SKIPPED_ROWS)
                 .with_description("Magnitude of the reason count on a SkippedActive prune")
                 .with_unit("{row}")
+                .build(),
+            maintenance_prune_duration_seconds: meter
+                .f64_histogram(names::MAINTENANCE_PRUNE_DURATION)
+                .with_description(
+                    "Successful ring prune latency by ring and database phase (lock/truncate/commit)",
+                )
+                .with_unit("s")
+                .with_boundaries(WAIT_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             maintenance_branch_duration_seconds: meter
                 .f64_histogram(names::MAINTENANCE_BRANCH_DURATION)
@@ -1012,7 +1024,7 @@ impl AwaMetrics {
                     self.maintenance_rotate_attempts.add(1, &attrs);
                 }
             }
-            awa_model::RotateOutcome::SkippedIdle { slot } => {
+            awa_model::RotateOutcome::SkippedIdle { slot, generation } => {
                 // Idle skip (#371): the ring received no writes, so
                 // rotation deliberately left the cursor in place. Expected
                 // steady state on a quiet queue — dashboards should read a
@@ -1026,6 +1038,7 @@ impl AwaMetrics {
                 self.maintenance_rotate_attempts.add(1, &attrs);
                 let slot_attrs = [opentelemetry::KeyValue::new("awa.ring", ring)];
                 self.ring_current_slot.record(*slot as i64, &slot_attrs);
+                self.ring_generation.record(*generation, &slot_attrs);
             }
         }
     }
@@ -1074,6 +1087,31 @@ impl AwaMetrics {
         if let Some(c) = count {
             self.maintenance_prune_skipped_rows.record(c as u64, &attrs);
         }
+        if let awa_model::PruneOutcome::Pruned { durations, .. } = outcome {
+            for (phase, duration) in [
+                ("lock", durations.lock),
+                ("truncate", durations.truncate),
+                ("commit", durations.commit),
+            ] {
+                let phase_attrs = [
+                    opentelemetry::KeyValue::new("awa.ring", ring),
+                    opentelemetry::KeyValue::new("awa.maintenance.phase", phase),
+                ];
+                self.maintenance_prune_duration_seconds
+                    .record(duration.as_secs_f64(), &phase_attrs);
+            }
+        }
+    }
+
+    /// Record an idle maintenance tick that skipped destructive prune because
+    /// the exact sealed generation was already reclaimed by this leader.
+    pub fn record_prune_already_pruned(&self, ring: &'static str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", ring),
+            opentelemetry::KeyValue::new("awa.ring.outcome", "already_pruned"),
+            opentelemetry::KeyValue::new("awa.ring.reason", "none"),
+        ];
+        self.maintenance_prune_attempts.add(1, &attrs);
     }
 }
 
@@ -1087,6 +1125,10 @@ impl Default for AwaMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+    use std::collections::BTreeSet;
 
     /// The info gauges are no-op under a default (global) meter provider —
     /// this just confirms the method signatures build and don't panic when
@@ -1119,5 +1161,73 @@ mod tests {
             &["outbound".to_string()],
         );
         metrics.record_job_kind_info("minimal", None, None, None, None, &[]);
+    }
+
+    #[test]
+    fn prune_metrics_export_database_phases_and_already_pruned_outcome() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let metrics = AwaMetrics::new(&provider.meter("awa-metrics-test"));
+
+        metrics.record_prune_outcome(
+            "queue",
+            &awa_model::PruneOutcome::Pruned {
+                slot: 3,
+                generation: 19,
+                carried_failed_rows: 0,
+                durations: awa_model::PruneDurations {
+                    lock: Duration::from_millis(7),
+                    truncate: Duration::from_millis(647),
+                    commit: Duration::from_millis(581),
+                },
+            },
+        );
+        metrics.record_prune_already_pruned("queue");
+        provider.force_flush().expect("flush metrics");
+        let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
+
+        let mut phases = BTreeSet::new();
+        let mut saw_already_pruned = false;
+        for resource in &resource_metrics {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    match (metric.name(), metric.data()) {
+                        (
+                            names::MAINTENANCE_PRUNE_DURATION,
+                            AggregatedMetrics::F64(MetricData::Histogram(histogram)),
+                        ) => {
+                            for point in histogram.data_points() {
+                                assert_eq!(point.count(), 1);
+                                for attribute in point.attributes() {
+                                    if attribute.key.as_str() == "awa.maintenance.phase" {
+                                        phases.insert(attribute.value.as_str().into_owned());
+                                    }
+                                }
+                            }
+                        }
+                        (
+                            names::MAINTENANCE_PRUNE_ATTEMPTS,
+                            AggregatedMetrics::U64(MetricData::Sum(sum)),
+                        ) => {
+                            saw_already_pruned |= sum.data_points().any(|point| {
+                                point.attributes().any(|attribute| {
+                                    attribute.key.as_str() == "awa.ring.outcome"
+                                        && attribute.value.as_str() == "already_pruned"
+                                })
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            phases,
+            BTreeSet::from(["commit".into(), "lock".into(), "truncate".into()])
+        );
+        assert!(saw_already_pruned);
     }
 }
