@@ -102,6 +102,15 @@ This is a breaking schema change even though the external API does not change.
 3. The legacy `open_receipt_claims` table is not part of the live read path. `prepare_schema()` drops it when empty, and refuses to proceed if it still contains rows so an operator can drain or reverse-migrate those rows deliberately.
 4. Subsequent claim, complete, rescue, and count paths target the partitioned claim/closure-evidence tables. The live receipt set is derived as an anti-join over the active claim-ring partitions; stale-rescue and deadline-rescue scans use separate per-slot cursors stored on `claim_ring_slots`.
 
+### Historical reverse-migration outline
+
+The original 0.5-to-0.6 rollout runbook carried a manual escape hatch for reverting the receipt-plane partitioning before 0.6 workers had taken over. It was deliberately never shipped as a down migration, and it is not a supported rollback after queue storage has accepted work; retain it here so an incident responder can identify the historical boundary rather than infer a downgrade from the current schema.
+
+1. Quiesce all 0.6 workers and receipt-plane writers, take a database snapshot, and verify `lease_claim_batches` and `lease_claim_closure_batches` are empty before renaming the partitioned `lease_claims` and `lease_claim_closures` parents so their pre-0.6 names are available.
+2. Create unpartitioned `lease_claims` and `lease_claim_closures` tables from the exact pre-ADR-023 release schema, including its indexes and constraints.
+3. Copy every row from the renamed partitioned parents with `INSERT ... SELECT`, then reconcile row counts and open-claim evidence before dropping the partitioned parents.
+4. Inspect both compact batch tables separately. They are compact claim/closure evidence that older runtimes cannot read — 0.6 wrote `lease_claim_batches` for zero-deadline receipt claims from the start, so live claims can exist in the batch representation with no row-local counterpart. If either table contains rows, do not start the older fleet: restore the snapshot or continue forward on 0.6 unless release-matched reverse SQL has materialized equivalent row-local claims and closures.
+
 TLA+ coverage (`AwaSegmentedStorage`, `AwaStorageLockOrder`) is extended to model the claim-ring rotation and the rescue-before-truncate precondition, parallel to the existing lease-ring model.
 
 ## Validation
