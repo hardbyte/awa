@@ -148,7 +148,7 @@ awa --database-url "$DATABASE_URL" storage status
 | After step | Watch for |
 | --- | --- |
 | migrate | `SELECT MAX(version) FROM awa.schema_version` advances; `awa storage status` reports no schema-readiness blocker |
-| prepare custom queue-storage schema | `awa storage status` reports no schema-readiness blocker for the configured schema |
+| prepare custom queue-storage schema | `SELECT to_regclass('<custom_schema>.ready_entries')` returns non-NULL (the substrate exists — `awa storage status` cannot verify a custom schema until the later `storage prepare` records it) |
 | prepare | `awa storage status` reports `state=prepared` |
 | start queue-storage target | `awa.runtime_instances` shows `transition_role='queue_storage_target'` and `storage_capability='queue_storage'` for the new instance; `awa storage status` lists no `enter_mixed_transition_blockers` |
 | enter-mixed-transition | `awa_maintenance_rotate_attempts_total{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
