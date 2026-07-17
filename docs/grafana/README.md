@@ -51,6 +51,7 @@ The dashboard ships three example panels — **Queue Descriptor Catalog**, **Job
 | **Maintenance Rescues** | Bars | Heartbeat, deadline, callback_timeout rescues |
 | **Completion Flush Performance** | Time series | Batch completion write latency |
 | **Promotion Throughput** | Time series | Scheduled/retryable jobs promoted per second |
+| **Prune Database Phase Latency p99** | Time series | Ring prune lock, `TRUNCATE`, and commit latency by ring |
 | **Claims / Waiting External** | Time series | Queue claim rate and callback-parked job rate |
 | **Error Rate** | Stat | Failed / (completed + failed) percentage |
 | **Jobs In Flight** | Stat | Total executing jobs with threshold colours |
@@ -174,6 +175,8 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.maintenance.promote_batch_size` | Histogram | state | Jobs promoted |
 | `awa.maintenance.promote_duration` | Histogram (s) | state | Promotion time |
 | `awa.maintenance.rescues` | Counter | rescue_kind | Jobs rescued |
+| `awa.maintenance.prune.attempts` | Counter | ring, outcome, reason | Ring prune outcomes, including destructive `pruned` and no-DDL `already_pruned` |
+| `awa.maintenance.prune.duration` | Histogram (s) | ring, phase | Successful destructive prune time split into `lock`, `truncate`, and `commit` |
 
 ### Heartbeat
 

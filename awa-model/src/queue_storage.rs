@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_SCHEMA: &str = "awa";
@@ -315,6 +315,8 @@ pub enum RotateOutcome {
     /// `slot` is the current slot, which stays open.
     SkippedIdle {
         slot: i32,
+        /// Cursor generation left unchanged by the idle skip.
+        generation: i64,
     },
 }
 
@@ -356,11 +358,15 @@ pub enum PruneOutcome {
     Noop,
     Pruned {
         slot: i32,
+        /// Generation of the sealed slot that was reclaimed.
+        generation: i64,
         /// Failed terminal rows inside the failed-retention floor that
         /// the queue prune re-homed into the live `done_entries`
         /// segment instead of dropping. Always zero for the lease and
         /// claim rings.
         carried_failed_rows: u64,
+        /// Time spent in the database phases that can force a WAL flush.
+        durations: PruneDurations,
     },
     /// Lock acquisition timed out (held-tx, lock contention).
     Blocked {
@@ -373,6 +379,21 @@ pub enum PruneOutcome {
         reason: SkipReason,
         count: i64,
     },
+}
+
+/// Database phase timings for a successful destructive ring prune.
+///
+/// These phases are separated because managed Postgres can spend most of a
+/// prune inside a durability wait in `TRUNCATE` or `COMMIT`, even after the
+/// bounded ACCESS EXCLUSIVE acquisition has succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PruneDurations {
+    /// Time acquiring `ACCESS EXCLUSIVE` on the child relations.
+    pub lock: Duration,
+    /// Time executing the destructive `TRUNCATE` statement.
+    pub truncate: Duration,
+    /// Time committing the prune transaction.
+    pub commit: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -14457,7 +14478,10 @@ impl QueueStorage {
         ];
         if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedIdle { slot: state.0 });
+            return Ok(RotateOutcome::SkippedIdle {
+                slot: state.0,
+                generation: state.1,
+            });
         }
 
         let next_generation = state.1 + 1;
@@ -14552,7 +14576,10 @@ impl QueueStorage {
         let ring_parents = [format!("{schema}.leases")];
         if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedIdle { slot: state.0 });
+            return Ok(RotateOutcome::SkippedIdle {
+                slot: state.0,
+                generation: state.1,
+            });
         }
 
         let next_generation = state.1 + 1;
@@ -15256,7 +15283,11 @@ impl QueueStorage {
     /// prunes every terminal row. Granularity is whole seconds,
     /// matching DLQ retention. The floor applies to `failed` only —
     /// `cancelled` is an explicit operator action and is always pruned.
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest")]
+    #[tracing::instrument(
+        skip(self, pool),
+        name = "queue_storage.prune_oldest",
+        fields(slot = tracing::field::Empty, generation = tracing::field::Empty)
+    )]
     pub async fn prune_oldest(
         &self,
         pool: &PgPool,
@@ -15299,6 +15330,9 @@ impl QueueStorage {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::Noop);
         };
+
+        tracing::Span::current().record("slot", slot);
+        tracing::Span::current().record("generation", generation);
 
         // Slot row lock: second resource in the queue-ring lock order
         // (ring advisory lock → slot row → child ACCESS EXCLUSIVE).
@@ -15372,11 +15406,13 @@ impl QueueStorage {
 
         set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
+        let lock_started = Instant::now();
         let lock_tables = sqlx::query(&format!(
             "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
+        let lock_duration = lock_started.elapsed();
 
         if let Err(err) = lock_tables {
             let _ = tx.rollback().await;
@@ -15631,11 +15667,13 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        let truncate_started = Instant::now();
         let truncate = sqlx::query(&format!(
             "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
         ))
         .execute(tx.as_mut())
         .await;
+        let truncate_duration = truncate_started.elapsed();
 
         match truncate {
             Ok(_) => {
@@ -15669,7 +15707,9 @@ impl QueueStorage {
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
+                let commit_started = Instant::now();
                 tx.commit().await.map_err(map_sqlx_error)?;
+                let commit_duration = commit_started.elapsed();
                 if carried_failed_rows > 0 {
                     tracing::info!(
                         slot,
@@ -15679,7 +15719,13 @@ impl QueueStorage {
                 }
                 Ok(PruneOutcome::Pruned {
                     slot,
+                    generation,
                     carried_failed_rows,
+                    durations: PruneDurations {
+                        lock: lock_duration,
+                        truncate: truncate_duration,
+                        commit: commit_duration,
+                    },
                 })
             }
             Err(err) if is_lock_contention_error(&err) => {
@@ -15693,7 +15739,11 @@ impl QueueStorage {
         }
     }
 
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_leases")]
+    #[tracing::instrument(
+        skip(self, pool),
+        name = "queue_storage.prune_oldest_leases",
+        fields(slot = tracing::field::Empty, generation = tracing::field::Empty)
+    )]
     pub async fn prune_oldest_leases(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -15734,11 +15784,14 @@ impl QueueStorage {
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
         let state = (current_slot, generation, slot_count);
 
-        let Some((slot, _generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
+        let Some((slot, generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
         else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::Noop);
         };
+
+        tracing::Span::current().record("slot", slot);
+        tracing::Span::current().record("generation", generation);
 
         let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
             r#"
@@ -15761,11 +15814,13 @@ impl QueueStorage {
 
         set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
+        let lock_started = Instant::now();
         let lock_table = sqlx::query(&format!(
             "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
+        let lock_duration = lock_started.elapsed();
 
         if let Err(err) = lock_table {
             let _ = tx.rollback().await;
@@ -15802,16 +15857,26 @@ impl QueueStorage {
             });
         }
 
+        let truncate_started = Instant::now();
         let truncate = sqlx::query(&format!("TRUNCATE TABLE {lease_child}"))
             .execute(tx.as_mut())
             .await;
+        let truncate_duration = truncate_started.elapsed();
 
         match truncate {
             Ok(_) => {
+                let commit_started = Instant::now();
                 tx.commit().await.map_err(map_sqlx_error)?;
+                let commit_duration = commit_started.elapsed();
                 Ok(PruneOutcome::Pruned {
                     slot,
+                    generation,
                     carried_failed_rows: 0,
+                    durations: PruneDurations {
+                        lock: lock_duration,
+                        truncate: truncate_duration,
+                        commit: commit_duration,
+                    },
                 })
             }
             Err(err) if is_lock_contention_error(&err) => {
@@ -15930,7 +15995,10 @@ impl QueueStorage {
         ];
         if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedIdle { slot: state.0 });
+            return Ok(RotateOutcome::SkippedIdle {
+                slot: state.0,
+                generation: state.1,
+            });
         }
 
         let next_generation = state.1 + 1;
@@ -15992,7 +16060,11 @@ impl QueueStorage {
     /// partition, prune returns `SkippedActive` and the claim has to
     /// drain by normal completion or be rescued by
     /// `rescue_stale_receipt_claims_tx` before prune will try again.
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_claims")]
+    #[tracing::instrument(
+        skip(self, pool),
+        name = "queue_storage.prune_oldest_claims",
+        fields(slot = tracing::field::Empty, generation = tracing::field::Empty)
+    )]
     pub async fn prune_oldest_claims(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -16025,11 +16097,14 @@ impl QueueStorage {
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
         let state = (current_slot, generation, slot_count);
 
-        let Some((slot, _generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
+        let Some((slot, generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
         else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::Noop);
         };
+
+        tracing::Span::current().record("slot", slot);
+        tracing::Span::current().record("generation", generation);
 
         // Lock the slot row so concurrent rotate/prune observe the same
         // state machine transition.
@@ -16083,11 +16158,13 @@ impl QueueStorage {
 
         set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
+        let lock_started = Instant::now();
         let lock_tables = sqlx::query(&format!(
             "LOCK TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
+        let lock_duration = lock_started.elapsed();
 
         if let Err(err) = lock_tables {
             let _ = tx.rollback().await;
@@ -16132,11 +16209,13 @@ impl QueueStorage {
             });
         }
 
+        let truncate_started = Instant::now();
         let truncate = sqlx::query(&format!(
             "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
         ))
         .execute(tx.as_mut())
         .await;
+        let truncate_duration = truncate_started.elapsed();
 
         match truncate {
             Ok(_) => {
@@ -16158,10 +16237,18 @@ impl QueueStorage {
                 .execute(tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
+                let commit_started = Instant::now();
                 tx.commit().await.map_err(map_sqlx_error)?;
+                let commit_duration = commit_started.elapsed();
                 Ok(PruneOutcome::Pruned {
                     slot,
+                    generation,
                     carried_failed_rows: 0,
+                    durations: PruneDurations {
+                        lock: lock_duration,
+                        truncate: truncate_duration,
+                        commit: commit_duration,
+                    },
                 })
             }
             Err(err) if is_lock_contention_error(&err) => {

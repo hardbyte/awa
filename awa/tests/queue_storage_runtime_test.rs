@@ -2084,7 +2084,7 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
             .await
             .expect("rotate_claims should succeed");
         match outcome {
-            RotateOutcome::SkippedIdle { slot } => {
+            RotateOutcome::SkippedIdle { slot, .. } => {
                 assert_eq!(slot, 0, "idle ring must keep slot 0 at step {step}");
             }
             other => panic!("rotate_claims step {step} unexpected outcome: {other:?}"),
@@ -2163,6 +2163,167 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .prepare_schema(&pool)
         .await
         .expect("prepare_schema should be idempotent");
+}
+
+/// Successful destructive prunes expose timings for the explicit child lock,
+/// TRUNCATE, and COMMIT phases. Relational filenodes prove each branch really
+/// exercised TRUNCATE rather than returning through an empty fast path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_successful_prunes_report_database_phase_timings() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_prune_idempotent";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for ring in ["queue", "lease", "claim"] {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.{ring}_ring_rotations (generation, slot) VALUES (1, 1)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|err| panic!("advance {ring} ring: {err}"));
+    }
+
+    let filenodes = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(&format!(
+            r#"
+            SELECT
+                pg_relation_filenode('{schema}.ready_entries_0'::regclass)::bigint,
+                pg_relation_filenode('{schema}.leases_0'::regclass)::bigint,
+                pg_relation_filenode('{schema}.lease_claims_0'::regclass)::bigint
+            "#
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("read ring child filenodes")
+    };
+
+    let before = filenodes().await;
+    let queue_first = store
+        .prune_oldest(&pool, Duration::ZERO)
+        .await
+        .expect("first queue prune");
+    let lease_first = store
+        .prune_oldest_leases(&pool)
+        .await
+        .expect("first lease prune");
+    let claim_first = store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("first claim prune");
+    for (ring, outcome) in [
+        ("queue", queue_first),
+        ("lease", lease_first),
+        ("claim", claim_first),
+    ] {
+        let PruneOutcome::Pruned {
+            slot,
+            generation,
+            durations,
+            ..
+        } = outcome
+        else {
+            panic!("{ring} prune must reclaim generation 0, got {outcome:?}");
+        };
+        assert_eq!((slot, generation), (0, 0));
+        assert!(durations.lock > Duration::ZERO, "{ring} lock timing");
+        assert!(
+            durations.truncate > Duration::ZERO,
+            "{ring} truncate timing"
+        );
+        assert!(durations.commit > Duration::ZERO, "{ring} commit timing");
+    }
+    let after_first = filenodes().await;
+    assert_ne!(
+        after_first, before,
+        "the first destructive prunes must replace child relfilenodes"
+    );
+}
+
+/// The maintenance leader should call destructive prune once for an idle
+/// cursor, then suppress repeat DDL while the cursor generation is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_maintenance_idle_prune_replaces_child_filenode_once() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_idle_prune_once";
+    let queue = "idle_prune_once";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 2,
+        ..Default::default()
+    };
+    let _store = create_store_with_config(&pool, store_config.clone()).await;
+
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.queue_ring_rotations (generation, slot) VALUES (1, 1)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("advance empty queue ring");
+
+    let child_filenode = || async {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT pg_relation_filenode('{schema}.ready_entries_0'::regclass)::bigint"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("read queue child filenode")
+    };
+    let before = child_filenode().await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .leader_election_interval(Duration::from_millis(25))
+        .leader_check_interval(Duration::from_millis(25))
+        .register_worker(CompleteWorker)
+        .build()
+        .expect("build idle-prune client");
+    client.start().await.expect("start idle-prune client");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let after_first = loop {
+        let current = child_filenode().await;
+        if current != before {
+            break current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "maintenance did not issue the first queue prune"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(
+        child_filenode().await,
+        after_first,
+        "idle maintenance ticks must not repeat TRUNCATE at the same cursor generation"
+    );
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// The #371 idle gate must not freeze rotation while sealed slots still
@@ -2697,7 +2858,7 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
         .await
         .expect("rotate_leases on empty ring")
     {
-        RotateOutcome::SkippedIdle { slot } => assert_eq!(slot, 0),
+        RotateOutcome::SkippedIdle { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected SkippedIdle {{ slot: 0 }}, got {other:?}"),
     }
     sqlx::query(&format!(
@@ -2995,7 +3156,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         .await
         .expect("rotate away from ready slot 0");
     assert!(
-        matches!(idle, RotateOutcome::SkippedIdle { slot: 0 }),
+        matches!(idle, RotateOutcome::SkippedIdle { slot: 0, .. }),
         "empty ready slot 0 should idle-skip: {idle:?}"
     );
     sqlx::query(&format!(
@@ -3942,21 +4103,21 @@ async fn test_idle_ring_rotation_skips_without_ring_state_churn() {
 
     for round in 0..25 {
         match store.rotate(&pool).await.expect("idle queue rotate") {
-            RotateOutcome::SkippedIdle { slot } => assert_eq!(
+            RotateOutcome::SkippedIdle { slot, .. } => assert_eq!(
                 slot, queue_before.0,
                 "idle queue rotate must keep the current slot (round {round})"
             ),
             other => panic!("idle queue rotate round {round}: expected SkippedIdle, got {other:?}"),
         }
         match store.rotate_leases(&pool).await.expect("idle lease rotate") {
-            RotateOutcome::SkippedIdle { slot } => assert_eq!(
+            RotateOutcome::SkippedIdle { slot, .. } => assert_eq!(
                 slot, lease_before.0,
                 "idle lease rotate must keep the current slot (round {round})"
             ),
             other => panic!("idle lease rotate round {round}: expected SkippedIdle, got {other:?}"),
         }
         match store.rotate_claims(&pool).await.expect("idle claim rotate") {
-            RotateOutcome::SkippedIdle { slot } => assert_eq!(
+            RotateOutcome::SkippedIdle { slot, .. } => assert_eq!(
                 slot, claim_before.0,
                 "idle claim rotate must keep the current slot (round {round})"
             ),
@@ -4206,21 +4367,21 @@ async fn test_drained_ring_rotation_skips_after_prune() {
         assert!(
             matches!(
                 store.rotate(&pool).await.expect("idle queue rotate"),
-                RotateOutcome::SkippedIdle { slot } if slot == queue_cursor.0
+                RotateOutcome::SkippedIdle { slot, .. } if slot == queue_cursor.0
             ),
             "drained queue ring must skip rotation"
         );
         assert!(
             matches!(
                 store.rotate_leases(&pool).await.expect("idle lease rotate"),
-                RotateOutcome::SkippedIdle { slot } if slot == lease_cursor.0
+                RotateOutcome::SkippedIdle { slot, .. } if slot == lease_cursor.0
             ),
             "compact traffic never wrote lease rows; lease ring must skip rotation"
         );
         assert!(
             matches!(
                 store.rotate_claims(&pool).await.expect("idle claim rotate"),
-                RotateOutcome::SkippedIdle { slot } if slot == claim_cursor.0
+                RotateOutcome::SkippedIdle { slot, .. } if slot == claim_cursor.0
             ),
             "drained claim ring must skip rotation"
         );
@@ -7998,7 +8159,7 @@ async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rota
     // — in production the ring advances like this whenever other jobs'
     // leases keep it busy.
     match store.rotate_leases(&pool).await.expect("rotate lease ring") {
-        RotateOutcome::SkippedIdle { slot } => assert_eq!(
+        RotateOutcome::SkippedIdle { slot, .. } => assert_eq!(
             slot, claim_lease_slot,
             "compact claim leaves no lease rows, so the lease ring is idle"
         ),
@@ -11011,6 +11172,7 @@ async fn test_queue_storage_prune_carries_failed_rows_inside_retention_floor() {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 1,
+            ..
         } => {}
         other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 1 }}, got {other:?}"),
     }
@@ -11288,6 +11450,7 @@ async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 2,
+            ..
         } => {}
         other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 2 }}, got {other:?}"),
     }
@@ -11460,6 +11623,7 @@ async fn test_queue_storage_prune_past_floor_folds_failed_into_rollup() {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 0,
+            ..
         } => {}
         other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 0 }}, got {other:?}"),
     }
@@ -11568,6 +11732,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         PruneOutcome::Pruned {
             slot: 0,
             carried_failed_rows: 1,
+            ..
         } => {}
         other => panic!("expected Pruned {{ slot: 0, carried_failed_rows: 1 }}, got {other:?}"),
     }
@@ -11615,6 +11780,7 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         PruneOutcome::Pruned {
             slot: 1,
             carried_failed_rows: 1,
+            ..
         } => {}
         other => panic!("expected Pruned {{ slot: 1, carried_failed_rows: 1 }}, got {other:?}"),
     }
