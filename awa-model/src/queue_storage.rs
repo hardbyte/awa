@@ -315,6 +315,7 @@ pub enum RotateOutcome {
     /// `slot` is the current slot, which stays open.
     SkippedIdle {
         slot: i32,
+        /// Cursor generation left unchanged by the idle skip.
         generation: i64,
     },
 }
@@ -355,21 +356,16 @@ pub struct BusyCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PruneOutcome {
     Noop,
-    /// This exact sealed generation was already reclaimed by this maintenance
-    /// leader. The worker returns this without calling the destructive storage
-    /// prune again. A leadership change can conservatively repeat one prune.
-    AlreadyPruned {
-        slot: i32,
-        generation: i64,
-    },
     Pruned {
         slot: i32,
+        /// Generation of the sealed slot that was reclaimed.
         generation: i64,
         /// Failed terminal rows inside the failed-retention floor that
         /// the queue prune re-homed into the live `done_entries`
         /// segment instead of dropping. Always zero for the lease and
         /// claim rings.
         carried_failed_rows: u64,
+        /// Time spent in the database phases that can force a WAL flush.
         durations: PruneDurations,
     },
     /// Lock acquisition timed out (held-tx, lock contention).
@@ -392,8 +388,11 @@ pub enum PruneOutcome {
 /// bounded ACCESS EXCLUSIVE acquisition has succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PruneDurations {
+    /// Time acquiring `ACCESS EXCLUSIVE` on the child relations.
     pub lock: Duration,
+    /// Time executing the destructive `TRUNCATE` statement.
     pub truncate: Duration,
+    /// Time committing the prune transaction.
     pub commit: Duration,
 }
 

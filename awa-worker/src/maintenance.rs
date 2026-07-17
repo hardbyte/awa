@@ -489,7 +489,7 @@ impl PruneBackoffTracker {
                     .min(MAX_PRUNE_BACKOFF_LEVEL);
                 state.skip_remaining = 1u32 << state.backoff_level;
             }
-            PruneOutcome::Noop | PruneOutcome::AlreadyPruned { .. } => {}
+            PruneOutcome::Noop => {}
         }
     }
 
@@ -499,7 +499,7 @@ impl PruneBackoffTracker {
         current_slot: i32,
         cursor_generation: i64,
         slot_count: usize,
-    ) -> Option<PruneOutcome> {
+    ) -> Option<(i32, i64)> {
         let initialized_slots = (cursor_generation + 1).min(slot_count as i64);
         if initialized_slots <= 1 {
             return None;
@@ -509,8 +509,7 @@ impl PruneBackoffTracker {
         let target_slot = (i64::from(current_slot) - offset).rem_euclid(slot_count as i64) as i32;
         let branches = self.branches.lock().expect("prune backoff tracker mutex");
         let (slot, generation) = branches.get(branch)?.last_pruned?;
-        (slot == target_slot && generation == target_generation)
-            .then_some(PruneOutcome::AlreadyPruned { slot, generation })
+        (slot == target_slot && generation == target_generation).then_some((slot, generation))
     }
 
     #[cfg(test)]
@@ -2284,7 +2283,7 @@ impl MaintenanceService {
             }
         };
 
-        if let Some(outcome) = idle_cursor.and_then(|(slot, generation)| {
+        if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_QUEUE,
                 slot,
@@ -2292,13 +2291,11 @@ impl MaintenanceService {
                 runtime.store.queue_slot_count(),
             )
         }) {
-            self.metrics.record_prune_outcome("queue", &outcome);
-            if let PruneOutcome::AlreadyPruned { slot, generation } = outcome {
-                debug!(
-                    slot,
-                    generation, "Queue storage queue segment already pruned"
-                );
-            }
+            self.metrics.record_prune_already_pruned("queue");
+            debug!(
+                slot,
+                generation, "Queue storage queue segment already pruned"
+            );
             return;
         }
 
@@ -2317,12 +2314,6 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_QUEUE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
-                    PruneOutcome::AlreadyPruned { slot, generation } => {
-                        debug!(
-                            slot,
-                            generation, "Queue storage queue segment already pruned"
-                        );
-                    }
                     PruneOutcome::Pruned {
                         slot,
                         generation,
@@ -2397,7 +2388,7 @@ impl MaintenanceService {
             }
         };
 
-        if let Some(outcome) = idle_cursor.and_then(|(slot, generation)| {
+        if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_LEASE,
                 slot,
@@ -2405,13 +2396,11 @@ impl MaintenanceService {
                 runtime.store.lease_slot_count(),
             )
         }) {
-            self.metrics.record_prune_outcome("lease", &outcome);
-            if let PruneOutcome::AlreadyPruned { slot, generation } = outcome {
-                debug!(
-                    slot,
-                    generation, "Queue storage lease segment already pruned"
-                );
-            }
+            self.metrics.record_prune_already_pruned("lease");
+            debug!(
+                slot,
+                generation, "Queue storage lease segment already pruned"
+            );
             return;
         }
 
@@ -2426,12 +2415,6 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_LEASE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
-                    PruneOutcome::AlreadyPruned { slot, generation } => {
-                        debug!(
-                            slot,
-                            generation, "Queue storage lease segment already pruned"
-                        );
-                    }
                     PruneOutcome::Pruned { slot, .. } => {
                         debug!(slot, "Pruned queue storage lease segment");
                     }
@@ -2498,7 +2481,7 @@ impl MaintenanceService {
             }
         };
 
-        if let Some(outcome) = idle_cursor.and_then(|(slot, generation)| {
+        if let Some((slot, generation)) = idle_cursor.and_then(|(slot, generation)| {
             prune_tracker.already_pruned_for_idle_cursor(
                 PRUNE_BRANCH_CLAIM,
                 slot,
@@ -2506,13 +2489,11 @@ impl MaintenanceService {
                 runtime.store.claim_slot_count(),
             )
         }) {
-            self.metrics.record_prune_outcome("claim", &outcome);
-            if let PruneOutcome::AlreadyPruned { slot, generation } = outcome {
-                debug!(
-                    slot,
-                    generation, "Queue storage claim segment already pruned"
-                );
-            }
+            self.metrics.record_prune_already_pruned("claim");
+            debug!(
+                slot,
+                generation, "Queue storage claim segment already pruned"
+            );
             return;
         }
 
@@ -2527,12 +2508,6 @@ impl MaintenanceService {
                 prune_tracker.record_outcome(PRUNE_BRANCH_CLAIM, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
-                    PruneOutcome::AlreadyPruned { slot, generation } => {
-                        debug!(
-                            slot,
-                            generation, "Queue storage claim segment already pruned"
-                        );
-                    }
                     PruneOutcome::Pruned { slot, .. } => {
                         debug!(slot, "Pruned queue storage claim segment");
                     }
@@ -3959,10 +3934,7 @@ mod tests {
 
         assert_eq!(
             tracker.already_pruned_for_idle_cursor(PRUNE_BRANCH_QUEUE, 3, 3, 4),
-            Some(PruneOutcome::AlreadyPruned {
-                slot: 0,
-                generation: 0,
-            }),
+            Some((0, 0)),
             "a frozen fully initialized cursor must suppress the repeated prune"
         );
         assert_eq!(
@@ -3972,10 +3944,7 @@ mod tests {
         );
         assert_eq!(
             tracker.already_pruned_for_idle_cursor(PRUNE_BRANCH_QUEUE, 1, 1, 4),
-            Some(PruneOutcome::AlreadyPruned {
-                slot: 0,
-                generation: 0,
-            }),
+            Some((0, 0)),
             "partial-ring startup derives the same generation as storage prune"
         );
     }

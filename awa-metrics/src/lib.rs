@@ -1072,7 +1072,6 @@ impl AwaMetrics {
     pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
         let (label, reason, count) = match outcome {
             awa_model::PruneOutcome::Noop => ("noop", "none", None),
-            awa_model::PruneOutcome::AlreadyPruned { .. } => ("already_pruned", "none", None),
             awa_model::PruneOutcome::Pruned { .. } => ("pruned", "none", None),
             awa_model::PruneOutcome::Blocked { .. } => ("blocked", "none", None),
             awa_model::PruneOutcome::SkippedActive { reason, count, .. } => {
@@ -1102,6 +1101,17 @@ impl AwaMetrics {
                     .record(duration.as_secs_f64(), &phase_attrs);
             }
         }
+    }
+
+    /// Record an idle maintenance tick that skipped destructive prune because
+    /// the exact sealed generation was already reclaimed by this leader.
+    pub fn record_prune_already_pruned(&self, ring: &'static str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", ring),
+            opentelemetry::KeyValue::new("awa.ring.outcome", "already_pruned"),
+            opentelemetry::KeyValue::new("awa.ring.reason", "none"),
+        ];
+        self.maintenance_prune_attempts.add(1, &attrs);
     }
 }
 
@@ -1174,13 +1184,7 @@ mod tests {
                 },
             },
         );
-        metrics.record_prune_outcome(
-            "queue",
-            &awa_model::PruneOutcome::AlreadyPruned {
-                slot: 3,
-                generation: 19,
-            },
-        );
+        metrics.record_prune_already_pruned("queue");
         provider.force_flush().expect("flush metrics");
         let resource_metrics = exporter.get_finished_metrics().expect("read metrics");
 

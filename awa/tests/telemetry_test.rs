@@ -1009,6 +1009,26 @@ async fn test_otlp_metrics_reach_prometheus() {
     // 2. Set as global meter provider so AwaMetrics::from_global() uses it.
     global::set_meter_provider(meter_provider.clone());
 
+    // Exercise the prune instruments directly so this collector-backed test
+    // validates their Prometheus names and labels independently of leader and
+    // ring timing. Database-backed prune behavior is covered in
+    // queue_storage_runtime_test.
+    let prune_metrics = awa::worker::AwaMetrics::from_global();
+    prune_metrics.record_prune_outcome(
+        "queue",
+        &awa::model::PruneOutcome::Pruned {
+            slot: 3,
+            generation: 19,
+            carried_failed_rows: 0,
+            durations: awa::model::PruneDurations {
+                lock: Duration::from_millis(7),
+                truncate: Duration::from_millis(647),
+                commit: Duration::from_millis(581),
+            },
+        },
+    );
+    prune_metrics.record_prune_already_pruned("queue");
+
     // 3. Build + start Client with a worker. Declare a queue and kind
     // descriptor so the awa.queue.info / awa.job_kind.info gauges fire.
     let client = Client::builder(pool.clone())
@@ -1119,6 +1139,22 @@ async fn test_otlp_metrics_reach_prometheus() {
     let wait_duration_count =
         wait_for_metric(&http, "awa_job_wait_duration_seconds_count", 1.0, timeout).await;
     eprintln!("  awa.job.wait_duration count = {wait_duration_count}");
+
+    for phase in ["lock", "truncate", "commit"] {
+        let query = format!(
+            "awa_maintenance_prune_duration_seconds_count{{awa_ring=\"queue\",awa_maintenance_phase=\"{phase}\"}}"
+        );
+        let count = wait_for_metric(&http, &query, 1.0, timeout).await;
+        eprintln!("  awa.maintenance.prune.duration {phase} count = {count}");
+    }
+    let already_pruned = wait_for_metric(
+        &http,
+        "awa_maintenance_prune_attempts_total{awa_ring=\"queue\",awa_ring_outcome=\"already_pruned\"}",
+        1.0,
+        timeout,
+    )
+    .await;
+    eprintln!("  awa.maintenance.prune.attempts already_pruned = {already_pruned}");
 
     // Note: awa.queue.depth and awa.queue.lag are leader-only gauges published
     // by the maintenance loop. They require leader election + queue_stats_interval
