@@ -106,10 +106,10 @@ This is a breaking schema change even though the external API does not change.
 
 The original 0.5-to-0.6 rollout runbook carried a manual escape hatch for reverting the receipt-plane partitioning before 0.6 workers had taken over. It was deliberately never shipped as a down migration, and it is not a supported rollback after queue storage has accepted work; retain it here so an incident responder can identify the historical boundary rather than infer a downgrade from the current schema.
 
-1. Quiesce receipt-plane writers, take a database snapshot, and rename the partitioned `lease_claims` and `lease_claim_closures` parents so their pre-0.6 names are available.
+1. Quiesce all 0.6 workers and receipt-plane writers, take a database snapshot, and verify `lease_claim_batches` and `lease_claim_closure_batches` are empty before renaming the partitioned `lease_claims` and `lease_claim_closures` parents so their pre-0.6 names are available.
 2. Create unpartitioned `lease_claims` and `lease_claim_closures` tables from the exact pre-ADR-023 release schema, including its indexes and constraints.
 3. Copy every row from the renamed partitioned parents with `INSERT ... SELECT`, then reconcile row counts and open-claim evidence before dropping the partitioned parents.
-4. Inspect `lease_claim_closure_batches` separately. It is compact closure evidence that older runtimes cannot read; do not start the older fleet unless release-matched reverse SQL has materialized equivalent row-local closures. Otherwise restore the snapshot or continue forward on 0.6.
+4. Inspect both compact batch tables separately. They are compact claim/closure evidence that older runtimes cannot read — 0.6 wrote `lease_claim_batches` for zero-deadline receipt claims from the start, so live claims can exist in the batch representation with no row-local counterpart. If either table contains rows, do not start the older fleet: restore the snapshot or continue forward on 0.6 unless release-matched reverse SQL has materialized equivalent row-local claims and closures.
 
 TLA+ coverage (`AwaSegmentedStorage`, `AwaStorageLockOrder`) is extended to model the claim-ring rotation and the rescue-before-truncate precondition, parallel to the existing lease-ring model.
 
