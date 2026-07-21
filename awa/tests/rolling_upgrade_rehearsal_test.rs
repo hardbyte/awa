@@ -1316,10 +1316,12 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     // `*/5 * * * *` looks inert but can coincide with a real wall-clock
     // boundary on a slow/contended run, and the periodic dispatcher fires
     // independently of manual triggers, producing an uncounted third
-    // completion that overshoots `expectations` by one. Pausing right
-    // after registration blocks *automatic* fires while leaving
-    // trigger_cron_job() — which works on paused schedules by design —
-    // fully functional for the two intentional fires.
+    // completion that overshoots `expectations` by one. Registering and
+    // pausing in the same transaction closes the window entirely: the
+    // periodic dispatcher only ever observes the committed (paused) row,
+    // never an intermediate unpaused one. trigger_cron_job() keeps working
+    // on a paused schedule by design ("manual trigger is an explicit
+    // operator action"), so the two intentional fires are unaffected.
     let cron_name = format!("upgrade_rehearsal_cron_{run_id}");
     let cron_job = PeriodicJob::builder(cron_name.clone(), "*/5 * * * *")
         .queue(workload_queue.clone())
@@ -1328,12 +1330,17 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
             mode: "complete".to_string(),
         })
         .expect("build cron job");
-    upsert_cron_job(&pool, &cron_job)
+    let mut cron_setup_tx = pool.begin().await.expect("begin cron registration");
+    upsert_cron_job(cron_setup_tx.as_mut(), &cron_job)
         .await
         .expect("upsert cron job");
-    pause_cron_job(&pool, &cron_name, Some("rehearsal-test"))
+    pause_cron_job(cron_setup_tx.as_mut(), &cron_name, Some("rehearsal-test"))
         .await
         .expect("pause cron schedule so only explicit triggers fire it");
+    cron_setup_tx
+        .commit()
+        .await
+        .expect("commit paused cron registration");
     let pre_flip_fire = trigger_cron_job(&pool, &cron_name)
         .await
         .expect("trigger cron before flip");
