@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use awa::model::{
     admin,
-    cron::{trigger_cron_job, upsert_cron_job, PeriodicJob},
+    cron::{pause_cron_job, trigger_cron_job, upsert_cron_job, PeriodicJob},
     dlq, insert_with, migrations, storage, InsertOpts, JobState, QueueStorage, QueueStorageConfig,
 };
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
@@ -1310,7 +1310,18 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     .await;
     report.phase("migrated_mixed_fleet_completing");
 
-    // Cron work fires while both fleets are live, before any flip.
+    // Cron work fires while both fleets are live, before any flip. The
+    // schedule itself must never fire on its own — the test wants exactly
+    // the two explicit trigger_cron_job() calls below and nothing else.
+    // `*/5 * * * *` looks inert but can coincide with a real wall-clock
+    // boundary on a slow/contended run, and the periodic dispatcher fires
+    // independently of manual triggers, producing an uncounted third
+    // completion that overshoots `expectations` by one. Registering and
+    // pausing in the same transaction closes the window entirely: the
+    // periodic dispatcher only ever observes the committed (paused) row,
+    // never an intermediate unpaused one. trigger_cron_job() keeps working
+    // on a paused schedule by design ("manual trigger is an explicit
+    // operator action"), so the two intentional fires are unaffected.
     let cron_name = format!("upgrade_rehearsal_cron_{run_id}");
     let cron_job = PeriodicJob::builder(cron_name.clone(), "*/5 * * * *")
         .queue(workload_queue.clone())
@@ -1319,9 +1330,17 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
             mode: "complete".to_string(),
         })
         .expect("build cron job");
-    upsert_cron_job(&pool, &cron_job)
+    let mut cron_setup_tx = pool.begin().await.expect("begin cron registration");
+    upsert_cron_job(cron_setup_tx.as_mut(), &cron_job)
         .await
         .expect("upsert cron job");
+    pause_cron_job(cron_setup_tx.as_mut(), &cron_name, Some("rehearsal-test"))
+        .await
+        .expect("pause cron schedule so only explicit triggers fire it");
+    cron_setup_tx
+        .commit()
+        .await
+        .expect("commit paused cron registration");
     let pre_flip_fire = trigger_cron_job(&pool, &cron_name)
         .await
         .expect("trigger cron before flip");
