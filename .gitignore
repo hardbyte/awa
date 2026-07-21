@@ -33,3 +33,4 @@ correctness/**/*_TTrace_*.tla
 /benchmarks/portable/results/
 /benchmarks/portable/awa-bench/target/
 .compat-venv-*
+rehearsal-repro-logs/

@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use awa::model::{
     admin,
-    cron::{trigger_cron_job, upsert_cron_job, PeriodicJob},
+    cron::{pause_cron_job, trigger_cron_job, upsert_cron_job, PeriodicJob},
     dlq, insert_with, migrations, storage, InsertOpts, JobState, QueueStorage, QueueStorageConfig,
 };
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
@@ -1310,7 +1310,16 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     .await;
     report.phase("migrated_mixed_fleet_completing");
 
-    // Cron work fires while both fleets are live, before any flip.
+    // Cron work fires while both fleets are live, before any flip. The
+    // schedule itself must never fire on its own — the test wants exactly
+    // the two explicit trigger_cron_job() calls below and nothing else.
+    // `*/5 * * * *` looks inert but can coincide with a real wall-clock
+    // boundary on a slow/contended run, and the periodic dispatcher fires
+    // independently of manual triggers, producing an uncounted third
+    // completion that overshoots `expectations` by one. Pausing right
+    // after registration blocks *automatic* fires while leaving
+    // trigger_cron_job() — which works on paused schedules by design —
+    // fully functional for the two intentional fires.
     let cron_name = format!("upgrade_rehearsal_cron_{run_id}");
     let cron_job = PeriodicJob::builder(cron_name.clone(), "*/5 * * * *")
         .queue(workload_queue.clone())
@@ -1322,6 +1331,9 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     upsert_cron_job(&pool, &cron_job)
         .await
         .expect("upsert cron job");
+    pause_cron_job(&pool, &cron_name, Some("rehearsal-test"))
+        .await
+        .expect("pause cron schedule so only explicit triggers fire it");
     let pre_flip_fire = trigger_cron_job(&pool, &cron_name)
         .await
         .expect("trigger cron before flip");
