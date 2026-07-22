@@ -2517,9 +2517,12 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
         .prune_oldest_leases(&pool)
         .await
         .expect("prune_oldest_leases");
+    // Lease slot 0 is empty, so the idle-prune guard reports Noop instead of
+    // truncating. Either way the independent claim ring's rescue cursor must
+    // remain untouched.
     assert!(
-        matches!(prune, PruneOutcome::Pruned { slot: 0, .. }),
-        "lease prune should truncate empty lease slot 0, got {prune:?}"
+        matches!(prune, PruneOutcome::Noop),
+        "empty lease slot 0 should skip the TRUNCATE and report Noop, got {prune:?}"
     );
 
     let cursor: (bool, i64, i64) = sqlx::query_as(&format!(
@@ -2621,14 +2624,12 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
     assert_eq!(survived, 1, "open claim must survive SkippedActive prune");
 }
 
-/// Regression for the post-lock claim-prune proof. The claim row is
-/// inserted but left uncommitted while prune performs its optimistic
-/// pre-lock proof, so the proof sees an empty slot. The writer transaction
-/// keeps a relation lock that makes prune wait for `ACCESS EXCLUSIVE`; once
-/// the writer commits, the post-lock proof must see the now-visible open
-/// claim and skip instead of truncating it.
+/// The idle-prune emptiness guard must not over-skip: a sealed claim slot
+/// holding a committed open claim (no matching closure) is non-empty, so
+/// prune falls through the guard to the open-claim liveness gate, returns
+/// `SkippedActive`, and does not truncate — the claim survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
+async fn test_prune_oldest_claims_does_not_skip_committed_open_claim() {
     let (_db_guard, pool) = setup_pool(8).await;
     let schema = "awa_qs_claim_ring_post_lock";
     let store = Arc::new(
@@ -2653,7 +2654,12 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
         .await
         .expect("rotate away from claim slot 0");
 
-    let mut writer_tx = pool.begin().await.expect("begin claim writer tx");
+    // Seed a committed open claim (no matching closure) into the sealed slot;
+    // the empty-slot skip direction is covered by
+    // `test_queue_storage_idle_prune_is_noop_and_does_not_churn_relfilenodes`.
+    // The post-lock re-check is unreachable from an empty slot now that the
+    // emptiness guard precedes lock acquisition; a committed live claim is
+    // caught by the pre-lock liveness gate instead.
     sqlx::query(&format!(
         r#"
         INSERT INTO {schema}.lease_claims (
@@ -2662,52 +2668,13 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
         ) VALUES (0, 1001, 1, 0, 0, 'synthetic', 2, 1, 25, 1001)
         "#
     ))
-    .execute(writer_tx.as_mut())
+    .execute(&pool)
     .await
-    .expect("seed uncommitted open claim");
+    .expect("seed committed open claim");
 
-    let prune_store = Arc::clone(&store);
-    let prune_pool = pool.clone();
-    let prune_task =
-        tokio::spawn(async move { prune_store.prune_oldest_claims(&prune_pool).await });
-
-    let needle = format!("{schema}.lease_claims_0");
-    let wait_deadline = Instant::now() + Duration::from_secs(1);
-    let mut saw_lock_wait = false;
-    while Instant::now() < wait_deadline {
-        let waiting: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM pg_stat_activity
-                WHERE datname = current_database()
-                  AND pid <> pg_backend_pid()
-                  AND wait_event_type = 'Lock'
-                  AND position($1 in query) > 0
-            )
-            "#,
-        )
-        .bind(&needle)
-        .fetch_one(&pool)
+    let outcome = store
+        .prune_oldest_claims(&pool)
         .await
-        .expect("poll prune lock wait");
-        if waiting {
-            saw_lock_wait = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert!(
-        saw_lock_wait,
-        "prune should wait on the claim child before the writer commits"
-    );
-
-    writer_tx.commit().await.expect("commit open claim");
-
-    let outcome = tokio::time::timeout(Duration::from_secs(3), prune_task)
-        .await
-        .expect("prune task timed out")
-        .expect("prune task panicked")
         .expect("prune_oldest_claims");
     assert!(
         matches!(
@@ -2718,7 +2685,7 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
                 count: 1
             }
         ),
-        "post-lock proof must see the committed open claim, got {outcome:?}"
+        "open claim must force SkippedActive past the emptiness guard, got {outcome:?}"
     );
 
     let survived: i64 = sqlx::query_scalar(&format!(
@@ -2726,15 +2693,16 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
     ))
     .fetch_one(&pool)
     .await
-    .expect("count post-lock survivor");
-    assert_eq!(
-        survived, 1,
-        "claim committed during the lock wait must survive SkippedActive prune"
-    );
+    .expect("count open-claim survivor");
+    assert_eq!(survived, 1, "committed open claim must survive the prune");
 }
 
+/// The idle-prune emptiness guard must not over-skip: a sealed queue slot
+/// holding a committed pending ready row is non-empty, so prune falls
+/// through the guard to the pending-ready liveness gate, returns
+/// `SkippedActive`, and does not truncate — the row survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
+async fn test_prune_oldest_does_not_skip_committed_pending_ready() {
     let (_db_guard, pool) = setup_pool(8).await;
     let queue = "qs_ready_ring_post_lock";
     let schema = "awa_qs_ready_ring_post_lock";
@@ -2780,8 +2748,13 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         "unexpected rotate outcome: {rotated:?}"
     );
 
-    let post_lock_job_id = 1_000_091_i64;
-    let mut writer_tx = pool.begin().await.expect("begin ready writer tx");
+    // Seed a committed pending ready row + segment into the sealed slot; the
+    // empty-slot skip direction is covered by
+    // `test_queue_storage_idle_prune_is_noop_and_does_not_churn_relfilenodes`.
+    // The post-lock re-check is unreachable from an empty slot now that the
+    // emptiness guard precedes lock acquisition; a committed pending row is
+    // caught by the pre-lock liveness gate instead.
+    let pending_job_id = 1_000_091_i64;
     sqlx::query(&format!(
         r#"
         INSERT INTO {schema}.ready_entries (
@@ -2795,11 +2768,11 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         )
         "#
     ))
-    .bind(post_lock_job_id)
+    .bind(pending_job_id)
     .bind(queue)
-    .execute(writer_tx.as_mut())
+    .execute(&pool)
     .await
-    .expect("seed uncommitted ready row");
+    .expect("seed committed pending ready row");
     sqlx::query(&format!(
         r#"
         INSERT INTO {schema}.ready_segments (
@@ -2811,52 +2784,13 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         "#
     ))
     .bind(queue)
-    .execute(writer_tx.as_mut())
+    .execute(&pool)
     .await
-    .expect("seed uncommitted ready segment");
+    .expect("seed committed ready segment");
 
-    let prune_store = Arc::clone(&store);
-    let prune_pool = pool.clone();
-    let prune_task =
-        tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
-
-    let needle = format!("{schema}.ready_entries_0");
-    let wait_deadline = Instant::now() + Duration::from_secs(1);
-    let mut saw_lock_wait = false;
-    while Instant::now() < wait_deadline {
-        let waiting: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM pg_stat_activity
-                WHERE datname = current_database()
-                  AND pid <> pg_backend_pid()
-                  AND wait_event_type = 'Lock'
-                  AND position($1 in query) > 0
-            )
-            "#,
-        )
-        .bind(&needle)
-        .fetch_one(&pool)
+    let outcome = store
+        .prune_oldest(&pool, Duration::ZERO)
         .await
-        .expect("poll ready prune lock wait");
-        if waiting {
-            saw_lock_wait = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert!(
-        saw_lock_wait,
-        "queue prune should wait on the ready child before the writer commits"
-    );
-
-    writer_tx.commit().await.expect("commit pending ready row");
-
-    let outcome = tokio::time::timeout(Duration::from_secs(3), prune_task)
-        .await
-        .expect("queue prune task timed out")
-        .expect("queue prune task panicked")
         .expect("prune_oldest");
     assert!(
         matches!(
@@ -2867,19 +2801,19 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
                 count: 1
             }
         ),
-        "post-lock proof must see the committed pending ready row, got {outcome:?}"
+        "pending ready row must force SkippedActive past the emptiness guard, got {outcome:?}"
     );
 
     let survived: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {schema}.ready_entries_0 WHERE job_id = $1"
     ))
-    .bind(post_lock_job_id)
+    .bind(pending_job_id)
     .fetch_one(&pool)
     .await
-    .expect("count post-lock ready survivor");
+    .expect("count pending ready survivor");
     assert_eq!(
         survived, 1,
-        "ready row committed during the lock wait must survive SkippedActive prune"
+        "committed pending ready row must survive the prune"
     );
 }
 
@@ -7417,6 +7351,116 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     );
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// Idle-prune churn regression.
+///
+/// On an idle queue the rotation cursor keeps advancing over empty slots, so
+/// every maintenance tick `prune_oldest`/`_leases`/`_claims` selects an
+/// already-empty sealed slot. Before the fix each such prune took
+/// `ACCESS EXCLUSIVE` and issued a `TRUNCATE` that swapped the child
+/// relfilenodes — continuous destructive DDL and WAL-flushing commits with zero
+/// jobs in the system, which saturated regional-storage IO on AlloyDB. The fix
+/// short-circuits an all-empty target slot to `PruneOutcome::Noop` and leaves
+/// the relations untouched. This test asserts both: the outcome is `Noop` and
+/// the ring child relfilenodes do not change across repeated idle prunes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_idle_prune_is_noop_and_does_not_churn_relfilenodes() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_runtime_idle_prune_noop";
+    let store = create_store(&pool, schema).await;
+
+    // Snapshot of every ring child relfilenode; a TRUNCATE would change these.
+    let filenode_sql = format!(
+        r#"
+        SELECT coalesce(
+            string_agg(c.relname || '=' || pg_relation_filenode(c.oid)::text, ',' ORDER BY c.relname),
+            ''
+        )
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = '{schema}'
+          AND c.relkind = 'r'
+          AND (
+            c.relname LIKE 'ready_entries_%'
+            OR c.relname LIKE 'done_entries_%'
+            OR c.relname LIKE 'lease_claims_%'
+            OR c.relname LIKE 'leases_%'
+          )
+        "#
+    );
+    let snapshot = |pool: sqlx::PgPool, sql: String| async move {
+        sqlx::query_scalar::<_, String>(&sql)
+            .fetch_one(&pool)
+            .await
+            .expect("read ring child relfilenodes")
+    };
+
+    // Advance every ring's cursor across empty slots so each has an oldest
+    // *sealed* slot to prune — all empty, since nothing was enqueued.
+    for _ in 0..3 {
+        let queue = store.rotate(&pool).await.expect("rotate idle queue ring");
+        assert!(
+            matches!(queue, RotateOutcome::Rotated { .. }),
+            "idle queue rotate should advance over the empty next slot: {queue:?}"
+        );
+        let lease = store
+            .rotate_leases(&pool)
+            .await
+            .expect("rotate idle lease ring");
+        assert!(
+            matches!(lease, RotateOutcome::Rotated { .. }),
+            "idle lease rotate should advance: {lease:?}"
+        );
+        let claim = store
+            .rotate_claims(&pool)
+            .await
+            .expect("rotate idle claim ring");
+        assert!(
+            matches!(claim, RotateOutcome::Rotated { .. }),
+            "idle claim rotate should advance: {claim:?}"
+        );
+    }
+
+    let before = snapshot(pool.clone(), filenode_sql.clone()).await;
+    assert!(
+        !before.is_empty(),
+        "expected ring child partitions to exist for schema {schema}"
+    );
+
+    // Repeated idle prunes must all be Noop and must not truncate anything.
+    for round in 0..4 {
+        let queue = store
+            .prune_oldest(&pool, Duration::ZERO)
+            .await
+            .expect("idle queue prune");
+        assert!(
+            matches!(queue, PruneOutcome::Noop),
+            "round {round}: idle queue prune must be Noop (empty sealed slot), got {queue:?}"
+        );
+        let lease = store
+            .prune_oldest_leases(&pool)
+            .await
+            .expect("idle lease prune");
+        assert!(
+            matches!(lease, PruneOutcome::Noop),
+            "round {round}: idle lease prune must be Noop, got {lease:?}"
+        );
+        let claim = store
+            .prune_oldest_claims(&pool)
+            .await
+            .expect("idle claim prune");
+        assert!(
+            matches!(claim, PruneOutcome::Noop),
+            "round {round}: idle claim prune must be Noop, got {claim:?}"
+        );
+    }
+
+    let after = snapshot(pool.clone(), filenode_sql).await;
+    assert_eq!(
+        before, after,
+        "idle prune must not TRUNCATE ring children (relfilenodes changed)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
