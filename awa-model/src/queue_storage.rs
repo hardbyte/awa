@@ -13356,6 +13356,22 @@ impl QueueStorage {
             .map_err(map_sqlx_error)
     }
 
+    /// Returns `true` if any of `relations` has at least one row, checking in
+    /// order and stopping at the first non-empty one. Used by the ring prune
+    /// paths to prove an oldest sealed slot is empty before taking
+    /// `ACCESS EXCLUSIVE` and issuing a destructive `TRUNCATE` on it.
+    async fn any_relation_has_rows_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        relations: &[&str],
+    ) -> Result<bool, AwaError> {
+        for relation in relations {
+            if Self::relation_has_rows_tx(tx, relation).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
     pub async fn rotate(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
@@ -14129,11 +14145,60 @@ impl QueueStorage {
         let receipt_tomb_child = receipt_completion_tombstone_child_name(schema, slot as usize);
         let delta_child = terminal_delta_child_name(schema, slot as usize);
 
-        // Queue prune has three common skip gates. Check them before
-        // taking ACCESS EXCLUSIVE on the ready/terminal child tables so
-        // a known-busy slot does not block hot claim reads behind a
-        // doomed truncate attempt. These are only MVCC snapshots; the
-        // same gates are checked again after the exclusive locks.
+        // Idle-prune churn guard: on an idle queue the rotation cursor keeps
+        // sealing empty slots, so without this gate the prune would re-take
+        // ACCESS EXCLUSIVE and re-issue TRUNCATE on an already-empty sealed
+        // slot every maintenance tick — continuous relfilenode churn and
+        // WAL-flushing commits with zero jobs in the system. That idle DDL is
+        // near-free on local-SSD Postgres but saturates the IO path on
+        // disaggregated-storage engines such as AlloyDB, inflating p99 latency
+        // for co-located application queries. If every child partition this
+        // prune would truncate is already empty there is nothing to reclaim,
+        // so commit and report Noop instead of truncating. The slot is sealed
+        // (slot <> current_slot) and its ring-state and slot rows are held FOR
+        // UPDATE above, so the emptiness snapshot cannot race a writer.
+        let slot_has_reclaimable_rows = Self::any_relation_has_rows_tx(
+            &mut tx,
+            &[
+                &ready_child,
+                &claim_attempt_child,
+                &done_child,
+                &tomb_child,
+                &segment_child,
+                &receipt_batch_child,
+                &receipt_tomb_child,
+                &delta_child,
+            ],
+        )
+        .await?;
+        if !slot_has_reclaimable_rows {
+            // The destructive prune path also deletes this slot's
+            // queue_terminal_live_counts rows alongside the TRUNCATE. Those
+            // rows are a materialized per-slot aggregate of done_entries, so an
+            // empty done partition normally means none exist. Counter drift
+            // (possible during a rolling upgrade from a pre-counter binary) can
+            // nonetheless leave orphan rows for a slot whose ring children are
+            // already empty. Preserve that cleanup on the skip path so avoiding
+            // the (no-op) TRUNCATE does not strand counter rows and let the
+            // exact per-queue counters drift indefinitely. This is a cheap
+            // 0-row DELETE in the steady state and needs no ACCESS EXCLUSIVE.
+            sqlx::query(&format!(
+                "DELETE FROM {schema}.queue_terminal_live_counts WHERE ready_slot = $1"
+            ))
+            .bind(slot)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::Noop);
+        }
+
+        // Beyond the emptiness gate above, queue prune has three liveness
+        // skip gates. Check them before taking ACCESS EXCLUSIVE on the
+        // ready/terminal child tables so a known-busy slot does not block hot
+        // claim reads behind a doomed truncate attempt. These are only MVCC
+        // snapshots; the same gates are checked again after the exclusive
+        // locks.
         let active_leases =
             queue_prune_has_active_leases_tx(&mut tx, schema, slot, generation).await?;
 
@@ -14543,6 +14608,18 @@ impl QueueStorage {
 
         let lease_child = lease_child_name(schema, slot as usize);
 
+        // Idle-prune churn guard (see `prune_oldest`): skip the destructive
+        // ACCESS EXCLUSIVE + TRUNCATE when the sealed lease slot is already
+        // empty, turning a per-tick truncate of an empty slot into a Noop and
+        // eliminating the relfilenode/WAL churn that disaggregated-storage
+        // engines such as AlloyDB amplify into application p99 latency. The
+        // slot is sealed and its ring-state and slot rows are held FOR UPDATE
+        // above, so the emptiness snapshot cannot race a writer.
+        if !Self::relation_has_rows_tx(&mut tx, &lease_child).await? {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::Noop);
+        }
+
         set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_table = sqlx::query(&format!(
@@ -14798,6 +14875,29 @@ impl QueueStorage {
         let claim_batch_child = claim_batch_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
+
+        // Idle-prune churn guard (see `prune_oldest`): if every claim-ring
+        // child partition for this sealed slot is already empty there is
+        // nothing to reclaim, so commit a Noop instead of re-truncating an
+        // empty slot every maintenance tick, eliminating the relfilenode/WAL
+        // churn that disaggregated-storage engines such as AlloyDB amplify
+        // into application p99 latency. The slot is sealed and its ring-state
+        // and slot rows are held FOR UPDATE above, so the emptiness snapshot
+        // cannot race a writer.
+        let slot_has_reclaimable_rows = Self::any_relation_has_rows_tx(
+            &mut tx,
+            &[
+                &claim_child,
+                &claim_batch_child,
+                &closure_child,
+                &closure_batch_child,
+            ],
+        )
+        .await?;
+        if !slot_has_reclaimable_rows {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::Noop);
+        }
 
         // Before taking ACCESS EXCLUSIVE on the child partitions, prove
         // the sealed slot is actually reclaimable. This optimistic proof
