@@ -801,10 +801,14 @@ async fn test_queue_storage_round_trip_smoke() {
         .prune_oldest_leases(&pool)
         .await
         .expect("Failed to prune smoke lease slot");
-    assert!(matches!(
-        pruned_leases,
-        PruneOutcome::Pruned { slot: 0, .. }
-    ));
+    // The legacy complete path DELETEs each lease row in `complete_batch`, so
+    // after draining, sealed lease slot 0 is already empty. The idle-prune
+    // guard therefore skips the (no-op) TRUNCATE and reports Noop; a Pruned
+    // outcome would mean the slot still held rows.
+    assert!(
+        matches!(pruned_leases, PruneOutcome::Noop),
+        "drained (empty) lease slot 0 should report Noop, got {pruned_leases:?}"
+    );
 
     let final_counts = store
         .queue_counts(&pool, "smoke")
