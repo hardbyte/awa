@@ -4,6 +4,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-07-22
+
+Patch release: one performance fix for idle background IO. No migrations, no schema changes, no API changes.
+
+### Performance
+
+- **Idle rings no longer `TRUNCATE` empty sealed slots every maintenance tick.** On an idle queue the ring-rotation cursor keeps advancing over empty slots, so `prune_oldest` / `prune_oldest_leases` / `prune_oldest_claims` re-took `ACCESS EXCLUSIVE` and issued a destructive `TRUNCATE` on an already-empty oldest sealed slot every rotation tick — continuous relfilenode churn and WAL-flushing commits with **zero jobs in the system**. That idle DDL is near-free on local-SSD Postgres but saturates the IO path on disaggregated-storage engines such as AlloyDB, inflating p99 latency for co-located application queries. Each prune now proves the target slot's child partitions are empty before locking and returns `PruneOutcome::Noop` when there is nothing to reclaim.
+  - Non-empty slots still follow the same lock + liveness-recheck + truncate path, so no reclamation is skipped and no data can be stranded; the queue prune also keeps its per-slot `queue_terminal_live_counts` cleanup on the skip path so exact per-queue counters cannot drift.
+  - Measured on an idle queue against AlloyDB Omni (30 s window, zero jobs): destructive `TRUNCATE`s dropped from ~82/s to 0 and WAL generation fell ~50×.
+  - This is the prune-side equivalent of the rotation-side idle-skip that ships in 0.7.0 ([#409](https://github.com/hardbyte/awa/pull/409)).
+
 ## [0.6.3] — 2026-07-15
 
 - **Migrations no longer require superuser ([#431](https://github.com/hardbyte/awa/pull/431)).** The queue-storage migrations (v024 onward) discovered substrate schemas by probing every schema in `pg_namespace` with `to_regprocedure()` / `to_regclass()`, which raise `permission denied for schema pg_toast` (or any other schema the role lacks `USAGE` on) for a non-superuser — so on managed Postgres, where the migration role owns the `awa` schema but is deliberately not a superuser, provisioning failed at migration v024. Discovery now uses shared-catalog lookups (`pg_proc` / `pg_class`) gated on `has_schema_privilege()`, which never trigger per-schema permission checks. No behavioural change for superusers or single-schema installs; on shared databases, discovery is additionally restricted to substrates the role can actually access. A regression test now runs the full migration chain as a `NOSUPERUSER` owner role, so the scan idiom cannot creep back in. If you run migrations through your own external tooling, note that the historical migration files changed in place (semantically equivalent SQL); Awa's built-in migrator tracks applied versions by number and is unaffected.
