@@ -260,6 +260,7 @@ jobs:
           mkdir -p "${ARCHIVE}"
           cp "target/${{ matrix.target }}/release/awa" "${ARCHIVE}/"
           cp README.md LICENSE* "${ARCHIVE}/" 2>/dev/null || true
+          cp -r skills "${ARCHIVE}/skills"
           tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
           echo "ARCHIVE=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
 
