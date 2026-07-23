@@ -148,7 +148,7 @@ The UI starts on `http://127.0.0.1:3000` by default.
 
 ## Production Notes
 
-- This quickstart implements `JobArgs` manually to keep the dependency set minimal. If you want `#[derive(JobArgs)]`, add a direct dependency on `awa-model` and derive `awa_model::JobArgs`.
+- This quickstart implements `JobArgs` by hand to show the trait. To derive it instead, add `JobArgs` to the `#[derive(...)]` list (`#[derive(Debug, Serialize, Deserialize, JobArgs)]`) — the `awa` crate re-exports the derive macro, so no extra dependency is needed.
 - `Client::start()` spawns background tasks and returns immediately. Your service should usually stay alive until it receives a shutdown signal.
 - `Client::shutdown(Duration)` is the graceful drain path. Set your container or process shutdown timeout slightly above that duration.
 - If you only need to enqueue jobs from Rust, depend on `awa-model` instead of `awa`.
