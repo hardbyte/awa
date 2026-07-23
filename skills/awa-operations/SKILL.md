@@ -2,7 +2,7 @@
 name: awa-operations
 description: Deploy, upgrade, and operate the Awa Postgres-native job queue and its worker fleet. Use when running database migrations, planning a rolling upgrade, sizing connection pools on managed Postgres, operating the dead-letter queue or cron schedules, driving a storage-engine transition, configuring the awa CLI, or serving the web admin UI.
 license: MIT
-compatibility: Requires an awa CLI matching the deployed runtime version and PostgreSQL access. Storage and health workflows require a live worker fleet.
+compatibility: Requires an awa CLI matching the deployed runtime version and PostgreSQL access. Written for awa 0.7; pin to the release tag matching your deployment. The CLI, `awa health`, and `awa storage status` work against the database alone; the runtime `/readyz` probe and the fleet-liveness fields require a live worker fleet.
 ---
 
 # Awa Operations

@@ -2,7 +2,7 @@
 name: awa-jobs
 description: Author, enqueue, and handle jobs with the Awa Postgres-native job queue in Rust or Python. Use when defining a job kind, registering a worker or handler, configuring queues, enqueuing transactionally, choosing retry versus snooze, scheduling cron jobs, wiring in-process or webhook callbacks, or reporting job progress.
 license: MIT
-compatibility: Requires the awa Rust crate or the awa-pg Python wheel and a PostgreSQL database matching the installed awa schema version.
+compatibility: Requires the awa Rust crate or the awa-pg Python wheel. Written for the awa 0.7 API and semantics; install the skill version matching your awa release (pin to the release tag) because field availability and defaults change across minor versions.
 ---
 
 # Awa Jobs
@@ -18,14 +18,16 @@ Every job kind has a stable string name and a serializable payload. Choose the
 name deliberately — it is a durable identifier stored on every row.
 
 **Rust** — implement `JobArgs`, or derive it. The derived `kind()` is the
-snake_case of the struct name; override with `#[awa(kind = "...")]`. Deriving
-requires a direct `awa-model` dependency.
+snake_case of the struct name; override with `#[awa(kind = "...")]`. The `awa`
+facade re-exports both the trait and the derive macro, so depending on `awa`
+alone is enough — no separate `awa-model` dependency is needed. (If you only
+enqueue and never run a worker, depend on `awa-model` directly instead.)
 
 ```rust
-use awa::{JobArgs, JobResult};
+use awa::JobArgs;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, awa_model::JobArgs)]
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct SendEmail { to: String, subject: String } // kind() == "send_email"
 ```
 
@@ -101,9 +103,15 @@ awa::insert_with(&mut *tx, &SendEmail { to, subject },
 ```
 
 **Python** — `await client.insert(args, queue=..., priority=..., run_at=..., ...)`.
-For transactional enqueue use `async with await client.transaction() as tx:
-await tx.insert(...)`, or `awa.bridge.insert_job(session, args, ...)` to enqueue
-inside an existing asyncpg / psycopg3 / SQLAlchemy / Django transaction.
+For transactional enqueue:
+
+```python
+async with await client.transaction() as tx:
+    await tx.insert(args)
+```
+
+Or use `awa.bridge.insert_job(session, args, ...)` to enqueue inside an existing
+asyncpg / psycopg3 / SQLAlchemy / Django transaction.
 
 `InsertOpts` / keyword options: `queue`, `priority`, `max_attempts`, `run_at`
 (a future time starts the job `Scheduled` rather than `Available`),
@@ -113,9 +121,13 @@ a waiting job's effective priority one level per aging interval (default 60s) so
 low-priority work cannot starve indefinitely.
 
 **Unique jobs** deduplicate on a BLAKE3 key over kind + optionally queue + args +
-a time-period bucket. Defaults: dedup by args, not by queue. A duplicate insert
-is silently skipped. Cancel without storing the id via `cancel_by_unique_key(kind,
-queue=, args=, period_bucket=)` — the components must match those used at insert.
+a time-period bucket. Defaults: dedup by args, not by queue. Conflict handling
+depends on the API: a single-row `insert` / `insert_with` and the row-by-row
+`insert_many` **raise `AwaError::UniqueConflict`** (Python raises the
+corresponding error) on a duplicate — you must handle it, do not assume a silent
+no-op. Only the COPY bulk path (`insert_many_copy`) silently skips duplicates.
+Cancel without storing the id via `cancel_by_unique_key(kind, queue=, args=,
+period_bucket=)` — the components must match those used at insert.
 Args-based uniqueness relies on canonical (sorted-key) JSON, pinned by
 cross-language golden tests; the default state set includes `completed`, so a
 still-retained completed job suppresses a re-insert with the same args. Scope
@@ -149,7 +161,9 @@ cannot double-fire an occurrence.
 
 ```rust
 let job = PeriodicJob::builder("nightly-report", "0 0 * * *")
-    .timezone("Pacific/Auckland").queue("reports").build(&ReportArgs { .. })?;
+    .timezone("Pacific/Auckland")
+    .queue("reports")
+    .build(&ReportArgs { region: "nz".into() })?;
 // .periodic(job) on the client builder
 ```
 
@@ -213,9 +227,21 @@ Rust exposes two hook families on the client builder:
   `Rescued`, `WaitingForCallback`. They are **not** a durable workflow — they can
   be lost on crash and `shutdown()` does not wait for them.
 - **Durable follow-up hooks** (`on_completed_enqueue`, `on_exhausted_enqueue`,
-  and the other `on_*_enqueue`) INSERT a follow-up job in the **same transaction**
-  as the triggering transition, so they survive a crash. Use these for side
-  effects that must not be lost.
+  and the other `on_*_enqueue`) INSERT a follow-up job for side effects that must
+  survive a crash. Atomicity depends on what triggered them:
+  - Worker-driven outcomes (a handler returning `Ok`/`Err`) and callback
+    resolution on the `Client` (`complete_external`, `resolve_callback`, …) commit
+    the follow-up in the **same transaction** as the transition — exactly-once per
+    committed outcome.
+  - **`on_rescued_enqueue` is the exception: it is best-effort, not atomic.**
+    Maintenance rescue (stale-heartbeat / deadline / expired-callback) commits the
+    rescue first, then dispatches the follow-up in a separate transaction; a
+    failure there leaves the rescue applied and is only logged. Do not build a
+    rescue-notification workflow that assumes the follow-up cannot be lost — use an
+    outbox/sweeper if you need zero-loss rescue signals.
+
+  Every follow-up, once enqueued, is delivered at-least-once, so its handler must
+  be safe to re-run.
 
 Enqueues capture the current trace span into reserved metadata
 (`awa:traceparent`) automatically; disable with `AWA_TRACE_CAPTURE=off`. To

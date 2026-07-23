@@ -50,7 +50,10 @@ Canonical, portable [Agent Skills](https://agentskills.io/) live under
 - Validate every skill locally with
   `uvx --from skills-ref==0.1.1 agentskills validate skills/<name>`; CI runs the
   same check.
-- Skills ship in the release binary archives. Do not copy them into crates,
-  runtime images, or the container build.
+- The repository is the source of truth; skills also ship in the CLI release
+  binary archives. Do not copy them into crates, runtime images, or the container
+  build — files buried in a wheel or cargo registry are not agent-discoverable,
+  and duplicated copies drift. Consumers install from the repo pinned to the
+  release tag matching their awa version (see the README).
 - Update the affected skill when public behavior or a documented workflow
   changes, and avoid duplicating skill content elsewhere.
