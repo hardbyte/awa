@@ -169,6 +169,46 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
           AWA_TEST_ENGINE: queue_storage
 
+  # Runs the queue-storage prune suite against AlloyDB Omni (PG 18) to guard
+  # the idle-prune behaviour on a disaggregated-storage engine: awa reclaims
+  # ring slots with ACCESS EXCLUSIVE + TRUNCATE, whose relfilenode churn is far
+  # costlier on AlloyDB than on stock Postgres, so an idle ring must not re-run
+  # it every maintenance tick. Omni runs as a plain Postgres service here; the
+  # columnar-engine preload is unnecessary because the tests assert logical
+  # prune behaviour (idle skip + no relfilenode churn), not columnar performance.
+  rust-test-alloydb-omni:
+    name: Rust prune tests (AlloyDB Omni)
+    needs: [rust-build]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      alloydb:
+        image: gcr.io/alloydb-omni/alloydbomni:18.3
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Wait for AlloyDB Omni
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Run prune suite on AlloyDB Omni
+        run: cargo test -p awa --test queue_storage_runtime_test prune
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+          AWA_TEST_ENGINE: queue_storage
+
   # ─── Rust bridge (tokio-postgres) ──────────────────────
   rust-bridge-tokio-pg:
     name: Rust bridge (tokio-postgres)
