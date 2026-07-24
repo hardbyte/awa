@@ -40,6 +40,33 @@ jobs:
       - name: Check CI test-shard membership
         run: ./scripts/ci-test-shard.sh check
 
+  agent-skills:
+    name: Agent Skills validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v8.2.0
+      - name: Validate every published skill
+        run: |
+          shopt -s nullglob
+          skills=(skills/*/)
+          if [ ${#skills[@]} -eq 0 ]; then
+            echo "::error::no skills found under skills/"
+            exit 1
+          fi
+          for dir in "${skills[@]}"; do
+            test -f "${dir}SKILL.md" || {
+              echo "::error::${dir} has no SKILL.md"; exit 1;
+            }
+            echo "Validating ${dir%/}"
+            uvx --from skills-ref==0.1.1 agentskills validate "${dir%/}"
+          done
+
   rust-build:
     name: Rust build
     needs: [rust-lint]

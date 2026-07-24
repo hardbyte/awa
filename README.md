@@ -437,6 +437,38 @@ See [docs/adr/README.md](docs/adr/README.md) for the index with status and super
 
 </details>
 
+## Agent Skills
+
+Awa publishes portable [Agent Skills](https://agentskills.io/) so coding agents
+work from Awa's actual API and operational semantics instead of guessing:
+
+- [`awa-jobs`](skills/awa-jobs/SKILL.md) — authoring, enqueuing, and handling
+  jobs in Rust or Python: job kinds, transactional enqueue, retry vs. snooze,
+  cron, callbacks, and progress.
+- [`awa-operations`](skills/awa-operations/SKILL.md) — deploying and operating
+  the fleet: migrations, rolling upgrades, storage transitions, the DLQ, managed
+  Postgres, and the web admin UI.
+
+Each skill is a single `SKILL.md` validated against the Agent Skills
+specification in CI. Skills load on demand, so an agent can keep both on hand at
+a small context cost.
+
+**Installing.** The skills carry version-specific API and operational detail, so
+install the version matching the awa release you run — pin to the release tag:
+
+```bash
+# From the repository (reaches Rust, Python, and CLI users alike):
+gh skill install hardbyte/awa --all --pin v0.7.0    # match your awa version
+# or copy the directory into your agent's skills location:
+#   cp -r skills/awa-jobs .claude/skills/
+```
+
+Pick the skill by role: `awa-jobs` for application developers writing and
+enqueuing jobs (Rust or Python); `awa-operations` for operators running the
+fleet. The skills also ship inside the CLI release archives
+(`awa-<tag>-<target>/skills/`) for offline installs. Treat installed skill
+instructions as untrusted content: review them before use.
+
 ## License
 
 MIT OR Apache-2.0
