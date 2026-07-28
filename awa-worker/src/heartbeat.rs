@@ -66,10 +66,9 @@ impl HeartbeatService {
         self.alive.store(false, Ordering::SeqCst);
     }
 
-    // Each tick is an explicit root for the same reason as the dispatcher's
-    // poll: `run` owns a loop that lives as long as the worker, so a shared
-    // parent would collect every lease heartbeat and progress flush of the
-    // process into one unbounded trace.
+    // Explicit root, as for the dispatcher's poll: `run` owns a loop that
+    // lives as long as the worker, so a shared parent would collect every
+    // tick into one unbounded trace.
     #[tracing::instrument(
         parent = None,
         skip(self),

@@ -357,24 +357,16 @@ async fn enqueue_overhead_e8_gate() {
     );
 }
 
-/// #449: the dispatcher and heartbeat loops must not accumulate one
-/// unbounded trace. `Dispatcher::run` and `HeartbeatService::run` both own
-/// loops that live as long as the worker, so instrumenting them made every
-/// poll, claim query, and lease heartbeat a descendant of a root span that
-/// never closed. In production those traces passed a 5 MB backend limit and
-/// were rejected, taking dispatcher telemetry with them. Each poll and each
-/// heartbeat tick is now an explicit root, so repeated ticks are independent
-/// finite traces. Re-instrumenting either loop fails this test. `parent = None`
-/// on the ticks is not observable on its own here — a spawned dispatcher task
-/// has no ambient span — so it guards the case where an ambient parent is
-/// reintroduced above the loop.
+/// #449: `Dispatcher::run` and `HeartbeatService::run` own loops that live as
+/// long as the worker, so instrumenting them collected every poll and
+/// heartbeat tick under one span that never closed. Each tick is its own
+/// trace root now. Re-instrumenting either loop fails this test.
 #[tokio::test]
 async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
     let exporter = init_tracing();
     let pool = setup(POLL_QUEUE).await;
 
-    // No jobs are enqueued: an idle poll still opens its span, which is the
-    // repeated-span shape that grew without bound.
+    // No jobs needed: an idle poll still opens its span.
     let client = Client::builder(pool.clone())
         .heartbeat_interval(Duration::from_millis(100))
         .queue(
@@ -396,8 +388,7 @@ async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
 
     let spans = exporter.get_finished_spans().expect("exported spans");
 
-    // The exporter is shared across this file's tests, so scope the poll
-    // assertions to this queue's dispatcher via the span's queue attribute.
+    // The exporter is shared across this file's tests, so scope to this queue.
     let polls: Vec<_> = spans
         .iter()
         .filter(|s| {
@@ -423,11 +414,10 @@ async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
     assert_eq!(
         poll_traces.len(),
         polls.len(),
-        "each poll must start its own trace so no trace grows with worker lifetime"
+        "each poll must start its own trace"
     );
 
-    // Heartbeat ticks carry no queue attribute (they are per-runtime), so
-    // assert the same root property over every exported tick.
+    // Heartbeat ticks are per-runtime, so they carry no queue attribute.
     let beats: Vec<_> = spans
         .iter()
         .filter(|s| s.name.as_ref() == "heartbeat_once")

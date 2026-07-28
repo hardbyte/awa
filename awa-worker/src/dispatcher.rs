@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_CLAIM_BATCH_LIMIT: usize = 512;
@@ -412,7 +412,10 @@ impl Dispatcher {
         let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
             Ok(listener) => listener,
             Err(err) => {
-                error!(
+                // warn, not error: poll-only still works, and a
+                // transaction-mode pooler makes this the expected path
+                // (#374). Matches the LISTEN fallback below.
+                warn!(
                     queue = %self.queue,
                     error = %err,
                     "Failed to create PG listener, falling back to polling only"
