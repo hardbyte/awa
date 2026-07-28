@@ -6,12 +6,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- **Dispatcher and heartbeat traces no longer grow for the lifetime of the worker ([#449](https://github.com/hardbyte/awa/issues/449)).** `Dispatcher::run` and `HeartbeatService::run` each own a loop that runs until shutdown, and both were `#[tracing::instrument]`-annotated — so their spans never closed and every poll, claim query, lease heartbeat, progress flush, and job span accumulated under one root. A single trace grew without bound: production workers produced traces of tens of megabytes that Tempo rejected with `TRACE_TOO_LARGE` at a 5 MB limit, and the resulting export pressure surfaced as `BatchSpanProcessor` `ExportError: Timeout expired` (reported through integrations such as Sentry as application errors). The worker and its database work were healthy throughout; only telemetry export failed.
-  - Neither loop is instrumented now, and each `poll_once` / `heartbeat_once` tick is an explicit trace root (`parent = None`), so repeated ticks produce independent finite traces. Poll spans keep their `queue` attribute.
-  - As a side effect, sampling now works on this path. One lifetime-long root span meant a single head-sampling decision governed every span the worker ever emitted; each poll is now sampled independently.
+- **Dispatcher and heartbeat traces no longer grow for the lifetime of the worker ([#449](https://github.com/hardbyte/awa/issues/449)).** `Dispatcher::run` and `HeartbeatService::run` own loops that run until shutdown, so instrumenting them kept one span open and accumulated every poll, claim, lease heartbeat, and progress flush under it. Traces grew past backend size limits — Tempo rejected them with `TRACE_TOO_LARGE` at 5 MB — and the export pressure surfaced as `BatchSpanProcessor` timeouts. Neither loop is instrumented now, and each `poll_once` / `heartbeat_once` tick is an explicit trace root, so ticks are independent and sampled independently. Poll spans keep their `queue` attribute.
   - A poll trace is bounded by the claim batch — up to `claim_batch_size` (default 512) job subtrees.
-  - The dispatcher's PG-listener `error!`/`warn!` events now carry `queue` explicitly; they previously inherited it from the removed span, so listener failures were unattributable on a multi-queue worker.
-  - No schema, migration, or API change. Backport of [#450](https://github.com/hardbyte/awa/pull/450) for the 0.6 line; the regression test added there covers the same code on `main` (0.6 predates the in-memory span-exporter harness it uses).
+  - Both PG-listener fallback paths now log `queue` explicitly and log at `warn`: poll-only is degraded but working, and is the expected path under a transaction-mode pooler ([#374](https://github.com/hardbyte/awa/issues/374)).
+  - No schema, migration, or API change. Backport of [#450](https://github.com/hardbyte/awa/pull/450); the regression test added there covers the same code on `main` (0.6 predates the span-exporter harness it uses).
 
 ## [0.6.4] — 2026-07-22
 
