@@ -60,7 +60,7 @@ and that surprises users repeatedly, the fix is to amend the document, not to ar
 - **Semver alone** — says *that* something broke, not *which surface was ever promised*;
   pre-1.0 semver carries no information for consumers.
 - **A stability attribute per item** (Rust `#[stable]`-style annotations) — heavier tooling
-  than a seven-row table justifies, and it cannot describe SQL, HTTP, metric, or CLI
+  than a surface map justifies, and it cannot describe SQL, HTTP, metric, or CLI
   surfaces at all.
 - **Per-crate CHANGELOG discipline without a map** — documents changes without defining the
   boundary; the boundary is the thing consumers need.

@@ -52,6 +52,13 @@ Every installed routine belongs to exactly one class in a machine-readable capab
 | Migration, DDL, installer, or arbitrary-schema helper | `SECURITY INVOKER` | Migrator/operator only | Never elevated to a runtime capability |
 | Trigger function | Chosen per trigger boundary | No direct `EXECUTE` grant is required for trigger firing | `SECURITY DEFINER` only when the trigger intentionally mediates writes from a less-privileged relation |
 
+Every installed Awa routine, in every class, has `EXECUTE` revoked from `PUBLIC`. The manifest
+records the exact positive grants for callable surfaces; internal helpers, migration/DDL/install
+routines, and trigger functions receive no runtime grant. The migrator applies both the revocation
+and positive grants in the routine's creating transaction and configures default privileges so a
+new routine cannot accidentally reintroduce `PUBLIC EXECUTE`. `awa doctor` treats any manifest/ACL
+disagreement, including `PUBLIC EXECUTE` on an invoker or internal routine, as drift.
+
 `awa.install_queue_storage_substrate` remains invoker and migrator-only. A caller-controlled schema,
 relation, function, operator, or SQL fragment is disqualifying for a runtime definer entry point.
 Such work stays behind the migration boundary even when identifiers are quoted safely.
@@ -105,9 +112,9 @@ Every `SECURITY DEFINER` entry point must satisfy all of these conditions:
 
 1. Set a fixed `search_path` containing only `pg_catalog`, trusted Awa schemas, and `pg_temp` last.
 2. Schema-qualify every Awa object and security-relevant function, operator, type, and sequence.
-3. Accept no caller-controlled SQL identifier or fragment. Dynamic SQL is absent from runtime
-   definers; a separately reviewed exception must resolve an allowlisted catalog identity rather
-   than interpolate caller text.
+3. Accept no caller-controlled SQL identifier or fragment. Dynamic SQL is absent from every runtime
+   definer, including SQL assembled from a catalog-resolved or allowlisted identifier. A capability
+   that requires dynamic SQL remains invoker-only behind the migrator/operator boundary.
 4. Perform one bounded capability and enforce its own row-, token-, queue-, and attempt-level
    guards. Possession of `EXECUTE` is not authority to mutate arbitrary jobs.
 5. Never execute DDL, `SET ROLE`, privilege changes, or transaction control.
@@ -204,7 +211,8 @@ before activation.
 Acceptance requires:
 
 - catalog tests that fail on an unclassified function or trigger, a definer owned by an excessive
-  role, `PUBLIC EXECUTE`, an unsafe `search_path`, an unexpected ACL, or a definer with dynamic SQL;
+  role, `PUBLIC EXECUTE` on any Awa routine, an unsafe `search_path`, an unexpected ACL, or a
+  definer with dynamic SQL;
 - negative privilege tests for every principal, including cross-capability attempts, direct table
   DML/`TRUNCATE`, installer execution, stale tokens, forged job identifiers, temporary-object
   shadowing, and operator/function shadowing;

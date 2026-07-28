@@ -233,7 +233,9 @@ breaking contract introduces `complete_job_v2` and retains `complete_job` throug
 documented deprecation window.
 
 `complete_job` is a hardened `SECURITY DEFINER` function owned by the bounded execution owner
-defined by ADR-043 (the queue-storage schema owner is the transitional fallback). Its migration:
+defined by ADR-043. A queue-storage schema owner may be used only as a transitional, non-strict
+fallback; it does not satisfy the hardened owner model, and `awa doctor` rejects that ownership
+when the deployment declares the strict profile. Its migration:
 
 - fixes `search_path` to trusted schemas with `pg_temp` last and fully qualifies every referenced
   object;

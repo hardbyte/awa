@@ -157,9 +157,10 @@ SQL contract work in #342 and ADR-036. Compatible changes retain the name; a bre
 introduces `complete_job_v2` and keeps v1 through the documented deprecation window.
 
 The function is a hardened `SECURITY DEFINER` privilege boundary owned by ADR-043's bounded
-execution owner (the queue-storage schema owner is the transitional fallback): it has a fixed
-`search_path`, uses fully qualified object names, accepts no caller-controlled identifiers, and uses
-`pg_temp` last in the path. The same migration transaction creates or replaces the function,
+execution owner. A queue-storage schema owner is only a transitional, non-strict fallback and is
+rejected when `awa doctor` validates the strict profile. The function has a fixed `search_path`,
+uses fully qualified object names, accepts no caller-controlled identifiers, and uses `pg_temp`
+last in the path. The same migration transaction creates or replaces the function,
 transfers ownership, revokes `EXECUTE` from `PUBLIC`, and grants `EXECUTE` by exact signature to the
 application-worker role. The function does not commit. Operators grant only schema `USAGE` plus
 that exact function `EXECUTE`; they do not grant `awa_runtime` membership or direct Awa-table DML.
@@ -172,7 +173,7 @@ wrapper or overload.
 worker application role, not producer-only, browser, or public callback roles. The function routes
 through the active queue-storage representation and applies the same guard and writes as normal
 completion. Custom queue-storage schema installation creates an equivalently hardened,
-schema-qualified function owned by that schema's trusted owner.
+schema-qualified function owned by the bounded execution owner.
 
 A stale token raises a dedicated SQLSTATE exception. Returning `false` is insufficient: callers
 could accidentally commit their business writes after ignoring the result. The exception aborts
