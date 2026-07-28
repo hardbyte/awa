@@ -214,6 +214,40 @@ Other PostgreSQL features used at runtime:
 | `COPY ... FROM STDIN` | Bulk insert path | `TEMP` on database |
 | `FOR UPDATE SKIP LOCKED` | Non-blocking job claiming | `SELECT`, `UPDATE` on table |
 
+## Planned caller-owned finalization role (ADR-042)
+
+> **Proposed for 0.7; not shipped in the current release.** This section records the privilege
+> boundary the implementation and migration must satisfy.
+
+[ADR-042](adr/042-caller-owned-finalization-transactions.md) lets a handler commit application rows
+and guarded Awa completion in one transaction. That transaction normally comes from a separate
+application pool whose login can write the application's billing/inbox tables. Do **not** make that
+login a member of `awa_runtime`: the current runtime role can directly mutate and `TRUNCATE` Awa
+tables, which is far broader than caller-owned completion needs.
+
+The completion migration instead installs `complete_job_compat` as a hardened `SECURITY DEFINER`
+function owned by the queue-storage schema owner (`awa_owner` after the recommended ownership
+transfer). It:
+
+- fixes `search_path` to trusted schemas with `pg_temp` last and fully qualifies every referenced
+  object;
+- accepts no caller-controlled schema, table, function, or SQL identifier;
+- revokes `EXECUTE` from `PUBLIC` in the same migration transaction that creates the function;
+- performs only guarded completion of the supplied finalization token and never commits; and
+- has the same hardened per-schema installation for a custom queue-storage schema.
+
+The operator grants the application-worker login (or a dedicated `NOLOGIN` group role used by
+those logins) only `USAGE` on the Awa/queue-storage schema and `EXECUTE` on the exact versioned
+completion function. It receives no direct Awa table, sequence, maintenance-function, or
+`TRUNCATE` privilege. The Rust `complete_in_tx` helper calls this same SQL function through the
+application transaction, so Rust and non-Rust workers share one privilege and conformance boundary.
+
+Function execution authorizes completion of any valid token presented by that trusted worker
+application role. Do not grant it to producer-only roles, browser/admin clients, or public callback
+ingress roles. The implementation ships role/grant diagnostics in `awa doctor` and negative tests
+that prove the finalizer role cannot read or mutate Awa tables directly or redirect the definer
+function through `search_path`.
+
 ## Managing roles with pgroles
 
 For teams that manage PostgreSQL access declaratively, [pgroles](https://github.com/hardbyte/pgroles) can maintain the role model as a YAML manifest:
@@ -277,7 +311,7 @@ This is additive — no schema changes, no downtime.
 
 ## Future: tighter runtime grants
 
-The current model requires broad table grants because compatibility triggers and helper functions still use `SECURITY INVOKER`. A future migration could convert the internal queue-storage helpers to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
+The current model requires broad table grants because compatibility triggers and helper functions still use `SECURITY INVOKER`. ADR-042's proposed completion function is a deliberately narrow `SECURITY DEFINER` exception for an application role that must join business writes without gaining runtime privileges; it does not reduce what the ordinary runtime needs. A future migration could convert more internal queue-storage helpers to `SECURITY DEFINER` (running as the schema owner), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This broader tightening is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
 
 ## Deployable roles
 

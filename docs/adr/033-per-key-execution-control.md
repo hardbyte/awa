@@ -73,6 +73,24 @@ lease, retry, and DLQ rows. Narrow terminal rows and compact successful completi
 their retained ready backing row under ADR-026 instead of widening the terminal hot path. The
 fallback is evaluated once at enqueue; it is not recomputed from routing state later.
 
+Enqueue-shard routing has explicit precedence:
+
+1. an explicit `ordering_key` selects the shard;
+2. otherwise a `concurrency_key` selects a stable shard using its stored digest; and
+3. only jobs with neither key use the enqueue rotor.
+
+The second rule localizes keyed-but-unordered work instead of scattering one saturated key across
+every enqueue shard. It does not promote `concurrency_key` to an ordering API: Awa still makes no
+completion-order promise, and jobs with explicit, differing ordering keys may share one concurrency
+key across several lanes. Physical `PartitionedQueue` routing is unchanged; the policy id remains
+the cross-partition concurrency namespace.
+
+The selected `enqueue_shard` becomes durable routing metadata on deferred/retry, callback, and DLQ
+representations and is reused when those rows return to ready. It is not recomputed through the
+unkeyed rotor. This also closes the current retry-path gap where an original ordering-key route is
+not retained. Lowering `enqueue_shards` follows ADR-025's drain/compatibility rules for lanes that
+were selected under the old width.
+
 The limit and scope are database-authoritative, represented by a bounded policy catalog rather
 than independently configured worker values. A policy has a stable `key_policy_id` and a
 `max_in_flight` value. Multiple physical partitions of one `PartitionedQueue` may reference the
@@ -122,6 +140,12 @@ finite `(priority, enqueue_shard)` lane registry. For each candidate lane it:
 5. appends ordinary claim evidence, including the grant fields or separate grant prototype, in the
    same transaction.
 
+The function keeps a per-call memo keyed by `(key_policy_id, key_digest)`: it acquires and counts a
+key once, then tracks grants tentatively added by earlier admitted prefixes. This matters when an
+explicit ordering key, priority, or compatibility row places the same concurrency key in more than
+one probed lane. The database-authoritative count remains the source of truth; the memo only avoids
+repeating it inside one transaction.
+
 The default prototype uses `pg_try_advisory_xact_lock`: contention ends the admissible prefix
 without waiting on another key decision. A 64-bit lock key is derived with a domain that includes
 the Awa schema identity, policy id, and full digest; advisory locks are database-scoped, so omitting
@@ -142,6 +166,22 @@ key does not make that insert non-blocking. The existing bounded prune `lock_tim
 E5 plus the lock-order model must cover claim-holds-key-lock versus prune-holds-child-lock. If an
 implementation caps probes below the fixed lane count, it must rotate the starting lane across
 calls so lanes outside one probe window remain live.
+
+#### Grant-close wakeup and gated backoff
+
+Closing a keyed grant changes ready-work eligibility even when it does not insert a ready row.
+Every completion, retry/snooze, cancellation, DLQ, callback resolution, caller-owned completion,
+and rescue transaction that closes one or more keyed grants therefore emits the ordinary
+transactional queue notification for each distinct affected logical queue. PostgreSQL delivers the
+notification only after commit, so a woken claimer sees the closure. Batched closure paths dedupe
+queues before calling `pg_notify`.
+
+`key_gated` is its own dispatcher wait class. It is busy for idle-prune/health purposes but does not
+hot-spin: the dispatcher waits for a queue notification plus a bounded safety poll for lost
+notifications. `key_lock_contended` uses a shorter jittered retry because the competing claim
+transaction should be brief. With a working session listener, post-closure pickup is
+notify-bounded; poll-only or transaction-pooler deployments use the explicit gated safety cadence.
+E5 measures pickup latency and notification wake amplification in both modes.
 
 #### Grant lifetime
 
@@ -173,6 +213,25 @@ key's availability objective, and health/metrics expose the oldest open grant. A
 blocks later admission for that key until rescue, and an unresolved one-hour callback can hold the
 key for the full hour. Forced rescue still cannot prove that a partitioned zombie stopped calling
 an external provider.
+
+### Policy and operator surface
+
+`max_in_flight` must be at least 1. A zero value would pause every key attached to a policy, not one
+tenant, and queue pause already expresses that operation honestly. Per-key incident overrides are a
+future design because a high-cardinality mutable override table could recreate the hot-row problem
+this ADR avoids.
+
+The admin API and CLI expose policy create/show/update, limit lowering, drain, and force-disable
+operations using the same preview/confirm conventions as other operator mutations. Limit changes
+are audited. The UI and SQL inspection surface provide:
+
+- open grant count and oldest age by policy and key digest;
+- top saturated keys without exposing raw caller keys;
+- a derived `key_gated` reason on an available job when its current policy/key is saturated; and
+- queue metrics for gated outcomes, lock contention, closure notifications, wake amplification,
+  and post-closure pickup latency.
+
+These are derived views over authoritative evidence, not a new mutable live-counter family.
 
 ### Fairness is a separate allocator decision
 
@@ -237,6 +296,10 @@ Before Tier 2 is accepted:
   one winner at limit 1;
 - a gated top-priority lane cannot make an admissible lane in the same queue report idle, and the
   storage result distinguishes idle, gated, and lock-contended outcomes;
+- keyed jobs without an ordering key remain shard-local across enqueue, retry, callback, and DLQ
+  replay; differing explicit ordering keys exercise the per-call same-key memo across lanes;
+- closing a grant wakes a gated session-listening dispatcher after commit without hot polling;
+  poll-only mode stays within its documented gated safety interval;
 - completion, caller-owned completion, retry, snooze, callback wait/resume, cancel, DLQ, rescue,
   rotation, and prune each prove exact grant lifetime;
 - E5 compares keyed row-local claim evidence with a separate grant/closure ledger under uniform and
@@ -263,6 +326,26 @@ write and correctness surface.
 
 Rejected for the capacity-query index. It keeps the batch compact, but PostgreSQL cannot index each
 member by `(key_policy_id, key_digest)` without expanding retained arrays on the hot claim path.
+
+### Park gated jobs and promote them on grant closure
+
+This is the strongest alternative to lane-head gating and is retained as E5 prototype (d). A
+committed park transition could tombstone the ready lane, advance its cursor with durable evidence,
+and move the job to a keyed deferred-like structure. Grant closure would promote parked work and
+reuse ordinary ready-row notification, removing repeated probes and within-lane head-of-line
+blocking.
+
+The costs are substantial: every gated arrival adds a move; the parking table churns in proportion
+to the hot key's backlog; closure gains promotion work; and FIFO moves from lane order to parking
+order. More importantly, promotion without a reservation can lose the next capacity slot to a new
+ready arrival and re-park the same job, while reserving capacity before dispatch introduces the
+pre-start reservation state ADR-023 deliberately avoided. E5 may select parking only with an exact
+handoff/liveness proof, no hot mutable per-key row, and better measured results than the simpler
+lane-probe shapes. [Solid Queue's concurrency controls](https://github.com/rails/solid_queue#concurrency-controls)
+are direct semaphore-parking prior art; [GoodJob's concurrency controls](https://github.com/bensheldon/good_job#concurrency-controls)
+and [Oban Pro's Smart Engine](https://oban.hexdocs.pm/2.11.0/smart_engine.html) are broader
+Postgres-queue comparisons. Their choices are inputs, not evidence that the same storage trade-offs
+fit Awa's claim ring.
 
 ### Mutable per-key counter or permit row
 
@@ -294,8 +377,9 @@ executing, wasting claim/receipt capacity.
 - **ADR-019/023/026:** the preferred grant representation reuses the append-only claim/closure ring
   discipline and prune proof; E5 may select a separate append/truncate ledger only with its added
   proof cost recorded.
-- **ADR-025/031:** ordering and concurrency keys are distinct. Partition and enqueue-shard routing
-  co-locate ordered work; the policy id defines the fleet-exact concurrency namespace.
+- **ADR-025/031:** ordering and concurrency keys are distinct. An explicit ordering key owns shard
+  routing; otherwise the concurrency key provides shard locality without adding an ordering
+  promise. The policy id defines the fleet-exact cross-partition namespace.
 - **ADR-041:** enabling exact enforcement is a capability-gated representation flip.
 - **ADR-042:** caller-owned completion closes the exact attempt's grant in the caller's atomic
   business/finalization transaction.

@@ -64,17 +64,26 @@ database.
 
 ### Rust surface
 
-Caller-owned completion is declared on the job kind at worker registration. The exact builder
-spelling is an implementation detail, but the registration contract distinguishes ordinary
-executor-owned completion from `CompletionMode::CallerOwned`. A handler registered in ordinary
-mode cannot return `Finalized`; a caller-owned kind always takes the reconciliation path described
-below. Making the mode static lets startup reject incompatible follow-up specifications, expose the
-capability in health/diagnostics, and avoid adding a reconciliation query to every ordinary job.
+Caller-owned completion uses a distinct registration method and handler trait, not a flag on the
+ordinary `JobResult` handler. Conceptually, a caller-owned handler receives a
+`CallerOwnedJobContext` and returns `Result<FinalizationReceipt, JobError>`. The receipt is
+non-constructible outside that context's finalization method, so forgetting to finalize cannot
+compile as a successful Rust handler. Ordinary handlers cannot return a finalization receipt and do
+not pay the reconciliation query.
+
+The distinct registration also lets startup reject incompatible follow-up specifications and
+expose the capability in health/diagnostics. Python mirrors it with a dedicated decorator, type
+stubs, and runtime enforcement that a successful handler returns the binding's receipt type; a
+plain `Completed` result is rejected immediately as a programming error rather than retried toward
+attempt exhaustion.
 
 The ergonomic Rust path operates on the caller's `sqlx::Transaction`:
 
 ```rust
-async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+async fn perform(
+    &self,
+    ctx: &CallerOwnedJobContext,
+) -> Result<FinalizationReceipt, JobError> {
     let provider_state = fetch_provider_state().await?; // no DB tx held here
 
     let app_db = ctx.extract::<AppDb>().ok_or(JobError::misconfigured("AppDb"))?;
@@ -87,7 +96,7 @@ async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
 
     let receipt = ctx.complete_in_tx(&mut tx).await?;
     tx.commit().await?;
-    Ok(JobResult::Finalized(receipt))
+    Ok(receipt)
 }
 ```
 
@@ -96,9 +105,9 @@ uniqueness transition, progress flush, and exact-key grant closure as normal com
 single-job slow path and deliberately bypasses the completion batcher: a caller transaction cannot
 be merged with unrelated jobs' transactions.
 
-`JobResult::Finalized(receipt)` carries the caller's expected outcome, but it is not an unchecked
-`AlreadyFinalized` assertion. For every exit from a caller-owned handler -- success, error, panic,
-or cancellation -- the executor first reconciles durable evidence for the attempt's
+The returned receipt carries the caller's expected outcome, but it is not an unchecked finalized
+assertion. For every exit from a caller-owned handler -- success, error, panic, or cancellation --
+the executor first reconciles durable evidence for the attempt's
 `FinalizationToken`. If the handler returned a receipt, it must match that evidence. Before
 releasing the dispatch permit, in-flight state, or ADR-033 execution-grant accounting, the executor
 classifies the result:
@@ -144,10 +153,22 @@ FROM awa.complete_job_compat(
 );
 ```
 
-The exact signature is frozen with the SQL contract work in #342. The function is `SECURITY
-INVOKER`, is granted only to the worker role, does not commit, and returns the portable
-`FinalizationReceipt` fields. It routes through the active queue-storage representation and applies
-the same guard and writes as the Rust helper.
+The exact signature is frozen with the SQL contract work in #342. The function is a hardened
+`SECURITY DEFINER` privilege boundary owned by the queue-storage schema owner (`awa_owner` in the
+recommended separated-role deployment): it has a fixed `search_path`, uses fully qualified object
+names, accepts no caller-controlled identifiers, and uses `pg_temp` last in the path. The same
+migration transaction revokes `EXECUTE` from `PUBLIC` before commit. The function does not commit
+and returns the portable `FinalizationReceipt` fields. Operators grant only schema `USAGE` plus
+function `EXECUTE` to the application-worker role. They do not grant that role `awa_runtime`
+membership or direct Awa-table DML. The Rust `complete_in_tx` helper calls this same function
+through the caller's transaction rather than relying on the application connection to hold
+runtime-table privileges.
+
+`EXECUTE` authorizes guarded completion of a valid attempt token; it is granted to the trusted
+worker application role, not producer-only, browser, or public callback roles. The function routes
+through the active queue-storage representation and applies the same guard and writes as normal
+completion. Custom queue-storage schema installation creates an equivalently hardened,
+schema-qualified function owned by that schema's trusted owner.
 
 A stale token raises a dedicated SQLSTATE exception. Returning `false` is insufficient: callers
 could accidentally commit their business writes after ignoring the result. The exception aborts
@@ -159,8 +180,8 @@ exception, including SQLAlchemy `begin_nested()`. Such a transaction is unsuppor
 later commits successfully, because it has deliberately separated application writes from the
 stale finalization failure.
 
-Python bindings construct `JobResult.finalized(receipt)` only from the function result. As on the
-Rust path, caller-owned mode makes the worker runtime reconcile the dispatched attempt token after
+Python bindings construct their receipt object only from the function result. As on the Rust path,
+caller-owned registration makes the worker runtime reconcile the dispatched attempt token after
 every handler exit, including a driver exception while committing.
 
 ### Scope of v1
@@ -180,7 +201,7 @@ policy outside the rolled-back transaction.
 ADR-029's registered `on_completed_enqueue` closure is process-local application code. A generic
 SQL function invoked through another driver cannot evaluate that closure inside the caller's
 transaction. To avoid silently weakening atomicity, registration rejects a job kind that combines
-`CompletionMode::CallerOwned` and registered Completed follow-up specs.
+the caller-owned handler trait/decorator and registered Completed follow-up specs.
 
 Handlers using caller-owned completion enqueue explicit outbox/follow-up jobs inside their
 transaction through ADR-006/016/017-compatible insert surfaces. This is the most direct expression
@@ -231,6 +252,17 @@ concurrency leaves a reserved runtime connection budget. Admission must cap call
 below that boundary rather than relying on pool-acquire timeouts during heartbeat or reconciliation.
 Deployment guidance also budgets both pools against PostgreSQL's database-wide connection limit.
 
+### Transaction-pooler compatibility
+
+Caller-owned finalization uses one ordinary transaction, transaction-scoped advisory locks, and no
+session state, so the Rust and SQL finalization protocol works through transaction-mode pgbouncer,
+pgcat, and RDS Proxy. The transaction must remain pinned to one backend for its duration, which is
+the pooler's normal transaction contract.
+
+This does not make Awa's queue listener sessionless. ADR-033 grant-close `NOTIFY` calls are safe on
+the sending transaction, but receiving `LISTEN` still requires a direct/session-pooled connection;
+under the #374 transaction-pooler fallback, dispatchers use the documented gated safety poll.
+
 ## Guarantees and non-guarantees
 
 When used as specified, caller-owned completion guarantees:
@@ -263,7 +295,9 @@ representation. They follow ADR-041:
 - caller-owned completion cannot be enabled for a queue until every claiming runtime advertises
   receipt support;
 - the SQL contract is versioned against `awa.schema_version` and covered by #342 conformance tests;
-  and
+- migration installs the function under the schema owner, revokes `PUBLIC`, and leaves application
+  role `EXECUTE` as an explicit operator grant documented in `docs/security.md`; separated-role
+  deployments transfer ownership to `awa_owner` with the rest of the schema; and
 - mixed-version rehearsal proves normal executor completion still works while the new path is
   disabled.
 
@@ -287,6 +321,9 @@ Acceptance requires:
   transactions;
 - negative conformance tests for each driver's savepoint/nested-transaction pattern, proving a stale
   finalization cannot be swallowed and followed by an application commit in supported usage;
+- privilege tests proving an application-finalizer role can execute only guarded completion, cannot
+  read or mutate Awa tables directly, and cannot exploit `search_path` or token fields to reach
+  another schema or statement;
 - a crash-after-server-commit/before-client-ack test proving receipt reconciliation;
 - a completion-versus-rescue TLA+ model where either completion commits all application/finalization
   facts or rescue wins and the application transaction cannot commit;
@@ -296,6 +333,8 @@ Acceptance requires:
   commit and stays open on rollback;
 - pool-starvation tests proving caller-owned transactions cannot consume the runtime connection
   reserve needed by heartbeat and reconciliation;
+- session-mode and transaction-mode pooler tests; transaction mode uses the #374 polling fallback
+  for queue wakeup while preserving finalization atomicity;
 - a pinned-MVCC test rejecting transactions held across the handler and measuring the documented
   short-transaction path; and
 - performance comparison against batched completion, reported honestly as an opt-in per-job
@@ -306,7 +345,8 @@ Acceptance requires:
 ### Trust `JobResult::AlreadyFinalized`
 
 Rejected. A caller may return it after rollback, before commit, or after an ambiguous failure. The
-runtime needs a receipt and durable verification before releasing capacity.
+runtime needs a receipt and durable verification before releasing capacity. A distinct
+caller-owned handler return type also prevents an ordinary Rust handler from asserting this state.
 
 ### Let Awa own and commit the transaction through a closure
 
@@ -323,9 +363,9 @@ Postgres protocol session, and the lifetime/commit boundary is not portable thro
 
 Rejected as the stable contract. It avoids an installed function but makes every binding reproduce
 multi-statement ordering, stale-guard interpretation, storage-representation routing, dependency
-promotion, and future additive compatibility. A versioned `SECURITY INVOKER` function keeps that
-protocol server-side, matching #342's SQL-contract direction while still running inside the
-caller's transaction.
+promotion, and future additive compatibility. A versioned, hardened `SECURITY DEFINER` function
+keeps that protocol server-side, matching #342's SQL-contract direction while still running inside
+the caller's transaction and without granting the application role direct Awa-table DML.
 
 ### Transactional outbox without Awa completion
 
@@ -354,4 +394,5 @@ does not introduce a distributed transaction coordinator.
 - **ADR-034:** when dependencies ship, their storage-level promotion/resolution is part of the
   caller-owned finalization statement; it is not a process-local follow-up.
 - **ADR-036/041:** the Rust and SQL surfaces are versioned public contracts delivered through an
-  additive, capability-gated rollout.
+  additive, capability-gated rollout; `docs/security.md` defines the definer-function grant
+  boundary and keeps the application role out of `awa_runtime`.
