@@ -361,6 +361,9 @@ async fn enqueue_overhead_e8_gate() {
 /// long as the worker, so instrumenting them collected every poll and
 /// heartbeat tick under one span that never closed. Each tick is its own
 /// trace root now. Re-instrumenting either loop fails this test.
+///
+/// Both spans are `debug`, so a production pipeline filtering at `info` creates
+/// neither. This test's subscriber installs no filter, so it still sees them.
 #[tokio::test]
 async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
     let exporter = init_tracing();

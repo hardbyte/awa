@@ -123,12 +123,20 @@ an OpenTelemetry pipeline), the runtime's `send {queue}` and
 Grafana under **Explore → Tempo**, or search TraceQL like
 `{ span.messaging.system = "awa" }`.
 
-Worker-side, each dispatcher poll is its own trace rooted at
-`receive {queue}` (consumer kind, same messaging attributes, so the TraceQL
-above finds it) and each heartbeat tick is one rooted at `heartbeat.tick`.
-Those are per-tick by design — see the trace-volume note in
-[configuration.md](../configuration.md#worker-side-traces) before pointing a
-per-trace-priced backend at a busy fleet.
+Worker-side, each dispatcher poll roots its own trace at `receive {queue}`
+(consumer kind, same messaging attributes, so the TraceQL above finds it) and
+each heartbeat tick roots one at `heartbeat.tick`. Both are **`debug`**, so an
+`info` pipeline shows neither — they tick whether or not there is work, and at
+the default poll interval that would be ~5 traces/s per queue-claimer. Raise the
+filter when you want them; see
+[configuration.md](../configuration.md#worker-side-traces).
+
+Every span that names a queue carries both `queue` and the OTel
+`messaging.destination.name`, so `{ span.messaging.destination.name = "email" }`
+finds the messaging spans and the `queue_storage.*` spans together. The bare
+`queue` key is retained for existing queries
+([#454](https://github.com/hardbyte/awa/issues/454) tracks whether it is
+eventually dropped).
 
 ## Keeping these assets honest
 
