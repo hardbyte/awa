@@ -658,6 +658,24 @@ the execution span; `ctx.traceparent()` (Rust) and `job.traceparent`
 (Python) return the stored *enqueue-site* context for inspection or for
 continuing the trace where no ambient context exists.
 
+### Worker-side traces
+
+The dispatcher's own poll and the heartbeat tick are **root spans** — one trace
+per poll (`receive {queue}`, consumer kind, with
+`messaging.batch.message_count`) and one per heartbeat tick (`heartbeat.tick`).
+Neither loop is instrumented as a whole: a span covering a loop that lives as
+long as the worker never closes, and every child accumulates under it until the
+trace exceeds what a backend will accept ([#449](https://github.com/hardbyte/awa/issues/449)).
+
+The trade-off is trace *count*. At the default 200 ms `poll_interval` an
+otherwise idle dispatcher opens ~5 poll traces per second per queue-claimer, so
+budget a sampler if your backend prices or indexes per trace. Each poll is now
+sampled independently, which is what makes that possible — under a single
+lifetime-long root span, one head-sampling decision governed every span the
+worker would ever emit. A job carrying `awa:traceparent` still moves to its
+producer's trace, so poll traces hold only the claim, the dispatch, and any
+jobs enqueued without trace context.
+
 Capture costs well under a microsecond per enqueue and is on by default;
 `AWA_TRACE_CAPTURE=off` disables ambient capture process-wide (Rust and
 Python alike). Python producers are captured at the binding layer whenever

@@ -389,10 +389,11 @@ async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
     let spans = exporter.get_finished_spans().expect("exported spans");
 
     // The exporter is shared across this file's tests, so scope to this queue.
+    let poll_span_name = format!("receive {POLL_QUEUE}");
     let polls: Vec<_> = spans
         .iter()
         .filter(|s| {
-            s.name.as_ref() == "poll_once"
+            s.name.as_ref() == poll_span_name
                 && s.attributes
                     .iter()
                     .any(|kv| kv.key.as_str() == "queue" && kv.value.as_str() == POLL_QUEUE)
@@ -417,10 +418,45 @@ async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
         "each poll must start its own trace"
     );
 
-    // Heartbeat ticks are per-runtime, so they carry no queue attribute.
+    // A dispatcher trace's root is the consumer half of the ADR-039 messaging
+    // pair, so it carries the same conventions as `send {queue}` and is
+    // reachable by the `{ span.messaging.system = "awa" }` TraceQL in the
+    // Grafana docs.
+    let poll = polls[0];
+    assert_eq!(
+        poll.span_kind,
+        opentelemetry::trace::SpanKind::Consumer,
+        "poll span should map otel.kind = consumer"
+    );
+    for (key, want) in [
+        ("messaging.system", "awa"),
+        ("messaging.operation.type", "receive"),
+        ("messaging.destination.name", POLL_QUEUE),
+    ] {
+        assert!(
+            poll.attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == key && kv.value.as_str() == want),
+            "poll span should carry {key} = {want}; saw {:?}",
+            poll.attributes
+                .iter()
+                .map(|kv| kv.key.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Heartbeat ticks are per-runtime, so they carry no queue to scope by. Use
+    // this test's interval instead: every other test in the file runs the
+    // default 30s interval and still emits one final tick on shutdown, so an
+    // unscoped filter would let their ticks satisfy the count below.
     let beats: Vec<_> = spans
         .iter()
-        .filter(|s| s.name.as_ref() == "heartbeat_once")
+        .filter(|s| {
+            s.name.as_ref() == "heartbeat.tick"
+                && s.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "interval_ms" && kv.value.as_str() == "100")
+        })
         .collect();
     assert!(
         beats.len() >= 2,

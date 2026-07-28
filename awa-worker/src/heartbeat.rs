@@ -69,8 +69,11 @@ impl HeartbeatService {
     // Explicit root, as for the dispatcher's poll: `run` owns a loop that
     // lives as long as the worker, so a shared parent would collect every
     // tick into one unbounded trace.
+    // Not a messaging operation, so it stays an internal span; the name follows
+    // the `maintenance.*` / `queue_storage.*` convention now that it is a root.
     #[tracing::instrument(
         parent = None,
+        name = "heartbeat.tick",
         skip(self),
         fields(interval_ms = self.interval.as_millis() as u64)
     )]

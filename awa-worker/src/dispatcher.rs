@@ -658,8 +658,22 @@ impl Dispatcher {
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
     // Each poll is an explicit root so this long-lived dispatcher cannot
-    // accumulate every claim and dispatched job in one unbounded trace.
-    #[tracing::instrument(parent = None, skip(self), fields(queue = %self.queue))]
+    // accumulate every claim and dispatched job in one unbounded trace. A root
+    // span names its trace, so this follows the ADR-039 messaging convention:
+    // the consumer-side receive that pairs with the producer's `send {queue}`.
+    #[tracing::instrument(
+        parent = None,
+        skip(self),
+        fields(
+            queue = %self.queue,
+            otel.name = %format!("receive {}", self.queue),
+            otel.kind = "consumer",
+            messaging.system = "awa",
+            messaging.operation.r#type = "receive",
+            messaging.destination.name = %self.queue,
+            messaging.batch.message_count = tracing::field::Empty,
+        )
+    )]
     async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
@@ -807,6 +821,7 @@ impl Dispatcher {
         };
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
+        tracing::Span::current().record("messaging.batch.message_count", jobs.len() as u64);
         if !jobs.is_empty() {
             // Queue-storage carries an `enqueue_shard` on every claim;
             // bucket the batch so dashboards can sum

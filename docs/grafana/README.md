@@ -123,6 +123,13 @@ an OpenTelemetry pipeline), the runtime's `send {queue}` and
 Grafana under **Explore → Tempo**, or search TraceQL like
 `{ span.messaging.system = "awa" }`.
 
+Worker-side, each dispatcher poll is its own trace rooted at
+`receive {queue}` (consumer kind, same messaging attributes, so the TraceQL
+above finds it) and each heartbeat tick is one rooted at `heartbeat.tick`.
+Those are per-tick by design — see the trace-volume note in
+[configuration.md](../configuration.md#worker-side-traces) before pointing a
+per-trace-priced backend at a busy fleet.
+
 ## Keeping these assets honest
 
 These dashboards and alert rules are validated in CI against a live LGTM
