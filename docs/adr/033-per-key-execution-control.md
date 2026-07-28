@@ -2,10 +2,10 @@
 
 ## Status
 
-Proposed. Tracked in [#340](https://github.com/hardbyte/awa/issues/340). The
-worker-local baseline and the fleet-exact protocol remain experiment-gated by E5 in
-[`docs/0.7-roadmap.md`](../0.7-roadmap.md); this ADR is a design, not evidence that either tier
-has shipped.
+Accepted. Tracked in [#340](https://github.com/hardbyte/awa/issues/340). The worker-local baseline
+and the fleet-exact protocol remain experiment-gated by E5 in
+[`docs/0.7-roadmap.md`](../0.7-roadmap.md); acceptance fixes the contract and candidate constraints,
+not evidence that either tier has shipped.
 
 ## Context
 
@@ -85,11 +85,21 @@ completion-order promise, and jobs with explicit, differing ordering keys may sh
 key across several lanes. Physical `PartitionedQueue` routing is unchanged; the policy id remains
 the cross-partition concurrency namespace.
 
+Shard locality is a producer-contract obligation, not a server-side guarantee for direct SQL
+writes. Every supported producer path must apply the same domain-separated concurrency-key digest
+and routing precedence above. The public SQL producer contract in #342 freezes that digest and the
+`concurrency_key`-to-shard vectors alongside the existing `ordering_key` vectors. A producer that
+does not implement the rule cannot weaken exact admission, but it may scatter one key across lanes
+and invalidate the bounded-probe locality assumed by E5.
+
 The selected `enqueue_shard` becomes durable routing metadata on deferred/retry, callback, and DLQ
 representations and is reused when those rows return to ready. It is not recomputed through the
 unkeyed rotor. This also closes the current retry-path gap where an original ordering-key route is
 not retained. Lowering `enqueue_shards` follows ADR-025's drain/compatibility rules for lanes that
-were selected under the old width.
+were selected under the old width. A same-queue priority move retains the shard. A cross-queue
+administrative move resolves the retained shard against the destination width as
+`retained_enqueue_shard % destination_enqueue_shards`; it must not copy an out-of-range shard or
+fall back to the rotor. Jobs that shared a source route therefore remain co-located after the move.
 
 The limit and scope are database-authoritative, represented by a bounded policy catalog rather
 than independently configured worker values. A policy has a stable `key_policy_id` and a

@@ -2,10 +2,8 @@
 
 ## Status
 
-Proposed. Tracked in
-[#401](https://github.com/hardbyte/awa/issues/401). This ADR defines the contract and validation
-boundary; it does not claim that the Rust or SQL surfaces have shipped. The roadmap's status column
-is the acceptance target, not the current status.
+Accepted. Tracked in [#401](https://github.com/hardbyte/awa/issues/401). Acceptance fixes the
+contract and validation boundary; it does not claim that the Rust or SQL surfaces have shipped.
 
 ## Context
 

@@ -310,7 +310,7 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V21 | Per-key fairness under Zipf-skewed tenants (Jain index bound, no starvation) | ✓ |  | #340 |
 | V22 | A→B promotion is transactional with parent finalize; `on_parent_failure` policies (TLA+ witness + integration) | ✓ | ✓ | #14 |
 | V23 | Backpressure: `Signal` surfaces pressure, `Reject` returns typed error, transactional enqueue unaffected by default | ✓ | ✓ | #341 |
-| V24 | SQL contract conformance script green; BLAKE3 unique-key + shard-hash cross-language vectors | ✓ | ✓ | #342 |
+| V24 | SQL contract conformance script green; BLAKE3 unique-key, domain-separated concurrency-key digest, and ordering/concurrency shard-precedence cross-language vectors | ✓ | ✓ | #342 |
 | V25 | Per-key Tier 2: concurrent claimers never exceed the grant limit; every exit closes only its exact grant; gated heads neither advance nor report false idle; keyed-only routing stays shard-local; grant closure wakes session listeners while poll-only pickup is bounded; E5 compares row-local, separate-ledger, and proved parking shapes | ✓ | ✓ | #340, ADR-033 |
 | V26 | Caller-owned completion: distinct handler return type; app rows + terminal/conditional grant closure commit or roll back together; receipt/lease tokens reconcile; bounded ambiguity preserves durable authority and pool reserve; finalizer role has only hardened function execution; transaction-pooler conformance | ✓ | ✓ | #401, ADR-042 |
 
