@@ -225,12 +225,12 @@ application pool whose login can write the application's billing/inbox tables. D
 login a member of `awa_runtime`: the current runtime role can directly mutate and `TRUNCATE` Awa
 tables, which is far broader than caller-owned completion needs.
 
-The completion migration installs `complete_job` as the canonical v1 public finalization entry
-point. Its exact argument signature,
+The completion migration installs `complete_job` as the canonical public finalization entry point.
+Its exact argument signature,
 `FinalizationReceipt` result, stale-token SQLSTATE, and schema-version compatibility semantics are
-part of the ADR-036 SQL worker contract. Compatible implementation changes keep this name; a
-breaking contract introduces `complete_job_v2` and retains `complete_job` through the
-documented deprecation window.
+part of the ADR-036 SQL worker contract. Compatible implementation changes keep this name. Breaking
+improvements require ADR-036 deprecation and ADR-041 expand/migrate/contract; a versioned
+coexistence name may be used during migration without making version suffixes permanent policy.
 
 `complete_job` is a hardened `SECURITY DEFINER` function owned by the bounded execution owner
 defined by ADR-043. A queue-storage schema owner may be used only as a transitional, non-strict

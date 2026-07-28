@@ -150,17 +150,25 @@ The `_compat` suffix is reserved for internal cross-representation or rolling-up
 today's `insert_job_compat` and `delete_job_compat`. `_runtime` is reserved for binary-coupled
 helpers. Neither suffix appears in a new public contract.
 
-Each public definer name has one exact input signature. Awa does not overload it or add a second
-variant distinguished only by defaultable parameters: that complicates exact ACLs and PostgreSQL
+At any installed schema version, each public definer name has one exact input signature. Awa does
+not overload it or add a second variant distinguished only by defaultable parameters: that
+complicates exact ACLs and PostgreSQL
 [function resolution](https://www.postgresql.org/docs/current/typeconv-func.html). Extensible options
-belong inside the one versioned request shape; callers use explicit types, and `awa doctor` resolves
-one exact `regprocedure`.
+belong inside the current request shape; callers use explicit types, and `awa doctor` resolves one
+exact `regprocedure`.
 
-The unversioned names are the v1 contract. Their signatures, results, errors, and schema-version
-semantics are frozen under ADR-036. Compatible implementation changes retain the name and signature.
-A breaking contract introduces `insert_job_v2` or `complete_job_v2`, keeps v1 through the documented
-deprecation window, and grants each exact signature independently. The unversioned v1 name never
-silently retargets to a breaking implementation.
+These are stable APIs, not immutable artifacts. Compatible changes retain the clean name and
+signature. A breaking improvement is allowed under ADR-036: it requires a reviewed contract
+decision, a changelog entry, an upgrade path, and deprecation where feasible. Schema-backed changes
+also follow ADR-041 expand/migrate/contract and prove the supported mixed-version window.
+
+When old and new contracts must coexist, the expand phase may add a temporary, separately granted
+name such as `insert_job_v2` or `complete_job_v2`; it must not create an overload of the clean name.
+After callers have migrated and the old contract has completed its deprecation window, a declared
+breaking release may make the clean domain name canonical for the successor. That change is an
+operator-visible contract migration, never an automatic retarget based only on schema version.
+Version suffixes are migration tools, not a requirement to preserve every historical contract or
+accumulate permanent public names.
 
 Binary-coupled capability functions may use explicit schema-version suffixes or be replaced in an
 expand migration. They are called only by binaries inside the supported compatibility window and

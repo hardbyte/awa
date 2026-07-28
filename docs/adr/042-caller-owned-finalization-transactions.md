@@ -151,10 +151,12 @@ FROM awa.complete_job(
 );
 ```
 
-`complete_job` is the canonical v1 public finalization entry point. Its exact signature, portable
-`FinalizationReceipt` fields, stale-token SQLSTATE, and schema-version semantics are frozen with the
-SQL contract work in #342 and ADR-036. Compatible changes retain the name; a breaking contract
-introduces `complete_job_v2` and keeps v1 through the documented deprecation window.
+`complete_job` is the canonical public finalization entry point. Its exact signature, portable
+`FinalizationReceipt` fields, stale-token SQLSTATE, and schema-version semantics are covered by the
+SQL contract work in #342 and ADR-036. Compatible changes retain the name and signature. A breaking
+improvement uses ADR-036 deprecation and ADR-041 expand/migrate/contract; a temporary
+`complete_job_v2` may provide coexistence, but a declared breaking release may ultimately return
+the successor to the clean canonical name after old callers are retired.
 
 The function is a hardened `SECURITY DEFINER` privilege boundary owned by ADR-043's bounded
 execution owner. A queue-storage schema owner is only a transitional, non-strict fallback and is
