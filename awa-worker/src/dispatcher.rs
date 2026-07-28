@@ -397,7 +397,6 @@ impl Dispatcher {
     }
 
     /// Run the poll loop. Returns when cancelled.
-    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
     pub async fn run(mut self) {
         self.alive.store(true, Ordering::SeqCst);
         info!(
@@ -638,7 +637,9 @@ impl Dispatcher {
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
-    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
+    // Each poll is an explicit root so this long-lived dispatcher cannot
+    // accumulate every claim and dispatched job in one unbounded trace.
+    #[tracing::instrument(parent = None, skip(self), fields(queue = %self.queue))]
     async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
