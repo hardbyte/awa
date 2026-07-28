@@ -311,18 +311,18 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V22 | A→B promotion is transactional with parent finalize; `on_parent_failure` policies (TLA+ witness + integration) | ✓ | ✓ | #14 |
 | V23 | Backpressure: `Signal` surfaces pressure, `Reject` returns typed error, transactional enqueue unaffected by default | ✓ | ✓ | #341 |
 | V24 | SQL contract conformance script green; BLAKE3 unique-key + shard-hash cross-language vectors | ✓ | ✓ | #342 |
-| V25 | Per-key Tier 2: concurrent fleet claimers never exceed the grant limit; every completion/retry/cancel/rescue path closes only its exact grant; gated heads never advance the lane cursor | ✓ | ✓ | #340, ADR-033 |
-| V26 | Caller-owned completion: app rows + terminal/grant closure commit or roll back together; stale rescue aborts app writes; ambiguous commit reconciles before permit release | ✓ | ✓ | #401, ADR-042 |
+| V25 | Per-key Tier 2: concurrent fleet claimers never exceed the grant limit; every completion/retry/cancel/rescue closes only its exact grant; gated heads never advance their lane cursor or make an admissible queue report idle; E5 compares row-local claims with a separate ledger | ✓ | ✓ | #340, ADR-033 |
+| V26 | Caller-owned completion: app rows + terminal/conditional grant closure commit or roll back together; receipt and materialized-lease tokens reconcile; stale rescue aborts app writes; bounded ambiguous-commit reconciliation preserves durable authority and runtime pool reserve | ✓ | ✓ | #401, ADR-042 |
 
 ### Storage & performance (gate evidence, benchmark harness)
 
 | # | Test | Ref |
 | --- | --- | --- |
-| V25 | 0.6 pinned-MVCC long-horizon shape still passes on 0.7 main (798/s through 60-min pin, bounded depth, full reclaim) | #383 Gate 2 |
-| V26 | #246 shape: ≤5% rescue-ON overhead at 1×256, or named mechanism + mitigation | #246 / E2 |
-| V27 | Ring-state dead tuples reduced to noise on the long-horizon idle phase | #371 |
-| V28 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
-| V29 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
+| V27 | 0.6 pinned-MVCC long-horizon shape still passes on 0.7 main (798/s through 60-min pin, bounded depth, full reclaim) | #383 Gate 2 |
+| V28 | #246 shape: ≤5% rescue-ON overhead at 1×256, or named mechanism + mitigation | #246 / E2 |
+| V29 | Ring-state dead tuples reduced to noise on the long-horizon idle phase | #371 |
+| V30 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
+| V31 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
 
 ## Running Tests
 

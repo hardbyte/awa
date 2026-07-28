@@ -68,8 +68,10 @@ That invariant is fleet-wide and independent of the number of worker processes o
 `InsertOpts::concurrency_key` is distinct from `ordering_key`. When it is absent and an
 `ordering_key` is present, the enqueue path copies the ordering key into the concurrency-key input
 before storage. A domain-separated BLAKE3 digest, rather than the raw caller key, is stored on every
-job representation and carried through ready, deferred, retry, callback, DLQ, and terminal moves.
-The fallback is therefore evaluated once at enqueue; it is not recomputed from routing state later.
+live representation and every wide representation that can later be re-enqueued: ready, deferred,
+lease, retry, and DLQ rows. Narrow terminal rows and compact successful completions hydrate it from
+their retained ready backing row under ADR-026 instead of widening the terminal hot path. The
+fallback is evaluated once at enqueue; it is not recomputed from routing state later.
 
 The limit and scope are database-authoritative, represented by a bounded policy catalog rather
 than independently configured worker values. A policy has a stable `key_policy_id` and a
@@ -83,41 +85,63 @@ silently changing namespace would weaken the established guarantee.
 
 #### Append-only grant and closure evidence
 
-The queue-storage schema gains append-only execution-grant and execution-grant-closure evidence,
-partitioned with the claim ring. A grant records at least:
+An execution grant is a semantic role of the attempt's existing claim evidence, not necessarily a
+second ledger family. Grant open-ness and claim open-ness have the same lifecycle: materializing a
+receipt claim into `leases` or entering `waiting_external` does not close either, while completion,
+retry, snooze, cancellation, DLQ, and rescue close both.
 
-- policy id and full key digest;
-- `(job_id, run_lease)`;
-- the claim/receipt identity and claim-ring slot; and
-- grant timestamp.
+The preferred physical prototype therefore routes keyed attempts through the retained row-local
+`lease_claims` shape and adds `key_policy_id` plus the full key digest to that row. Existing
+`lease_claim_closures` / `lease_claim_closure_batches` evidence closes the grant. The open set is
+keyed `lease_claims` anti-joined with those existing closure shapes. Per-child indexes on
+`(key_policy_id, key_digest)` limit the search to one key across the fixed claim-ring children;
+same-key history retained within those children remains an E5 cost to measure.
 
-A closure references the exact grant and records the transition that released it. The open set is
-`grants` anti-joined with `closures`. Per-child indexes on `(key_policy_id, key_digest)` make the
-lookup proportional to the fixed claim-ring width rather than retained job history.
+This row-local shape is necessary because compact `lease_claim_batches` stores members in arrays;
+PostgreSQL cannot provide the per-member policy/key index needed by the claim-time capacity query
+without unnesting retained batches. Reusing claim evidence avoids an extra close write on every
+transition, makes grant/claim divergence structurally impossible, and reuses the existing claim
+prune proof.
 
-This deliberately writes one extra grant and closure fact per keyed attempt. It does not update or
-delete a per-key counter. Claim-ring prune may truncate the evidence only after its existing
-receipt proof and the new proof that every grant in the slot is closed.
+It is not free. Keyed throughput that would otherwise use compact claim batches writes one
+row-local claim per attempt, and closed rows remain until claim-ring rotation. E5 must compare this
+preferred shape with a separate indexed grant/closure ledger that lets the ordinary receipt claim
+remain compact. Both are append/truncate designs; neither may introduce a mutable per-key counter.
+The accepted physical shape is the one that passes the #246, pinned-MVCC, WAL, and claim-p99 gates.
 
 #### Serialized claim decision
 
-The claim transaction:
+`claim_ready_runtime` is already a PL/pgSQL transaction-scoped allocator, so the protocol remains
+one database round trip. It probes eligible lane heads in scheduler order, bounded by the queue's
+finite `(priority, enqueue_shard)` lane registry. For each candidate lane it:
 
-1. selects the ordinary FIFO candidate window from one
-   `(queue, priority, enqueue_shard)` lane;
-2. acquires transaction-scoped advisory locks for the distinct
-   `(key_policy_id, key_digest)` values in deterministic order;
-3. counts committed, unclosed grants for each key;
+1. reads the ordinary FIFO candidate window;
+2. on the first occurrence of each keyed value, attempts a transaction-scoped advisory lock;
+3. counts committed, unclosed grants for that key;
 4. chooses the longest contiguous candidate prefix that stays within every limit; and
-5. appends the ordinary claim evidence and execution grants in the same transaction.
+5. appends ordinary claim evidence, including the grant fields or separate grant prototype, in the
+   same transaction.
 
-The advisory lock key may be a 64-bit reduction of the full digest. A lock collision only causes
-conservative serialization because capacity is still counted by the full stored digest; it cannot
-allow over-admission. Deterministic multi-key lock order is part of the storage lock-order model.
+The default prototype uses `pg_try_advisory_xact_lock`: contention ends the admissible prefix
+without waiting on another key decision. A 64-bit lock key is derived with a domain that includes
+the Awa schema identity, policy id, and full digest; advisory locks are database-scoped, so omitting
+the schema would make independent Awa schemas contend accidentally. A hash collision only causes
+conservative under-admission because capacity is still counted by the full stored digest. The
+existing per-attempt receipt-lock helper is the implementation precedent, while the exact blocking
+versus try-lock acquisition plan remains part of E5 and `AwaStorageLockOrder` validation.
 
-If the head row is already at capacity, the claim emits no work from that lane. It does not advance
-past the row or write a tombstone. This preserves the current cursor and prune contracts, at the
-cost of head-of-line blocking for unrelated keys that hash into the same shard.
+If a lane head is at capacity or its key lock is busy, the function does not advance that lane's
+cursor or write a tombstone; it probes the next eligible lane. The current allocator selects only
+one lane per call, and `SKIP LOCKED` helps only when concurrent transactions overlap, so returning
+immediately here could repeatedly pick the same gated lane and make a ready queue appear idle. The
+new result contract must distinguish `idle`, `key_gated`, and `key_lock_contended` even when it
+returns no jobs. Dispatch idle backoff and idle-prune heuristics must treat the latter two as busy.
+
+Relation locks for the eventual claim insert still interact with claim-ring prune; try-locking the
+key does not make that insert non-blocking. The existing bounded prune `lock_timeout` remains, and
+E5 plus the lock-order model must cover claim-holds-key-lock versus prune-holds-child-lock. If an
+implementation caps probes below the fixed lane count, it must rotate the starting lane across
+calls so lanes outside one probe window remain live.
 
 #### Grant lifetime
 
@@ -130,26 +154,38 @@ The grant opens with the committed claim and stays open while the attempt is `ru
 - otherwise leaves the active-attempt set.
 
 A later retry is a new attempt and acquires a new grant. Consequently, `max_in_flight = 1`
-prevents execution overlap but does not promise completion order across backoff: after event A
-becomes deferred, event B may run before A's retry. Holding a key barrier across retry is a
-different strict-serialization feature and is not implied by this ADR.
+prevents overlap in Awa's admitted active-attempt set but does not promise completion order across
+backoff: after event A becomes deferred, event B may run before A's retry. Holding a key barrier
+across retry is a different strict-serialization feature and is not implied by this ADR.
 
 Normal executor finalization, batched completion, callback transitions, admin cancellation, and
-maintenance rescue append the closure in the same transaction as their guarded state transition.
+maintenance rescue append or reuse the claim closure in the same transaction as their guarded state
+transition.
 [ADR-042](042-caller-owned-finalization-transactions.md) extends the same rule to a caller-owned
 transaction: application rows, terminal evidence, and the grant closure commit together or all
 roll back.
+
+Capacity-release latency is therefore part of policy sizing. A crashed attempt holds its grant until
+heartbeat/deadline rescue; `waiting_external` holds it until callback resolution or
+`callback_timeout_at`, extended by callback heartbeats. There is no independent timer that silently
+releases a live grant. Operators choose attempt deadlines and callback timeouts consistent with the
+key's availability objective, and health/metrics expose the oldest open grant. At limit 1, a crash
+blocks later admission for that key until rescue, and an unresolved one-hour callback can hold the
+key for the full hour. Forced rescue still cannot prove that a partitioned zombie stopped calling
+an external provider.
 
 ### Fairness is a separate allocator decision
 
 Issue #340 also asks for fairness across keys. Exact admission and cross-key fair scheduling have
 different proof obligations. The contiguous-prefix protocol above intentionally preserves FIFO and
-cursor monotonicity, so a saturated key at a shard head can block other keys behind it.
+cursor monotonicity, so a saturated key at a lane head blocks other keys behind it in that lane.
+Bounded lane probing prevents that lane from masquerading as an idle physical queue, but it is not
+round-robin scheduling across keys.
 
-Removing that head-of-line blocking requires a later design: for example durable per-key sub-lanes
-or append-only hole/skip evidence that the allocator and prune model can prove. Tier 2 may ship
-without claiming cross-key fairness. Metrics must expose key-gated claims and oldest gated age so
-the trade-off is visible.
+Removing within-lane head-of-line blocking requires a later design: for example durable per-key
+sub-lanes or append-only hole/skip evidence that the allocator and prune model can prove. Tier 2 may
+ship without claiming cross-key fairness. Metrics must expose gated lanes, lock contention, oldest
+gated age, and ready-but-gated outcomes so the trade-off is visible.
 
 ## Guarantees and non-guarantees
 
@@ -158,8 +194,10 @@ Tier 2 guarantees:
 - no more than the configured number of committed, unclosed Awa attempts for a key across the
   fleet;
 - rollback-safe admission: a failed claim transaction creates neither a claim nor a grant;
-- attempt-specific release: a stale completion cannot close a successor's grant; and
-- no release before durable finalization acknowledgement.
+- attempt-specific release: a stale completion cannot close a successor's grant;
+- no release before durable finalization acknowledgement; and
+- a gated lane alone cannot produce an idle result while an admissible lane is within the configured
+  probe set.
 
 It does not guarantee:
 
@@ -189,17 +227,22 @@ gate by itself.
 Before Tier 2 is accepted:
 
 - a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, attempt-specific closure, rollback
-  safety, completion-versus-rescue, and no cursor advance over a gated head;
-- `AwaStorageLockOrder` includes deterministic key locks and the grant/closure partitions;
-- `AwaDeadTupleContract` classifies both tables as append/truncate and forbids per-key
-  UPDATE/DELETE;
+  safety, completion-versus-rescue, no cursor advance over a gated head, and conditional liveness
+  when capacity eventually becomes available;
+- `AwaStorageLockOrder` covers key-lock acquisition, receipt completion, and both directions of the
+  claim/prune partition-lock interaction;
+- `AwaDeadTupleContract` classifies the selected row-local or separate-ledger shape as
+  append/truncate and forbids per-key UPDATE/DELETE;
 - integration races run at least two claimers on different runtimes against the same key and prove
   one winner at limit 1;
+- a gated top-priority lane cannot make an admissible lane in the same queue report idle, and the
+  storage result distinguishes idle, gated, and lock-contended outcomes;
 - completion, caller-owned completion, retry, snooze, callback wait/resume, cancel, DLQ, rescue,
   rotation, and prune each prove exact grant lifetime;
-- E5 runs uniform and Zipf key distributions at limits 1 and N, records claim p99, oldest gated
-  age, throughput, WAL/job, and storage footprint, and stays within the roadmap's 10% claim-p99
-  gate; and
+- E5 compares keyed row-local claim evidence with a separate grant/closure ledger under uniform and
+  Zipf key distributions at limits 1 and N. It records claim p99, oldest gated age, throughput,
+  WAL/job, retained rows, and storage footprint, and stays within the roadmap's 10% claim-p99 gate;
+  and
 - the ADR-041 mixed-version rehearsal proves the disabled expand phase and the capability-gated
   enablement boundary with real N-1 artifacts.
 
@@ -208,6 +251,18 @@ Before Tier 2 is accepted:
 ### Read live leases/receipts without serialization
 
 Rejected. Two concurrent claimers can observe the same open count and both admit work.
+
+### Separate execution-grant and closure ledgers
+
+Retained as an E5 physical-layout candidate, not the default. It preserves compact receipt claims
+but duplicates one grant and one closure fact for every keyed attempt and adds a second prune proof.
+It wins only if the row-local claim shape repeats the #246 regression badly enough to justify that
+write and correctness surface.
+
+### Put key arrays on compact claim batches
+
+Rejected for the capacity-query index. It keeps the batch compact, but PostgreSQL cannot index each
+member by `(key_policy_id, key_digest)` without expanding retained arrays on the hot claim path.
 
 ### Mutable per-key counter or permit row
 
@@ -236,8 +291,9 @@ executing, wasting claim/receipt capacity.
   dispatcher asks for work; the execution grant is an additional storage admission condition.
 - **ADR-013:** `(job_id, run_lease)` is the attempt identity attached to and allowed to close a
   grant.
-- **ADR-019/023/026:** grant evidence follows the append-only claim/closure ring discipline and
-  extends claim-prune proofs without adding a mutable counter family.
+- **ADR-019/023/026:** the preferred grant representation reuses the append-only claim/closure ring
+  discipline and prune proof; E5 may select a separate append/truncate ledger only with its added
+  proof cost recorded.
 - **ADR-025/031:** ordering and concurrency keys are distinct. Partition and enqueue-shard routing
   co-locate ordered work; the policy id defines the fleet-exact concurrency namespace.
 - **ADR-041:** enabling exact enforcement is a capability-gated representation flip.
