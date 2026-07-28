@@ -151,16 +151,23 @@ FROM awa.complete_job_compat(
 );
 ```
 
-The exact signature is frozen with the SQL contract work in #342. The function is a hardened
-`SECURITY DEFINER` privilege boundary owned by the queue-storage schema owner (`awa_owner` in the
-recommended separated-role deployment): it has a fixed `search_path`, uses fully qualified object
-names, accepts no caller-controlled identifiers, and uses `pg_temp` last in the path. The same
-migration transaction revokes `EXECUTE` from `PUBLIC` before commit. The function does not commit
-and returns the portable `FinalizationReceipt` fields. Operators grant only schema `USAGE` plus
-function `EXECUTE` to the application-worker role. They do not grant that role `awa_runtime`
-membership or direct Awa-table DML. The Rust `complete_in_tx` helper calls this same function
-through the caller's transaction rather than relying on the application connection to hold
-runtime-table privileges.
+`complete_job_compat` is the canonical v1 public finalization entry point, not a compatibility
+wrapper around another public function. Its exact signature, portable `FinalizationReceipt` fields,
+stale-token SQLSTATE, and schema-version semantics are frozen with the SQL contract work in #342 and
+ADR-036. Compatible changes retain the name; a breaking contract introduces a new function name and
+keeps the old entry point through the documented deprecation window.
+
+The function is a hardened `SECURITY DEFINER` privilege boundary owned by ADR-043's bounded
+execution owner (the queue-storage schema owner is the transitional fallback): it has a fixed
+`search_path`, uses fully qualified object names, accepts no caller-controlled identifiers, and uses
+`pg_temp` last in the path. The same migration transaction creates or replaces the function,
+transfers ownership, revokes `EXECUTE` from `PUBLIC`, and grants `EXECUTE` by exact signature to the
+application-worker role. The function does not commit. Operators grant only schema `USAGE` plus
+that exact function `EXECUTE`; they do not grant `awa_runtime` membership or direct Awa-table DML.
+The Rust `complete_in_tx` helper calls the same function through the caller's transaction rather
+than relying on the application connection to hold runtime-table privileges. `awa doctor` validates
+the exact signature, owner, security mode, fixed path, and ACL rather than accepting a same-named
+wrapper or overload.
 
 `EXECUTE` authorizes guarded completion of a valid attempt token; it is granted to the trusted
 worker application role, not producer-only, browser, or public callback roles. The function routes

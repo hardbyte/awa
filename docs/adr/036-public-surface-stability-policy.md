@@ -7,9 +7,9 @@ Accepted — the policy text is [`docs/stability.md`](../stability.md), which is
 
 ## Context
 
-Awa is consumed through at least seven distinct surfaces — the Rust API, the Python API, the
-SQL producer contract, the HTTP admin API, the callback receiver contract, metric
-names/attributes, and the CLI — and 0.6's beta-series churn (`QueueFanout` →
+Awa is consumed through at least eight distinct surfaces — the Rust API, the Python API, the
+SQL producer contract, SQL worker finalization contract, HTTP admin API, callback receiver
+contract, metric names/attributes, and the CLI — and 0.6's beta-series churn (`QueueFanout` →
 `PartitionedQueue`) showed the cost of having no written boundary: consumers cannot tell a
 supported surface from an internal one, and maintainers cannot tell a breaking change from a
 refactor. Polyglot producers ([#342](https://github.com/hardbyte/awa/issues/342)) and API

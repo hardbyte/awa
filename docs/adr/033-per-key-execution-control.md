@@ -287,13 +287,23 @@ while no exact policy is enabled; they cannot retain the new key through every r
 Enabling a policy therefore acts as a capability-gated flip under ADR-041: every fresh runtime that
 can claim, retry, rescue, or administratively move the affected queues must advertise support first.
 
+Runtime capability is necessary but not sufficient. Rows enqueued before the expansion may have an
+`ordering_key`-selected shard but no recoverable concurrency-key digest: many keys map to one shard,
+so `enqueue_shard` is not an authoritative backfill source. Before enabling an exact policy, the
+same guarded flip must prove that every affected ready, deferred, retry, callback, DLQ, receipt, and
+lease representation either carries the new policy/key identity or has drained. An
+application-supplied authoritative key mapping may backfill rows before the flip; otherwise the
+operator must drain the affected queues. A legacy row without key identity never silently shares a
+policy with new keyed work, because that could admit it outside `max_in_flight`. `awa doctor` names
+the blocking representation counts and the drain/backfill requirement.
+
 The implementation release must either provide a compatible N-1 patch that recognizes the expand
 schema or defer the migration to the next minor. This ADR does not reopen the current 0.7 release
 gate by itself.
 
 ## Validation
 
-Before Tier 2 is accepted:
+Before Tier 2 ships:
 
 - a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, attempt-specific closure, rollback
   safety, completion-versus-rescue, no cursor advance over a gated head, and conditional liveness
@@ -308,6 +318,9 @@ Before Tier 2 is accepted:
   storage result distinguishes idle, gated, and lock-contended outcomes;
 - keyed jobs without an ordering key remain shard-local across enqueue, retry, callback, and DLQ
   replay; differing explicit ordering keys exercise the per-call same-key memo across lanes;
+- policy enablement refuses while an affected legacy representation lacks authoritative key
+  identity, including banked backlog and in-flight N-1 attempts; a drain or authoritative backfill
+  plus the final capability/row reconciliation makes the flip succeed atomically;
 - closing a grant wakes a gated session-listening dispatcher after commit without hot polling;
   poll-only mode stays within its documented gated safety interval;
 - completion, caller-owned completion, retry, snooze, callback wait/resume, cancel, DLQ, rescue,
