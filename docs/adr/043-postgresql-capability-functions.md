@@ -15,7 +15,7 @@ role can enqueue, claim, execute, maintain, and administer jobs. It receives bro
 and most helpers execute as `SECURITY INVOKER`. The split from `awa_migrator` still protects schema
 ownership, but compromise of any runtime surface grants broad data-plane mutation authority.
 
-ADR-042 adds a narrower application-worker principal. Its `complete_job_compat` entry point runs as
+ADR-042 adds a narrower application-worker principal. Its planned `complete_job` entry point runs as
 `SECURITY DEFINER`, so an application transaction can complete one guarded attempt without joining
 `awa_runtime` or receiving direct Awa-table privileges. That creates a natural question: should the
 whole PostgreSQL function surface become `SECURITY DEFINER` so all runtime table grants can be
@@ -45,7 +45,7 @@ Every installed routine belongs to exactly one class in a machine-readable capab
 
 | Class | Security mode | Who may execute | Contract |
 | --- | --- | --- | --- |
-| Public compatibility capability | Hardened `SECURITY DEFINER` when it crosses into private tables | Exact documented role grants | Stable under ADR-036; examples include `insert_job_compat` and `complete_job_compat` |
+| Public capability | Hardened `SECURITY DEFINER` when it crosses into private tables | Exact documented role grants | Stable under ADR-036; initial names are `insert_job` and `complete_job` |
 | Binary-coupled runtime capability | Hardened `SECURITY DEFINER` | Exact producer, executor, maintenance, callback, or admin role | Versioned with the schema/binary compatibility window; not a public SQL API |
 | Internal helper | `SECURITY INVOKER` by default | Definer owner and migrator only | Internal; callable by a capability function but not by runtime logins |
 | Read-only inspection surface | `SECURITY INVOKER` unless private-table mediation is required | Explicit read roles | Stable only when listed by ADR-036 |
@@ -127,10 +127,33 @@ classification is part of the same audit rather than an implicit exception.
 ### Public names and internal names
 
 Only entry points listed in [`docs/stability.md`](../stability.md) are public SQL contracts.
-`insert_job_compat` and `complete_job_compat` are canonical compatibility entry points, not wrappers
-around an undocumented public function. Their signatures, results, errors, and schema-version
-semantics are frozen under ADR-036. A breaking contract introduces a new function name and retains
-the old entry point through the documented deprecation window.
+
+Public functions use domain names, not implementation or rollout suffixes. The initial v1 surface
+is:
+
+- `awa.insert_job(...)` for SQL producers; and
+- `<queue_storage_schema>.complete_job(...)` for caller-owned completion.
+
+`complete_job` names the user-visible job transition even though its token and stale guard identify
+one exact attempt. This matches Awa's existing Rust lifecycle terminology while the arguments keep
+the attempt boundary explicit. `complete_attempt` would overemphasize a storage fact; `finalize_job`
+would conflict with Awa's broader use of finalization for success, failure, retry, and cancellation.
+
+The `_compat` suffix is reserved for internal cross-representation or rolling-upgrade shims such as
+today's `insert_job_compat` and `delete_job_compat`. `_runtime` is reserved for binary-coupled
+helpers. Neither suffix appears in a new public contract.
+
+Each public definer name has one exact input signature. Awa does not overload it or add a second
+variant distinguished only by defaultable parameters: that complicates exact ACLs and PostgreSQL
+[function resolution](https://www.postgresql.org/docs/current/typeconv-func.html). Extensible options
+belong inside the one versioned request shape; callers use explicit types, and `awa doctor` resolves
+one exact `regprocedure`.
+
+The unversioned names are the v1 contract. Their signatures, results, errors, and schema-version
+semantics are frozen under ADR-036. Compatible implementation changes retain the name and signature.
+A breaking contract introduces `insert_job_v2` or `complete_job_v2`, keeps v1 through the documented
+deprecation window, and grants each exact signature independently. The unversioned v1 name never
+silently retargets to a breaking implementation.
 
 Binary-coupled capability functions may use explicit schema-version suffixes or be replaced in an
 expand migration. They are called only by binaries inside the supported compatibility window and
@@ -252,5 +275,5 @@ operation while allowing storage internals to evolve.
 - **ADR-036:** only listed compatibility entry points are stable public SQL surfaces.
 - **ADR-041:** broad-to-strict grants roll out through expand, capability evidence, operator-visible
   tightening, and a later contract phase.
-- **ADR-042:** `complete_job_compat` is the first hardened application-finalizer capability and must
+- **ADR-042:** `complete_job` is the first hardened application-finalizer capability and must
   obey this ADR's naming, ownership, ACL, and diagnostic rules.

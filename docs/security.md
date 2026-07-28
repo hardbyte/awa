@@ -225,14 +225,14 @@ application pool whose login can write the application's billing/inbox tables. D
 login a member of `awa_runtime`: the current runtime role can directly mutate and `TRUNCATE` Awa
 tables, which is far broader than caller-owned completion needs.
 
-The completion migration installs `complete_job_compat` as the canonical v1 public finalization
-entry point, not as a wrapper around another public function. Its exact argument signature,
+The completion migration installs `complete_job` as the canonical v1 public finalization entry
+point. Its exact argument signature,
 `FinalizationReceipt` result, stale-token SQLSTATE, and schema-version compatibility semantics are
 part of the ADR-036 SQL worker contract. Compatible implementation changes keep this name; a
-breaking contract introduces a new function name and retains `complete_job_compat` through the
+breaking contract introduces `complete_job_v2` and retains `complete_job` through the
 documented deprecation window.
 
-`complete_job_compat` is a hardened `SECURITY DEFINER` function owned by the bounded execution owner
+`complete_job` is a hardened `SECURITY DEFINER` function owned by the bounded execution owner
 defined by ADR-043 (the queue-storage schema owner is the transitional fallback). Its migration:
 
 - fixes `search_path` to trusted schemas with `pg_temp` last and fully qualifies every referenced
@@ -247,7 +247,7 @@ those logins) only `USAGE` on the Awa/queue-storage schema and `EXECUTE` on the 
 completion function. It receives no direct Awa table, sequence, maintenance-function, or
 `TRUNCATE` privilege. The Rust `complete_in_tx` helper calls this same SQL function through the
 application transaction, so Rust and non-Rust workers share one privilege and conformance boundary.
-The migration grants by the exact `complete_job_compat(...)` signature after ownership transfer;
+The migration grants by the exact `complete_job(...)` signature after ownership transfer;
 replacement preserves that ACL, and removal follows ADR-036 rather than silently redirecting the
 grant to an internal helper.
 

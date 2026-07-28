@@ -140,7 +140,7 @@ conceptually:
 
 ```sql
 SELECT *
-FROM awa.complete_job_compat(
+FROM awa.complete_job(
     job_id       => $1,
     run_lease    => $2,
     claim_slot   => $3,
@@ -151,11 +151,10 @@ FROM awa.complete_job_compat(
 );
 ```
 
-`complete_job_compat` is the canonical v1 public finalization entry point, not a compatibility
-wrapper around another public function. Its exact signature, portable `FinalizationReceipt` fields,
-stale-token SQLSTATE, and schema-version semantics are frozen with the SQL contract work in #342 and
-ADR-036. Compatible changes retain the name; a breaking contract introduces a new function name and
-keeps the old entry point through the documented deprecation window.
+`complete_job` is the canonical v1 public finalization entry point. Its exact signature, portable
+`FinalizationReceipt` fields, stale-token SQLSTATE, and schema-version semantics are frozen with the
+SQL contract work in #342 and ADR-036. Compatible changes retain the name; a breaking contract
+introduces `complete_job_v2` and keeps v1 through the documented deprecation window.
 
 The function is a hardened `SECURITY DEFINER` privilege boundary owned by ADR-043's bounded
 execution owner (the queue-storage schema owner is the transitional fallback): it has a fixed
@@ -216,7 +215,7 @@ the restriction without running process-local code from SQL.
 Storage-level finalization obligations are different from process-local hooks. If ADR-034 job
 dependencies are enabled, successful caller-owned completion must promote or resolve dependants in
 the same transaction just like ordinary completion. Dependants are per-job data and cannot be
-rejected reliably at registration, so `complete_in_tx` / `complete_job_compat` owns this step.
+rejected reliably at registration, so `complete_in_tx` / `complete_job` owns this step.
 
 Best-effort lifecycle hooks, metrics, and terminal tracing run only after the executor verifies the
 committed receipt. They retain their existing crash-loss boundary: a process that commits and dies

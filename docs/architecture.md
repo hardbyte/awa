@@ -65,7 +65,8 @@ Most applications should use the Rust, Python, CLI, or UI APIs rather than query
 
 | Surface | Role | Consumer contract |
 | --- | --- | --- |
-| `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility surface used during the storage transition and by SQL adapters that need the public job shape. When queue storage is active, the runtime does not claim or complete from `awa.jobs`; compatibility inserts route into the active backend, and SQL deletes of ready rows append ready tombstones. | Public compatibility surface. Prefer Rust/Python/adapter APIs for ordinary writes. For high-volume queue-storage producers, prefer configured direct COPY through `QueueStorage::enqueue_params_copy()` or Python `enqueue_many_copy()` rather than the compat COPY path. |
+| `awa.insert_job()` | Planned public v1 SQL producer capability under #342. It presents one stable request/result/error contract while delegating to the active storage implementation. | Public SQL contract once shipped. Prefer configured direct COPY for trusted high-volume producers that accept ADR-043's broader privilege profile. |
+| `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility plumbing used during the storage transition and by current Rust/Python adapters. When queue storage is active, the runtime does not claim or complete from `awa.jobs`; compatibility inserts route into the active backend, and SQL deletes of ready rows append ready tombstones. | Internal cross-representation surface. `_compat` functions may evolve with the supported binary/schema window and are not the #342 public contract. |
 | `{schema}.terminal_jobs` | Read-only hydrated view over queue-storage terminal history. It joins narrow `done_entries_*` rows and compact `receipt_completion_batches_*` rows back to retained `ready_entries_*` bodies. | Public read surface for SQL inspection and reporting of terminal queue-storage rows. It is not a write or transition surface. |
 | `ready_entries_*` | Physical runnable queue ring. | Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths. |
 | `ready_claim_attempt_batches_*` | Physical attempt-emission ledger keyed by ready slot/generation and lane ranges. | Internal storage. Claim writes one compact batch row in the same transaction as the receipt/lease claims; stale claim-cursor recovery treats covered lanes as durable evidence that those lanes already emitted `run_lease + 1`. Queue prune truncates it with the matching ready segment. |
@@ -150,7 +151,7 @@ Enqueue is transactional: if the producer's outer transaction rolls back, the jo
 There are two COPY-shaped producer paths:
 
 - Direct queue-storage COPY is the high-throughput path: Rust producers use a configured `QueueStorage::enqueue_params_copy()`, and Python producers use `enqueue_many_copy()`. Direct-copy producers must use the same queue-storage configuration as the worker fleet, especially `queue_stripe_count` / `queue_storage_queue_stripe_count`.
-- `insert_many_copy()` is the compatibility path. It stages rows with COPY but then routes each row through `awa.insert_job_compat()`, so it preserves the public compatibility surface rather than bypassing to the direct producer path.
+- `insert_many_copy()` is the compatibility path. It stages rows with COPY but then routes each row through the internal `awa.insert_job_compat()` plumbing, preserving cross-storage behavior rather than bypassing to the direct producer path. The planned `awa.insert_job()` public capability owns the stable SQL contract separately.
 
 Claim is cursor-based rather than heap-scan based:
 
