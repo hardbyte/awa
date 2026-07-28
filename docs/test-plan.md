@@ -311,6 +311,8 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V22 | A→B promotion is transactional with parent finalize; `on_parent_failure` policies (TLA+ witness + integration) | ✓ | ✓ | #14 |
 | V23 | Backpressure: `Signal` surfaces pressure, `Reject` returns typed error, transactional enqueue unaffected by default | ✓ | ✓ | #341 |
 | V24 | SQL contract conformance script green; BLAKE3 unique-key + shard-hash cross-language vectors | ✓ | ✓ | #342 |
+| V25 | Per-key Tier 2: concurrent fleet claimers never exceed the grant limit; every completion/retry/cancel/rescue path closes only its exact grant; gated heads never advance the lane cursor | ✓ | ✓ | #340, ADR-033 |
+| V26 | Caller-owned completion: app rows + terminal/grant closure commit or roll back together; stale rescue aborts app writes; ambiguous commit reconciles before permit release | ✓ | ✓ | #401, ADR-042 |
 
 ### Storage & performance (gate evidence, benchmark harness)
 
