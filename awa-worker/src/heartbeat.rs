@@ -42,7 +42,6 @@ impl HeartbeatService {
     }
 
     /// Run the heartbeat loop. Returns when cancelled.
-    #[tracing::instrument(skip(self), fields(interval_ms = self.interval.as_millis() as u64))]
     pub async fn run(&self) {
         self.alive.store(true, Ordering::SeqCst);
         debug!(
@@ -67,7 +66,15 @@ impl HeartbeatService {
         self.alive.store(false, Ordering::SeqCst);
     }
 
-    #[tracing::instrument(skip(self))]
+    // Each tick is an explicit root for the same reason as the dispatcher's
+    // poll: `run` owns a loop that lives as long as the worker, so a shared
+    // parent would collect every lease heartbeat and progress flush of the
+    // process into one unbounded trace.
+    #[tracing::instrument(
+        parent = None,
+        skip(self),
+        fields(interval_ms = self.interval.as_millis() as u64)
+    )]
     async fn heartbeat_once(&self) {
         let mut all_keys: Vec<(i64, RunLease)> = self.in_flight.keys();
         all_keys.sort_unstable();

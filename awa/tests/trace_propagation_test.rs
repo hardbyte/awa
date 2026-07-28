@@ -5,12 +5,13 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use awa::{Client, JobArgs, JobResult, QueueConfig};
 use awa_model::{insert_with, migrations, trace::TRACEPARENT_METADATA_KEY, InsertOpts};
-use opentelemetry::trace::TraceContextExt;
+use opentelemetry::trace::{SpanId, TraceContextExt};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -26,6 +27,7 @@ fn database_url() -> String {
 
 const QUEUE: &str = "trace_prop";
 const RETRY_QUEUE: &str = "trace_retry";
+const POLL_QUEUE: &str = "trace_poll";
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct TracedJob {
@@ -352,5 +354,100 @@ async fn enqueue_overhead_e8_gate() {
         "capture cost: {:.3}µs/enqueue ({:+.3}% of a 1ms enqueue roundtrip)",
         per_insert * 1e6,
         per_insert / 1e-3 * 100.0
+    );
+}
+
+/// #449: the dispatcher and heartbeat loops must not accumulate one
+/// unbounded trace. `Dispatcher::run` and `HeartbeatService::run` both own
+/// loops that live as long as the worker, so instrumenting them made every
+/// poll, claim query, and lease heartbeat a descendant of a root span that
+/// never closed. In production those traces passed a 5 MB backend limit and
+/// were rejected, taking dispatcher telemetry with them. Each poll and each
+/// heartbeat tick is now an explicit root, so repeated ticks are independent
+/// finite traces. Re-instrumenting either loop fails this test. `parent = None`
+/// on the ticks is not observable on its own here — a spawned dispatcher task
+/// has no ambient span — so it guards the case where an ambient parent is
+/// reintroduced above the loop.
+#[tokio::test]
+async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
+    let exporter = init_tracing();
+    let pool = setup(POLL_QUEUE).await;
+
+    // No jobs are enqueued: an idle poll still opens its span, which is the
+    // repeated-span shape that grew without bound.
+    let client = Client::builder(pool.clone())
+        .heartbeat_interval(Duration::from_millis(100))
+        .queue(
+            POLL_QUEUE,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(100),
+                ..QueueConfig::default()
+            },
+        )
+        .register::<TracedJob, _, _>(
+            |_args: TracedJob, _ctx| async move { Ok(JobResult::Completed) },
+        )
+        .build()
+        .expect("client should build");
+    client.start().await.expect("client should start");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    client.shutdown(Duration::from_secs(10)).await;
+
+    let spans = exporter.get_finished_spans().expect("exported spans");
+
+    // The exporter is shared across this file's tests, so scope the poll
+    // assertions to this queue's dispatcher via the span's queue attribute.
+    let polls: Vec<_> = spans
+        .iter()
+        .filter(|s| {
+            s.name.as_ref() == "poll_once"
+                && s.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "queue" && kv.value.as_str() == POLL_QUEUE)
+        })
+        .collect();
+    assert!(
+        polls.len() >= 2,
+        "expected repeated dispatcher polls to export spans, saw {}",
+        polls.len()
+    );
+    for poll in &polls {
+        assert_eq!(
+            poll.parent_span_id,
+            SpanId::INVALID,
+            "each poll span must be a trace root, not a child of the poll loop"
+        );
+    }
+    let poll_traces: HashSet<_> = polls.iter().map(|s| s.span_context.trace_id()).collect();
+    assert_eq!(
+        poll_traces.len(),
+        polls.len(),
+        "each poll must start its own trace so no trace grows with worker lifetime"
+    );
+
+    // Heartbeat ticks carry no queue attribute (they are per-runtime), so
+    // assert the same root property over every exported tick.
+    let beats: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name.as_ref() == "heartbeat_once")
+        .collect();
+    assert!(
+        beats.len() >= 2,
+        "expected repeated heartbeat ticks to export spans, saw {}",
+        beats.len()
+    );
+    for beat in &beats {
+        assert_eq!(
+            beat.parent_span_id,
+            SpanId::INVALID,
+            "each heartbeat tick must be a trace root, not a child of the heartbeat loop"
+        );
+    }
+    let beat_traces: HashSet<_> = beats.iter().map(|s| s.span_context.trace_id()).collect();
+    assert_eq!(
+        beat_traces.len(),
+        beats.len(),
+        "each heartbeat tick must start its own trace"
     );
 }

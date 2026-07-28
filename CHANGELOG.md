@@ -4,6 +4,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dispatcher and heartbeat traces no longer grow for the lifetime of the worker ([#449](https://github.com/hardbyte/awa/issues/449)).** `Dispatcher::run` and `HeartbeatService::run` each own a loop that runs until shutdown, and both were `#[tracing::instrument]`-annotated — so their spans never closed and every poll, claim query, lease heartbeat, progress flush, and untraced job span accumulated under one root. A single trace therefore grew without bound: production workers produced traces of tens of megabytes that Tempo rejected with `TRACE_TOO_LARGE` at a 5 MB limit, and the resulting export pressure surfaced as `BatchSpanProcessor` `ExportError: Timeout expired` (reported through integrations such as Sentry as application errors). The worker and its database work were healthy throughout; only telemetry export failed.
+  - Neither loop is instrumented now, and each `poll_once` / `heartbeat_once` tick is an explicit trace root (`parent = None`), so repeated ticks produce independent finite traces. Every poll span keeps its `queue` attribute, and the enqueue→execute propagation from [ADR-039](docs/adr/039-trace-propagation.md) is unchanged: a job carrying `awa:traceparent` still joins its producer's trace, and retries still start a fresh trace linked back to the enqueue site.
+  - As a side effect, sampling now works on this path. One lifetime-long root span meant a single head-sampling decision governed every span the worker ever emitted; each poll is now sampled independently.
+  - Jobs *without* a stored `traceparent` (SQL producers, or `AWA_TRACE_CAPTURE=off`) still attach to the poll that dispatched them, so a poll trace is bounded by the claim batch — up to `claim_batch_size` (default 512) job subtrees. Deployments that want job execution fully decoupled from dispatcher traces should keep trace capture on.
+  - The dispatcher's PG-listener `error!`/`warn!` events now carry `queue` explicitly; they previously inherited it from the removed span, so listener failures were unattributable on a multi-queue worker.
+
 ## [0.7.0-alpha.1] — 2026-07-17
 
 > **Upgrade path:** the ring-cursor authority work (migration v043) makes **0.6.2 a mandatory

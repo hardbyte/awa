@@ -412,7 +412,11 @@ impl Dispatcher {
         let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
             Ok(listener) => listener,
             Err(err) => {
-                error!(error = %err, "Failed to create PG listener, falling back to polling only");
+                error!(
+                    queue = %self.queue,
+                    error = %err,
+                    "Failed to create PG listener, falling back to polling only"
+                );
                 // Fall back to poll-only mode
                 self.poll_loop_only().await;
                 self.alive.store(false, Ordering::SeqCst);
@@ -421,13 +425,22 @@ impl Dispatcher {
         };
 
         if let Err(err) = listener.listen(&notify_channel).await {
-            warn!(error = %err, channel = %notify_channel, "Failed to LISTEN, falling back to polling");
+            warn!(
+                queue = %self.queue,
+                error = %err,
+                channel = %notify_channel,
+                "Failed to LISTEN, falling back to polling"
+            );
             self.poll_loop_only().await;
             self.alive.store(false, Ordering::SeqCst);
             return;
         }
 
-        debug!(channel = %notify_channel, "Listening for job notifications");
+        debug!(
+            queue = %self.queue,
+            channel = %notify_channel,
+            "Listening for job notifications"
+        );
 
         loop {
             tokio::select! {
@@ -443,7 +456,11 @@ impl Dispatcher {
                             self.drain_ready(WakeReason::Notify, Instant::now()).await;
                         }
                         Err(err) => {
-                            warn!(error = %err, "PG listener error, will retry");
+                            warn!(
+                                queue = %self.queue,
+                                error = %err,
+                                "PG listener error, will retry"
+                            );
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
