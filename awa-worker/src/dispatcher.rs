@@ -665,18 +665,10 @@ impl Dispatcher {
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
-    // Each poll is an explicit root so this long-lived dispatcher cannot
-    // accumulate every claim and dispatched job in one unbounded trace. A root
-    // span names its trace, so this follows the ADR-039 messaging convention:
-    // the consumer-side receive that pairs with the producer's `send {queue}`.
-    // `debug`, not `info`: an idle dispatcher polls on `poll_interval` (200ms by
-    // default), so an info-level span would open ~5 traces/s per queue-claimer
-    // whose only content is "claimed nothing". Empty polls are already covered
-    // by `record_dispatch_empty_claim` and the `record_claim_batch` histogram
-    // below, which are metrics and always on. Filtered out at info, the callsite
-    // is not interested, so nothing is allocated or exported — and untraced
-    // `job.execute` spans become their own roots rather than fanning up to
-    // `claim_batch_size` subtrees into one poll trace.
+    ///
+    /// Returns whether the caller should keep polling.
+    // Debug-level root span: this runs on `poll_interval` whether or not there
+    // is work, and empty polls are already covered by metrics (#449, #455).
     #[tracing::instrument(
         level = "debug",
         parent = None,
