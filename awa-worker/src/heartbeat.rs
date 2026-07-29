@@ -68,7 +68,7 @@ impl HeartbeatService {
 
     /// One heartbeat pass: refresh leases for in-flight jobs and flush any
     /// pending progress. No-op when nothing is in flight.
-    // Debug-level root span, as for the dispatcher's poll (#449, #455).
+    // Debug-level root span: see #449, #455.
     #[tracing::instrument(
         level = "debug",
         parent = None,

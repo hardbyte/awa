@@ -366,9 +366,6 @@ impl Dispatcher {
         let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
             Ok(listener) => listener,
             Err(err) => {
-                // warn, not error: poll-only still works, and a
-                // transaction-mode pooler makes this the expected path
-                // (#374). Matches the LISTEN fallback below.
                 warn!(
                     queue = %self.queue,
                     error = %err,
@@ -519,8 +516,7 @@ impl Dispatcher {
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
     ///
     /// Returns whether the caller should keep polling.
-    // Debug-level root span: this runs on `poll_interval` whether or not there
-    // is work, and empty polls are already covered by metrics (#449, #455).
+    // Debug-level root span: see #449, #455.
     #[tracing::instrument(
         level = "debug",
         parent = None,
