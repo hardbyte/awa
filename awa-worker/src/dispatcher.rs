@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_CLAIM_BATCH_LIMIT: usize = 512;
@@ -397,11 +397,11 @@ impl Dispatcher {
     }
 
     /// Run the poll loop. Returns when cancelled.
-    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
     pub async fn run(mut self) {
         self.alive.store(true, Ordering::SeqCst);
         info!(
             queue = %self.queue,
+            messaging.destination.name = %self.queue,
             runtime_instance_id = %self.runtime_instance_id,
             claimer_owner_id = %self.claimer_owner_id,
             poll_interval_ms = self.config.poll_interval.as_millis(),
@@ -413,7 +413,15 @@ impl Dispatcher {
         let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
             Ok(listener) => listener,
             Err(err) => {
-                error!(error = %err, "Failed to create PG listener, falling back to polling only");
+                // warn, not error: poll-only still works, and a
+                // transaction-mode pooler makes this the expected path
+                // (#374). Matches the LISTEN fallback below.
+                warn!(
+                    queue = %self.queue,
+                    messaging.destination.name = %self.queue,
+                    error = %err,
+                    "Failed to create PG listener, falling back to polling only"
+                );
                 // Fall back to poll-only mode
                 self.poll_loop_only().await;
                 self.alive.store(false, Ordering::SeqCst);
@@ -422,29 +430,45 @@ impl Dispatcher {
         };
 
         if let Err(err) = listener.listen(&notify_channel).await {
-            warn!(error = %err, channel = %notify_channel, "Failed to LISTEN, falling back to polling");
+            warn!(
+                queue = %self.queue,
+                messaging.destination.name = %self.queue,
+                error = %err,
+                channel = %notify_channel,
+                "Failed to LISTEN, falling back to polling"
+            );
             self.poll_loop_only().await;
             self.alive.store(false, Ordering::SeqCst);
             return;
         }
 
-        debug!(channel = %notify_channel, "Listening for job notifications");
+        debug!(
+            queue = %self.queue,
+            messaging.destination.name = %self.queue,
+            channel = %notify_channel,
+            "Listening for job notifications"
+        );
 
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
-                    debug!(queue = %self.queue, "Dispatcher shutting down");
+                    debug!(queue = %self.queue, messaging.destination.name = %self.queue, "Dispatcher shutting down");
                     break;
                 }
                 // Wait for either a notification or the poll interval
                 notification = listener.recv() => {
                     match notification {
                         Ok(_) => {
-                            debug!(queue = %self.queue, "Woken by NOTIFY");
+                            debug!(queue = %self.queue, messaging.destination.name = %self.queue, "Woken by NOTIFY");
                             self.drain_ready(WakeReason::Notify, Instant::now()).await;
                         }
                         Err(err) => {
-                            warn!(error = %err, "PG listener error, will retry");
+                            warn!(
+                                queue = %self.queue,
+                                messaging.destination.name = %self.queue,
+                                error = %err,
+                                "PG listener error, will retry"
+                            );
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
@@ -471,7 +495,7 @@ impl Dispatcher {
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
-                    debug!(queue = %self.queue, "Dispatcher (poll-only) shutting down");
+                    debug!(queue = %self.queue, messaging.destination.name = %self.queue, "Dispatcher (poll-only) shutting down");
                     break;
                 }
                 _ = self.capacity_wake.notified() => {
@@ -557,6 +581,7 @@ impl Dispatcher {
                 Err(err) => {
                     debug!(
                         queue = %self.queue,
+                        messaging.destination.name = %self.queue,
                         error = %err,
                         "Override refresh failed; keeping current values"
                     );
@@ -580,6 +605,7 @@ impl Dispatcher {
             Some(ms) if self.base_deadline_duration.is_zero() != (ms == 0) => {
                 warn!(
                     queue = %self.queue,
+                    messaging.destination.name = %self.queue,
                     override_deadline_ms = ms,
                     "Ignoring deadline override that crosses the zero boundary: \
                      the receipts-vs-legacy claim mode is fixed at startup"
@@ -612,6 +638,7 @@ impl Dispatcher {
             _ if overrides.rate_limit.is_some() => {
                 warn!(
                     queue = %self.queue,
+                    messaging.destination.name = %self.queue,
                     "Ignoring rate-limit override: queue was built without a rate \
                      limit (enabling limiting live is Tier 2)"
                 );
@@ -619,7 +646,7 @@ impl Dispatcher {
             _ => {}
         }
 
-        info!(queue = %self.queue, ?overrides, "Applied queue runtime overrides");
+        info!(queue = %self.queue, messaging.destination.name = %self.queue, ?overrides, "Applied queue runtime overrides");
         self.applied_overrides = overrides;
     }
 
@@ -638,7 +665,24 @@ impl Dispatcher {
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
-    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
+    ///
+    /// Returns whether the caller should keep polling.
+    // Debug-level root span: this runs on `poll_interval` whether or not there
+    // is work, and empty polls are already covered by metrics (#449, #455).
+    #[tracing::instrument(
+        level = "debug",
+        parent = None,
+        skip(self),
+        fields(
+            queue = %self.queue,
+            otel.name = %format!("receive {}", self.queue),
+            otel.kind = "consumer",
+            messaging.system = "awa",
+            messaging.operation.r#type = "receive",
+            messaging.destination.name = %self.queue,
+            messaging.batch.message_count = tracing::field::Empty,
+        )
+    )]
     async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
@@ -745,7 +789,7 @@ impl Dispatcher {
                     })
                     .collect(),
                 Err(err) => {
-                    warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
+                    warn!(queue = %self.queue, messaging.destination.name = %self.queue, error = %err, "Failed to claim jobs");
                     self.refund_rate_limit(batch_size);
                     return false;
                 }
@@ -776,6 +820,7 @@ impl Dispatcher {
                 Err(err) => {
                     warn!(
                         queue = %self.queue,
+                        messaging.destination.name = %self.queue,
                         error = %err,
                         "Failed to claim queue storage jobs"
                     );
@@ -786,6 +831,7 @@ impl Dispatcher {
         };
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
+        tracing::Span::current().record("messaging.batch.message_count", jobs.len() as u64);
         if !jobs.is_empty() {
             // Queue-storage carries an `enqueue_shard` on every claim;
             // bucket the batch so dashboards can sum
@@ -861,7 +907,7 @@ impl Dispatcher {
             return false;
         }
 
-        debug!(queue = %self.queue, count = jobs.len(), "Claimed jobs");
+        debug!(queue = %self.queue, messaging.destination.name = %self.queue, count = jobs.len(), "Claimed jobs");
 
         // Phase 6: Dispatch (each job takes one pre-acquired permit)
         let mut set = self.job_set.lock().await;

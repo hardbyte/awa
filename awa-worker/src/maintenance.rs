@@ -2656,6 +2656,7 @@ impl MaintenanceService {
                     total_deleted += result.rows_affected();
                     debug!(
                         queue = %queue_name,
+                        messaging.destination.name = %queue_name,
                         count = result.rows_affected(),
                         "Cleaned up old jobs (queue override)"
                     );
@@ -2663,6 +2664,7 @@ impl MaintenanceService {
                 Err(err) => {
                     error!(
                         queue = %queue_name,
+                        messaging.destination.name = %queue_name,
                         error = %err,
                         "Failed to clean up old jobs (queue override)"
                     );

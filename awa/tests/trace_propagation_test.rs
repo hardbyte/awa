@@ -5,12 +5,13 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use awa::{Client, JobArgs, JobResult, QueueConfig};
 use awa_model::{insert_with, migrations, trace::TRACEPARENT_METADATA_KEY, InsertOpts};
-use opentelemetry::trace::TraceContextExt;
+use opentelemetry::trace::{SpanId, TraceContextExt};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -26,6 +27,7 @@ fn database_url() -> String {
 
 const QUEUE: &str = "trace_prop";
 const RETRY_QUEUE: &str = "trace_retry";
+const POLL_QUEUE: &str = "trace_poll";
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct TracedJob {
@@ -352,5 +354,129 @@ async fn enqueue_overhead_e8_gate() {
         "capture cost: {:.3}µs/enqueue ({:+.3}% of a 1ms enqueue roundtrip)",
         per_insert * 1e6,
         per_insert / 1e-3 * 100.0
+    );
+}
+
+/// #449: `Dispatcher::run` and `HeartbeatService::run` own loops that live as
+/// long as the worker, so instrumenting them collected every poll and
+/// heartbeat tick under one span that never closed. Each tick is its own
+/// trace root now. Re-instrumenting either loop fails this test.
+///
+/// Both spans are `debug`, so a production pipeline filtering at `info` creates
+/// neither. This test's subscriber installs no filter, so it still sees them.
+#[tokio::test]
+async fn dispatcher_polls_and_heartbeats_are_independent_root_traces() {
+    let exporter = init_tracing();
+    let pool = setup(POLL_QUEUE).await;
+
+    // No jobs needed: an idle poll still opens its span.
+    let client = Client::builder(pool.clone())
+        .heartbeat_interval(Duration::from_millis(100))
+        .queue(
+            POLL_QUEUE,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(100),
+                ..QueueConfig::default()
+            },
+        )
+        .register::<TracedJob, _, _>(
+            |_args: TracedJob, _ctx| async move { Ok(JobResult::Completed) },
+        )
+        .build()
+        .expect("client should build");
+    client.start().await.expect("client should start");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    client.shutdown(Duration::from_secs(10)).await;
+
+    let spans = exporter.get_finished_spans().expect("exported spans");
+
+    // The exporter is shared across this file's tests, so scope to this queue.
+    let poll_span_name = format!("receive {POLL_QUEUE}");
+    let polls: Vec<_> = spans
+        .iter()
+        .filter(|s| {
+            s.name.as_ref() == poll_span_name
+                && s.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "queue" && kv.value.as_str() == POLL_QUEUE)
+        })
+        .collect();
+    assert!(
+        polls.len() >= 2,
+        "expected repeated dispatcher polls to export spans, saw {}",
+        polls.len()
+    );
+    for poll in &polls {
+        assert_eq!(
+            poll.parent_span_id,
+            SpanId::INVALID,
+            "each poll span must be a trace root, not a child of the poll loop"
+        );
+    }
+    let poll_traces: HashSet<_> = polls.iter().map(|s| s.span_context.trace_id()).collect();
+    assert_eq!(
+        poll_traces.len(),
+        polls.len(),
+        "each poll must start its own trace"
+    );
+
+    // A dispatcher trace's root is the consumer half of the ADR-039 messaging
+    // pair, so it carries the same conventions as `send {queue}` and is
+    // reachable by the `{ span.messaging.system = "awa" }` TraceQL in the
+    // Grafana docs.
+    let poll = polls[0];
+    assert_eq!(
+        poll.span_kind,
+        opentelemetry::trace::SpanKind::Consumer,
+        "poll span should map otel.kind = consumer"
+    );
+    for (key, want) in [
+        ("messaging.system", "awa"),
+        ("messaging.operation.type", "receive"),
+        ("messaging.destination.name", POLL_QUEUE),
+    ] {
+        assert!(
+            poll.attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == key && kv.value.as_str() == want),
+            "poll span should carry {key} = {want}; saw {:?}",
+            poll.attributes
+                .iter()
+                .map(|kv| kv.key.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Heartbeat ticks are per-runtime, so they carry no queue to scope by. Use
+    // this test's interval instead: every other test in the file runs the
+    // default 30s interval and still emits one final tick on shutdown, so an
+    // unscoped filter would let their ticks satisfy the count below.
+    let beats: Vec<_> = spans
+        .iter()
+        .filter(|s| {
+            s.name.as_ref() == "heartbeat.tick"
+                && s.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "interval_ms" && kv.value.as_str() == "100")
+        })
+        .collect();
+    assert!(
+        beats.len() >= 2,
+        "expected repeated heartbeat ticks to export spans, saw {}",
+        beats.len()
+    );
+    for beat in &beats {
+        assert_eq!(
+            beat.parent_span_id,
+            SpanId::INVALID,
+            "each heartbeat tick must be a trace root, not a child of the heartbeat loop"
+        );
+    }
+    let beat_traces: HashSet<_> = beats.iter().map(|s| s.span_context.trace_id()).collect();
+    assert_eq!(
+        beat_traces.len(),
+        beats.len(),
+        "each heartbeat tick must start its own trace"
     );
 }

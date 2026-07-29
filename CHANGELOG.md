@@ -4,6 +4,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dispatcher and heartbeat traces no longer grow for the lifetime of the worker ([#449](https://github.com/hardbyte/awa/issues/449)).** `Dispatcher::run` and `HeartbeatService::run` own loops that run until shutdown, so instrumenting them kept one span open and accumulated every poll, claim, and heartbeat under it — traces passed backend size limits (Tempo rejects at 5 MB) and the export pressure surfaced as `BatchSpanProcessor` timeouts. Neither loop is instrumented now; each poll and tick is its own `debug`-level root, named `receive {queue}` (consumer kind, messaging attributes) and `heartbeat.tick`. An `info` pipeline creates neither, and empty polls stay visible through `awa.dispatch.empty_claim` and the claim-duration histogram. Enqueue→execute propagation ([ADR-039](docs/adr/039-trace-propagation.md)) is unchanged. See [`docs/configuration.md`](docs/configuration.md#worker-side-traces).
+  - The PG-listener fallback paths log `queue` explicitly and at `warn` — poll-only is degraded but working, and is the expected path under a transaction-mode pooler ([#374](https://github.com/hardbyte/awa/issues/374)).
+
+### Changed
+
+- **Spans and log events that name a queue also carry the OTel `messaging.destination.name` ([#454](https://github.com/hardbyte/awa/issues/454)).** 8 `queue_storage.*` spans and 19 log events now emit it alongside the existing `queue`, so one predicate matches both families. `queue` is retained, so existing queries keep working.
+
 ## [0.7.0-alpha.1] — 2026-07-17
 
 > **Upgrade path:** the ring-cursor authority work (migration v043) makes **0.6.2 a mandatory

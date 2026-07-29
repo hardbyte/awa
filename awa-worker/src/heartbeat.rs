@@ -42,7 +42,6 @@ impl HeartbeatService {
     }
 
     /// Run the heartbeat loop. Returns when cancelled.
-    #[tracing::instrument(skip(self), fields(interval_ms = self.interval.as_millis() as u64))]
     pub async fn run(&self) {
         self.alive.store(true, Ordering::SeqCst);
         debug!(
@@ -67,7 +66,16 @@ impl HeartbeatService {
         self.alive.store(false, Ordering::SeqCst);
     }
 
-    #[tracing::instrument(skip(self))]
+    /// One heartbeat pass: refresh leases for in-flight jobs and flush any
+    /// pending progress. No-op when nothing is in flight.
+    // Debug-level root span, as for the dispatcher's poll (#449, #455).
+    #[tracing::instrument(
+        level = "debug",
+        parent = None,
+        name = "heartbeat.tick",
+        skip(self),
+        fields(interval_ms = self.interval.as_millis() as u64)
+    )]
     async fn heartbeat_once(&self) {
         let mut all_keys: Vec<(i64, RunLease)> = self.in_flight.keys();
         all_keys.sort_unstable();

@@ -658,6 +658,29 @@ the execution span; `ctx.traceparent()` (Rust) and `job.traceparent`
 (Python) return the stored *enqueue-site* context for inspection or for
 continuing the trace where no ambient context exists.
 
+### Worker-side traces
+
+The dispatcher's own poll and the heartbeat tick are **`debug`-level root
+spans** — `receive {queue}` (consumer kind, with the messaging attributes and
+`messaging.batch.message_count`) and `heartbeat.tick`. Neither loop is
+instrumented as a whole: a span covering a loop that lives as long as the worker
+never closes, and every child accumulates under it until the trace exceeds what
+a backend will accept ([#449](https://github.com/hardbyte/awa/issues/449)).
+
+They are `debug` rather than `info` because they tick whether or not there is
+work: at the default 200 ms `poll_interval`, an info-level poll span would open
+~5 traces/s per queue-claimer, nearly all of them recording "claimed nothing".
+A pipeline filtering at `info` — the usual production setting — creates neither
+span, and nothing is allocated or exported. Raise your filter to `debug` for the
+dispatcher target when you want them.
+
+What you keep either way: empty and non-empty polls alike are counted by
+`awa.dispatch.empty_claim` and timed by the claim-duration histogram, which are
+metrics and unaffected by span filtering. With no poll span at `info`, a job
+enqueued *without* trace context executes under its own root span instead of
+nesting into the poll that claimed it; a job carrying `awa:traceparent` still
+joins its producer's trace as before.
+
 Capture costs well under a microsecond per enqueue and is on by default;
 `AWA_TRACE_CAPTURE=off` disables ambient capture process-wide (Rust and
 Python alike). Python producers are captured at the binding layer whenever

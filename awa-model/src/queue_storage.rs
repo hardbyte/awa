@@ -5833,7 +5833,7 @@ impl QueueStorage {
         Ok(claimed)
     }
 
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.claim_runtime_batch")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue), name = "queue_storage.claim_runtime_batch")]
     pub async fn claim_runtime_batch(
         &self,
         pool: &PgPool,
@@ -5851,7 +5851,7 @@ impl QueueStorage {
         .await
     }
 
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.claim_runtime_batch_with_aging")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue), name = "queue_storage.claim_runtime_batch_with_aging")]
     pub async fn claim_runtime_batch_with_aging(
         &self,
         pool: &PgPool,
@@ -5889,6 +5889,7 @@ impl QueueStorage {
                     Err(err) => {
                         tracing::warn!(
                             queue = %queue,
+                            messaging.destination.name = %queue,
                             stripe_queue = %stripe_queue,
                             claimed = claimed.len(),
                             error = ?err,
@@ -5974,7 +5975,7 @@ impl QueueStorage {
             .collect()
     }
 
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.acquire_queue_claimer")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue, instance_id = %instance_id), name = "queue_storage.acquire_queue_claimer")]
     pub async fn acquire_queue_claimer(
         &self,
         pool: &PgPool,
@@ -6115,7 +6116,7 @@ impl QueueStorage {
         Ok(None)
     }
 
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id, claimer_slot = lease.claimer_slot), name = "queue_storage.mark_queue_claimer_active")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue, instance_id = %instance_id, claimer_slot = lease.claimer_slot), name = "queue_storage.mark_queue_claimer_active")]
     pub async fn mark_queue_claimer_active(
         &self,
         pool: &PgPool,
@@ -6324,7 +6325,7 @@ impl QueueStorage {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]
     pub async fn claim_runtime_batch_with_aging_for_instance(
         &self,
         pool: &PgPool,
@@ -6374,7 +6375,7 @@ impl QueueStorage {
         Ok(claimed)
     }
 
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.claim_job_batch")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue), name = "queue_storage.claim_job_batch")]
     pub async fn claim_job_batch(
         &self,
         pool: &PgPool,
@@ -7704,7 +7705,7 @@ impl QueueStorage {
         })
     }
 
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.queue_counts")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue), name = "queue_storage.queue_counts")]
     pub async fn queue_counts(&self, pool: &PgPool, queue: &str) -> Result<QueueCounts, AwaError> {
         self.queue_counts_exact(pool, queue).await
     }
@@ -7745,7 +7746,7 @@ impl QueueStorage {
     /// pollers (admin dashboards, depth-target producers, soak
     /// observability); use [`Self::queue_counts`] for admin tooling
     /// that needs the exact terminal count.
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.queue_counts_fast")]
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue), name = "queue_storage.queue_counts_fast")]
     pub async fn queue_counts_fast(
         &self,
         pool: &PgPool,
