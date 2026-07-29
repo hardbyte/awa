@@ -66,10 +66,11 @@ impl HeartbeatService {
         self.alive.store(false, Ordering::SeqCst);
     }
 
-    // Explicit root, as for the dispatcher's poll: `run` owns a loop that
-    // lives as long as the worker, so a shared parent would collect every
-    // tick into one unbounded trace.
+    /// One heartbeat pass: refresh leases for in-flight jobs and flush any
+    /// pending progress. No-op when nothing is in flight.
+    // Debug-level root span, as for the dispatcher's poll (#449, #455).
     #[tracing::instrument(
+        level = "debug",
         parent = None,
         skip(self),
         fields(interval_ms = self.interval.as_millis() as u64)

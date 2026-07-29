@@ -517,9 +517,16 @@ impl Dispatcher {
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
-    // Each poll is an explicit root so this long-lived dispatcher cannot
-    // accumulate every claim and dispatched job in one unbounded trace.
-    #[tracing::instrument(parent = None, skip(self), fields(queue = %self.queue))]
+    ///
+    /// Returns whether the caller should keep polling.
+    // Debug-level root span: this runs on `poll_interval` whether or not there
+    // is work, and empty polls are already covered by metrics (#449, #455).
+    #[tracing::instrument(
+        level = "debug",
+        parent = None,
+        skip(self),
+        fields(queue = %self.queue)
+    )]
     async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
