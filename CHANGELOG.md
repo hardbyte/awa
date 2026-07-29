@@ -4,6 +4,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dispatcher and heartbeat traces no longer grow for the lifetime of the worker ([#449](https://github.com/hardbyte/awa/issues/449)).** `Dispatcher::run` and `HeartbeatService::run` own loops that run until shutdown, so instrumenting them kept one span open and accumulated every poll, claim, lease heartbeat, and progress flush under it. Traces grew past backend size limits — Tempo rejected them with `TRACE_TOO_LARGE` at 5 MB — and the export pressure surfaced as `BatchSpanProcessor` timeouts. Neither loop is instrumented now, and each poll and heartbeat tick is its own `debug`-level trace root. Poll spans keep their `queue` attribute.
+  - The roots are `debug` rather than `info` so the fix does not trade one telemetry problem for another: they tick whether or not there is work, and at the default 200 ms `poll_interval` an info-level poll span would open ~5 traces/s per queue-claimer recording "claimed nothing". An `info` pipeline creates neither span; empty polls stay visible through `awa.dispatch.empty_claim` and the claim-duration histogram, which are metrics. Raise your filter to `debug` for the dispatcher target when you want them.
+  - Span names are unchanged on this line. The 0.7 fix additionally renames these roots to follow OTel messaging conventions and adds `messaging.destination.name` alongside `queue`; neither is backported, because this line has no ADR-039 producer-side conventions for them to pair with and a patch release should not move or grow telemetry names.
+  - Both PG-listener fallback paths now log `queue` explicitly and log at `warn`: poll-only is degraded but working, and is the expected path under a transaction-mode pooler ([#374](https://github.com/hardbyte/awa/issues/374)).
+  - No schema, migration, or API change. Backport of [#450](https://github.com/hardbyte/awa/pull/450); the regression test added there covers the same code on `main` (0.6 predates the span-exporter harness it uses).
+
 ## [0.6.4] — 2026-07-22
 
 Patch release: one performance fix for idle background IO. No migrations, no schema changes, no API changes.

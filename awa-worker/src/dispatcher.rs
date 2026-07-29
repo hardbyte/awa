@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_CLAIM_BATCH_LIMIT: usize = 512;
@@ -351,7 +351,6 @@ impl Dispatcher {
     }
 
     /// Run the poll loop. Returns when cancelled.
-    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
     pub async fn run(mut self) {
         self.alive.store(true, Ordering::SeqCst);
         info!(
@@ -367,7 +366,11 @@ impl Dispatcher {
         let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
             Ok(listener) => listener,
             Err(err) => {
-                error!(error = %err, "Failed to create PG listener, falling back to polling only");
+                warn!(
+                    queue = %self.queue,
+                    error = %err,
+                    "Failed to create PG listener, falling back to polling only"
+                );
                 // Fall back to poll-only mode
                 self.poll_loop_only().await;
                 self.alive.store(false, Ordering::SeqCst);
@@ -376,13 +379,22 @@ impl Dispatcher {
         };
 
         if let Err(err) = listener.listen(&notify_channel).await {
-            warn!(error = %err, channel = %notify_channel, "Failed to LISTEN, falling back to polling");
+            warn!(
+                queue = %self.queue,
+                error = %err,
+                channel = %notify_channel,
+                "Failed to LISTEN, falling back to polling"
+            );
             self.poll_loop_only().await;
             self.alive.store(false, Ordering::SeqCst);
             return;
         }
 
-        debug!(channel = %notify_channel, "Listening for job notifications");
+        debug!(
+            queue = %self.queue,
+            channel = %notify_channel,
+            "Listening for job notifications"
+        );
 
         loop {
             tokio::select! {
@@ -398,7 +410,11 @@ impl Dispatcher {
                             self.drain_ready(WakeReason::Notify, Instant::now()).await;
                         }
                         Err(err) => {
-                            warn!(error = %err, "PG listener error, will retry");
+                            warn!(
+                                queue = %self.queue,
+                                error = %err,
+                                "PG listener error, will retry"
+                            );
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
@@ -498,7 +514,15 @@ impl Dispatcher {
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
-    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
+    ///
+    /// Returns whether the caller should keep polling.
+    // Debug-level root span: see #449, #455.
+    #[tracing::instrument(
+        level = "debug",
+        parent = None,
+        skip(self),
+        fields(queue = %self.queue)
+    )]
     async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
