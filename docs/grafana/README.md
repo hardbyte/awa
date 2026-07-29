@@ -131,10 +131,13 @@ the default poll interval that would be ~5 traces/s per queue-claimer. Raise the
 filter when you want them; see
 [configuration.md](../configuration.md#worker-side-traces).
 
-Every span that names a queue carries both `queue` and the OTel
-`messaging.destination.name`, so `{ span.messaging.destination.name = "email" }`
-finds the messaging spans and the `queue_storage.*` spans together. The bare
-`queue` key is retained for existing queries
+Spans and log events for work on a *specific* queue carry both `queue` and the
+OTel `messaging.destination.name`, so
+`{ span.messaging.destination.name = "email" }` finds the messaging spans and the
+`queue_storage.*` claim/count spans together. Bulk DLQ operations
+(`bulk_move_failed_to_dlq`, `bulk_retry_from_dlq`) carry only `queue`, because
+theirs is an optional filter rather than a destination — query those by `queue`.
+The bare key is retained everywhere for existing queries
 ([#454](https://github.com/hardbyte/awa/issues/454) tracks whether it is
 eventually dropped).
 
