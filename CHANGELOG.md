@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-07-29
+
+Patch release: one telemetry fix. No migrations, no schema changes, no API changes.
+
 ### Fixed
 
 - **Dispatcher and heartbeat traces no longer grow for the lifetime of the worker ([#449](https://github.com/hardbyte/awa/issues/449)).** `Dispatcher::run` and `HeartbeatService::run` own loops that run until shutdown, so instrumenting them kept one span open and accumulated every poll, claim, lease heartbeat, and progress flush under it. Traces grew past backend size limits — Tempo rejected them with `TRACE_TOO_LARGE` at 5 MB — and the export pressure surfaced as `BatchSpanProcessor` timeouts. Neither loop is instrumented now, and each poll and heartbeat tick is its own `debug`-level trace root. Poll spans keep their `queue` attribute.
