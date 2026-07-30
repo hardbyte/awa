@@ -17,7 +17,7 @@ For migration details see [migrations.md](migrations.md). For user-facing knobs 
 ## Terms
 
 - A **claim** is the storage transition that makes a ready job belong to one attempt. It increments `run_lease`; later completion, retry, rescue, and cancellation must match that lease number.
-- A **deferred** job is not claimable yet. Future `run_at` jobs are `scheduled`; retry backoff and snooze rows are `retryable`. Maintenance promotes due deferred rows into the ready ring.
+- A **deferred** job is not claimable yet. Future `run_at` jobs and snoozed jobs are `scheduled`; retry backoff and `RetryAfter` rows are `retryable`. Maintenance promotes due deferred rows into the ready ring.
 - A **lane** is one ordered `(queue, priority, enqueue_shard)` stream. Raising the shard count creates more lanes for the same logical queue.
 - A **lease** is the durable live-attempt row used when an attempt needs mutable execution state such as heartbeat, progress, callbacks, or deadlines.
 - A **receipt** is the lighter claim evidence used for short attempts. A receipt can be a row in `lease_claims_*` or an item inside a compact `lease_claim_batches_*` row. Compact batch claims carry a claim-batch id and one-based item index so completion can validate the exact item without searching the batch by receipt range. Receipt attempts close through durable closure evidence: explicit closure rows for non-success and cold paths, or compact claim-local closure batches for successful hot-path completions. Successful completions also write compact terminal history that is exposed through `terminal_jobs`. Open receipts are derived by anti-joining row and batch claims against every closure-evidence family.
@@ -103,7 +103,8 @@ Core transitions:
 | `scheduled` / `retryable` | `available` | Maintenance promotion when `run_at <= now()`. |
 | `available` | `running` | Dispatcher claim; `run_lease` increments. |
 | `running` | `completed` | Handler succeeds. |
-| `running` | `retryable` | Handler returns retryable failure or snooze/backoff path. |
+| `running` | `retryable` | Handler returns a retryable failure, or `RetryAfter`. |
+| `running` | `scheduled` | Handler snoozes; the attempt is not counted. |
 | `running` | `waiting_external` | Handler parks for callback or sequential wait. |
 | `waiting_external` | `running` | `resume_external` resumes a sequential wait. |
 | `running` / `waiting_external` | `cancelled` | Handler cancel, admin cancel, or rescue cancellation. |

@@ -1,6 +1,6 @@
 use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
-use crate::storage::RuntimeStorage;
+use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
@@ -528,6 +528,11 @@ pub struct MaintenanceService {
     /// to running handlers on this worker instance.
     in_flight: InFlightMap,
     storage: RuntimeStorage,
+    /// #456: the configured queue-storage runtime of a canonical-resolved
+    /// worker. A pre-flip maintenance leader uses it to promote the
+    /// queue-storage deferred backlog once routing has flipped — post-flip
+    /// runtimes execute that work but may not hold leadership.
+    standby_queue_storage: Option<QueueStorageRuntime>,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     callback_rescue_interval: Duration,
@@ -593,6 +598,7 @@ impl MaintenanceService {
             periodic_jobs,
             in_flight,
             storage,
+            standby_queue_storage: None,
             enqueue_specs,
             lifecycle_handlers,
             heartbeat_rescue_interval: Duration::from_secs(30),
@@ -669,6 +675,14 @@ impl MaintenanceService {
     /// Set the leader connection health-check interval (default: 30s).
     pub fn leader_check_interval(mut self, interval: Duration) -> Self {
         self.leader_check_interval = interval;
+        self
+    }
+
+    /// #456: register the configured queue-storage runtime of a
+    /// canonical-resolved worker so a pre-flip leader can promote the
+    /// queue-storage deferred backlog after the routing flip.
+    pub(crate) fn standby_queue_storage(mut self, runtime: Option<QueueStorageRuntime>) -> Self {
+        self.standby_queue_storage = runtime;
         self
     }
 
@@ -1964,6 +1978,80 @@ impl MaintenanceService {
 
                     if promoted < PROMOTE_BATCH_SIZE as usize {
                         break;
+                    }
+                }
+            }
+        }
+
+        // #456: while a storage transition drains, due jobs can still sit in
+        // the canonical deferred backlog. Drain-only runtimes execute
+        // canonical work but stop leading maintenance once a post-flip
+        // runtime wins the election, so a queue-storage leader must promote
+        // the canonical plane too. Both queries are cheap no-ops once the
+        // canonical tables are empty (every finalized or fresh install).
+        if matches!(&self.storage, RuntimeStorage::QueueStorage(_)) {
+            for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+                if self.cancel.is_cancelled() {
+                    break;
+                }
+                let (promoted, queues) = self
+                    .promote_due_batch(state)
+                    .await
+                    .map_err(awa_model::AwaError::Database)?;
+                if promoted == 0 {
+                    break;
+                }
+                promoted_total += promoted;
+                notified_queues.extend(queues);
+                if promoted < PROMOTE_BATCH_SIZE as usize {
+                    break;
+                }
+            }
+        }
+
+        // #456 mirror: a canonical-resolved (pre-flip) leader must promote
+        // the queue-storage deferred backlog once routing has flipped —
+        // re-scheduled canonical jobs migrate there, and post-flip runtimes
+        // that would promote them may not hold leadership. The active-schema
+        // guard keeps this a no-op until the flip.
+        if matches!(&self.storage, RuntimeStorage::Canonical) {
+            if let Some(runtime) = &self.standby_queue_storage {
+                let active_schema: Option<String> =
+                    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(awa_model::AwaError::Database)?;
+                if active_schema.as_deref() == Some(runtime.store.schema()) {
+                    let job_state = match state {
+                        "scheduled" => awa_model::JobState::Scheduled,
+                        "retryable" => awa_model::JobState::Retryable,
+                        other => {
+                            return Err(awa_model::AwaError::Validation(format!(
+                                "unsupported queue storage promote state: {other}"
+                            )));
+                        }
+                    };
+                    for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+                        if self.cancel.is_cancelled() {
+                            break;
+                        }
+                        let promote_start = std::time::Instant::now();
+                        let promoted = runtime
+                            .store
+                            .promote_due(&self.pool, job_state, PROMOTE_BATCH_SIZE)
+                            .await?;
+                        self.metrics.record_promotion_batch(
+                            state,
+                            promoted as u64,
+                            promote_start.elapsed(),
+                        );
+                        if promoted == 0 {
+                            break;
+                        }
+                        promoted_total += promoted;
+                        if promoted < PROMOTE_BATCH_SIZE as usize {
+                            break;
+                        }
                     }
                 }
             }

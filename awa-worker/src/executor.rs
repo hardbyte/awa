@@ -3,6 +3,7 @@ use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use awa_model::reschedule::{Reschedule, RescheduleOutcome};
 use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
 use sqlx::PgPool;
 use std::any::Any;
@@ -674,40 +675,50 @@ async fn complete_job_canonical(
                 };
             }
 
-            let result = sqlx::query(
-                r#"
-                UPDATE awa.jobs
-                SET state = 'retryable',
-                    run_at = now() + make_interval(secs => $2),
-                    finalized_at = now(),
-                    progress = $4
-                WHERE id = $1 AND state = 'running' AND run_lease = $3
-                "#,
+            let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+                pool,
+                job.id,
+                job.run_lease,
+                Reschedule::RetryAfter {
+                    delay_secs: seconds,
+                },
+                None,
+                progress_snapshot.as_ref(),
             )
-            .bind(job.id)
-            .bind(seconds)
-            .bind(job.run_lease)
-            .bind(&progress_snapshot)
-            .execute(pool)
             .await?;
-            if result.rows_affected() == 0 {
+            let (RescheduleOutcome::Rescheduled {
+                job_id,
+                run_at,
+                attempt,
+            }
+            | RescheduleOutcome::Migrated {
+                job_id,
+                run_at,
+                attempt,
+            }) = outcome
+            else {
                 warn!(
                     job_id = job.id,
                     "Job already rescued/cancelled, retry ignored"
                 );
                 return Ok(CompletionOutcome::IgnoredStale);
-            }
+            };
             if needs_event {
-                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-                    .bind(job.id)
-                    .fetch_one(pool)
-                    .await?;
+                let updated_job = rescheduled_event_row(
+                    job,
+                    JobState::Retryable,
+                    job_id,
+                    run_at,
+                    attempt,
+                    None,
+                    progress_snapshot,
+                );
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Retried {
-                        job: updated_job.clone(),
+                        job: updated_job,
                         error: String::new(),
-                        attempt: updated_job.attempt,
-                        next_run_at: updated_job.run_at,
+                        attempt,
+                        next_run_at: run_at,
                     }),
                     terminal: false,
                 })
@@ -727,25 +738,18 @@ async fn complete_job_canonical(
                 snooze_secs = seconds,
                 "Job snoozed (attempt not incremented)"
             );
-            let result = sqlx::query(
-                r#"
-                UPDATE awa.jobs
-                SET state = 'scheduled',
-                    run_at = now() + make_interval(secs => $2),
-                    attempt = attempt - 1,
-                    heartbeat_at = NULL,
-                    deadline_at = NULL,
-                    progress = $4
-                WHERE id = $1 AND state = 'running' AND run_lease = $3
-                "#,
+            let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+                pool,
+                job.id,
+                job.run_lease,
+                Reschedule::Snooze {
+                    delay_secs: seconds,
+                },
+                None,
+                progress_snapshot.as_ref(),
             )
-            .bind(job.id)
-            .bind(seconds)
-            .bind(job.run_lease)
-            .bind(&progress_snapshot)
-            .execute(pool)
             .await?;
-            if result.rows_affected() == 0 {
+            if matches!(outcome, RescheduleOutcome::Stale) {
                 warn!(
                     job_id = job.id,
                     "Job already rescued/cancelled, snooze ignored"
@@ -1230,50 +1234,53 @@ async fn complete_job_canonical(
                     };
                 }
 
-                let result = sqlx::query(
-                    r#"
-                    UPDATE awa.jobs
-                    SET state = 'retryable',
-                        run_at = now() + awa.backoff_duration($2, $3),
-                        finalized_at = now(),
-                        heartbeat_at = NULL,
-                        deadline_at = NULL,
-                        errors = errors || $4::jsonb,
-                        progress = $6
-                    WHERE id = $1 AND state = 'running' AND run_lease = $5
-                    "#,
-                )
-                .bind(job.id)
-                .bind(job.attempt)
-                .bind(job.max_attempts)
-                .bind(serde_json::json!({
+                let error_entry = serde_json::json!({
                     "error": error_msg,
                     "attempt": job.attempt,
                     "at": chrono::Utc::now().to_rfc3339()
-                }))
-                .bind(job.run_lease)
-                .bind(&progress_snapshot)
-                .execute(pool)
+                });
+                let outcome = awa_model::reschedule::reschedule_canonical_attempt(
+                    pool,
+                    job.id,
+                    job.run_lease,
+                    Reschedule::RetryBackoff,
+                    Some(&error_entry),
+                    progress_snapshot.as_ref(),
+                )
                 .await?;
-                if result.rows_affected() == 0 {
+                let (RescheduleOutcome::Rescheduled {
+                    job_id,
+                    run_at,
+                    attempt,
+                }
+                | RescheduleOutcome::Migrated {
+                    job_id,
+                    run_at,
+                    attempt,
+                }) = outcome
+                else {
                     warn!(
                         job_id = job.id,
                         "Job already rescued/cancelled, retry ignored"
                     );
                     return Ok(CompletionOutcome::IgnoredStale);
-                }
+                };
                 if needs_event {
-                    let updated_job: JobRow =
-                        sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-                            .bind(job.id)
-                            .fetch_one(pool)
-                            .await?;
+                    let updated_job = rescheduled_event_row(
+                        job,
+                        JobState::Retryable,
+                        job_id,
+                        run_at,
+                        attempt,
+                        Some(&error_entry),
+                        progress_snapshot,
+                    );
                     Ok(CompletionOutcome::Applied {
                         event: Some(UntypedJobEvent::Retried {
-                            job: updated_job.clone(),
+                            job: updated_job,
                             error: error_msg,
                             attempt: job.attempt,
-                            next_run_at: updated_job.run_at,
+                            next_run_at: run_at,
                         }),
                         terminal: false,
                     })
@@ -1286,6 +1293,40 @@ async fn complete_job_canonical(
             }
         }
     }
+}
+
+/// Synthesize the post-reschedule row for event emission. After a migrated
+/// re-schedule the job lives in the queue-storage deferred backlog under a
+/// new id, so re-reading `awa.jobs` by the old id would return nothing.
+///
+/// This must mirror every mutation the reschedule persisted, not just the
+/// routing fields: hooks inspecting `JobEvent::Retried.job` read `errors` to
+/// see the failure that triggered the retry, and `finalized_at` to see when
+/// the attempt closed.
+fn rescheduled_event_row(
+    job: &JobRow,
+    state: JobState,
+    job_id: i64,
+    run_at: chrono::DateTime<chrono::Utc>,
+    attempt: i16,
+    error: Option<&serde_json::Value>,
+    progress: Option<serde_json::Value>,
+) -> JobRow {
+    let mut row = job.clone();
+    row.id = job_id;
+    row.state = state;
+    row.run_at = run_at;
+    row.attempt = attempt;
+    row.heartbeat_at = None;
+    row.deadline_at = None;
+    row.progress = progress;
+    if let Some(error) = error {
+        row.errors.get_or_insert_with(Vec::new).push(error.clone());
+    }
+    if state == JobState::Retryable {
+        row.finalized_at = Some(chrono::Utc::now());
+    }
+    row
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2564,47 +2605,40 @@ async fn retry_after_canonical_with_followups(
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
 
-    let updated_job: Option<JobRow> = sqlx::query_as(
-        r#"
-        WITH deleted AS (
-            DELETE FROM awa.jobs_hot
-            WHERE id = $1 AND state = 'running' AND run_lease = $3
-            RETURNING *
-        )
-        INSERT INTO awa.scheduled_jobs (
-            id, kind, queue, args, state, priority, attempt, max_attempts,
-            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-            created_at, errors, metadata, tags, unique_key, unique_states,
-            callback_id, callback_timeout_at, callback_filter,
-            callback_on_complete, callback_on_fail, callback_transform,
-            run_lease, progress
-        )
-        SELECT
-            id, kind, queue, args,
-            'retryable'::awa.job_state,
-            priority, attempt, max_attempts,
-            now() + make_interval(secs => $2),
-            heartbeat_at, deadline_at, attempted_at,
-            now(),
-            created_at, errors, metadata, tags, unique_key, unique_states,
-            callback_id, callback_timeout_at, callback_filter,
-            callback_on_complete, callback_on_fail, callback_transform,
-            run_lease, $4
-        FROM deleted
-        RETURNING *
-        "#,
+    let outcome = awa_model::reschedule::reschedule_canonical_attempt_tx(
+        &mut tx,
+        job.id,
+        job.run_lease,
+        Reschedule::RetryAfter {
+            delay_secs: seconds,
+        },
+        None,
+        progress_snapshot,
     )
-    .bind(job.id)
-    .bind(seconds)
-    .bind(job.run_lease)
-    .bind(progress_snapshot)
-    .fetch_optional(&mut *tx)
     .await?;
-
-    let Some(updated_job) = updated_job else {
+    let (RescheduleOutcome::Rescheduled {
+        job_id,
+        run_at,
+        attempt,
+    }
+    | RescheduleOutcome::Migrated {
+        job_id,
+        run_at,
+        attempt,
+    }) = outcome
+    else {
         tx.rollback().await?;
         return Ok(None);
     };
+    let updated_job = rescheduled_event_row(
+        job,
+        JobState::Retryable,
+        job_id,
+        run_at,
+        attempt,
+        None,
+        progress_snapshot.cloned(),
+    );
 
     let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
         error: String::new(),
@@ -2728,56 +2762,43 @@ async fn retry_backoff_canonical_with_followups(
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
 
-    let updated_job: Option<JobRow> = sqlx::query_as(
-        r#"
-        WITH deleted AS (
-            DELETE FROM awa.jobs_hot
-            WHERE id = $1 AND state = 'running' AND run_lease = $5
-            RETURNING *
-        )
-        INSERT INTO awa.scheduled_jobs (
-            id, kind, queue, args, state, priority, attempt, max_attempts,
-            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-            created_at, errors, metadata, tags, unique_key, unique_states,
-            callback_id, callback_timeout_at, callback_filter,
-            callback_on_complete, callback_on_fail, callback_transform,
-            run_lease, progress
-        )
-        SELECT
-            id, kind, queue, args,
-            'retryable'::awa.job_state,
-            priority, attempt, max_attempts,
-            now() + awa.backoff_duration($2, $3),
-            NULL, NULL,
-            attempted_at,
-            now(),
-            created_at,
-            errors || $4::jsonb,
-            metadata, tags, unique_key, unique_states,
-            callback_id, callback_timeout_at, callback_filter,
-            callback_on_complete, callback_on_fail, callback_transform,
-            run_lease, $6
-        FROM deleted
-        RETURNING *
-        "#,
-    )
-    .bind(job.id)
-    .bind(job.attempt)
-    .bind(job.max_attempts)
-    .bind(serde_json::json!({
+    let error_entry = serde_json::json!({
         "error": error_msg,
         "attempt": job.attempt,
         "at": chrono::Utc::now().to_rfc3339()
-    }))
-    .bind(job.run_lease)
-    .bind(progress_snapshot)
-    .fetch_optional(&mut *tx)
+    });
+    let outcome = awa_model::reschedule::reschedule_canonical_attempt_tx(
+        &mut tx,
+        job.id,
+        job.run_lease,
+        Reschedule::RetryBackoff,
+        Some(&error_entry),
+        progress_snapshot,
+    )
     .await?;
-
-    let Some(updated_job) = updated_job else {
+    let (RescheduleOutcome::Rescheduled {
+        job_id,
+        run_at,
+        attempt,
+    }
+    | RescheduleOutcome::Migrated {
+        job_id,
+        run_at,
+        attempt,
+    }) = outcome
+    else {
         tx.rollback().await?;
         return Ok(None);
     };
+    let updated_job = rescheduled_event_row(
+        job,
+        JobState::Retryable,
+        job_id,
+        run_at,
+        attempt,
+        Some(&error_entry),
+        progress_snapshot.cloned(),
+    );
 
     let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
         error: error_msg.to_string(),

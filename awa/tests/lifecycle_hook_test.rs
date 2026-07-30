@@ -270,7 +270,7 @@ async fn test_typed_retried_event_handler_runs() {
                     next_run_at,
                 } = event
                 {
-                    tx.send((args.value, job.state, error, attempt, next_run_at))
+                    tx.send((args.value, job, error, attempt, next_run_at))
                         .unwrap();
                 }
             }
@@ -294,14 +294,30 @@ async fn test_typed_retried_event_handler_runs() {
     .unwrap();
 
     client.start().await.unwrap();
-    let (value, event_state, error, attempt, next_run_at) = recv_event(&mut rx).await;
+    let (value, event_job, error, attempt, next_run_at) = recv_event(&mut rx).await;
     client.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(value, "beta");
-    assert_eq!(event_state, JobState::Retryable);
+    assert_eq!(event_job.state, JobState::Retryable);
     assert_eq!(attempt, 1);
     assert!(error.contains("retry beta"));
     assert!(next_run_at > inserted.run_at);
+
+    // #456: the emitted row must mirror every mutation the reschedule
+    // persisted, not just the routing fields — hooks read `errors` to see the
+    // failure that triggered the retry, and `finalized_at` to see when the
+    // attempt closed.
+    let event_errors = event_job.errors.as_deref().unwrap_or_default();
+    assert!(
+        event_errors.iter().any(|entry| entry["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("retry beta"))),
+        "Retried event job must carry the triggering error: {event_errors:?}"
+    );
+    assert!(
+        event_job.finalized_at.is_some(),
+        "Retried event job must carry finalized_at"
+    );
 
     let stored = admin::get_job(&pool, inserted.id).await.unwrap();
     assert_eq!(stored.state, JobState::Retryable);

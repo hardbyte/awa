@@ -12,6 +12,7 @@ pub mod kind;
 pub mod migrations;
 pub mod partitioned_queue;
 pub mod queue_storage;
+pub mod reschedule;
 pub mod storage;
 pub mod unique;
 

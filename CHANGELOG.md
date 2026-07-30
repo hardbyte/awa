@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **Canonical drain now converges for perpetually snoozing jobs ([#456](https://github.com/hardbyte/awa/issues/456)).** During a storage transition, the re-scheduling completions of canonical-claimed jobs — snooze, retry backoff, and `RetryAfter` — now move the job into the active queue-storage schema's `deferred_jobs` (fresh id, unique claim re-pointed, attempt/errors/progress preserved) instead of writing it back into canonical `scheduled_jobs`. A workload whose handlers snooze on every run previously replenished `canonical_live_backlog` forever, so `awa storage finalize --wait` could never pass. No migration and no schema change: the fix is runtime SQL against the existing v040 schema, because the clusters that need it are exactly the unfinalized ones. Stale-completion protection is unchanged — the take of the canonical row carries the same `state = 'running' AND run_lease = $n` guard, the successor takes a fresh id, and the transaction holds `FOR SHARE` on the transition singleton so a concurrent `storage abort` cannot restore canonical routing between the routing decision and the insert. Maintenance leaders also promote the other plane's deferred backlog for the duration of the transition, so drain and post-flip execution no longer depend on which runtime holds leadership.
+
 ## [0.6.5] — 2026-07-29
 
 Patch release: one telemetry fix. No migrations, no schema changes, no API changes.
