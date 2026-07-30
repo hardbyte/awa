@@ -39,6 +39,8 @@ awa storage finalize --wait
 
 Then upgrade binaries to 0.7 and run `awa migrate`.
 
+If `finalize --wait` sits at a non-zero backlog that never falls while jobs are visibly executing, your workload probably contains **perpetually snoozing jobs** — handlers that end every run in `JobResult::Snooze`. On builds before [#456](https://github.com/hardbyte/awa/issues/456) those re-entered canonical `scheduled_jobs` after each post-flip run, replenishing the backlog forever. Roll to a build carrying that fix (or apply the manual backlog migration in [upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md#known-issues)) before waiting on finalize.
+
 Remember the transition is a one-way door once queue-storage work is accepted; the 0.5→0.6
 guide covers the abort boundaries.
 

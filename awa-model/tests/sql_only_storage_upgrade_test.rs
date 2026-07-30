@@ -413,6 +413,35 @@ async fn reschedule_canonical_attempt_routes_by_transition_state() {
         .execute(&pool)
         .await
         .expect("storage_prepare");
+    // `prepared` must still route canonical: migrating before the routing flip
+    // would put rows in a schema that is not yet authoritative and would break
+    // the `storage abort` rollback interlock, which requires the queue-storage
+    // tables to be empty.
+    let key_prepared = b"reschedule-prepared-key";
+    let job_prepared = seed_canonical_running_job(&pool, key_prepared, 9).await;
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job_prepared,
+        9,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("prepared-state snooze");
+    assert!(
+        matches!(outcome, RescheduleOutcome::Rescheduled { .. }),
+        "state=prepared must route canonical, got {outcome:?}"
+    );
+    let deferred_before_flip: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.deferred_jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("count deferred before flip");
+    assert_eq!(
+        deferred_before_flip, 0,
+        "nothing may reach queue storage before the routing flip"
+    );
+
     stamp_queue_storage_target_runtime(&pool).await;
     sqlx::query("SELECT awa.storage_enter_mixed_transition()")
         .execute(&pool)
@@ -420,6 +449,15 @@ async fn reschedule_canonical_attempt_routes_by_transition_state() {
         .expect("storage_enter_mixed_transition");
 
     // ── Migrated routing: retry backoff leaves the canonical plane ──
+    // `awa.jobs_id_seq` (canonical) and `awa.job_id_seq` (queue storage) are
+    // independent and can hand out the same number, so advance the
+    // queue-storage sequence: the id assertions below then actually prove the
+    // successor was allocated from the queue-storage id space rather than
+    // passing on a coincidence.
+    sqlx::query("SELECT setval('awa.job_id_seq', 500000)")
+        .execute(&pool)
+        .await
+        .expect("advance queue-storage id sequence");
     let key2 = b"reschedule-key-2";
     let job2 = seed_canonical_running_job(&pool, key2, 7).await;
     let error_entry = serde_json::json!({ "error": "boom", "attempt": 1 });
@@ -438,6 +476,10 @@ async fn reschedule_canonical_attempt_routes_by_transition_state() {
             job_id, attempt, ..
         } => {
             assert_ne!(job_id, job2, "migrated successor gets a fresh id");
+            assert!(
+                job_id > 500_000,
+                "successor id must come from the queue-storage sequence, got {job_id}"
+            );
             assert_eq!(attempt, 1, "retry backoff preserves the attempt count");
             job_id
         }
@@ -512,14 +554,17 @@ async fn reschedule_canonical_attempt_routes_by_transition_state() {
         other => panic!("expected Migrated, got {other:?}"),
     }
 
-    // The perpetual-snoozer scenario: canonical live backlog is now zero
-    // even though every job re-scheduled rather than completing.
+    // The perpetual-snoozer scenario: every job re-scheduled rather than
+    // completing, yet nothing added by the post-flip re-schedules remains on
+    // the canonical plane. `job1` and `job_prepared` are excluded because they
+    // re-scheduled *before* the routing flip and correctly stayed canonical.
     let backlog: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*)::bigint FROM awa.jobs_hot \
           WHERE state NOT IN ('completed','failed','cancelled') AND kind = 'reschedule_test') \
-         + (SELECT count(*)::bigint FROM awa.scheduled_jobs WHERE kind = 'reschedule_test' AND id <> $1)",
+         + (SELECT count(*)::bigint FROM awa.scheduled_jobs \
+            WHERE kind = 'reschedule_test' AND id <> ALL($1))",
     )
-    .bind(job1)
+    .bind(vec![job1, job_prepared])
     .fetch_one(&pool)
     .await
     .expect("canonical backlog");
@@ -541,4 +586,342 @@ async fn reschedule_canonical_attempt_routes_by_transition_state() {
         .execute(&pool)
         .await
         .expect("finalize after reschedule test");
+}
+
+/// #456 (review follow-up): the reschedule transaction must lock the
+/// transition singleton, so a concurrent `storage_abort` cannot validate the
+/// queue-storage tables as empty and restore canonical routing between the
+/// routing decision and the deferred insert — which would strand the job in a
+/// schema that is no longer active.
+#[tokio::test]
+async fn reschedule_holds_transition_lock_against_concurrent_abort() {
+    use awa_model::reschedule::{reschedule_canonical_attempt_tx, Reschedule, RescheduleOutcome};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    clear_canonical_work(&pool).await;
+    sqlx::query("DELETE FROM awa.deferred_jobs")
+        .execute(&pool)
+        .await
+        .expect("clear deferred_jobs");
+    sqlx::query("DELETE FROM awa.job_unique_claims")
+        .execute(&pool)
+        .await
+        .expect("clear unique claims");
+    reset_transition_state(&pool).await;
+
+    sqlx::query("SELECT awa.storage_prepare('queue_storage', '{\"schema\": \"awa\"}'::jsonb)")
+        .execute(&pool)
+        .await
+        .expect("storage_prepare");
+    stamp_queue_storage_target_runtime(&pool).await;
+    sqlx::query("SELECT awa.storage_enter_mixed_transition()")
+        .execute(&pool)
+        .await
+        .expect("storage_enter_mixed_transition");
+
+    let key = b"reschedule-lock-key";
+    let job_id = seed_canonical_running_job(&pool, key, 5).await;
+
+    // Hold an in-flight reschedule open: it has taken the routing decision
+    // and written the deferred successor, but has not committed.
+    let mut tx = pool.begin().await.expect("begin reschedule tx");
+    let outcome = reschedule_canonical_attempt_tx(
+        &mut tx,
+        job_id,
+        5,
+        Reschedule::Snooze {
+            delay_secs: 3_600.0,
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("reschedule inside held tx");
+    assert!(matches!(outcome, RescheduleOutcome::Migrated { .. }));
+
+    // A concurrent abort must block on the share lock rather than racing the
+    // uncommitted insert. `lock_timeout` turns the block into a deterministic
+    // error instead of a hang.
+    let abort_result = async {
+        let mut conn = pool.acquire().await.expect("abort connection");
+        sqlx::query("SET lock_timeout = '750ms'")
+            .execute(&mut *conn)
+            .await
+            .expect("set lock_timeout");
+        sqlx::query("SELECT awa.storage_abort()")
+            .execute(&mut *conn)
+            .await
+    }
+    .await;
+    let err = abort_result.expect_err("concurrent abort must not proceed past the share lock");
+    let code = err
+        .as_database_error()
+        .and_then(|db| db.code())
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        code, "55P03",
+        "abort should fail on lock_timeout while the reschedule holds the singleton, got: {err}"
+    );
+
+    tx.commit().await.expect("commit reschedule");
+
+    // Cleanup, leaving the transition finalized (see the note in the
+    // reschedule routing test above).
+    sqlx::query("DELETE FROM awa.deferred_jobs WHERE kind = 'reschedule_test'")
+        .execute(&pool)
+        .await
+        .expect("cleanup deferred");
+    sqlx::query("DELETE FROM awa.job_unique_claims")
+        .execute(&pool)
+        .await
+        .expect("cleanup claims");
+    clear_canonical_work(&pool).await;
+    sqlx::query("SELECT awa.storage_finalize()")
+        .execute(&pool)
+        .await
+        .expect("finalize after lock test");
+}
+
+/// Drive the cluster to `mixed_transition` with queue storage on the default
+/// `awa` schema, leaving the canonical plane empty.
+async fn enter_mixed_transition_for_test(pool: &PgPool) {
+    clear_canonical_work(pool).await;
+    sqlx::query("DELETE FROM awa.deferred_jobs")
+        .execute(pool)
+        .await
+        .expect("clear deferred_jobs");
+    sqlx::query("DELETE FROM awa.job_unique_claims")
+        .execute(pool)
+        .await
+        .expect("clear unique claims");
+    reset_transition_state(pool).await;
+    sqlx::query("SELECT awa.storage_prepare('queue_storage', '{\"schema\": \"awa\"}'::jsonb)")
+        .execute(pool)
+        .await
+        .expect("storage_prepare");
+    stamp_queue_storage_target_runtime(pool).await;
+    sqlx::query("SELECT awa.storage_enter_mixed_transition()")
+        .execute(pool)
+        .await
+        .expect("storage_enter_mixed_transition");
+}
+
+/// Leave the transition finalized and the planes empty (see the note in the
+/// reschedule routing test).
+async fn finalize_after_test(pool: &PgPool) {
+    sqlx::query("DELETE FROM awa.deferred_jobs WHERE kind = 'reschedule_test'")
+        .execute(pool)
+        .await
+        .expect("cleanup deferred");
+    sqlx::query("DELETE FROM awa.job_unique_claims")
+        .execute(pool)
+        .await
+        .expect("cleanup claims");
+    clear_canonical_work(pool).await;
+    sqlx::query("SELECT awa.storage_finalize()")
+        .execute(pool)
+        .await
+        .expect("finalize after test");
+}
+
+/// Seed a canonical `running` row with an explicit `unique_states` mask.
+/// `get_bit(mask, 0)` is the leftmost character, so `B'01111111'` claims every
+/// state except `scheduled`.
+async fn seed_canonical_running_job_with_mask(
+    pool: &PgPool,
+    unique_key: &[u8],
+    run_lease: i64,
+    mask: &str,
+) -> i64 {
+    sqlx::query_scalar(&format!(
+        r#"
+        INSERT INTO awa.jobs_hot (
+            kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, attempted_at, created_at, errors, metadata,
+            tags, unique_key, unique_states, run_lease
+        )
+        VALUES (
+            'reschedule_test', 'reschedule_q', '{{}}'::jsonb, 'running', 2, 1, 25,
+            now(), now(), now(), now(), ARRAY[]::jsonb[],
+            '{{}}'::jsonb, ARRAY[]::text[], $1, B'{mask}', $2
+        )
+        RETURNING id
+        "#
+    ))
+    .bind(unique_key.to_vec())
+    .bind(run_lease)
+    .fetch_one(pool)
+    .await
+    .expect("seed canonical running job with mask")
+}
+
+/// #456 corner cases on the migrated path: a `unique_states` mask that does
+/// not claim the destination state must leave the successor unclaimed, a
+/// newer duplicate already holding the key must keep it, and `RetryAfter` must
+/// honour the caller's delay rather than computing backoff.
+#[tokio::test]
+async fn migrated_reschedule_handles_claim_masks_duplicates_and_delays() {
+    use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    enter_mixed_transition_for_test(&pool).await;
+
+    // ── Mask does not claim `scheduled`: successor stays unclaimed ──
+    let key1 = b"reschedule-mask-key";
+    let job1 = seed_canonical_running_job_with_mask(&pool, key1, 2, "01111111").await;
+    assert_eq!(
+        claim_holder(&pool, key1).await,
+        Some(job1),
+        "running is inside the mask, so the seeded job holds the claim"
+    );
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job1,
+        2,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("masked snooze");
+    assert!(matches!(outcome, RescheduleOutcome::Migrated { .. }));
+    assert_eq!(
+        claim_holder(&pool, key1).await,
+        None,
+        "scheduled is outside the mask, so no claim should survive the move"
+    );
+
+    // ── A newer duplicate holds the key: the holder wins ──
+    let key2 = b"reschedule-dup-key";
+    let job2 = seed_canonical_running_job_with_mask(&pool, key2, 4, "11111111").await;
+    let decoy_id: i64 = 987_654;
+    sqlx::query("UPDATE awa.job_unique_claims SET job_id = $1 WHERE unique_key = $2")
+        .bind(decoy_id)
+        .bind(key2.to_vec())
+        .execute(&pool)
+        .await
+        .expect("simulate a newer duplicate taking the claim");
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job2,
+        4,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("duplicate-claim snooze");
+    let successor2 = match outcome {
+        RescheduleOutcome::Migrated { job_id, .. } => job_id,
+        other => panic!("expected Migrated, got {other:?}"),
+    };
+    assert_eq!(
+        claim_holder(&pool, key2).await,
+        Some(decoy_id),
+        "the duplicate holder keeps the claim; the successor proceeds unclaimed"
+    );
+    let deferred_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM awa.deferred_jobs WHERE job_id = $1)")
+            .bind(successor2)
+            .fetch_one(&pool)
+            .await
+            .expect("successor row exists");
+    assert!(
+        deferred_exists,
+        "a lost claim race must not lose the job itself"
+    );
+
+    // ── RetryAfter honours the caller delay; heartbeat/deadline cleared ──
+    let key3 = b"reschedule-retryafter-key";
+    let job3 = seed_canonical_running_job_with_mask(&pool, key3, 6, "11111111").await;
+    let before = chrono::Utc::now();
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job3,
+        6,
+        Reschedule::RetryAfter { delay_secs: 900.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("migrated retry-after");
+    let (successor3, run_at, attempt3) = match outcome {
+        RescheduleOutcome::Migrated {
+            job_id,
+            run_at,
+            attempt,
+        } => (job_id, run_at, attempt),
+        other => panic!("expected Migrated, got {other:?}"),
+    };
+    assert_eq!(attempt3, 1, "RetryAfter must not decrement the attempt");
+    let delay = run_at - before;
+    assert!(
+        delay >= chrono::TimeDelta::seconds(890) && delay <= chrono::TimeDelta::seconds(960),
+        "RetryAfter must schedule at ~now + delay, got {delay:?}"
+    );
+    // `deferred_jobs` has no heartbeat_at / deadline_at columns at all, so a
+    // migrated successor structurally cannot inherit the finished attempt's
+    // liveness fields; only the terminal-close stamp is asserted here.
+    let (state, finalized_at): (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT state::text, finalized_at FROM awa.deferred_jobs WHERE job_id = $1")
+            .bind(successor3)
+            .fetch_one(&pool)
+            .await
+            .expect("retry-after successor row");
+    assert_eq!(state, "retryable");
+    assert!(
+        finalized_at.is_some(),
+        "a retryable successor records when the attempt closed"
+    );
+
+    finalize_after_test(&pool).await;
+}
+
+/// A missing transition singleton resolves to canonical routing rather than
+/// erroring — `active_queue_storage_schema()` is NULL-safe and the locking
+/// read must preserve that. Runs inside a rolled-back transaction so the
+/// singleton is never actually removed.
+#[tokio::test]
+async fn reschedule_without_transition_singleton_routes_canonical() {
+    use awa_model::reschedule::{reschedule_canonical_attempt_tx, Reschedule, RescheduleOutcome};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    clear_canonical_work(&pool).await;
+    reset_transition_state(&pool).await;
+
+    let key = b"reschedule-no-singleton-key";
+    let job_id = seed_canonical_running_job_with_mask(&pool, key, 3, "11111111").await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("DELETE FROM awa.storage_transition_state")
+        .execute(&mut *tx)
+        .await
+        .expect("drop singleton inside tx");
+    let outcome = reschedule_canonical_attempt_tx(
+        &mut tx,
+        job_id,
+        3,
+        Reschedule::Snooze { delay_secs: 30.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("reschedule with no singleton must not error");
+    match outcome {
+        RescheduleOutcome::Rescheduled {
+            job_id: same_id, ..
+        } => assert_eq!(same_id, job_id, "canonical routing keeps the id"),
+        other => panic!("expected canonical Rescheduled, got {other:?}"),
+    }
+    tx.rollback().await.expect("rollback");
+
+    clear_canonical_work(&pool).await;
+    sqlx::query("DELETE FROM awa.job_unique_claims")
+        .execute(&pool)
+        .await
+        .expect("cleanup claims");
 }

@@ -131,11 +131,25 @@ pub async fn reschedule_canonical_attempt_tx(
     error: Option<&serde_json::Value>,
     progress: Option<&serde_json::Value>,
 ) -> Result<RescheduleOutcome, AwaError> {
-    let active_schema: Option<String> =
-        sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(map_sqlx_error)?;
+    // Lock the transition singleton FOR SHARE for the rest of this
+    // transaction before deciding where the attempt goes. `storage_abort`,
+    // `storage_enter_mixed_transition`, and `storage_finalize` all take
+    // `FOR UPDATE` on this row, so the share lock serializes us against
+    // them: without it, an abort could validate the queue-storage tables as
+    // empty and restore canonical routing between our read and our insert,
+    // stranding the job in a schema that is no longer active.
+    //
+    // `fetch_optional(...).flatten()` keeps the NULL-safe behaviour of
+    // `active_queue_storage_schema()` when the singleton row is missing —
+    // that resolves to canonical, same as a NULL result.
+    let active_schema: Option<String> = sqlx::query_scalar(
+        "SELECT awa.active_queue_storage_schema() \
+         FROM awa.storage_transition_state WHERE singleton FOR SHARE",
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?
+    .flatten();
 
     match active_schema {
         None => reschedule_canonical(conn, job_id, run_lease, reschedule, error, progress).await,
