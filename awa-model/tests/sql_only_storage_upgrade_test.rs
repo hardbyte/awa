@@ -925,3 +925,103 @@ async fn reschedule_without_transition_singleton_routes_canonical() {
         .await
         .expect("cleanup claims");
 }
+
+/// #456 (review follow-up): a job carrying callback wiring must **not** migrate
+/// cross-plane. `deferred_jobs` has no callback columns, so migrating one would
+/// silently drop `callback_id` and the CEL expressions and leave the callback
+/// unresolvable. Such a job keeps the canonical write instead.
+#[tokio::test]
+async fn callback_carrying_job_is_not_migrated_to_queue_storage() {
+    use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    enter_mixed_transition_for_test(&pool).await;
+
+    let callback_id = Uuid::new_v4();
+    let job_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO awa.jobs_hot (
+            kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, attempted_at, created_at, errors, metadata,
+            tags, run_lease, callback_id, callback_on_complete
+        )
+        VALUES (
+            'reschedule_test', 'reschedule_q', '{}'::jsonb, 'running', 2, 1, 25,
+            now(), now(), now(), now(), ARRAY[]::jsonb[], '{}'::jsonb,
+            ARRAY[]::text[], 8, $1, 'payload.done == true'
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(callback_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed callback-carrying running job");
+
+    let deferred_before: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.deferred_jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("count deferred before");
+
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job_id,
+        8,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("callback-carrying snooze");
+    match outcome {
+        RescheduleOutcome::Rescheduled {
+            job_id: same_id, ..
+        } => assert_eq!(
+            same_id, job_id,
+            "a callback-carrying job stays canonical under its own id"
+        ),
+        other => panic!("expected canonical Rescheduled, got {other:?}"),
+    }
+
+    let deferred_after: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.deferred_jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("count deferred after");
+    assert_eq!(
+        deferred_before, deferred_after,
+        "no queue-storage row may be created for a callback-carrying job"
+    );
+
+    // The callback wiring survived on the canonical successor.
+    let (kept_id, kept_on_complete): (Option<Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT callback_id, callback_on_complete FROM awa.scheduled_jobs WHERE id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("canonical successor row");
+    assert_eq!(kept_id, Some(callback_id));
+    assert_eq!(kept_on_complete.as_deref(), Some("payload.done == true"));
+
+    // A genuinely stale completion is still reported as stale, not silently
+    // re-scheduled by the canonical fallback.
+    let stale = reschedule_canonical_attempt(
+        &pool,
+        job_id,
+        999,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("stale call");
+    assert!(matches!(stale, RescheduleOutcome::Stale));
+
+    sqlx::query("DELETE FROM awa.scheduled_jobs WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup callback job");
+    finalize_after_test(&pool).await;
+}

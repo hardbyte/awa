@@ -245,10 +245,23 @@ async fn migrate_to_queue_storage(
     progress: Option<&serde_json::Value>,
 ) -> Result<RescheduleOutcome, AwaError> {
     // The jobs_hot delete trigger releases the job's unique claim.
+    //
+    // Jobs carrying callback wiring are deliberately excluded: `deferred_jobs`
+    // has no callback columns (queue storage keeps that state on the lease), so
+    // migrating one would silently drop `callback_id` and the CEL expressions,
+    // leaving no way to resume or resolve the callback. Those keep the
+    // canonical write below — they are not the perpetual-snooze shape this
+    // path exists for, and a callback job reaches a terminal state on its own.
     let taken: Option<TakenJob> = sqlx::query_as(
         r#"
         DELETE FROM awa.jobs_hot
         WHERE id = $1 AND state = 'running' AND run_lease = $2
+          AND callback_id IS NULL
+          AND callback_timeout_at IS NULL
+          AND callback_filter IS NULL
+          AND callback_on_complete IS NULL
+          AND callback_on_fail IS NULL
+          AND callback_transform IS NULL
         RETURNING kind, queue, args, priority, attempt, run_lease, max_attempts,
                   attempted_at, created_at, errors, metadata, tags,
                   unique_key, unique_states::text AS unique_states
@@ -261,7 +274,11 @@ async fn migrate_to_queue_storage(
     .map_err(map_sqlx_error)?;
 
     let Some(job) = taken else {
-        return Ok(RescheduleOutcome::Stale);
+        // Either the job carries callback wiring, or the run_lease guard did
+        // not match. Fall through to the canonical write, which applies the
+        // same guard: it re-schedules a callback-carrying job in place and
+        // reports `Stale` for a genuinely lost attempt.
+        return reschedule_canonical(conn, job_id, run_lease, reschedule, error, progress).await;
     };
 
     let (delay_secs, use_backoff) = reschedule.delay_parameters();
@@ -275,11 +292,15 @@ async fn migrate_to_queue_storage(
     // The id sequences differ between the canonical tables and a
     // queue-storage schema, so the successor must take a fresh id; reusing
     // the canonical id could collide with a future queue-storage insert.
-    let (new_id, run_at): (i64, DateTime<Utc>) = sqlx::query_as(&format!(
+    // `finalized_at` comes from the same statement as `run_at`: retention and
+    // cleanup compare it against the database clock, so stamping it from the
+    // worker would let clock skew shift those decisions.
+    let (new_id, run_at, db_now): (i64, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(&format!(
         r#"
         SELECT nextval('{schema}.job_id_seq')::bigint,
                CASE WHEN $1 THEN now() + awa.backoff_duration($2::smallint, $3::smallint)
-                    ELSE now() + make_interval(secs => $4) END
+                    ELSE now() + make_interval(secs => $4) END,
+               now()
         "#
     ))
     .bind(use_backoff)
@@ -348,7 +369,7 @@ async fn migrate_to_queue_storage(
     .bind(run_at)
     .bind(job.attempted_at)
     .bind(if next_state == JobState::Retryable {
-        Some(Utc::now())
+        Some(db_now)
     } else {
         None
     })

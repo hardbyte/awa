@@ -597,6 +597,11 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     eprintln!("[rehearsal] phase 3a: queue-storage schema installed");
 
     let qs_target_handled = Arc::new(AtomicI64::new(0));
+    // Separate from `snooze_performs`: sharing one counter with the pre-flip
+    // auto client would let phase 7 pass on work done by *some* runtime, when
+    // the property #456 is about is that queue storage specifically keeps
+    // executing the snoozer bank.
+    let qs_snooze_performs = Arc::new(AtomicI64::new(0));
     let qs_store_config = QueueStorageConfig {
         schema: qs_schema.clone(),
         ..Default::default()
@@ -646,7 +651,7 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
             },
         )
         .register_worker(SnoozeForeverWorker {
-            performs: snooze_performs.clone(),
+            performs: qs_snooze_performs.clone(),
         })
         .build()
         .expect("queue_storage_target client build");
@@ -723,13 +728,13 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
 
     // ── Phase 7: stable on queue_storage ───────────────────────────────
 
-    let snooze_at_finalize = snooze_performs.load(Ordering::Relaxed);
+    let snooze_at_finalize = qs_snooze_performs.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let snooze_after_finalize = snooze_performs.load(Ordering::Relaxed);
+    let snooze_after_finalize = qs_snooze_performs.load(Ordering::Relaxed);
     assert!(
         snooze_after_finalize > snooze_at_finalize,
-        "perpetual snoozers must keep executing on queue storage after finalize \
-         (at_finalize={snooze_at_finalize} after={snooze_after_finalize})"
+        "the queue-storage target must keep executing perpetual snoozers after \
+         finalize (at_finalize={snooze_at_finalize} after={snooze_after_finalize})"
     );
     assert_eq!(
         canonical_backlog_count(&pool, &snooze_queue).await,
