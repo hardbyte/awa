@@ -131,6 +131,32 @@ impl Worker for CountingWorker {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct SnoozeForeverJob {
+    id: i64,
+}
+
+/// Handler that never completes: every run ends in a short snooze. #456 —
+/// a canonical backlog of these must still drain during mixed transition,
+/// because each post-flip re-schedule moves the job to queue storage
+/// instead of back into canonical `scheduled_jobs`.
+#[derive(Clone)]
+struct SnoozeForeverWorker {
+    performs: Arc<AtomicI64>,
+}
+
+#[async_trait]
+impl Worker for SnoozeForeverWorker {
+    fn kind(&self) -> &'static str {
+        "snooze_forever_job"
+    }
+
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        self.performs.fetch_add(1, Ordering::Relaxed);
+        Ok(JobResult::Snooze(Duration::from_millis(300)))
+    }
+}
+
 struct PythonHelper {
     child: Child,
     handled: Arc<AtomicI64>,
@@ -270,10 +296,16 @@ async fn reset_schema(pool: &sqlx::PgPool, queue_storage_schema: &str) {
 async fn canonical_backlog_count(pool: &sqlx::PgPool, queue: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT count(*)::bigint
-        FROM awa.jobs_hot
-        WHERE queue = $1
-          AND state NOT IN ('completed', 'failed', 'cancelled')
+        SELECT (
+            SELECT count(*)::bigint
+            FROM awa.jobs_hot
+            WHERE queue = $1
+              AND state NOT IN ('completed', 'failed', 'cancelled')
+        ) + (
+            SELECT count(*)::bigint
+            FROM awa.scheduled_jobs
+            WHERE queue = $1
+        )
         "#,
     )
     .bind(queue)
@@ -370,6 +402,28 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         accepted_seqs.lock().unwrap().insert(seq);
     }
 
+    // #456: a bank of perpetual snoozers — jobs whose handler snoozes on
+    // every run. Before the reschedule-migration fix these re-entered
+    // canonical `scheduled_jobs` after every post-flip execution, so the
+    // canonical backlog never converged and finalize could not pass. They
+    // live on their own queue so the Python helper (which only understands
+    // simple_chaos_job) never claims them.
+    let snooze_queue = format!("{queue}_snooze");
+    let snooze_performs = Arc::new(AtomicI64::new(0));
+    const SNOOZE_JOBS: i64 = 5;
+    for id in 0..SNOOZE_JOBS {
+        insert_with(
+            &pool,
+            &SnoozeForeverJob { id },
+            InsertOpts {
+                queue: snooze_queue.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed snooze-forever job");
+    }
+
     // Producer task: continuous insert at ~50/s. We track total seeded
     // via an atomic so the final assertion compares against actual
     // production, not an a priori expected count.
@@ -455,6 +509,18 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
             handled_seqs: rust_handled_seqs.clone(),
             delay: Duration::from_millis(100),
         })
+        .queue(
+            &snooze_queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: auto_rust_deadline,
+                ..QueueConfig::default()
+            },
+        )
+        .register_worker(SnoozeForeverWorker {
+            performs: snooze_performs.clone(),
+        })
         .build()
         .expect("auto rust client build");
     auto_rust_client.start().await.expect("auto rust start");
@@ -489,6 +555,17 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
         pre_prepare_backlog > 0,
         "banked canonical work must remain live when prepare begins"
     );
+
+    // The snoozer bank must have cycled at least once on the canonical
+    // engine before the transition begins.
+    let snooze_baseline_deadline = Instant::now() + Duration::from_secs(30);
+    while snooze_performs.load(Ordering::Relaxed) < SNOOZE_JOBS {
+        assert!(
+            Instant::now() < snooze_baseline_deadline,
+            "snooze-forever jobs never executed on the canonical engine"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     // ── Phase 2: prepare ───────────────────────────────────────────────
 
@@ -559,6 +636,18 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
             handled_seqs: rust_handled_seqs.clone(),
             delay: Duration::from_millis(100),
         })
+        .queue(
+            &snooze_queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: qs_deadline,
+                ..QueueConfig::default()
+            },
+        )
+        .register_worker(SnoozeForeverWorker {
+            performs: snooze_performs.clone(),
+        })
         .build()
         .expect("queue_storage_target client build");
     qs_target_client.start().await.expect("qs target start");
@@ -583,7 +672,8 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
     let drain_deadline = Instant::now() + Duration::from_secs(60);
     let mut last_backlog = -1i64;
     loop {
-        let n = canonical_backlog_count(&pool, &queue).await;
+        let n = canonical_backlog_count(&pool, &queue).await
+            + canonical_backlog_count(&pool, &snooze_queue).await;
         if n == 0 {
             eprintln!("[rehearsal] phase 5: canonical backlog drained");
             break;
@@ -633,7 +723,19 @@ async fn test_rolling_transition_with_live_producers_rust_and_python() {
 
     // ── Phase 7: stable on queue_storage ───────────────────────────────
 
+    let snooze_at_finalize = snooze_performs.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_secs(5)).await;
+    let snooze_after_finalize = snooze_performs.load(Ordering::Relaxed);
+    assert!(
+        snooze_after_finalize > snooze_at_finalize,
+        "perpetual snoozers must keep executing on queue storage after finalize \
+         (at_finalize={snooze_at_finalize} after={snooze_after_finalize})"
+    );
+    assert_eq!(
+        canonical_backlog_count(&pool, &snooze_queue).await,
+        0,
+        "snoozer bank must have left the canonical plane"
+    );
     let post_finalize_seeded = seeded.load(Ordering::Relaxed);
     let post_finalize_qs_processed = qs_target_handled.load(Ordering::Relaxed);
     eprintln!(

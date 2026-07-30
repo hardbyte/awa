@@ -307,3 +307,238 @@ async fn external_tooling_can_finalize_fresh_install_via_sql() {
 
     reset_transition_state(&pool).await;
 }
+
+/// Seed a canonical `running` row directly in `awa.jobs_hot`, mimicking a
+/// claimed attempt (the insert trigger creates its unique claim).
+async fn seed_canonical_running_job(pool: &PgPool, unique_key: &[u8], run_lease: i64) -> i64 {
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO awa.jobs_hot (
+            kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, attempted_at, created_at, errors, metadata,
+            tags, unique_key, unique_states, run_lease
+        )
+        VALUES (
+            'reschedule_test', 'reschedule_q', '{"n":1}'::jsonb, 'running', 2, 1, 25,
+            now(), now(), now(), now(), ARRAY['{"error":"seed"}'::jsonb],
+            '{"tenant":"t1"}'::jsonb, ARRAY['tagged'], $1, B'11111111', $2
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(unique_key.to_vec())
+    .bind(run_lease)
+    .fetch_one(pool)
+    .await
+    .expect("seed canonical running job")
+}
+
+async fn claim_holder(pool: &PgPool, unique_key: &[u8]) -> Option<i64> {
+    sqlx::query_scalar("SELECT job_id FROM awa.job_unique_claims WHERE unique_key = $1")
+        .bind(unique_key.to_vec())
+        .fetch_optional(pool)
+        .await
+        .expect("read unique claim")
+}
+
+/// #456: `awa_model::reschedule` keeps snooze/retry re-schedules
+/// canonical while the cluster is canonical, and moves them to the active
+/// queue-storage schema's `deferred_jobs` once routing has flipped — so the
+/// canonical drain converges even for handlers that snooze on every run.
+#[tokio::test]
+async fn reschedule_canonical_attempt_routes_by_transition_state() {
+    use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
+
+    let _guard = TRANSITION_LOCK.lock().await;
+    let pool = migrated_pool().await;
+    clear_canonical_work(&pool).await;
+    sqlx::query("DELETE FROM awa.deferred_jobs")
+        .execute(&pool)
+        .await
+        .expect("clear deferred_jobs");
+    sqlx::query("DELETE FROM awa.job_unique_claims")
+        .execute(&pool)
+        .await
+        .expect("clear unique claims");
+    reset_transition_state(&pool).await;
+
+    // ── Canonical routing: snooze re-schedules under the existing id ──
+    let key1 = b"reschedule-key-1";
+    let job1 = seed_canonical_running_job(&pool, key1, 3).await;
+
+    // Wrong run_lease loses the guard.
+    let stale = reschedule_canonical_attempt(
+        &pool,
+        job1,
+        99,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("stale reschedule call");
+    assert!(matches!(stale, RescheduleOutcome::Stale));
+
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job1,
+        3,
+        Reschedule::Snooze { delay_secs: 60.0 },
+        None,
+        None,
+    )
+    .await
+    .expect("canonical snooze");
+    match outcome {
+        RescheduleOutcome::Rescheduled {
+            job_id, attempt, ..
+        } => {
+            assert_eq!(job_id, job1, "canonical snooze keeps the job id");
+            assert_eq!(attempt, 0, "snooze does not count the attempt");
+        }
+        other => panic!("expected Rescheduled, got {other:?}"),
+    }
+    let (state, count): (String, i64) = sqlx::query_as(
+        "SELECT state::text, count(*) OVER () FROM awa.scheduled_jobs WHERE id = $1",
+    )
+    .bind(job1)
+    .fetch_one(&pool)
+    .await
+    .expect("scheduled row after canonical snooze");
+    assert_eq!((state.as_str(), count), ("scheduled", 1));
+    assert_eq!(claim_holder(&pool, key1).await, Some(job1));
+
+    // ── Flip to mixed transition ──
+    sqlx::query("SELECT awa.storage_prepare('queue_storage', '{\"schema\": \"awa\"}'::jsonb)")
+        .execute(&pool)
+        .await
+        .expect("storage_prepare");
+    stamp_queue_storage_target_runtime(&pool).await;
+    sqlx::query("SELECT awa.storage_enter_mixed_transition()")
+        .execute(&pool)
+        .await
+        .expect("storage_enter_mixed_transition");
+
+    // ── Migrated routing: retry backoff leaves the canonical plane ──
+    let key2 = b"reschedule-key-2";
+    let job2 = seed_canonical_running_job(&pool, key2, 7).await;
+    let error_entry = serde_json::json!({ "error": "boom", "attempt": 1 });
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job2,
+        7,
+        Reschedule::RetryBackoff,
+        Some(&error_entry),
+        Some(&serde_json::json!({ "step": 2 })),
+    )
+    .await
+    .expect("migrated retry backoff");
+    let new_id = match outcome {
+        RescheduleOutcome::Migrated {
+            job_id, attempt, ..
+        } => {
+            assert_ne!(job_id, job2, "migrated successor gets a fresh id");
+            assert_eq!(attempt, 1, "retry backoff preserves the attempt count");
+            job_id
+        }
+        other => panic!("expected Migrated, got {other:?}"),
+    };
+
+    let canonical_left: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.jobs_hot WHERE id = $1 \
+         UNION ALL SELECT count(*)::bigint FROM awa.scheduled_jobs WHERE id = $1 \
+         ORDER BY 1 DESC LIMIT 1",
+    )
+    .bind(job2)
+    .fetch_one(&pool)
+    .await
+    .expect("canonical remnants");
+    assert_eq!(canonical_left, 0, "migrated job left the canonical plane");
+
+    let (state, attempt, run_lease, payload): (String, i16, i64, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT state::text, attempt, run_lease, payload \
+             FROM awa.deferred_jobs WHERE job_id = $1",
+        )
+        .bind(new_id)
+        .fetch_one(&pool)
+        .await
+        .expect("deferred successor row");
+    assert_eq!(state, "retryable");
+    assert_eq!(attempt, 1);
+    assert_eq!(run_lease, 7, "run_lease carries over to the successor");
+    let errors = payload["errors"].as_array().expect("payload errors array");
+    assert_eq!(errors.len(), 2, "seeded error plus appended retry error");
+    assert_eq!(errors[1]["error"], "boom");
+    assert_eq!(payload["metadata"]["tenant"], "t1");
+    assert_eq!(payload["tags"], serde_json::json!(["tagged"]));
+    assert_eq!(payload["progress"]["step"], 2);
+    assert_eq!(
+        claim_holder(&pool, key2).await,
+        Some(new_id),
+        "unique claim follows the successor id"
+    );
+
+    // A late completion from the taken attempt is stale.
+    let stale = reschedule_canonical_attempt(
+        &pool,
+        job2,
+        7,
+        Reschedule::RetryBackoff,
+        Some(&error_entry),
+        None,
+    )
+    .await
+    .expect("stale post-migration call");
+    assert!(matches!(stale, RescheduleOutcome::Stale));
+
+    // ── Migrated routing: snooze does not count the attempt ──
+    let key3 = b"reschedule-key-3";
+    let job3 = seed_canonical_running_job(&pool, key3, 1).await;
+    let outcome = reschedule_canonical_attempt(
+        &pool,
+        job3,
+        1,
+        Reschedule::Snooze {
+            delay_secs: 86_400.0,
+        },
+        None,
+        None,
+    )
+    .await
+    .expect("migrated snooze");
+    match outcome {
+        RescheduleOutcome::Migrated { attempt, .. } => assert_eq!(attempt, 0),
+        other => panic!("expected Migrated, got {other:?}"),
+    }
+
+    // The perpetual-snoozer scenario: canonical live backlog is now zero
+    // even though every job re-scheduled rather than completing.
+    let backlog: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*)::bigint FROM awa.jobs_hot \
+          WHERE state NOT IN ('completed','failed','cancelled') AND kind = 'reschedule_test') \
+         + (SELECT count(*)::bigint FROM awa.scheduled_jobs WHERE kind = 'reschedule_test' AND id <> $1)",
+    )
+    .bind(job1)
+    .fetch_one(&pool)
+    .await
+    .expect("canonical backlog");
+    assert_eq!(backlog, 0);
+
+    // Cleanup: drive the transition to `active` rather than resetting to
+    // `canonical` — a later `migrations::run` against this shared test
+    // database would otherwise hit the ADR-037 unfinalized-cluster gate.
+    sqlx::query("DELETE FROM awa.deferred_jobs WHERE kind = 'reschedule_test'")
+        .execute(&pool)
+        .await
+        .expect("cleanup deferred");
+    sqlx::query("DELETE FROM awa.job_unique_claims")
+        .execute(&pool)
+        .await
+        .expect("cleanup claims");
+    clear_canonical_work(&pool).await;
+    sqlx::query("SELECT awa.storage_finalize()")
+        .execute(&pool)
+        .await
+        .expect("finalize after reschedule test");
+}
