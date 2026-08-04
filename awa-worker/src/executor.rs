@@ -1042,7 +1042,10 @@ async fn complete_job_canonical(
                 progress_snapshot.as_ref(),
             )
             .await?;
-            if matches!(outcome, RescheduleOutcome::Stale) {
+            if matches!(
+                outcome,
+                RescheduleOutcome::Stale | RescheduleOutcome::CancelledDuplicate { .. }
+            ) {
                 warn!(
                     job_id = job.id,
                     "Job already rescued/cancelled, snooze ignored"
@@ -2750,19 +2753,25 @@ async fn retry_after_canonical_with_followups(
         progress_snapshot,
     )
     .await?;
-    let (RescheduleOutcome::Rescheduled {
-        job_id,
-        run_at,
-        attempt,
-    }
-    | RescheduleOutcome::Migrated {
-        job_id,
-        run_at,
-        attempt,
-    }) = outcome
-    else {
-        tx.rollback().await?;
-        return Ok(None);
+    let (job_id, run_at, attempt) = match outcome {
+        RescheduleOutcome::Rescheduled {
+            job_id,
+            run_at,
+            attempt,
+        }
+        | RescheduleOutcome::Migrated {
+            job_id,
+            run_at,
+            attempt,
+        } => (job_id, run_at, attempt),
+        RescheduleOutcome::CancelledDuplicate { .. } => {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        RescheduleOutcome::Stale => {
+            tx.rollback().await?;
+            return Ok(None);
+        }
     };
     let updated_job = rescheduled_event_row(
         job,
@@ -2910,19 +2919,25 @@ async fn retry_backoff_canonical_with_followups(
         progress_snapshot,
     )
     .await?;
-    let (RescheduleOutcome::Rescheduled {
-        job_id,
-        run_at,
-        attempt,
-    }
-    | RescheduleOutcome::Migrated {
-        job_id,
-        run_at,
-        attempt,
-    }) = outcome
-    else {
-        tx.rollback().await?;
-        return Ok(None);
+    let (job_id, run_at, attempt) = match outcome {
+        RescheduleOutcome::Rescheduled {
+            job_id,
+            run_at,
+            attempt,
+        }
+        | RescheduleOutcome::Migrated {
+            job_id,
+            run_at,
+            attempt,
+        } => (job_id, run_at, attempt),
+        RescheduleOutcome::CancelledDuplicate { .. } => {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        RescheduleOutcome::Stale => {
+            tx.rollback().await?;
+            return Ok(None);
+        }
     };
     let updated_job = rescheduled_event_row(
         job,
