@@ -12217,6 +12217,112 @@ impl QueueStorage {
         Ok(Some(deferred.into_job_row()?))
     }
 
+    /// Insert a canonical attempt's transition-time deferred successor,
+    /// degrading to a cancelled terminal row if a newer duplicate already
+    /// owns the unique claim. Canonical deletion releases any claim before
+    /// this call, so the deferred insert must acquire from `None` even when
+    /// the old `running` state was inside the mask.
+    pub(crate) async fn insert_migrated_deferred_or_cancel_duplicate_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        row: JobRow,
+        unique_states: Option<String>,
+        duplicate_error: &str,
+    ) -> Result<JobRow, AwaError> {
+        let payload = Self::payload_from_parts(row.metadata, row.tags, row.errors, row.progress)?;
+        let deferred = DeferredJobRow {
+            job_id: row.id,
+            kind: row.kind,
+            queue: row.queue,
+            args: row.args,
+            state: row.state,
+            priority: row.priority,
+            attempt: row.attempt,
+            run_lease: row.run_lease,
+            max_attempts: row.max_attempts,
+            run_at: row.run_at,
+            attempted_at: row.attempted_at,
+            finalized_at: row.finalized_at,
+            created_at: row.created_at,
+            unique_key: row.unique_key,
+            unique_states,
+            payload,
+        };
+
+        {
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_deferred_rows_tx(&mut savepoint, vec![deferred.clone()], None)
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    return deferred.into_job_row();
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let mut cancelled_payload = RuntimePayload::from_json(deferred.payload.clone())?;
+        cancelled_payload.push_error(lifecycle_error(duplicate_error, deferred.attempt, true));
+        let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
+        self.ensure_lane(tx, &deferred.queue, deferred.priority, 0)
+            .await?;
+        let mut done = DoneJobRow {
+            ready_slot,
+            ready_generation,
+            job_id: deferred.job_id,
+            kind: deferred.kind,
+            queue: deferred.queue,
+            args: deferred.args,
+            state: JobState::Cancelled,
+            priority: deferred.priority,
+            attempt: deferred.attempt,
+            run_lease: deferred.run_lease,
+            max_attempts: deferred.max_attempts,
+            // The successor never entered a ready lane. Mirror deferred-job
+            // cancellation with a synthetic negative sequence on shard 0.
+            lane_seq: -deferred.job_id,
+            enqueue_shard: 0,
+            run_at: deferred.run_at,
+            attempted_at: deferred.attempted_at,
+            finalized_at: self.current_timestamp_tx(tx).await?,
+            created_at: deferred.created_at,
+            unique_key: deferred.unique_key,
+            unique_states: deferred.unique_states,
+            payload: cancelled_payload.into_json(),
+        };
+
+        {
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_done_rows_tx(&mut savepoint, std::slice::from_ref(&done), None)
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    return done.into_job_row();
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        // If `cancelled` itself claims uniqueness, the newer holder still
+        // wins. The cancelled evidence carries no claim to release, so strip
+        // the uniqueness fields exactly like rescue duplicate cancellation.
+        done.unique_key = None;
+        done.unique_states = None;
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), None)
+            .await?;
+        done.into_job_row()
+    }
+
     /// Rescue-path fallback for unique-claim conflicts: insert the rescued
     /// attempt's deferred successor, degrading to a cancelled terminal row
     /// when the job's unique claim is held by a newer duplicate — the claim

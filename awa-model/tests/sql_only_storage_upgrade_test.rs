@@ -711,6 +711,18 @@ async fn enter_mixed_transition_for_test(pool: &PgPool) {
 /// Leave the transition finalized and the planes empty (see the note in the
 /// reschedule routing test).
 async fn finalize_after_test(pool: &PgPool) {
+    let terminal_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT job_id FROM awa.terminal_jobs WHERE kind = 'reschedule_test'")
+            .fetch_all(pool)
+            .await
+            .expect("list terminal reschedule rows");
+    for job_id in terminal_ids {
+        sqlx::query("SELECT awa.delete_job_compat($1)")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .expect("cleanup terminal reschedule row");
+    }
     sqlx::query("DELETE FROM awa.deferred_jobs WHERE kind = 'reschedule_test'")
         .execute(pool)
         .await
@@ -759,8 +771,9 @@ async fn seed_canonical_running_job_with_mask(
 
 /// #456 corner cases on the migrated path: a `unique_states` mask that does
 /// not claim the destination state must leave the successor unclaimed, a
-/// newer duplicate already holding the key must keep it, and `RetryAfter` must
-/// honour the caller's delay rather than computing backoff.
+/// newer duplicate already holding the key must cancel the attempted successor,
+/// and `RetryAfter` must honour the caller's delay rather than computing
+/// backoff.
 #[tokio::test]
 async fn migrated_reschedule_handles_claim_masks_duplicates_and_delays() {
     use awa_model::reschedule::{reschedule_canonical_attempt, Reschedule, RescheduleOutcome};
@@ -794,16 +807,24 @@ async fn migrated_reschedule_handles_claim_masks_duplicates_and_delays() {
         "scheduled is outside the mask, so no claim should survive the move"
     );
 
-    // ── A newer duplicate holds the key: the holder wins ──
+    // ── Running does not claim; a newer duplicate wins before snooze ──
     let key2 = b"reschedule-dup-key";
-    let job2 = seed_canonical_running_job_with_mask(&pool, key2, 4, "11111111").await;
+    // scheduled + available claim, running does not. This is the real race:
+    // the canonical attempt legitimately owns no claim while executing, so a
+    // newer enqueue can acquire the key before the snooze successor exists.
+    let job2 = seed_canonical_running_job_with_mask(&pool, key2, 4, "11000000").await;
+    assert_eq!(
+        claim_holder(&pool, key2).await,
+        None,
+        "running is outside the mask, so the attempt must not hold the claim"
+    );
     let decoy_id: i64 = 987_654;
-    sqlx::query("UPDATE awa.job_unique_claims SET job_id = $1 WHERE unique_key = $2")
-        .bind(decoy_id)
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
         .bind(key2.to_vec())
+        .bind(decoy_id)
         .execute(&pool)
         .await
-        .expect("simulate a newer duplicate taking the claim");
+        .expect("newer duplicate takes the unheld claim");
     let outcome = reschedule_canonical_attempt(
         &pool,
         job2,
@@ -815,23 +836,39 @@ async fn migrated_reschedule_handles_claim_masks_duplicates_and_delays() {
     .await
     .expect("duplicate-claim snooze");
     let successor2 = match outcome {
-        RescheduleOutcome::Migrated { job_id, .. } => job_id,
-        other => panic!("expected Migrated, got {other:?}"),
+        RescheduleOutcome::CancelledDuplicate { job_id } => job_id,
+        other => panic!("expected CancelledDuplicate, got {other:?}"),
     };
     assert_eq!(
         claim_holder(&pool, key2).await,
         Some(decoy_id),
-        "the duplicate holder keeps the claim; the successor proceeds unclaimed"
+        "the newer duplicate must retain the claim"
     );
     let deferred_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM awa.deferred_jobs WHERE job_id = $1)")
             .bind(successor2)
             .fetch_one(&pool)
             .await
-            .expect("successor row exists");
+            .expect("check deferred successor");
     assert!(
-        deferred_exists,
-        "a lost claim race must not lose the job itself"
+        !deferred_exists,
+        "the claim-losing successor must never remain executable"
+    );
+    let (terminal_state, terminal_payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT state::text, payload FROM awa.terminal_jobs WHERE job_id = $1")
+            .bind(successor2)
+            .fetch_one(&pool)
+            .await
+            .expect("cancelled duplicate terminal row");
+    assert_eq!(terminal_state, "cancelled");
+    let terminal_errors = terminal_payload["errors"]
+        .as_array()
+        .expect("terminal payload errors");
+    assert!(
+        terminal_errors.iter().any(|entry| entry["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unique claim held by a newer job"))),
+        "cancelled duplicate must retain the claim-conflict reason: {terminal_errors:?}"
     );
 
     // ── RetryAfter honours the caller delay; heartbeat/deadline cleared ──

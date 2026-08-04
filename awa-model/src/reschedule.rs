@@ -19,10 +19,11 @@
 //! attempt matches nothing and reports stale.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 use crate::error::{map_sqlx_error, AwaError};
-use crate::job::JobState;
+use crate::job::{JobRow, JobState};
+use crate::queue_storage::QueueStorage;
 
 /// What kind of re-schedule the completing attempt requested.
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +76,10 @@ pub enum RescheduleOutcome {
         run_at: DateTime<Utc>,
         attempt: i16,
     },
+    /// A newer duplicate acquired the unique claim while the canonical
+    /// attempt was running. The attempted successor was recorded as a
+    /// cancelled queue-storage terminal row and is not executable.
+    CancelledDuplicate { job_id: i64 },
     /// The `state = 'running' AND run_lease = $n` guard matched nothing —
     /// the attempt was rescued or cancelled and this completion is stale.
     Stale,
@@ -124,7 +129,7 @@ pub async fn reschedule_canonical_attempt(
 /// Transaction-composable form of [`reschedule_canonical_attempt`] for
 /// callers that must commit follow-up work atomically with the re-schedule.
 pub async fn reschedule_canonical_attempt_tx(
-    conn: &mut PgConnection,
+    tx: &mut Transaction<'_, Postgres>,
     job_id: i64,
     run_lease: i64,
     reschedule: Reschedule,
@@ -146,18 +151,18 @@ pub async fn reschedule_canonical_attempt_tx(
         "SELECT awa.active_queue_storage_schema() \
          FROM awa.storage_transition_state WHERE singleton FOR SHARE",
     )
-    .fetch_optional(&mut *conn)
+    .fetch_optional(tx.as_mut())
     .await
     .map_err(map_sqlx_error)?
     .flatten();
 
     match active_schema {
-        None => reschedule_canonical(conn, job_id, run_lease, reschedule, error, progress).await,
+        None => {
+            reschedule_canonical(tx.as_mut(), job_id, run_lease, reschedule, error, progress).await
+        }
         Some(schema) => {
-            migrate_to_queue_storage(
-                conn, &schema, job_id, run_lease, reschedule, error, progress,
-            )
-            .await
+            migrate_to_queue_storage(tx, &schema, job_id, run_lease, reschedule, error, progress)
+                .await
         }
     }
 }
@@ -236,7 +241,7 @@ async fn reschedule_canonical(
 /// Mixed transition / active: take the canonical row and re-insert the
 /// attempt as a queue-storage deferred job under a fresh id.
 async fn migrate_to_queue_storage(
-    conn: &mut PgConnection,
+    tx: &mut Transaction<'_, Postgres>,
     schema: &str,
     job_id: i64,
     run_lease: i64,
@@ -269,7 +274,7 @@ async fn migrate_to_queue_storage(
     )
     .bind(job_id)
     .bind(run_lease)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(tx.as_mut())
     .await
     .map_err(map_sqlx_error)?;
 
@@ -278,7 +283,8 @@ async fn migrate_to_queue_storage(
         // not match. Fall through to the canonical write, which applies the
         // same guard: it re-schedules a callback-carrying job in place and
         // reports `Stale` for a genuinely lost attempt.
-        return reschedule_canonical(conn, job_id, run_lease, reschedule, error, progress).await;
+        return reschedule_canonical(tx.as_mut(), job_id, run_lease, reschedule, error, progress)
+            .await;
     };
 
     let (delay_secs, use_backoff) = reschedule.delay_parameters();
@@ -307,7 +313,7 @@ async fn migrate_to_queue_storage(
     .bind(job.attempt)
     .bind(job.max_attempts)
     .bind(delay_secs)
-    .fetch_one(&mut *conn)
+    .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)?;
 
@@ -315,75 +321,53 @@ async fn migrate_to_queue_storage(
     if let Some(error) = error {
         errors.push(error.clone());
     }
-    let payload = serde_json::json!({
-        "metadata": job.metadata,
-        "tags": job.tags,
-        "errors": errors,
-        "progress": progress,
-    });
-
-    // Claim the successor id. If a newer duplicate already holds the key
-    // (possible only when 'running' is outside the job's unique_states mask,
-    // so the delete above released nothing), the holder wins and the
-    // successor proceeds unclaimed — consistent with the queue-storage
-    // rescue path's duplicate handling.
-    if let (Some(unique_key), Some(unique_states)) = (&job.unique_key, &job.unique_states) {
-        let claims: bool =
-            sqlx::query_scalar("SELECT awa.job_state_in_bitmask($1::bit(8), $2::awa.job_state)")
-                .bind(unique_states)
-                .bind(next_state)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(map_sqlx_error)?;
-        if claims {
-            sqlx::query(
-                "INSERT INTO awa.job_unique_claims (unique_key, job_id) \
-                 VALUES ($1, $2) ON CONFLICT (unique_key) DO NOTHING",
-            )
-            .bind(unique_key)
-            .bind(new_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(map_sqlx_error)?;
-        }
-    }
-
-    sqlx::query(&format!(
-        r#"
-        INSERT INTO {schema}.deferred_jobs (
-            job_id, kind, queue, args, state, priority, attempt, run_lease,
-            max_attempts, run_at, attempted_at, finalized_at, created_at,
-            unique_key, unique_states, payload
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::bit(8), $16)
-        "#
-    ))
-    .bind(new_id)
-    .bind(&job.kind)
-    .bind(&job.queue)
-    .bind(&job.args)
-    .bind(next_state)
-    .bind(job.priority)
-    .bind(attempt)
-    .bind(job.run_lease)
-    .bind(job.max_attempts)
-    .bind(run_at)
-    .bind(job.attempted_at)
-    .bind(if next_state == JobState::Retryable {
-        Some(db_now)
-    } else {
-        None
-    })
-    .bind(job.created_at)
-    .bind(&job.unique_key)
-    .bind(&job.unique_states)
-    .bind(&payload)
-    .execute(&mut *conn)
-    .await
-    .map_err(map_sqlx_error)?;
-
-    Ok(RescheduleOutcome::Migrated {
-        job_id: new_id,
-        run_at,
+    let successor = JobRow {
+        id: new_id,
+        kind: job.kind,
+        queue: job.queue,
+        args: job.args,
+        state: next_state,
+        priority: job.priority,
         attempt,
-    })
+        run_lease: job.run_lease,
+        max_attempts: job.max_attempts,
+        run_at,
+        heartbeat_at: None,
+        deadline_at: None,
+        attempted_at: job.attempted_at,
+        finalized_at: (next_state == JobState::Retryable).then_some(db_now),
+        created_at: job.created_at,
+        errors: (!errors.is_empty()).then_some(errors),
+        metadata: job.metadata,
+        tags: job.tags,
+        unique_key: job.unique_key,
+        unique_states: None,
+        callback_id: None,
+        callback_timeout_at: None,
+        callback_filter: None,
+        callback_on_complete: None,
+        callback_on_fail: None,
+        callback_transform: None,
+        progress: progress.cloned(),
+    };
+    let inserted = QueueStorage::from_existing_schema(schema)?
+        .insert_migrated_deferred_or_cancel_duplicate_tx(
+            tx,
+            successor,
+            job.unique_states,
+            "rescheduled as duplicate: unique claim held by a newer job",
+        )
+        .await?;
+
+    if inserted.state == JobState::Cancelled {
+        Ok(RescheduleOutcome::CancelledDuplicate {
+            job_id: inserted.id,
+        })
+    } else {
+        Ok(RescheduleOutcome::Migrated {
+            job_id: inserted.id,
+            run_at: inserted.run_at,
+            attempt: inserted.attempt,
+        })
+    }
 }
