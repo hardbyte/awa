@@ -107,11 +107,13 @@ Core transitions:
 | `running` | `scheduled` | Handler snoozes; the attempt is not counted. |
 | `running` | `waiting_external` | Handler parks for callback or sequential wait. |
 | `waiting_external` | `running` | `resume_external` resumes a sequential wait. |
-| `running` / `waiting_external` | `cancelled` | Handler cancel, admin cancel, or rescue cancellation. |
+| `running` / `waiting_external` | `cancelled` | Handler cancel, admin cancel, rescue cancellation, or a transition-time re-schedule superseded by a newer unique-claim holder. |
 | `running` / `waiting_external` | `failed` | Attempts exhausted, terminal error, or callback timeout exhaustion. |
 | `failed` | `dlq_entries` | Optional per-queue DLQ routing. |
 
 `run_lease` increments at claim time. Runtime mutations carry `(job_id, run_lease)`, so stale completions, retries, snoozes, cancels, and callback resumes lose after rescue, admin cancellation, or re-claim.
+
+During a storage transition, a canonical re-schedule acquires any unique claim required by its destination state before its queue-storage successor can become executable. If a newer duplicate acquired the key while the running state was outside the job's `unique_states` mask, the newer job keeps the claim and the old attempt is recorded as cancelled terminal evidence with `rescheduled as duplicate`.
 
 Terminal rows differ by storage backend:
 
