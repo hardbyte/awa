@@ -2,9 +2,10 @@
 //!
 //! #456: the historical canonical `running -> scheduled/retryable` move
 //! while the cluster is canonical, and a move into the active queue-storage
-//! schema's `deferred_jobs` once routing has flipped — so the canonical live
-//! backlog converges during mixed transition even for handlers that snooze
-//! on every run.
+//! schema once routing has flipped — ordinarily as `deferred_jobs`, or as
+//! cancelled terminal evidence when a newer duplicate owns a required unique
+//! claim. Either outcome leaves the canonical plane, so its live backlog
+//! converges during mixed transition even for handlers that snooze every run.
 //!
 //! Deliberately implemented as runtime SQL against the v040 schema rather
 //! than a database function: the fix matters only on *unfinalized* clusters

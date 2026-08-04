@@ -37,6 +37,8 @@ AwaStorageTransition.tla       ;; -                                       ;; pas
 AwaStorageTransition.tla       ;; AwaStorageTransitionCurrentGate.cfg     ;; MixedHasQueueExecutor is violated ;; pre-v014 capability-gate witness
 AwaStorageTransition.tla       ;; AwaStorageTransitionMigrate07Ungated.cfg ;; Migrate07OnlyOnQuiescedCanonical is violated ;; ungated 0.7 migrate witness
 AwaStorageTransition.tla       ;; AwaStorageTransitionRescheduleStaysCanonical.cfg ;; MixedTransitionCanReduceCanonicalBacklog is violated ;; pre-#456 canonical re-schedule wedge witness
+AwaMigratedRescheduleUnique.tla ;; -                                      ;; pass ;; migrated re-schedule duplicate cancellation
+AwaMigratedRescheduleUnique.tla ;; AwaMigratedRescheduleUniqueBroken.cfg  ;; NoUnclaimedExecutable is violated ;; old lost-claim successor witness
 AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; per-row rescue fallback converges
 AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueBatchOnly.cfg   ;; Temporal property Convergence was violated ;; batch-only rescue starvation witness
 '

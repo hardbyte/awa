@@ -479,12 +479,18 @@ CompleteQueueStorage ==
 \* (snooze / retry-after / retryable error).
 \*
 \* Once routing has flipped, `reschedule_canonical_attempt_tx` takes the
-\* canonical `jobs_hot` row and re-inserts the attempt into the active
-\* queue-storage schema's `deferred_jobs` under a fresh id, so an existing
-\* canonical row moves cross-plane: the canonical backlog shrinks by one and
-\* the queue-storage plane gains one row. While the cluster is still
-\* canonical or merely prepared, the historical `jobs_hot -> scheduled_jobs`
-\* move applies and nothing crosses planes, so this action is disabled.
+\* canonical `jobs_hot` row and records exactly one disposition in the active
+\* queue-storage schema under a fresh id. Ordinarily that is a `deferred_jobs`
+\* successor. If a newer duplicate already owns a claim required by the
+\* destination state, it is instead a cancelled `done_entries` row and is not
+\* executable. `queueRows` deliberately counts both kinds of queue-storage
+\* evidence, so either disposition shrinks the canonical backlog by one and
+\* grows the queue-storage plane by one. The claim-level choice is checked in
+\* AwaMigratedRescheduleUnique.tla.
+\*
+\* While the cluster is still canonical or merely prepared, the historical
+\* `jobs_hot -> scheduled_jobs` move applies and nothing crosses planes, so
+\* this action is disabled.
 \*
 \* With RescheduleStaysCanonical = TRUE the pre-fix behavior is modeled: the
 \* row is written back into the canonical deferred backlog, which is net-zero
@@ -670,9 +676,12 @@ MixedTransitionCanReduceCanonicalBacklog ==
      /\ canonicalBacklog > 0
      /\ LiveDrainCapability > 0) => CanonicalBacklogReducible
 
-\* Work conservation for the cross-plane move: it relocates an attempt, it
-\* never drops or duplicates one. An action property, since conservation is
-\* a statement about the step rather than about any single state.
+\* Disposition conservation for the cross-plane move: it replaces one
+\* canonical row with exactly one queue-storage row, either executable
+\* deferred work or cancelled terminal evidence. An action property, since
+\* conservation is a statement about the step rather than any single state.
+\* AwaMigratedRescheduleUnique checks that the executable outcome cannot be
+\* chosen when a newer duplicate owns the required claim.
 RescheduleMigrationConservesWork ==
     [][MigrateCanonicalRescheduleToQueueStorage =>
          canonicalBacklog' + queueRows' = canonicalBacklog + queueRows]_vars

@@ -342,8 +342,9 @@ async fn claim_holder(pool: &PgPool, unique_key: &[u8]) -> Option<i64> {
 }
 
 /// #456: `awa_model::reschedule` keeps snooze/retry re-schedules
-/// canonical while the cluster is canonical, and moves them to the active
-/// queue-storage schema's `deferred_jobs` once routing has flipped — so the
+/// canonical while the cluster is canonical, and moves them to an active
+/// queue-storage disposition once routing has flipped — normally deferred,
+/// or cancelled if a newer duplicate owns the required unique claim — so the
 /// canonical drain converges even for handlers that snooze on every run.
 #[tokio::test]
 async fn reschedule_canonical_attempt_routes_by_transition_state() {
