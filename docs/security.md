@@ -224,6 +224,11 @@ strict capability profile ships, its generated ownership manifest must exclude `
 other bounded-owner definers from blanket transfer to `awa_owner`; `awa doctor` treats such a
 transfer as strict-profile drift.
 
+Strict validation also audits the complete PostgreSQL role graph. It follows both transitive
+inherited privileges and nested `SET ROLE` paths from every runtime, application, callback, and
+admin login, and rejects any non-allowlisted path to the bounded execution owner, migrator, schema
+owner, or a role that can reach them. Direct-membership checks alone are not sufficient.
+
 [ADR-042](adr/042-caller-owned-finalization-transactions.md) lets a handler commit application rows
 and guarded Awa completion in one transaction. That transaction normally comes from a separate
 application pool whose login can write the application's billing/inbox tables. Do **not** make that
@@ -265,7 +270,7 @@ application role. Do not grant it to producer-only roles, browser/admin clients,
 ingress roles. `awa doctor` resolves the exact `regprocedure` signature and checks its owner,
 `SECURITY DEFINER` flag, fixed `search_path`, `PUBLIC` revocation, and application-role ACL. Negative
 tests prove the finalizer role cannot read or mutate Awa tables directly or redirect the function
-through `search_path`.
+through `search_path`, inherited membership, or a transitive `SET ROLE` chain.
 
 ## Managing roles with pgroles
 

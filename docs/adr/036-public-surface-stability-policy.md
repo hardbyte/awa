@@ -14,7 +14,9 @@ contract, HTTP admin API, callback receiver contract, metric names/attributes, a
 supported surface from an internal one, and maintainers cannot tell a breaking change from a
 refactor. Polyglot producers ([#342](https://github.com/hardbyte/awa/issues/342)) and API
 consumers cannot exist without a written contract. Accepted designs such as ADR-042's SQL worker
-finalization contract join this map only when their implementation and conformance artifacts ship.
+finalization contract join this map only when implementation, public documentation and the surface
+table, conformance evidence, and the changelog transition ship together; an upgrade guide is also
+required when a new surface replaces an older covered entry point.
 
 ## Decision
 
@@ -69,6 +71,7 @@ and that surprises users repeatedly, the fix is to amend the document, not to ar
 ## Relationship to other ADRs
 
 Governs the ADR-016 adapter contract, the [#342](https://github.com/hardbyte/awa/issues/342) SQL
-producer contract, and ADR-042 once its worker finalization surface ships; constrains every future
-ADR that touches a listed surface; the skew row is enforced by the ADR-037 migrate gate plus the
-compat matrix.
+producer contract, and ADR-042 only after its implementation, public documentation/table row,
+conformance evidence, and changelog transition ship together (plus an upgrade guide when replacing
+an older surface); constrains every future ADR that touches a listed surface; the skew row is
+enforced by the ADR-037 migrate gate plus the compat matrix.

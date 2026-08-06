@@ -88,6 +88,14 @@ One deployment may grant several capability roles to one login for operational s
 database ACL remains compositional, so callback-only and maintenance-only deployments do not
 silently inherit the full worker or admin surface.
 
+Role membership is itself part of the authorization boundary. The capability manifest and
+`awa doctor` compute the complete transitive membership closure from every runtime, application,
+callback, and admin login, following both privileges inherited through membership and every nested
+`SET ROLE` path. A strict profile rejects any direct or transitive path to the execution owner,
+migrator, schema owner, or another role that can reach them, except for the explicitly allowlisted
+migration principal and ownership-change path. Checking only direct membership is insufficient:
+PostgreSQL role graphs can convey authority through intermediate `INHERIT` or `SET` memberships.
+
 ### A bounded execution owner
 
 Definer functions should not be owned by a login, superuser, or schema owner. The strict deployment
@@ -102,8 +110,9 @@ profile uses a dedicated `NOLOGIN` execution-owner role that:
 The migrator creates or replaces routines, transfers each definer entry point to this execution
 owner, and applies the manifest ACL in the same migration transaction. The migrator is the only
 login allowed to assume the execution owner for ownership changes; ordinary runtime logins cannot
-become or inherit it. Later replacements run under that migration authority or transfer ownership
-to the migrator and back inside the migration transaction.
+become or inherit it through any direct or transitive `INHERIT`/`SET ROLE` chain. Later replacements
+run under that migration authority or transfer ownership to the migrator and back inside the
+migration transaction.
 
 A single-role development install remains supported. In that profile function mediation provides a
 stable call shape but does not claim privilege separation. `awa doctor` reports the difference
@@ -227,6 +236,9 @@ Acceptance requires:
 - catalog tests that fail on an unclassified function or trigger, a definer owned by an excessive
   role, `PUBLIC EXECUTE` on any Awa routine, an unsafe `search_path`, an unexpected ACL, or a
   definer with dynamic SQL;
+- role-graph tests that compute transitive inherited-privilege and `SET ROLE` closure and reject
+  every non-allowlisted runtime, application, callback, or admin path to the execution owner,
+  migrator, or schema owner, including paths through multiple intermediate roles;
 - negative privilege tests for every principal, including cross-capability attempts, direct table
   DML/`TRUNCATE`, installer execution, stale tokens, forged job identifiers, temporary-object
   shadowing, and operator/function shadowing;

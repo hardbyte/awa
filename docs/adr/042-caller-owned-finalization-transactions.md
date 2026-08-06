@@ -339,7 +339,7 @@ Acceptance requires:
   finalization cannot be swallowed and followed by an application commit in supported usage;
 - privilege tests proving an application-finalizer role can execute only guarded completion, cannot
   read or mutate Awa tables directly, and cannot exploit `search_path` or token fields to reach
-  another schema or statement;
+  another schema or statement, including through transitive inherited privileges or `SET ROLE`;
 - installation/upgrade tests proving strict ownership transfers before the application grant,
   replacement never restores `PUBLIC EXECUTE`, the exact ACL survives replacement, and the
   schema-owner fallback is reported as non-strict and rejected for strict enablement;

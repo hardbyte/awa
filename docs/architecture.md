@@ -151,7 +151,7 @@ Enqueue is transactional: if the producer's outer transaction rolls back, the jo
 There are two COPY-shaped producer paths:
 
 - Direct queue-storage COPY is the high-throughput path: Rust producers use a configured `QueueStorage::enqueue_params_copy()`, and Python producers use `enqueue_many_copy()`. Direct-copy producers must use the same queue-storage configuration as the worker fleet, especially `queue_stripe_count` / `queue_storage_queue_stripe_count`.
-- `insert_many_copy()` is the compatibility path. It stages rows with COPY but then routes each row through the transitional `awa.insert_job_compat()` entry point and its internal storage plumbing, preserving cross-storage behavior rather than bypassing to the direct producer path. The planned `awa.insert_job()` public capability becomes the clean stable SQL contract after #342 ships its migration and conformance artifacts.
+- `insert_many_copy()` is the compatibility path. It stages rows with COPY, then takes one of two branches. If any staged row has a `unique_key`, every row is replayed through `POSTGRES_INSERT_JOB_SQL` inside a per-row savepoint so SQLSTATE `23505` can skip that duplicate without aborting the batch; that statement itself calls `awa.insert_job_compat()`. An all-non-unique batch uses one lateral `awa.insert_job_compat()` call per staged row without savepoints. Both branches therefore preserve cross-storage behavior. The planned `awa.insert_job()` public capability becomes the clean stable SQL contract after #342 ships its migration and conformance artifacts.
 
 Claim is cursor-based rather than heap-scan based:
 
