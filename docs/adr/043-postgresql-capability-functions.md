@@ -133,15 +133,18 @@ Every `SECURITY DEFINER` entry point must satisfy all of these conditions:
 4. Perform one bounded capability and enforce its own row-, token-, queue-, and attempt-level
    guards. Possession of `EXECUTE` is not authority to mutate arbitrary jobs.
 5. Never execute DDL, `SET ROLE`, privilege changes, or transaction control. The maintenance
-   dispatcher may execute only `LOCK TABLE ... ACCESS EXCLUSIVE` and `TRUNCATE TABLE` against the
-   verified partition set; partition creation, attachment, detachment, alteration, and removal stay
-   behind the migrator boundary.
+   dispatcher may execute only `LOCK TABLE ONLY ... ACCESS EXCLUSIVE` and
+   `TRUNCATE TABLE ONLY ... CONTINUE IDENTITY RESTRICT` against the verified partition set;
+   partition creation, attachment, detachment, alteration, and removal stay behind the migrator
+   boundary.
 6. Return only the documented result. Errors with correctness meaning use stable SQLSTATE and abort
    the caller transaction when ignoring the result would be unsafe.
 7. Revoke `PUBLIC` in the same transaction that creates the function, then grant `EXECUTE` by exact
    `regprocedure` signature to the intended capability roles.
 8. Have its owner, `prosecdef`, `proconfig`, language, volatility, body hash, ACL, dynamic-relation
-   policy, and audit-principal source checked by the catalog audit and `awa doctor`.
+   policy, and audit-principal source checked by the catalog audit and `awa doctor`. The audit
+   covers the definer's transitively reachable routine and trigger closure, not the root body
+   alone: helpers and triggers execute under the entry point's effective privileges.
 9. Never use `current_user` as the acting principal in an audit record: a definer rewrites it to the
    execution owner. An audited capability records `session_user`, or accepts an explicit actor value
    whose binding to the authenticated caller is validated by the documented ingress boundary. The
@@ -170,16 +173,26 @@ recorded in the capability manifest as `awa_ring_slot_reclaim_v1`. A function us
 3. resolves each target through `pg_catalog`, then verifies its OID, namespace, owner, partition
    attachment, parent, and manifest-listed relation family before constructing any statement;
 4. renders identifiers only from those verified catalog rows, under the fixed trusted `search_path`;
-5. applies the documented short transaction-local `lock_timeout`, locks only that verified set in
-   the global storage lock order, rechecks reclaimability, and executes only `TRUNCATE`. The
-   reclaimability proofs, rescue-cursor resets, and rollup-delta appends are static SQL routed
-   through the partitioned parents with slot predicates, so partition pruning selects the child
-   without a rendered identifier; `LOCK TABLE` and `TRUNCATE` remain the only dynamically rendered
+5. applies the documented short transaction-local `lock_timeout` and locks only that verified set
+   in the global storage lock order, as `LOCK TABLE ONLY` so a descendant outside the verified set
+   is never locked implicitly;
+6. after the locks are held, revalidates each target's OID, namespace, owner, partition attachment,
+   parent, relation family, and ACL against the catalog before rendering or executing any further
+   dynamic statement — the step-3 checks ran unlocked, so a concurrent detach, rename, or swap
+   between verification and lock acquisition must abort here (having locked a swapped relation is
+   recoverable; truncating one is not);
+7. rechecks reclaimability and executes only
+   `TRUNCATE TABLE ONLY ... CONTINUE IDENTITY RESTRICT`, so descendants, owned sequences, and
+   foreign-key dependants can never be reached beyond the verified OID set. The reclaimability
+   proofs, rescue-cursor resets, and rollup-delta appends are static SQL routed through the
+   partitioned parents with slot predicates, so partition pruning selects the child without a
+   rendered identifier; `LOCK TABLE` and `TRUNCATE` remain the only dynamically rendered
    statements. If implementation evidence shows parent-routed proofs are inadequate, the manifest
    may extend this policy to read-only `SELECT` against the same verified OID set — an explicit
    manifest and body-hash revision, never an implicit widening; and
-6. fails closed on a missing, renamed, detached, unexpectedly owned, out-of-range, or excessive
-   target. It never falls back to a caller-derived name or a wider relation scan.
+8. fails closed on a missing, renamed, detached, unexpectedly owned, out-of-range, or excessive
+   target at either validation point. It never falls back to a caller-derived name, a wider
+   relation scan, `CASCADE`, or `RESTART IDENTITY`.
 
 The execution owner receives `TRUNCATE` only on the manifest-listed ring children, plus the static
 table privileges the protocol itself needs: `SELECT` on the partitioned parents for the proofs,
@@ -290,12 +303,22 @@ Acceptance requires:
   `awa_ring_slot_reclaim_v1` manifest declaration and reviewed body hash;
 - body-validation fixtures for each prohibited hardening-rule operation: static and dynamic DDL
   outside the exact maintenance `LOCK`/`TRUNCATE` exception, `SET ROLE`, privilege changes
-  (`GRANT`, `REVOKE`, ownership/default-privilege changes), and transaction control. Catalog tests,
+  (`GRANT`, `REVOKE`, ownership/default-privilege changes), and transaction control. Validation
+  traverses the transitively reachable routine and trigger closure of each definer entry point
+  under its effective execution context — every internal helper a definer calls, and every trigger
+  its writes can fire, executes with the owner's privileges, so a prohibited operation in a helper
+  or trigger body is a violation of the calling definer, not only of the helper. Catalog tests,
   `awa doctor`, and strict-profile startup must each reject and identify the exact function and
-  operation class, so a static statement cannot bypass the dynamic-SQL check;
+  operation class, so a static statement cannot bypass the dynamic-SQL check and a helper cannot
+  bypass root-only validation;
 - maintenance-dispatch tests covering valid reclaim, forged and out-of-range slots, stale
   generations, detached/wrong-parent/wrong-owner relations, unexpected manifest targets, bounded
-  lock timeout, and concurrent rotation; only the verified child OIDs may be locked or truncated;
+  lock timeout, and concurrent rotation; only the verified child OIDs may be locked or truncated.
+  Negative fixtures prove `LOCK TABLE` without `ONLY` and `TRUNCATE` without
+  `ONLY ... CONTINUE IDENTITY RESTRICT` are rejected, that an inheritance descendant or
+  foreign-key dependant attached to a verified child is never locked or truncated, and that a
+  relation detached, renamed, or swapped between unlocked verification and lock acquisition fails
+  the post-lock revalidation instead of being truncated;
 - role-graph tests on the oldest and newest PostgreSQL majors in the documented support window —
   a pair that must straddle PostgreSQL 16's membership-option change — that compute
   version-correct transitive inherited-privilege and `SET ROLE` closure and reject every

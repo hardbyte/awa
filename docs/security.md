@@ -355,8 +355,9 @@ privilege-escalation entry points. Instead, an allowlisted set of producer, exec
 admin, callback, and finalizer capability functions runs under a bounded `NOLOGIN` execution owner.
 Maintenance partition reclamation is the sole relation-dispatch exception: it accepts only a
 bounded ring slot, verifies each manifest-listed Awa child by catalog OID/namespace/owner/attachment,
-uses a short lock timeout, and may issue only `ACCESS EXCLUSIVE` lock plus `TRUNCATE` after the
-reclaimability recheck. It never accepts a caller relation or SQL fragment. Internal helpers remain
+uses a short lock timeout, revalidates every target's catalog identity again after the locks are
+held, and may issue only `LOCK TABLE ONLY ... ACCESS EXCLUSIVE` plus
+`TRUNCATE TABLE ONLY ... CONTINUE IDENTITY RESTRICT` after the reclaimability recheck. It never accepts a caller relation or SQL fragment. Internal helpers remain
 inaccessible, `PUBLIC EXECUTE` is revoked, and broad table grants are removed only after an ADR-041
 capability rollout. This work is tracked in [#452](https://github.com/hardbyte/awa/issues/452).
 

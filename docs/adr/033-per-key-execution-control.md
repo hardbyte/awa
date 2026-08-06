@@ -129,10 +129,18 @@ uses a three-step, epoch-guarded transition:
 2. Outside the exclusive window, Awa scans the fixed claim-ring children for the maximum open count
    under a bounded, operator-visible verification timeout. Closures may continue and can only lower
    the result. A timeout or resource-limit failure returns `verification_incomplete`, keeps the old
-   limit authoritative, and leaves admission drained until the operator retries or cancels.
+   limit authoritative, and leaves admission drained until the operator resumes or cancels.
 3. A final short transaction locks the policy row, verifies the same epoch, target, and drained
    state, and activates the lower value only if the observed maximum is within it. Otherwise it
-   reports the observed maximum and leaves the old limit unchanged.
+   reports the observed maximum, leaves the old limit unchanged, and keeps the transition pending
+   and drained so open grants keep falling toward the target.
+
+Retrying after `verification_incomplete` is a `resume` of the pending transition, not a new step 1
+— step 1 refuses while a change is `draining`, so resume is the only forward path. Resume carries
+the change epoch and target returned by step 1, validates them against the pending transition in a
+short policy-row transaction without incrementing the epoch, keeps admission closed throughout, and
+reruns step 2's bounded verification followed by step 3. A resume with a stale epoch or mismatched
+target is rejected without changing policy state; resume never creates a second pending transition.
 
 Cancellation is also an epoch-guarded state transition, not an out-of-band flag clear. The request
 carries the change epoch and target returned by step 1. A short transaction exclusively locks the
@@ -148,7 +156,7 @@ fail-closed residue is that an abandoned transition — an operator tool that cr
 leaves the policy `draining` indefinitely; nothing re-opens admission automatically. Draining
 state, its pending target/epoch, and its age are therefore first-class health and metrics signals,
 not just rows an operator can query. The operator waits for open grants to fall within the target
-and retries; Awa never "grandfathers" an over-limit active set under a lower authoritative value. Disabling or changing a policy's identity
+and resumes; Awa never "grandfathers" an over-limit active set under a lower authoritative value. Disabling or changing a policy's identity
 while it has open grants uses the same drain/epoch discipline; silently changing namespace would
 weaken the established guarantee.
 
@@ -365,9 +373,11 @@ gate by itself.
 Before Tier 2 ships:
 
 - a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, the
-  drain/epoch/verify/activate-or-cancel lowering protocol, the governed-only scope of partial-legacy
-  coverage, attempt-specific closure, rollback safety, completion-versus-rescue, no cursor advance
-  over a gated head, and conditional liveness when capacity eventually becomes available;
+  drain/epoch/verify/resume/activate-or-cancel lowering protocol — including that resume validates
+  the pending epoch/target, never opens admission, and never creates a second pending transition —
+  the governed-only scope of partial-legacy coverage, attempt-specific closure, rollback safety,
+  completion-versus-rescue, no cursor advance over a gated head, and conditional liveness when
+  capacity eventually becomes available;
 - `AwaStorageLockOrder` covers the shared policy-row lock before key-lock acquisition, both short
   exclusive policy-transition windows with verification outside them, receipt completion, and both
   directions of the claim/prune partition-lock interaction;
@@ -379,9 +389,11 @@ Before Tier 2 ships:
   outside the exclusive policy-row window under a bounded timeout, refuses incomplete or
   over-target verification, and never exposes a committed policy state where
   `OpenGrantsPerKey > Limit`; concurrent claimers do not wait behind the verification scan. A
-  matching cancel restores the prior limit atomically, stale cancel/activate requests fail, and no
-  grant opens while rollback still reports `draining`; a second transition refuses while one is
-  pending, and an abandoned `draining` policy is reported through health/metrics with its age;
+  matching cancel restores the prior limit atomically, stale cancel/activate/resume requests fail,
+  and no grant opens while rollback still reports `draining`; a second transition refuses while one
+  is pending; resume validates the pending epoch/target, keeps admission closed, and reruns
+  verification to activation; and an abandoned `draining` policy is reported through health/metrics
+  with its age;
 - a gated top-priority lane cannot make an admissible lane in the same queue report idle, and the
   storage result distinguishes idle, gated, and lock-contended outcomes;
 - keyed jobs without an ordering key remain shard-local across enqueue, retry, callback, and DLQ
