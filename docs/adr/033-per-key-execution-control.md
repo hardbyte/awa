@@ -114,8 +114,8 @@ same policy, so a width change or cross-partition administration cannot accident
 second concurrency namespace. Jobs without a concurrency key do not consume a grant.
 
 Lowering a limit must preserve the invariant at the instant the new value becomes authoritative,
-without holding a claim-conflicting row lock during an unbounded all-key scan. It uses a three-step,
-epoch-guarded transition:
+without holding a claim-conflicting row lock during an unbounded all-key scan. A successful change
+uses a three-step, epoch-guarded transition:
 
 1. A short transaction exclusively locks the policy row, records the requested target, increments
    its change epoch, and moves admission to `draining`. Acquiring that lock waits for claimers that
@@ -127,6 +127,14 @@ epoch-guarded transition:
 3. A final short transaction locks the policy row, verifies the same epoch, target, and drained
    state, and activates the lower value only if the observed maximum is within it. Otherwise it
    reports the observed maximum and leaves the old limit unchanged.
+
+Cancellation is also an epoch-guarded state transition, not an out-of-band flag clear. The request
+carries the change epoch and target returned by step 1. A short transaction exclusively locks the
+policy row, requires that exact epoch/target and `draining` state, increments the epoch, clears the
+pending target, and restores the prior active limit/state atomically. Admission remains closed until
+that transaction commits. A stale cancel is rejected without changing policy state; an in-flight
+verifier or activator from the cancelled operation observes the new epoch and cannot commit. After
+commit, new claims may use only the restored prior limit.
 
 This protocol never exposes a committed policy state where the lower limit is authoritative while
 an over-limit governed set exists, and claimers do not queue behind the verification scan. The
@@ -235,9 +243,11 @@ prevents overlap in Awa's admitted active-attempt set but does not promise compl
 backoff: after event A becomes deferred, event B may run before A's retry. Holding a key barrier
 across retry is a different strict-serialization feature and is not implied by this ADR.
 
-Normal executor finalization, batched completion, callback transitions, admin cancellation, and
-maintenance rescue append or reuse the claim closure in the same transaction as their guarded state
-transition.
+Callback parking and resumption within `waiting_external` retain the grant and do not append or
+reuse closure evidence. Only callback resolution that completes, retries/defers, cancels, enters the
+DLQ, or otherwise leaves the active-attempt set closes it. Normal executor finalization, batched
+completion, such callback resolution, admin cancellation, and maintenance rescue append or reuse
+the claim closure in the same transaction as their guarded state transition.
 [ADR-042](042-caller-owned-finalization-transactions.md) extends the same rule to a caller-owned
 transaction: application rows, terminal evidence, and the grant closure commit together or all
 roll back.
@@ -343,10 +353,10 @@ gate by itself.
 
 Before Tier 2 ships:
 
-- a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, the drain/epoch/verify/activate lowering
-  protocol, the governed-only scope of partial-legacy coverage, attempt-specific closure, rollback
-  safety, completion-versus-rescue, no cursor advance over a gated head, and conditional liveness
-  when capacity eventually becomes available;
+- a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, the
+  drain/epoch/verify/activate-or-cancel lowering protocol, the governed-only scope of partial-legacy
+  coverage, attempt-specific closure, rollback safety, completion-versus-rescue, no cursor advance
+  over a gated head, and conditional liveness when capacity eventually becomes available;
 - `AwaStorageLockOrder` covers the shared policy-row lock before key-lock acquisition, both short
   exclusive policy-transition windows with verification outside them, receipt completion, and both
   directions of the claim/prune partition-lock interaction;
@@ -357,7 +367,9 @@ Before Tier 2 ships:
 - limit lowering fences admission in a short epoch transition, performs its all-key verification
   outside the exclusive policy-row window under a bounded timeout, refuses incomplete or
   over-target verification, and never exposes a committed policy state where
-  `OpenGrantsPerKey > Limit`; concurrent claimers do not wait behind the verification scan;
+  `OpenGrantsPerKey > Limit`; concurrent claimers do not wait behind the verification scan. A
+  matching cancel restores the prior limit atomically, stale cancel/activate requests fail, and no
+  grant opens while rollback still reports `draining`;
 - a gated top-priority lane cannot make an admissible lane in the same queue report idle, and the
   storage result distinguishes idle, gated, and lock-contended outcomes;
 - keyed jobs without an ordering key remain shard-local across enqueue, retry, callback, and DLQ
@@ -369,8 +381,9 @@ Before Tier 2 ships:
   and cannot promote to complete coverage until the same reconciliation passes;
 - closing a grant wakes a gated session-listening dispatcher after commit without hot polling;
   poll-only mode stays within its documented gated safety interval;
-- completion, caller-owned completion, retry, snooze, callback wait/resume, cancel, DLQ, rescue,
-  rotation, and prune each prove exact grant lifetime;
+- completion, caller-owned completion, retry, snooze, cancel, DLQ, rescue, rotation, and prune each
+  prove exact grant lifetime; callback park/resume retains the grant and only resolution that leaves
+  the active-attempt set closes it;
 - E5 compares keyed row-local claim evidence with a separate grant/closure ledger under uniform and
   Zipf key distributions at limits 1 and N. It records claim p99, oldest gated age, throughput,
   WAL/job, retained rows, and storage footprint, and stays within the roadmap's 10% claim-p99 gate;

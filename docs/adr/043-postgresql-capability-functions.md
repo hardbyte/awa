@@ -280,6 +280,11 @@ Acceptance requires:
   role, `PUBLIC EXECUTE` on any Awa routine, an unsafe `search_path`, an unexpected ACL, an audited
   definer that derives its actor from `current_user`, or dynamic SQL without the exact
   `awa_ring_slot_reclaim_v1` manifest declaration and reviewed body hash;
+- body-validation fixtures for each prohibited hardening-rule operation: static and dynamic DDL
+  outside the exact maintenance `LOCK`/`TRUNCATE` exception, `SET ROLE`, privilege changes
+  (`GRANT`, `REVOKE`, ownership/default-privilege changes), and transaction control. Catalog tests,
+  `awa doctor`, and strict-profile startup must each reject and identify the exact function and
+  operation class, so a static statement cannot bypass the dynamic-SQL check;
 - maintenance-dispatch tests covering valid reclaim, forged and out-of-range slots, stale
   generations, detached/wrong-parent/wrong-owner relations, unexpected manifest targets, bounded
   lock timeout, and concurrent rotation; only the verified child OIDs may be locked or truncated;
