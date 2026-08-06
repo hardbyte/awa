@@ -4,6 +4,9 @@
 
 Accepted. Tracked in [#401](https://github.com/hardbyte/awa/issues/401). Acceptance fixes the
 contract and validation boundary; it does not claim that the Rust or SQL surfaces have shipped.
+The 0.7 implementation scope includes the narrow ADR-043 substrate required by this function: the
+bounded execution owner, its exact `complete_job` manifest/ACL entry, ownership transfer, and strict
+`awa doctor` checks. The broader ordinary-runtime capability split remains deferred under #452.
 
 ## Context
 
@@ -140,7 +143,7 @@ conceptually:
 
 ```sql
 SELECT *
-FROM awa.complete_job(
+FROM <queue_storage_schema>.complete_job(
     job_id       => $1,
     run_lease    => $2,
     claim_slot   => $3,
@@ -337,9 +340,10 @@ Acceptance requires:
   transactions;
 - negative conformance tests for each driver's savepoint/nested-transaction pattern, proving a stale
   finalization cannot be swallowed and followed by an application commit in supported usage;
-- privilege tests proving an application-finalizer role can execute only guarded completion, cannot
-  read or mutate Awa tables directly, and cannot exploit `search_path` or token fields to reach
-  another schema or statement, including through transitive inherited privileges or `SET ROLE`;
+- privilege tests on PostgreSQL 15 and 18 proving an application-finalizer role can execute only
+  guarded completion, cannot read or mutate Awa tables directly, and cannot exploit `search_path`
+  or token fields to reach another schema or statement, including through version-correct transitive
+  inherited privileges or `SET ROLE`;
 - installation/upgrade tests proving strict ownership transfers before the application grant,
   replacement never restores `PUBLIC EXECUTE`, the exact ACL survives replacement, and the
   schema-owner fallback is reported as non-strict and rejected for strict enablement;

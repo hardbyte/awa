@@ -241,7 +241,11 @@ Pending, scanning, running, and cancelling operations are never removed by reten
 
 The operation detail surface reports state, counts, submitted/finalized timestamps, runner instance, cursor summary, and last error. Metrics should cover submitted operations, active operations, rows processed/skipped/errored, chunk duration, and final states.
 
-Batch operation rows are the audit log for who did what and when. They are not intended to be a forensic record of every row changed in `0.6`; that is the possible future error/audit side table.
+Batch operation rows are the audit log for who did what and when. The submitting boundary records an
+explicit authenticated actor, or PostgreSQL `session_user` for direct operator SQL. A future
+`SECURITY DEFINER` capability must not derive that field from `current_user`, because PostgreSQL
+would record the bounded execution owner instead of the caller. The rows are not intended to be a
+forensic record of every row changed in `0.6`; that is the possible future error/audit side table.
 
 ## Consequences
 

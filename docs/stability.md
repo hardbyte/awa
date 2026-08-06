@@ -46,8 +46,11 @@ The table above lists shipped contracts. Accepting an ADR does not add a public 
 implementation, documentation, conformance evidence, and release note land together:
 
 - [#342](https://github.com/hardbyte/awa/issues/342) and ADR-043 reserve `awa.insert_job(...)` as the
-  future clean SQL producer capability. Until it ships, `insert_job_compat` remains the covered
-  transitional producer entry point rather than becoming internal by documentation alone.
+  future clean, single-signature SQL producer capability. Its final
+  `opts jsonb DEFAULT '{}'::jsonb` argument is the sole extension point, and PostgreSQL computes the
+  ADR-033 concurrency digest and shard authoritatively from logical keys. Until it ships,
+  `insert_job_compat` remains the covered transitional producer entry point rather than becoming
+  internal by documentation alone.
 - [ADR-042](adr/042-caller-owned-finalization-transactions.md) reserves
   `<queue_storage_schema>.complete_job(...)` and its receipt/error/version semantics for
   caller-owned finalization. The function is not shipped and is not yet an active SQL worker

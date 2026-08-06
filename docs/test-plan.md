@@ -251,6 +251,11 @@ The formal suite includes passing configs and expected-counterexample configs. T
 
 Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`](0.7-roadmap.md)) and the release gates on the [#383 tracker](https://github.com/hardbyte/awa/issues/383). Rows move into the matrix above as they are implemented.
 
+V25 adds a focused `AwaKeyedExecution` model for grant safety, partial-legacy coverage scope, and the
+drain/epoch/verify/activate lowering protocol; it also extends `AwaStorageLockOrder` for the two short
+policy transition windows. V26 adds `AwaCallerOwnedCompletion` for completion-versus-rescue
+atomicity. These names are planned deliverables, not claims that model files already exist.
+
 ### Harness & compatibility
 
 | # | Test | Rust | Py | Ref |
@@ -310,9 +315,9 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V21 | Per-key fairness under Zipf-skewed tenants (Jain index bound, no starvation) | ✓ |  | #340 |
 | V22 | A→B promotion is transactional with parent finalize; `on_parent_failure` policies (TLA+ witness + integration) | ✓ | ✓ | #14 |
 | V23 | Backpressure: `Signal` surfaces pressure, `Reject` returns typed error, transactional enqueue unaffected by default | ✓ | ✓ | #341 |
-| V24 | SQL contract conformance script green; BLAKE3 unique-key, domain-separated concurrency-key digest, and ordering/concurrency shard-precedence cross-language vectors | ✓ | ✓ | #342 |
-| V25 | Per-key Tier 2: concurrent claimers never exceed the grant limit; limit lowering serializes with claims and refuses invariant-breaking updates; every exit closes only its exact grant; gated heads never advance and cannot report false idle while an admissible lane is inside the configured probe set; capped rotating probes provide bounded eventual pickup; keyed-only routing stays shard-local; legacy rows block enablement until drained or authoritatively backfilled; grant closure wakes session listeners while poll-only pickup is bounded; E5 compares row-local, separate-ledger, and proved parking shapes | ✓ | ✓ | #340, ADR-033 |
-| V26 | Caller-owned completion: distinct handler return type; app rows + terminal/conditional grant closure commit or roll back together; receipt/lease tokens reconcile; bounded ambiguity preserves durable authority and pool reserve; finalizer role has only hardened function execution with no inherited or transitive `SET ROLE` path to protected owners; transaction-pooler conformance | ✓ | ✓ | #401, ADR-042 |
+| V24 | SQL contract conformance script green; cross-language BLAKE3 unique-key vectors match; PostgreSQL authoritatively computes the domain-separated concurrency-key digest and ordering/concurrency shard precedence, rejecting any supplied expectation that disagrees | ✓ | ✓ | #342 |
+| V25 | Per-key Tier 2: `AwaKeyedExecution` and concurrent claimers never exceed the grant limit; limit lowering uses short epoch fences plus bounded out-of-lock verification and refuses incomplete/invariant-breaking updates without stalling claimers; every exit closes only its exact grant; gated heads never advance and cannot report false idle while an admissible lane is inside the configured probe set; capped rotating probes provide bounded eventual pickup; keyed-only routing stays shard-local; complete coverage rejects legacy rows until drained/backfilled while explicit partial mode admits them ungoverned with non-green diagnostics/metrics; grant closure wakes session listeners while poll-only pickup is bounded; E5 compares row-local, separate-ledger, and proved parking shapes | ✓ | ✓ | #340, ADR-033 |
+| V26 | Caller-owned completion: `AwaCallerOwnedCompletion` proves completion-versus-rescue atomicity; distinct handler return type; app rows + terminal/conditional grant closure commit or roll back together; receipt/lease tokens reconcile; bounded ambiguity preserves durable authority and pool reserve; the 0.7 bounded-owner/manifest slice leaves the finalizer role only hardened function execution with no inherited or transitive `SET ROLE` path to protected owners on PostgreSQL 15 and 18; transaction-pooler conformance | ✓ | ✓ | #401, ADR-042 |
 
 ### Storage & performance (gate evidence, benchmark harness)
 

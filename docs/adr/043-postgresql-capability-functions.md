@@ -64,7 +64,10 @@ disagreement, including `PUBLIC EXECUTE` on an invoker or internal routine, as d
 
 `awa.install_queue_storage_substrate` remains invoker and migrator-only. A caller-controlled schema,
 relation, function, operator, or SQL fragment is disqualifying for a runtime definer entry point.
-Such work stays behind the migration boundary even when identifiers are quoted safely.
+Such work stays behind the migration boundary even when identifiers are quoted safely. The one
+runtime relation-dispatch shape permitted by this ADR is the bounded maintenance-partition protocol
+below: it accepts an integer ring slot, not an identifier, and resolves only manifest-listed Awa
+children through verified catalog identity.
 
 Internal invoker helpers still work when called by a definer entry point: they inherit the effective
 privileges of that entry point's owner. Keeping them non-executable by runtime logins limits the
@@ -124,24 +127,60 @@ Every `SECURITY DEFINER` entry point must satisfy all of these conditions:
 
 1. Set a fixed `search_path` containing only `pg_catalog`, trusted Awa schemas, and `pg_temp` last.
 2. Schema-qualify every Awa object and security-relevant function, operator, type, and sequence.
-3. Accept no caller-controlled SQL identifier or fragment. Dynamic SQL is absent from every runtime
-   definer, including SQL assembled from a catalog-resolved or allowlisted identifier. A capability
-   that requires dynamic SQL remains invoker-only behind the migrator/operator boundary.
+3. Accept no caller-controlled SQL identifier or fragment. Dynamic SQL is absent from runtime
+   definers except for a manifest-declared maintenance partition dispatcher that satisfies the
+   bounded protocol below. Catalog lookup or identifier allowlisting alone is not an exception.
 4. Perform one bounded capability and enforce its own row-, token-, queue-, and attempt-level
    guards. Possession of `EXECUTE` is not authority to mutate arbitrary jobs.
-5. Never execute DDL, `SET ROLE`, privilege changes, or transaction control.
+5. Never execute DDL, `SET ROLE`, privilege changes, or transaction control. The maintenance
+   dispatcher may execute only `LOCK TABLE ... ACCESS EXCLUSIVE` and `TRUNCATE TABLE` against the
+   verified partition set; partition creation, attachment, detachment, alteration, and removal stay
+   behind the migrator boundary.
 6. Return only the documented result. Errors with correctness meaning use stable SQLSTATE and abort
    the caller transaction when ignoring the result would be unsafe.
 7. Revoke `PUBLIC` in the same transaction that creates the function, then grant `EXECUTE` by exact
    `regprocedure` signature to the intended capability roles.
-8. Have its owner, `prosecdef`, `proconfig`, language, volatility, body hash, and ACL checked by the
-   catalog audit and `awa doctor`.
+8. Have its owner, `prosecdef`, `proconfig`, language, volatility, body hash, ACL, dynamic-relation
+   policy, and audit-principal source checked by the catalog audit and `awa doctor`.
+9. Never use `current_user` as the acting principal in an audit record: a definer rewrites it to the
+   execution owner. An audited capability records `session_user`, or accepts an explicit actor value
+   whose binding to the authenticated caller is validated by the documented ingress boundary. The
+   manifest declares which source is authoritative.
 
 These rules follow PostgreSQL's guidance for safely writing
 [`SECURITY DEFINER`](https://www.postgresql.org/docs/current/sql-createfunction.html) functions.
 PostgreSQL [trigger execution](https://www.postgresql.org/docs/current/trigger-definition.html)
 follows the invoking role unless the trigger function is itself a definer, so trigger
 classification is part of the same audit rather than an implicit exception.
+
+### Bounded maintenance partition dispatch
+
+Queue, receipt, claim, and terminal-ring reclamation cannot be implemented as a static SQL function:
+the selected child relation varies by ring slot, and the existing protocol takes an
+`ACCESS EXCLUSIVE` lock before `TRUNCATE`. Leaving those operations as direct maintenance-role
+privileges would preserve the broadest runtime authority that this ADR is intended to remove.
+
+A strict maintenance profile therefore permits one narrowly reviewed relation-dispatch policy,
+recorded in the capability manifest as `awa_ring_slot_reclaim_v1`. A function using that policy:
+
+1. accepts only the logical ring identity and an integer slot/generation; it accepts no schema,
+   relation, operator, command, or SQL text from the caller;
+2. locks the authoritative ring metadata, checks the slot against the configured width and expected
+   generation/state, and derives a bounded set of relation families fixed by the function body;
+3. resolves each target through `pg_catalog`, then verifies its OID, namespace, owner, partition
+   attachment, parent, and manifest-listed relation family before constructing any statement;
+4. renders identifiers only from those verified catalog rows, under the fixed trusted `search_path`;
+5. applies the documented short transaction-local `lock_timeout`, locks only that verified set in
+   the global storage lock order, rechecks reclaimability, and executes only `TRUNCATE`; and
+6. fails closed on a missing, renamed, detached, unexpectedly owned, out-of-range, or excessive
+   target. It never falls back to a caller-derived name or a wider relation scan.
+
+The execution owner receives `TRUNCATE` only on the manifest-listed ring children and the minimum
+metadata access needed for these checks. The catalog audit recognizes the exception only when the
+manifest marker, exact function identity and body hash, relation-family allowlist, owner, and ACL all
+match. Any other runtime definer containing dynamic SQL or DDL remains invalid. A deployment that
+cannot install this dispatcher may retain an explicitly named trusted-maintenance profile with
+narrow direct privileges, but that profile is not the strict no-table-grant profile.
 
 ### Public names and internal names
 
@@ -168,9 +207,13 @@ public contract.
 At any installed schema version, each public definer name has one exact input signature. Awa does
 not overload it or add a second variant distinguished only by defaultable parameters: that
 complicates exact ACLs and PostgreSQL
-[function resolution](https://www.postgresql.org/docs/current/typeconv-func.html). Extensible options
-belong inside the current request shape; callers use explicit types, and `awa doctor` resolves one
-exact `regprocedure`.
+[function resolution](https://www.postgresql.org/docs/current/typeconv-func.html). The v1
+`insert_job` signature has one final `opts jsonb DEFAULT '{}'::jsonb` parameter as its extension
+point. That default belongs to the sole exact signature; it does not authorize another overload.
+New optional keys may be added compatibly, unknown keys fail with the contract's stable error rather
+than being ignored, and changing an existing key's meaning or making a new key required is a
+breaking contract change. Callers use explicit types, and `awa doctor` resolves the one exact
+`regprocedure` including its `jsonb` argument.
 
 These are stable APIs, not immutable artifacts. Compatible changes retain the clean name and
 signature. A breaking improvement is allowed under ADR-036: it requires a reviewed contract
@@ -234,11 +277,17 @@ before activation.
 Acceptance requires:
 
 - catalog tests that fail on an unclassified function or trigger, a definer owned by an excessive
-  role, `PUBLIC EXECUTE` on any Awa routine, an unsafe `search_path`, an unexpected ACL, or a
-  definer with dynamic SQL;
-- role-graph tests that compute transitive inherited-privilege and `SET ROLE` closure and reject
-  every non-allowlisted runtime, application, callback, or admin path to the execution owner,
-  migrator, or schema owner, including paths through multiple intermediate roles;
+  role, `PUBLIC EXECUTE` on any Awa routine, an unsafe `search_path`, an unexpected ACL, an audited
+  definer that derives its actor from `current_user`, or dynamic SQL without the exact
+  `awa_ring_slot_reclaim_v1` manifest declaration and reviewed body hash;
+- maintenance-dispatch tests covering valid reclaim, forged and out-of-range slots, stale
+  generations, detached/wrong-parent/wrong-owner relations, unexpected manifest targets, bounded
+  lock timeout, and concurrent rotation; only the verified child OIDs may be locked or truncated;
+- role-graph tests on PostgreSQL 15 and 18 (the oldest and newest supported majors) that compute
+  version-correct transitive inherited-privilege and `SET ROLE` closure and reject every
+  non-allowlisted runtime, application, callback, or admin path to the execution owner, migrator, or
+  schema owner, including paths through multiple intermediate roles and PostgreSQL 16+'s membership
+  option semantics;
 - negative privilege tests for every principal, including cross-capability attempts, direct table
   DML/`TRUNCATE`, installer execution, stale tokens, forged job identifiers, temporary-object
   shadowing, and operator/function shadowing;

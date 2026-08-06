@@ -219,6 +219,11 @@ Other PostgreSQL features used at runtime:
 > **Accepted design for 0.7; not shipped in the current release.** This section records the
 > privilege boundary the implementation and migration must satisfy.
 
+The #401 implementation owns the narrow ADR-043 substrate required to make that boundary strict in
+0.7: a pre-provisioned bounded execution owner, the exact `complete_job` manifest entry, transactional
+ownership transfer and `PUBLIC` revocation, the application-role grant, and `awa doctor` validation.
+The broader producer/executor/maintenance/admin capability split remains deferred under #452.
+
 The generic ownership-transfer examples above describe today's broad-grant profile. Once the
 strict capability profile ships, its generated ownership manifest must exclude `complete_job` and
 other bounded-owner definers from blanket transfer to `awa_owner`; `awa doctor` treats such a
@@ -227,7 +232,9 @@ transfer as strict-profile drift.
 Strict validation also audits the complete PostgreSQL role graph. It follows both transitive
 inherited privileges and nested `SET ROLE` paths from every runtime, application, callback, and
 admin login, and rejects any non-allowlisted path to the bounded execution owner, migrator, schema
-owner, or a role that can reach them. Direct-membership checks alone are not sufficient.
+owner, or a role that can reach them. Direct-membership checks alone are not sufficient. The
+conformance matrix runs this audit on PostgreSQL 15 and 18 so PostgreSQL 16+'s separate membership
+`SET`/`INHERIT`/`ADMIN` semantics cannot be mistaken for the older role model.
 
 [ADR-042](adr/042-caller-owned-finalization-transactions.md) lets a handler commit application rows
 and guarded Awa completion in one transaction. That transaction normally comes from a separate
@@ -341,12 +348,16 @@ still use `SECURITY INVOKER`. ADR-042's completion function is a deliberately na
 runtime privileges; it does not reduce what the ordinary runtime needs.
 
 [ADR-043](adr/043-postgresql-capability-functions.md) defines the long-term tightening path. Awa
-will not convert the entire function surface to `SECURITY DEFINER`: generic internal, dynamic-SQL,
-arbitrary-schema, and DDL helpers would become excessive privilege-escalation entry points. Instead,
-an allowlisted set of producer, executor, maintenance, admin, callback, and finalizer capability
-functions runs under a bounded `NOLOGIN` execution owner. Internal helpers remain inaccessible,
-`PUBLIC EXECUTE` is revoked, and broad table grants are removed only after an ADR-041 capability
-rollout. This work is tracked in [#452](https://github.com/hardbyte/awa/issues/452).
+will not convert the entire function surface to `SECURITY DEFINER`: generic internal,
+caller-controlled dynamic-SQL, arbitrary-schema, and DDL helpers would become excessive
+privilege-escalation entry points. Instead, an allowlisted set of producer, executor, maintenance,
+admin, callback, and finalizer capability functions runs under a bounded `NOLOGIN` execution owner.
+Maintenance partition reclamation is the sole relation-dispatch exception: it accepts only a
+bounded ring slot, verifies each manifest-listed Awa child by catalog OID/namespace/owner/attachment,
+uses a short lock timeout, and may issue only `ACCESS EXCLUSIVE` lock plus `TRUNCATE` after the
+reclaimability recheck. It never accepts a caller relation or SQL fragment. Internal helpers remain
+inaccessible, `PUBLIC EXECUTE` is revoked, and broad table grants are removed only after an ADR-041
+capability rollout. This work is tracked in [#452](https://github.com/hardbyte/awa/issues/452).
 
 ## Deployable roles
 

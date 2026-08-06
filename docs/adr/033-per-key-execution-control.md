@@ -88,12 +88,15 @@ completion-order promise, and jobs with explicit, differing ordering keys may sh
 key across several lanes. Physical `PartitionedQueue` routing is unchanged; the policy id remains
 the cross-partition concurrency namespace.
 
-Shard locality is a producer-contract obligation, not a server-side guarantee for direct SQL
-writes. Every supported producer path must apply the same domain-separated concurrency-key digest
-and routing precedence above. The public SQL producer contract in #342 freezes that digest and the
-`concurrency_key`-to-shard vectors alongside the existing `ordering_key` vectors. A producer that
-does not implement the rule cannot weaken exact admission, but it may scatter one key across lanes
-and invalidate the bounded-probe locality assumed by E5.
+Shard locality is part of the producer contract, and the public SQL boundary enforces it rather than
+trusting each polyglot client. Every supported producer path uses the same domain-separated
+concurrency-key digest and routing precedence above. The `awa.insert_job` contract in #342 receives
+the logical keys and computes the digest and `enqueue_shard` authoritatively in PostgreSQL; it does
+not accept a client digest or shard as authoritative. If a conformance/debug request supplies an
+expected value, a mismatch fails with a stable contract error. Binary-coupled and bulk paths perform
+the equivalent validation before publishing staged rows. The contract freezes the digest and
+`concurrency_key`-to-shard vectors alongside the existing `ordering_key` vectors, converting a
+non-compliant producer from a silent queue-wide probe-cost regression into a boundary error.
 
 The selected `enqueue_shard` becomes durable routing metadata on deferred/retry, callback, and DLQ
 representations and is reused when those rows return to ready. It is not recomputed through the
@@ -110,14 +113,27 @@ than independently configured worker values. A policy has a stable `key_policy_i
 same policy, so a width change or cross-partition administration cannot accidentally create a
 second concurrency namespace. Jobs without a concurrency key do not consume a grant.
 
-Lowering a limit must preserve the invariant at the instant the new value becomes authoritative.
-The update transaction locks the policy catalog row against concurrent admissions and succeeds only
-when every key attached to the policy already has at most the requested number of open grants. If
-any key is above the target, the update fails with the observed maximum and leaves the old limit
-unchanged. The operator drains new admission, waits for open grants to fall within the target, and
-retries the update; Awa never "grandfathers" an over-limit active set under a lower authoritative
-value. Disabling or changing a policy's identity while it has open grants likewise requires an
-explicit drain/force operation; silently changing namespace would weaken the established guarantee.
+Lowering a limit must preserve the invariant at the instant the new value becomes authoritative,
+without holding a claim-conflicting row lock during an unbounded all-key scan. It uses a three-step,
+epoch-guarded transition:
+
+1. A short transaction exclusively locks the policy row, records the requested target, increments
+   its change epoch, and moves admission to `draining`. Acquiring that lock waits for claimers that
+   already hold the shared policy lock; after commit, no new grant can open under that policy.
+2. Outside the exclusive window, Awa scans the fixed claim-ring children for the maximum open count
+   under a bounded, operator-visible verification timeout. Closures may continue and can only lower
+   the result. A timeout or resource-limit failure returns `verification_incomplete`, keeps the old
+   limit authoritative, and leaves admission drained until the operator retries or cancels.
+3. A final short transaction locks the policy row, verifies the same epoch, target, and drained
+   state, and activates the lower value only if the observed maximum is within it. Otherwise it
+   reports the observed maximum and leaves the old limit unchanged.
+
+This protocol never exposes a committed policy state where the lower limit is authoritative while
+an over-limit governed set exists, and claimers do not queue behind the verification scan. The
+operator waits for open grants to fall within the target and retries; Awa never "grandfathers" an
+over-limit active set under a lower authoritative value. Disabling or changing a policy's identity
+while it has open grants uses the same drain/epoch discipline; silently changing namespace would
+weaken the established guarantee.
 
 #### Append-only grant and closure evidence
 
@@ -244,7 +260,9 @@ this ADR avoids.
 
 The admin API and CLI expose policy create/show/update, limit lowering, drain, and force-disable
 operations using the same preview/confirm conventions as other operator mutations. Limit changes
-are audited. The UI and SQL inspection surface provide:
+are audited with an explicit authenticated actor supplied by the admin boundary, or with PostgreSQL
+`session_user` for direct operator SQL; a definer must not record `current_user`, which would name
+its execution owner. The UI and SQL inspection surface provide:
 
 - open grant count and oldest age by policy and key digest;
 - top saturated keys without exposing raw caller keys;
@@ -300,13 +318,22 @@ can claim, retry, rescue, or administratively move the affected queues must adve
 
 Runtime capability is necessary but not sufficient. Rows enqueued before the expansion may have an
 `ordering_key`-selected shard but no recoverable concurrency-key digest: many keys map to one shard,
-so `enqueue_shard` is not an authoritative backfill source. Before enabling an exact policy, the
+so `enqueue_shard` is not an authoritative backfill source. Before enabling complete coverage, the
 same guarded flip must prove that every affected ready, deferred, retry, callback, DLQ, receipt, and
 lease representation either carries the new policy/key identity or has drained. An
 application-supplied authoritative key mapping may backfill rows before the flip; otherwise the
-operator must drain the affected queues. A legacy row without key identity never silently shares a
-policy with new keyed work, because that could admit it outside `max_in_flight`. `awa doctor` names
-the blocking representation counts and the drain/backfill requirement.
+operator drains the affected queues. A legacy row without key identity never silently shares a
+policy with new keyed work, because Awa cannot know which user-intent key it should consume.
+
+For a queue that cannot drain, the operator may instead select an explicit
+`permit_legacy_ungoverned` compatibility activation. Legacy rows then run without a grant while rows
+with authoritative identity receive exact Tier 2 admission. This does not violate
+`OpenGrantsPerKey <= Limit` for governed rows, but it weakens the end-to-end user-intent promise: a
+legacy row may run concurrently with governed key-mates. The policy reports
+`coverage=partial_legacy`, `awa doctor` remains non-green with representation counts and remediation,
+and health/metrics expose ungoverned admission totals and remaining backlog. No raw shard is treated
+as a key. Promotion to `coverage=complete` is a separate epoch-guarded flip after every
+representation has drained or been authoritatively backfilled.
 
 The implementation release must either provide a compatible N-1 patch that recognizes the expand
 schema or defer the migration to the next minor. This ADR does not reopen the current 0.7 release
@@ -316,25 +343,30 @@ gate by itself.
 
 Before Tier 2 ships:
 
-- a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, attempt-specific closure, rollback
+- a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, the drain/epoch/verify/activate lowering
+  protocol, the governed-only scope of partial-legacy coverage, attempt-specific closure, rollback
   safety, completion-versus-rescue, no cursor advance over a gated head, and conditional liveness
   when capacity eventually becomes available;
-- `AwaStorageLockOrder` covers the shared policy-row lock before key-lock acquisition, the exclusive
-  policy-update path, receipt completion, and both directions of the claim/prune partition-lock
-  interaction;
+- `AwaStorageLockOrder` covers the shared policy-row lock before key-lock acquisition, both short
+  exclusive policy-transition windows with verification outside them, receipt completion, and both
+  directions of the claim/prune partition-lock interaction;
 - `AwaDeadTupleContract` classifies the selected row-local or separate-ledger shape as
   append/truncate and forbids per-key UPDATE/DELETE;
 - integration races run at least two claimers on different runtimes against the same key and prove
   one winner at limit 1;
-- limit lowering serializes with concurrent claims, refuses while any key is above the requested
-  value, and never exposes a committed policy state where `OpenGrantsPerKey > Limit`;
+- limit lowering fences admission in a short epoch transition, performs its all-key verification
+  outside the exclusive policy-row window under a bounded timeout, refuses incomplete or
+  over-target verification, and never exposes a committed policy state where
+  `OpenGrantsPerKey > Limit`; concurrent claimers do not wait behind the verification scan;
 - a gated top-priority lane cannot make an admissible lane in the same queue report idle, and the
   storage result distinguishes idle, gated, and lock-contended outcomes;
 - keyed jobs without an ordering key remain shard-local across enqueue, retry, callback, and DLQ
   replay; differing explicit ordering keys exercise the per-call same-key memo across lanes;
-- policy enablement refuses while an affected legacy representation lacks authoritative key
-  identity, including banked backlog and in-flight N-1 attempts; a drain or authoritative backfill
-  plus the final capability/row reconciliation makes the flip succeed atomically;
+- complete-coverage enablement refuses while an affected legacy representation lacks authoritative
+  key identity, including banked backlog and in-flight N-1 attempts; a drain or authoritative
+  backfill plus the final capability/row reconciliation makes the flip succeed atomically. The
+  explicit partial-legacy mode admits those rows ungoverned, reports non-green coverage and metrics,
+  and cannot promote to complete coverage until the same reconciliation passes;
 - closing a grant wakes a gated session-listening dispatcher after commit without hot polling;
   poll-only mode stays within its documented gated safety interval;
 - completion, caller-owned completion, retry, snooze, callback wait/resume, cancel, DLQ, rescue,
