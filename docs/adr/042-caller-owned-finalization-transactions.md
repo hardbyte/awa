@@ -340,7 +340,8 @@ Acceptance requires:
   transactions;
 - negative conformance tests for each driver's savepoint/nested-transaction pattern, proving a stale
   finalization cannot be swallowed and followed by an application commit in supported usage;
-- privilege tests on PostgreSQL 15 and 18 proving an application-finalizer role can execute only
+- privilege tests on the oldest and newest supported PostgreSQL majors proving an
+  application-finalizer role can execute only
   guarded completion, cannot read or mutate Awa tables directly, and cannot exploit `search_path`
   or token fields to reach another schema or statement, including through version-correct transitive
   inherited privileges or `SET ROLE`;

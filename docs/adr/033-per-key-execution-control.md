@@ -70,9 +70,13 @@ That invariant is fleet-wide and independent of the number of worker processes o
 
 `InsertOpts::concurrency_key` is distinct from `ordering_key`. When it is absent and an
 `ordering_key` is present, the enqueue path copies the ordering key into the concurrency-key input
-before storage. A domain-separated BLAKE3 digest, rather than the raw caller key, is stored on every
-live representation and every wide representation that can later be re-enqueued: ready, deferred,
-lease, retry, and DLQ rows. Narrow terminal rows and compact successful completions hydrate it from
+before storage. A domain-separated SHA-256 digest, rather than the raw caller key, is stored on
+every live representation and every wide representation that can later be re-enqueued: ready,
+deferred, lease, retry, and DLQ rows. SHA-256 rather than ADR-002's BLAKE3 is deliberate: the
+public SQL contract computes this digest authoritatively inside PostgreSQL, and `sha256()` is a
+PostgreSQL built-in, while BLAKE3 would require an extension or an impractical procedural
+implementation. `unique_key` remains client-side BLAKE3 under ADR-002; the two key families
+intentionally use different algorithms and computation venues, and the #342 vectors cover both. Narrow terminal rows and compact successful completions hydrate it from
 their retained ready backing row under ADR-026 instead of widening the terminal hot path. The
 fallback is evaluated once at enqueue; it is not recomputed from routing state later.
 
@@ -119,7 +123,9 @@ uses a three-step, epoch-guarded transition:
 
 1. A short transaction exclusively locks the policy row, records the requested target, increments
    its change epoch, and moves admission to `draining`. Acquiring that lock waits for claimers that
-   already hold the shared policy lock; after commit, no new grant can open under that policy.
+   already hold the shared policy lock; after commit, no new grant can open under that policy. A
+   policy carries at most one pending transition: step 1 refuses while another change is already
+   `draining`.
 2. Outside the exclusive window, Awa scans the fixed claim-ring children for the maximum open count
    under a bounded, operator-visible verification timeout. Closures may continue and can only lower
    the result. A timeout or resource-limit failure returns `verification_incomplete`, keeps the old
@@ -138,8 +144,11 @@ commit, new claims may use only the restored prior limit.
 
 This protocol never exposes a committed policy state where the lower limit is authoritative while
 an over-limit governed set exists, and claimers do not queue behind the verification scan. The
-operator waits for open grants to fall within the target and retries; Awa never "grandfathers" an
-over-limit active set under a lower authoritative value. Disabling or changing a policy's identity
+fail-closed residue is that an abandoned transition — an operator tool that crashed after step 1 —
+leaves the policy `draining` indefinitely; nothing re-opens admission automatically. Draining
+state, its pending target/epoch, and its age are therefore first-class health and metrics signals,
+not just rows an operator can query. The operator waits for open grants to fall within the target
+and retries; Awa never "grandfathers" an over-limit active set under a lower authoritative value. Disabling or changing a policy's identity
 while it has open grants uses the same drain/epoch discipline; silently changing namespace would
 weaken the established guarantee.
 
@@ -276,7 +285,9 @@ its execution owner. The UI and SQL inspection surface provide:
 
 - open grant count and oldest age by policy and key digest;
 - top saturated keys without exposing raw caller keys;
-- a derived `key_gated` reason on an available job when its current policy/key is saturated; and
+- a derived `key_gated` reason on an available job when its current policy/key is saturated;
+- policies in `draining`, with their pending target, change epoch, and age, surfaced through
+  health/metrics so an abandoned transition pages rather than lingers; and
 - queue metrics for gated outcomes, lock contention, closure notifications, wake amplification,
   and post-closure pickup latency.
 
@@ -369,7 +380,8 @@ Before Tier 2 ships:
   over-target verification, and never exposes a committed policy state where
   `OpenGrantsPerKey > Limit`; concurrent claimers do not wait behind the verification scan. A
   matching cancel restores the prior limit atomically, stale cancel/activate requests fail, and no
-  grant opens while rollback still reports `draining`;
+  grant opens while rollback still reports `draining`; a second transition refuses while one is
+  pending, and an abandoned `draining` policy is reported through health/metrics with its age;
 - a gated top-priority lane cannot make an admissible lane in the same queue report idle, and the
   storage result distinguishes idle, gated, and lock-contended outcomes;
 - keyed jobs without an ordering key remain shard-local across enqueue, retry, callback, and DLQ
@@ -392,6 +404,13 @@ Before Tier 2 ships:
   enablement boundary with real N-1 artifacts.
 
 ## Alternatives considered
+
+### BLAKE3 for the concurrency digest
+
+Rejected. Server-authoritative digest computation is part of the producer contract, and PostgreSQL
+has no native BLAKE3 — it would need an extension or a procedural implementation on the insert hot
+path. Computing BLAKE3 client-side only would reopen the silent key-scatter hole the authoritative
+boundary closes.
 
 ### Read live leases/receipts without serialization
 

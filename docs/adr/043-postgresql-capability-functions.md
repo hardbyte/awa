@@ -171,12 +171,20 @@ recorded in the capability manifest as `awa_ring_slot_reclaim_v1`. A function us
    attachment, parent, and manifest-listed relation family before constructing any statement;
 4. renders identifiers only from those verified catalog rows, under the fixed trusted `search_path`;
 5. applies the documented short transaction-local `lock_timeout`, locks only that verified set in
-   the global storage lock order, rechecks reclaimability, and executes only `TRUNCATE`; and
+   the global storage lock order, rechecks reclaimability, and executes only `TRUNCATE`. The
+   reclaimability proofs, rescue-cursor resets, and rollup-delta appends are static SQL routed
+   through the partitioned parents with slot predicates, so partition pruning selects the child
+   without a rendered identifier; `LOCK TABLE` and `TRUNCATE` remain the only dynamically rendered
+   statements. If implementation evidence shows parent-routed proofs are inadequate, the manifest
+   may extend this policy to read-only `SELECT` against the same verified OID set — an explicit
+   manifest and body-hash revision, never an implicit widening; and
 6. fails closed on a missing, renamed, detached, unexpectedly owned, out-of-range, or excessive
    target. It never falls back to a caller-derived name or a wider relation scan.
 
-The execution owner receives `TRUNCATE` only on the manifest-listed ring children and the minimum
-metadata access needed for these checks. The catalog audit recognizes the exception only when the
+The execution owner receives `TRUNCATE` only on the manifest-listed ring children, plus the static
+table privileges the protocol itself needs: `SELECT` on the partitioned parents for the proofs,
+`UPDATE` on the ring-slot metadata rows it resets, and `INSERT` on the rollup-delta ledgers it
+appends. The catalog audit recognizes the exception only when the
 manifest marker, exact function identity and body hash, relation-family allowlist, owner, and ACL all
 match. Any other runtime definer containing dynamic SQL or DDL remains invalid. A deployment that
 cannot install this dispatcher may retain an explicitly named trusted-maintenance profile with
@@ -288,7 +296,8 @@ Acceptance requires:
 - maintenance-dispatch tests covering valid reclaim, forged and out-of-range slots, stale
   generations, detached/wrong-parent/wrong-owner relations, unexpected manifest targets, bounded
   lock timeout, and concurrent rotation; only the verified child OIDs may be locked or truncated;
-- role-graph tests on PostgreSQL 15 and 18 (the oldest and newest supported majors) that compute
+- role-graph tests on the oldest and newest PostgreSQL majors in the documented support window —
+  a pair that must straddle PostgreSQL 16's membership-option change — that compute
   version-correct transitive inherited-privilege and `SET ROLE` closure and reject every
   non-allowlisted runtime, application, callback, or admin path to the execution owner, migrator, or
   schema owner, including paths through multiple intermediate roles and PostgreSQL 16+'s membership

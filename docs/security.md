@@ -233,8 +233,9 @@ Strict validation also audits the complete PostgreSQL role graph. It follows bot
 inherited privileges and nested `SET ROLE` paths from every runtime, application, callback, and
 admin login, and rejects any non-allowlisted path to the bounded execution owner, migrator, schema
 owner, or a role that can reach them. Direct-membership checks alone are not sufficient. The
-conformance matrix runs this audit on PostgreSQL 15 and 18 so PostgreSQL 16+'s separate membership
-`SET`/`INHERIT`/`ADMIN` semantics cannot be mistaken for the older role model.
+conformance matrix runs this audit on the oldest and newest supported PostgreSQL majors — a pair
+that straddles PostgreSQL 16's separate membership `SET`/`INHERIT`/`ADMIN` semantics — so the newer
+role model cannot be mistaken for the older one.
 
 [ADR-042](adr/042-caller-owned-finalization-transactions.md) lets a handler commit application rows
 and guarded Awa completion in one transaction. That transaction normally comes from a separate

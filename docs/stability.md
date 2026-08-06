@@ -55,9 +55,11 @@ implementation, documentation, conformance evidence, and release note land toget
   `<queue_storage_schema>.complete_job(...)` and its receipt/error/version semantics for
   caller-owned finalization. The function is not shipped and is not yet an active SQL worker
   surface.
-- [ADR-033](adr/033-per-key-execution-control.md) adds the future domain-separated
+- [ADR-033](adr/033-per-key-execution-control.md) adds the future domain-separated SHA-256
   `concurrency_key` digest and ordering/concurrency shard-precedence vectors to #342's contract
-  gate; those promises become active only with the implementing release.
+  gate; those promises become active only with the implementing release. The digest algorithm
+  differs from `unique_key`'s client-side BLAKE3 (ADR-002) by design — PostgreSQL computes the
+  concurrency digest authoritatively and has no native BLAKE3.
 
 The implementation PR for each surface must add or replace the corresponding table row, ship the
 referenced conformance artifacts, and record any transition from an older covered entry point in
