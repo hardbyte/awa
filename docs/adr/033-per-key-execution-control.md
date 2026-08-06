@@ -50,7 +50,10 @@ fleet upper bound ~= per-runtime limit x runtimes able to claim the queue
 
 It is useful for noisy-neighbour damping and per-runtime API budgets, but its API and metrics must
 always name the approximation. Worker-local rate limiting remains in this tier; this ADR does not
-define an exact distributed rate-window protocol.
+define an exact distributed rate-window protocol. The concurrency-key digest still travels
+durably with the job so claim, retry, callback, and DLQ paths retain the dispatch identity. Tier 1's
+storage claim is that it adds no fleet-wide grant, closure, counter, or permit family, not that the
+key occupies no bytes in existing job representations.
 
 ### Tier 2: fleet-exact execution grants
 
@@ -107,9 +110,14 @@ than independently configured worker values. A policy has a stable `key_policy_i
 same policy, so a width change or cross-partition administration cannot accidentally create a
 second concurrency namespace. Jobs without a concurrency key do not consume a grant.
 
-Lowering a limit prevents new grants until the open count falls below the new value. Disabling or
-changing a policy's identity while it has open grants requires an explicit drain/force operation;
-silently changing namespace would weaken the established guarantee.
+Lowering a limit must preserve the invariant at the instant the new value becomes authoritative.
+The update transaction locks the policy catalog row against concurrent admissions and succeeds only
+when every key attached to the policy already has at most the requested number of open grants. If
+any key is above the target, the update fails with the observed maximum and leaves the old limit
+unchanged. The operator drains new admission, waits for open grants to fall within the target, and
+retries the update; Awa never "grandfathers" an over-limit active set under a lower authoritative
+value. Disabling or changing a policy's identity while it has open grants likewise requires an
+explicit drain/force operation; silently changing namespace would weaken the established guarantee.
 
 #### Append-only grant and closure evidence
 
@@ -144,17 +152,20 @@ one database round trip. It probes eligible lane heads in scheduler order, bound
 finite `(priority, enqueue_shard)` lane registry. For each candidate lane it:
 
 1. reads the ordinary FIFO candidate window;
-2. on the first occurrence of each keyed value, attempts a transaction-scoped advisory lock;
-3. counts committed, unclosed grants for that key;
-4. chooses the longest contiguous candidate prefix that stays within every limit; and
-5. appends ordinary claim evidence, including the grant fields or separate grant prototype, in the
+2. takes a shared row lock on each referenced policy, compatible with other claimers but conflicting
+   with an administrative policy update;
+3. on the first occurrence of each keyed value, attempts a transaction-scoped advisory lock;
+4. counts committed, unclosed grants for that key;
+5. chooses the longest contiguous candidate prefix that stays within every limit; and
+6. appends ordinary claim evidence, including the grant fields or separate grant prototype, in the
    same transaction.
 
-The function keeps a per-call memo keyed by `(key_policy_id, key_digest)`: it acquires and counts a
-key once, then tracks grants tentatively added by earlier admitted prefixes. This matters when an
-explicit ordering key, priority, or compatibility row places the same concurrency key in more than
-one probed lane. The database-authoritative count remains the source of truth; the memo only avoids
-repeating it inside one transaction.
+The function keeps per-call memos for policy row locks and for
+`(key_policy_id, key_digest)`: it locks each policy once, acquires and counts a key once, then tracks
+grants tentatively added by earlier admitted prefixes. This matters when an explicit ordering key,
+priority, or compatibility row places the same concurrency key in more than one probed lane. The
+database-authoritative count remains the source of truth; the memo only avoids repeating work
+inside one transaction.
 
 The default prototype uses `pg_try_advisory_xact_lock`: contention ends the admissible prefix
 without waiting on another key decision. A 64-bit lock key is derived with a domain that includes
@@ -308,12 +319,15 @@ Before Tier 2 ships:
 - a focused TLA+ model proves `OpenGrantsPerKey <= Limit`, attempt-specific closure, rollback
   safety, completion-versus-rescue, no cursor advance over a gated head, and conditional liveness
   when capacity eventually becomes available;
-- `AwaStorageLockOrder` covers key-lock acquisition, receipt completion, and both directions of the
-  claim/prune partition-lock interaction;
+- `AwaStorageLockOrder` covers the shared policy-row lock before key-lock acquisition, the exclusive
+  policy-update path, receipt completion, and both directions of the claim/prune partition-lock
+  interaction;
 - `AwaDeadTupleContract` classifies the selected row-local or separate-ledger shape as
   append/truncate and forbids per-key UPDATE/DELETE;
 - integration races run at least two claimers on different runtimes against the same key and prove
   one winner at limit 1;
+- limit lowering serializes with concurrent claims, refuses while any key is above the requested
+  value, and never exposes a committed policy state where `OpenGrantsPerKey > Limit`;
 - a gated top-priority lane cannot make an admissible lane in the same queue report idle, and the
   storage result distinguishes idle, gated, and lock-contended outcomes;
 - keyed jobs without an ordering key remain shard-local across enqueue, retry, callback, and DLQ

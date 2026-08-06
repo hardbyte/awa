@@ -54,9 +54,12 @@ Every installed routine belongs to exactly one class in a machine-readable capab
 
 Every installed Awa routine, in every class, has `EXECUTE` revoked from `PUBLIC`. The manifest
 records the exact positive grants for callable surfaces; internal helpers, migration/DDL/install
-routines, and trigger functions receive no runtime grant. The migrator applies both the revocation
-and positive grants in the routine's creating transaction and configures default privileges so a
-new routine cannot accidentally reintroduce `PUBLIC EXECUTE`. `awa doctor` treats any manifest/ACL
+routines, and trigger functions receive no runtime grant. The migrator applies the revocation in
+the routine's creating transaction and configures default privileges so a new routine cannot
+accidentally reintroduce `PUBLIC EXECUTE`. Positive grants are manifest-driven and apply only after
+the function's final owner is set: the migrator may apply them in the same administrative
+transaction when the target roles are configured, otherwise it emits the exact-signature grant
+plan that the operator must apply before enablement. `awa doctor` treats any manifest/ACL
 disagreement, including `PUBLIC EXECUTE` on an invoker or internal routine, as drift.
 
 `awa.install_queue_storage_substrate` remains invoker and migrator-only. A caller-controlled schema,
@@ -146,9 +149,12 @@ one exact attempt. This matches Awa's existing Rust lifecycle terminology while 
 the attempt boundary explicit. `complete_attempt` would overemphasize a storage fact; `finalize_job`
 would conflict with Awa's broader use of finalization for success, failure, retry, and cancellation.
 
-The `_compat` suffix is reserved for internal cross-representation or rolling-upgrade shims such as
-today's `insert_job_compat` and `delete_job_compat`. `_runtime` is reserved for binary-coupled
-helpers. Neither suffix appears in a new public contract.
+The `_compat` suffix is reserved for internal cross-representation or rolling-upgrade shims in new
+designs. Today's `insert_job_compat` is a transitional exception because the current normative
+stability map already covers it; it remains covered until `insert_job` ships and the declared
+migration/deprecation step completes. `delete_job_compat` and other unlisted compatibility helpers
+remain internal. `_runtime` is reserved for binary-coupled helpers. Neither suffix appears in a new
+public contract.
 
 At any installed schema version, each public definer name has one exact input signature. Awa does
 not overload it or add a second variant distinguished only by defaultable parameters: that

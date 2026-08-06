@@ -162,13 +162,20 @@ The function is a hardened `SECURITY DEFINER` privilege boundary owned by ADR-04
 execution owner. A queue-storage schema owner is only a transitional, non-strict fallback and is
 rejected when `awa doctor` validates the strict profile. The function has a fixed `search_path`,
 uses fully qualified object names, accepts no caller-controlled identifiers, and uses `pg_temp`
-last in the path. The same migration transaction creates or replaces the function,
-transfers ownership, revokes `EXECUTE` from `PUBLIC`, and grants `EXECUTE` by exact signature to the
-application-worker role. The function does not commit. Operators grant only schema `USAGE` plus
-that exact function `EXECUTE`; they do not grant `awa_runtime` membership or direct Awa-table DML.
-The Rust `complete_in_tx` helper calls the same function through the caller's transaction rather
-than relying on the application connection to hold runtime-table privileges. `awa doctor` validates
-the exact signature, owner, security mode, fixed path, and ACL rather than accepting a same-named
+last in the path. Its installation transaction creates or replaces the function and immediately
+revokes `EXECUTE` from `PUBLIC`. In a strict deployment the operator pre-provisions the bounded
+execution owner and the migrator transfers ownership to it before that transaction commits. A
+compatible single-role installation may leave the function under the queue-storage schema owner,
+but `awa doctor` labels that profile non-strict and refuses strict enablement.
+
+The application-worker grant is an explicit provisioning action, applied by exact function
+signature only after the final owner is set. A replacement reasserts the `PUBLIC` revocation and
+preserves or reapplies only the manifest-listed ACL; it must not restore PostgreSQL's default
+`PUBLIC EXECUTE`. The function does not commit. Operators grant only schema `USAGE` plus that exact
+function `EXECUTE`; they do not grant `awa_runtime` membership or direct Awa-table DML. The Rust
+`complete_in_tx` helper calls the same function through the caller's transaction rather than
+relying on the application connection to hold runtime-table privileges. `awa doctor` validates the
+exact signature, owner, security mode, fixed path, and ACL rather than accepting a same-named
 wrapper or overload.
 
 `EXECUTE` authorizes guarded completion of a valid attempt token; it is granted to the trusted
@@ -302,9 +309,11 @@ representation. They follow ADR-041:
 - caller-owned completion cannot be enabled for a queue until every claiming runtime advertises
   receipt support;
 - the SQL contract is versioned against `awa.schema_version` and covered by #342 conformance tests;
-- migration installs the function under the schema owner, revokes `PUBLIC`, and leaves application
-  role `EXECUTE` as an explicit operator grant documented in `docs/security.md`; separated-role
-  deployments transfer ownership to `awa_owner` with the rest of the schema; and
+- installation revokes `PUBLIC` in the creating transaction; strict deployments transfer the
+  function to the pre-provisioned bounded execution owner before commit, while schema-owner or
+  `awa_owner` ownership is an explicitly non-strict compatibility fallback;
+- the operator applies the application role's exact-signature `EXECUTE` grant only after ownership
+  is final, and `awa doctor` verifies owner and ACL state before strict enablement; and
 - mixed-version rehearsal proves normal executor completion still works while the new path is
   disabled.
 
@@ -331,6 +340,9 @@ Acceptance requires:
 - privilege tests proving an application-finalizer role can execute only guarded completion, cannot
   read or mutate Awa tables directly, and cannot exploit `search_path` or token fields to reach
   another schema or statement;
+- installation/upgrade tests proving strict ownership transfers before the application grant,
+  replacement never restores `PUBLIC EXECUTE`, the exact ACL survives replacement, and the
+  schema-owner fallback is reported as non-strict and rejected for strict enablement;
 - a crash-after-server-commit/before-client-ack test proving receipt reconciliation;
 - a completion-versus-rescue TLA+ model where either completion commits all application/finalization
   facts or rescue wins and the application transaction cannot commit;

@@ -219,6 +219,11 @@ Other PostgreSQL features used at runtime:
 > **Accepted design for 0.7; not shipped in the current release.** This section records the
 > privilege boundary the implementation and migration must satisfy.
 
+The generic ownership-transfer examples above describe today's broad-grant profile. Once the
+strict capability profile ships, its generated ownership manifest must exclude `complete_job` and
+other bounded-owner definers from blanket transfer to `awa_owner`; `awa doctor` treats such a
+transfer as strict-profile drift.
+
 [ADR-042](adr/042-caller-owned-finalization-transactions.md) lets a handler commit application rows
 and guarded Awa completion in one transaction. That transaction normally comes from a separate
 application pool whose login can write the application's billing/inbox tables. Do **not** make that
@@ -241,6 +246,8 @@ when the deployment declares the strict profile. Its migration:
   object;
 - accepts no caller-controlled schema, table, function, or SQL identifier;
 - revokes `EXECUTE` from `PUBLIC` in the same migration transaction that creates the function;
+- transfers the function to the pre-provisioned bounded execution owner before commit in a strict
+  deployment, or explicitly records the schema-owner fallback as non-strict;
 - performs only guarded completion of the supplied finalization token and never commits; and
 - has the same hardened per-schema installation for a custom queue-storage schema.
 
@@ -249,9 +256,9 @@ those logins) only `USAGE` on the Awa/queue-storage schema and `EXECUTE` on the 
 completion function. It receives no direct Awa table, sequence, maintenance-function, or
 `TRUNCATE` privilege. The Rust `complete_in_tx` helper calls this same SQL function through the
 application transaction, so Rust and non-Rust workers share one privilege and conformance boundary.
-The migration grants by the exact `complete_job(...)` signature after ownership transfer;
-replacement preserves that ACL, and removal follows ADR-036 rather than silently redirecting the
-grant to an internal helper.
+Provisioning grants by the exact `complete_job(...)` signature only after ownership transfer;
+replacement reasserts the `PUBLIC` revocation and preserves or reapplies only that manifest-listed
+ACL. Removal follows ADR-036 rather than silently redirecting the grant to an internal helper.
 
 Function execution authorizes completion of any valid token presented by that trusted worker
 application role. Do not grant it to producer-only roles, browser/admin clients, or public callback
