@@ -104,7 +104,9 @@ SELECT awa.storage_enter_mixed_transition();
 SELECT awa.storage_finalize();
 ```
 
-`storage_enter_mixed_transition` rejects the call until at least one live `queue_storage_target` runtime is heartbeating. `storage_finalize` rejects while `awa.canonical_live_backlog() > 0` or a canonical-only runtime is live. Pre-flip auto runtimes report `canonical_drain_only` after routing flips; once the backlog is empty they are idle and v040 allows finalization without waiting for those processes to restart or their heartbeat rows to expire.
+`storage_enter_mixed_transition` rejects the call until at least one live `queue_storage_target` runtime is heartbeating. `storage_finalize` rejects while `awa.canonical_live_backlog() > 0` or a canonical-only runtime is live.
+
+Once routing has flipped, a canonical attempt that re-schedules itself — snooze, retry backoff, or `RetryAfter` — leaves the canonical plane instead of returning to canonical `scheduled_jobs` ([#456](https://github.com/hardbyte/awa/issues/456)). Ordinarily its fresh-id successor is written to the prepared schema's `deferred_jobs`. If the destination state claims uniqueness and a newer duplicate acquired that key while `running` was outside the mask, the attempted successor is recorded as a cancelled terminal row with a `rescheduled as duplicate` error; it never becomes executable and the newer claim holder wins. The canonical backlog therefore still converges for handlers that snooze on every run rather than completing. Pre-flip auto runtimes report `canonical_drain_only` after routing flips; once the backlog is empty they are idle and v040 allows finalization without waiting for those processes to restart or their heartbeat rows to expire.
 
 The orchestration (start new-mode workers, stop old-mode workers, wait for drain) is unchanged from the CLI flow — only the invocation surface is different.
 

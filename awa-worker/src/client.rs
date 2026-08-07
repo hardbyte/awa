@@ -1712,6 +1712,18 @@ impl Client {
             self.enqueue_specs.clone(),
             self.lifecycle_handlers.clone(),
         )
+        .standby_queue_storage(
+            // #456: a canonical-resolved worker keeps its configured
+            // queue-storage runtime available so a pre-flip maintenance
+            // leader can promote the queue-storage deferred backlog once
+            // routing flips.
+            match (&effective_storage, &self.storage) {
+                (RuntimeStorage::Canonical, RuntimeStorage::QueueStorage(runtime)) => {
+                    Some(runtime.clone())
+                }
+                _ => None,
+            },
+        )
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
             maintenance = maintenance.heartbeat_rescue_interval(interval);

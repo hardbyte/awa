@@ -3870,7 +3870,7 @@ async fn test_runtime_version_floor_override_allows_old_live_runtime() {
         .execute(&pool)
         .await
         .expect("set runtime below v043 floor");
-    rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+    rewind_schema_version(&pool, 43).await;
 
     let options = migrations::MigrateOptions {
         allow_live_runtimes: true,
@@ -3901,7 +3901,9 @@ async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
             .execute(&pool)
             .await
             .expect("set incompatible runtime version");
-        rewind_schema_version(&pool, migrations::CURRENT_VERSION).await;
+        // Rewind past v043 so the pending range crosses the floor migration
+        // regardless of how many migrations follow it.
+        rewind_schema_version(&pool, 43).await;
 
         let err = migrations::run(&pool)
             .await
@@ -4028,8 +4030,11 @@ async fn test_live_migration_retries_hot_table_deadlock() {
     };
 
     let (migration_result, ()) = tokio::join!(migrations::run(&pool), create_deadlock);
-    migration_result.expect("migration should retry the deadlock and reach v043");
-    assert_eq!(migrations::current_version(&pool).await.unwrap(), 43);
+    migration_result.expect("migration should retry the deadlock and reach the current version");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
     let deadlocks_after: i64 = sqlx::query_scalar(
         "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
     )

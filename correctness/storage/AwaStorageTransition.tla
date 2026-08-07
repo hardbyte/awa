@@ -12,7 +12,8 @@ EXTENDS TLC, Naturals, FiniteSets
 CONSTANTS MaxCanonicalBacklog,
           MaxQueueRows,
           RequireQueueExecutorOnEnter,
-          GateMigrate07
+          GateMigrate07,
+          RescheduleStaysCanonical
 
 States == {"canonical", "prepared", "mixed_transition", "active"}
 Engines == {"canonical", "queue_storage", "none"}
@@ -29,7 +30,8 @@ VARIABLES state,
           explicitDrainLive,
           mixedEntryHadQueueExecutor,
           migrated07,
-          migrate07EntryClean
+          migrate07EntryClean,
+          snoozerCanonical
 
 vars == <<state,
           currentEngine,
@@ -43,7 +45,8 @@ vars == <<state,
           explicitDrainLive,
           mixedEntryHadQueueExecutor,
           migrated07,
-          migrate07EntryClean>>
+          migrate07EntryClean,
+          snoozerCanonical>>
 
 ActiveEngine ==
     IF state \in {"mixed_transition", "active"}
@@ -69,6 +72,13 @@ LiveQueueCapability ==
     + IF state \in {"canonical", "prepared"}
         THEN autoPreMixedLive
         ELSE 0
+
+\* Canonical backlog jobs whose handler re-schedules on every run (snooze /
+\* retry-after / retry backoff). Such a job is never *completed* by a drain
+\* worker, so it is excluded from `DrainCanonical`; the only action that can
+\* remove it from the canonical plane is the re-schedule itself.
+SnoozeCount ==
+    IF snoozerCanonical THEN 1 ELSE 0
 
 \* Runtimes that will actually execute queue-storage work immediately after
 \* the routing flip.
@@ -120,6 +130,7 @@ Init ==
     /\ mixedEntryHadQueueExecutor = TRUE
     /\ migrated07 = FALSE
     /\ migrate07EntryClean = TRUE
+    /\ snoozerCanonical = FALSE
 
 PrepareQueueStorage ==
     /\ state \in {"canonical", "prepared"}
@@ -136,7 +147,8 @@ PrepareQueueStorage ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 PrepareSchema ==
     /\ state = "prepared"
@@ -153,7 +165,8 @@ PrepareSchema ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 EnterMixedTransition ==
     /\ CanEnterMixed
@@ -169,7 +182,8 @@ EnterMixedTransition ==
                    queueTargetLive,
                    explicitDrainLive,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 Finalize ==
     /\ CanFinalize
@@ -185,7 +199,8 @@ Finalize ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 AbortPrepared ==
     /\ state = "prepared"
@@ -201,7 +216,8 @@ AbortPrepared ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 AbortMixed ==
     /\ CanAbortMixed
@@ -217,7 +233,8 @@ AbortMixed ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StartOldCanonical ==
     /\ state \in {"canonical", "prepared"}
@@ -234,7 +251,8 @@ StartOldCanonical ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StopOldCanonical ==
     /\ oldCanonicalLive > 0
@@ -250,7 +268,8 @@ StopOldCanonical ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StartAutoPreMixed ==
     /\ state \in {"canonical", "prepared"}
@@ -267,7 +286,8 @@ StartAutoPreMixed ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StopAutoPreMixed ==
     /\ autoPreMixedLive > 0
@@ -283,7 +303,8 @@ StopAutoPreMixed ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StartQueueTarget ==
     /\ state # "canonical"
@@ -302,7 +323,8 @@ StartQueueTarget ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StopQueueTarget ==
     /\ queueTargetLive > 0
@@ -318,7 +340,8 @@ StopQueueTarget ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StartExplicitDrain ==
     /\ state \in {"prepared", "mixed_transition"}
@@ -335,7 +358,8 @@ StartExplicitDrain ==
                    queueTargetLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 StopExplicitDrain ==
     /\ explicitDrainLive > 0
@@ -351,12 +375,36 @@ StopExplicitDrain ==
                    queueTargetLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 ProducerEnqueueCanonical ==
     /\ ActiveEngine = "canonical"
     /\ canonicalBacklog < MaxCanonicalBacklog
     /\ canonicalBacklog' = canonicalBacklog + 1
+    /\ UNCHANGED <<state,
+                   currentEngine,
+                   preparedEngine,
+                   preparedSchemaReady,
+                   queueRows,
+                   oldCanonicalLive,
+                   autoPreMixedLive,
+                   queueTargetLive,
+                   explicitDrainLive,
+                   mixedEntryHadQueueExecutor,
+                   migrated07,
+                   migrate07EntryClean,
+                   snoozerCanonical>>
+
+\* A canonical enqueue of a job whose handler re-schedules on every run. At
+\* most one is modeled; it is the #456 workload that kept
+\* `canonical_live_backlog()` above zero forever.
+ProducerEnqueueCanonicalSnoozing ==
+    /\ ActiveEngine = "canonical"
+    /\ ~snoozerCanonical
+    /\ canonicalBacklog < MaxCanonicalBacklog
+    /\ canonicalBacklog' = canonicalBacklog + 1
+    /\ snoozerCanonical' = TRUE
     /\ UNCHANGED <<state,
                    currentEngine,
                    preparedEngine,
@@ -385,10 +433,14 @@ ProducerEnqueueQueueStorage ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
+\* Completion of a canonical backlog job by a drain-capable runtime. A
+\* re-scheduling job is never completed, so it is not drainable — see
+\* MigrateCanonicalRescheduleToQueueStorage.
 DrainCanonical ==
-    /\ canonicalBacklog > 0
+    /\ canonicalBacklog > SnoozeCount
     /\ LiveDrainCapability > 0
     /\ canonicalBacklog' = canonicalBacklog - 1
     /\ UNCHANGED <<state,
@@ -402,7 +454,8 @@ DrainCanonical ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
 
 CompleteQueueStorage ==
     /\ queueRows > 0
@@ -419,7 +472,60 @@ CompleteQueueStorage ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor,
                    migrated07,
-                   migrate07EntryClean>>
+                   migrate07EntryClean,
+                   snoozerCanonical>>
+
+\* #456: a canonical-claimed attempt whose handler asked to be re-scheduled
+\* (snooze / retry-after / retryable error).
+\*
+\* Once routing has flipped, `reschedule_canonical_attempt_tx` takes the
+\* canonical `jobs_hot` row and records exactly one disposition in the active
+\* queue-storage schema under a fresh id. Ordinarily that is a `deferred_jobs`
+\* successor. If a newer duplicate already owns a claim required by the
+\* destination state, it is instead a cancelled `done_entries` row and is not
+\* executable. `queueRows` deliberately counts both kinds of queue-storage
+\* evidence, so either disposition shrinks the canonical backlog by one and
+\* grows the queue-storage plane by one. The claim-level choice is checked in
+\* AwaMigratedRescheduleUnique.tla.
+\*
+\* While the cluster is still canonical or merely prepared, the historical
+\* `jobs_hot -> scheduled_jobs` move applies and nothing crosses planes, so
+\* this action is disabled.
+\*
+\* With RescheduleStaysCanonical = TRUE the pre-fix behavior is modeled: the
+\* row is written back into the canonical deferred backlog, which is net-zero
+\* on `canonicalBacklog`. A job that re-schedules on every run then never
+\* leaves the canonical plane, `canonical_live_backlog()` never reaches zero,
+\* and `storage_finalize` can never pass — see
+\* AwaStorageTransitionRescheduleStaysCanonical.cfg.
+\*
+\* The `queueRows < MaxQueueRows` conjunct is a model-finiteness bound, not a
+\* real precondition; MixedTransitionCanReduceCanonicalBacklog is therefore
+\* stated over the routing rule rather than over enabledness.
+MigrateCanonicalRescheduleToQueueStorage ==
+    /\ ActiveEngine = "queue_storage"
+    /\ LiveDrainCapability > 0
+    /\ canonicalBacklog > 0
+    /\ IF RescheduleStaysCanonical
+         THEN UNCHANGED vars
+         ELSE /\ queueRows < MaxQueueRows
+              /\ canonicalBacklog' = canonicalBacklog - 1
+              /\ queueRows' = queueRows + 1
+              /\ \/ /\ snoozerCanonical
+                    /\ snoozerCanonical' = FALSE
+                 \/ /\ canonicalBacklog > SnoozeCount
+                    /\ UNCHANGED snoozerCanonical
+              /\ UNCHANGED <<state,
+                             currentEngine,
+                             preparedEngine,
+                             preparedSchemaReady,
+                             oldCanonicalLive,
+                             autoPreMixedLive,
+                             queueTargetLive,
+                             explicitDrainLive,
+                             mixedEntryHadQueueExecutor,
+                             migrated07,
+                             migrate07EntryClean>>
 
 \* The 0.7 migrate gate (#370 / ADR-037). `awa migrate` on a 0.7 binary
 \* applies pending migrations only when the transition is finalized or the
@@ -455,7 +561,8 @@ Migrate07 ==
                    autoPreMixedLive,
                    queueTargetLive,
                    explicitDrainLive,
-                   mixedEntryHadQueueExecutor>>
+                   mixedEntryHadQueueExecutor,
+                   snoozerCanonical>>
 
 Stutter == UNCHANGED vars
 
@@ -475,9 +582,11 @@ Next ==
     \/ StartExplicitDrain
     \/ StopExplicitDrain
     \/ ProducerEnqueueCanonical
+    \/ ProducerEnqueueCanonicalSnoozing
     \/ ProducerEnqueueQueueStorage
     \/ DrainCanonical
     \/ CompleteQueueStorage
+    \/ MigrateCanonicalRescheduleToQueueStorage
     \/ Migrate07
     \/ Stutter
 
@@ -497,6 +606,7 @@ TypeOK ==
     /\ mixedEntryHadQueueExecutor \in BOOLEAN
     /\ migrated07 \in BOOLEAN
     /\ migrate07EntryClean \in BOOLEAN
+    /\ snoozerCanonical \in BOOLEAN
 
 PreparedRequiresEngine ==
     state \in {"prepared", "mixed_transition"} => preparedEngine = "queue_storage"
@@ -526,5 +636,54 @@ AbortMixedKeepsCanonicalIfQueueStorageUnused ==
 \* that can still execute canonical work is live.
 Migrate07OnlyOnQuiescedCanonical ==
     migrated07 => migrate07EntryClean
+
+\* #456 safety: the cross-plane re-schedule can never place a row in the
+\* queue-storage plane while producer routing is still canonical. Together
+\* with AbortMixedKeepsCanonicalIfQueueStorageUnused this is what makes
+\* `storage_abort` sound: aborting back to canonical only ever happens with
+\* the queue-storage plane empty, and the re-schedule's `FOR SHARE` lock on
+\* `awa.storage_transition_state` is what gives the implementation the
+\* action atomicity the model assumes here.
+NoQueueRowsUnderCanonicalRouting ==
+    ActiveEngine = "canonical" => queueRows = 0
+
+\* A re-scheduling job is part of the canonical backlog for as long as it
+\* has not migrated, so it can never outlive the backlog count. This is what
+\* lets FinalizeOnlyAfterDrain imply that no snoozing canonical job survives
+\* finalization.
+SnoozerImpliesCanonicalWork ==
+    snoozerCanonical => canonicalBacklog > 0
+
+\* #456 drain convergence, as safety: while mixed transition is in progress
+\* and a drain-capable runtime is live, some modeled action always reduces
+\* the canonical backlog — either an ordinary job completes, or a
+\* re-scheduling job migrates cross-plane. Violating this means the backlog
+\* is wedged above zero, so `CanFinalize` can never become true.
+\*
+\* Stated as a safety invariant rather than a liveness property on purpose:
+\* the model deliberately permits a cluster to never prepare, to abort, and
+\* to stop every runtime, so no unconditional `<>[] state = "active"` holds
+\* even with the fix, and adding enough fairness to exclude those behaviors
+\* would encode the conclusion into the hypotheses.
+CanonicalBacklogReducible ==
+    \/ canonicalBacklog > SnoozeCount
+    \/ /\ snoozerCanonical
+       /\ ~RescheduleStaysCanonical
+       /\ ActiveEngine = "queue_storage"
+
+MixedTransitionCanReduceCanonicalBacklog ==
+    (/\ state = "mixed_transition"
+     /\ canonicalBacklog > 0
+     /\ LiveDrainCapability > 0) => CanonicalBacklogReducible
+
+\* Disposition conservation for the cross-plane move: it replaces one
+\* canonical row with exactly one queue-storage row, either executable
+\* deferred work or cancelled terminal evidence. An action property, since
+\* conservation is a statement about the step rather than any single state.
+\* AwaMigratedRescheduleUnique checks that the executable outcome cannot be
+\* chosen when a newer duplicate owns the required claim.
+RescheduleMigrationConservesWork ==
+    [][MigrateCanonicalRescheduleToQueueStorage =>
+         canonicalBacklog' + queueRows' = canonicalBacklog + queueRows]_vars
 
 =============================================================================

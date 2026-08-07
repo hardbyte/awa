@@ -94,7 +94,9 @@ processes. Exactly one worker per database is the elected maintenance leader
 (session-scoped advisory lock — if it dies, another is elected on the next
 tick). The leader alone runs cluster-wide scans: deferred→ready promotion, the
 three rescue paths (stale-heartbeat, hard-deadline, callback-timeout), ring
-rotation and prune, DLQ and descriptor cleanup, and cron evaluation. Every
+rotation and prune, DLQ and descriptor cleanup, and cron evaluation. During an
+unfinalized transition it promotes both planes' deferred backlogs, so drain and
+post-flip execution do not depend on which runtime holds leadership. Every
 worker dispatches and heartbeats its own attempts. There is no `pg_cron` or
 external scheduler.
 
@@ -182,6 +184,8 @@ Dangerous operations:
   unparseable runtime version counts as not flip-aware).
 - `rebuild-terminal-counters` is for counter-drift incidents and is best run on
   a quiesced fleet.
+
+While the transition is unfinalized, a canonical attempt that re-schedules itself (snooze, retry backoff, `RetryAfter`) leaves the canonical plane rather than returning to canonical `scheduled_jobs`, so the drain converges even for handlers that snooze on every run instead of completing (#456). The ordinary outcome is a fresh-id row in the prepared queue-storage schema's `deferred_jobs`. If a newer duplicate owns a unique claim required by the destination state, the old attempt instead becomes cancelled terminal evidence with `rescheduled as duplicate`; it is not executable and the newer holder wins. If `finalize --wait` sits at a flat non-zero backlog while jobs are executing, you are on a build without that fix.
 
 Rings rotate only when active — a frozen generation on an idle queue is healthy.
 The condition to alert on is a frozen generation *with* accumulating rows

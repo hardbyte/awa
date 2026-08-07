@@ -236,7 +236,7 @@ There is no active per-job-kind hard timeout today. The hard timeout is the queu
 
 Set `run_at` when enqueueing a job that should not be claimable yet. Awa stores that row in the deferred backlog and the maintenance leader promotes it to the ready ring once `run_at <= now()`.
 
-Retry backoff and `Snooze` use the same mechanism: the current attempt closes, a retryable row is written with its next `run_at`, and promotion makes it ready again later. Cron schedules are producers on top of the same enqueue path; a cron fire atomically records the schedule fire and inserts the resulting job.
+Retry backoff and `Snooze` use the same mechanism: the current attempt closes, a deferred row is written with its next `run_at` (`retryable` for backoff and `RetryAfter`, `scheduled` for a snooze), and promotion makes it ready again later. Cron schedules are producers on top of the same enqueue path; a cron fire atomically records the schedule fire and inserts the resulting job.
 
 Operational knobs:
 
