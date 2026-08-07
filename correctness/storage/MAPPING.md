@@ -105,7 +105,7 @@ The TLA+ lifecycle model does not represent the completed-history rollup cache, 
 
 ## Storage-transition model mapping
 
-`AwaStorageTransition.tla` maps to the transition SQL in `awa-model/migrations/v010_storage_transition_prep.sql`, `awa-model/migrations/v012_queue_storage_compat.sql`, the executor gate in `awa-model/migrations/v014_storage_transition_role.sql`, and the narrowed finalization gate in `awa-model/migrations/v040_finalize_with_drain_runtimes.sql`, plus the worker role/effective-storage resolution in `awa-worker/src/client.rs`.
+`AwaStorageTransition.tla` maps to the transition SQL in `awa-model/migrations/v010_storage_transition_prep.sql`, `awa-model/migrations/v012_queue_storage_compat.sql`, the executor gate in `awa-model/migrations/v014_storage_transition_role.sql`, and the narrowed finalization gate in `awa-model/migrations/v040_finalize_with_drain_runtimes.sql`, plus the worker role/effective-storage resolution in `awa-worker/src/client.rs` and the cross-plane attempt re-schedule in `awa-model/src/reschedule.rs`.
 
 | TLA+ variable / action | Rust / SQL equivalent |
 | --- | --- |
@@ -121,11 +121,20 @@ The TLA+ lifecycle model does not represent the completed-history rollup cache, 
 | `EnterMixedTransition` | `awa.storage_enter_mixed_transition()` and insertion of `runtime_storage_backends('queue_storage', schema)` |
 | `ProducerEnqueueCanonical` | `insert_job_compat()` path before `active_queue_storage_schema()` is set |
 | `ProducerEnqueueQueueStorage` | `insert_job_compat()` path after mixed transition activates the queue-storage backend |
-| `DrainCanonical` | canonical-drain workers continuing to complete `jobs_hot` / `scheduled_jobs` backlog |
+| `DrainCanonical` | canonical-drain workers continuing to complete ordinary `jobs_hot` / `scheduled_jobs` backlog. The model reserves one outstanding row as the worst-case handler that always re-schedules and therefore cannot complete |
+| `MigrateCanonicalRescheduleToQueueStorage` | `reschedule_canonical_attempt_tx()` on the `Some(schema)` branch: consume the guarded canonical row and record one fresh-id queue-storage disposition. The ordinary outcome is `{schema}.deferred_jobs`; if a newer duplicate owns a claim required by the destination state, the outcome is a cancelled `{schema}.done_entries` row with no executable successor and the newer holder keeps the claim |
 | `Finalize` | `awa.storage_finalize()`: requires `canonical_live_backlog() = 0` and no live `canonical` runtimes; v040 permits idle `canonical_drain_only` runtimes to remain |
 | `AbortMixed` | `awa.storage_abort()`: rejects rollback while live `queue_storage` runtimes or queue-storage rows exist |
 
 The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate property, not a permanent liveness invariant: a queue-storage target can stop after the transition. As of v014 the SQL gate enforces `transition_role = 'queue_storage_target' AND storage_capability = 'queue_storage'`, which is the same property `LiveQueueExecutor > 0` expresses in the model. V040 then permits pre-flip auto runtimes to remain drain-only through finalization once the canonical backlog is empty; producer routing is already queue-storage-only in both `mixed_transition` and `active`. `AwaStorageTransition.cfg` (with `RequireQueueExecutorOnEnter = TRUE`) is the configuration that matches production. `AwaStorageTransitionCurrentGate.cfg` is retained as a historical reproducer of the pre-v014 gap, where `storage_capability = 'queue_storage'` alone was used and the `MixedHasQueueExecutor` invariant could fail because an `autoPreMixedLive` runtime satisfied the gate pre-flip and downgraded to drain-only post-flip.
+
+### Cross-plane attempt re-schedule (#456)
+
+`MigrateCanonicalRescheduleToQueueStorage` is one atomic TLA+ step that decrements `canonicalBacklog` and increments `queueRows`. Here `queueRows` means any queue-storage row relevant to the abort interlock, including deferred work and cancelled terminal evidence. The implementation earns that atomicity by taking `FOR SHARE` on the transition singleton before choosing routing and recording either disposition; abort and finalize take `FOR UPDATE` on the same row.
+
+`MixedTransitionCanReduceCanonicalBacklog` checks the perpetual-snoozer drain obligation. `AwaStorageTransitionRescheduleStaysCanonical.cfg` retains the historical write-back behavior and must violate that invariant. `RescheduleMigrationConservesWork` checks that one guarded canonical row becomes exactly one queue-storage disposition.
+
+[`AwaMigratedRescheduleUnique.tla`](AwaMigratedRescheduleUnique.tla) refines the aggregate counter model at the claim boundary. If the destination state claims uniqueness and a newer duplicate owns the key, the old attempt converges to `cancelled`, the newer holder wins, and `NoUnclaimedExecutable` forbids the historical deferred-without-claim outcome. Its broken config is the expected counterexample for that bug.
 
 ## Local runtime note
 
@@ -135,7 +144,7 @@ The TLA+ storage model does not represent local worker-capacity accounting. Rust
 
 The TLA+ storage model treats `EnqueueReady` and `EnqueueDeferred` as logical per-job state transitions. Rust may batch the SQL implementation of producer side effects: allocating a contiguous lane sequence range, syncing enqueue-time `job_unique_claims` with one array-backed statement, and inserting rows with multi-row `INSERT` or COPY. Those batching choices refine the same logical actions as long as they commit in the same transaction as the ready/deferred append.
 
-Uniqueness itself is intentionally outside this storage model: duplicate rejection is covered by Rust integration tests around `job_unique_claims`. The model's enqueue preconditions start after a job has been admitted to the storage state, so batching uniqueness claims changes implementation granularity rather than the modeled lifecycle, lane, lease, or prune invariants.
+General enqueue uniqueness remains outside `AwaSegmentedStorage`: duplicate rejection is covered by Rust integration tests around `job_unique_claims`. The focused `AwaMigratedRescheduleUnique` model covers the transition-time claim conflict because it determines whether the migrated disposition is executable deferred work or cancelled terminal evidence.
 
 ## Partitioned queue routing note
 

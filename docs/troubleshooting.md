@@ -147,7 +147,7 @@ Failed to rescue stale heartbeat jobs, error: ... duplicate key value violates u
 Failed to rescue deadline-expired jobs, error: ... duplicate key value violates unique constraint "idx_awa_jobs_unique"
 ```
 
-Cause: a unique job whose `unique_states` mask excludes `running` was stuck running (holding no claim), a newer duplicate took the claim, and the rescue transition back into a claiming state conflicts. Since 0.6.1 both engines degrade row-at-a-time: the conflicted job is cancelled with a `rescued as duplicate` error entry (the claim holder wins) and everything else rescues normally, so the log appears at most once per conflicted job. On 0.6.0 the whole batched sweep aborted every tick — upgrade, or clear the conflict by hand:
+Cause: a unique job whose `unique_states` mask excludes `running` was running without a claim, a newer duplicate took the key, and the old attempt then tried to enter a claiming state. Rescue reports this as `rescued as duplicate`. During a storage transition, snooze/retry migration reports the same race as `rescheduled as duplicate`. In both fixed paths the old attempt becomes cancelled terminal evidence, never executable work, and the newer claim holder wins. Since 0.6.1 rescue degrades row-at-a-time; the transition-time reschedule behavior is fixed by [#456](https://github.com/hardbyte/awa/issues/456). On affected older builds the whole rescue batch can abort every tick, or a migrated successor can lose its claim — upgrade rather than deleting a live claim by hand:
 
 ```sql
 SELECT j.id AS stuck_job, j.kind, j.queue, j.unique_key,
@@ -158,9 +158,9 @@ LEFT JOIN awa.jobs h ON h.id = c.job_id
 WHERE j.state = 'running';
 ```
 
-Cancel the `stuck_job` (cancelled is outside the default mask, so the transition succeeds), or delete the claim row if its holder no longer exists.
+Cancel the `stuck_job` (cancelled is outside the default mask, so the transition succeeds). Delete a claim row only after proving its recorded holder no longer exists; deleting a live holder's claim admits a duplicate.
 
-Prevention: on the canonical engine, choose `unique_states` masks that are *closed under runtime transitions* — retry/rescue move `running -> retryable`, promotion moves `retryable -> available` and `scheduled -> available`. A mask a transition can enter from outside (e.g. `{scheduled, available, retryable}` without `running`) means any stuck-then-superseded job ends in a fallback cancellation. `{}` (no dedup) and the full non-terminal set `{scheduled, available, running, retryable}` are always safe; pair the full mask with a short `by_period` bucket if you need "a change during a run still gets a fresh run" semantics.
+Prevention: choose `unique_states` masks that are *closed under runtime transitions* — retry/rescue move `running -> retryable`, snooze moves `running -> scheduled`, and promotion moves `retryable -> available` or `scheduled -> available`. A mask a transition can enter from outside (for example `{scheduled, available, retryable}` without `running`) intentionally permits a newer enqueue during execution, so the superseded old attempt can end in a fallback cancellation. `{}` (no dedup) and the full non-terminal set `{scheduled, available, running, retryable}` avoid that race; pair the full mask with a short `by_period` bucket if you need "a change during a run still gets a fresh run" semantics.
 
 ## Producer Enqueue Is Slower Than Expected
 

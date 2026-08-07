@@ -11,7 +11,8 @@ EXTENDS TLC, Naturals, FiniteSets
 
 CONSTANTS MaxCanonicalBacklog,
           MaxQueueRows,
-          RequireQueueExecutorOnEnter
+          RequireQueueExecutorOnEnter,
+          RescheduleStaysCanonical
 
 States == {"canonical", "prepared", "mixed_transition", "active"}
 Engines == {"canonical", "queue_storage", "none"}
@@ -64,6 +65,12 @@ LiveQueueCapability ==
     + IF state \in {"canonical", "prepared"}
         THEN autoPreMixedLive
         ELSE 0
+
+\* Worst-case #456 workload: when any canonical backlog exists, reserve one
+\* row as a handler that always re-schedules. `DrainCanonical` cannot complete
+\* that row; only its re-schedule can remove it from the canonical plane.
+SnoozeCount ==
+    IF canonicalBacklog > 0 THEN 1 ELSE 0
 
 \* Runtimes that will actually execute queue-storage work immediately after
 \* the routing flip.
@@ -348,8 +355,10 @@ ProducerEnqueueQueueStorage ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor>>
 
+\* Completion of ordinary canonical work. The reserved perpetual snoozer is
+\* excluded because it never completes.
 DrainCanonical ==
-    /\ canonicalBacklog > 0
+    /\ canonicalBacklog > SnoozeCount
     /\ LiveDrainCapability > 0
     /\ canonicalBacklog' = canonicalBacklog - 1
     /\ UNCHANGED <<state,
@@ -378,6 +387,35 @@ CompleteQueueStorage ==
                    explicitDrainLive,
                    mixedEntryHadQueueExecutor>>
 
+\* #456: after routing flips, a canonical attempt that re-schedules records
+\* exactly one fresh-id queue-storage disposition. Ordinarily it is deferred
+\* executable work. If a newer duplicate owns a required unique claim, it is
+\* cancelled terminal evidence instead. `queueRows` counts both families, so
+\* either outcome decrements canonicalBacklog and increments queueRows. The
+\* claim-level choice is checked in AwaMigratedRescheduleUnique.tla.
+\*
+\* With RescheduleStaysCanonical = TRUE the historical write back to
+\* canonical scheduled_jobs is modeled as a stutter, preserving the drain
+\* wedge as an expected counterexample.
+MigrateCanonicalRescheduleToQueueStorage ==
+    /\ ActiveEngine = "queue_storage"
+    /\ LiveDrainCapability > 0
+    /\ canonicalBacklog > 0
+    /\ IF RescheduleStaysCanonical
+         THEN UNCHANGED vars
+         ELSE /\ queueRows < MaxQueueRows
+              /\ canonicalBacklog' = canonicalBacklog - 1
+              /\ queueRows' = queueRows + 1
+              /\ UNCHANGED <<state,
+                             currentEngine,
+                             preparedEngine,
+                             preparedSchemaReady,
+                             oldCanonicalLive,
+                             autoPreMixedLive,
+                             queueTargetLive,
+                             explicitDrainLive,
+                             mixedEntryHadQueueExecutor>>
+
 Stutter == UNCHANGED vars
 
 Next ==
@@ -399,6 +437,7 @@ Next ==
     \/ ProducerEnqueueQueueStorage
     \/ DrainCanonical
     \/ CompleteQueueStorage
+    \/ MigrateCanonicalRescheduleToQueueStorage
     \/ Stutter
 
 Spec == Init /\ [][Next]_vars
@@ -439,5 +478,31 @@ MixedHasQueueExecutor ==
 
 AbortMixedKeepsCanonicalIfQueueStorageUnused ==
     state = "canonical" /\ currentEngine = "canonical" => queueRows = 0
+
+\* The cross-plane disposition cannot appear while routing is canonical. The
+\* implementation provides this atomicity by holding FOR SHARE on the
+\* transition singleton against abort/finalize's FOR UPDATE lock.
+NoQueueRowsUnderCanonicalRouting ==
+    ActiveEngine = "canonical" => queueRows = 0
+
+\* In mixed transition, a live drain runtime can reduce any backlog: ordinary
+\* rows complete, while the reserved perpetual snoozer leaves the canonical
+\* plane through the re-schedule disposition.
+CanonicalBacklogReducible ==
+    \/ canonicalBacklog > SnoozeCount
+    \/ /\ canonicalBacklog > 0
+       /\ ~RescheduleStaysCanonical
+       /\ ActiveEngine = "queue_storage"
+
+MixedTransitionCanReduceCanonicalBacklog ==
+    (/\ state = "mixed_transition"
+     /\ canonicalBacklog > 0
+     /\ LiveDrainCapability > 0) => CanonicalBacklogReducible
+
+\* One guarded canonical row becomes exactly one queue-storage disposition,
+\* either deferred work or cancelled terminal evidence.
+RescheduleMigrationConservesWork ==
+    [][MigrateCanonicalRescheduleToQueueStorage =>
+         canonicalBacklog' + queueRows' = canonicalBacklog + queueRows]_vars
 
 =============================================================================
