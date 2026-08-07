@@ -36,7 +36,7 @@ The runtime is three cooperating layers:
 
 The important ownership split is simple: every worker can dispatch and heartbeat its own attempts, but exactly one elected maintenance leader runs cluster-wide promotion, rescue, queue/lease/claim ring rotation and prune, DLQ cleanup, descriptor cleanup, cron evaluation, metadata refresh, and queue-health publication.
 
-While a storage transition is unfinalized, the leader promotes the deferred backlog of *both* planes regardless of which engine it resolved at startup, so a drain cannot stall on which runtime happens to hold the lock ([#456](https://github.com/hardbyte/awa/issues/456)). Both extra passes are no-ops once the cluster is finalized.
+While a storage transition is unfinalized, the leader promotes the deferred backlog and runs the rescue sweeps of *both* planes regardless of which engine it resolved at startup, so a drain cannot stall — and mid-flight jobs cannot wedge — on which runtime happens to hold the lock ([#456](https://github.com/hardbyte/awa/issues/456)). The extra passes are no-ops once the cluster is finalized.
 
 ## Deployment Model
 

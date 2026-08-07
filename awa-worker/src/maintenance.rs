@@ -33,79 +33,144 @@ fn is_unique_claim_conflict(err: &awa_model::AwaError) -> bool {
     }
 }
 
-/// Single-row variants of the batched canonical rescue UPDATEs, used by the
-/// #388 fallback. Bodies mirror the batch statements exactly; only the WHERE
-/// clause narrows to one id (re-checking the staleness predicate so a row
-/// that recovered between selection and update is left alone).
+/// Canonical rescue statements write the physical tables directly — the
+/// same `DELETE` from `awa.jobs_hot` + `INSERT` into `awa.scheduled_jobs`
+/// move the `awa.jobs` view's canonical UPDATE branch performs. The view
+/// itself is unusable here: once routing has flipped it exposes (and
+/// raises on writes to) only the queue-storage plane, while stuck
+/// canonical rows must keep being rescued until finalize (#456). The
+/// table triggers keep unique claims and admin dirty keys in sync, so the
+/// #388 unique-claim conflict semantics are unchanged.
+///
+/// Single-row variants of the batched canonical rescue statements, used by
+/// the #388 fallback. Bodies mirror the batch statements exactly; only the
+/// WHERE clause narrows to one id (re-checking the staleness predicate so a
+/// row that recovered between selection and update is left alone).
 const HEARTBEAT_RESCUE_PER_ROW_SQL: &str = r#"
-    UPDATE awa.jobs
-    SET state = 'retryable',
-        finalized_at = now(),
-        heartbeat_at = NULL,
-        deadline_at = NULL,
-        callback_id = NULL,
-        callback_timeout_at = NULL,
-        callback_filter = NULL,
-        callback_on_complete = NULL,
-        callback_on_fail = NULL,
-        callback_transform = NULL,
-        errors = errors || jsonb_build_object(
+    WITH deleted AS (
+        DELETE FROM awa.jobs_hot
+        WHERE id = $1
+          AND state = 'running'
+          AND heartbeat_at < now() - ($2 * interval '1 millisecond')
+        RETURNING *
+    )
+    INSERT INTO awa.scheduled_jobs (
+        id, kind, queue, args, state, priority, attempt, max_attempts,
+        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+        created_at, errors, metadata, tags, unique_key, unique_states,
+        callback_id, callback_timeout_at, callback_filter,
+        callback_on_complete, callback_on_fail, callback_transform,
+        run_lease, progress
+    )
+    SELECT
+        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+        run_at, NULL, NULL, attempted_at, now(),
+        created_at,
+        errors || jsonb_build_object(
             'error', 'heartbeat stale: worker presumed dead',
             'attempt', attempt,
             'at', now()
-        )::jsonb
-    WHERE id = $1
-      AND state = 'running'
-      AND heartbeat_at < now() - ($2 * interval '1 millisecond')
+        )::jsonb,
+        metadata, tags, unique_key, unique_states,
+        NULL, NULL, NULL, NULL, NULL, NULL,
+        run_lease, progress
+    FROM deleted
     RETURNING *
 "#;
 
 const DEADLINE_RESCUE_PER_ROW_SQL: &str = r#"
-    UPDATE awa.jobs
-    SET state = 'retryable',
-        finalized_at = now(),
-        heartbeat_at = NULL,
-        deadline_at = NULL,
-        callback_id = NULL,
-        callback_timeout_at = NULL,
-        callback_filter = NULL,
-        callback_on_complete = NULL,
-        callback_on_fail = NULL,
-        callback_transform = NULL,
-        errors = errors || jsonb_build_object(
+    WITH deleted AS (
+        DELETE FROM awa.jobs_hot
+        WHERE id = $1
+          AND state = 'running'
+          AND deadline_at IS NOT NULL
+          AND deadline_at < now()
+        RETURNING *
+    )
+    INSERT INTO awa.scheduled_jobs (
+        id, kind, queue, args, state, priority, attempt, max_attempts,
+        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+        created_at, errors, metadata, tags, unique_key, unique_states,
+        callback_id, callback_timeout_at, callback_filter,
+        callback_on_complete, callback_on_fail, callback_transform,
+        run_lease, progress
+    )
+    SELECT
+        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+        run_at, NULL, NULL, attempted_at, now(),
+        created_at,
+        errors || jsonb_build_object(
             'error', 'hard deadline exceeded',
             'attempt', attempt,
             'at', now()
-        )::jsonb
-    WHERE id = $1
-      AND state = 'running'
-      AND deadline_at IS NOT NULL
-      AND deadline_at < now()
+        )::jsonb,
+        metadata, tags, unique_key, unique_states,
+        NULL, NULL, NULL, NULL, NULL, NULL,
+        run_lease, progress
+    FROM deleted
     RETURNING *
 "#;
 
 const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
-    UPDATE awa.jobs
-    SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
-        finalized_at = now(),
-        callback_id = NULL,
-        callback_timeout_at = NULL,
-        callback_filter = NULL,
-        callback_on_complete = NULL,
-        callback_on_fail = NULL,
-        callback_transform = NULL,
-        run_at = CASE WHEN attempt >= max_attempts THEN run_at
-                 ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
-        errors = errors || jsonb_build_object(
-            'error', 'callback timed out',
-            'attempt', attempt,
-            'at', now()
-        )::jsonb
-    WHERE id = $1
-      AND state = 'waiting_external'
-      AND callback_timeout_at IS NOT NULL
-      AND callback_timeout_at < now()
-    RETURNING *
+    WITH candidate AS (
+        SELECT id, attempt, max_attempts FROM awa.jobs_hot
+        WHERE id = $1
+          AND state = 'waiting_external'
+          AND callback_timeout_at IS NOT NULL
+          AND callback_timeout_at < now()
+        FOR UPDATE
+    ),
+    failed AS (
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            callback_filter = NULL,
+            callback_on_complete = NULL,
+            callback_on_fail = NULL,
+            callback_transform = NULL,
+            errors = errors || jsonb_build_object(
+                'error', 'callback timed out',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (SELECT id FROM candidate WHERE attempt >= max_attempts)
+        RETURNING *
+    ),
+    deleted AS (
+        DELETE FROM awa.jobs_hot
+        WHERE id IN (SELECT id FROM candidate WHERE attempt < max_attempts)
+        RETURNING *
+    ),
+    moved AS (
+        INSERT INTO awa.scheduled_jobs (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+            now() + awa.backoff_duration(attempt, max_attempts),
+            heartbeat_at, deadline_at, attempted_at, now(),
+            created_at,
+            errors || jsonb_build_object(
+                'error', 'callback timed out',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb,
+            metadata, tags, unique_key, unique_states,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            run_lease, progress
+        FROM deleted
+        RETURNING *
+    )
+    SELECT * FROM failed
+    UNION ALL
+    SELECT * FROM moved
 "#;
 
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
@@ -1445,28 +1510,46 @@ impl MaintenanceService {
     }
 
     /// Rescue jobs with stale heartbeats (crash detection).
+    ///
+    /// #456 mirror: during a mixed transition either engine's leader must
+    /// sweep both planes — stuck canonical rows would otherwise pin
+    /// `canonical_live_backlog` above zero and wedge `finalize --wait`,
+    /// and stuck queue-storage rows would wait out a drain-only leader.
+    /// Both cross-plane sweeps are cheap no-ops once their tables are empty.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
     async fn rescue_stale_heartbeats(&self) {
+        match &self.storage {
+            RuntimeStorage::Canonical => {
+                let outcome = self.rescue_canonical_stale_heartbeats().await;
+                self.process_heartbeat_rescues(outcome, true).await;
+                if let Some(runtime) = self.active_standby_queue_storage().await {
+                    let outcome = runtime
+                        .store
+                        .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
+                        .await;
+                    self.process_heartbeat_rescues(outcome, false).await;
+                }
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                let outcome = runtime
+                    .store
+                    .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
+                    .await;
+                self.process_heartbeat_rescues(outcome, true).await;
+                let outcome = self.rescue_canonical_stale_heartbeats().await;
+                self.process_heartbeat_rescues(outcome, false).await;
+            }
+        }
+    }
+
+    /// Batched canonical stale-heartbeat rescue with the #388 row-at-a-time
+    /// fallback on unique-claim conflict.
+    async fn rescue_canonical_stale_heartbeats(&self) -> Result<Vec<JobRow>, awa_model::AwaError> {
         let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
-        let outcome = match &self.storage {
-            RuntimeStorage::Canonical => sqlx::query_as::<_, JobRow>(
-                r#"
-                    UPDATE awa.jobs
-                    SET state = 'retryable',
-                        finalized_at = now(),
-                        heartbeat_at = NULL,
-                        deadline_at = NULL,
-                        callback_id = NULL,
-                        callback_timeout_at = NULL,
-                        callback_filter = NULL,
-                        callback_on_complete = NULL,
-                        callback_on_fail = NULL,
-                        callback_transform = NULL,
-                        errors = errors || jsonb_build_object(
-                            'error', 'heartbeat stale: worker presumed dead',
-                            'attempt', attempt,
-                            'at', now()
-                        )::jsonb
+        let outcome = sqlx::query_as::<_, JobRow>(
+            r#"
+                WITH deleted AS (
+                    DELETE FROM awa.jobs_hot
                     WHERE id IN (
                         SELECT id FROM awa.jobs_hot
                         WHERE state = 'running'
@@ -1475,24 +1558,37 @@ impl MaintenanceService {
                         FOR UPDATE SKIP LOCKED
                     )
                     RETURNING *
-                    "#,
-            )
-            .bind(staleness_ms)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(awa_model::AwaError::Database),
-            RuntimeStorage::QueueStorage(runtime) => {
-                runtime
-                    .store
-                    .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
-                    .await
-            }
-        };
-        let outcome = match outcome {
-            Err(err)
-                if matches!(self.storage, RuntimeStorage::Canonical)
-                    && is_unique_claim_conflict(&err) =>
-            {
+                )
+                INSERT INTO awa.scheduled_jobs (
+                    id, kind, queue, args, state, priority, attempt, max_attempts,
+                    run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                    created_at, errors, metadata, tags, unique_key, unique_states,
+                    callback_id, callback_timeout_at, callback_filter,
+                    callback_on_complete, callback_on_fail, callback_transform,
+                    run_lease, progress
+                )
+                SELECT
+                    id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+                    run_at, NULL, NULL, attempted_at, now(),
+                    created_at,
+                    errors || jsonb_build_object(
+                        'error', 'heartbeat stale: worker presumed dead',
+                        'attempt', attempt,
+                        'at', now()
+                    )::jsonb,
+                    metadata, tags, unique_key, unique_states,
+                    NULL, NULL, NULL, NULL, NULL, NULL,
+                    run_lease, progress
+                FROM deleted
+                RETURNING *
+                "#,
+        )
+        .bind(staleness_ms)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(awa_model::AwaError::Database);
+        match outcome {
+            Err(err) if is_unique_claim_conflict(&err) => {
                 warn!(
                     error = %err,
                     "Batched heartbeat rescue hit a unique-claim conflict; retrying row-at-a-time (#388)"
@@ -1511,14 +1607,30 @@ impl MaintenanceService {
                 .await
             }
             other => other,
-        };
+        }
+    }
+
+    /// Metrics, cancellation signalling, and lifecycle events for one
+    /// plane's stale-heartbeat rescue outcome. `signal_local` is false for
+    /// the cross-plane sweep: those jobs never execute on this worker, and
+    /// the planes' id sequences are independent, so an `(id, run_lease)`
+    /// match in the in-flight map would flag an unrelated local job.
+    async fn process_heartbeat_rescues(
+        &self,
+        outcome: Result<Vec<JobRow>, awa_model::AwaError>,
+        signal_local: bool,
+    ) {
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
                 let (cancelled_duplicates, rescued): (Vec<_>, Vec<_>) = rescued
                     .into_iter()
                     .partition(|job| job.state == JobState::Cancelled);
-                self.handle_duplicate_cancellations("heartbeat", &cancelled_duplicates)
-                    .await;
+                self.handle_duplicate_cancellations(
+                    "heartbeat",
+                    &cancelled_duplicates,
+                    signal_local,
+                )
+                .await;
                 if rescued.is_empty() {
                     return;
                 }
@@ -1528,7 +1640,9 @@ impl MaintenanceService {
                 );
                 warn!(count = rescued.len(), "Rescued stale heartbeat jobs");
                 // Signal cancellation to any rescued jobs still running on this instance
-                self.signal_cancellation(&rescued).await;
+                if signal_local {
+                    self.signal_cancellation(&rescued).await;
+                }
                 for job in &rescued {
                     self.emit_rescued(job, crate::events::RescueReason::StaleHeartbeat)
                         .await;
@@ -1541,28 +1655,57 @@ impl MaintenanceService {
         }
     }
 
+    /// The standby queue-storage runtime, but only once routing has flipped
+    /// to its schema — the same guard as the promote mirror in
+    /// [`Self::promote_due_state`].
+    async fn active_standby_queue_storage(&self) -> Option<&QueueStorageRuntime> {
+        let runtime = self.standby_queue_storage.as_ref()?;
+        match sqlx::query_scalar::<_, Option<String>>("SELECT awa.active_queue_storage_schema()")
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(active_schema) if active_schema.as_deref() == Some(runtime.store.schema()) => {
+                Some(runtime)
+            }
+            Ok(_) => None,
+            Err(err) => {
+                error!(error = %err, "Failed to resolve the active queue-storage schema");
+                None
+            }
+        }
+    }
+
     /// Rescue jobs that exceeded their hard deadline.
+    ///
+    /// #456 mirror: sweeps both storage planes; see
+    /// [`Self::rescue_stale_heartbeats`].
     #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
     async fn rescue_expired_deadlines(&self) {
-        let outcome = match &self.storage {
-            RuntimeStorage::Canonical => sqlx::query_as::<_, JobRow>(
-                r#"
-                UPDATE awa.jobs
-                SET state = 'retryable',
-                    finalized_at = now(),
-                    heartbeat_at = NULL,
-                    deadline_at = NULL,
-                    callback_id = NULL,
-                    callback_timeout_at = NULL,
-                    callback_filter = NULL,
-                    callback_on_complete = NULL,
-                    callback_on_fail = NULL,
-                    callback_transform = NULL,
-                    errors = errors || jsonb_build_object(
-                        'error', 'hard deadline exceeded',
-                        'attempt', attempt,
-                        'at', now()
-                    )::jsonb
+        match &self.storage {
+            RuntimeStorage::Canonical => {
+                let outcome = self.rescue_canonical_expired_deadlines().await;
+                self.process_deadline_rescues(outcome, true).await;
+                if let Some(runtime) = self.active_standby_queue_storage().await {
+                    let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
+                    self.process_deadline_rescues(outcome, false).await;
+                }
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
+                self.process_deadline_rescues(outcome, true).await;
+                let outcome = self.rescue_canonical_expired_deadlines().await;
+                self.process_deadline_rescues(outcome, false).await;
+            }
+        }
+    }
+
+    /// Batched canonical deadline rescue with the #388 row-at-a-time
+    /// fallback on unique-claim conflict.
+    async fn rescue_canonical_expired_deadlines(&self) -> Result<Vec<JobRow>, awa_model::AwaError> {
+        let outcome = sqlx::query_as::<_, JobRow>(
+            r#"
+            WITH deleted AS (
+                DELETE FROM awa.jobs_hot
                 WHERE id IN (
                     SELECT id FROM awa.jobs_hot
                     WHERE state = 'running'
@@ -1572,20 +1715,36 @@ impl MaintenanceService {
                     FOR UPDATE SKIP LOCKED
                 )
                 RETURNING *
-                "#,
             )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(awa_model::AwaError::Database),
-            RuntimeStorage::QueueStorage(runtime) => {
-                runtime.store.rescue_expired_deadlines(&self.pool).await
-            }
-        };
-        let outcome = match outcome {
-            Err(err)
-                if matches!(self.storage, RuntimeStorage::Canonical)
-                    && is_unique_claim_conflict(&err) =>
-            {
+            INSERT INTO awa.scheduled_jobs (
+                id, kind, queue, args, state, priority, attempt, max_attempts,
+                run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                created_at, errors, metadata, tags, unique_key, unique_states,
+                callback_id, callback_timeout_at, callback_filter,
+                callback_on_complete, callback_on_fail, callback_transform,
+                run_lease, progress
+            )
+            SELECT
+                id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+                run_at, NULL, NULL, attempted_at, now(),
+                created_at,
+                errors || jsonb_build_object(
+                    'error', 'hard deadline exceeded',
+                    'attempt', attempt,
+                    'at', now()
+                )::jsonb,
+                metadata, tags, unique_key, unique_states,
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                run_lease, progress
+            FROM deleted
+            RETURNING *
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(awa_model::AwaError::Database);
+        match outcome {
+            Err(err) if is_unique_claim_conflict(&err) => {
                 warn!(
                     error = %err,
                     "Batched deadline rescue hit a unique-claim conflict; retrying row-at-a-time (#388)"
@@ -1605,14 +1764,27 @@ impl MaintenanceService {
                 .await
             }
             other => other,
-        };
+        }
+    }
+
+    /// One plane's deadline rescue outcome; `signal_local` as in
+    /// [`Self::process_heartbeat_rescues`].
+    async fn process_deadline_rescues(
+        &self,
+        outcome: Result<Vec<JobRow>, awa_model::AwaError>,
+        signal_local: bool,
+    ) {
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
                 let (cancelled_duplicates, rescued): (Vec<_>, Vec<_>) = rescued
                     .into_iter()
                     .partition(|job| job.state == JobState::Cancelled);
-                self.handle_duplicate_cancellations("deadline", &cancelled_duplicates)
-                    .await;
+                self.handle_duplicate_cancellations(
+                    "deadline",
+                    &cancelled_duplicates,
+                    signal_local,
+                )
+                .await;
                 if rescued.is_empty() {
                     return;
                 }
@@ -1622,7 +1794,9 @@ impl MaintenanceService {
                 );
                 warn!(count = rescued.len(), "Rescued deadline-expired jobs");
                 // Signal cancellation so handlers see ctx.is_cancelled() == true
-                self.signal_cancellation(&rescued).await;
+                if signal_local {
+                    self.signal_cancellation(&rescued).await;
+                }
                 for job in &rescued {
                     self.emit_rescued(job, crate::events::RescueReason::DeadlineExceeded)
                         .await;
@@ -1636,13 +1810,52 @@ impl MaintenanceService {
     }
 
     /// Rescue jobs whose callback timeout has expired.
+    ///
+    /// #456 mirror: sweeps both storage planes; see
+    /// [`Self::rescue_stale_heartbeats`]. The canonical sweep matters
+    /// doubly here because callback-carrying jobs never migrate off the
+    /// canonical plane during a transition.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_callback_timeout")]
     async fn rescue_expired_callbacks(&self) {
-        let outcome = match &self.storage {
-            RuntimeStorage::Canonical => sqlx::query_as::<_, JobRow>(
-                r#"
-                UPDATE awa.jobs
-                SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
+        match &self.storage {
+            RuntimeStorage::Canonical => {
+                let outcome = self.rescue_canonical_expired_callbacks().await;
+                self.process_callback_rescues(outcome, true, None).await;
+                if let Some(runtime) = self.active_standby_queue_storage().await {
+                    let outcome = runtime.store.rescue_expired_callbacks(&self.pool).await;
+                    self.process_callback_rescues(outcome, false, Some(runtime))
+                        .await;
+                }
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                let outcome = runtime.store.rescue_expired_callbacks(&self.pool).await;
+                self.process_callback_rescues(outcome, true, Some(runtime))
+                    .await;
+                let outcome = self.rescue_canonical_expired_callbacks().await;
+                self.process_callback_rescues(outcome, false, None).await;
+            }
+        }
+    }
+
+    /// Batched canonical callback-timeout rescue with the #388
+    /// row-at-a-time fallback on unique-claim conflict. Exhausted attempts
+    /// fail in place (`failed` rows live in `jobs_hot`); the rest move to
+    /// `scheduled_jobs` as `retryable` with backoff, mirroring the view's
+    /// state-routed UPDATE.
+    async fn rescue_canonical_expired_callbacks(&self) -> Result<Vec<JobRow>, awa_model::AwaError> {
+        let outcome = sqlx::query_as::<_, JobRow>(
+            r#"
+            WITH candidates AS (
+                SELECT id, attempt, max_attempts FROM awa.jobs_hot
+                WHERE state = 'waiting_external'
+                  AND callback_timeout_at IS NOT NULL
+                  AND callback_timeout_at < now()
+                LIMIT 500
+                FOR UPDATE SKIP LOCKED
+            ),
+            failed AS (
+                UPDATE awa.jobs_hot
+                SET state = 'failed',
                     finalized_at = now(),
                     callback_id = NULL,
                     callback_timeout_at = NULL,
@@ -1650,36 +1863,54 @@ impl MaintenanceService {
                     callback_on_complete = NULL,
                     callback_on_fail = NULL,
                     callback_transform = NULL,
-                    run_at = CASE WHEN attempt >= max_attempts THEN run_at
-                             ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
                     errors = errors || jsonb_build_object(
                         'error', 'callback timed out',
                         'attempt', attempt,
                         'at', now()
                     )::jsonb
-                WHERE id IN (
-                    SELECT id FROM awa.jobs_hot
-                    WHERE state = 'waiting_external'
-                      AND callback_timeout_at IS NOT NULL
-                      AND callback_timeout_at < now()
-                    LIMIT 500
-                    FOR UPDATE SKIP LOCKED
-                )
+                WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
                 RETURNING *
-                "#,
+            ),
+            deleted AS (
+                DELETE FROM awa.jobs_hot
+                WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+                RETURNING *
+            ),
+            moved AS (
+                INSERT INTO awa.scheduled_jobs (
+                    id, kind, queue, args, state, priority, attempt, max_attempts,
+                    run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                    created_at, errors, metadata, tags, unique_key, unique_states,
+                    callback_id, callback_timeout_at, callback_filter,
+                    callback_on_complete, callback_on_fail, callback_transform,
+                    run_lease, progress
+                )
+                SELECT
+                    id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+                    now() + awa.backoff_duration(attempt, max_attempts),
+                    heartbeat_at, deadline_at, attempted_at, now(),
+                    created_at,
+                    errors || jsonb_build_object(
+                        'error', 'callback timed out',
+                        'attempt', attempt,
+                        'at', now()
+                    )::jsonb,
+                    metadata, tags, unique_key, unique_states,
+                    NULL, NULL, NULL, NULL, NULL, NULL,
+                    run_lease, progress
+                FROM deleted
+                RETURNING *
             )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(awa_model::AwaError::Database),
-            RuntimeStorage::QueueStorage(runtime) => {
-                runtime.store.rescue_expired_callbacks(&self.pool).await
-            }
-        };
-        let outcome = match outcome {
-            Err(err)
-                if matches!(self.storage, RuntimeStorage::Canonical)
-                    && is_unique_claim_conflict(&err) =>
-            {
+            SELECT * FROM failed
+            UNION ALL
+            SELECT * FROM moved
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(awa_model::AwaError::Database);
+        match outcome {
+            Err(err) if is_unique_claim_conflict(&err) => {
                 warn!(
                     error = %err,
                     "Batched callback-timeout rescue hit a unique-claim conflict; retrying row-at-a-time (#388)"
@@ -1699,14 +1930,32 @@ impl MaintenanceService {
                 .await
             }
             other => other,
-        };
+        }
+    }
+
+    /// One plane's callback-timeout rescue outcome; `signal_local` as in
+    /// [`Self::process_heartbeat_rescues`]. `dlq_runtime` is the runtime
+    /// owning the rescued rows' plane, when that plane is queue storage —
+    /// canonical rows have no DLQ, and the independent id sequences mean
+    /// routing them through a queue-storage DLQ move could hit an
+    /// unrelated job with the same id.
+    async fn process_callback_rescues(
+        &self,
+        outcome: Result<Vec<JobRow>, awa_model::AwaError>,
+        signal_local: bool,
+        dlq_runtime: Option<&QueueStorageRuntime>,
+    ) {
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
                 let (cancelled_duplicates, rescued): (Vec<_>, Vec<_>) = rescued
                     .into_iter()
                     .partition(|job| job.state == JobState::Cancelled);
-                self.handle_duplicate_cancellations("callback_timeout", &cancelled_duplicates)
-                    .await;
+                self.handle_duplicate_cancellations(
+                    "callback_timeout",
+                    &cancelled_duplicates,
+                    signal_local,
+                )
+                .await;
                 if rescued.is_empty() {
                     return;
                 }
@@ -1722,7 +1971,7 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::ExpiredCallback)
                         .await;
                 }
-                if let RuntimeStorage::QueueStorage(runtime) = &self.storage {
+                if let Some(runtime) = dlq_runtime {
                     for job in &rescued {
                         if job.state != JobState::Failed || !self.dlq_policy.enabled_for(&job.queue)
                         {
@@ -1910,8 +2159,14 @@ impl MaintenanceService {
     /// Shared handling for rescue rows that were cancelled because a newer
     /// duplicate held their unique claim (either engine): metrics, local
     /// cancellation signal, and the same terminal lifecycle event a normal
-    /// cancellation dispatches.
-    async fn handle_duplicate_cancellations(&self, rescue_kind: &str, cancelled: &[JobRow]) {
+    /// cancellation dispatches. `signal_local` as in
+    /// [`Self::process_heartbeat_rescues`].
+    async fn handle_duplicate_cancellations(
+        &self,
+        rescue_kind: &str,
+        cancelled: &[JobRow],
+        signal_local: bool,
+    ) {
         if cancelled.is_empty() {
             return;
         }
@@ -1926,7 +2181,9 @@ impl MaintenanceService {
             count = cancelled.len(),
             rescue_kind, "Cancelled unique-conflicted jobs superseded by a newer duplicate"
         );
-        self.signal_cancellation(cancelled).await;
+        if signal_local {
+            self.signal_cancellation(cancelled).await;
+        }
         for job in cancelled {
             let handlers = self.lifecycle_handlers.clone();
             let kind = job.kind.clone();
@@ -1954,7 +2211,7 @@ impl MaintenanceService {
         sqlx::query_scalar(
             r#"
             SELECT c.job_id
-            FROM awa.jobs AS j
+            FROM awa.jobs_hot AS j
             JOIN awa.job_unique_claims AS c ON c.unique_key = j.unique_key
             WHERE j.id = $1 AND c.job_id <> j.id
             "#,
@@ -1979,7 +2236,7 @@ impl MaintenanceService {
     ) -> Result<Option<JobRow>, awa_model::AwaError> {
         let row = sqlx::query_as::<_, JobRow>(
             r#"
-            UPDATE awa.jobs
+            UPDATE awa.jobs_hot
             SET state = 'cancelled',
                 finalized_at = now(),
                 heartbeat_at = NULL,
@@ -3554,6 +3811,168 @@ mod tests {
             .rollback()
             .await
             .expect("release receipt table locks");
+    }
+
+    /// #456 mirror: a queue-storage-resolved maintenance leader must keep
+    /// rescuing stuck canonical rows until finalize — the drain-only
+    /// runtimes that execute them may no longer hold leadership, and
+    /// unrescued rows pin `canonical_live_backlog` above zero.
+    ///
+    /// Runs on its own database: it holds the storage transition in
+    /// `mixed_transition` with live canonical rows, which would trip the
+    /// ADR-037 migrate gate for tests sharing the default database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_storage_leader_rescues_canonical_plane() {
+        let base_url = database_url();
+        let url = format!("{}_rescue_mirror", base_url.trim_end_matches('/'));
+        ensure_database_exists(&url).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .expect("Failed to connect to rescue-mirror test database");
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("migrations should succeed");
+
+        let store = QueueStorage::new(QueueStorageConfig::default()).expect("queue storage");
+        store.install(&pool).await.expect("queue storage install");
+
+        // A fresh install auto-finalizes straight to queue storage, but the
+        // scenario under test is a *mixed transition*: canonical rows still
+        // live while routing has flipped. Rewind to canonical, seed the
+        // stuck rows, then drive prepare → mixed_transition the way the
+        // staged-upgrade SQL does.
+        sqlx::query(
+            r#"
+            UPDATE awa.storage_transition_state
+            SET current_engine = 'canonical',
+                prepared_engine = NULL,
+                state = 'canonical',
+                transition_epoch = transition_epoch + 1,
+                details = '{}'::jsonb,
+                updated_at = now(),
+                finalized_at = NULL
+            WHERE singleton
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("rewind transition state to canonical");
+
+        // A canonical job whose worker died mid-run…
+        let stale_running: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO awa.jobs_hot (kind, queue, state, attempt, heartbeat_at, attempted_at)
+            VALUES ('rescue_mirror', 'rescue_mirror_q', 'running', 1, now() - interval '1 hour', now())
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed stale canonical running job");
+
+        // …and one parked on a callback that has timed out. Callback-carrying
+        // jobs never migrate off the canonical plane during a transition, so
+        // this sweep has no other owner once drain-only runtimes lose
+        // leadership.
+        let expired_callback: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO awa.jobs_hot (
+                kind, queue, state, attempt, attempted_at,
+                callback_id, callback_timeout_at
+            )
+            VALUES (
+                'rescue_mirror', 'rescue_mirror_q', 'waiting_external', 1, now(),
+                gen_random_uuid(), now() - interval '1 hour'
+            )
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed expired-callback canonical job");
+
+        sqlx::query(
+            r#"
+            INSERT INTO awa.runtime_instances (
+                instance_id, hostname, pid, version, storage_capability,
+                transition_role, started_at, last_seen_at, snapshot_interval_ms,
+                healthy, postgres_connected, poll_loop_alive, heartbeat_alive,
+                maintenance_alive, shutting_down, leader, global_max_workers,
+                queues, queue_descriptor_hashes, job_kind_descriptor_hashes
+            )
+            VALUES (
+                gen_random_uuid(), 'rescue-mirror-test', 0, '0.0.0-test',
+                'queue_storage', 'queue_storage_target',
+                now(), now(), 5000, TRUE, TRUE, TRUE, TRUE, TRUE,
+                FALSE, FALSE, 1,
+                '[]'::jsonb, '[]'::jsonb, '[]'::jsonb
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("stamp queue_storage_target runtime");
+        sqlx::query("SELECT awa.storage_prepare('queue_storage', '{\"schema\": \"awa\"}'::jsonb)")
+            .execute(&pool)
+            .await
+            .expect("storage_prepare");
+        sqlx::query("SELECT awa.storage_enter_mixed_transition()")
+            .execute(&pool)
+            .await
+            .expect("storage_enter_mixed_transition");
+
+        let runtime = crate::storage::QueueStorageRuntime::new(
+            QueueStorageConfig::default(),
+            Duration::from_millis(1000),
+            Duration::from_millis(250),
+        )
+        .expect("queue storage runtime");
+        let service = MaintenanceService::new(
+            pool.clone(),
+            metrics_for_test(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            CancellationToken::new(),
+            Arc::new(Vec::new()),
+            InFlightMap::default(),
+            RuntimeStorage::QueueStorage(runtime),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+        );
+
+        service.rescue_stale_heartbeats().await;
+        service.rescue_expired_callbacks().await;
+
+        // Post-flip the `awa.jobs` view exposes only the queue-storage
+        // plane, so assert against the physical canonical tables: both
+        // rescues move `retryable` rows into `scheduled_jobs`.
+        let state: String =
+            sqlx::query_scalar("SELECT state::text FROM awa.scheduled_jobs WHERE id = $1")
+                .bind(stale_running)
+                .fetch_one(&pool)
+                .await
+                .expect("read rescued stale-heartbeat job");
+        assert_eq!(state, "retryable");
+
+        let (state, callback_id): (String, Option<uuid::Uuid>) =
+            sqlx::query_as("SELECT state::text, callback_id FROM awa.scheduled_jobs WHERE id = $1")
+                .bind(expired_callback)
+                .fetch_one(&pool)
+                .await
+                .expect("read rescued callback job");
+        assert_eq!(state, "retryable");
+        assert_eq!(callback_id, None, "rescue must clear the callback park");
+
+        let leftover: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM awa.jobs_hot WHERE kind = 'rescue_mirror'")
+                .fetch_one(&pool)
+                .await
+                .expect("count leftover canonical hot rows");
+        assert_eq!(leftover, 0, "no stuck canonical rows may remain");
     }
 
     #[test]
