@@ -214,6 +214,72 @@ Other PostgreSQL features used at runtime:
 | `COPY ... FROM STDIN` | Bulk insert path | `TEMP` on database |
 | `FOR UPDATE SKIP LOCKED` | Non-blocking job claiming | `SELECT`, `UPDATE` on table |
 
+## Planned caller-owned finalization role (ADR-042)
+
+> **Accepted design for 0.7; not shipped in the current release.** This section records the
+> privilege boundary the implementation and migration must satisfy.
+
+The #401 implementation owns the narrow ADR-043 substrate required to make that boundary strict in
+0.7: a pre-provisioned bounded execution owner, the exact `complete_job` manifest entry, transactional
+ownership transfer and `PUBLIC` revocation, the application-role grant, and `awa doctor` validation.
+The broader producer/executor/maintenance/admin capability split remains deferred under #452.
+
+The generic ownership-transfer examples above describe today's broad-grant profile. Once the
+strict capability profile ships, its generated ownership manifest must exclude `complete_job` and
+other bounded-owner definers from blanket transfer to `awa_owner`; `awa doctor` treats such a
+transfer as strict-profile drift.
+
+Strict validation also audits the complete PostgreSQL role graph. It follows both transitive
+inherited privileges and nested `SET ROLE` paths from every runtime, application, callback, and
+admin login, and rejects any non-allowlisted path to the bounded execution owner, migrator, schema
+owner, or a role that can reach them. Direct-membership checks alone are not sufficient. The
+conformance matrix runs this audit on the oldest and newest supported PostgreSQL majors — a pair
+that straddles PostgreSQL 16's separate membership `SET`/`INHERIT`/`ADMIN` semantics — so the newer
+role model cannot be mistaken for the older one.
+
+[ADR-042](adr/042-caller-owned-finalization-transactions.md) lets a handler commit application rows
+and guarded Awa completion in one transaction. That transaction normally comes from a separate
+application pool whose login can write the application's billing/inbox tables. Do **not** make that
+login a member of `awa_runtime`: the current runtime role can directly mutate and `TRUNCATE` Awa
+tables, which is far broader than caller-owned completion needs.
+
+The completion migration installs `complete_job` as the canonical public finalization entry point.
+Its exact argument signature,
+`FinalizationReceipt` result, stale-token SQLSTATE, and schema-version compatibility semantics are
+part of the ADR-036 SQL worker contract. Compatible implementation changes keep this name. Breaking
+improvements require ADR-036 deprecation and ADR-041 expand/migrate/contract; a versioned
+coexistence name may be used during migration without making version suffixes permanent policy.
+
+`complete_job` is a hardened `SECURITY DEFINER` function owned by the bounded execution owner
+defined by ADR-043. A queue-storage schema owner may be used only as a transitional, non-strict
+fallback; it does not satisfy the hardened owner model, and `awa doctor` rejects that ownership
+when the deployment declares the strict profile. Its migration:
+
+- fixes `search_path` to trusted schemas with `pg_temp` last and fully qualifies every referenced
+  object;
+- accepts no caller-controlled schema, table, function, or SQL identifier;
+- revokes `EXECUTE` from `PUBLIC` in the same migration transaction that creates the function;
+- transfers the function to the pre-provisioned bounded execution owner before commit in a strict
+  deployment, or explicitly records the schema-owner fallback as non-strict;
+- performs only guarded completion of the supplied finalization token and never commits; and
+- has the same hardened per-schema installation for a custom queue-storage schema.
+
+The operator grants the application-worker login (or a dedicated `NOLOGIN` group role used by
+those logins) only `USAGE` on the Awa/queue-storage schema and `EXECUTE` on the exact versioned
+completion function. It receives no direct Awa table, sequence, maintenance-function, or
+`TRUNCATE` privilege. The Rust `complete_in_tx` helper calls this same SQL function through the
+application transaction, so Rust and non-Rust workers share one privilege and conformance boundary.
+Provisioning grants by the exact `complete_job(...)` signature only after ownership transfer;
+replacement reasserts the `PUBLIC` revocation and preserves or reapplies only that manifest-listed
+ACL. Removal follows ADR-036 rather than silently redirecting the grant to an internal helper.
+
+Function execution authorizes completion of any valid token presented by that trusted worker
+application role. Do not grant it to producer-only roles, browser/admin clients, or public callback
+ingress roles. `awa doctor` resolves the exact `regprocedure` signature and checks its owner,
+`SECURITY DEFINER` flag, fixed `search_path`, `PUBLIC` revocation, and application-role ACL. Negative
+tests prove the finalizer role cannot read or mutate Awa tables directly or redirect the function
+through `search_path`, inherited membership, or a transitive `SET ROLE` chain.
+
 ## Managing roles with pgroles
 
 For teams that manage PostgreSQL access declaratively, [pgroles](https://github.com/hardbyte/pgroles) can maintain the role model as a YAML manifest:
@@ -277,7 +343,23 @@ This is additive — no schema changes, no downtime.
 
 ## Future: tighter runtime grants
 
-The current model requires broad table grants because compatibility triggers and helper functions still use `SECURITY INVOKER`. A future migration could convert the internal queue-storage helpers to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to the active queue-storage schema plus the shared control tables (`queue_meta`, `job_unique_claims`, `cron_jobs`, `runtime_instances`, and `runtime_storage_backends`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
+The current model requires broad table grants because compatibility triggers and helper functions
+still use `SECURITY INVOKER`. ADR-042's completion function is a deliberately narrow
+`SECURITY DEFINER` exception for an application role that must join business writes without gaining
+runtime privileges; it does not reduce what the ordinary runtime needs.
+
+[ADR-043](adr/043-postgresql-capability-functions.md) defines the long-term tightening path. Awa
+will not convert the entire function surface to `SECURITY DEFINER`: generic internal,
+caller-controlled dynamic-SQL, arbitrary-schema, and DDL helpers would become excessive
+privilege-escalation entry points. Instead, an allowlisted set of producer, executor, maintenance,
+admin, callback, and finalizer capability functions runs under a bounded `NOLOGIN` execution owner.
+Maintenance partition reclamation is the sole relation-dispatch exception: it accepts only a
+bounded ring slot, verifies each manifest-listed Awa child by catalog OID/namespace/owner/attachment,
+uses a short lock timeout, revalidates every target's catalog identity again after the locks are
+held, and may issue only `LOCK TABLE ONLY ... ACCESS EXCLUSIVE` plus
+`TRUNCATE TABLE ONLY ... CONTINUE IDENTITY RESTRICT` after the reclaimability recheck. It never accepts a caller relation or SQL fragment. Internal helpers remain
+inaccessible, `PUBLIC EXECUTE` is revoked, and broad table grants are removed only after an ADR-041
+capability rollout. This work is tracked in [#452](https://github.com/hardbyte/awa/issues/452).
 
 ## Deployable roles
 

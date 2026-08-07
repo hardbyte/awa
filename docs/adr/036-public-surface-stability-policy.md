@@ -7,13 +7,16 @@ Accepted — the policy text is [`docs/stability.md`](../stability.md), which is
 
 ## Context
 
-Awa is consumed through at least seven distinct surfaces — the Rust API, the Python API, the
-SQL producer contract, the HTTP admin API, the callback receiver contract, metric
-names/attributes, and the CLI — and 0.6's beta-series churn (`QueueFanout` →
+Awa is consumed through distinct surfaces — the Rust API, the Python API, the SQL producer
+contract, HTTP admin API, callback receiver contract, metric names/attributes, and the CLI — and
+0.6's beta-series churn (`QueueFanout` →
 `PartitionedQueue`) showed the cost of having no written boundary: consumers cannot tell a
 supported surface from an internal one, and maintainers cannot tell a breaking change from a
 refactor. Polyglot producers ([#342](https://github.com/hardbyte/awa/issues/342)) and API
-consumers cannot exist without a written contract.
+consumers cannot exist without a written contract. Accepted designs such as ADR-042's SQL worker
+finalization contract join this map only when implementation, public documentation and the surface
+table, conformance evidence, and the changelog transition ship together; an upgrade guide is also
+required when a new surface replaces an older covered entry point.
 
 ## Decision
 
@@ -60,13 +63,15 @@ and that surprises users repeatedly, the fix is to amend the document, not to ar
 - **Semver alone** — says *that* something broke, not *which surface was ever promised*;
   pre-1.0 semver carries no information for consumers.
 - **A stability attribute per item** (Rust `#[stable]`-style annotations) — heavier tooling
-  than a seven-row table justifies, and it cannot describe SQL, HTTP, metric, or CLI
+  than a surface map justifies, and it cannot describe SQL, HTTP, metric, or CLI
   surfaces at all.
 - **Per-crate CHANGELOG discipline without a map** — documents changes without defining the
   boundary; the boundary is the thing consumers need.
 
 ## Relationship to other ADRs
 
-Governs the ADR-016 adapter contract and the [#342](https://github.com/hardbyte/awa/issues/342)
-SQL producer contract; constrains every future ADR that touches a listed surface; the skew
-row is enforced by the ADR-037 migrate gate plus the compat matrix.
+Governs the ADR-016 adapter contract, the [#342](https://github.com/hardbyte/awa/issues/342) SQL
+producer contract, and ADR-042 only after its implementation, public documentation/table row,
+conformance evidence, and changelog transition ship together (plus an upgrade guide when replacing
+an older surface); constrains every future ADR that touches a listed surface; the skew row is
+enforced by the ADR-037 migrate gate plus the compat matrix.

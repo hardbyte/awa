@@ -33,6 +33,8 @@ Sizing rule of thumb: pick the vCPU count for your steady-state completion targe
 
 Migrations and custom queue-storage schema preparation need DDL-capable credentials. Ordinary workers can run with the runtime grants in [`security.md`](security.md) once `awa migrate` has materialized the default `awa` substrate, or once `awa storage prepare-queue-storage-schema` has materialized a custom queue-storage schema. If you rely on fresh-install auto-prepare from the first worker startup instead, that worker connection also needs the DDL privileges required by `prepare_schema()`.
 
+> **0.7 design note (not yet shipped):** [ADR-042](adr/042-caller-owned-finalization-transactions.md) uses one ordinary transaction, transaction-scoped advisory locks, and no session state, so its caller-owned finalization protocol is compatible with transaction-mode pgbouncer/pgcat and RDS Proxy. Queue `LISTEN` remains session-scoped: [ADR-033](adr/033-per-key-execution-control.md) grant-close notifications require a direct/session-pooled listener or the #374 gated polling fallback. The sending `pg_notify` call itself remains transactional and pooler-safe.
+
 ### Cloud SQL with IAM authentication
 
 If your runtime SA authenticates via Cloud SQL IAM (recommended over password-based auth in GCP), the SA needs `cloudsqlsuperuser` to call `CREATE SEQUENCE`, `CREATE TABLE`, and a handful of other DDL the queue-storage substrate uses. Granting the role is a one-shot manual step — Cloud SQL doesn't expose it through the IAM grant — so it typically lives next to your Terraform that creates the IAM user:

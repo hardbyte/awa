@@ -200,13 +200,13 @@ Rows already running, waiting for callbacks, completed, failed, cancelled, or in
 
 Only `available` and `scheduled` rows are eligible in `0.6`.
 
-For canonical storage and queue-storage scheduled rows in `deferred_jobs`, the mutation is a guarded `UPDATE SET queue = $new_queue, priority = COALESCE($new_priority, priority)`.
+For canonical storage the mutation is a guarded `UPDATE SET queue = $new_queue, priority = COALESCE($new_priority, priority)`. Queue-storage scheduled rows in `deferred_jobs` also resolve the destination queue's current shard width. Under ADR-033, a retained route becomes `enqueue_shard = enqueue_shard % destination_enqueue_shards`; rows without retained keyed routing use the destination's ordinary enqueue rule. The move retains key-policy and key-digest metadata.
 
 For queue storage available rows, the per-row helper is the same lane move as `set_priority` with additional destination queue resolution:
 
 1. Recheck that the source ready row is still live and operation-eligible.
 2. Resolve the destination queue's `enqueue_shards` configuration.
-3. Route the destination row through the normal queue-storage reinsert helper. Because ready/deferred storage does not retain the producer's original ordering key, moved no-key rows use the destination queue's shard rotor. The source shard is irrelevant after the move.
+3. Route the destination row through the normal queue-storage reinsert helper. Under ADR-033, map a retained route to `source_enqueue_shard % destination_enqueue_shards`; this keeps the shard in range and preserves co-location for rows that shared a source route. Rows without retained keyed routing use the destination queue's ordinary enqueue rule.
 4. Resolve the destination `(queue, priority, enqueue_shard)` lane.
 5. Lock the source `ready_entries` row with `FOR UPDATE`; the source claim-head row is read but not locked.
 6. Reserve the destination `lane_seq`, taking the destination lane/head lock in the normal enqueue order.
@@ -233,7 +233,7 @@ Pending, scanning, running, and cancelling operations are never removed by reten
 
 The operation detail surface reports state, counts, submitted/finalized timestamps, runner instance, cursor summary, and last error. Metrics should cover submitted operations, active operations, rows processed/skipped/errored, chunk duration, and final states.
 
-Batch operation rows are the audit log for who did what and when. They are not intended to be a forensic record of every row changed in `0.6`; that is the possible future error/audit side table.
+Batch operation rows are the audit log for who did what and when. The submitting boundary records an explicit authenticated actor, or PostgreSQL `session_user` for direct operator SQL. A future `SECURITY DEFINER` capability must not derive that field from `current_user`, because PostgreSQL would record the bounded execution owner instead of the caller. The rows are not intended to be a forensic record of every row changed in `0.6`; that is the possible future error/audit side table.
 
 ## Consequences
 
@@ -291,7 +291,7 @@ This adds one table and one runner lane, then amortizes that cost across priorit
 - **ADR-019** (Queue Storage Engine). Batch operation handlers must use queue-storage lane, tombstone, deferred, and uniqueness invariants rather than rewriting `ready_entries` directly.
 - **ADR-020** (Dead Letter Queue). Existing DLQ bulk retry/purge/move endpoints remain synchronous in `0.6`; migrating them to batch operations is a future compatibility/UX decision.
 - **ADR-023** (Receipt Plane Ring Partitioning). Running and waiting rows are not mutated by `set_priority` or `move_queue` in `0.6`; active attempts remain guarded by receipt/lease semantics.
-- **ADR-025** (Sharded Enqueue Heads). Queue moves must hash against the destination queue's `enqueue_shards` configuration and assign a destination lane sequence there.
+- **ADR-025** (Sharded Enqueue Heads). Queue moves must resolve against the destination queue's `enqueue_shards` configuration and assign a destination lane sequence there. They never copy an out-of-range source shard; ADR-033 retained routes use modulo the destination width.
 - **ADR-026** (Narrow Terminal History). Terminal rows are not eligible for the initial operations; history remains immutable operator evidence.
 - **ADR-028** (Maintenance-only runtime role). Batch operation execution is another maintenance-owned responsibility. A maintenance-only runtime must run it; a callback-only or read-only UI must not.
 - **ADR-029** (Transactional follow-up jobs). Batch operations are not follow-up jobs. They are internal control-plane work that may later emit observation events or follow-up jobs, but their execution is owned by maintenance.

@@ -251,6 +251,8 @@ The formal suite includes passing configs and expected-counterexample configs. T
 
 Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`](0.7-roadmap.md)) and the release gates on the [#383 tracker](https://github.com/hardbyte/awa/issues/383). Rows move into the matrix above as they are implemented.
 
+V25 adds a focused `AwaKeyedExecution` model for grant safety, partial-legacy coverage scope, and the drain/epoch/verify/resume/activate-or-cancel lowering protocol; it also extends `AwaStorageLockOrder` for the short policy transition windows. V26 adds `AwaCallerOwnedCompletion` for completion-versus-rescue atomicity. These names are planned deliverables, not claims that model files already exist.
+
 ### Harness & compatibility
 
 | # | Test | Rust | Py | Ref |
@@ -310,17 +312,19 @@ Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`]
 | V21 | Per-key fairness under Zipf-skewed tenants (Jain index bound, no starvation) | ✓ |  | #340 |
 | V22 | A→B promotion is transactional with parent finalize; `on_parent_failure` policies (TLA+ witness + integration) | ✓ | ✓ | #14 |
 | V23 | Backpressure: `Signal` surfaces pressure, `Reject` returns typed error, transactional enqueue unaffected by default | ✓ | ✓ | #341 |
-| V24 | SQL contract conformance script green; BLAKE3 unique-key + shard-hash cross-language vectors | ✓ | ✓ | #342 |
+| V24 | SQL contract conformance script green; cross-language vectors cover BLAKE3 unique-key derivation, the domain-separated SHA-256 concurrency-key digest (two algorithms by design — see ADR-033), concurrency-key-to-enqueue-shard mapping at every test width, and explicit ordering-key-over-concurrency-key precedence for SQL, direct binary, and bulk producers; PostgreSQL computes public-SQL routing authoritatively and rejects any supplied expectation that disagrees | ✓ | ✓ | #342 |
+| V25 | Per-key Tier 2: `AwaKeyedExecution` and concurrent claimers never exceed the grant limit; limit lowering uses short epoch fences plus bounded out-of-lock verification, refuses incomplete/invariant-breaking updates without stalling claimers, cancellation restores the prior limit only for the matching epoch while admission stays closed until commit, and resume revalidates the pending epoch/target, keeps admission closed, and reruns verification without creating a second pending transition; every exit closes only its exact grant, with callback park/resume retaining it; gated heads never advance and cannot report false idle while an admissible lane is inside the configured probe set; capped rotating probes provide bounded eventual pickup; keyed-only routing stays shard-local; complete coverage rejects legacy rows until drained/backfilled while explicit partial mode admits them ungoverned with non-green diagnostics/metrics; grant closure wakes session listeners while poll-only pickup is bounded; E5 compares row-local, separate-ledger, and proved parking shapes | ✓ | ✓ | #340, ADR-033 |
+| V26 | Caller-owned completion: `AwaCallerOwnedCompletion` proves completion-versus-rescue atomicity; distinct handler return type; app rows + terminal/conditional grant closure commit or roll back together; receipt/lease tokens reconcile; bounded ambiguity preserves durable authority and pool reserve; the 0.7 bounded-owner/manifest slice leaves the finalizer role only hardened function execution with no inherited or transitive `SET ROLE` path to protected owners on the oldest and newest supported PostgreSQL majors (straddling PG16's membership-option change); transaction-pooler conformance | ✓ | ✓ | #401, ADR-042 |
 
 ### Storage & performance (gate evidence, benchmark harness)
 
 | # | Test | Ref |
 | --- | --- | --- |
-| V25 | 0.6 pinned-MVCC long-horizon shape still passes on 0.7 main (798/s through 60-min pin, bounded depth, full reclaim) | #383 Gate 2 |
-| V26 | #246 shape: ≤5% rescue-ON overhead at 1×256, or named mechanism + mitigation | #246 / E2 |
-| V27 | Ring-state dead tuples reduced to noise on the long-horizon idle phase | #371 |
-| V28 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
-| V29 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
+| V27 | 0.6 pinned-MVCC long-horizon shape still passes on 0.7 main (798/s through 60-min pin, bounded depth, full reclaim) | #383 Gate 2 |
+| V28 | #246 shape: ≤5% rescue-ON overhead at 1×256, or named mechanism + mitigation | #246 / E2 |
+| V29 | Ring-state dead tuples reduced to noise on the long-horizon idle phase | #371 |
+| V30 | Partitioned-queue preset ≥9k jobs/s e2e on the reference 24-CPU harness | #383 Gate 2 |
+| V31 | Gate A evidence: allocator bake-off (E1) + WAL/job decomposition (E3) run ids recorded on #295 | #295 |
 
 ## Running Tests
 
