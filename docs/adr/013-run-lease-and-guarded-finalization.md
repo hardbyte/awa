@@ -60,10 +60,4 @@ The `run_lease` guard decision carries into queue storage unchanged. Under ADR-0
 
 ## Relationship to ADR-042
 
-[ADR-042](042-caller-owned-finalization-transactions.md) exposes guarded completion inside a
-caller's PostgreSQL transaction. The runtime reconciles the attempt token against receipt or
-materialized-lease authority before interpreting the handler result. After a bounded database
-outage it may release heavyweight local capacity, but the durable attempt remains open for rescue
-and is never converted to a retry or completion without evidence. If rescue has already replaced
-the run lease, finalization raises a stale-attempt error so the application writes and the rejected
-completion cannot commit independently.
+[ADR-042](042-caller-owned-finalization-transactions.md) exposes guarded completion inside a caller's PostgreSQL transaction. The runtime reconciles the attempt token against receipt or materialized-lease authority before interpreting the handler result. After a bounded database outage it may release heavyweight local capacity, but the durable attempt remains open for rescue and is never converted to a retry or completion without evidence. If rescue has already replaced the run lease, finalization raises a stale-attempt error so the application writes and the rejected completion cannot commit independently.

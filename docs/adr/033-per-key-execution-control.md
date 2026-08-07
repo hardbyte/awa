@@ -76,9 +76,10 @@ deferred, lease, retry, and DLQ rows. SHA-256 rather than ADR-002's BLAKE3 is de
 public SQL contract computes this digest authoritatively inside PostgreSQL, and `sha256()` is a
 PostgreSQL built-in, while BLAKE3 would require an extension or an impractical procedural
 implementation. `unique_key` remains client-side BLAKE3 under ADR-002; the two key families
-intentionally use different algorithms and computation venues, and the #342 vectors cover both. Narrow terminal rows and compact successful completions hydrate it from
-their retained ready backing row under ADR-026 instead of widening the terminal hot path. The
-fallback is evaluated once at enqueue; it is not recomputed from routing state later.
+intentionally use different algorithms and computation venues, and the #342 vectors cover both.
+Narrow terminal rows and compact successful completions hydrate the digest from their retained
+ready backing row under ADR-026 instead of widening the terminal hot path. The fallback is
+evaluated once at enqueue; it is not recomputed from routing state later.
 
 Enqueue-shard routing has explicit precedence:
 
@@ -152,13 +153,13 @@ commit, new claims may use only the restored prior limit.
 
 This protocol never exposes a committed policy state where the lower limit is authoritative while
 an over-limit governed set exists, and claimers do not queue behind the verification scan. The
-fail-closed residue is that an abandoned transition — an operator tool that crashed after step 1 —
-leaves the policy `draining` indefinitely; nothing re-opens admission automatically. Draining
-state, its pending target/epoch, and its age are therefore first-class health and metrics signals,
-not just rows an operator can query. The operator waits for open grants to fall within the target
-and resumes; Awa never "grandfathers" an over-limit active set under a lower authoritative value. Disabling or changing a policy's identity
-while it has open grants uses the same drain/epoch discipline; silently changing namespace would
-weaken the established guarantee.
+fail-closed residue is that an abandoned transition — an operator tool that crashed after step
+1 — leaves the policy `draining` indefinitely; nothing re-opens admission automatically. Draining
+state, its pending target/epoch, and its age are therefore first-class health and metrics
+signals, not just rows an operator can query. The operator waits for open grants to fall within
+the target and resumes; Awa never "grandfathers" an over-limit active set under a lower
+authoritative value. Disabling or changing a policy's identity while it has open grants uses the
+same drain/epoch discipline; silently changing namespace would weaken the established guarantee.
 
 #### Append-only grant and closure evidence
 
@@ -202,7 +203,8 @@ finite `(priority, enqueue_shard)` lane registry. For each candidate lane it:
    same transaction.
 
 The function keeps per-call memos for policy row locks and for
-`(key_policy_id, key_digest)`: it locks each policy once, acquires and counts a key once, then tracks
+`(key_policy_id, key_digest)`: it locks each policy once, acquires and counts a key once, then
+tracks
 grants tentatively added by earlier admitted prefixes. This matters when an explicit ordering key,
 priority, or compatibility row places the same concurrency key in more than one probed lane. The
 database-authoritative count remains the source of truth; the memo only avoids repeating work
@@ -359,7 +361,8 @@ For a queue that cannot drain, the operator may instead select an explicit
 with authoritative identity receive exact Tier 2 admission. This does not violate
 `OpenGrantsPerKey <= Limit` for governed rows, but it weakens the end-to-end user-intent promise: a
 legacy row may run concurrently with governed key-mates. The policy reports
-`coverage=partial_legacy`, `awa doctor` remains non-green with representation counts and remediation,
+`coverage=partial_legacy`, `awa doctor` remains non-green with representation counts and
+remediation,
 and health/metrics expose ungoverned admission totals and remaining backlog. No raw shard is treated
 as a key. Promotion to `coverage=complete` is a separate epoch-guarded flip after every
 representation has drained or been authoritatively backfilled.

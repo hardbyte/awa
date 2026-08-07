@@ -149,11 +149,7 @@ Operational procedure:
 
 The contract is enforced by `test_queue_storage_lowering_enqueue_shards_drains_existing_rows`, which seeds rows on every shard at `S = 4`, lowers to `S = 2`, and asserts every row drains to `done_entries`.
 
-Cross-queue administration is a separate routing event, not a width-lowering drain. `move_queue`
-must resolve the row against the destination queue's current width and must never copy an
-out-of-range source shard. Under ADR-033, a retained keyed route maps to
-`source_enqueue_shard % destination_enqueue_shards`; rows without retained keyed routing use the
-destination's ordinary enqueue rule. ADR-030 owns the mutation protocol.
+Cross-queue administration is a separate routing event, not a width-lowering drain. `move_queue` must resolve the row against the destination queue's current width and must never copy an out-of-range source shard. Under ADR-033, a retained keyed route maps to `source_enqueue_shard % destination_enqueue_shards`; rows without retained keyed routing use the destination's ordinary enqueue rule. ADR-030 owns the mutation protocol.
 
 ## Consequences
 

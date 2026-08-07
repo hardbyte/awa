@@ -197,9 +197,9 @@ recorded in the capability manifest as `awa_ring_slot_reclaim_v1`. A function us
 The execution owner receives `TRUNCATE` only on the manifest-listed ring children, plus the static
 table privileges the protocol itself needs: `SELECT` on the partitioned parents for the proofs,
 `UPDATE` on the ring-slot metadata rows it resets, and `INSERT` on the rollup-delta ledgers it
-appends. The catalog audit recognizes the exception only when the
-manifest marker, exact function identity and body hash, relation-family allowlist, owner, and ACL all
-match. Any other runtime definer containing dynamic SQL or DDL remains invalid. A deployment that
+appends. The catalog audit recognizes the exception only when the manifest marker, exact
+function identity and body hash, relation-family allowlist, owner, and ACL all match. Any other
+runtime definer containing dynamic SQL or DDL remains invalid. A deployment that
 cannot install this dispatcher may retain an explicitly named trusted-maintenance profile with
 narrow direct privileges, but that profile is not the strict no-table-grant profile.
 
@@ -276,8 +276,9 @@ The transition follows ADR-041 and never begins by revoking privileges:
 
 1. **Inventory.** Generate the routine/trigger manifest from a migrated schema and classify every
    executable object, including custom queue-storage-schema templates.
-2. **Expand.** Add hardened capability entry points, the bounded owner contract, catalog diagnostics,
-   and new binary paths. Existing direct DML and invoker functions continue to work for N-1.
+2. **Expand.** Add hardened capability entry points, the bounded owner contract, catalog
+   diagnostics, and new binary paths. Existing direct DML and invoker functions continue to work
+   for N-1.
 3. **Exercise.** Current binaries use only capability paths in the strict-role integration matrix.
    Mixed-version rehearsal proves N-1 remains functional with the broad legacy grants.
 4. **Enable.** After every connected runtime advertises the capability surface, operators apply a
