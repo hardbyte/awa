@@ -603,10 +603,11 @@ async fn complete_job_canonical(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-                    .bind(job.id)
-                    .fetch_one(pool)
-                    .await?;
+                let updated_job: JobRow =
+                    sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
+                        .bind(job.id)
+                        .fetch_one(pool)
+                        .await?;
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
                         job: updated_job,
@@ -819,9 +820,14 @@ async fn complete_job_canonical(
                 };
             }
 
+            // `awa.jobs_hot` directly, not the `awa.jobs` view: in canonical-drain
+            // mode the view is backed by the active queue-storage schema, so a view
+            // UPDATE silently misses the canonical row and the job wedges in
+            // `running` (same rationale as `complete_canonical_with_followups`).
+            // This applies to every canonical fast-path write and re-read here.
             let result = sqlx::query(
                 r#"
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'cancelled',
                     finalized_at = now(),
                     errors = errors || $2::jsonb,
@@ -847,10 +853,11 @@ async fn complete_job_canonical(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-                    .bind(job.id)
-                    .fetch_one(pool)
-                    .await?;
+                let updated_job: JobRow =
+                    sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
+                        .bind(job.id)
+                        .fetch_one(pool)
+                        .await?;
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Cancelled {
                         job: updated_job,
@@ -901,7 +908,7 @@ async fn complete_job_canonical(
 
             let result = sqlx::query(
                 r#"
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'waiting_external',
                     heartbeat_at = NULL,
                     deadline_at = NULL,
@@ -915,11 +922,16 @@ async fn complete_job_canonical(
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
-                let current: Option<(JobState, Option<uuid::Uuid>)> =
-                    sqlx::query_as("SELECT state, callback_id FROM awa.jobs WHERE id = $1")
-                        .bind(job.id)
-                        .fetch_optional(pool)
-                        .await?;
+                // A rescued row may have moved to `scheduled_jobs`, so the
+                // race check reads both canonical tables.
+                let current: Option<(JobState, Option<uuid::Uuid>)> = sqlx::query_as(
+                    "SELECT state, callback_id FROM awa.jobs_hot WHERE id = $1 \
+                     UNION ALL \
+                     SELECT state, callback_id FROM awa.scheduled_jobs WHERE id = $1",
+                )
+                .bind(job.id)
+                .fetch_optional(pool)
+                .await?;
                 match current {
                     Some((state, _)) if state.is_terminal() => {
                         info!(
@@ -939,7 +951,7 @@ async fn complete_job_canonical(
                         );
                         let result = sqlx::query(
                             r#"
-                            UPDATE awa.jobs
+                            UPDATE awa.jobs_hot
                             SET state = 'failed',
                                 finalized_at = now(),
                                 errors = errors || $2::jsonb
@@ -974,7 +986,7 @@ async fn complete_job_canonical(
                 }
             }
             let event = if needs_event {
-                let parked_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                let parked_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
                     .bind(job.id)
                     .fetch_one(pool)
                     .await?;
@@ -1040,7 +1052,7 @@ async fn complete_job_canonical(
 
             let result = sqlx::query(
                 r#"
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'failed',
                     finalized_at = now(),
                     errors = errors || $2::jsonb,
@@ -1067,10 +1079,11 @@ async fn complete_job_canonical(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-                    .bind(job.id)
-                    .fetch_one(pool)
-                    .await?;
+                let updated_job: JobRow =
+                    sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
+                        .bind(job.id)
+                        .fetch_one(pool)
+                        .await?;
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Exhausted {
                         job: updated_job,
@@ -1142,7 +1155,7 @@ async fn complete_job_canonical(
 
                 let result = sqlx::query(
                     r#"
-                    UPDATE awa.jobs
+                    UPDATE awa.jobs_hot
                     SET state = 'failed',
                         finalized_at = now(),
                         errors = errors || $2::jsonb,
@@ -1169,7 +1182,7 @@ async fn complete_job_canonical(
                 }
                 if needs_event {
                     let updated_job: JobRow =
-                        sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                        sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
                             .bind(job.id)
                             .fetch_one(pool)
                             .await?;
