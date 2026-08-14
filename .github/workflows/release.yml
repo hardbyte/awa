@@ -10,6 +10,7 @@ env:
   SQLX_OFFLINE: "true"
 
 permissions:
+  actions: read
   contents: write
   packages: write
   id-token: write
@@ -88,14 +89,41 @@ jobs:
           sys.exit(fail)
           PY
 
+  # ─── Exact-candidate gate ────────────────────────────────────────
+  # Require the complete CI workflow triggered by the merge push to have
+  # passed on this exact commit before the release rehearsal or publication.
+  candidate-ci:
+    name: Verify exact-candidate CI
+    needs: [version-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful branch-push CI on this SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          count=$(gh api -X GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="${EXPECTED_SHA}" \
+            -f event=push \
+            -f status=success \
+            -f per_page=100 \
+            --jq '.total_count')
+          if [ "$count" -lt 1 ]; then
+            echo "::error::No successful branch-push CI run exists for ${EXPECTED_SHA}."
+            echo "Merge the release-prep PR, wait for the automatically triggered full CI run on the release branch, then tag that exact commit."
+            exit 1
+          fi
+          echo "Found ${count} successful exact-SHA branch-push CI run(s) for ${EXPECTED_SHA}."
+
   # ─── Cross-compile CLI binaries ──────────────────────────────────────
   # ─── Adversarial upgrade rehearsal gate (#427 / #383) ───────────────
-  # The mixed-version rehearsal must pass on the exact tagged commit
-  # before anything publishes. Tagging without the manual pre-tag
-  # dispatch of release-gate.yml therefore cannot ship artifacts.
+  # The mixed-version rehearsal must pass on the exact tagged commit before
+  # anything publishes. It runs after exact-candidate CI has been verified.
   release-gate:
     name: Release gate — upgrade rehearsal
-    needs: [version-check]
+    needs: [version-check, candidate-ci]
     uses: ./.github/workflows/release-gate.yml
 
   build-binaries:
@@ -173,8 +201,8 @@ jobs:
             exit 1
           fi
           test -d awa-ui/static/assets
-          ls awa-ui/static/assets/ | grep -q '\.js$'
-          ls awa-ui/static/assets/ | grep -q '\.css$'
+          compgen -G 'awa-ui/static/assets/*.js' >/dev/null
+          compgen -G 'awa-ui/static/assets/*.css' >/dev/null
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
@@ -419,11 +447,12 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
         run: |
-          images=""
-          for tag in ${TAGS}; do
-            images+="${tag}@${DIGEST} "
+          read -r -a tags <<< "$TAGS"
+          images=()
+          for tag in "${tags[@]}"; do
+            images+=("${tag}@${DIGEST}")
           done
-          cosign sign --yes ${images}
+          cosign sign --yes "${images[@]}"
 
       - name: Attest build provenance
         uses: actions/attest@v4
@@ -573,8 +602,8 @@ jobs:
             exit 1
           fi
           test -d awa-ui/static/assets
-          ls awa-ui/static/assets/ | grep -q '\.js$'
-          ls awa-ui/static/assets/ | grep -q '\.css$'
+          compgen -G 'awa-ui/static/assets/*.js' >/dev/null
+          compgen -G 'awa-ui/static/assets/*.css' >/dev/null
 
       - name: Build CLI wheels
         uses: PyO3/maturin-action@v1
@@ -682,8 +711,8 @@ jobs:
             exit 1
           fi
           test -d awa-ui/static/assets
-          ls awa-ui/static/assets/ | grep -q '\.js$'
-          ls awa-ui/static/assets/ | grep -q '\.css$'
+          compgen -G 'awa-ui/static/assets/*.js' >/dev/null
+          compgen -G 'awa-ui/static/assets/*.css' >/dev/null
 
       - name: Publish awa-macros
         run: cargo publish --package awa-macros --no-verify
