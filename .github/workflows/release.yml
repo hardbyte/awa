@@ -215,14 +215,14 @@ jobs:
 
   # ─── Exact-candidate and immutable-release gates ──────────────
   # A tag is irreversible once registries and immutable GitHub Releases are
-  # involved. Require the complete manually dispatched CI workflow to have
-  # passed on this exact commit before any publication job is allowed to run.
+  # involved. Require the complete CI workflow triggered by the merge push to
+  # have passed on this exact commit before any publication job can run.
   candidate-ci:
     name: Verify exact-candidate CI
     needs: [version-check]
     runs-on: ubuntu-latest
     steps:
-      - name: Require successful manually dispatched CI on this SHA
+      - name: Require successful branch-push CI on this SHA
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_SHA: ${{ github.sha }}
@@ -231,16 +231,16 @@ jobs:
           count=$(gh api -X GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
             -f head_sha="${EXPECTED_SHA}" \
-            -f event=workflow_dispatch \
+            -f event=push \
             -f status=success \
             -f per_page=100 \
             --jq '.total_count')
           if [ "$count" -lt 1 ]; then
-            echo "::error::No successful manually dispatched CI run exists for ${EXPECTED_SHA}."
-            echo "Dispatch CI against the release branch after merging the release-prep PR, wait for the full run, then tag that exact commit."
+            echo "::error::No successful branch-push CI run exists for ${EXPECTED_SHA}."
+            echo "Merge the release-prep PR, wait for the automatically triggered full CI run on the release branch, then tag that exact commit."
             exit 1
           fi
-          echo "Found ${count} successful exact-SHA manual CI run(s) for ${EXPECTED_SHA}."
+          echo "Found ${count} successful exact-SHA branch-push CI run(s) for ${EXPECTED_SHA}."
 
   # Establish the mutable draft before registry publication. If a release was
   # published manually, fail while nothing has been pushed to crates.io, PyPI,
