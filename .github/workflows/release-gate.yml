@@ -2,12 +2,10 @@
 # must pass on the exact release-candidate SHA before artifacts publish.
 #
 # Two entry points:
-#   * workflow_dispatch — run manually against a candidate ref BEFORE
-#     tagging (the required pre-tag check in the release process).
-#   * workflow_call — invoked by release.yml on tag push, so even a tag
-#     created without the manual pre-check cannot publish until the same
-#     rehearsal passes on the tagged commit. Publishing is gated, not
-#     merely observed.
+#   * workflow_dispatch — optionally rehearse early against a candidate ref.
+#   * workflow_call — invoked by release.yml on tag push after exact-SHA CI is
+#     verified, so publication still waits for the rehearsal on the tagged
+#     commit. Publishing is gated, not merely observed.
 #
 # Evidence: each rehearsal cell writes a machine-readable JSON report
 # (phases with elapsed-ms watermarks, census counts, flip status, exact
