@@ -88,18 +88,12 @@ wheels = [
 
 [[package]]
 name = "awa-cli"
-version = "0.6.0b2"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b4/23/17da893af1d004bb56c538260d79225012fc0ca7378e8d8b60f209c4fdcd/awa_cli-0.6.0b2-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:3c057f77f9704b429ff22fe81804d989040b4b4d3491cadd27e9e3e42044e877", size = 5377048, upload-time = "2026-06-10T09:56:36.044Z" },
-    { url = "https://files.pythonhosted.org/packages/a7/ca/aa69bc4fc35522c74731fd172c19bbc64d32cd7df8c1580aca092141aa7e/awa_cli-0.6.0b2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:0b909fe5e6724d0cc1747c8c8c40b07c241efd4732a22f732d97c9fa63f98794", size = 5201405, upload-time = "2026-06-10T09:56:37.826Z" },
-    { url = "https://files.pythonhosted.org/packages/91/19/36efaa96694f7b3aa67fb23e770dba9cc7fb5b7666f81a18cb11ca98f9bc/awa_cli-0.6.0b2-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:744b73296212f24b10c9931b3511c5a4102c5e06e4c0027d54d4e4e762d10e66", size = 5349849, upload-time = "2026-06-10T09:56:39.37Z" },
-    { url = "https://files.pythonhosted.org/packages/ad/a2/c629fe854b1d28e4d3ee6a7f9d32becb9ae915edc62a1e2e70a45246f095/awa_cli-0.6.0b2-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f8b43fb3003da3173f18c7e5730ba8aea1c6455091950d3634f29ca172607e57", size = 5513311, upload-time = "2026-06-10T09:56:40.966Z" },
-]
+version = "0.6.6"
+source = { directory = "../awa-cli" }
 
 [[package]]
 name = "awa-pg"
-version = "0.6.0b2"
+version = "0.6.6"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -120,7 +114,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "awa-cli", marker = "extra == 'ui'", specifier = "==0.6.0b2" }]
+requires-dist = [{ name = "awa-cli", marker = "extra == 'ui'", directory = "../awa-cli" }]
 provides-extras = ["ui"]
 
 [package.metadata.requires-dev]

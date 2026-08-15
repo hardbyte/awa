@@ -24,15 +24,27 @@ Use pre-release tags before publishing a final version. Both crates.io and PyPI 
 1. Bump version in these release manifests:
    - `Cargo.toml` (workspace `[workspace.package].version` and every workspace dependency whose version points at an Awa crate being released)
    - `awa/Cargo.toml` (`awa-testing` dev-dependency version)
-   - `awa-cli/Cargo.toml` (`awa-ui` dependency version)
+   - `awa-seaorm/Cargo.toml` (`awa-testing` dev-dependency version)
+   - `awa-cli/Cargo.toml` (`awa-ui` and `awa-testing` dependency versions)
    - `awa-cli/pyproject.toml` (`[project].version` — controls CLI wheel version on PyPI)
    - `awa-python/Cargo.toml` (`version`, `awa-model`, `awa-worker` dep versions)
    - `awa-python/pyproject.toml` (`[project].version` — controls SDK wheel version on PyPI)
-2. Commit: `Bump version to 0.x.0-alpha.1`
-3. Push to a branch, wait for CI green.
-4. Tag and push: `git tag v0.x.0-alpha.1 && git push origin v0.x.0-alpha.1`
-5. The Release workflow builds wheels, publishes to crates.io and PyPI, and creates a GitHub Release with binary assets.
-6. When ready for final: bump version to `0.x.0`, merge to main, tag `v0.x.0`.
+   - `Cargo.lock`, `awa-python/Cargo.lock`, and `awa-python/uv.lock`
+2. Finalize the matching changelog section and commit the release preparation.
+3. Push a branch and open a PR against the branch being released. Apply the
+   `full-ci` label and wait for every check, including the TLA+ storage models.
+4. After merge, record the release branch's exact commit SHA and wait for the
+   automatically triggered **CI** workflow to pass completely. The Release
+   workflow refuses to publish unless this exact-SHA branch-push run succeeded;
+   a PR run against a pre-merge SHA is not sufficient.
+5. Tag and push the validated commit, for example:
+   `git tag v0.x.0-alpha.1 && git push origin v0.x.0-alpha.1`.
+6. Do not create or publish the GitHub Release manually. The Release workflow
+   creates a draft first, builds and uploads every asset, publishes crates,
+   wheels, and the container image, then publishes the completed draft. This
+   ordering is required when immutable releases are enabled.
+7. When ready for final: bump version to `0.x.0`, repeat the exact-SHA CI gate,
+   merge to the release branch, and tag `v0.x.0`.
 
 ### Why pre-releases matter
 

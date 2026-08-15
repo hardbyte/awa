@@ -10,6 +10,7 @@ env:
   SQLX_OFFLINE: "true"
 
 permissions:
+  actions: read
   contents: write
   packages: write
   id-token: write
@@ -49,6 +50,41 @@ jobs:
                   or data.get("workspace", {}).get("package", {}).get("version")
               )
 
+          def cargo_dependency_version(
+              path: str, table_path: tuple[str, ...], dependency: str
+          ) -> str | None:
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              table = data
+              for key in table_path:
+                  table = table.get(key, {})
+              spec = table.get(dependency)
+              if isinstance(spec, str):
+                  return spec
+              if isinstance(spec, dict):
+                  return spec.get("version")
+              return None
+
+          def lock_package_version(path: str, package: str) -> str | None:
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              matches = [
+                  entry.get("version")
+                  for entry in data.get("package", [])
+                  if entry.get("name") == package and "source" not in entry
+              ]
+              return matches[0] if len(matches) == 1 else None
+
+          def uv_lock_package_version(path: str, package: str) -> str | None:
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              matches = [
+                  entry.get("version")
+                  for entry in data.get("package", [])
+                  if entry.get("name") == package
+              ]
+              return matches[0] if len(matches) == 1 else None
+
           def pyproject_version(path: str) -> str | None:
               with open(path, "rb") as f:
                   data = tomllib.load(f)
@@ -68,10 +104,99 @@ jobs:
 
           checks = [
               ("Cargo.toml", cargo_version("Cargo.toml")),
+              *[
+                  (
+                      f"Cargo.toml [workspace.dependencies].{dependency}",
+                      cargo_dependency_version(
+                          "Cargo.toml", ("workspace", "dependencies"), dependency
+                      ),
+                  )
+                  for dependency in (
+                      "awa-model",
+                      "awa-macros",
+                      "awa-metrics",
+                      "awa-worker",
+                      "awa",
+                  )
+              ],
+              (
+                  "awa/Cargo.toml [dev-dependencies].awa-testing",
+                  cargo_dependency_version(
+                      "awa/Cargo.toml", ("dev-dependencies",), "awa-testing"
+                  ),
+              ),
+              (
+                  "awa-seaorm/Cargo.toml [dev-dependencies].awa-testing",
+                  cargo_dependency_version(
+                      "awa-seaorm/Cargo.toml", ("dev-dependencies",), "awa-testing"
+                  ),
+              ),
+              (
+                  "awa-cli/Cargo.toml [dependencies].awa-ui",
+                  cargo_dependency_version(
+                      "awa-cli/Cargo.toml", ("dependencies",), "awa-ui"
+                  ),
+              ),
+              (
+                  "awa-cli/Cargo.toml [dev-dependencies].awa-testing",
+                  cargo_dependency_version(
+                      "awa-cli/Cargo.toml", ("dev-dependencies",), "awa-testing"
+                  ),
+              ),
               ("awa-cli/pyproject.toml", pyproject_version("awa-cli/pyproject.toml")),
               ("awa-python/Cargo.toml", cargo_version("awa-python/Cargo.toml")),
+              (
+                  "awa-python/Cargo.toml [dependencies].awa-model",
+                  cargo_dependency_version(
+                      "awa-python/Cargo.toml", ("dependencies",), "awa-model"
+                  ),
+              ),
+              (
+                  "awa-python/Cargo.toml [dependencies].awa-worker",
+                  cargo_dependency_version(
+                      "awa-python/Cargo.toml", ("dependencies",), "awa-worker"
+                  ),
+              ),
               ("awa-python/pyproject.toml", pyproject_version("awa-python/pyproject.toml")),
               ("awa-python/pyproject.toml [ui] extra", ui_extra_pin("awa-python/pyproject.toml")),
+              *[
+                  (
+                      f"Cargo.lock package {package}",
+                      lock_package_version("Cargo.lock", package),
+                  )
+                  for package in (
+                      "awa",
+                      "awa-cli",
+                      "awa-macros",
+                      "awa-metrics",
+                      "awa-model",
+                      "awa-seaorm",
+                      "awa-testing",
+                      "awa-ui",
+                      "awa-worker",
+                  )
+              ],
+              *[
+                  (
+                      f"awa-python/Cargo.lock package {package}",
+                      lock_package_version("awa-python/Cargo.lock", package),
+                  )
+                  for package in (
+                      "awa-macros",
+                      "awa-metrics",
+                      "awa-model",
+                      "awa-python",
+                      "awa-worker",
+                  )
+              ],
+              (
+                  "awa-python/uv.lock package awa-pg",
+                  uv_lock_package_version("awa-python/uv.lock", "awa-pg"),
+              ),
+              (
+                  "awa-python/uv.lock package awa-cli",
+                  uv_lock_package_version("awa-python/uv.lock", "awa-cli"),
+              ),
           ]
 
           fail = 0
@@ -87,6 +212,63 @@ jobs:
 
           sys.exit(fail)
           PY
+
+  # ─── Exact-candidate and immutable-release gates ──────────────
+  # A tag is irreversible once registries and immutable GitHub Releases are
+  # involved. Require the complete CI workflow triggered by the merge push to
+  # have passed on this exact commit before any publication job can run.
+  candidate-ci:
+    name: Verify exact-candidate CI
+    needs: [version-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful branch-push CI on this SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          count=$(gh api -X GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="${EXPECTED_SHA}" \
+            -f event=push \
+            -f status=success \
+            -f per_page=100 \
+            --jq '.total_count')
+          if [ "$count" -lt 1 ]; then
+            echo "::error::No successful branch-push CI run exists for ${EXPECTED_SHA}."
+            echo "Merge the release-prep PR, wait for the automatically triggered full CI run on the release branch, then tag that exact commit."
+            exit 1
+          fi
+          echo "Found ${count} successful exact-SHA branch-push CI run(s) for ${EXPECTED_SHA}."
+
+  # Establish the mutable draft before registry publication. If a release was
+  # published manually, fail while nothing has been pushed to crates.io, PyPI,
+  # or GHCR; published immutable releases cannot accept the built assets.
+  prepare-github-release:
+    name: Prepare draft GitHub Release
+    needs: [version-check, candidate-ci]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or verify draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if is_draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::GitHub Release ${tag} is already published. Immutable releases cannot accept the workflow assets."
+              exit 1
+            fi
+            echo "Draft release ${tag} already exists."
+          else
+            release_args=(--verify-tag --title "$tag" --generate-notes --draft)
+            if [[ "$tag" =~ (alpha|beta|rc) ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "$tag" "${release_args[@]}"
+          fi
 
   # ─── Cross-compile CLI binaries ──────────────────────────────────────
   build-binaries:
@@ -164,8 +346,8 @@ jobs:
             exit 1
           fi
           test -d awa-ui/static/assets
-          ls awa-ui/static/assets/ | grep -q '\.js$'
-          ls awa-ui/static/assets/ | grep -q '\.css$'
+          compgen -G 'awa-ui/static/assets/*.js' >/dev/null
+          compgen -G 'awa-ui/static/assets/*.css' >/dev/null
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
@@ -280,7 +462,7 @@ jobs:
   # ─── Multi-arch Docker image ─────────────────────────────────────────
   docker:
     name: Docker — CLI
-    needs: [build-binaries]
+    needs: [build-binaries, prepare-github-release]
     runs-on: ubuntu-latest
     env:
       IMAGE_NAME: awa
@@ -409,11 +591,12 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
         run: |
-          images=""
-          for tag in ${TAGS}; do
-            images+="${tag}@${DIGEST} "
+          read -r -a tags <<< "$TAGS"
+          images=()
+          for tag in "${tags[@]}"; do
+            images+=("${tag}@${DIGEST}")
           done
-          cosign sign --yes ${images}
+          cosign sign --yes "${images[@]}"
 
       - name: Attest build provenance
         uses: actions/attest@v4
@@ -425,7 +608,15 @@ jobs:
   # ─── GitHub Release ──────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [build-binaries, python-wheels, cli-wheels]
+    needs:
+      - build-binaries
+      - python-wheels
+      - cli-wheels
+      - docker
+      - publish-pypi-sdk
+      - publish-pypi-cli
+      - publish-crates
+      - prepare-github-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -435,19 +626,6 @@ jobs:
         with:
           pattern: "{binary-*,wheels-*,cli-wheels-*}"
           merge-multiple: true
-
-      - name: Create draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          if ! gh release view "$tag" --json tagName >/dev/null 2>&1; then
-            prerelease_flag=""
-            if echo "$tag" | grep -qE 'alpha|beta|rc'; then
-              prerelease_flag="--prerelease"
-            fi
-            gh release create "$tag" --title "$tag" --generate-notes --draft $prerelease_flag
-          fi
 
       - name: Upload assets
         env:
@@ -563,8 +741,8 @@ jobs:
             exit 1
           fi
           test -d awa-ui/static/assets
-          ls awa-ui/static/assets/ | grep -q '\.js$'
-          ls awa-ui/static/assets/ | grep -q '\.css$'
+          compgen -G 'awa-ui/static/assets/*.js' >/dev/null
+          compgen -G 'awa-ui/static/assets/*.css' >/dev/null
 
       - name: Build CLI wheels
         uses: PyO3/maturin-action@v1
@@ -584,7 +762,7 @@ jobs:
   # ─── Publish Python SDK to PyPI ──────────────────────────────────────
   publish-pypi-sdk:
     name: Publish SDK to PyPI
-    needs: [python-wheels]
+    needs: [python-wheels, prepare-github-release]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -603,7 +781,7 @@ jobs:
   # ─── Publish CLI to PyPI ────────────────────────────────────────────
   publish-pypi-cli:
     name: Publish CLI to PyPI
-    needs: [cli-wheels]
+    needs: [cli-wheels, prepare-github-release]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -631,7 +809,7 @@ jobs:
   # first publish.
   publish-crates:
     name: Publish to crates.io
-    needs: [version-check]
+    needs: [version-check, prepare-github-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -672,8 +850,8 @@ jobs:
             exit 1
           fi
           test -d awa-ui/static/assets
-          ls awa-ui/static/assets/ | grep -q '\.js$'
-          ls awa-ui/static/assets/ | grep -q '\.css$'
+          compgen -G 'awa-ui/static/assets/*.js' >/dev/null
+          compgen -G 'awa-ui/static/assets/*.css' >/dev/null
 
       - name: Publish awa-macros
         run: cargo publish --package awa-macros --no-verify
