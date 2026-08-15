@@ -447,7 +447,7 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
         run: |
-          read -r -a tags <<< "$TAGS"
+          mapfile -t tags <<< "$TAGS"
           images=()
           for tag in "${tags[@]}"; do
             images+=("${tag}@${DIGEST}")

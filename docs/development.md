@@ -40,8 +40,8 @@ Use pre-release tags before publishing a final version. Both crates.io and PyPI 
 6. The Release workflow reruns the rolling-upgrade rehearsal on the tagged
    commit, builds wheels, publishes to crates.io and PyPI, and creates a GitHub
    Release with binary assets.
-7. When ready for final: bump version to `0.x.0`, repeat the exact-SHA CI gate,
-   merge to the branch being released, and tag `v0.x.0`.
+7. When ready for final: bump the version to `0.x.0`, repeat steps 2–4 for the
+   final release preparation, then tag the validated commit as `v0.x.0`.
 
 ### Why pre-releases matter
 
