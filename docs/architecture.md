@@ -290,22 +290,22 @@ Core safety invariants are modeled in TLA+:
 
 | Model | Focus |
 | --- | --- |
-| [`AwaCore`](../correctness/core/AwaCore.tla) | job lifecycle, retry/fail/cancel transitions, callback states |
-| [`AwaBatcher`](../correctness/core/AwaBatcher.tla) | guarded completion batching and stale-result rejection |
-| [`AwaExtended`](../correctness/protocol/AwaExtended.tla) | multi-instance shutdown, rescue, permit, leadership, and bounded fairness protocol |
-| [`AwaSegmentedStorage`](../correctness/storage/AwaSegmentedStorage.tla) | queue-storage lifecycle, rotate/prune safety, DLQ round-trip, receipt rescue |
-| [`AwaSegmentedStorageRaces`](../correctness/storage/AwaSegmentedStorageRaces.tla) | claim-vs-rotate/prune interleavings |
-| [`AwaSegmentedStorageTrace`](../correctness/storage/AwaSegmentedStorageTrace.tla) | concrete runtime trace acceptance for representative queue-storage flows |
-| [`AwaShardedPrune`](../correctness/storage/AwaShardedPrune.tla) | cross-shard ready/terminal prune matching by `enqueue_shard` |
-| [`AwaStorageLockOrder`](../correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across claim, rotate, and prune |
-| [`AwaStorageTransition`](../correctness/storage/AwaStorageTransition.tla) | queue-storage transition prepare, mixed-entry, finalize, and abort gates |
-| [`AwaDeadTupleContract`](../correctness/storage/AwaDeadTupleContract.tla) | hot-table reclaim-kind contract for partition truncate and bounded warm tables |
-| [`AwaCbk`](../correctness/races/AwaCbk.tla) | callback registration/resume/finalization races |
-| [`AwaDispatchClaim`](../correctness/races/AwaDispatchClaim.tla) | availability re-check at dispatch claim commit |
-| [`AwaViewTrigger`](../correctness/races/AwaViewTrigger.tla) | `awa.jobs` view trigger concurrency and version checks |
-| [`AwaCron`](../correctness/races/AwaCron.tla) | cron double-fire prevention under leader failover |
+| [`AwaCore`](https://github.com/hardbyte/awa/blob/main/correctness/core/AwaCore.tla) | job lifecycle, retry/fail/cancel transitions, callback states |
+| [`AwaBatcher`](https://github.com/hardbyte/awa/blob/main/correctness/core/AwaBatcher.tla) | guarded completion batching and stale-result rejection |
+| [`AwaExtended`](https://github.com/hardbyte/awa/blob/main/correctness/protocol/AwaExtended.tla) | multi-instance shutdown, rescue, permit, leadership, and bounded fairness protocol |
+| [`AwaSegmentedStorage`](https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaSegmentedStorage.tla) | queue-storage lifecycle, rotate/prune safety, DLQ round-trip, receipt rescue |
+| [`AwaSegmentedStorageRaces`](https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaSegmentedStorageRaces.tla) | claim-vs-rotate/prune interleavings |
+| [`AwaSegmentedStorageTrace`](https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaSegmentedStorageTrace.tla) | concrete runtime trace acceptance for representative queue-storage flows |
+| [`AwaShardedPrune`](https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaShardedPrune.tla) | cross-shard ready/terminal prune matching by `enqueue_shard` |
+| [`AwaStorageLockOrder`](https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across claim, rotate, and prune |
+| [`AwaStorageTransition`](https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaStorageTransition.tla) | queue-storage transition prepare, mixed-entry, finalize, and abort gates |
+| [`AwaDeadTupleContract`](https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaDeadTupleContract.tla) | hot-table reclaim-kind contract for partition truncate and bounded warm tables |
+| [`AwaCbk`](https://github.com/hardbyte/awa/blob/main/correctness/races/AwaCbk.tla) | callback registration/resume/finalization races |
+| [`AwaDispatchClaim`](https://github.com/hardbyte/awa/blob/main/correctness/races/AwaDispatchClaim.tla) | availability re-check at dispatch claim commit |
+| [`AwaViewTrigger`](https://github.com/hardbyte/awa/blob/main/correctness/races/AwaViewTrigger.tla) | `awa.jobs` view trigger concurrency and version checks |
+| [`AwaCron`](https://github.com/hardbyte/awa/blob/main/correctness/races/AwaCron.tla) | cron double-fire prevention under leader failover |
 
-The storage model-to-code correspondence is maintained in [`correctness/storage/MAPPING.md`](../correctness/storage/MAPPING.md). Runtime tests replay representative storage traces against these models, and the benchmark notes document long-horizon partition and dead-tuple validation for ADR-019 and ADR-023. Public SQL projections such as `awa.jobs` and admin counts are treated as refinements over the modeled storage state; they need code-level regression tests as well as TLA+ lifecycle coverage.
+The storage model-to-code correspondence is maintained in [`correctness/storage/MAPPING.md`](https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md). Runtime tests replay representative storage traces against these models, and the benchmark notes document long-horizon partition and dead-tuple validation for ADR-019 and ADR-023. Public SQL projections such as `awa.jobs` and admin counts are treated as refinements over the modeled storage state; they need code-level regression tests as well as TLA+ lifecycle coverage.
 
 ## Crate Structure
 

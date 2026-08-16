@@ -42,74 +42,10 @@ cargo add serde --features derive
 Put this in `src/main.rs`:
 
 ```rust
-use awa::{admin, insert_with, migrations, Client, InsertOpts, JobArgs, JobResult, QueueConfig};
-use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use std::{env, time::Duration};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SendEmail {
-    to: String,
-    subject: String,
-}
-
-impl JobArgs for SendEmail {
-    fn kind() -> &'static str {
-        "send_email"
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = env::var("DATABASE_URL")?;
-
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
-        .await?;
-
-    // This is your application's sqlx pool. Awa uses it for queue storage,
-    // but it does not become your general database abstraction.
-    migrations::run(&pool).await?;
-
-    let client = Client::builder(pool.clone())
-        .queue(
-            "email",
-            QueueConfig {
-                max_workers: 2,
-                ..Default::default()
-            },
-        )
-        .register::<SendEmail, _, _>(|args, _ctx| async move {
-            println!("sending email to {}: {}", args.to, args.subject);
-            Ok(JobResult::Completed)
-        })
-        .build()?;
-
-    client.start().await?;
-
-    let job = insert_with(
-        &pool,
-        &SendEmail {
-            to: "alice@example.com".into(),
-            subject: "Welcome".into(),
-        },
-        InsertOpts {
-            queue: "email".into(),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let job = admin::get_job(&pool, job.id).await?;
-    println!("job {} state = {:?}", job.id, job.state);
-
-    client.shutdown(Duration::from_secs(5)).await;
-    Ok(())
-}
+--8<-- "awa/examples/quickstart.rs"
 ```
+
+This page includes the repository's canonical example verbatim. The docs check compiles it on every change.
 
 ## 3. Run It
 
@@ -196,7 +132,7 @@ let opts = InsertOpts {
 awa::insert_with(&pool, &UpdateCustomer { customer_id, payload }, opts).await?;
 ```
 
-At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#raising-enqueue_shards) for the operator-side knob.
+At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [queue configuration](configuration.md#sharding-the-enqueue-head-per-queue) for the operator-side knob.
 
 ## Next
 
@@ -204,8 +140,8 @@ At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sh
 - [Deployment guide](deployment.md)
 - [Migration guide](migrations.md)
 - [Troubleshooting](troubleshooting.md)
-- [Advanced Rust example](../awa/examples/etl_pipeline.rs)
-- [Deadline-bounded polling pattern](../awa/examples/poll_until_deadline.rs) — poll an external system every X until it's ready or the deadline expires, using `JobResult::Snooze` so polls don't burn attempts.
+- [Advanced Rust example](https://github.com/hardbyte/awa/blob/main/awa/examples/etl_pipeline.rs)
+- [Deadline-bounded polling pattern](https://github.com/hardbyte/awa/blob/main/awa/examples/poll_until_deadline.rs) — poll an external system every X until it's ready or the deadline expires, using `JobResult::Snooze` so polls don't burn attempts.
 
   **Dashboard mid-run** — three polling jobs in flight (1 failed terminally, 1 scheduled between snoozes, 1 completed).
 

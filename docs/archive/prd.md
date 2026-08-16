@@ -1,6 +1,6 @@
 # AWA — Product Requirements Document (archived)
 
-> **Historical product brief — archived.** This document captures the 0.x design intent at the time it was written (early 2026) and is retained for context. It is **not** a description of current behavior; for that, see [`docs/architecture.md`](../architecture.md), [`docs/configuration.md`](../configuration.md), and the ADRs under [`docs/adr/`](../adr/).
+> **Historical product brief — archived.** This document captures the 0.x design intent at the time it was written (early 2026) and is retained for context. It is **not** a description of current behavior; for that, see [`docs/architecture.md`](../architecture.md), [`docs/configuration.md`](../configuration.md), and the [architecture decision index](../adr/README.md).
 
 _Version: 1.0 — March 2026 (archived)_
 

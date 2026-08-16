@@ -45,45 +45,10 @@ python -m awa --database-url "$DATABASE_URL" migrate
 Create `quickstart.py`:
 
 ```python
-import asyncio
-import os
-from dataclasses import dataclass
-
-import awa
-
-DATABASE_URL = os.environ["DATABASE_URL"]
-
-
-@dataclass
-class SendEmail:
-    to: str
-    subject: str
-
-
-async def main() -> None:
-    client = awa.AsyncClient(DATABASE_URL)
-
-    @client.task(SendEmail, queue="email")
-    async def handle_email(job):
-        print(f"sending email to {job.args.to}: {job.args.subject}")
-
-    await client.start([("email", 2)])
-
-    job = await client.insert(
-        SendEmail(to="alice@example.com", subject="Welcome"),
-        queue="email",
-    )
-
-    await asyncio.sleep(1)
-
-    result = await client.get_job(job.id)
-    print(f"job {result.id} state = {result.state}")
-
-    await client.shutdown()
-
-
-asyncio.run(main())
+--8<-- "awa-python/examples/quickstart.py"
 ```
+
+This page includes the repository's canonical example verbatim. CI runs it against PostgreSQL and the docs check compiles its Python syntax.
 
 ## 4. Run It
 
@@ -182,7 +147,7 @@ await client.insert(
 )
 ```
 
-At the default `enqueue_shards = 1` the key is ignored (everything is on shard 0 anyway). See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#raising-enqueue_shards) for the operator-side knob.
+At the default `enqueue_shards = 1` the key is ignored (everything is on shard 0 anyway). See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [queue configuration](configuration.md#sharding-the-enqueue-head-per-queue) for the operator-side knob.
 
 ### Exporting OpenTelemetry metrics
 
@@ -199,7 +164,7 @@ awa.init_telemetry(
 # ... then build the client and start workers as normal.
 ```
 
-`init_telemetry` is idempotent; only the first call installs a provider. Call `awa.shutdown_telemetry()` at the end of short-lived scripts to flush pending metrics. See [`awa-python/examples/telemetry.py`](../awa-python/examples/telemetry.py) for a runnable example.
+`init_telemetry` is idempotent; only the first call installs a provider. Call `awa.shutdown_telemetry()` at the end of short-lived scripts to flush pending metrics. See [`awa-python/examples/telemetry.py`](https://github.com/hardbyte/awa/blob/main/awa-python/examples/telemetry.py) for a runnable example.
 
 ### Distributed tracing
 
@@ -228,8 +193,8 @@ the enqueue-site context so the trace still connects.
 
 ## More Examples
 
-- [Bundled quickstart example](../awa-python/examples/quickstart.py)
-- [ETL pipeline example](../examples/python/etl_pipeline.py)
-- [Webhook callback example](../examples/python/webhook_payments.py)
+- [Bundled quickstart example](https://github.com/hardbyte/awa/blob/main/awa-python/examples/quickstart.py)
+- [ETL pipeline example](https://github.com/hardbyte/awa/blob/main/examples/python/etl_pipeline.py)
+- [Webhook callback example](https://github.com/hardbyte/awa/blob/main/examples/python/webhook_payments.py)
 - [Deployment guide](deployment.md)
 - [Troubleshooting](troubleshooting.md)

@@ -58,7 +58,7 @@ Runtime validation for ADR-019 is recorded in [`bench/019-queue-storage-validati
 
 Runtime validation for ADR-023 is recorded in [`bench/023-receipt-ring-validation-2026-04-26.md`](bench/023-receipt-ring-validation-2026-04-26.md) (receipt-ring long-horizon and overnight evidence).
 
-TLA+ correctness models that pin spec-level invariants are under [`../../correctness/`](../../correctness/) — the segmented-storage family (`AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`, `AwaSegmentedStorageTrace`) maps to ADR-019 and ADR-020; the worker-runtime family (`AwaCore`, `AwaExtended`, `AwaBatcher`, `AwaCbk`, `AwaDispatchClaim`, `AwaViewTrigger`, `AwaCron`) covers rescue, batcher, callback race, dispatcher claim, view-trigger concurrency, and cron double-fire.
+TLA+ correctness models that pin spec-level invariants are under [`correctness/`](https://github.com/hardbyte/awa/tree/main/correctness) — the segmented-storage family (`AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`, `AwaSegmentedStorageTrace`) maps to ADR-019 and ADR-020; the worker-runtime family (`AwaCore`, `AwaExtended`, `AwaBatcher`, `AwaCbk`, `AwaDispatchClaim`, `AwaViewTrigger`, `AwaCron`) covers rescue, batcher, callback race, dispatcher claim, view-trigger concurrency, and cron double-fire.
 
 ## Conventions
 

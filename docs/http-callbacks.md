@@ -201,7 +201,7 @@ let router = callback_router(
 .await?;
 ```
 
-Use [`HttpWorkerConfig::callback_path_prefix`](#configuration) on the worker side to match a non-default `--path-prefix` so the URLs the worker hands to your function point at the receiver.
+Use [`HttpWorkerConfig::callback_path_prefix`](#configure-the-worker) on the worker side to match a non-default `--path-prefix` so the URLs the worker hands to your function point at the receiver.
 
 If you want callbacks to land inside your own application (FastAPI, axum, etc.) rather than running Awa's receiver at all, see [`docs/callback-receivers.md`](./callback-receivers.md) for the user-owned API integration pattern.
 

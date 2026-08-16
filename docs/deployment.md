@@ -93,8 +93,8 @@ The nightly MVCC benchmark exists to catch changes that make this failure mode w
 
 The repository already includes Dockerfiles for the `awa` CLI:
 
-- [`docker/Dockerfile`](../docker/Dockerfile)
-- [`docker/Dockerfile.runtime`](../docker/Dockerfile.runtime)
+- [`docker/Dockerfile`](https://github.com/hardbyte/awa/blob/main/docker/Dockerfile)
+- [`docker/Dockerfile.runtime`](https://github.com/hardbyte/awa/blob/main/docker/Dockerfile.runtime)
 
 Build the CLI image locally:
 

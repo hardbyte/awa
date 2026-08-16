@@ -181,7 +181,7 @@ This ADR has been implemented for 0.6:
 Validation evidence is split by purpose:
 
 - Runtime and long-horizon evidence lives in [`bench/023-receipt-ring-validation-2026-04-26.md`](bench/023-receipt-ring-validation-2026-04-26.md). The recorded runs include the 115-minute 4x8 receipts-on long-horizon run and the 12-hour overnight run; receipt closure partitions stayed at 0 dead tuples across every phase, and receipt claims remained bounded.
-- Spec and implementation mapping lives in [`../../correctness/storage/MAPPING.md`](../../correctness/storage/MAPPING.md). The storage TLA+ family models claim-ring rotation, partition prune safety, receipt rescue, running cancel, and DLQ retry trace witnesses.
+- Spec and implementation mapping lives in [`correctness/storage/MAPPING.md`](https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md). The storage TLA+ family models claim-ring rotation, partition prune safety, receipt rescue, running cancel, and DLQ retry trace witnesses.
 - Operator-facing tuning and defaults live in [`../configuration.md`](../configuration.md#queue-storage-tuning).
 
 The detailed phase-by-phase implementation notes were intentionally kept out of this ADR. ADRs record the decision and its consequences; dated build logs, benchmark output, and branch-era investigation notes belong in validation artifacts or the 0.6 storage-design archive.

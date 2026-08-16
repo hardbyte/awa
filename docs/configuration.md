@@ -226,7 +226,7 @@ Queue configuration is the normal way to express operational policy. Job kinds a
 | Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
 | Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
 | Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, and extra metadata. They do not set dispatch limits or timeouts. |
-| Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout--bounding-wait_for_callback). |
+| Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout-bounding-wait_for_callback). |
 | Per queue / global retention and DLQ policy | `completed_retention`, `failed_retention`, `queue_retention(...)`, `dlq_enabled_by_default`, `queue_dlq_enabled`, `dlq_retention` | Retention has global defaults with per-queue overrides. DLQ enablement is queue-scoped. Split job kinds across queues if only some kinds should DLQ. |
 | Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` currently applies to the queue-storage engine rather than to one named queue. |
 
@@ -594,7 +594,7 @@ A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× / 3.69
 
 Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard` attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.
 
-Lowering the value is safe at any time — see [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#lowering-enqueue_shards). See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and contract.
+Lowering the value is safe at any time. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and contract.
 
 ### Hot-Queue Claim Control
 

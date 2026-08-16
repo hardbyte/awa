@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 470" role="img">
+  <title>AWA producers and workers coordinate through PostgreSQL</title>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1">
+      <stop offset="0" stop-color="#eef8f1"/>
+      <stop offset="1" stop-color="#e7f3ed"/>
+    </linearGradient>
+    <linearGradient id="db" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17633e"/>
+      <stop offset="1" stop-color="#0d4d2e"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 10 5 0 10z" fill="#287a51"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#10341f" flood-opacity=".16"/>
+    </filter>
+  </defs>
+  <rect width="920" height="470" rx="28" fill="url(#bg)"/>
+  <g font-family="Inter,system-ui,sans-serif">
+    <text x="460" y="40" text-anchor="middle" font-size="18" font-weight="700" fill="#17633e">ONE DURABLE COORDINATION PLANE</text>
+
+    <g filter="url(#shadow)">
+      <rect x="42" y="85" width="235" height="120" rx="18" fill="#fff" stroke="#b9d6c4" stroke-width="2"/>
+      <circle cx="82" cy="125" r="16" fill="#d4eee0"/>
+      <path d="M74 125h16m-8-8 8 8-8 8" fill="none" stroke="#17633e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="110" y="125" font-size="21" font-weight="750" fill="#173324">Producers</text>
+      <text x="70" y="160" font-size="15" fill="#52675a">Rust · Python · SQL bridges</text>
+      <text x="70" y="184" font-size="14" fill="#52675a">Application transaction</text>
+
+      <rect x="643" y="85" width="235" height="120" rx="18" fill="#fff" stroke="#b9d6c4" stroke-width="2"/>
+      <circle cx="683" cy="125" r="16" fill="#d4eee0"/>
+      <path d="M677 125l4 4 9-10" fill="none" stroke="#17633e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="711" y="125" font-size="21" font-weight="750" fill="#173324">Workers</text>
+      <text x="670" y="160" font-size="15" fill="#52675a">Claim · heartbeat · execute</text>
+      <text x="670" y="184" font-size="14" fill="#52675a">Complete · retry · wait</text>
+
+      <rect x="312" y="235" width="296" height="150" rx="22" fill="url(#db)"/>
+      <ellipse cx="460" cy="270" rx="102" ry="24" fill="#55c58a" opacity=".32"/>
+      <path d="M358 270v65c0 14 46 25 102 25s102-11 102-25v-65" fill="none" stroke="#b9ecd0" stroke-width="3"/>
+      <path d="M358 302c0 14 46 25 102 25s102-11 102-25" fill="none" stroke="#b9ecd0" stroke-width="2" opacity=".75"/>
+      <text x="460" y="300" text-anchor="middle" font-size="23" font-weight="760" fill="#fff">PostgreSQL</text>
+      <text x="460" y="329" text-anchor="middle" font-size="15" fill="#d9f4e4">application data + AWA jobs</text>
+    </g>
+
+    <path d="M210 205c25 57 62 81 102 91" fill="none" stroke="#287a51" stroke-width="4" marker-end="url(#arrow)"/>
+    <text x="222" y="257" font-size="14" font-weight="650" fill="#17633e">COMMIT</text>
+    <path d="M608 296c44-12 77-40 94-91" fill="none" stroke="#287a51" stroke-width="4" marker-end="url(#arrow)"/>
+    <text x="654" y="257" font-size="14" font-weight="650" fill="#17633e">CLAIM</text>
+    <path d="M750 205c-27 67-73 112-142 126" fill="none" stroke="#287a51" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arrow)"/>
+    <text x="700" y="312" font-size="14" font-weight="650" fill="#17633e">RESULT</text>
+
+    <g>
+      <rect x="78" y="407" width="764" height="38" rx="19" fill="#d8ebe0"/>
+      <text x="460" y="431" text-anchor="middle" font-size="14" font-weight="650" fill="#345845">CLI · WEB UI · METRICS · TRACES · SQL INSPECTION</text>
+    </g>
+  </g>
+</svg>

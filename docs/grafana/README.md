@@ -11,7 +11,7 @@ Previews (live demo workload, both dashboards rendered against a local `grafana/
 | --------------------------------- | ----------------------------- |
 | ![](screenshots/awa-postgres.png) | ![](screenshots/awa-otel.png) |
 
-Alert rules (see [`alerts/`](alerts/)) import as Grafana unified-alerting file provisioning. Here's the rule browser after provisioning both variants, with the "no active runtime (Postgres)" rule firing after we stopped the demo worker:
+Alert rules (see the [alert provisioning guide](alerts/README.md)) import as Grafana unified-alerting file provisioning. Here's the rule browser after provisioning both variants, with the "no active runtime (Postgres)" rule firing after we stopped the demo worker:
 
 ![](screenshots/awa-alerts.png)
 

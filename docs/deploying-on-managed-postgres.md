@@ -94,7 +94,7 @@ DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 
 Use an upsert — first-enqueue may create lane rows before any operator inserts a `queue_meta` row, so a plain `UPDATE` can quietly affect zero rows.
 
-Going higher than 4 only helps when producer-side head-row contention is your bottleneck; raise it after measuring. Lowering it later is safe (see [`upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#lowering-enqueue_shards)) but the FIFO contract changes — see [`configuration.md`](configuration.md#sharding-the-enqueue-head-per-queue) and [ADR-025](adr/025-sharded-enqueue-heads.md).
+Going higher than 4 only helps when producer-side head-row contention is your bottleneck; raise it after measuring. Lowering it later is safe, but the FIFO contract changes — see [`configuration.md`](configuration.md#sharding-the-enqueue-head-per-queue) and [ADR-025](adr/025-sharded-enqueue-heads.md).
 
 ## Producer path: use the direct COPY entry point
 
