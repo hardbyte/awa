@@ -72,6 +72,13 @@ Install the CLI if you want migration/admin/UI commands:
 uv tool install awa-cli==0.6.6
 ```
 
+If uv reports that its tool directory is not on `PATH`, update your shell and
+open a new terminal before continuing:
+
+```bash
+uv tool update-shell
+```
+
 Then inspect what happened:
 
 ```bash
