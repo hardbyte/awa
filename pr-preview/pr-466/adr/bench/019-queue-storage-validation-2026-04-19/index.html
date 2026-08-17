@@ -1976,7 +1976,7 @@
 </span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>  -- --ignored --exact --nocapture --test-threads=1
 </span></code></pre></div>
 <p>Summary output:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>[queue-storage-soak] summary duration=10s seeded=9988 produced_for=10.01s drained_in=12.79s handler=1016/s finalized=781/s peak_in_flight=334 peak_dead_total=10041 peak_attempt_state=0 exact_dead_total=276 exact_dead=(queue_lanes=19,ready=0,done=255,leases=2,attempt_state=0) final_counts={&quot;completed&quot;: 8998, &quot;failed&quot;: 990} seeded_by_mode={&quot;terminal_fail&quot;: 495, &quot;complete&quot;: 6000, &quot;deadline_hang&quot;: 998, &quot;snooze_once&quot;: 1000, &quot;retry_once&quot;: 1000, &quot;callback_timeout&quot;: 495} final_dlq=990
+<div class="language-text highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>[queue-storage-soak] summary duration=10s seeded=9988 produced_for=10.01s drained_in=12.79s handler=1016/s finalized=781/s peak_in_flight=334 peak_dead_total=10041 peak_attempt_state=0 exact_dead_total=276 exact_dead=(queue_lanes=19,ready=0,done=255,leases=2,attempt_state=0) final_counts={"completed": 8998, "failed": 990} seeded_by_mode={"terminal_fail": 495, "complete": 6000, "deadline_hang": 998, "snooze_once": 1000, "retry_once": 1000, "callback_timeout": 495} final_dlq=990
 </span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>ok
 </span></code></pre></div>
 <h3 id="terminal-failure-burst">Terminal-failure burst<a class="headerlink" href="#terminal-failure-burst" title="Permanent link">&para;</a></h3>
@@ -1986,7 +1986,7 @@
 </span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>  -- --ignored --exact --nocapture --test-threads=1
 </span></code></pre></div>
 <p>Summary output:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>[queue-storage-terminal-burst] summary total=10000 drain=5.10s handler=1962/s finalized=1962/s peak_in_flight=9936 peak_dead_total=2964 peak_attempt_state=0 exact_dead_total=61 exact_dead=(queue_lanes=61,ready=0,done=0,leases=0,attempt_state=0) final_counts={&quot;failed&quot;: 10000} final_dlq=10000
+<div class="language-text highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>[queue-storage-terminal-burst] summary total=10000 drain=5.10s handler=1962/s finalized=1962/s peak_in_flight=9936 peak_dead_total=2964 peak_attempt_state=0 exact_dead_total=61 exact_dead=(queue_lanes=61,ready=0,done=0,leases=0,attempt_state=0) final_counts={"failed": 10000} final_dlq=10000
 </span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>ok
 </span></code></pre></div>
 <h2 id="counter-lesson">Counter Lesson<a class="headerlink" href="#counter-lesson" title="Permanent link">&para;</a></h2>

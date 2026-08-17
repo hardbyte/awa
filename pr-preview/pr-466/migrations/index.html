@@ -2097,7 +2097,7 @@
 <p>The default queue-storage substrate in <code>awa.*</code> is migration-owned. Custom queue-storage schemas are installed through the same SQL helper; see <a href="../queue-storage-substrate/">Queue-storage substrate</a> for ownership and configuration details.</p>
 <h2 id="fresh-install-no-prior-canonical-data">Fresh Install (No Prior Canonical Data)<a class="headerlink" href="#fresh-install-no-prior-canonical-data" title="Permanent link">&para;</a></h2>
 <h3 id="cli">CLI<a class="headerlink" href="#cli" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>migrate
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>migrate
 </span></code></pre></div>
 <h3 id="rust">Rust<a class="headerlink" href="#rust" title="Permanent link">&para;</a></h3>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">awa</span><span class="p">::</span><span class="n">migrations</span><span class="p">::</span><span class="n">run</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
@@ -2115,16 +2115,16 @@
 <li><a href="../upgrade-0.6-to-0.7/">Upgrade 0.6 to 0.7</a></li>
 </ul>
 <p>Then run the migration command at the point specified by that guide:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>migrate
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>migrate
 </span></code></pre></div>
 <p>Do not assume that every release requires schema-first deployment. A guide may require a compatibility patch before migration, permit migration and binary rollout in either order, or define a capability-gated flip after the binaries have rolled.</p>
 <p>Use the storage status command when an upgrade includes a storage transition:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>storage<span class="w"> </span>status
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>status
 </span></code></pre></div>
 <p>The <a href="../queue-storage-substrate/">queue-storage substrate guide</a> documents preparation of custom schemas and non-default slot counts.</p>
 <h2 id="external-migration-tooling">External Migration Tooling<a class="headerlink" href="#external-migration-tooling" title="Permanent link">&para;</a></h2>
 <p>To manage Awa SQL with Flyway, Liquibase, dbmate, or another runner, extract the bundled migrations:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>migrate<span class="w"> </span>--extract-to<span class="w"> </span>./sql/awa
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>migrate<span class="w"> </span>--extract-to<span class="w"> </span>./sql/awa
 </span></code></pre></div>
 <p>Use <code>awa migrate --sql</code> to print the same migration set to standard output.</p>
 <p>The same SQL is available programmatically:</p>

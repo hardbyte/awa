@@ -2659,20 +2659,20 @@
 <p>This is why queue storage's hot-path reclamation is a rotation-and-prune discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the canonical compatibility path.</p>
 <h2 id="maintenance-leader">Maintenance Leader<a class="headerlink" href="#maintenance-leader" title="Permanent link">&para;</a></h2>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>flowchart TB
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    subgraph Workers[&quot;Worker processes&quot;]
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>        W1[&quot;worker&quot;]
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        W2[&quot;worker&quot;]
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>        W3[&quot;worker&quot;]
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    subgraph Workers["Worker processes"]
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>        W1["worker"]
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        W2["worker"]
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>        W3["worker"]
 </span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    end
 </span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    Lock[&quot;pg_try_advisory_lock(0x4157415f4d41494e)&quot;]
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    Lock["pg_try_advisory_lock(0x4157415f4d41494e)"]
 </span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    W1 --&gt; Lock
 </span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    W2 --&gt; Lock
 </span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    W3 --&gt; Lock
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>    Lock -- &quot;one session wins&quot; --&gt; Leader[&quot;maintenance leader&quot;]
-</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>    Lock -- &quot;retry later&quot; --&gt; Followers[&quot;followers&quot;]
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>    Lock -- "one session wins" --&gt; Leader["maintenance leader"]
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>    Lock -- "retry later" --&gt; Followers["followers"]
 </span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>
-</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>    Leader --&gt; Tasks[&quot;promotion&lt;br/&gt;heartbeat/deadline/callback rescue&lt;br/&gt;queue/lease/claim rotate + prune&lt;br/&gt;DLQ cleanup&lt;br/&gt;descriptor cleanup&lt;br/&gt;cron eval&lt;br/&gt;metadata refresh&lt;br/&gt;queue health&quot;]
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>    Leader --&gt; Tasks["promotion&lt;br/&gt;heartbeat/deadline/callback rescue&lt;br/&gt;queue/lease/claim rotate + prune&lt;br/&gt;DLQ cleanup&lt;br/&gt;descriptor cleanup&lt;br/&gt;cron eval&lt;br/&gt;metadata refresh&lt;br/&gt;queue health"]
 </span></code></pre></div>
 <p>The advisory lock is session-scoped. If the leader process or database connection dies, Postgres releases the lock and another worker can win the next election. Heartbeat refresh is not leader-elected; only cluster-wide rescue and maintenance scans are.</p>
 <h2 id="operator-surfaces">Operator Surfaces<a class="headerlink" href="#operator-surfaces" title="Permanent link">&para;</a></h2>
