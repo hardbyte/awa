@@ -381,6 +381,8 @@ All coordination through Postgres. The Rust runtime owns dispatch, leases, heart
 
 ## Documentation
 
+**[Browse the documentation site →](https://hardbyte.github.io/awa/)**
+
 | Doc | Description |
 | --- | --- |
 | [Rust getting started](docs/getting-started-rust.md) | From `cargo add` to a job reaching `completed` |
