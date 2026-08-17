@@ -74,6 +74,8 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v8
         with:
           name: awa-docs-${{ github.run_id }}
@@ -96,6 +98,8 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - uses: actions/checkout@v6
+
       - name: Remove pull request preview
         uses: rossjrw/pr-preview-action@v1
         with:
@@ -110,6 +114,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+
       - uses: actions/download-artifact@v8
         with:
           name: awa-docs-${{ github.run_id }}
