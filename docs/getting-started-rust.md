@@ -2,6 +2,10 @@
 
 This guide takes you from `cargo add` to a job reaching `completed`.
 
+!!! note "Version used in this guide"
+
+    The install commands pin **v0.6.6**, the latest stable release. The canonical example is tested against both that release and the code on `main`; development-only 0.7 surfaces elsewhere on this site are identified by the site banner and stability labels.
+
 ## Mental Model
 
 Before writing code, it helps to know what Awa is doing for you:
@@ -31,7 +35,7 @@ export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 cargo new awa-rust-quickstart
 cd awa-rust-quickstart
 
-cargo add awa
+cargo add awa@0.6.6
 cargo add sqlx --features runtime-tokio-rustls,postgres
 cargo add tokio --features macros,rt-multi-thread,time
 cargo add serde --features derive
@@ -65,7 +69,7 @@ job 1 state = Completed
 Install the CLI if you want migration/admin/UI commands:
 
 ```bash
-uv tool install awa-cli
+uv tool install awa-cli==0.6.6
 ```
 
 Then inspect what happened:

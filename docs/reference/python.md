@@ -3,7 +3,7 @@
 Install `awa-pg` for the Python clients and worker runtime:
 
 ```bash
-uv add awa-pg
+uv add awa-pg==0.6.6
 ```
 
 The package ships type information for its public surface. This page is a map; use Python help and your editor against the installed version for exact signatures.

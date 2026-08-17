@@ -46,7 +46,7 @@ Business data and job state share PostgreSQL. A transaction either commits both 
 === "Rust"
 
     ```bash
-    cargo add awa
+    cargo add awa@0.6.6
     ```
 
     Define typed job arguments, register async handlers, and use your existing `sqlx` pool for migrations, enqueueing, and administration.
@@ -56,7 +56,7 @@ Business data and job state share PostgreSQL. A transaction either commits both 
 === "Python"
 
     ```bash
-    uv add awa-pg
+    uv add awa-pg==0.6.6
     ```
 
     Register sync or async handlers around dataclasses and use direct clients or transaction bridges for asyncpg, psycopg, SQLAlchemy, and Django.
@@ -66,7 +66,7 @@ Business data and job state share PostgreSQL. A transaction either commits both 
 === "Operations"
 
     ```bash
-    uv tool install awa-cli
+    uv tool install awa-cli==0.6.6
     awa --database-url "$DATABASE_URL" health
     ```
 

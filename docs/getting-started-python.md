@@ -2,6 +2,10 @@
 
 This guide takes you from `uv init` to a job reaching `completed`.
 
+!!! note "Version used in this guide"
+
+    The install commands pin **v0.6.6**, the latest stable release. The canonical example is tested against both that release and the code on `main`; development-only 0.7 surfaces elsewhere on this site are identified by the site banner and stability labels.
+
 ## Prerequisites
 
 - PostgreSQL running locally or remotely
@@ -19,7 +23,7 @@ export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 ```bash
 uv init awa-python-quickstart --bare
 cd awa-python-quickstart
-uv add awa-pg
+uv add awa-pg==0.6.6
 ```
 
 `uv init` creates a minimal Python project. `uv add` creates and manages the project's virtual environment, records `awa-pg` in `pyproject.toml`, and writes a lockfile—there is no environment activation step.
@@ -79,7 +83,7 @@ uv run python -m awa --database-url "$DATABASE_URL" queue stats
 The dashboard ships in a separate wheel so the default `awa-pg` install stays small for workers and producers. Install the `[ui]` extra to bring in the `awa-cli` binary that hosts it:
 
 ```bash
-uv add 'awa-pg[ui]'
+uv add 'awa-pg[ui]==0.6.6'
 uv run python -m awa --database-url "$DATABASE_URL" serve
 # → http://127.0.0.1:3000
 ```

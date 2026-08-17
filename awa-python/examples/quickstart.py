@@ -1,6 +1,6 @@
 """Awa Python quickstart — a complete runnable example.
 
-Requires: uv add awa-pg
+Requires: uv add awa-pg==0.6.6
 Requires: a running Postgres instance with DATABASE_URL set.
 
 Usage from the repository's awa-python directory:
@@ -47,21 +47,36 @@ async def main():
     # Verify it reaches a terminal state without relying on a fixed delay.
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 10
+    last_state = job.state
     try:
         while True:
-            result = await client.get_job(job.id)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for job {job.id} "
+                    f"(last state: {last_state})"
+                )
+
+            # get_job is a single read-only query, so cancelling this await
+            # cannot leave an application transaction partially committed.
+            try:
+                result = await asyncio.wait_for(
+                    client.get_job(job.id), timeout=remaining
+                )
+            except asyncio.TimeoutError as error:
+                raise TimeoutError(
+                    f"timed out waiting for job {job.id} "
+                    f"(last state: {last_state})"
+                ) from error
+
+            last_state = result.state
             if result.state == awa.JobState.Completed:
                 break
             if result.state in (awa.JobState.Failed, awa.JobState.Cancelled):
                 raise RuntimeError(
                     f"job {result.id} ended in terminal state {result.state}"
                 )
-            if loop.time() >= deadline:
-                raise TimeoutError(
-                    f"timed out waiting for job {result.id} "
-                    f"(last state: {result.state})"
-                )
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(min(0.1, max(0, deadline - loop.time())))
     finally:
         await client.shutdown()
 
