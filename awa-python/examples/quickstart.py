@@ -44,11 +44,27 @@ async def main():
     )
     print(f"Inserted job {job.id} (kind={job.kind}, state={job.state})")
 
-    await asyncio.sleep(1)
-    await client.shutdown()
+    # Verify it reaches a terminal state without relying on a fixed delay.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10
+    try:
+        while True:
+            result = await client.get_job(job.id)
+            if result.state == awa.JobState.Completed:
+                break
+            if result.state in (awa.JobState.Failed, awa.JobState.Cancelled):
+                raise RuntimeError(
+                    f"job {result.id} ended in terminal state {result.state}"
+                )
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for job {result.id} "
+                    f"(last state: {result.state})"
+                )
+            await asyncio.sleep(0.1)
+    finally:
+        await client.shutdown()
 
-    # Verify it completed
-    result = await client.get_job(job.id)
     print(f"Job {result.id} state: {result.state}")
 
 
