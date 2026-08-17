@@ -638,17 +638,6 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#mental-model" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Mental Model
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#prerequisites" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -660,10 +649,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#1-install-packages" class="md-nav__link">
+  <a href="#1-create-a-project" class="md-nav__link">
     <span class="md-ellipsis">
       
-        1. Install Packages
+        1. Create a Project
       
     </span>
   </a>
@@ -697,6 +686,17 @@
     <span class="md-ellipsis">
       
         4. Run It
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-happened" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What happened?
       
     </span>
   </a>
@@ -1988,17 +1988,6 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#mental-model" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Mental Model
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#prerequisites" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2010,10 +1999,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#1-install-packages" class="md-nav__link">
+  <a href="#1-create-a-project" class="md-nav__link">
     <span class="md-ellipsis">
       
-        1. Install Packages
+        1. Create a Project
       
     </span>
   </a>
@@ -2047,6 +2036,17 @@
     <span class="md-ellipsis">
       
         4. Run It
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-happened" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What happened?
       
     </span>
   </a>
@@ -2168,43 +2168,34 @@
 
 
 <h1 id="python-getting-started">Python Getting Started<a class="headerlink" href="#python-getting-started" title="Permanent link">&para;</a></h1>
-<p>This guide takes you from <code>pip install</code> to a job reaching <code>completed</code>.</p>
-<h2 id="mental-model">Mental Model<a class="headerlink" href="#mental-model" title="Permanent link">&para;</a></h2>
-<p>Before the code, here is the operational model Awa is built around:</p>
-<ul>
-<li>inserting a job writes durable job state to Postgres, so enqueuing can live inside the same transaction as your application write</li>
-<li>workers claim runnable jobs, heartbeat while they execute, and rescue them if the worker dies</li>
-<li>retries, callback waits, and progress checkpoints are persisted in Postgres and exposed as one hydrated job snapshot instead of being held only in memory</li>
-<li>when you debug or operate the system, inspect the job first; the CLI and UI are designed around that read-only inspection path</li>
-</ul>
-<p>That means “what happened?” is usually a database inspection question, not a worker-log archaeology exercise.</p>
+<p>This guide takes you from <code>uv init</code> to a job reaching <code>completed</code>.</p>
 <h2 id="prerequisites">Prerequisites<a class="headerlink" href="#prerequisites" title="Permanent link">&para;</a></h2>
 <ul>
 <li>PostgreSQL running locally or remotely</li>
-<li>Python 3.10+</li>
+<li><a href="https://docs.astral.sh/uv/getting-started/installation/"><code>uv</code></a> (it will use or install a compatible Python 3.10+ interpreter)</li>
 <li>A database URL exported as <code>DATABASE_URL</code></li>
 </ul>
 <p>Example local URL:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test
 </span></code></pre></div>
-<h2 id="1-install-packages">1. Install Packages<a class="headerlink" href="#1-install-packages" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python<span class="w"> </span>-m<span class="w"> </span>venv<span class="w"> </span>.venv
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>pip<span class="w"> </span>install<span class="w"> </span>awa-pg
+<h2 id="1-create-a-project">1. Create a Project<a class="headerlink" href="#1-create-a-project" title="Permanent link">&para;</a></h2>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>uv<span class="w"> </span>init<span class="w"> </span>awa-python-quickstart<span class="w"> </span>--bare
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nb">cd</span><span class="w"> </span>awa-python-quickstart
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>uv<span class="w"> </span>add<span class="w"> </span>awa-pg
 </span></code></pre></div>
+<p><code>uv init</code> creates a minimal Python project. <code>uv add</code> creates and manages the project's virtual environment, records <code>awa-pg</code> in <code>pyproject.toml</code>, and writes a lockfile—there is no environment activation step.</p>
 <h2 id="2-run-migrations">2. Run Migrations<a class="headerlink" href="#2-run-migrations" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>migrate
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>migrate
 </span></code></pre></div>
 <h2 id="3-create-a-worker">3. Create a Worker<a class="headerlink" href="#3-create-a-worker" title="Permanent link">&para;</a></h2>
 <p>Create <code>quickstart.py</code>:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="sd">&quot;&quot;&quot;Awa Python quickstart — a complete runnable example.</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="sd">Requires: pip install awa-pg</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="sd">Requires: uv add awa-pg</span>
 </span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="sd">Requires: a running Postgres instance with DATABASE_URL set.</span>
 </span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="sd">Usage:</span>
-</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="sd">    DATABASE_URL=postgres://localhost/mydb python examples/quickstart.py</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="sd">Usage from the repository&#39;s awa-python directory:</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="sd">    DATABASE_URL=postgres://localhost/mydb uv run python examples/quickstart.py</span>
 </span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="sd">&quot;&quot;&quot;</span>
 </span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>
 </span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
@@ -2257,26 +2248,35 @@
 </span></code></pre></div>
 <p>This page includes the repository's canonical example verbatim. CI runs it against PostgreSQL and the docs check compiles its Python syntax.</p>
 <h2 id="4-run-it">4. Run It<a class="headerlink" href="#4-run-it" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>python<span class="w"> </span>quickstart.py
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>quickstart.py
 </span></code></pre></div>
-<p>Expected output is similar to:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>sending email to alice@example.com: Welcome
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>job 1 state = completed
+<p>You should see the inserted job, the handler output, and the terminal state. The first two lines can swap order because the worker starts before the insert:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>Inserted job 1 (kind=send_email, state=available)
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>Sending email to alice@example.com: Welcome
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>Job 1 state: completed
 </span></code></pre></div>
+<h2 id="what-happened">What happened?<a class="headerlink" href="#what-happened" title="Permanent link">&para;</a></h2>
+<ol>
+<li><code>client.migrate()</code> made the example standalone; the explicit migration command in step 2 is the deployment-friendly path.</li>
+<li>Inserting the job wrote durable state to PostgreSQL.</li>
+<li>The worker claimed it, incremented the attempt, and kept the claim alive while the handler ran.</li>
+<li>The handler result became durable <code>completed</code> state, which the final query read back.</li>
+</ol>
+<p>Retries, callback waits, and progress checkpoints follow the same rule: PostgreSQL is the system of record, not worker memory. When you debug a job, inspect its durable snapshot first instead of relying only on worker logs.</p>
 <h2 id="5-inspect-the-queue">5. Inspect the Queue<a class="headerlink" href="#5-inspect-the-queue" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>job<span class="w"> </span>list<span class="w"> </span>--queue<span class="w"> </span>email
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>job<span class="w"> </span>dump<span class="w"> </span><span class="m">1</span>
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>job<span class="w"> </span>dump-run<span class="w"> </span><span class="m">1</span>
-</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>queue<span class="w"> </span>stats
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>job<span class="w"> </span>list<span class="w"> </span>--queue<span class="w"> </span>email
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>job<span class="w"> </span>dump<span class="w"> </span><span class="m">1</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>job<span class="w"> </span>dump-run<span class="w"> </span><span class="m">1</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>queue<span class="w"> </span>stats
 </span></code></pre></div>
 <p><code>job dump</code> gives you the whole job snapshot as JSON. <code>job dump-run</code> focuses on one attempt: the current attempt uses live row data, while historical attempts are reconstructed from the stored <code>errors[]</code> history.</p>
 <h2 id="6-web-ui-optional">6. Web UI (optional)<a class="headerlink" href="#6-web-ui-optional" title="Permanent link">&para;</a></h2>
 <p>The dashboard ships in a separate wheel so the default <code>awa-pg</code> install stays small for workers and producers. Install the <code>[ui]</code> extra to bring in the <code>awa-cli</code> binary that hosts it:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s1">&#39;awa-pg[ui]&#39;</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>serve
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>add<span class="w"> </span><span class="s1">&#39;awa-pg[ui]&#39;</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>serve
 </span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="c1"># → http://127.0.0.1:3000</span>
 </span></code></pre></div>
-<p><code>python -m awa serve</code> delegates to the <code>awa serve</code> binary (you can also call <code>awa serve</code> directly once the extra is installed). The UI is read-only when the database reports <code>transaction_read_only = on</code> (e.g. on a replica) or when <code>--read-only</code> is passed.</p>
+<p><code>uv run python -m awa serve</code> delegates to the <code>awa serve</code> binary (you can also call <code>awa serve</code> directly once the extra is installed). The UI is read-only when the database reports <code>transaction_read_only = on</code> (e.g. on a replica) or when <code>--read-only</code> is passed.</p>
 <h2 id="useful-variants">Useful Variants<a class="headerlink" href="#useful-variants" title="Permanent link">&para;</a></h2>
 <ul>
 <li><code>await client.migrate()</code> runs migrations from Python instead of the CLI.</li>
@@ -2287,7 +2287,7 @@
 <h2 id="orm-transaction-bridging">ORM Transaction Bridging<a class="headerlink" href="#orm-transaction-bridging" title="Permanent link">&para;</a></h2>
 <p>Most applications should keep using their normal database stack for business tables. Use <code>AsyncClient</code>/<code>Client</code> for workers, admin calls, migrations, and queue-only producers; when a web request already has a transaction, enqueue through <code>awa.bridge</code> on that same connection/session.</p>
 <p>Install the app database libraries you already use, for example:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s1">&#39;sqlalchemy[asyncio]&#39;</span><span class="w"> </span>asyncpg
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>uv<span class="w"> </span>add<span class="w"> </span><span class="s1">&#39;sqlalchemy[asyncio]&#39;</span><span class="w"> </span>asyncpg
 </span></code></pre></div>
 <p>Then enqueue in the same SQLAlchemy transaction as your application write:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
