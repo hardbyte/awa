@@ -1,0 +1,2228 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/026-narrow-terminal-history/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>ADR-026: Narrow Terminal History - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="AWA — Postgres-native background jobs">
+  <meta property="og:description" content="Durable, transactional background jobs for Rust and Python.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#adr-026-narrow-terminal-history" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              ADR-026: Narrow Terminal History
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="awa-dark" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_6" id="__nav_6_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Status
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#context" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#consequences" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Consequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Consequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#positive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positive
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#negative" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Negative
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alternatives-considered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternatives Considered
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Alternatives Considered">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#keep-fully-materialized-terminal-rows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keep fully materialized terminal rows
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#remove-durable-terminal-history-for-successful-completions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Remove durable terminal history for successful completions
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#store-compact-successful-receipt-completions-synchronously" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Store compact successful receipt completions synchronously
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#drop-terminal-counters-and-scan-done_entries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Drop terminal counters and scan done_entries
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#make-terminal-counts-eventually-consistent" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Make terminal counts eventually consistent
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#keep-striped-live-counters-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keep striped live counters only
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#defaults" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Defaults
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#relationship-to-rejected-adr-024" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Relationship to Rejected ADR-024
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#relationship-to-other-adrs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Relationship to Other ADRs
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="adr-026-narrow-terminal-history">ADR-026: Narrow Terminal History<a class="headerlink" href="#adr-026-narrow-terminal-history" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Accepted. The "Queue-prune logic must continue treating ready and terminal rows as one retention unit" consequence below is <strong>amended by <a href="../032-failed-terminal-retention/">ADR-032: Failed terminal retention floor</a></strong> for <code>failed</code> terminal rows inside the <code>failed_retention</code> floor: queue prune carries those rows forward into the live segment as wide self-contained terminal rows (the synthetic shape this ADR already defines for unclaimed/scheduled cancellation), decoupling them from the retained ready body so they stay retryable past their original segment. Ordinary terminal history is still one retention unit.</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p>The queue-storage runtime intentionally keeps the runnable row immutable in <code>ready_entries</code> and records durable terminal history when an attempt completes, fails, or is cancelled. The first queue-storage shape wrote every terminal fact to <code>done_entries</code>. That shape was safe and easy to inspect, but it duplicated the immutable job body on the hottest successful completion path: <code>args</code>, <code>max_attempts</code>, <code>run_at</code>, <code>created_at</code>, uniqueness metadata, and often an unchanged runtime payload were written once in <code>ready_entries</code> and then again in <code>done_entries</code>.</p>
+<p>The duplication is visible in the WAL and row-size budget. Reference queue-storage runs showed this shape:</p>
+<table>
+<thead>
+<tr>
+<th>Shape</th>
+<th style="text-align: right;">Completed jobs/s</th>
+<th style="text-align: right;">p99 e2e</th>
+<th style="text-align: right;">WAL/job</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tuned production queue storage</td>
+<td style="text-align: right;"><code>7,885/s</code></td>
+<td style="text-align: right;"><code>203 ms</code></td>
+<td style="text-align: right;"><code>2,241 B</code></td>
+</tr>
+<tr>
+<td>Narrow terminal history</td>
+<td style="text-align: right;"><code>8,337/s</code></td>
+<td style="text-align: right;"><code>205 ms</code></td>
+<td style="text-align: right;"><code>1,932 B</code></td>
+</tr>
+<tr>
+<td>Skip <code>done_entries</code> entirely</td>
+<td style="text-align: right;"><code>8,402/s</code></td>
+<td style="text-align: right;"><code>230 ms</code></td>
+<td style="text-align: right;"><code>1,441 B</code></td>
+</tr>
+</tbody>
+</table>
+<p>Skipping durable terminal history is not acceptable: it weakens the operator/API source of truth. The useful signal is that most of the safe gain comes from avoiding duplicated terminal body bytes, not from deleting the terminal fact.</p>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p>For terminal rows whose source attempt still has a retained ready row, avoid copying immutable ready-body fields into terminal history.</p>
+<p>For failed, cancelled, non-receipt, and wide terminal rows, write a narrow <code>done_entries</code> row:</p>
+<ul>
+<li>keep terminal identity and ordering fields: <code>ready_slot</code>, <code>ready_generation</code>, <code>job_id</code>, <code>kind</code>, <code>queue</code>, <code>state</code>, <code>priority</code>, <code>attempt</code>, <code>run_lease</code>, <code>lane_seq</code>, <code>enqueue_shard</code>, <code>attempted_at</code>, and <code>finalized_at</code></li>
+<li>keep <code>payload</code> only when the terminal runtime payload differs from the ready-row payload</li>
+<li>leave duplicated immutable body fields nullable and normally <code>NULL</code>: <code>args</code>, <code>max_attempts</code>, <code>run_at</code>, <code>created_at</code>, <code>unique_key</code>, and <code>unique_states</code></li>
+</ul>
+<p>Reads that materialize a <code>JobRow</code> or move a terminal row to another storage family hydrate through a left join from <code>done_entries</code> to the retained <code>ready_entries</code> row using the ready segment and lane key:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>(ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq)
+</span></code></pre></div>
+<p>For successful receipt-backed completions that do not need wide terminal body fields, write compact rows to <code>receipt_completion_batches</code> instead of one <code>done_entries</code> row per completed job. Each compact terminal batch stores arrays of <code>(job_id, run_lease, lane_seq, attempt, attempted_at)</code> plus the shared ready segment, queue, priority, shard, finalized timestamp, and originating claim slot. The same completion transaction also writes a compact claim-local row to <code>lease_claim_closure_batches</code>, keyed by immutable receipt ids allocated from <code>lease_claim_receipt_id_seq</code> and stored either on row-local <code>lease_claims</code> rows or inside compact <code>lease_claim_batches.receipt_ids</code>. The closure batch also stores a derived <code>int8multirange</code> for indexed membership checks. The claim transaction returns <code>receipt_id</code> to the worker for every receipt claim; compact <code>lease_claim_batches</code> claims also return the inserted <code>batch_id</code> and a one-based item index. Compact completion validates row-local claims by <code>(claim_slot, job_id, run_lease, receipt_id)</code> and compact batch claims by direct <code>(claim_slot, batch_id, index)</code> plus the expected <code>(job_id, run_lease, receipt_id)</code> after taking the per-attempt advisory lock. Receipt rescue uses the same advisory key before writing rescue closures, so successful completion and rescue serialize without making compact success <code>FOR UPDATE</code> every claim row. The claim transaction writes compact <code>ready_claim_attempt_batches</code> range evidence in the ready row's queue slot before writing receipt claims, so stale claim-cursor recovery can prove that covered lanes already emitted attempts without reading claim-ring parent tables. Zero-deadline claims also use compact <code>lease_claim_batches</code>; deadline-backed claims remain row-local in <code>lease_claims</code> so deadline rescue can stay index-backed on <code>deadline_at</code>. The runtime routes claim lookup and compact closure writes to the originating <code>claim_slot</code> child partitions, while compact terminal history and claim-attempt evidence remain queue-slot routed. Compact terminal batches are counted directly while retained; the terminal-count delta ledger is reserved for <code>done_entries</code> terminal mutations. The compact closure batch carries the ready slot and generation for the completed group, so queue and claim prune can compare exact row counts for a sealed segment and skip conservatively when counts do not prove closure. Terminal history and claim-closure proof are therefore separate append-only ledgers, so successful completions do not need per-job <code>lease_claim_closures</code> rows and stale receipt scans do not need to unnest terminal-history arrays.</p>
+<p>Receipt stale-rescue and deadline-rescue cursors scan only claims that are old or expired enough to be rescue candidates, so long-lived retained claim partitions do not make each maintenance tick re-prove fresh claims.</p>
+<p>The compact path is only for receipt-backed jobs with no unique key, no tags, no terminal errors, and no custom metadata. Awa-owned provenance metadata (<code>_awa_original_priority</code> and <code>_awa_original_queue</code>) remains compact-safe: it is either already present on the retained ready payload, or it is claim-time priority-aging provenance that does not require duplicating the whole terminal body in <code>done_entries</code>.</p>
+<p>Schema preparation creates a read-only <code>{schema}.terminal_jobs</code> view with the hydrated terminal shape. It is the preferred SQL surface for inspection, reporting, and external read-only tooling. The view expands compact completion batches and joins both physical terminal families back to retained <code>ready_entries</code>. The physical <code>done_entries</code> table remains the write/transition surface for terminal rows that can be retried, moved to DLQ, discarded, or carried forward by failed-retention pruning. Compact completed rows are not retryable; SQL compatibility delete hides them by writing <code>receipt_completion_tombstones</code>. That compatibility delete expands retained compact batches to find the target job; Awa does not maintain a <code>job_ids</code> GIN index because that would add WAL to every successful compact completion for a cold administrative path.</p>
+<p>The retained ready backing row remains immutable and inert until queue prune reclaims the segment.</p>
+<p>Terminal rows are narrow only for claimed attempts whose immutable body is already represented by a retained ready row: <code>running</code> and <code>waiting_external</code> attempts. Cancelling an unclaimed <code>available</code> job tombstones the ready lane and writes a wide <code>done_entries</code> row because the job never had a claimed attempt snapshot. Scheduled/deferred cancellation also remains wide because there is no ready backing row in the ready ring.</p>
+<p>When a terminal row is deleted, the retained ready backing row is not deleted and does not become live again. A ready-backed terminal row was already claimed, so the lane is behind the claim cursor; retry or queue-move paths append a fresh ready row at a new lane position. Ready-row cleanup remains segment-level work owned by queue prune.</p>
+<p>Queue-ring prune reclaims retained ready bodies, ready tombstones, compact completion batches, compact completion tombstones, pending <code>done_entries</code> terminal-count deltas, and any remaining terminal facts for the segment together. The TLA+ model records this as <code>TerminalHasRetainedReadyBody</code>: every modelled ready-backed public terminal row has a retained ready body until the terminal fact is moved/deleted or queue prune removes the segment.</p>
+<p>Exact terminal counts are part of this terminal-history contract. Awa keeps them exact with retained compact batches plus three derived stores:</p>
+<ul>
+<li><code>queue_terminal_live_counts</code>, keyed by <code>(ready_slot, queue, priority, enqueue_shard, counter_bucket)</code>, stores folded counts for retained queue segments.</li>
+<li><code>queue_terminal_count_deltas_*</code>, partitioned with the queue ring, stores pending signed deltas for <code>done_entries</code> terminal mutations that have not been folded yet.</li>
+<li><code>receipt_completion_batches_*</code> and <code>receipt_completion_tombstones_*</code> provide the retained compact completion count directly, without another hot-path derived write.</li>
+<li><code>queue_terminal_rollups</code> stores permanent counts for pruned queue segments.</li>
+</ul>
+<p><code>done_entries</code> terminal mutations append a narrow delta row in the same transaction as the physical terminal mutation:</p>
+<ul>
+<li><code>done_entries</code> terminal insertion writes a positive delta;</li>
+<li>retry, purge, discard, DLQ move, and compatibility delete of <code>done_entries</code> rows write a negative delta;</li>
+<li>the delta key includes <code>ready_generation</code>, so reused <code>ready_slot</code> partitions cannot inherit stale deltas.</li>
+</ul>
+<p>Compact receipt completion batches do not append terminal-count deltas. A 512-job compact batch writes one compact terminal-history row for a queue/priority/shard group and is counted from its retained <code>completed_count</code> until queue prune folds that segment into permanent rollups. SQL compatibility delete of a compact completed row writes <code>receipt_completion_tombstones</code>, and exact counts subtract retained compact tombstones. Wide <code>done_entries</code> terminal rows keep job-id counter bucketing so later terminal deletes cancel their original positive bucket exactly.</p>
+<p><code>queue_counts_exact</code> computes the live terminal component as <code>queue_terminal_live_counts + SUM(queue_terminal_count_deltas) + SUM(receipt_completion_batches.completed_count) - COUNT(receipt_completion_tombstones)</code>, then adds pruned rollups from <code>queue_terminal_rollups</code> / <code>queue_lanes</code>. The exact read remains honest while maintenance is behind. If the terminal-counter trust marker is not set, the read path falls back to scanning <code>{schema}.terminal_jobs</code> so rolling upgrades and recovery windows stay honest.</p>
+<p>The maintenance leader rolls sealed delta segments into <code>queue_terminal_live_counts</code> in deterministic key order, then truncates the matching delta child in the same transaction. Candidate selection is driven by sealed slots that actually contain pending deltas, so an empty old prefix cannot hide a later sealed slot that needs rollup. Rollup skips the current queue slot and any slot with active leases, retained ready rows at or beyond their lane claim cursors, or open receipt claims. The retained-ready check runs before the exclusive delta-child lock and before the receipt-closure proof, because a slot with pending ready rows cannot be rolled up or pruned yet. Once the delta child is locked, rollup proves receipt claims are closed with the same exact-count proof queue prune uses and skips conservatively when counts do not prove closure.</p>
+<p>Rollup is also MVCC-horizon aware. If PostgreSQL reports another backend with an open snapshot in the current database, or an idle transaction with an assigned transaction id, maintenance returns before mutating <code>queue_terminal_live_counts</code> or locking the delta child. The pending deltas remain append-only and exact reads remain honest because they include the delta sum. When the horizon clears, a later maintenance tick folds the sealed deltas. Queue prune also truncates the delta child after folding terminal history into permanent rollups, so a lagging counter rollup cannot block retention.</p>
+<p>The trust marker remains meaningful: it means the folded counter plus all unrolled deltas is complete for retained <code>done_entries</code> rows in the active schema. Compact completion batches are direct-counted in both trusted and untrusted modes. Rebuild recomputes the folded counter from <code>{schema}.done_entries</code> and clears the delta ledger.</p>
+<p>Correctness requirements for the delta ledger:</p>
+<ul>
+<li>The delta append must commit atomically with the terminal mutation it describes. If the state transition rolls back, the delta rolls back.</li>
+<li>Exact reads must include every committed terminal mutation exactly once: <code>done_entries</code> rows through the rolled-up counter or unrolled delta sum, compact receipt completions through retained batches minus retained compact tombstones, and pruned segments through rollups.</li>
+<li>Rollup must be crash-safe and idempotent. Applying deltas and truncating the delta segment must commit together.</li>
+<li>Rollup must acquire counter rows in deterministic order.</li>
+<li>Rollup may defer while the MVCC horizon is pinned, but the deferral must happen before mutating folded counters or truncating pending deltas.</li>
+<li>Segment prune may truncate pending delta rows and retained compact batches only because it first folds terminal history from <code>terminal_jobs</code> into permanent rollups; exact reads no longer need that retained segment evidence after the terminal segment is pruned.</li>
+<li>The storage TLA+ models track terminal deltas as append-only, partition-truncated derived state; they do not make job safety depend on counter rollup timing.</li>
+</ul>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Keeps the durable terminal fact and all existing public API semantics.</li>
+<li>Reduces WAL and row bytes on the dominant completion path.</li>
+<li>Preserves <code>attempted_at</code> and <code>finalized_at</code> in terminal history, so terminal attempt timing remains inspectable through <code>{schema}.terminal_jobs</code>.</li>
+<li>Keeps the ring-prune safety story unchanged: ready rows, terminal rows, compact completion batches, compact tombstones, and <code>done_entries</code> terminal deltas are still reclaimed by queue-slot truncation after the queue slot is proven inactive.</li>
+</ul>
+<h3 id="negative">Negative<a class="headerlink" href="#negative" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Direct SQL against <code>done_entries.args</code>, <code>max_attempts</code>, <code>run_at</code>, <code>created_at</code>, <code>unique_key</code>, <code>unique_states</code>, or <code>payload</code> must tolerate <code>NULL</code> on ready-backed terminal rows. Direct SQL against <code>done_entries</code> must also tolerate successful receipt-backed completed jobs being absent from that table. Use <code>{schema}.terminal_jobs</code> unless code intentionally needs the physical storage representation.</li>
+<li><code>done_entries</code> terminal delete paths have one more responsibility: append the matching negative terminal-count delta before re-enqueuing, moving to DLQ, or discarding.</li>
+<li>Queue-prune logic must continue treating ready and terminal rows as one retention unit. (<a href="../032-failed-terminal-retention/">ADR-032</a> amends this for <code>failed</code> rows inside the <code>failed_retention</code> floor, which prune carries forward as wide self-contained terminal rows.)</li>
+<li>Exact terminal-count reads must include folded counters, pending <code>done_entries</code> deltas, retained compact batches minus compact tombstones, and permanent rollups. Operational SQL that reads only <code>queue_terminal_live_counts</code> sees folded <code>done_entries</code> state, not the full exact count.</li>
+<li>Pending delta rows can accumulate while long reader transactions pin the MVCC horizon. That is intentional: it trades a larger append-only <code>done_entries</code> ledger for near-zero dead tuples in <code>queue_terminal_live_counts</code> during the pin. Compact receipt successes do not add to this ledger.</li>
+</ul>
+<h2 id="alternatives-considered">Alternatives Considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="keep-fully-materialized-terminal-rows">Keep fully materialized terminal rows<a class="headerlink" href="#keep-fully-materialized-terminal-rows" title="Permanent link">&para;</a></h3>
+<p>This is the pre-ADR behavior. It is simple for direct SQL users but spends extra WAL and heap bytes on every terminal transition.</p>
+<h3 id="remove-durable-terminal-history-for-successful-completions">Remove durable terminal history for successful completions<a class="headerlink" href="#remove-durable-terminal-history-for-successful-completions" title="Permanent link">&para;</a></h3>
+<p>This produced the lowest WAL/job result in experiment, but it removes the durable terminal fact that queue counts, <code>load_job</code>, admin inspection, and retention rely on. It is rejected.</p>
+<h3 id="store-compact-successful-receipt-completions-synchronously">Store compact successful receipt completions synchronously<a class="headerlink" href="#store-compact-successful-receipt-completions-synchronously" title="Permanent link">&para;</a></h3>
+<p>This is the chosen design. It adds another physical terminal family, but keeps one public terminal surface (<code>terminal_jobs</code>), one exact-count contract, and one queue-ring prune boundary. It deliberately does not add a background materializer or make completion visible before durable terminal history commits.</p>
+<h3 id="drop-terminal-counters-and-scan-done_entries">Drop terminal counters and scan <code>done_entries</code><a class="headerlink" href="#drop-terminal-counters-and-scan-done_entries" title="Permanent link">&para;</a></h3>
+<p>Rejected for the normal exact-count path. It is simple and exact, but makes a common admin/UI read proportional to retained terminal history. That moves cost from completion to observability rather than removing it.</p>
+<h3 id="make-terminal-counts-eventually-consistent">Make terminal counts eventually consistent<a class="headerlink" href="#make-terminal-counts-eventually-consistent" title="Permanent link">&para;</a></h3>
+<p>Rejected for <code>queue_counts_exact</code>. Awa exposes exact queue counts and uses the trust marker to make that contract explicit. Eventual counts may be useful for a cheaper overview endpoint, but they should not replace the exact path.</p>
+<h3 id="keep-striped-live-counters-only">Keep striped live counters only<a class="headerlink" href="#keep-striped-live-counters-only" title="Permanent link">&para;</a></h3>
+<p>Counter bucketing reduces contention, but it still updates mutable rows in the terminal path. This is rejected for the high-throughput queue-storage path because benchmark evidence showed the live-counter table becoming the dominant dead-tuple source under pinned readers after ready rows became append-only.</p>
+<h2 id="defaults">Defaults<a class="headerlink" href="#defaults" title="Permanent link">&para;</a></h2>
+<p>This ADR changes the batching defaults that determine whether lower WAL turns into durable throughput:</p>
+<ul>
+<li><code>enqueue_shards = 1</code> remains the strict-FIFO default; use more shards only when partitioned FIFO is acceptable.</li>
+<li><code>claimers = 1</code> and <code>claim_batch_size = 512</code> remain the queue defaults.</li>
+<li><code>AWA_COMPLETION_BATCH_SIZE = 512</code> and <code>AWA_COMPLETION_FLUSH_MS = 1</code> remain the completion defaults. Queue storage uses <code>AWA_COMPLETION_SHARDS = 1</code> for ordinary runtimes and <code>4</code> when the configured runtime worker capacity is at least <code>512</code>; canonical storage keeps <code>8</code>.</li>
+<li><code>queue_slot_count = 16</code>, <code>lease_slot_count = 8</code>, <code>claim_slot_count = 8</code>, and <code>lease_claim_receipts = true</code> remain the queue-storage defaults.</li>
+<li><code>terminal_count_rollup_interval = 30s</code> folds pending <code>done_entries</code> terminal-count deltas for sealed queue slots. Each tick processes at most four sealed slots. Exact reads include pending deltas and retained compact batches, so this cadence affects compaction pressure, not correctness.</li>
+</ul>
+<p>The queue-storage short-job completion path also uses one fused statement for the common receipt-backed, payload-empty terminal transition: insert compact completion batch rows, insert compact claim-closure batch rows, and delete any matching <code>attempt_state</code>. Before that statement, the transaction takes per-<code>(job_id, run_lease)</code> advisory locks in deterministic key order so duplicate completion attempts and known-key materialization or close paths serialize and observe the winning evidence. The fused statement validates row-local <code>lease_claims</code> by the immutable receipt tuple and compact <code>lease_claim_batches</code> by the claim-returned batch id and one-based item index, and skips claims that already have a materialized <code>leases</code> row; those attempts keep the general lease-deleting transaction path. A materialized receipt can be in a newer lease-ring slot than the original claim carried, so the general receipt fallback matches the lease by stable ready-lane identity and <code>(job_id, run_lease)</code>. Jobs with unique-key transitions, terminal payload metadata, materialized lease state, or missed receipt evidence also keep the general transaction path.</p>
+<p>If a later retry, DLQ move, discard, or SQL compatibility delete removes a <code>done_entries</code> terminal row before claim prune has reclaimed the originating receipt, the terminal-delete path first materializes an explicit <code>lease_claim_closures</code> row. Compact successful completions keep their closure evidence in <code>lease_claim_closure_batches</code>; SQL compatibility delete hides them from public terminal reads by writing <code>receipt_completion_tombstones</code> and does not reopen the receipt.</p>
+<p>The offered-rate benchmark turns that lower write budget into an explicit capacity check. With one queue shard, one claimer, <code>claim_batch_size = 512</code>, adaptive queue-storage completion shards, and <code>max_workers = 1024</code>, a 10-second <code>10k/s</code> no-op workload keeps durable completions at the offered rate, drains to zero backlog, and writes <code>1.8 KiB</code> WAL per completed job. A <code>12k/s</code> offered workload exceeds that reference configuration and accumulates backlog during the offer window before draining afterward.</p>
+<h2 id="relationship-to-rejected-adr-024">Relationship to Rejected ADR-024<a class="headerlink" href="#relationship-to-rejected-adr-024" title="Permanent link">&para;</a></h2>
+<p>The relevant historical ADR-024 was <strong>Deferred <code>done_entries</code> Materialisation</strong>. It removed the <code>done_entries</code> insert from receipt completion entirely, treated <code>lease_claim_closures</code> as the immediate completion source of truth, and added a background materializer plus read-side synthetic projections and prune guards. Its A/B benchmark was worse than the synchronous path: <code>1,839/s</code> vs <code>2,803/s</code>, with higher p99 latency. It also added new moving parts: a materializer cadence, materializer lag monitoring, rotation catch-up, and temporary closure-without-terminal read semantics.</p>
+<p>ADR-026 deliberately keeps the opposite contract:</p>
+<ul>
+<li>completion still writes durable terminal history synchronously;</li>
+<li><code>{schema}.terminal_jobs</code> is the terminal source of truth for counts and admin reads; <code>done_entries</code> remains the transition surface for retryable/movable terminal rows;</li>
+<li>there is no materializer, no lag window, and no extra prune precondition;</li>
+<li>the fast path is an implementation detail of the same logical transition: successful completion writes compact terminal history plus compact claim-local closure evidence atomically, while non-success and cold terminal-delete paths use <code>lease_claim_closures</code> with <code>done_entries</code>.</li>
+</ul>
+<p>The overlap with ADR-024 is the insight that duplicating ready-body JSONB is wasteful. The difference is where the system draws the safety boundary: ADR-024 deferred the terminal fact; ADR-026 keeps the terminal fact durable and only narrows or compacts its payload, then fuses receipt-claim locking, compact terminal insert, and compact claim-closure insert so the synchronous contract is cheap enough to hit the throughput target.</p>
+<p>The first tuning move for overload remains semantic enqueue sharding when the workload can accept partitioned FIFO. This ADR lowers the durable completion write budget underneath those defaults.</p>
+<h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Runtime tests assert that completed and failed ready-backed terminal rows are narrow, hydrate correctly through <code>load_job</code>, and can retry without resurrecting the retained ready backing row.</li>
+<li>Runtime tests assert that the <code>{schema}.terminal_jobs</code> compatibility view hydrates ready-backed terminal rows while physical terminal rows remain narrow or compact.</li>
+<li>Runtime tests assert that successful compact receipt-backed completions write no completed <code>done_entries</code> row, appear in <code>terminal_jobs</code>, write no per-job completed receipt closures, write compact <code>lease_claim_closure_batches</code> evidence for row-local and compact claim-batch receipts, write no terminal-count deltas, can be hidden by SQL compatibility delete through <code>receipt_completion_tombstones</code>, remain closed from the receipt plane, and are counted by trusted direct-batch reads, untrusted fallback scans, and rebuild paths.</li>
+<li>Runtime tests assert that receipt claims materialized into <code>leases</code> after lease-ring rotation still complete through the general receipt fallback and delete the materialized lease by stable identity.</li>
+<li>Runtime tests assert that cancelling an unclaimed available job tombstones the ready lane and writes a wide terminal row because the job never had a claimed attempt snapshot.</li>
+<li>Existing DLQ move, bulk move, retry, and discard flows hydrate terminal rows before moving them, remove the terminal fact, and leave retained ready backing rows inert until queue prune.</li>
+<li>Runtime tests assert that <code>done_entries</code> terminal mutations append signed deltas, exact counts include folded counters plus pending deltas plus retained compact batches minus compact tombstones, maintenance rolls sealed deltas into <code>queue_terminal_live_counts</code>, prune folds terminal history into permanent rollups, and rebuild restores counters from <code>done_entries</code>.</li>
+<li><code>correctness/storage/AwaSegmentedStorage.tla</code> models retained terminal ready bodies, compact receipt closure evidence, terminal-to-DLQ terminal-fact deletion, and queue prune reclaiming retained ready bodies with any remaining terminal facts.</li>
+</ul>
+<h2 id="relationship-to-other-adrs">Relationship to Other ADRs<a class="headerlink" href="#relationship-to-other-adrs" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Refines ADR-019's queue-storage terminal family.</li>
+<li>Preserves ADR-023's receipt-plane safety: completion still closes the exact claim and writes a durable terminal fact.</li>
+<li>Complements ADR-025: enqueue sharding attacks producer head-row contention; this ADR reduces completion-side WAL/row pressure.</li>
+<li>Supersedes the useful part of the rejected ADR-024 deferred-materialisation experiment without adopting its asynchronous terminal-history contract.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -1,0 +1,2301 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/023-receipt-plane-ring-partitioning/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>ADR-023: Receipt Plane Ring Partitioning - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="AWA — Postgres-native background jobs">
+  <meta property="og:description" content="Durable, transactional background jobs for Rust and Python.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#adr-023-receipt-plane-ring-partitioning" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              ADR-023: Receipt Plane Ring Partitioning
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="awa-dark" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_6" id="__nav_6_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Status
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#context" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#design-goals-and-non-goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Design goals and non-goals
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Decision">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#physical-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Physical layout
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#hot-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hot path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#open-claim-queries" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open-claim queries
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rotation-and-prune" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rotation and prune
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#invariants-preserved" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Invariants preserved
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#migration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Migration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#historical-reverse-migration-outline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Historical reverse-migration outline
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#consequences" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Consequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Consequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#positive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positive
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#negative" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Negative
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alternatives-considered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternatives Considered
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Alternatives Considered">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#per-table-autovacuum-tuning-on-open_receipt_claims" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-table autovacuum tuning on open_receipt_claims
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#documented-operational-autovacuum_naptime-reduction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Documented operational autovacuum_naptime reduction
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#awa-owned-periodic-vacuum-on-open_receipt_claims" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Awa-owned periodic VACUUM on open_receipt_claims
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#update-based-soft-close-on-open_receipt_claims" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        UPDATE-based soft close on open_receipt_claims
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ship-06-with-receipts-off" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ship 0.6 with receipts off
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#relationship-to-earlier-adrs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Relationship to Earlier ADRs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation-and-validation-status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Implementation and Validation Status
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="adr-023-receipt-plane-ring-partitioning">ADR-023: Receipt Plane Ring Partitioning<a class="headerlink" href="#adr-023-receipt-plane-ring-partitioning" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Accepted (implemented). <code>lease_claim_receipts</code> is the default in 0.6. The validation artifact under <code>docs/adr/bench/</code> is the empirical evidence the design holds; this ADR is the architectural record.</p>
+<p><strong>Evolution (0.7, <a href="https://github.com/hardbyte/awa/issues/246">#246</a>).</strong> The original design routed deadline-backed claims through row-local <code>lease_claims</code> (so the deadline-rescue cursor could stay index-backed) and reserved <code>lease_claim_batches.deadline_at</code> for a later compact-deadline path. That path is now the default: every job claimed in one <code>claim_ready_runtime</code> call shares one <code>claimed_at</code>, hence one <code>deadline_at</code>, so a deadline-backed claim writes the same compact <code>lease_claim_batches</code> row as a zero-deadline claim, with the batch's <code>deadline_at</code> populated. At 256-worker saturation this removed the ~83k steady-state live <code>lease_claims</code> rows the row-local path materialized (and the e2e p99 regression they caused). Deadline rescue gains a second per-slot cursor over <code>(deadline_at, batch_id)</code> on <code>claim_ring_slots</code> (index-backed by a partial <code>(deadline_at, batch_id) WHERE deadline_at IS NOT NULL</code> index per <code>lease_claim_batches</code> child) that expands expired batches and force-closes open members into <code>lease_claim_closure_batches</code> with outcome <code>deadline_expired</code>. Row-local <code>lease_claims</code> and its deadline cursor are retained additively for claims that materialize into mutable leases and for legacy in-flight claims written before the upgrade. The sentences below that say deadline-backed claims live in <code>lease_claims</code> describe the pre-#246 shape; the compact representation is now used for both deadline modes.</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p>ADR-019 committed the hot queue plane to a vacuum-aware discipline: ready and terminal queue entries reclaim space by partition rotation and <code>TRUNCATE</code>, not by row-level cleanup. The remaining planes have narrower, explicit churn: materialized leases live in a bounded mutable lease ring, <code>deferred_jobs</code> is a plain scheduled/retryable backlog table promoted by delete-and-insert, and <code>dlq_entries</code> is an operator hold table with bounded retention cleanup. The ADR-019 validation artifact recorded 276 exact dead tuples across the entire schema after a 1000/s soak — <code>queue_lanes=19, ready=0, done=255, leases=2, attempt_state=0</code> — consistent with the design intent.</p>
+<p>The experimental receipt-backed short-job path introduced after that validation adds three tables:</p>
+<ul>
+<li><code>lease_claims</code> — append-only claim receipts (durable claim history)</li>
+<li><code>lease_claim_closures</code> — append-only closure tombstones</li>
+<li><code>open_receipt_claims</code> — a bounded "currently live receipt-backed attempt" frontier, introduced so rescue and queue-count queries would not degrade into anti-joins against unbounded claim history</li>
+</ul>
+<p><code>lease_claims</code> and <code>lease_claim_closures</code> honour the ADR-019 contract: they are insert-only. <code>open_receipt_claims</code> does not. Its design is one <code>INSERT</code> per claim and one <code>DELETE</code> per completion, so every completion produces a dead tuple on that table.</p>
+<p>Measurements at the time the receipt ring landed confirmed this is the remaining MVCC source. In an internal long-horizon run from <code>custom-20260424T065828Z-227187</code> (since-extracted to <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking">postgresql-job-queue-benchmarking</a>, 28-minute clean phase at ~800/s per replica, receipts on), the <code>open_receipt_claims</code> heap held a median of 28,390 dead tuples and a peak of 93,789 while every other hot table stayed under 100 dead tuples. The autovacuum floor is <code>autovacuum_naptime=60s</code>, which is global, so per-table thresholds do not move the median: a measured before/after run with per-table knobs on <code>open_receipt_claims</code> left that median unchanged. Knobs treat the symptom; they cannot remove the <code>DELETE</code> from the hot path.</p>
+<p>The receipt-backed short-job path is the only way to retire per-claim mutable lease row churn on the common path, and making it the default is a 0.6 release goal. Delivering that goal without violating ADR-019 requires bringing <code>open_receipt_claims</code> onto the same rotation-and- prune discipline as the rest of the engine.</p>
+<h2 id="design-goals-and-non-goals">Design goals and non-goals<a class="headerlink" href="#design-goals-and-non-goals" title="Permanent link">&para;</a></h2>
+<p>Guided by the 0.6 priorities from ADR-019:</p>
+<ul>
+<li>Preserve at-least-once delivery. No claim may be lost across any crash, restart, or partition-truncation boundary.</li>
+<li>Preserve stale-writer protection by <code>(job_id, run_lease)</code>. Completion must still lose cleanly against a rescue or cancel on the same attempt.</li>
+<li>Keep the claim hot path bounded and predictable under partition maintenance. The fix must remove per-completion receipt-row churn; one compact, append-only emission row per claim batch is acceptable only if it removes broader claim-ring parent scans from the hot stale-cursor recovery path.</li>
+<li>Eliminate the remaining MVCC churn source. Steady-state dead tuples on the receipt plane should be zero once rotation catches up.</li>
+<li>Finish the vacuum-aware story before 0.6 ships; hold the quality bar rather than the timeline.</li>
+</ul>
+<p>Non-goals:</p>
+<ul>
+<li>Do not change the heartbeat / deadline / callback-timeout rescue contract. Those continue to live on <code>attempt_state</code> and <code>active_leases</code>.</li>
+<li>Do not change the external API or the <code>(job_id, run_lease)</code> stale-writer guard.</li>
+<li>Do not introduce any new reservation or pre-start state. The archived <a href="../../archive/0.6-storage-design/lease-plane-redesign-spike/"><code>lease-plane-redesign-spike</code></a> record shows that direction has been tried and rejected repeatedly on cost grounds.</li>
+</ul>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p>Apply ADR-019's rotation-and-prune pattern to the receipt plane. Remove <code>open_receipt_claims</code> as a distinct table.</p>
+<h3 id="physical-layout">Physical layout<a class="headerlink" href="#physical-layout" title="Permanent link">&para;</a></h3>
+<ol>
+<li><code>lease_claims</code> becomes <code>PARTITIONED BY LIST (claim_slot)</code> with a small fixed set of child partitions (<code>lease_claims_0..N-1</code>). Row-local receipt claims live here when Awa needs per-claim deadline indexing or later materialization metadata.</li>
+<li><code>lease_claim_batches</code> is partitioned by <code>claim_slot</code> with matching children. Receipt claims (zero-deadline and, since #246, deadline-backed — every job claimed in one call shares one <code>deadline_at</code>) write one compact row per claim batch, storing arrays of job ids, run leases, receipt ids, lane ids, attempts, and max attempts plus a derived receipt multirange for exact membership checks.</li>
+<li><code>lease_claim_closures</code> becomes <code>PARTITIONED BY LIST (claim_slot)</code> with matching children. A closure row lives in the same <code>claim_slot</code> as its originating claim.</li>
+<li><code>lease_claim_closure_batches</code> is partitioned by <code>claim_slot</code> with matching children. Compact successful completions write globally allocated receipt identities here, plus a derived <code>int8multirange</code>, so open-claim proofs can use an indexed <code>receipt_ranges @&gt; receipt_id</code> membership check while prune still truncates the matching claim and closure partitions together.</li>
+<li>A new control-plane pair <code>claim_ring_state</code> and <code>claim_ring_slots</code> coordinates rotation, mirroring the existing <code>lease_ring_state</code> and <code>lease_ring_slots</code>. <code>claim_ring_slots</code> also stores per-slot rescue cursors: stale rescue sweeps receipt rows and compact claim batches by <code>(claimed_at, job_id, run_lease)</code>, while deadline rescue sweeps deadline-backed claims in both shapes: row-local rows by <code>(deadline_at, job_id, run_lease)</code> and compact batches by <code>(deadline_at, batch_id)</code> (#246).</li>
+<li><code>open_receipt_claims</code> is deleted. Its indexes and the schema-install backfill are dropped.</li>
+</ol>
+<h3 id="hot-path">Hot path<a class="headerlink" href="#hot-path" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Claim: append queue-slot-local batch/range attempt evidence to <code>ready_claim_attempt_batches</code> and append receipt claims to the current claim-slot partition in the same transaction. Both deadline modes use compact <code>lease_claim_batches</code> (#246): all jobs claimed in one call share one deadline, and the batch-deadline rescue cursor stays index-backed via the partial <code>(deadline_at, batch_id)</code> sweep index. Row-local <code>lease_claims</code> remains for claims that materialise into mutable leases and for legacy in-flight rows. The claim result carries <code>claim_slot</code> and the immutable <code>receipt_id</code> through to the worker so compact closure evidence can be tied back to the exact claim partition and attempt.</li>
+<li>Complete: successful compact receipt completion records terminal history through <code>receipt_completion_batches</code> and records claim-local closure proof through <code>lease_claim_closure_batches</code>. Non-success exits, receipt rescue, and cancellation close by claim shape: a row-local <code>lease_claims</code> claim appends an explicit <code>lease_claim_closures</code> row, while a compact <code>lease_claim_batches</code> claim appends a <code>lease_claim_closure_batches</code> row carrying <code>ready_slot</code> / <code>ready_generation</code>. A compact claim has no <code>lease_claims</code> row, so an explicit closure for it would be invisible to the queue-prune count proof (which joins <code>lease_claims</code>); the closure batch keeps it countable via <code>compact_count</code>.</li>
+<li>The claim step and compact successful completion step do not <code>UPDATE</code> or <code>DELETE</code> receipt-plane history. Non-success, rescue, cancellation, and terminal-delete closure paths append durable closure rows — <code>lease_claim_closures</code> for row-local claims, <code>lease_claim_closure_batches</code> for compact claims; row-local claims can also set the <code>lease_claims.closed_at</code> fence so a waiter rechecks the claim as closed after the winning transaction commits.</li>
+<li>Short-job fast path moves the cost to append-only ledgers: claim writes receipt rows plus one ready-slot attempt batch row for the claimed lane range, and compact success writes batch-level terminal and claim-closure evidence without a per-job closure row, count-delta row, or receipt delete.</li>
+<li>Non-success closure batches are ordered by <code>claim_slot</code> before <code>(job_id, run_lease)</code> so a flusher presents partition-local closure rows to Postgres. That ordering does not change the stale-writer guard; it only improves locality for the append-only receipt plane.</li>
+<li>Default successful completions avoid writing a terminal payload copy when the runtime payload is empty or unchanged from <code>ready_entries</code>. When an entire done batch has empty terminal payloads, completion also skips the ready-payload lookup that would otherwise be needed to prove unchanged non-empty payloads can be elided.</li>
+<li>The receipt-backed compact completion SQL takes a per-<code>(job_id, run_lease)</code> advisory transaction lock, validates the matching receipt claim by <code>(claim_slot, job_id, run_lease, receipt_id)</code> from either <code>lease_claims</code> or <code>lease_claim_batches</code>, skips claims that have already materialized <code>leases</code> rows, removes matching <code>attempt_state</code>, appends compact claim-local closure evidence, and appends compact terminal history in one statement. Known-key materialization, explicit close paths, and receipt rescue use the same advisory key before row locks, so a same-attempt race observes the committed winner before deciding whether the receipt is still open. The compact terminal history carries the public terminal-history contract through <code>{schema}.terminal_jobs</code>; the compact closure batch carries the claim-prune contract for successful completions. Exact terminal counts read retained compact batches directly; the terminal-count delta ledger is reserved for <code>done_entries</code> terminal mutations.</li>
+</ul>
+<h3 id="open-claim-queries">Open-claim queries<a class="headerlink" href="#open-claim-queries" title="Permanent link">&para;</a></h3>
+<p>Every read that currently targets <code>open_receipt_claims</code> becomes a bounded read over the active <code>lease_claims</code> and <code>lease_claim_batches</code> child partitions, anti-joined with durable closure evidence. Evidence can be an explicit <code>lease_claim_closures</code> row, a matching compact <code>lease_claim_closure_batches</code> item, or durable disposition rows retained for older rows:</p>
+<ul>
+<li>"Is <code>(job_id, run_lease)</code> still open?" — exact lookup into active row-local claims or compact claim-batch items, anti-join durable closure evidence. Used by the completion guard and by <code>load_job</code> on receipt-backed attempts.</li>
+<li>"Scan stale receipt claims for rescue." — per-slot cursor scan ordered by <code>(claimed_at, job_id, run_lease)</code>, limited to row-local claims and compact claim-batch items old enough to be rescue candidates, anti-join durable closure evidence and materialized leases, take the same per-attempt advisory key used by completion, and close stale candidates by appending rescue closures.</li>
+<li>"Scan expired receipt deadlines for rescue." — two independent per-slot cursor scans, both limited to claims whose deadline has already passed and both anti-joining durable closure evidence and materialized leases under the same per-attempt advisory key used by completion (#246). The compact-batch scan is ordered by <code>(deadline_at, batch_id)</code>, expands each expired batch into its members, and closes open members by appending <code>deadline_expired</code> rows to <code>lease_claim_closure_batches</code>; its cursor advances past a batch only when every member is closed. The legacy row-local scan is ordered by <code>(deadline_at, job_id, run_lease)</code> over <code>lease_claims</code> and closes into <code>lease_claim_closures</code>, covering in-flight claims written before the compact-deadline upgrade.</li>
+<li>"Count in-flight receipt-backed attempts." — count row-local claims plus compact claim-batch items minus matching closure or durable disposition evidence.</li>
+</ul>
+<p>Stale claim-cursor recovery is deliberately not an open-claim query. A claim transaction also writes <code>ready_claim_attempt_batches</code> in the ready row's queue-ring slot, keyed by <code>(ready_slot, ready_generation, queue, priority, enqueue_shard)</code> plus an <code>int8multirange</code> of covered <code>lane_seq</code> values. If the post-commit cursor advance is lost, the next claim can advance over already-emitted attempts by reading this queue-slot-local ledger. That keeps the hot claim path from taking parent <code>lease_claims</code> / closure evidence locks while old claim partitions are being truncated, while amortizing the proof row across the whole claim batch.</p>
+<p>Both rescue cursors are bounded cyclic sweeps. Each pass scans forward from the cursor and wraps to the start of the partition when it reaches the end, but it does not visit rows that are too new to be candidates for that rescue class. Stale rescue can advance over closed claims, materialized lease-plane claims, old claims with fresh heartbeat evidence, and claims it closes in the current rescue transaction; it stops before a stale open claim that it did not close. Deadline rescue can advance over closed claims, materialized lease-plane claims, and claims it closes in the current rescue transaction. These cursors keep liveness scans from repeatedly proving old completed receipts are closed when a long reader prevents partition prune, without making every tick re-prove claims that are not yet old or expired enough to rescue.</p>
+<h3 id="rotation-and-prune">Rotation and prune<a class="headerlink" href="#rotation-and-prune" title="Permanent link">&para;</a></h3>
+<ul>
+<li>The maintenance leader owns <code>claim_ring_state</code> rotation on a cadence chosen to keep the active scan surface bounded. Initial target: rotate at the same cadence as the queue ring so claim partitions age out roughly in step with the ready / done partitions they reference.</li>
+<li>A claim-slot partition may be truncated only when every claim in it is represented by durable closure evidence. If open claims remain, prune skips the partition until normal completion, normal non-success closure, or the separate receipt-rescue scans close those claims.</li>
+<li>Queue-ring prune must not remove terminal history for a segment before matching receipt claims have durable closure evidence. It also must not remove retained ready or tombstone rows that are still at or ahead of their lane's claim cursor, because those rows are the cursor's proof that the prefix has been spent. These sealed-slot skip proofs run before the ready/terminal child-table exclusive locks so maintenance skips active slots without blocking hot claim reads, then run again after the locks so rows that committed while the lock waited are visible before truncate. Current successful compact completions write terminal/closure evidence synchronously, and compatibility/cold paths preserve or create closure evidence before hiding terminal history.</li>
+<li>Prune order mirrors <code>prune_oldest</code> and <code>prune_oldest_leases</code>, except the open-claim proof intentionally runs both before and after the child-table exclusive locks:</li>
+<li><code>FOR UPDATE</code> on <code>claim_ring_state</code>.</li>
+<li><code>FOR UPDATE</code> on the target <code>claim_ring_slots</code> row.</li>
+<li>Prove every visible claim in the sealed slot has durable closure evidence.</li>
+<li>Bounded <code>ACCESS EXCLUSIVE</code> on all claim-ring partitions for that slot (row-local claims, compact claim batches, explicit closures, and compact closure batches).</li>
+<li>Recheck not-current and re-prove no open claims under the partition locks, then reset the slot's rescue cursor and <code>TRUNCATE</code>.</li>
+<li>Partition truncation never races with claim because claim writes to the ring's current slot and the prune path rechecks the sealed partition after taking the exclusive child locks.</li>
+</ul>
+<h3 id="invariants-preserved">Invariants preserved<a class="headerlink" href="#invariants-preserved" title="Permanent link">&para;</a></h3>
+<ul>
+<li>At-least-once delivery: a partition cannot truncate while live claims remain in it. Rescue is the gating step, not the prune itself.</li>
+<li><code>(job_id, run_lease)</code> stale-writer protection: the authoritative record is the row-local claim or compact claim-batch item plus durable closure evidence. The closure table follows the claim shape, not the exit reason: compact <code>lease_claim_batches</code> claims close into <code>lease_claim_closure_batches</code> on every path (successful completion, non-success exit, cancellation, rescue), while row-local <code>lease_claims</code> claims close into <code>lease_claim_closures</code>. Wide/cold paths that operate on row-local claims use <code>lease_claim_closures</code>.</li>
+<li>Heartbeat / callback-timeout rescue: unchanged for materialized leases. Deadline rescue is split by storage shape: materialized leases stay on the lease-side deadline path, while receipt-only claims use the deadline cursor and append a <code>deadline_expired</code> closure before entering the same retry / DLQ routing.</li>
+</ul>
+<h3 id="migration">Migration<a class="headerlink" href="#migration" title="Permanent link">&para;</a></h3>
+<p>This is a breaking schema change even though the external API does not change.</p>
+<ol>
+<li>A new migration creates <code>claim_ring_state</code>, <code>claim_ring_slots</code>, and the partitioned <code>lease_claims</code>, <code>lease_claim_batches</code>, <code>lease_claim_closures</code>, and <code>lease_claim_closure_batches</code> shapes.</li>
+<li>Existing <code>lease_claims</code> and <code>lease_claim_closures</code> rows are rewritten into the current slot of the new partitioned parents. Compact claim batches and compact closure batches are new storage and start empty on upgrade.</li>
+<li>The legacy <code>open_receipt_claims</code> table is not part of the live read path. <code>prepare_schema()</code> drops it when empty, and refuses to proceed if it still contains rows so an operator can drain or reverse-migrate those rows deliberately.</li>
+<li>Subsequent claim, complete, rescue, and count paths target the partitioned claim/closure-evidence tables. The live receipt set is derived as an anti-join over the active claim-ring partitions; stale-rescue and deadline-rescue scans use separate per-slot cursors stored on <code>claim_ring_slots</code>.</li>
+</ol>
+<h3 id="historical-reverse-migration-outline">Historical reverse-migration outline<a class="headerlink" href="#historical-reverse-migration-outline" title="Permanent link">&para;</a></h3>
+<p>The original 0.5-to-0.6 rollout runbook carried a manual escape hatch for reverting the receipt-plane partitioning before 0.6 workers had taken over. It was deliberately never shipped as a down migration, and it is not a supported rollback after queue storage has accepted work; retain it here so an incident responder can identify the historical boundary rather than infer a downgrade from the current schema.</p>
+<ol>
+<li>Quiesce all 0.6 workers and receipt-plane writers, take a database snapshot, and verify <code>lease_claim_batches</code> and <code>lease_claim_closure_batches</code> are empty before renaming the partitioned <code>lease_claims</code> and <code>lease_claim_closures</code> parents so their pre-0.6 names are available.</li>
+<li>Create unpartitioned <code>lease_claims</code> and <code>lease_claim_closures</code> tables from the exact pre-ADR-023 release schema, including its indexes and constraints.</li>
+<li>Copy every row from the renamed partitioned parents with <code>INSERT ... SELECT</code>, then reconcile row counts and open-claim evidence before dropping the partitioned parents.</li>
+<li>Inspect both compact batch tables separately. They are compact claim/closure evidence that older runtimes cannot read — 0.6 wrote <code>lease_claim_batches</code> for zero-deadline receipt claims from the start, so live claims can exist in the batch representation with no row-local counterpart. If either table contains rows, do not start the older fleet: restore the snapshot or continue forward on 0.6 unless release-matched reverse SQL has materialized equivalent row-local claims and closures.</li>
+</ol>
+<p>TLA+ coverage (<code>AwaSegmentedStorage</code>, <code>AwaStorageLockOrder</code>) is extended to model the claim-ring rotation and the rescue-before-truncate precondition, parallel to the existing lease-ring model.</p>
+<h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
+<p>Success criteria for this redesign, measured on the long-horizon portable harness used for the ADR-019 baseline:</p>
+<ul>
+<li><code>open_receipt_claims</code> is absent from the schema. Steady-state dead tuples across the queue-storage schema return to the ADR-019-validation shape: low hundreds, concentrated in ring-state singletons.</li>
+<li>Throughput on the <code>1x32</code>, <code>4x8</code>, and soak profiles is no worse than the current branch and should improve slightly because claim and completion each drop a table touch.</li>
+<li>Crash-under-load recovers cleanly. The rescue-before-truncate path is exercised by the existing crash-recovery scenarios and by a new test that drives rescue concurrently with partition prune.</li>
+<li><code>lease_claim_receipts</code> is on by default for 0.6 with no dead-tuple regression relative to the ADR-019 validation run.</li>
+</ul>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
+<ul>
+<li>The 0.6 vacuum-aware story becomes complete: no hot table relies on <code>DELETE</code> or <code>UPDATE</code> for reclamation.</li>
+<li>The short-job hot path drops one <code>INSERT</code> at claim and one <code>DELETE</code> at completion. Per-job database work is strictly reduced.</li>
+<li>Autovacuum tuning on <code>open_receipt_claims</code> becomes dead code and is removed. The per-table HOT tuning on the small ring-state and head tables stays because it addresses a separate per-row UPDATE class that this ADR does not change.</li>
+<li>Receipts become the default short-job path for 0.6, retiring the per-claim mutable lease row on the common path.</li>
+</ul>
+<h3 id="negative">Negative<a class="headerlink" href="#negative" title="Permanent link">&para;</a></h3>
+<ul>
+<li>This is a breaking schema migration.</li>
+<li>"Currently open" queries move from a single bounded-frontier lookup to a bounded anti-join across a small number of active partitions. Query planning needs spot-checking once the partition count is chosen.</li>
+<li>Rescue gains a partition-aware variant and must run before prune takes bounded <code>ACCESS EXCLUSIVE</code>. The interaction point is small but adds a prune-path precondition not present for <code>ready</code> / <code>done</code>.</li>
+<li>The default-success path now writes one compact completion-batch row and one compact claim-closure batch row for the worker completion batch. ADR-026 explains how compact terminal history is exposed through <code>{schema}.terminal_jobs</code>, how claim-local closure evidence protects receipt pruning, and how exact counts and segment-level retention are preserved.</li>
+</ul>
+<h2 id="alternatives-considered">Alternatives Considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="per-table-autovacuum-tuning-on-open_receipt_claims">Per-table autovacuum tuning on <code>open_receipt_claims</code><a class="headerlink" href="#per-table-autovacuum-tuning-on-open_receipt_claims" title="Permanent link">&para;</a></h3>
+<p>Rejected. A measured 28-minute soak with aggressive per-table thresholds and cost knobs left the median dead-tuple count on this table unchanged relative to the unmodified baseline (<code>custom-20260424T041700Z-278649</code> vs. <code>custom-20260424T065828Z-227187</code>). The rate-limiter is <code>autovacuum_naptime=60s</code>, which is global, and the table is already eligible for vacuum on every wake-up. Per-table knobs improve vacuum efficiency when it runs but do not change the steady-state floor.</p>
+<h3 id="documented-operational-autovacuum_naptime-reduction">Documented operational <code>autovacuum_naptime</code> reduction<a class="headerlink" href="#documented-operational-autovacuum_naptime-reduction" title="Permanent link">&para;</a></h3>
+<p>Rejected as the primary fix. Lowering <code>autovacuum_naptime</code> globally improves reclamation cadence but pushes configuration requirements onto operators and applies to every table in their database. It contradicts the ADR-019 principle that vacuum-awareness is a property of the schema design, not of operator tuning.</p>
+<h3 id="awa-owned-periodic-vacuum-on-open_receipt_claims">Awa-owned periodic VACUUM on <code>open_receipt_claims</code><a class="headerlink" href="#awa-owned-periodic-vacuum-on-open_receipt_claims" title="Permanent link">&para;</a></h3>
+<p>Rejected. A background <code>VACUUM</code> loop would mask the churn but keeps a hot <code>DELETE</code> on the common completion path and leaves the table as a permanent architectural outlier. The rest of the engine has no equivalent self-vacuum loop.</p>
+<h3 id="update-based-soft-close-on-open_receipt_claims">UPDATE-based soft close on <code>open_receipt_claims</code><a class="headerlink" href="#update-based-soft-close-on-open_receipt_claims" title="Permanent link">&para;</a></h3>
+<p>Rejected. Marking a <code>closed_at</code> column and sweeping closed rows periodically keeps the table live-bounded, and a HOT-eligible <code>UPDATE</code> avoids a new heap tuple. But the sweep still performs <code>DELETE</code>s in batch, index bloat still tracks throughput, and the architectural outlier persists.</p>
+<h3 id="ship-06-with-receipts-off">Ship 0.6 with receipts off<a class="headerlink" href="#ship-06-with-receipts-off" title="Permanent link">&para;</a></h3>
+<p>Rejected. Shipping with receipts off lets 0.6 hit the dead-tuple budget today, but it leaves the short-job path on the mutable <code>leases</code> ring and defers the work tracked in the archived <a href="../../archive/0.6-storage-design/lease-plane-redesign-spike/"><code>lease-plane-redesign-spike</code></a>. ADR-019's vacuum-aware intent is only satisfied when receipts are on by default and do not regress the dead-tuple budget. This ADR is the path to that posture.</p>
+<h2 id="relationship-to-earlier-adrs">Relationship to Earlier ADRs<a class="headerlink" href="#relationship-to-earlier-adrs" title="Permanent link">&para;</a></h2>
+<ul>
+<li>ADR-019 established the vacuum-aware discipline. This ADR applies that discipline to the one remaining hot table that did not follow it.</li>
+<li>ADR-013 (run-lease-guarded finalization) is unchanged. The authoritative record for <code>(job_id, run_lease)</code> staleness moves from a bounded mutable frontier to partitioned append-only tables; the guarantee does not.</li>
+<li>The archived <a href="../../archive/0.6-storage-design/lease-plane-redesign-spike/"><code>lease-plane-redesign-spike</code></a> identifies <code>open_receipt_claims</code> as the compromise that unblocked the receipt-backed path. This ADR is the follow-through that the spike anticipated.</li>
+</ul>
+<h2 id="implementation-and-validation-status">Implementation and Validation Status<a class="headerlink" href="#implementation-and-validation-status" title="Permanent link">&para;</a></h2>
+<p>This ADR has been implemented for 0.6:</p>
+<ul>
+<li><code>lease_claims</code>, <code>lease_claim_batches</code>, <code>lease_claim_closures</code>, and <code>lease_claim_closure_batches</code> are partitioned by <code>claim_slot</code>.</li>
+<li><code>claim_ring_state</code> and <code>claim_ring_slots</code> control rotation and prune.</li>
+<li><code>claim_ring_slots</code> stores per-slot stale-rescue and deadline-rescue sweep cursors so maintenance walks receipt history in bounded cyclic windows without reintroducing a per-claim mutable frontier. The stale sweep visits only claims old enough for the rescue cutoff; within that window it can pass claims whose heartbeat evidence is fresh and revisit them after wrap. Stale open claims stop advancement until rescue closes them. The deadline sweep visits only expired receipt deadlines and closes expired receipt-only claims.</li>
+<li><code>open_receipt_claims</code> is removed from fresh installs and is no longer a hot path table.</li>
+<li><code>lease_claim_receipts</code> defaults to <code>true</code>.</li>
+<li>Successful compact receipt completion writes compact terminal history plus compact claim-local closure evidence. SQL compatibility delete hides compact completed rows by writing <code>receipt_completion_tombstones</code>, without mutating the compact terminal batch or reopening the receipt.</li>
+<li>Receipts mode supports per-claim deadlines. Since #246 the claim path writes <code>deadline_at</code> onto the compact <code>lease_claim_batches</code> row when <code>QueueConfig.deadline_duration &gt; 0</code> (all jobs in one claim call share one deadline); legacy row-local deadline rows remain readable. The sibling rescue scan (<code>rescue_expired_receipt_deadlines_tx</code>) advances by <code>claim_ring_slots.deadline_cursor_*</code> for row-local claims and <code>claim_ring_slots.batch_deadline_cursor_*</code> for compact batches, force-closing deadline-backed receipt claims whose <code>deadline_at</code> has passed without a closure or materialized lease, writing a <code>'deadline_expired'</code> closure. The maintenance entry point (<code>rescue_expired_deadlines</code>) merges the lease-side and receipt-side scans into one batch per tick, so receipts mode and the existing hard-deadline behaviour compose without operator intervention.</li>
+</ul>
+<p>Validation evidence is split by purpose:</p>
+<ul>
+<li>Runtime and long-horizon evidence lives in <a href="../bench/023-receipt-ring-validation-2026-04-26/"><code>bench/023-receipt-ring-validation-2026-04-26.md</code></a>. The recorded runs include the 115-minute 4x8 receipts-on long-horizon run and the 12-hour overnight run; receipt closure partitions stayed at 0 dead tuples across every phase, and receipt claims remained bounded.</li>
+<li>Spec and implementation mapping lives in <a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md"><code>correctness/storage/MAPPING.md</code></a>. The storage TLA+ family models claim-ring rotation, partition prune safety, receipt rescue, running cancel, and DLQ retry trace witnesses.</li>
+<li>Operator-facing tuning and defaults live in <a href="../../configuration/#queue-storage-tuning"><code>../configuration.md</code></a>.</li>
+</ul>
+<p>The detailed phase-by-phase implementation notes were intentionally kept out of this ADR. ADRs record the decision and its consequences; dated build logs, benchmark output, and branch-era investigation notes belong in validation artifacts or the 0.6 storage-design archive.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block announce %}
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+{% endblock %}
+
+{% block extrahead %}
+  {{ super() }}
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="AWA — Postgres-native background jobs">
+  <meta property="og:description" content="Durable, transactional background jobs for Rust and Python.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/">
+{% endblock %}

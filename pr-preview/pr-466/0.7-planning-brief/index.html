@@ -1,0 +1,2839 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/0.7-planning-brief/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Awa 0.7 Planning Brief - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="AWA — Postgres-native background jobs">
+  <meta property="og:description" content="Durable, transactional background jobs for Rust and Python.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#awa-07-planning-brief" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Awa 0.7 Planning Brief
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="awa-dark" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_6" id="__nav_6_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-what-awa-is" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. What Awa is
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. What Awa is">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#delivery-contract-from-readme" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Delivery contract (from README)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#workspace-crates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Workspace crates
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#correctness-posture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Correctness posture
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-the-06-release-what-shipped" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. The 0.6 release — what shipped
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. The 0.6 release — what shipped">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-storage-durability-the-core-of-the-release" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.1 Storage &amp; durability (the core of the release)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-operator-surfaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.2 Operator surfaces
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-producer-apis-tuning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.3 Producer APIs &amp; tuning
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-telemetry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.4 Telemetry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-breaking-changes-06-betarc-series-matter-for-early-adopters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.5 Breaking changes (0.6 beta/rc series — matter for early adopters)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-benchmark-reality-169-the-honest-ceiling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.6 Benchmark reality (#169) — the honest ceiling
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-architectural-landscape-open-decisions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Architectural landscape &amp; open decisions
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Architectural landscape &amp; open decisions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-adr-status-snapshot-docsadrreadmemd" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 ADR status snapshot (docs/adr/README.md)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-cross-cutting-constraints-any-07-proposal-must-respect" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 Cross-cutting constraints any 0.7 proposal must respect
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-open-issue-inventory-20-open" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Open issue inventory (20 open)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Open issue inventory (20 open)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-in-the-v070-milestone-committed-scope" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 — In the v0.7.0 milestone (committed scope)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4.1 — In the v0.7.0 milestone (committed scope)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#295-rfc-v07-storage-engine-segment-storage-cursor-allocator-flagship" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        #295 — RFC: v0.7 storage engine — segment storage + cursor allocator (flagship)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#360-dual-engine-test-harness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        #360 — Dual-engine test harness
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="awa-07-planning-brief">Awa 0.7 Planning Brief<a class="headerlink" href="#awa-07-planning-brief" title="Permanent link">&para;</a></h1>
+<blockquote>
+<p><strong>Purpose.</strong> This document is a consolidated context pack for planning the Awa 0.7
+development cycle. It captures (1) what Awa is, (2) what the "massive" 0.6 release
+actually shipped, (3) the architectural landscape and open decisions, and (4) a full
+inventory of every open issue — with the authoritative <code>v0.7.0</code> GitHub milestone
+distinguished from unmilestoned candidates. It is written to be fed directly to a
+planning model. Facts are sourced from the repo (<code>README.md</code>, <code>CHANGELOG.md</code>,
+<code>docs/adr/</code>, <code>docs/archive/0.6-storage-design/</code>) and the live GitHub issue tracker as
+of 2026-07-05.</p>
+</blockquote>
+<hr />
+<h2 id="1-what-awa-is">1. What Awa is<a class="headerlink" href="#1-what-awa-is" title="Permanent link">&para;</a></h2>
+<p><strong>Postgres-native job queue for Rust and Python.</strong> (Māori: <em>awa</em> = river.)</p>
+<p>Positioned deliberately <em>between</em> two neighbours (<code>docs/positioning.md</code>):</p>
+<ul>
+<li>More capable than a Postgres <strong>event queue</strong> (PgQue / PgQ lineage — event log, consumer
+  cursors, retention-first). Awa adds priorities, unique jobs, cron, callbacks, DLQ, richer
+  lifecycle.</li>
+<li>Less ecosystem-bound than a language-specific <strong>job framework</strong> (River/Go, Oban/Elixir).
+  Awa runs <strong>Rust and Python workers on the same queues, same storage engine</strong>.</li>
+</ul>
+<p>One hard dependency: Postgres. No Redis, no RabbitMQ, no external <code>pg_cron</code> ticker — dispatch,
+rescue, rotation, prune, and cron are all <strong>leader-elected inside the worker fleet</strong>.</p>
+<h3 id="delivery-contract-from-readme">Delivery contract (from README)<a class="headerlink" href="#delivery-contract-from-readme" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Transactional enqueue</strong> — insert jobs inside the business transaction; commit = visible,
+  rollback = gone.</li>
+<li><strong>At-least-once</strong>, not exactly-once. Stale completions rejected; stuck work rescued.
+  Idempotent handlers recommended.</li>
+<li><strong>"No lost work under failure" outranks clever fast paths.</strong></li>
+<li><strong>Strict FIFO per <code>(queue, priority)</code> by default</strong>; operators can opt a hot queue into
+  <strong>partitioned FIFO</strong> by raising <code>enqueue_shards</code> (ADR-025) — an explicit semantic trade
+  (SQS Standard vs FIFO / Kafka partition count), not a free win.</li>
+</ul>
+<h3 id="workspace-crates">Workspace crates<a class="headerlink" href="#workspace-crates" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Crate</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>awa</code></td>
+<td>Umbrella — re-exports <code>awa-model</code> + <code>awa-worker</code></td>
+</tr>
+<tr>
+<td><code>awa-model</code></td>
+<td>Types, queries, migrations, admin ops</td>
+</tr>
+<tr>
+<td><code>awa-macros</code></td>
+<td><code>#[derive(JobArgs)]</code></td>
+</tr>
+<tr>
+<td><code>awa-worker</code></td>
+<td>Runtime: dispatch, heartbeat, maintenance</td>
+</tr>
+<tr>
+<td><code>awa-ui</code></td>
+<td>Web UI (axum API + embedded React)</td>
+</tr>
+<tr>
+<td><code>awa-cli</code></td>
+<td>CLI binary</td>
+</tr>
+<tr>
+<td><code>awa-python</code></td>
+<td>PyO3 module (<code>pip install awa-pg</code>)</td>
+</tr>
+<tr>
+<td><code>awa-testing</code></td>
+<td>Test helpers (<code>TestClient</code>)</td>
+</tr>
+<tr>
+<td><code>awa-seaorm</code></td>
+<td>New in 0.6 — transactional enqueue alongside SeaORM writes</td>
+</tr>
+<tr>
+<td><code>awa-metrics</code></td>
+<td>New in 0.6 — shared OTel counters for non-runtime callers</td>
+</tr>
+</tbody>
+</table>
+<h3 id="correctness-posture">Correctness posture<a class="headerlink" href="#correctness-posture" title="Permanent link">&para;</a></h3>
+<p>Core invariants are checked by <strong>TLA+ models</strong> (<code>correctness/</code>): no duplicate processing after
+rescue, stale completions rejected, no claim/rotate/prune deadlock, DLQ round-trip safety,
+prune-segment emptiness, heartbeat-driven short-job rescue. Two model families:
+- <strong>Segmented-storage family</strong> (<code>AwaSegmentedStorage</code>, <code>…Races</code>, <code>AwaStorageLockOrder</code>,
+  <code>AwaSegmentedStorageTrace</code>) → ADR-019/020. The trace model replays concrete runtime-test
+  event sequences against the spec.
+- <strong>Worker-runtime family</strong> (<code>AwaCore</code>, <code>AwaExtended</code>, <code>AwaBatcher</code>, <code>AwaCbk</code>,
+  <code>AwaDispatchClaim</code>, <code>AwaViewTrigger</code>, <code>AwaCron</code>).</p>
+<hr />
+<h2 id="2-the-06-release-what-shipped">2. The 0.6 release — what shipped<a class="headerlink" href="#2-the-06-release-what-shipped" title="Permanent link">&para;</a></h2>
+<p><strong>0.6.0 tagged 2026-07-04.</strong> The headline: the append-only <strong>queue-storage engine</strong> becomes
+the <strong>default and supported substrate</strong>, replacing the row-mutating "canonical" engine.
+Migrations v001–v039. The whole release was gated on a single benchmark result (#169, below).</p>
+<blockquote>
+<p>"The 0.6 line makes the append-only <strong>queue-storage engine</strong> the default … The
+<a href="https://github.com/hardbyte/awa/issues/169">#169</a> pinned-MVCC dead-tuple gate <strong>passed</strong>
+on <code>main</code>: after the rc line removed the last dominant hot-row update path (the
+<code>queue_claim_heads</code> ready-segment routing cache), a 60-minute idle-in-transaction soak
+holds bounded queue depth through the pinned hour and drains fully in recovery."
+— <code>CHANGELOG.md</code></p>
+</blockquote>
+<h3 id="21-storage-durability-the-core-of-the-release">2.1 Storage &amp; durability (the core of the release)<a class="headerlink" href="#21-storage-durability-the-core-of-the-release" title="Permanent link">&para;</a></h3>
+<p>The through-line was <strong>eliminating every hot-row UPDATE on the claim/complete loop</strong> so dead
+tuples stay bounded under a pinned MVCC horizon:</p>
+<ul>
+<li><strong>Queue-storage engine, default-on</strong> (ADR-019). Append-only <code>ready_entries</code>,
+  <code>deferred_jobs</code>, <code>done_entries</code>, <code>dlq_entries</code> + partitioned receipt ring.</li>
+<li>Lane cursors moved from MVCC-updated rows to <strong>Postgres sequences</strong> (#321, v027).</li>
+<li>Completion/DLQ/retry/discard no longer <code>DELETE FROM ready_entries</code> — append-only ready
+  segments + a <strong>tombstone ledger</strong> (#323, v028).</li>
+<li>Terminal counts append signed rows to a <strong>delta ledger</strong> folded asynchronously by the
+  maintenance leader (#329, v030, ADR-026).</li>
+<li><strong>The last dominant dead-tuple accumulator is gone</strong>: the per-claim <code>queue_claim_heads</code>
+  routing-cache update was removed; claim now routes through the <code>ready_segments</code> control
+  plane (#355, v039). This was the final change that let the #169 gate pass.</li>
+<li>Rollup mutation and segment truncation <strong>stand down while another backend pins the MVCC
+  horizon</strong>, then catch up once it clears (#333).</li>
+<li><strong>Compact receipt claim/completion batches</strong> (#352, v036–v038, ADR-026) — receipt-backed
+  successful completions write compact terminal batches instead of one <code>done_entries</code> row per
+  job. <code>{schema}.terminal_jobs</code> is the public terminal read surface; <strong>direct SQL against
+  <code>done_entries</code> must not assume all completed jobs live there.</strong></li>
+<li><strong>Failed-terminal retention floor</strong> (#337, v032, ADR-032) — non-DLQ <code>failed</code> rows stay
+  retryable ≥ <code>failed_retention</code> (default <code>72h</code>); aged-out rows fold into a monotonic
+  <code>QueueCounts.pruned_failed</code> so loss is visible.</li>
+<li><strong>Receipt-plane ring partitioning</strong> (ADR-023) — <code>lease_claims</code> / <code>lease_claim_closures</code>
+  partitioned by claim slot, rotated by maintenance (#349, v033–v035).</li>
+<li><strong>Per-claim deadlines</strong> in receipts mode (<code>QueueConfig.deadline_duration</code>).</li>
+<li><strong>Staged 0.5→0.6 transition tooling</strong>: <code>awa storage prepare</code> /
+  <code>prepare-queue-storage-schema</code> / <code>enter-mixed-transition</code> / <code>finalize</code> (<code>--wait</code>/<code>--check</code>)
+  / <code>abort</code>, plus a storage-transition readiness UI (#298, #299). <code>awa migrate</code> is now the
+  <strong>single owner of <code>awa.*</code> DDL</strong> (#308, v023); fresh installs auto-finalize.</li>
+</ul>
+<p><strong>The staged transition is a one-way door.</strong> <code>abort</code> works up to <code>mixed_transition</code> <em>before any
+queue-storage row is written</em>; once queue-storage work is accepted, the only rollback is a
+database restore (0.5 workers can't claim queue-storage work). See
+<code>docs/upgrade-0.5-to-0.6.md</code>.</p>
+<h3 id="22-operator-surfaces">2.2 Operator surfaces<a class="headerlink" href="#22-operator-surfaces" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Dead Letter Queue</strong> (ADR-020) — per-queue <code>dlq_enabled</code>; <code>awa dlq depth|list|retry|
+  retry-bulk|move|purge</code>, UI tab, Rust/Python APIs.</li>
+<li><strong>Durable batch operations</strong> (#328, v029, ADR-030) — crash-safe, maintenance-driven bulk
+  <code>set_priority</code> / <code>move_queue</code> with preview/submit/list/get/cancel/purge (HTTP, CLI, UI);
+  Python parity (#332). This is the first-class reprioritization surface (#307).</li>
+<li><strong>Transaction-scoped admin cancel</strong> (#357/#358) — <code>admin::cancel_tx</code> /
+  <code>cancel_by_unique_key_tx</code> take a caller <code>&amp;mut PgConnection</code> and run cancellation + the
+  cooperative <code>awa:cancel</code> NOTIFY atomically with the caller's work.</li>
+<li><strong>Descriptor catalog</strong> (ADR-022) — code-declared queue/job-kind metadata drives UI labels
+  and drift detection.</li>
+<li><strong>Cron missed-fire policy</strong> (<code>coalesce</code> default / <code>catch_up</code>) + <strong>pause/resume</strong> (#320,
+  v026).</li>
+<li><strong><code>awa-pg[ui]</code> extra</strong> + <code>python -m awa serve</code>.</li>
+<li><strong>Managed-Postgres deployment guide</strong> (<code>docs/deploying-on-managed-postgres.md</code>) — sizing,
+  Cloud SQL IAM (<code>cloudsqlsuperuser</code>), AlloyDB notes, auth-proxy sidecar, MVCC guidance.</li>
+</ul>
+<h3 id="23-producer-apis-tuning">2.3 Producer APIs &amp; tuning<a class="headerlink" href="#23-producer-apis-tuning" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong><code>PartitionedQueue</code></strong> (#348, ADR-031) — deterministic routing of one hot logical queue over
+  N physical partitions. Partition 0 <em>is</em> the logical name (<code>email</code>, <code>email__p1</code>, …) so direct
+  enqueues stay consumable; domain-separated key hash composes with ADR-025 enqueue-shards.
+  <strong>Replaces the beta-series <code>QueueFanout</code> (breaking rename).</strong></li>
+<li><strong>Per-job routing in Python COPY batch APIs</strong> (#348) — <code>insert_many_copy</code> /
+  <code>enqueue_many_copy</code> accept <code>opts=[...]</code> overriding <code>queue</code> / <code>ordering_key</code> per job.</li>
+<li><strong>Transactional follow-up jobs</strong> (ADR-029, #285/#288) — <code>ClientBuilder::on_completed_enqueue</code>
+  registers a follow-up job inserted in the same tx as the lifecycle transition. <em>This is the
+  durable-side-effect primitive that ADRs 027/028 lean on.</em></li>
+<li><strong>Callback-only router / user-owned callback layers</strong> (#291/#293) with configurable URL
+  prefix; <code>WaitingForCallback</code> lifecycle event + <code>resolve_callback</code> / <code>complete_external</code> /
+  <code>fail_external</code> / <code>retry_external</code> (#276).</li>
+<li><strong>Direct queue-storage COPY producer path</strong> — Rust <code>QueueStorage::enqueue_params_copy</code>,
+  Python <code>enqueue_many_copy</code> — as the documented high-volume entry point. <code>insert_many_copy</code>
+  is the compat route, <strong>not</strong> the fast path.</li>
+<li><strong><code>InsertOpts::ordering_key</code></strong> + <code>awa.queue_meta.enqueue_shards</code> (ADR-025) — per-queue
+  semantic switch; default <code>1</code> = strict FIFO, <code>≥2</code> = partitioned FIFO.</li>
+<li><strong>Handler futures no longer require <code>Sync</code></strong> (#331) — only <code>Send + 'static</code>.</li>
+</ul>
+<h3 id="24-telemetry">2.4 Telemetry<a class="headerlink" href="#24-telemetry" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong><code>awa-metrics</code> crate</strong> so <code>awa-ui</code> / <code>awa-cli</code> emit the same OTel counters as the worker.</li>
+<li>Sub-second buckets on <code>awa.job.wait_duration</code>; <code>awa.enqueue.batch_size</code> /
+  <code>awa.enqueue.duration</code> histograms; <code>awa.enqueue.shard</code> attribute on <code>awa.job.claimed</code>.</li>
+<li><strong><code>queue_counts_fast</code></strong> (#289) — index-only depth probe (under-counts unrolled terminal
+  rows; use <code>queue_counts</code> for exact).</li>
+<li><strong>Exact terminal counts without <code>done_entries</code> scans</strong> (#290 via #304/#306) — folded
+  counters serve exact reads once the trust marker is set
+  (<code>awa storage rebuild-terminal-counters</code>).</li>
+<li>Maintenance branch duration histograms + <code>awa_maintenance_branch_overrun_total{branch}</code>
+  (#302).</li>
+</ul>
+<h3 id="25-breaking-changes-06-betarc-series-matter-for-early-adopters">2.5 Breaking changes (0.6 beta/rc series — matter for early adopters)<a class="headerlink" href="#25-breaking-changes-06-betarc-series-matter-for-early-adopters" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>QueueFanout</code> → <code>PartitionedQueue</code> (no alias): <code>width</code>→<code>partitions</code>, <code>queue_fanout</code>→
+  <code>partitioned_queue</code>, Python <code>*_per_queue</code>→<code>*_per_partition</code>; <strong>routing differs from beta.2</strong>
+  (partition 0 = logical name, domain-separated hash) so a key may land on a different
+  partition — drain fanout queues before upgrading.</li>
+<li><code>QueueCounts.completed</code> → <code>QueueCounts.terminal</code> (now counts completed+cancelled+discarded);
+  gains <code>pruned_failed</code>.</li>
+<li><code>retry_failed_by_kind</code>/<code>by_queue</code> return <code>RetryFailedOutcome { retried, matched,
+  pruned_failed_count }</code> instead of <code>Vec&lt;JobRow&gt;</code>.</li>
+<li><code>JobEvent</code>/<code>UntypedJobEvent</code> gain a <code>WaitingForCallback</code> variant (exhaustive matches need a
+  new arm).</li>
+<li><code>PruneOutcome::Pruned</code> gains <code>carried_failed_rows</code>; <code>QueueStorage::prune_oldest</code> takes
+  <code>failed_retention: Duration</code>.</li>
+</ul>
+<h3 id="26-benchmark-reality-169-the-honest-ceiling">2.6 Benchmark reality (#169) — the honest ceiling<a class="headerlink" href="#26-benchmark-reality-169-the-honest-ceiling" title="Permanent link">&para;</a></h3>
+<p>This is the single most important context for 0.7. <strong>0.6 did not make Awa immune to long
+readers; it made the degradation bounded and recoverable, and documented the mitigation.</strong></p>
+<ul>
+<li>Harness: 1 replica, 64 workers, 800 jobs/s offered, 60-min idle-in-transaction reader
+  (<code>hardbyte/postgresql-job-queue-benchmarking</code>).</li>
+<li>Clean phase holds the offered rate at shallow median depth. <strong>Under the pinned reader,
+  completion sags but depth stays bounded (no dead-tuple cliff) and drains fully once the pin
+  releases</strong> — append-only segments hold zero dead tuples; residual pressure confined to
+  terminal-counter and ring-state metadata. This shape <em>is</em> the #169 gate and it passed.</li>
+<li><strong>Every per-row-state-machine Postgres queue (River, Oban, pg-boss, Graphile, pgmq) shares
+  this degradation shape.</strong> pgque avoids it only by dropping features (no per-row retries,
+  heartbeats, cancellation).</li>
+<li>Documented mitigation ("MVCC discipline"): give Awa its own database if the app runs long
+  <code>REPEATABLE READ</code>/<code>SERIALIZABLE</code> transactions; bound sessions with
+  <code>idle_in_transaction_session_timeout</code>; alert on <code>pg_stat_activity.xact_start</code> age.</li>
+<li>Separate result: Cloud SQL PG18 16-vCPU sweep (v021 shard-aware lane indexes) moved
+  end-to-end drain on a 3.5M-row backlog from ~1,300 → ~8,800–10,600 jobs/s.</li>
+</ul>
+<p>Headline reference numbers (README): <strong>9.5k jobs/s, 22 ms p95 pickup, 417 exact final dead
+tuples</strong> on a 5k-job runtime soak; enqueue ~30k/s single-producer, ~100k/s multi-producer.</p>
+<hr />
+<h2 id="3-architectural-landscape-open-decisions">3. Architectural landscape &amp; open decisions<a class="headerlink" href="#3-architectural-landscape-open-decisions" title="Permanent link">&para;</a></h2>
+<h3 id="31-adr-status-snapshot-docsadrreadmemd">3.1 ADR status snapshot (<code>docs/adr/README.md</code>)<a class="headerlink" href="#31-adr-status-snapshot-docsadrreadmemd" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Accepted &amp; central to 0.6:</strong> 019 (queue storage engine, supersedes 012), 020 (DLQ), 023
+  (receipt-plane ring), 025 (sharded enqueue heads), 026 (narrow terminal history), 029
+  (transactional follow-up jobs), 030 (batch ops), 031 (partitioned queues), 032 (failed
+  retention floor).</li>
+<li><strong>Proposed (not yet built — these are the forward-looking deployment-shape ADRs):</strong></li>
+<li><strong>ADR-027 — Callback ingress as a deployable surface.</strong> Split the signed callback receiver
+    away from the admin UI/API so it can be public/partner-facing while the admin UI stays
+    private. Introduces a surface taxonomy: Admin UI/API (private) · Callback receiver
+    (public, signed) · Worker runtime (internal) · Maintenance runtime (internal).</li>
+<li><strong>ADR-028 — Maintenance-only runtime role.</strong> A persistent role that runs promotion,
+    rescue, prune, and metadata maintenance <strong>without claiming or executing user jobs</strong> —
+    required so callback-only / serverless deployments don't leave time-based state frozen.</li>
+<li><strong>Rejected (historical):</strong> 024 (deferred <code>done_entries</code> materialisation).</li>
+</ul>
+<h3 id="32-cross-cutting-constraints-any-07-proposal-must-respect">3.2 Cross-cutting constraints any 0.7 proposal must respect<a class="headerlink" href="#32-cross-cutting-constraints-any-07-proposal-must-respect" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Postgres-only (ADR-001).</strong> No extensions Awa doesn't already require. PG14+ floor, PG18
+  supported.</li>
+<li><strong>No new hot mutable table under a pinned MVCC horizon.</strong> Any new per-key / per-tenant /
+  per-dependency state family must use the same <strong>delta-ledger discipline as ADR-026</strong> or it
+  reintroduces the #169 problem.</li>
+<li><strong>ADR-029 transactional follow-up semantics must compose</strong> with anything new.</li>
+<li><strong>Non-goal: workflow engine.</strong> The PRD explicitly lists "workflow engine" as a non-goal — no
+  DAG authoring, no saga orchestration. This directly bounds #14 and #81.</li>
+<li><strong>Transactional-enqueue tension (ADR-006):</strong> rejecting an enqueue inside a user transaction
+  turns a queue-health condition into a business-transaction failure — relevant to backpressure
+  (#341).</li>
+</ul>
+<hr />
+<h2 id="4-open-issue-inventory-20-open">4. Open issue inventory (20 open)<a class="headerlink" href="#4-open-issue-inventory-20-open" title="Permanent link">&para;</a></h2>
+<blockquote>
+<p><strong>Snapshot note.</strong> This inventory reflects the tracker <em>before</em> the roadmap
+(<a href="../0.7-roadmap/"><code>0.7-roadmap.md</code></a>) was adopted. The roadmap has since filed #367–#383 and
+moved the surviving candidates below into the <code>v0.7.0</code> milestone, so the milestone now holds
+~29 issues; the roadmap's §10 disposition table is the current authority. This section is
+kept as the point-in-time context it was written to be.</p>
+</blockquote>
+<p><strong>Authoritative signal: 8 issues carry the GitHub <code>v0.7.0</code> milestone.</strong> These are the
+committed/queued 0.7 scope. The remaining 12 are unmilestoned candidates. Author is <code>hardbyte</code>
+(project owner) except #256 (external) and #346 (bot).</p>
+<h3 id="41-in-the-v070-milestone-committed-scope">4.1 — In the <code>v0.7.0</code> milestone (committed scope)<a class="headerlink" href="#41-in-the-v070-milestone-committed-scope" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Title</th>
+<th>Labels</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>295</strong></td>
+<td>RFC: v0.7 storage engine — segment storage + cursor allocator</td>
+<td>feature, correctness</td>
+<td>RFC-stage, no code. The roadmap runs this as an evidence track: scope depends on Gate A (E1/E3).</td>
+</tr>
+<tr>
+<td><strong>246</strong> <em>(not milestoned — see 4.2, but tightly bound to 295)</em></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><strong>360</strong></td>
+<td>Test harness: run suite under both storage engines</td>
+<td>—</td>
+<td>Quality/safety prerequisite for evolving storage.</td>
+</tr>
+<tr>
+<td><strong>303</strong></td>
+<td>maintenance: split rescue+promote into separate tokio task (v0.7)</td>
+<td>operational</td>
+<td><strong>Conditional</strong> — telemetry-gated, may close wontfix.</td>
+</tr>
+<tr>
+<td><strong>282</strong></td>
+<td>Add a maintenance-only runtime role</td>
+<td>feature, operational</td>
+<td>Implements ADR-028.</td>
+</tr>
+<tr>
+<td><strong>143</strong></td>
+<td>Split awa-api from awa-ui</td>
+<td>—</td>
+<td>Decouple API response types from embedded React.</td>
+</tr>
+<tr>
+<td><strong>118</strong></td>
+<td>Serverless-friendly dispatch: <code>tick()</code> endpoint</td>
+<td>—</td>
+<td>Zero-infra deployments; pairs with ADR-028.</td>
+</tr>
+<tr>
+<td><strong>110</strong></td>
+<td>Tracing (end-to-end distributed tracing)</td>
+<td>feature</td>
+<td>Context propagation enqueue→exec, across PyO3.</td>
+</tr>
+<tr>
+<td><strong>14</strong></td>
+<td>Job dependencies: run B after A completes</td>
+<td>feature</td>
+<td>Must stay minimal (A→B, not DAGs) per non-goal.</td>
+</tr>
+</tbody>
+</table>
+<h4 id="295-rfc-v07-storage-engine-segment-storage-cursor-allocator-flagship">#295 — RFC: v0.7 storage engine — segment storage + cursor allocator <em>(flagship)</em><a class="headerlink" href="#295-rfc-v07-storage-engine-segment-storage-cursor-allocator-flagship" title="Permanent link">&para;</a></h4>
+<p>Milestone <code>v0.7.0</code>. <strong>Design RFC, no implementation.</strong> Directly targets the #169 residual
+degradation (799 → 387 jobs/s at 800 offered/s over a 2h pinned phase) — the class of behaviour
+0.6's ADR-012/023/025/026 mitigated but did not eliminate.</p>
+<blockquote>
+<p>"the lifecycle table itself is the wrong shape for sustained, long-reader-exposed
+workloads." … "the storage <em>shape</em> is right but the <em>claim allocator</em> is the load-bearing
+piece — the design has to start there, not at the segment format."</p>
+</blockquote>
+<p>Direction: <strong>append-only rotation segments</strong> for job lifecycle + a <strong>tiny per-segment claim
+ledger</strong> (the only mutable hot rows) + a <strong>cursor allocator</strong> that moves readers forward across
+segments instead of anti-joining over prunable history. Five explicit RFC questions:
+1. <strong>Claim allocator design</strong> — simplest allocator giving SKIP-LOCKED-equivalent fairness that
+   supports per-row retries/heartbeats/cancellation and does <em>not</em> degrade under a pinned
+   horizon. Single advisory-locked cursor table? Per-shard hash-routed cursor? Something else?
+2. <strong>Receipt-plane integration</strong> — how ADR-023 ring partitioning + ADR-026 narrow terminal
+   history compose with rotation segments.
+3. <strong>Migration story</strong> — 0.6→0.7 is a <em>second</em> storage migration right after 0.5→0.6. Staged
+   (like 0.5→0.6) or hard cutoff?
+4. <strong>Comparable designs</strong> — FoundationDB record layer, ScyllaDB commit log, pgque. <em>What stops
+   pgque from supporting per-row retries/heartbeats?</em>
+5. <strong>TLA+ coverage</strong> — what must be re-modelled before it ships.</p>
+<p>Constraints: Postgres-only, PG14+/PG18, API-compatible with 0.6 where feasible (operator-visible
+migration, <strong>not</strong> handler-visible), ADR-029 semantics must compose. Contribution path: draft
+ADR (next free number) once a direction has consensus.</p>
+<h4 id="360-dual-engine-test-harness">#360 — Dual-engine test harness<a class="headerlink" href="#360-dual-engine-test-harness" title="Permanent link">&para;</a></h4>
+<p>The caller-facing contract is meant to be <strong>engine-invariant</strong> (canonical vs queue_storage) but
+the default integration harness forces <code>canonical</code>, so queue_storage implementations are only
+covered by a dedicated suite.</p>
+<blockquote>
+<p>"This blind spot is how the queue-storage <code>cancel_by_unique_key</code> candidate query
+(<code>{schema}.leases.unique_key</code>, a column that does not exist on <code>leases</code>) shipped … the
+queue-storage SQL branch was dead code to CI." <em>(fixed #359 / 0.6.0-rc.4)</em></p>
+</blockquote>
+<p>Experiment: running <code>integration_test</code> under <code>AWA_TEST_ENGINE=queue_storage</code> → <strong>31 pass / 13
+fail, all 13 test artifacts</strong> (canonical-only raw-SQL helpers, admin-metadata cache assertions,
+test-isolation leakage), <strong>zero real engine bugs</strong>. Proposes engine-aware harness helpers, an
+engine guard for canonical-only tests, a CI matrix dimension, and a <strong>forward-compat test</strong> (old
+binary, e.g. awa 0.5.7, against a freshly-V39 DB — currently untested). A spike branch with the
+parameterization + triage exists locally. *High leverage: this is the safety net for shipping</p>
+<h1 id="295">295.*<a class="headerlink" href="#295" title="Permanent link">&para;</a></h1>
+<h4 id="303-split-rescuepromote-into-a-separate-tokio-task-conditional">#303 — Split rescue+promote into a separate tokio task <em>(conditional)</em><a class="headerlink" href="#303-split-rescuepromote-into-a-separate-tokio-task-conditional" title="Permanent link">&para;</a></h4>
+<p>Follow-up to #242 (closed via #302). 0.6 shipped only <em>observability</em>
+(<code>awa.maintenance.branch.duration/overrun</code>); this issue <strong>only activates if fleet telemetry
+shows non-trivial overrun on user-visible branches</strong>, else closes wontfix.</p>
+<blockquote>
+<p>"Conditional follow-up — open for visibility, not a foregone conclusion." TLA+ needs no
+re-modeling (every branch is still its own SQL tx).</p>
+</blockquote>
+<h4 id="282-maintenance-only-runtime-role-implements-adr-028">#282 — Maintenance-only runtime role (implements ADR-028)<a class="headerlink" href="#282-maintenance-only-runtime-role-implements-adr-028" title="Permanent link">&para;</a></h4>
+<p><code>.maintenance_only()</code> library API + <code>awa maintenance run</code> CLI. Acceptance: does NOT claim jobs /
+invoke handlers / dispatch HttpWorker, but DOES run promote/rescue/rotation/prune/cleanup/
+metadata and preserves leader-election + shutdown. "Composes with #242 rather than baking in
+another monolithic maintenance loop." Unblocks callback-only (#118, ADR-027) deployments.</p>
+<h4 id="143-split-awa-api-from-awa-ui">#143 — Split awa-api from awa-ui<a class="headerlink" href="#143-split-awa-api-from-awa-ui" title="Permanent link">&para;</a></h4>
+<p><code>awa-ui</code> mixes REST API (axum handlers, response types) with the embedded React frontend
+(rust-embed).</p>
+<blockquote>
+<p>"The API currently returns <code>JobRow</code> (a database row struct deriving <code>FromRow</code>) directly to
+HTTP clients. This leaks the DAL layer into the API contract."
+A <code>JobResponse</code> wrapper was added as a first step; proposes a dedicated <code>awa-api</code> crate so
+<code>awa-cli</code> can depend on it without the React build. <em>Note interaction with #343 UI auth and #344
+Helm — all touch the serve surface.</em></p>
+</blockquote>
+<h4 id="118-serverless-tick-dispatch-endpoint">#118 — Serverless <code>tick()</code> dispatch endpoint<a class="headerlink" href="#118-serverless-tick-dispatch-endpoint" title="Permanent link">&para;</a></h4>
+<p>HttpWorker (ADR-018) made <em>execution</em> serverless, but dispatch/maintenance still needs an
+always-on process — overkill for hobby/Supabase-scale apps.</p>
+<blockquote>
+<p>"The system is frozen until the next request arrives." (the no-traffic maintenance gap)
+Proposes a <strong>bounded</strong> <code>tick()</code> (each step <code>LIMIT 100</code> for predictable duration) + <code>POST
+/api/tick</code> driven by a cheap external scheduler (Cloud Scheduler, Vercel cron, GH Actions).
+Open Qs: Client method vs standalone; auth by default; leader election ("Probably: skip it, let
+SKIP LOCKED handle contention"). <em>Pairs directly with ADR-028 / #282.</em></p>
+</blockquote>
+<h4 id="110-end-to-end-distributed-tracing">#110 — End-to-end distributed tracing<a class="headerlink" href="#110-end-to-end-distributed-tracing" title="Permanent link">&para;</a></h4>
+<p>Awa emits OTel spans/metrics but tracing is <strong>component-local</strong> — parent context doesn't
+propagate enqueue→execution, especially across the Rust↔Python FFI (ADR-004) and transactional
+enqueues. Proposes storing serialized <code>trace_context</code> (JSONB/binary, &lt;200 bytes) on the job,
+injecting as parent at claim/dispatch, propagating across PyO3, recording span status on
+completion (guarded by <code>run_lease</code>), extending to callbacks/cron/maintenance. W3C tracecontext
+default; ship Rust→execution first, then the Python boundary.</p>
+<h4 id="14-job-dependencies-ab">#14 — Job dependencies (A→B)<a class="headerlink" href="#14-job-dependencies-ab" title="Permanent link">&para;</a></h4>
+<blockquote>
+<p>"after the PDF is generated, send the email" — currently requires manual next-job insert.
+Three options: <code>depends_on</code> column (maintenance promotes B when deps complete); a completion
+callback (<code>InsertOpts { on_complete }</code>, single-step); or document the manual approach.
+"The PRD explicitly lists 'workflow engine' as a non-goal. This should stay minimal — simple
+A→B chains, not DAGs." Tightly related to #81.</p>
+</blockquote>
+<h3 id="42-unmilestoned-candidates-12">4.2 — Unmilestoned candidates (12)<a class="headerlink" href="#42-unmilestoned-candidates-12" title="Permanent link">&para;</a></h3>
+<p><strong>Storage / correctness / perf</strong>
+- <strong>#246 — Claim hot-path slows ~33% with deadline rescue enabled at high concurrency.</strong>
+  <em>(4 comments; the most-characterized bug in the tracker.)</em> At 1×256 near saturation,
+  per-claim deadline rescue costs ~33% throughput / ~50% p99, spread uniformly across the claim
+  path (not one query) → shared-resource contention. Measured: completion 5,419→3,649 jobs/s
+  (−33%), e2e p99 100→151 ms (+51%). Primary hypothesis:</p>
+<blockquote>
+<p>"<code>awa.lease_claims</code> working set inflates when rescue is on, and every other query that
+touches <code>lease_claims</code> … pays the cost in index lookup time / page fetches / lock
+contention."
+  Safety constraint: <strong>do not disable <code>deadline_at</code> writes to fix it</strong> — per-claim deadline
+  rescue is the documented stuck-worker fallback the chaos suite relies on. A partial-index fix
+  needs a migration plan (<code>lease_claims</code> is partitioned). Reproduces on 0.6.0-alpha.6/7;
+  <code>pg_stat_statements</code> snapshots committed. <em>Strongest concrete correctness/perf bug for 0.7;
+  bound to the #295 receipt-plane redesign.</em></p>
+</blockquote>
+<p><strong>Dispatch / scheduling features</strong>
+- <strong>#347 — Design first-class partitioned queues (ADR-031 draft).</strong> Mostly shipped in 0.6
+  (<code>PartitionedQueue</code>), but the issue documents the <strong>correlated-hashing routing defect</strong> the
+  0.6 rename fixed: <code>queue_for_key</code> and the storage enqueue-shard pick used <em>the same 64-bit
+  hash under two moduli</em>, so at <code>width=4, enqueue_shards=4</code> each partition's keyed traffic
+  landed on exactly one shard — "ADR-025 is silently negated for keyed workloads." Fix =
+  domain-separate the partition hash. Largely closed by 0.6; verify residual open questions
+  (weighted mode, exact naming) are resolved or move to done.
+- <strong>#340 — Per-key execution control: concurrency limits &amp; fairness within a queue.</strong> The main
+  multi-tenant dispatch gap (cf. Oban Pro partitioned concurrency, BullMQ groups). Two gaps:
+  per-key concurrency ("≤N in-flight per tenant") and cross-key fairness (one hot tenant
+  starves others until priority aging). Key constraint:</p>
+<blockquote>
+<p>"per-key state must not become a new hot mutable table under pinned MVCC horizons (#169) —
+any per-key counter family needs the same delta-ledger discipline as ADR-026."
+  Enforcement point undecided: claim-time skip (interacts with cursor monotonicity/tombstones)
+  vs post-claim gating (burns claim throughput). Explicitly <em>not</em> workflow semantics.
+- <strong>#341 — Backpressure: queue-depth limits &amp; producer-side flow control.</strong> Nothing stops
+  producers outrunning completion; the COPY path (ADR-008) makes it trivial. Cites #246 numbers
+  (9,982/s enqueue vs 4,016/s completion, depth peaked 1.26M, 33s e2e p99). Building blocks
+  exist (<code>queue_counts_fast</code> #289, lane-head cursors #330).
+"A soft-signal default with opt-in hard rejection is probably the right shape." … "a
+depth-aware batch producer … would capture most of the value without changing enqueue
+semantics at all."</p>
+</blockquote>
+<p><strong>Operational / deployment</strong>
+- <strong>#344 — First-party Helm chart (or kustomize base).</strong> No installable k8s artifact today.
+  Cover Worker Deployment (+auth-proxy sidecar), Migrations Job (<code>awa migrate</code> as single DDL
+  owner), UI Deployment/Service (<code>--read-only</code>), probes. Must state explicitly that
+  maintenance/cron are <strong>leader-elected inside workers (ADR-007), not a k8s CronJob.</strong> Possible
+  sub-task: workers may lack a health endpoint for probes.
+- <strong>#343 — Admin UI authentication.</strong> Today only <code>--read-only</code> + "put it behind your ingress",
+  no worked example, no built-in auth — despite the UI exposing retry, cancel, DLQ purge, batch
+  ops, cron pause, and <strong>storage-transition controls</strong> (mutating, operator-grade). Proposes
+  (smallest-first): document an oauth2-proxy/OIDC pattern; add optional <code>AWA_ADMIN_TOKEN</code>
+  static-token/basic-auth ("not an SSO replacement"); defer authz tiers. <em>Pairs with #143 and
+  ADR-027 surface split.</em>
+- <strong>#335 — CI: Rust tests job takes 26+ min; shard it.</strong> PR-gating "Rust tests" took 26m22s on
+  a docs PR, mostly serialized waiting on real-time windows (one binary 180s).</p>
+<blockquote>
+<p>"A test that needs &gt;60s of wall clock is almost always waiting on a real-time window … These
+windows are configuration, not contract — the test should pin the behavior, not the
+production default duration."
+  Proposes CI matrix sharding (per-shard Postgres), cargo-nextest, sub-second fixture windows.
+  Target: worst shard &lt;8 min. <em>High developer-velocity leverage across the whole 0.7 cycle.</em>
+- <strong>#346 — Nightly chaos/benchmark failure (2026-06-11).</strong> Bot-filed; only <code>rust-nightly</code>
+  failed (tla-storage / postgres-failover-smoke / python-nightly all passed). <em>Triage/close.</em></p>
+</blockquote>
+<p><strong>API surface / architecture</strong>
+- <strong>#342 — Stabilize the SQL enqueue contract as a public producer API.</strong> Common shape: a third
+  language (Node/Go/JVM) on the <em>producer</em> side only. <code>awa.insert_job_compat(...)</code> already proves
+  the mechanism (#314 documented SQL-only install/upgrade) and remains the supported, covered SQL
+  producer contract today. The future public v1 name is the clean <code>awa.insert_job(...)</code>;
+  <code>insert_job_compat</code> becomes internal cross-storage plumbing only after #342 ships the documented
+  migration and deprecation step. The clean function has one exact signature with a final
+  <code>opts jsonb DEFAULT '{}'::jsonb</code> extension point. It receives logical keys and computes the
+  ADR-033 domain-separated SHA-256 concurrency digest and enqueue shard in PostgreSQL (built-in
+  <code>sha256()</code>; <code>unique_key</code> remains client-side BLAKE3 per ADR-002), so a third-party producer
+  cannot silently scatter a key by supplying incompatible routing metadata.</p>
+<blockquote>
+<p>"What's missing is the <strong>decision and contract</strong>, not the mechanism." … "<code>unique_key</code> is a
+BLAKE3 hash computed client-side (ADR-002). A non-Rust producer needs the exact derivation …
+documented, or uniqueness silently diverges between languages."
+  Out of scope: official client libraries for other languages. <em>Mostly a decision + docs +
+  contract-tests effort; positioning win.</em>
+- <strong>#143</strong> <em>(also in milestone — see 4.1)</em>.
+- <strong>#256 — Optional SeaORM integration crate.</strong> The one external-contributor issue
+  (<code>xyzbety</code>); a thin <code>awa-seaorm</code> crate surfacing <code>sqlx::PgPool</code> from
+  <code>sea_orm::DatabaseConnection</code>. <strong>Note: <code>awa-seaorm</code> already exists in the workspace and its
+  publish was added to the crates.io chain (<code>da69728</code>) — likely already landed; verify and
+  close.</strong></p>
+</blockquote>
+<p><strong>Research / positioning (no committed direction)</strong>
+- <strong>#81 — Research first-class orchestration within Awa's scope.</strong> Evaluate <code>send</code>/<code>call</code>/
+  <code>delay</code>-style multi-step APIs against the non-goal.</p>
+<blockquote>
+<p>PRD: "Postgres-native job execution for Rust and Python. One queue engine, two first-class
+languages." Any proposal must restate the non-goals and explain why it isn't a workflow
+engine. Related to #14.
+- <strong>#83 — Research official ingress adapters</strong> (webhook-to-job, Kafka event-stream, HTTP
+  ingress). Deliverable: keep ingress app-defined / ship reference adapters only / add
+  first-party packages — identify the smallest useful first step.</p>
+</blockquote>
+<hr />
+<h2 id="5-synthesis-how-the-07-scope-hangs-together">5. Synthesis — how the 0.7 scope hangs together<a class="headerlink" href="#5-synthesis-how-the-07-scope-hangs-together" title="Permanent link">&para;</a></h2>
+<p>There are <strong>three coherent workstreams</strong> plus a bug and some research:</p>
+<p><strong>A. The storage endgame (the reason 0.7 exists).</strong>
+<code>#295</code> (segment-storage + cursor allocator RFC) is the flagship, and it is still <em>pre-design</em>.
+<code>#360</code> (dual-engine harness) is its safety net and should land first — it is bounded (spike
+branch exists) and closes the exact defect class that a storage rewrite would otherwise risk.
+<code>#246</code> (deadline-rescue contention on <code>lease_claims</code>) is empirically the same receipt-plane
+surface #295 must redesign, so its resolution and the RFC should be reasoned about together.
+<code>#303</code> is a telemetry-gated maybe.
+- <em>Biggest schedule risk:</em> #295 is an RFC with five open design questions and implies a
+  <strong>second storage migration in consecutive releases</strong> (0.5→0.6→0.7) — migration UX and
+  operator trust are as much the work as the engine.</p>
+<p><strong>B. Deployment-shape maturation (ADR-027 + ADR-028 becoming real).</strong>
+<code>#282</code> (maintenance-only role, ADR-028) + <code>#118</code> (serverless <code>tick()</code>) + the ADR-027 callback
+ingress split together enable "callback-only / no always-on worker" deployments. <code>#344</code> (Helm),
+<code>#343</code> (UI auth), and <code>#143</code> (awa-api split) are the operational/packaging complements that make
+those deployments real and safe. These are largely independent of A and could ship
+incrementally.</p>
+<p><strong>C. Observability &amp; multi-tenancy features.</strong>
+<code>#110</code> (distributed tracing) is milestoned and self-contained (storage-column + propagation).
+<code>#340</code> (per-key concurrency/fairness) and <code>#341</code> (backpressure) are the highest-value <em>new</em>
+capabilities but are at the design-question stage and both carry the #169 "no new hot mutable
+table" constraint — they may be better sequenced <em>after</em> the #295 allocator lands, since a
+cursor allocator changes what per-key state is cheap.</p>
+<p><strong>D. Bounded feature: #14 job dependencies</strong> — deliberately minimal (A→B), guarded by the
+workflow-engine non-goal; #81/#83 are research spikes that gate whether B/C grow further.</p>
+<p><strong>E. Hygiene:</strong> #335 (CI sharding — velocity multiplier for the whole cycle), #346 (nightly
+triage), #256 (likely already done — verify/close), #347 (largely shipped — reconcile/close).</p>
+<h3 id="suggested-planning-questions-for-the-powerful-model">Suggested planning questions for the powerful model<a class="headerlink" href="#suggested-planning-questions-for-the-powerful-model" title="Permanent link">&para;</a></h3>
+<ol>
+<li><strong>Sequencing:</strong> Does #360 (dual-engine harness) block the start of #295 implementation? (It
+   should — it's the regression net for a storage rewrite.)</li>
+<li><strong>#246 vs #295:</strong> Fix the deadline-rescue <code>lease_claims</code> contention <em>within the current
+   receipt plane</em>, or fold it into the #295 allocator redesign? (They touch the same surface.)</li>
+<li><strong>Migration UX:</strong> A second storage migration in back-to-back releases — staged
+   (<code>prepare→mixed→finalize</code>, like 0.6) or hard cutoff? What's the operator-trust cost, and can
+   0.6→0.7 reuse the transition tooling from #298/#299?</li>
+<li><strong>Per-key state (#340/#341):</strong> How to add per-tenant concurrency/fairness/backpressure
+   counters without a new hot mutable table under a pinned horizon — delta-ledger (ADR-026) or
+   cursor-allocator-native? Is this better <em>after</em> #295?</li>
+<li><strong>Deployment stream independence:</strong> Can B (#282/#118/#344/#343/#143 + ADR-027/028) ship on
+   its own cadence, decoupled from the storage rewrite risk?</li>
+<li><strong>Non-goal boundary:</strong> #14 + #81 — where exactly is the line that keeps Awa a job queue and
+   not a workflow engine, and does per-key control (#340) or job dependencies (#14) cross it?</li>
+</ol>
+<hr />
+<h2 id="6-the-169-06-hot-row-chronology-the-most-important-input-for-295">6. The #169 → 0.6 hot-row chronology (the most important input for #295)<a class="headerlink" href="#6-the-169-06-hot-row-chronology-the-most-important-input-for-295" title="Permanent link">&para;</a></h2>
+<p>The closed #169 thread is the empirical spine of the entire 0.6 storage story, and it is the
+strongest argument for <em>why</em> #295 needs to be an architectural redesign rather than more
+symptom-fixing. The pattern is explicit in the owner's own words: <strong>"fix one hot row, the next
+one surfaces."</strong> Each dead-tuple source was removed, the pinned-horizon benchmark re-run, and a
+new dominant mutable hot row appeared — until the last one turned out to be a query-plan bug in
+disguise.</p>
+<h3 id="61-the-original-failure-2026-05-17-long-horizon-awa-vs-pgque">6.1 The original failure (2026-05-17, long-horizon Awa vs pgque)<a class="headerlink" href="#61-the-original-failure-2026-05-17-long-horizon-awa-vs-pgque" title="Permanent link">&para;</a></h3>
+<p>Shape: 1 replica, 32 workers, <strong>800 offered jobs/s</strong>, phases warmup→clean→60m idle-in-tx→2h
+recovery→2h idle-in-tx.</p>
+<table>
+<thead>
+<tr>
+<th>System</th>
+<th style="text-align: right;">clean</th>
+<th style="text-align: right;">idle-in-tx 1h</th>
+<th style="text-align: right;">recovery 2h</th>
+<th style="text-align: right;">idle-in-tx 2h</th>
+<th style="text-align: right;">WAL/job</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Awa</strong></td>
+<td style="text-align: right;">799/s</td>
+<td style="text-align: right;"><strong>581/s</strong> (depth 128k)</td>
+<td style="text-align: right;">799/s (drained ~27 min after pin released)</td>
+<td style="text-align: right;"><strong>387/s</strong> (depth 692k, peak <strong>2.49M</strong>)</td>
+<td style="text-align: right;">~2.2–2.9 KiB</td>
+</tr>
+<tr>
+<td><strong>pgque</strong></td>
+<td style="text-align: right;">799/s</td>
+<td style="text-align: right;">799/s (depth 0)</td>
+<td style="text-align: right;">799/s</td>
+<td style="text-align: right;">799/s (depth 0)</td>
+<td style="text-align: right;"><strong>~452 B</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Owner's read: <em>"This is not a correctness failure: no lost jobs or safety violation … It is a
+production-operational limit."</em> And the key comparative fact for #295: <strong>pgque holds the rate
+with ~5× less WAL/job</strong>, at the cost of a 1.3–1.4 GB active event table and the weaker event-bus
+contract (no per-row retries/heartbeats/cancellation).</p>
+<h3 id="62-the-hot-row-lineage-each-fix-exposed-the-next">6.2 The hot-row lineage (each fix exposed the next)<a class="headerlink" href="#62-the-hot-row-lineage-each-fix-exposed-the-next" title="Permanent link">&para;</a></h3>
+<p>This ordered list <em>is</em> the map of where mutable hot state lived in the per-row model — directly
+useful for designing the #295 claim allocator, which must avoid re-introducing any of them:</p>
+<ol>
+<li><strong><code>queue_lanes.available_count</code></strong> cache — removed v016 / #251 (derive from
+   <code>next_seq − claim_seq</code>). Was ~40k dead tuples in a 4-min window, ~2,500× over live rows.</li>
+<li><strong><code>queue_claimer_leases</code> / <code>leases</code> / <code>lease_claims</code></strong> — fillfactor + index-shape passes
+   (#315, <code>d21e5db</code>) restored HOT-updates.</li>
+<li><strong><code>leases.heartbeat_at</code></strong> write in receipts mode — removed (#317, "B1"); dropped
+   <code>idx_state_hb</code>, compat reads via <code>COALESCE(…, attempt_state.heartbeat_at)</code>. Lease/attempt
+   heartbeat churn stopped being dominant.</li>
+<li><strong>Maintenance noise</strong> — prune backoff + branch hysteresis (#316), duration-margin cooldown +
+   250 ms lease-rotate default (#318). Delayed the cliff ~40–50 min but did <strong>not</strong> close it;
+   <code>rotate_lease</code> warning storms persisted around the 50 ms threshold.</li>
+<li><strong>Lane cursors</strong> — sequence-backed, off mutable lane rows (#321, v027).</li>
+<li><strong>Ready segments</strong> — append-only + tombstone ledger; completion/DLQ/retry/discard stop
+   <code>DELETE FROM ready_entries</code> (#323, v028). <em>After this, <code>ready_entries_*</code>/<code>done_entries_*</code>/
+   <code>ready_tombstones_*</code> held </em><em>zero</em><em> dead tuples through the pin — permanently.</em></li>
+<li><strong><code>queue_terminal_live_counts</code></strong> then became the dominant accumulator: <strong>2.52M dead tuples,
+   197 MiB, 85% dead</strong> (post-#323 run). Fixed by the ADR-026 <strong>terminal-count delta ledger +
+   async rollup</strong> (#329/#330/#333) and <strong>256-way striping</strong> → 0 dead tuples at end of pin.</li>
+<li><strong><code>queue_claim_heads</code></strong> was the last dominant hot row (<strong>130k dead tuples, 80.5% share</strong>,
+   one live row taking ~40 dead versions/s from the per-claim <code>ready_segment_*</code> routing-cache
+   UPDATE). <strong>#355 removed the cache entirely</strong> — and the EXPLAIN study found <em>"the cache was
+   hiding a query-plan bug, not earning its keep"</em>: the cache-miss scan heapsorted the whole
+   growing tail; ordering <code>ready_segments</code> by <code>next_lane_seq ASC LIMIT 1</code> lets the index
+   short-circuit. Removing it made claim <strong>faster</strong> under the pin (claim p99 88→55 ms, total
+   idle dead tuples −81%, idle depth max 14,265→450).</li>
+</ol>
+<p>Also surfaced during the hunt: a <strong>dispatcher <code>JoinSet</code> leak (~3.2 GB/h/replica)</strong>, fixed
+<code>c0df1df</code>.</p>
+<h3 id="63-the-gate-that-finally-passed-2026-06-1824-060-rc1">6.3 The gate that finally passed (2026-06-18/24, → 0.6.0-rc.1)<a class="headerlink" href="#63-the-gate-that-finally-passed-2026-06-1824-060-rc1" title="Permanent link">&para;</a></h3>
+<p>After #355, the corrected shape (1 replica, 32 workers, 800/s, clean 20m → <strong>idle-in-tx 60m</strong> →
+recovery 10m) <strong>held 798/s completion through the full 60-minute pin</strong> with bounded depth (max
+~14k, mostly ~20) and <strong>full dead-tuple reclaim</strong> on release. #169 closed 2026-06-24. The stable
+bar had been <em>raised</em> mid-cycle (2026-06-10): from "measurable improvement + honest docs" to
+"must <strong>pass</strong> — bounded depth through the pin, drain to ~0 in recovery, <strong>and a named
+mechanism</strong> for any residual throughput drop."</p>
+<h3 id="64-what-this-hands-295">6.4 What this hands #295<a class="headerlink" href="#64-what-this-hands-295" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>The claim allocator is the load-bearing piece</strong> — 0.6 already proved the <em>storage shape</em>
+  (append-only segments = 0 dead tuples) works; every remaining problem was in mutable
+  <em>control-plane</em> rows (lane counters, terminal counters, routing cache) and in <em>query plans</em>.</li>
+<li><strong>A working list of hot rows to design out</strong>: lane cursors, terminal counters, claim-head
+  routing — all now solved by sequences / delta-ledgers / control-plane scans, but a clean
+  allocator should make them structural, not a series of patches.</li>
+<li><strong>The WAL gap is the real target</strong>: pgque's ~452 B/job vs Awa's ~2.2–2.9 KiB/job is the
+  quantified headroom, and RFC question #4 ("what stops pgque from supporting per-row
+  retries/heartbeats?") is asking exactly how much of that gap is intrinsic to the feature set.</li>
+<li><strong>A raised, concrete acceptance bar already exists</strong> for judging #295: pass the 60-min pinned
+  long-horizon shape with a <em>mechanistic</em> explanation, not just better numbers.</li>
+<li><strong>Single-shard 10k/s worst case is still unsolved</strong> (9,982/s enqueue vs 4,016/s complete,
+  depth →1.26M) — this is the #341 backpressure motivation and a second bench shape #295 should
+  be measured against, distinct from the MVCC-pin shape.</li>
+</ul>
+<h2 id="7-release-readiness-process-from-the-197-tracker-the-model-for-a-07-tracker">7. Release-readiness process (from the #197 tracker) — the model for a 0.7 tracker<a class="headerlink" href="#7-release-readiness-process-from-the-197-tracker-the-model-for-a-07-tracker" title="Permanent link">&para;</a></h2>
+<h1 id="197-is-worth-studying-as-the-template-for-how-07-esp-295-will-be-driven-to-a-tag-it-ran">197 is worth studying as the <em>template</em> for how 0.7 (esp. #295) will be driven to a tag. It ran<a class="headerlink" href="#197-is-worth-studying-as-the-template-for-how-07-esp-295-will-be-driven-to-a-tag-it-ran" title="Permanent link">&para;</a></h1>
+<p>as a live gate checklist across six dimensions, each with explicit pass criteria:</p>
+<ul>
+<li><strong>TLA+ / correctness gate</strong> — every storage change re-modelled before merge; trace witnesses
+  added for receipt rescue, running cancel, receipt-only cancel, callback wait/resume, DLQ
+  retry, DLQ purge; a P0 blocker was the <em>mixed-transition executor-gate mismatch</em>
+  (<code>AwaStorageTransitionCurrentGate.cfg</code> could permit mixed transition without proving live
+  queue-storage execution capacity). <strong>#295 explicitly asks which models need re-doing.</strong></li>
+<li><strong>Transition / operational gate</strong> — the staged <code>canonical→prepared→mixed→active</code> machinery,
+  fresh-install auto-finalize, rolling rehearsal in nightlies, the #180 decisions (finalize
+  stays explicit + <code>--wait</code>/<code>--check</code>; <strong>no reverse migrator, no <code>--require-recent-backup</code>,
+  <code>canonical→queue_storage</code> documented as one-way like Oban/River/Graphile</strong>; no new audit
+  table — client-accumulated history only).</li>
+<li><strong>Nightly / stability gate</strong> — chaos assertions converted from log-scraping (<code>wait_for_line</code>)
+  to DB-state observation (<code>wait_for_kind_state_count</code>); the constrained-100× acceptance dropped
+  once flakes cleared.</li>
+<li><strong>Performance / MVCC gate</strong> — the whole §6 chronology; the bar was <em>raised</em> mid-cycle.</li>
+<li><strong>Documentation gate</strong> — ADR-019 annotated <code>**historical:**</code> where ADR-023 supersedes it;
+  cross-doc consistency sweep; benchmark docs de-claimed as point-in-time not universal.</li>
+<li><strong>Release mechanics</strong> — crates published in dependency order (note <code>awa-seaorm</code> added to the
+  chain), wheels (<code>awa-pg</code> + <code>awa-cli</code>), GitHub release, Docker.</li>
+</ul>
+<p>Process decisions that carry into 0.7:
+- <strong>Beta-first.</strong> 0.6 cut <code>beta.1</code> while three judgment-call gates (#169, #180, #167/#242) were
+  still open, to "resolve under beta exposure rather than against a hypothetical population."
+- <strong>Milestone reshuffling is explicit.</strong> On 2026-05-12 the owner moved #118, #242, #143 to
+  v0.7.0 and <strong>refocused #110</strong> ("0.6 got opt-in OTel span context propagation + docs; full
+  schema / automatic propagation deferred") — so #110's <em>full</em> scope is genuinely 0.7 work, and
+  #303 was spun off from #242 as the conditional v0.7 follow-up.
+- <strong>#295 was partly pre-paid.</strong> Its highest-value parts (cursor allocation + append-only ready
+  segments) were <em>pulled forward into 0.6</em> as #321/#323; what remains for 0.7 is the full
+  lifecycle-table replacement and the non-naive claim allocator.
+- <strong>#307 (reprioritization)</strong> closed via ADR-030 durable batch ops (#328/#332), not bespoke
+  endpoints — a precedent for preferring a general durable-mutation surface over point APIs
+  (relevant to #340/#341).</p>
+<h2 id="8-key-file-reference-index">8. Key file &amp; reference index<a class="headerlink" href="#8-key-file-reference-index" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>README.md</code> — product overview, delivery contract, benchmarks, examples.</li>
+<li><code>CHANGELOG.md</code> — the full 0.6.0 entry (source for §2) + granular alpha/beta/rc log.</li>
+<li><code>docs/positioning.md</code> — category map, what to rely on.</li>
+<li><code>docs/upgrade-0.5-to-0.6.md</code> — staged transition, rollback boundaries, v017 sharding notes.</li>
+<li><code>docs/adr/README.md</code> — ADR index with status (027/028 = Proposed).</li>
+<li><code>docs/adr/027-callback-ingress-surface.md</code>, <code>…/028-maintenance-only-runtime-role.md</code> — the
+  forward-looking deployment ADRs.</li>
+<li><code>docs/adr/019/023/025/026/029/031/032</code> — the 0.6 storage/producer decisions #295 must compose
+  with or supersede.</li>
+<li><code>docs/archive/0.6-storage-design/issue-169-storage-spike.md</code> — the spike that produced the
+  #295 direction (§ "The real break point is the claim model"; "A naive claim-ledger
+  implementation is too slow" → the cursor-allocator conclusion).</li>
+<li><code>docs/archive/0.6-storage-design/lease-plane-redesign-spike.md</code> — companion lease-plane spike.</li>
+<li><code>correctness/README.md</code> — TLA+ model families (what needs re-modeling for #295).</li>
+<li>External: <code>hardbyte/postgresql-job-queue-benchmarking</code> — the #169 harness and the cross-system
+  comparison.</li>
+</ul>
+<p><strong>Referenced-but-closed context:</strong> #169 (0.6 storage release-blocker investigation), #197 (0.6
+release-readiness tracker), #242 (maintenance-branch split, closed via #302), #290 (live
+terminal counter), #314 (SQL-only install/upgrade docs), #359 (queue-storage
+<code>cancel_by_unique_key</code> fix).</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
