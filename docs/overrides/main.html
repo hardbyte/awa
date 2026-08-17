@@ -10,9 +10,12 @@
 
 {% block extrahead %}
   {{ super() }}
+  {% set social_title = page.title ~ " — " ~ config.site_name if page else config.site_name %}
+  {% set social_description = page.meta.description if page and page.meta and page.meta.description else config.site_description %}
+  {% set social_url = page.canonical_url if page and page.canonical_url else config.site_url %}
   <meta name="theme-color" content="#17633e">
-  <meta property="og:title" content="AWA — Postgres-native background jobs">
-  <meta property="og:description" content="Durable, transactional background jobs for Rust and Python.">
+  <meta property="og:title" content="{{ social_title | e }}">
+  <meta property="og:description" content="{{ social_description | e }}">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://hardbyte.github.io/awa/">
+  <meta property="og:url" content="{{ social_url | e }}">
 {% endblock %}

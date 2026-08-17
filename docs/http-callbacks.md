@@ -209,10 +209,9 @@ If you want callbacks to land inside your own application (FastAPI, axum, etc.) 
 
 The signature primarily protects the Awa callback receiver from unauthorized completion requests. If the function endpoint is public, you may also verify the worker-to-function request before starting work. In that case the function must know the same 32-byte secret and recompute the BLAKE3 keyed hash over the received `callback_id`.
 
-Python example:
+Add the dependency with `uv add blake3`, then:
 
 ```python
-# pip install blake3
 import blake3
 import hmac
 

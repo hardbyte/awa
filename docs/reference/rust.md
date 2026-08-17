@@ -2,13 +2,13 @@
 
 The workspace separates storage and runtime concerns so producers do not need to carry a worker runtime.
 
-| Crate | Use it for | API docs |
+| Crate | Use it for | Published versions |
 | --- | --- | --- |
-| `awa` | The usual Rust client: typed jobs, workers, migrations, enqueue, and admin APIs | [docs.rs/awa](https://docs.rs/awa) |
-| `awa-model` | Schema, migrations, records, enqueue operations, and admin queries without workers | [docs.rs/awa-model](https://docs.rs/awa-model) |
-| `awa-worker` | Worker runtime and execution internals | [docs.rs/awa-worker](https://docs.rs/awa-worker) |
-| `awa-testing` | PostgreSQL-backed fixtures and helpers for application tests | [docs.rs/awa-testing](https://docs.rs/awa-testing) |
-| `awa-seaorm` | SeaORM integration | [docs.rs/awa-seaorm](https://docs.rs/awa-seaorm) |
+| `awa` | The usual Rust client: typed jobs, workers, migrations, enqueue, and admin APIs | [docs.rs versions](https://docs.rs/crate/awa) |
+| `awa-model` | Schema, migrations, records, enqueue operations, and admin queries without workers | [docs.rs versions](https://docs.rs/crate/awa-model) |
+| `awa-worker` | Worker runtime and execution internals | [docs.rs versions](https://docs.rs/crate/awa-worker) |
+| `awa-testing` | PostgreSQL-backed fixtures and helpers for application tests | [docs.rs versions](https://docs.rs/crate/awa-testing) |
+| `awa-seaorm` | SeaORM integration | [docs.rs versions](https://docs.rs/crate/awa-seaorm) |
 
 ## Recommended entry point
 
