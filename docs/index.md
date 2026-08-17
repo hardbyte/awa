@@ -56,7 +56,7 @@ Business data and job state share PostgreSQL. A transaction either commits both 
 === "Python"
 
     ```bash
-    pip install awa-pg
+    uv add awa-pg
     ```
 
     Register sync or async handlers around dataclasses and use direct clients or transaction bridges for asyncpg, psycopg, SQLAlchemy, and Django.
@@ -66,7 +66,7 @@ Business data and job state share PostgreSQL. A transaction either commits both 
 === "Operations"
 
     ```bash
-    pip install awa-cli
+    uv tool install awa-cli
     awa --database-url "$DATABASE_URL" health
     ```
 

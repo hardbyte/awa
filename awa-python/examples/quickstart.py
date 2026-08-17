@@ -1,10 +1,10 @@
 """Awa Python quickstart — a complete runnable example.
 
-Requires: pip install awa-pg
+Requires: uv add awa-pg
 Requires: a running Postgres instance with DATABASE_URL set.
 
-Usage:
-    DATABASE_URL=postgres://localhost/mydb python examples/quickstart.py
+Usage from the repository's awa-python directory:
+    DATABASE_URL=postgres://localhost/mydb uv run python examples/quickstart.py
 """
 
 import asyncio

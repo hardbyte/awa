@@ -2,21 +2,21 @@
 
 The `awa` command runs migrations, inspects and administers queues, and can host the optional web dashboard.
 
-=== "Python package"
+=== "uv tool (recommended)"
 
     ```bash
-    pip install awa-cli
+    uv tool install awa-cli
     awa --help
     ```
 
-=== "Python client with UI"
+=== "Project dependency"
 
     ```bash
-    pip install 'awa-pg[ui]'
-    python -m awa --help
+    uv add 'awa-pg[ui]'
+    uv run python -m awa --help
     ```
 
-    `python -m awa` delegates to the bundled `awa` binary.
+    `python -m awa` delegates to the bundled `awa` binary inside the project environment.
 
 === "Release binary"
 

@@ -65,7 +65,7 @@ job 1 state = Completed
 Install the CLI if you want migration/admin/UI commands:
 
 ```bash
-pip install awa-cli
+uv tool install awa-cli
 ```
 
 Then inspect what happened:
