@@ -2050,6 +2050,10 @@
 
 <h1 id="rust-getting-started">Rust Getting Started<a class="headerlink" href="#rust-getting-started" title="Permanent link">&para;</a></h1>
 <p>This guide takes you from <code>cargo add</code> to a job reaching <code>completed</code>.</p>
+<div class="admonition note">
+<p class="admonition-title">Version used in this guide</p>
+<p>The install commands pin <strong>v0.6.6</strong>, the latest stable release. The canonical example is tested against both that release and the code on <code>main</code>; development-only 0.7 surfaces elsewhere on this site are identified by the site banner and stability labels.</p>
+</div>
 <h2 id="mental-model">Mental Model<a class="headerlink" href="#mental-model" title="Permanent link">&para;</a></h2>
 <p>Before writing code, it helps to know what Awa is doing for you:</p>
 <ul>
@@ -2072,7 +2076,7 @@
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>cargo<span class="w"> </span>new<span class="w"> </span>awa-rust-quickstart
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nb">cd</span><span class="w"> </span>awa-rust-quickstart
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>cargo<span class="w"> </span>add<span class="w"> </span>awa
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>cargo<span class="w"> </span>add<span class="w"> </span>awa@0.6.6
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>cargo<span class="w"> </span>add<span class="w"> </span>sqlx<span class="w"> </span>--features<span class="w"> </span>runtime-tokio-rustls,postgres
 </span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>cargo<span class="w"> </span>add<span class="w"> </span>tokio<span class="w"> </span>--features<span class="w"> </span>macros,rt-multi-thread,time
 </span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>cargo<span class="w"> </span>add<span class="w"> </span>serde<span class="w"> </span>--features<span class="w"> </span>derive
@@ -2180,7 +2184,7 @@
 </span></code></pre></div>
 <h2 id="4-inspect-the-queue">4. Inspect the Queue<a class="headerlink" href="#4-inspect-the-queue" title="Permanent link">&para;</a></h2>
 <p>Install the CLI if you want migration/admin/UI commands:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>uv<span class="w"> </span>tool<span class="w"> </span>install<span class="w"> </span>awa-cli
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>uv<span class="w"> </span>tool<span class="w"> </span>install<span class="w"> </span>awa-cli<span class="o">==</span><span class="m">0</span>.6.6
 </span></code></pre></div>
 <p>Then inspect what happened:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>job<span class="w"> </span>list<span class="w"> </span>--queue<span class="w"> </span>email

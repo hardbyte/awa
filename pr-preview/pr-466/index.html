@@ -1948,19 +1948,19 @@
 <div class="tabbed-set tabbed-alternate" data-tabs="1:3"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><input id="__tabbed_1_3" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">Rust</label><label for="__tabbed_1_2">Python</label><label for="__tabbed_1_3">Operations</label></div>
 <div class="tabbed-content">
 <div class="tabbed-block">
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>cargo<span class="w"> </span>add<span class="w"> </span>awa
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>cargo<span class="w"> </span>add<span class="w"> </span>awa@0.6.6
 </span></code></pre></div>
 <p>Define typed job arguments, register async handlers, and use your existing <code>sqlx</code> pool for migrations, enqueueing, and administration.</p>
 <p><a href="getting-started-rust/">Build a Rust worker →</a></p>
 </div>
 <div class="tabbed-block">
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>uv<span class="w"> </span>add<span class="w"> </span>awa-pg
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>uv<span class="w"> </span>add<span class="w"> </span>awa-pg<span class="o">==</span><span class="m">0</span>.6.6
 </span></code></pre></div>
 <p>Register sync or async handlers around dataclasses and use direct clients or transaction bridges for asyncpg, psycopg, SQLAlchemy, and Django.</p>
 <p><a href="getting-started-python/">Build a Python worker →</a></p>
 </div>
 <div class="tabbed-block">
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>uv<span class="w"> </span>tool<span class="w"> </span>install<span class="w"> </span>awa-cli
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>uv<span class="w"> </span>tool<span class="w"> </span>install<span class="w"> </span>awa-cli<span class="o">==</span><span class="m">0</span>.6.6
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DATABASE_URL</span><span class="s2">&quot;</span><span class="w"> </span>health
 </span></code></pre></div>
 <p>Run migrations, inspect jobs and queues, administer the dead-letter queue, and serve the optional web dashboard.</p>
