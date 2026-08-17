@@ -25,7 +25,17 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: awa-docs-pages
+  # Serialize each preview's updates and cleanup without letting unrelated PRs
+  # evict one another from GitHub's single pending slot. Production deploys
+  # remain serialized separately; manual runs are intentionally independent.
+  group: >-
+    awa-docs-${{
+      github.event_name == 'pull_request'
+      && format('pr-{0}', github.event.pull_request.number)
+      || github.event_name == 'push'
+      && 'production'
+      || format('manual-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:

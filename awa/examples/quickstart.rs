@@ -62,8 +62,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_state = job.state;
     let job = loop {
-        let current = admin::get_job(&pool, job.id).await?;
+        let current = tokio::time::timeout_at(deadline, admin::get_job(&pool, job.id))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for job {} (last state: {})",
+                        job.id, last_state
+                    ),
+                )
+            })??;
+        last_state = current.state;
         match current.state {
             JobState::Completed => break current,
             JobState::Failed | JobState::Cancelled => {
@@ -74,10 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
             _ if tokio::time::Instant::now() >= deadline => {
-                return Err(std::io::Error::other(format!(
-                    "timed out waiting for job {} (last state: {})",
-                    current.id, current.state
-                ))
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for job {} (last state: {})",
+                        current.id, current.state
+                    ),
+                )
                 .into());
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
