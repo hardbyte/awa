@@ -1233,7 +1233,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#callback-timeout-bounding-wait_for_callback" class="md-nav__link">
+  <a href="#callback-timeout" class="md-nav__link">
     <span class="md-ellipsis">
       
         Callback timeout — bounding wait_for_callback
@@ -2636,7 +2636,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#callback-timeout-bounding-wait_for_callback" class="md-nav__link">
+  <a href="#callback-timeout" class="md-nav__link">
     <span class="md-ellipsis">
       
         Callback timeout — bounding wait_for_callback
@@ -3203,7 +3203,7 @@
 <tr>
 <td>Per callback wait</td>
 <td>callback <code>timeout</code></td>
-<td>Applies only to jobs that enter <code>wait_for_callback</code>; see <a href="#callback-timeout-bounding-wait_for_callback">Callback timeout</a>.</td>
+<td>Applies only to jobs that enter <code>wait_for_callback</code>; see <a href="#callback-timeout">Callback timeout</a>.</td>
 </tr>
 <tr>
 <td>Per queue / global retention and DLQ policy</td>
@@ -3449,7 +3449,7 @@
 </tbody>
 </table>
 <p>Receipts mode (the 0.6 default storage) supports both shapes: the deadline lands on <code>lease_claims.deadline_at</code> and is rescued there for short claims, or carried onto <code>leases.deadline_at</code> if the claim materializes for a long-running attempt. See <a href="#queue-storage-tuning">Queue storage tuning</a> and ADR-023.</p>
-<h3 id="callback-timeout-bounding-wait_for_callback">Callback timeout — bounding <code>wait_for_callback</code><a class="headerlink" href="#callback-timeout-bounding-wait_for_callback" title="Permanent link">&para;</a></h3>
+<h3 id="callback-timeout">Callback timeout — bounding <code>wait_for_callback</code><a class="headerlink" href="#callback-timeout" title="Permanent link">&para;</a></h3>
 <p>If you suspend a handler with <code>wait_for_callback()</code> and the external system never resumes, a callback-timeout rescue brings the job back to ready (or DLQ if attempts are exhausted).</p>
 <table>
 <thead>
