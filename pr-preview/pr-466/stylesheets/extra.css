@@ -12,7 +12,7 @@
   --awa-muted: #52675a;
 }
 
-[data-md-color-scheme="awa-dark"] {
+[data-md-color-scheme="slate"] {
   color-scheme: dark;
   --md-primary-fg-color: #287a51;
   --md-primary-fg-color--light: #3f9468;
