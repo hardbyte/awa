@@ -2,14 +2,26 @@
 
 CREATE SCHEMA IF NOT EXISTS awa;
 
-CREATE TYPE awa.job_state AS ENUM (
-    'scheduled', 'available', 'running',
-    'completed', 'retryable', 'failed', 'cancelled', 'waiting_external'
-);
+-- `CREATE TYPE` has no IF NOT EXISTS, so guard on the catalog to keep this
+-- migration re-runnable (see the idempotency contract in docs/migrations.md).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'awa' AND t.typname = 'job_state'
+    ) THEN
+        CREATE TYPE awa.job_state AS ENUM (
+            'scheduled', 'available', 'running',
+            'completed', 'retryable', 'failed', 'cancelled', 'waiting_external'
+        );
+    END IF;
+END
+$$;
 
-CREATE SEQUENCE awa.jobs_id_seq;
+CREATE SEQUENCE IF NOT EXISTS awa.jobs_id_seq;
 
-CREATE TABLE awa.jobs_hot (
+CREATE TABLE IF NOT EXISTS awa.jobs_hot (
     id                  BIGINT      NOT NULL DEFAULT nextval('awa.jobs_id_seq') PRIMARY KEY,
     kind                TEXT        NOT NULL,
     queue               TEXT        NOT NULL DEFAULT 'default',
@@ -46,7 +58,7 @@ CREATE TABLE awa.jobs_hot (
     CONSTRAINT jobs_hot_tags_count CHECK (cardinality(tags) <= 20)
 );
 
-CREATE TABLE awa.scheduled_jobs (
+CREATE TABLE IF NOT EXISTS awa.scheduled_jobs (
     id                  BIGINT      NOT NULL DEFAULT nextval('awa.jobs_id_seq') PRIMARY KEY,
     kind                TEXT        NOT NULL,
     queue               TEXT        NOT NULL DEFAULT 'default',
@@ -83,19 +95,19 @@ CREATE TABLE awa.scheduled_jobs (
     CONSTRAINT scheduled_jobs_tags_count CHECK (cardinality(tags) <= 20)
 );
 
-CREATE TABLE awa.queue_meta (
+CREATE TABLE IF NOT EXISTS awa.queue_meta (
     queue       TEXT PRIMARY KEY,
     paused      BOOLEAN NOT NULL DEFAULT FALSE,
     paused_at   TIMESTAMPTZ,
     paused_by   TEXT
 );
 
-CREATE TABLE awa.job_unique_claims (
+CREATE TABLE IF NOT EXISTS awa.job_unique_claims (
     unique_key  BYTEA NOT NULL,
     job_id      BIGINT NOT NULL
 );
 
-CREATE TABLE awa.cron_jobs (
+CREATE TABLE IF NOT EXISTS awa.cron_jobs (
     name             TEXT PRIMARY KEY,
     cron_expr        TEXT        NOT NULL,
     timezone         TEXT        NOT NULL DEFAULT 'UTC',
@@ -113,13 +125,13 @@ CREATE TABLE awa.cron_jobs (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE awa.schema_version (
+CREATE TABLE IF NOT EXISTS awa.schema_version (
     version     INT PRIMARY KEY,
     description TEXT NOT NULL,
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE FUNCTION awa.job_state_in_bitmask(bitmask BIT(8), state awa.job_state)
+CREATE OR REPLACE FUNCTION awa.job_state_in_bitmask(bitmask BIT(8), state awa.job_state)
 RETURNS BOOLEAN AS $$
     SELECT CASE state
         WHEN 'scheduled'         THEN get_bit(bitmask, 0) = 1
@@ -134,7 +146,7 @@ RETURNS BOOLEAN AS $$
     END;
 $$ LANGUAGE sql IMMUTABLE;
 
-CREATE FUNCTION awa.backoff_duration(attempt SMALLINT, max_attempts SMALLINT)
+CREATE OR REPLACE FUNCTION awa.backoff_duration(attempt SMALLINT, max_attempts SMALLINT)
 RETURNS interval AS $$
     SELECT LEAST(
         make_interval(secs => power(2::double precision, attempt::double precision))
@@ -210,7 +222,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE VIEW awa.jobs AS
+CREATE OR REPLACE VIEW awa.jobs AS
 SELECT * FROM awa.jobs_hot
 UNION ALL
 SELECT * FROM awa.scheduled_jobs;
@@ -289,18 +301,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trg_awa_notify ON awa.jobs_hot;
 CREATE TRIGGER trg_awa_notify
     AFTER INSERT ON awa.jobs_hot
     FOR EACH ROW
     WHEN (NEW.state = 'available' AND NEW.run_at <= now())
     EXECUTE FUNCTION awa.notify_new_job();
 
+DROP TRIGGER IF EXISTS trg_jobs_hot_unique_claims_insert ON awa.jobs_hot;
 CREATE TRIGGER trg_jobs_hot_unique_claims_insert
     AFTER INSERT ON awa.jobs_hot
     FOR EACH ROW
     WHEN (NEW.unique_key IS NOT NULL AND NEW.unique_states IS NOT NULL)
     EXECUTE FUNCTION awa.sync_job_unique_claims();
 
+DROP TRIGGER IF EXISTS trg_jobs_hot_unique_claims_update ON awa.jobs_hot;
 CREATE TRIGGER trg_jobs_hot_unique_claims_update
     AFTER UPDATE ON awa.jobs_hot
     FOR EACH ROW
@@ -310,18 +325,21 @@ CREATE TRIGGER trg_jobs_hot_unique_claims_update
     )
     EXECUTE FUNCTION awa.sync_job_unique_claims();
 
+DROP TRIGGER IF EXISTS trg_jobs_hot_unique_claims_delete ON awa.jobs_hot;
 CREATE TRIGGER trg_jobs_hot_unique_claims_delete
     AFTER DELETE ON awa.jobs_hot
     FOR EACH ROW
     WHEN (OLD.unique_key IS NOT NULL AND OLD.unique_states IS NOT NULL)
     EXECUTE FUNCTION awa.sync_job_unique_claims();
 
+DROP TRIGGER IF EXISTS trg_scheduled_jobs_unique_claims_insert ON awa.scheduled_jobs;
 CREATE TRIGGER trg_scheduled_jobs_unique_claims_insert
     AFTER INSERT ON awa.scheduled_jobs
     FOR EACH ROW
     WHEN (NEW.unique_key IS NOT NULL AND NEW.unique_states IS NOT NULL)
     EXECUTE FUNCTION awa.sync_job_unique_claims();
 
+DROP TRIGGER IF EXISTS trg_scheduled_jobs_unique_claims_update ON awa.scheduled_jobs;
 CREATE TRIGGER trg_scheduled_jobs_unique_claims_update
     AFTER UPDATE ON awa.scheduled_jobs
     FOR EACH ROW
@@ -331,74 +349,78 @@ CREATE TRIGGER trg_scheduled_jobs_unique_claims_update
     )
     EXECUTE FUNCTION awa.sync_job_unique_claims();
 
+DROP TRIGGER IF EXISTS trg_scheduled_jobs_unique_claims_delete ON awa.scheduled_jobs;
 CREATE TRIGGER trg_scheduled_jobs_unique_claims_delete
     AFTER DELETE ON awa.scheduled_jobs
     FOR EACH ROW
     WHEN (OLD.unique_key IS NOT NULL AND OLD.unique_states IS NOT NULL)
     EXECUTE FUNCTION awa.sync_job_unique_claims();
 
+DROP TRIGGER IF EXISTS trg_awa_jobs_view_insert ON awa.jobs;
 CREATE TRIGGER trg_awa_jobs_view_insert
     INSTEAD OF INSERT ON awa.jobs
     FOR EACH ROW
     EXECUTE FUNCTION awa.write_jobs_view();
 
+DROP TRIGGER IF EXISTS trg_awa_jobs_view_update ON awa.jobs;
 CREATE TRIGGER trg_awa_jobs_view_update
     INSTEAD OF UPDATE ON awa.jobs
     FOR EACH ROW
     EXECUTE FUNCTION awa.write_jobs_view();
 
+DROP TRIGGER IF EXISTS trg_awa_jobs_view_delete ON awa.jobs;
 CREATE TRIGGER trg_awa_jobs_view_delete
     INSTEAD OF DELETE ON awa.jobs
     FOR EACH ROW
     EXECUTE FUNCTION awa.write_jobs_view();
 
-CREATE INDEX idx_awa_jobs_hot_dequeue
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_hot_dequeue
     ON awa.jobs_hot (queue, priority, run_at, id)
     WHERE state = 'available';
 
-CREATE INDEX idx_awa_jobs_hot_heartbeat
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_hot_heartbeat
     ON awa.jobs_hot (heartbeat_at)
     WHERE state = 'running';
 
-CREATE INDEX idx_awa_jobs_hot_deadline
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_hot_deadline
     ON awa.jobs_hot (deadline_at)
     WHERE state = 'running' AND deadline_at IS NOT NULL;
 
-CREATE INDEX idx_awa_jobs_hot_kind_state
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_hot_kind_state
     ON awa.jobs_hot (kind, state);
 
-CREATE UNIQUE INDEX idx_awa_jobs_hot_callback_id
+CREATE UNIQUE INDEX IF NOT EXISTS idx_awa_jobs_hot_callback_id
     ON awa.jobs_hot (callback_id)
     WHERE callback_id IS NOT NULL;
 
-CREATE INDEX idx_awa_jobs_hot_callback_timeout
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_hot_callback_timeout
     ON awa.jobs_hot (callback_timeout_at)
     WHERE state = 'waiting_external' AND callback_timeout_at IS NOT NULL;
 
-CREATE INDEX idx_awa_scheduled_jobs_run_at_scheduled
+CREATE INDEX IF NOT EXISTS idx_awa_scheduled_jobs_run_at_scheduled
     ON awa.scheduled_jobs (run_at, id, queue)
     WHERE state = 'scheduled';
 
-CREATE INDEX idx_awa_scheduled_jobs_run_at_retryable
+CREATE INDEX IF NOT EXISTS idx_awa_scheduled_jobs_run_at_retryable
     ON awa.scheduled_jobs (run_at, id, queue)
     WHERE state = 'retryable';
 
-CREATE INDEX idx_awa_scheduled_jobs_kind_state
+CREATE INDEX IF NOT EXISTS idx_awa_scheduled_jobs_kind_state
     ON awa.scheduled_jobs (kind, state);
 
-CREATE UNIQUE INDEX idx_awa_jobs_unique
+CREATE UNIQUE INDEX IF NOT EXISTS idx_awa_jobs_unique
     ON awa.job_unique_claims (unique_key);
 
 -- BRIN indexes on created_at for time-range queries (UI dashboard, timeseries)
-CREATE INDEX idx_awa_jobs_hot_created_at
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_hot_created_at
     ON awa.jobs_hot USING BRIN (created_at) WITH (pages_per_range = 32);
-CREATE INDEX idx_awa_scheduled_jobs_created_at
+CREATE INDEX IF NOT EXISTS idx_awa_scheduled_jobs_created_at
     ON awa.scheduled_jobs USING BRIN (created_at) WITH (pages_per_range = 32);
 
 -- GIN indexes on tags for array containment queries (tag filtering)
-CREATE INDEX idx_awa_jobs_hot_tags
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_hot_tags
     ON awa.jobs_hot USING GIN (tags) WHERE tags IS NOT NULL AND tags != '{}';
-CREATE INDEX idx_awa_scheduled_jobs_tags
+CREATE INDEX IF NOT EXISTS idx_awa_scheduled_jobs_tags
     ON awa.scheduled_jobs USING GIN (tags) WHERE tags IS NOT NULL AND tags != '{}';
 
 INSERT INTO awa.schema_version (version, description)

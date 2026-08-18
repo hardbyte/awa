@@ -33,14 +33,26 @@ file. Never print database URLs or passwords in logs or issues.
 
 ## Migrations
 
-Migrations are forward-only and transactional; there are no down migrations.
-Roll back with a database snapshot or reverse SQL, not with the CLI.
+Migrations are forward-only; there are no down migrations. Roll back with a
+database snapshot or reverse SQL, not with the CLI.
+
+One `awa migrate` applies the whole pending range in a single transaction under
+an advisory lock, so a failed or interrupted run commits nothing and concurrent
+runners converge on one application. Every migration is re-runnable, so a retry
+after any failure is safe.
 
 ```bash
 awa migrate --pending                 # apply from current DB version to latest
 awa migrate --sql --pending           # print the SQL instead of applying
 awa migrate --extract-to ./out        # write SQL files for an external runner
 ```
+
+`--sql` output is wrapped in one transaction taking the runner's advisory lock,
+so `awa migrate --sql | psql "$DATABASE_URL"` is atomic. Pass `--no-transaction`
+when the consuming runner opens its own transaction per migration (Flyway,
+Liquibase, dbmate); `--extract-to` files are never wrapped, for that reason.
+`--from` / `--to` / `--version` select a range to render and are rejected on the
+apply path — applying always targets the current version.
 
 The migrator runs pre-flight gates before touching the schema: it refuses a
 schema newer than the binary understands, refuses to apply while the storage

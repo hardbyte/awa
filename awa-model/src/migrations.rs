@@ -27,6 +27,12 @@ const EXCLUSIVE_WINDOW_MIGRATIONS: &[i32] = &[];
 /// feature capability state.
 const MIGRATION_RUNTIME_VERSION_FLOORS: &[(i32, &str)] = &[(43, "0.6.2")];
 
+/// Advisory-lock key that serializes migration runners against one database
+/// ("AWA_MIGR" as ASCII). Exposed so SQL emitted for an external runner can
+/// take the *same* lock the built-in runner takes, rather than a copy that
+/// could drift out of sync.
+pub const MIGRATION_LOCK_KEY: i64 = 0x4157_415f_4d49_4752;
+
 /// Heartbeat-staleness window (seconds) for the pre-flight live-runtime check.
 /// Matches the window used by the ADR-037 finalize gate and
 /// `awa.storage_auto_finalize_if_fresh`.
@@ -310,11 +316,13 @@ fn normalize_legacy_version(old_version: i32) -> i32 {
 
 /// Run all pending migrations against the database.
 ///
-/// Applies only migrations newer than the current schema version.
-/// V1 bootstraps the canonical schema from scratch; V2+ are incremental
-/// and use `IF NOT EXISTS` guards so they are safe to re-run. Legacy
-/// `schema_version` rows from pre-0.4 releases are normalized to the new
-/// numbering in [`current_version`] before the pending set is computed.
+/// Applies only migrations newer than the current schema version. Every
+/// migration is guarded (`IF NOT EXISTS`, `CREATE OR REPLACE`,
+/// `DROP TRIGGER IF EXISTS` before `CREATE TRIGGER`, and
+/// `ON CONFLICT DO NOTHING` on its `schema_version` row), so replaying one —
+/// or the whole set — converges instead of erroring. Legacy `schema_version`
+/// rows from pre-0.4 releases are normalized to the new numbering in
+/// [`current_version`] before the pending set is computed.
 ///
 /// Safe to call concurrently from any number of processes against the same
 /// database: a transaction-scoped advisory lock serializes runners, and every
@@ -331,7 +339,7 @@ pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
 /// pre-flights (`allow_live_runtimes`). The CLI wires this to
 /// `--allow-live-runtimes`; the default [`run`] never overrides the checks.
 pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<(), AwaError> {
-    let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
+    let lock_key: i64 = MIGRATION_LOCK_KEY;
 
     // Run the version check, ADR-037 finalize gate, and every migration step
     // inside a single transaction guarded by a *transaction-scoped* advisory
@@ -1031,6 +1039,297 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip SQL line comments, block comments, single-quoted literals, and
+    /// dollar-quoted bodies, leaving only top-level statement text.
+    ///
+    /// The lints below distinguish "what this migration executes directly"
+    /// from "what lives inside a function body". A plpgsql body legitimately
+    /// contains `BEGIN`/`END` and builds DDL with `format()`, so scanning the
+    /// raw text for transaction control would be all false positives.
+    fn strip_to_top_level(sql: &str) -> String {
+        let bytes = sql.as_bytes();
+        let mut out = String::with_capacity(sql.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if sql[i..].starts_with("--") {
+                i = sql[i..].find('\n').map_or(bytes.len(), |j| i + j);
+            } else if sql[i..].starts_with("/*") {
+                i = sql[i..].find("*/").map_or(bytes.len(), |j| i + j + 2);
+            } else if bytes[i] == b'\'' {
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if bytes[j] == b'\'' {
+                        if bytes.get(j + 1) == Some(&b'\'') {
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                i = (j + 1).min(bytes.len());
+            } else if bytes[i] == b'$' {
+                match dollar_tag(&sql[i..]) {
+                    Some(tag) => {
+                        let after = i + tag.len();
+                        i = sql[after..]
+                            .find(tag)
+                            .map_or(bytes.len(), |j| after + j + tag.len());
+                    }
+                    None => {
+                        out.push('$');
+                        i += 1;
+                    }
+                }
+            } else {
+                // SQL keywords are ASCII; migrations are ASCII-only SQL, but
+                // step by char boundary anyway so a stray UTF-8 comment body
+                // outside a stripped region can never panic.
+                let ch = sql[i..].chars().next().expect("in-bounds char boundary");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
+    /// `$tag$` / `$$` opening delimiter at the start of `rest`, if any.
+    fn dollar_tag(rest: &str) -> Option<&str> {
+        let mut end = 1;
+        for (offset, ch) in rest[1..].char_indices() {
+            if ch == '$' {
+                end = 1 + offset + 1;
+                return Some(&rest[..end]);
+            }
+            if !ch.is_ascii_alphanumeric() && ch != '_' {
+                return None;
+            }
+            end = 1 + offset + ch.len_utf8();
+        }
+        let _ = end;
+        None
+    }
+
+    /// Case-insensitive whitespace-tolerant scan for a keyword sequence at
+    /// statement position (not preceded by an identifier character or a dot).
+    fn find_statements(haystack: &str, keywords: &[&str]) -> Vec<usize> {
+        let lower = haystack.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let mut hits = Vec::new();
+        let first = keywords[0];
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(first) {
+            let start = from + rel;
+            from = start + 1;
+            let prev = start.checked_sub(1).map(|p| bytes[p]);
+            if matches!(prev, Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
+                continue;
+            }
+            let mut cursor = start + first.len();
+            let mut matched = true;
+            for keyword in &keywords[1..] {
+                let rest = &lower[cursor..];
+                let trimmed = rest.trim_start();
+                if trimmed.starts_with(keyword) {
+                    cursor = cursor + (rest.len() - trimmed.len()) + keyword.len();
+                } else {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                hits.push(start);
+            }
+        }
+        hits
+    }
+
+    /// Every migration version paired with the SQL file that defines it.
+    ///
+    /// A migration's step list may replay earlier files first (v027 re-runs
+    /// V23/V22 before its own step); the version's own file is always last.
+    fn own_step_per_version() -> Vec<(i32, &'static str)> {
+        MIGRATIONS
+            .iter()
+            .map(|&(version, _, steps)| {
+                (
+                    version,
+                    *steps.last().expect("every migration has at least one step"),
+                )
+            })
+            .collect()
+    }
+
+    // ── Atomicity: the whole run is one transaction, so every step must be
+    //    transaction-safe. A single `CREATE INDEX CONCURRENTLY` would make
+    //    `run()` fail outright ("cannot run inside a transaction block") and,
+    //    if ever worked around, would silently break all-or-nothing recovery.
+
+    #[test]
+    fn every_migration_step_is_transaction_safe() {
+        for &(version, _, steps) in MIGRATIONS {
+            for step in steps {
+                // `CONCURRENTLY` and `VACUUM` are checked against the raw text:
+                // they are never valid here, not even built inside a function
+                // body that the migration then calls. Matched as whole words so
+                // storage parameters like `autovacuum_vacuum_scale_factor` —
+                // which are legitimate in a `WITH (...)` clause — do not trip it.
+                for banned in ["concurrently", "vacuum"] {
+                    assert!(
+                        find_statements(step, &[banned]).is_empty(),
+                        "migration v{version} runs `{banned}`, which cannot execute \
+                         inside the single migration transaction"
+                    );
+                }
+
+                // Explicit transaction control is checked at top level only —
+                // plpgsql bodies legitimately use BEGIN/END blocks.
+                let top = strip_to_top_level(step);
+                for control in [
+                    vec!["begin"],
+                    vec!["commit"],
+                    vec!["rollback"],
+                    vec!["savepoint"],
+                    vec!["start", "transaction"],
+                ] {
+                    assert!(
+                        find_statements(&top, &control).is_empty(),
+                        "migration v{version} issues `{}` at statement level; the runner \
+                         owns the transaction boundary",
+                        control.join(" ")
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Idempotency: `run()` replays a version's own file whenever an older
+    //    schema catches up, external runners may retry a file after a crash,
+    //    and several migrations deliberately re-run earlier files (v027 →
+    //    V23/V22). Unguarded DDL would make any of those a hard error.
+
+    #[test]
+    fn every_migration_guards_its_ddl() {
+        for &(version, _, steps) in MIGRATIONS {
+            for step in steps {
+                let top = strip_to_top_level(step);
+
+                for (keywords, label) in [
+                    (vec!["create", "table"], "CREATE TABLE"),
+                    (vec!["create", "sequence"], "CREATE SEQUENCE"),
+                    (vec!["create", "index"], "CREATE INDEX"),
+                    (vec!["create", "unique", "index"], "CREATE UNIQUE INDEX"),
+                ] {
+                    for at in find_statements(&top, &keywords) {
+                        let tail = &top[at..];
+                        let mut guarded = keywords.clone();
+                        guarded.extend_from_slice(&["if", "not", "exists"]);
+                        assert!(
+                            find_statements(tail, &guarded).first() == Some(&0),
+                            "migration v{version} has an unguarded `{label}` \
+                             (needs IF NOT EXISTS to stay re-runnable): …{}…",
+                            &tail[..tail.len().min(80)].replace('\n', " ")
+                        );
+                    }
+                }
+
+                // `CREATE FUNCTION` / `CREATE VIEW` must be replaceable.
+                for (keywords, label) in [
+                    (vec!["create", "function"], "CREATE FUNCTION"),
+                    (vec!["create", "view"], "CREATE VIEW"),
+                ] {
+                    if let Some(&at) = find_statements(&top, &keywords).first() {
+                        panic!(
+                            "migration v{version} has a bare `{label}` (needs OR REPLACE \
+                             to stay re-runnable): …{}…",
+                            &top[at..(at + 80).min(top.len())].replace('\n', " ")
+                        );
+                    }
+                }
+
+                // `CREATE TRIGGER` has no IF NOT EXISTS, so each one must be
+                // preceded by a `DROP TRIGGER IF EXISTS` for the same name.
+                for at in find_statements(&top, &["create", "trigger"]) {
+                    let name: String = top[at..]
+                        .split_whitespace()
+                        .nth(2)
+                        .unwrap_or_default()
+                        .to_string();
+                    let preceding = top[..at].to_ascii_lowercase();
+                    let dropped = find_statements(
+                        &preceding,
+                        &[
+                            "drop",
+                            "trigger",
+                            "if",
+                            "exists",
+                            &name.to_ascii_lowercase(),
+                        ],
+                    );
+                    assert!(
+                        !dropped.is_empty(),
+                        "migration v{version} creates trigger `{name}` without a preceding \
+                         `DROP TRIGGER IF EXISTS {name}`, so re-running the file fails"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Each migration records exactly its own version, and records it in a way
+    /// that survives a replay. Without `ON CONFLICT DO NOTHING`, re-running a
+    /// file would abort the whole migration transaction on the primary key.
+    #[test]
+    fn every_migration_records_its_version_idempotently() {
+        for (version, own) in own_step_per_version() {
+            let top = strip_to_top_level(own);
+            let inserts = find_statements(&top, &["insert", "into", "awa.schema_version"]);
+            assert_eq!(
+                inserts.len(),
+                1,
+                "migration v{version} should record its version exactly once, found {}",
+                inserts.len()
+            );
+            let statement = &top[inserts[0]..];
+            let statement = &statement[..statement.find(';').map_or(statement.len(), |e| e + 1)];
+            // Stripping the quoted description leaves `values ( 43, )`, so
+            // collapse whitespace *and* the space after the opening paren.
+            let normalized = statement
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace("( ", "(");
+            assert!(
+                normalized.contains(&format!("values ({version},")),
+                "migration v{version} records a different version: {normalized}"
+            );
+            assert!(
+                normalized.contains("on conflict (version) do nothing"),
+                "migration v{version} must record its version with \
+                 `ON CONFLICT (version) DO NOTHING` so a replay is a no-op"
+            );
+        }
+    }
+
+    /// The version a migration records must match the key it is listed under,
+    /// and every listed version must be unique and ordered.
+    #[test]
+    fn migration_versions_are_unique_and_ordered() {
+        let mut previous = 0;
+        for &(version, _, _) in MIGRATIONS {
+            assert!(
+                version > previous,
+                "migration versions must strictly increase: v{version} follows v{previous}"
+            );
+            previous = version;
+        }
+        assert_eq!(
+            previous, CURRENT_VERSION,
+            "CURRENT_VERSION must match the highest listed migration"
+        );
+    }
 
     #[test]
     fn migration_sql_range_all() {
