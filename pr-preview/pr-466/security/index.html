@@ -2126,7 +2126,7 @@
 <li>Configure callback signatures unless an authenticating proxy or trusted network already provides the boundary.</li>
 <li>Use TLS, rotate secrets per environment, and avoid logging callback signatures.</li>
 </ol>
-<p>The current 0.6 runtime still needs broad DML and <code>TRUNCATE</code> privileges on Awa's internal tables. <a href="../adr/043-postgresql-capability-functions/">ADR-043</a> defines a proposed capability-function design for narrower roles; do not treat that future design as a shipped security control.</p>
+<p>The current 0.6 runtime and the 0.7 development runtime still need broad DML and <code>TRUNCATE</code> privileges on Awa's internal tables. <a href="../adr/043-postgresql-capability-functions/">ADR-043</a> defines a proposed capability-function design for narrower roles; do not treat that future design as a shipped security control.</p>
 <h2 id="deployable-roles">Deployable roles<a class="headerlink" href="#deployable-roles" title="Permanent link">&para;</a></h2>
 <p>The admin UI, callback ingress, workers, and maintenance tasks have different exposure profiles. See <a href="deployable-surfaces/">Deployable surfaces</a> for supported deployment shapes and network boundaries.</p>
 

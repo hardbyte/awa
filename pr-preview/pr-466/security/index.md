@@ -20,7 +20,7 @@ Awa's security boundary has two parts: PostgreSQL privileges determine who can r
 4. Configure callback signatures unless an authenticating proxy or trusted network already provides the boundary.
 5. Use TLS, rotate secrets per environment, and avoid logging callback signatures.
 
-The current 0.6 runtime still needs broad DML and `TRUNCATE` privileges on Awa's internal tables. [ADR-043](../adr/043-postgresql-capability-functions/index.md) defines a proposed capability-function design for narrower roles; do not treat that future design as a shipped security control.
+The current 0.6 runtime and the 0.7 development runtime still need broad DML and `TRUNCATE` privileges on Awa's internal tables. [ADR-043](../adr/043-postgresql-capability-functions/index.md) defines a proposed capability-function design for narrower roles; do not treat that future design as a shipped security control.
 
 ## Deployable roles
 

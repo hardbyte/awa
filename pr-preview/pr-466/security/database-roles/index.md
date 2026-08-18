@@ -13,7 +13,7 @@ awa_owner       NOLOGIN   owns the schema and its objects
 awa_runtime     LOGIN     workers, producers, admin UI and CLI operations
 ```
 
-Create the roles as a database owner or superuser:
+Create the roles as a superuser or a role with the cluster-wide `CREATEROLE` attribute. Database ownership alone cannot create roles:
 
 ```sql
 CREATE ROLE awa_owner NOLOGIN;
@@ -25,11 +25,18 @@ GRANT CONNECT ON DATABASE mydb TO awa_migrator, awa_runtime;
 GRANT CREATE ON DATABASE mydb TO awa_owner;
 ```
 
-Run `awa migrate` as `awa_migrator`. For long-lived installations, make `awa_owner` the owner of the `awa` schema and its tables, sequences, functions, and standalone enum/domain types. This decouples ownership from a login credential.
+Run migrations through the migrator login while making `awa_owner` the effective role for every migration connection:
+
+```bash
+PGOPTIONS='-c role=awa_owner' \
+  awa --database-url "$AWA_MIGRATOR_DATABASE_URL" migrate
+```
+
+This makes the `awa` schema and the tables, sequences, functions, and standalone enum/domain types created by migrations belong to the non-login owner from the outset. It also avoids relying on membership or default privileges to repair ownership later. The `awa_migrator` login must be allowed to `SET ROLE awa_owner`; on PostgreSQL 16 and newer, preserve that option when granting the membership.
 
 ## Runtime grants
 
-The 0.6 runtime uses `SECURITY INVOKER` triggers and maintenance helpers, so its grants are intentionally broader than an application's enqueue-only privileges:
+The 0.6 runtime and current 0.7 development runtime use `SECURITY INVOKER` triggers and maintenance helpers, so their grants are intentionally broader than an application's enqueue-only privileges:
 
 ```sql
 GRANT USAGE ON SCHEMA awa TO awa_runtime;
@@ -56,7 +63,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-If migrations create objects as `awa_migrator` without first running `SET ROLE awa_owner`, repeat those three statements with `FOR ROLE awa_migrator`.
+If an existing installation created objects as `awa_migrator` without first setting the owner role, transfer every existing schema object to `awa_owner` before relying on owner-scoped defaults. New migrations should use the effective-role command above.
 
 ## Custom queue-storage schemas
 
@@ -66,7 +73,7 @@ Repeat the schema, table, sequence, function, and default-privilege grants for a
 
 Runtime triggers maintain queue counts, descriptors, uniqueness claims, and other metadata as the invoking role. The elected maintenance task promotes and rescues jobs, refreshes metadata, and reclaims eligible ring slots. Consequently a login holding `awa_runtime` is trusted Awa infrastructure: do not grant it to a producer-only application or a public callback service.
 
-[ADR-042](../../adr/042-caller-owned-finalization-transactions/index.md) and [ADR-043](../../adr/043-postgresql-capability-functions/index.md) describe accepted/proposed boundaries for a narrower application finalizer and capability-specific runtime roles planned for 0.7. They are not the current 0.6 privilege model.
+[ADR-042](../../adr/042-caller-owned-finalization-transactions/index.md) and [ADR-043](../../adr/043-postgresql-capability-functions/index.md) describe accepted/proposed boundaries for a narrower application finalizer and capability-specific runtime roles. They are not implemented by the current 0.6 or 0.7 development runtime.
 
 ## Verify the split
 
