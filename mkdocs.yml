@@ -109,7 +109,6 @@ nav:
       - Queue storage: queue-storage-substrate.md
   - Guides:
       - Guide index: guides/index.md
-      - Configuration: configuration.md
       - Bridge adapters: bridge-adapters.md
       - Lifecycle hooks: lifecycle-hooks.md
       - HTTP callbacks: http-callbacks.md
@@ -117,18 +116,20 @@ nav:
       - Dead-letter queue: dead-letter-queue.md
   - Operations:
       - Operations index: operations/index.md
+      - Configuration: configuration.md
       - Deployment: deployment.md
       - Managed Postgres: deploying-on-managed-postgres.md
-      - Migrations: migrations.md
-      - Upgrade 0.5 to 0.6: upgrade-0.5-to-0.6.md
-      - Upgrade 0.6 to 0.7: upgrade-0.6-to-0.7.md
-      - Security:
-          - Security overview: security.md
-          - Database roles: security/database-roles.md
-          - Deployable surfaces: security/deployable-surfaces.md
-          - Callback security: security/callback-security.md
+      - Migrations:
+          - Migration overview: migrations.md
+          - Upgrade 0.5 to 0.6: upgrade-0.5-to-0.6.md
+          - Upgrade 0.6 to 0.7: upgrade-0.6-to-0.7.md
       - Observability: grafana/README.md
       - Troubleshooting: troubleshooting.md
+  - Security:
+      - Security overview: security.md
+      - Database roles: security/database-roles.md
+      - Deployable surfaces: security/deployable-surfaces.md
+      - Callback security: security/callback-security.md
   - Reference:
       - Reference index: reference/index.md
       - CLI commands: reference/cli.md
