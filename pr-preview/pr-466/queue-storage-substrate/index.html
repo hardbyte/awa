@@ -55,6 +55,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +76,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/queue-storage-substrate/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -90,7 +100,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#queue-storage-substrate-ownership-and-customisation" class="md-skip">
+        <a href="#queue-storage" class="md-skip">
           Skip to content
         </a>
       
@@ -863,10 +873,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#ownership-contract" class="md-nav__link">
+  <a href="#why-the-queue-is-split-into-planes" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Ownership contract
+        Why the queue is split into planes
       
     </span>
   </a>
@@ -874,10 +884,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-default-awa-schema-is-migration-owned-and-default-shaped" class="md-nav__link">
+  <a href="#how-storage-stays-bounded" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The default awa schema is migration-owned and default-shaped
+        How storage stays bounded
       
     </span>
   </a>
@@ -885,10 +895,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#custom-queue-storage-schemas" class="md-nav__link">
+  <a href="#default-and-custom-schemas" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Custom queue-storage schemas
+        Default and custom schemas
       
     </span>
   </a>
@@ -896,10 +906,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#-reset-is-rejected-for-schema-awa" class="md-nav__link">
+  <a href="#operator-rules" class="md-nav__link">
     <span class="md-ellipsis">
       
-        --reset is rejected for --schema awa
+        Operator rules
       
     </span>
   </a>
@@ -907,60 +917,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#driving-installs-and-upgrades-from-external-migration-tooling" class="md-nav__link">
+  <a href="#related-reading" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Driving installs and upgrades from external migration tooling
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Driving installs and upgrades from external migration tooling">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#fresh-install-no-canonical-data-yet" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Fresh install (no canonical data yet)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#upgrade-from-an-existing-canonical-only-deployment" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Upgrade from an existing canonical-only deployment
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#design-rationale" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Design rationale
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#see-also" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        See also
+        Related reading
       
     </span>
   </a>
@@ -1466,9 +1426,35 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="0">
+            
   
   
   <span class="md-ellipsis">
@@ -1482,7 +1468,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1562,6 +1676,8 @@
       
         
           
+        
+      
         
       
         
@@ -1738,6 +1854,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1756,8 +1900,6 @@
       
         
           
-        
-      
         
       
         
@@ -1874,34 +2016,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -1936,10 +2050,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#ownership-contract" class="md-nav__link">
+  <a href="#why-the-queue-is-split-into-planes" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Ownership contract
+        Why the queue is split into planes
       
     </span>
   </a>
@@ -1947,10 +2061,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-default-awa-schema-is-migration-owned-and-default-shaped" class="md-nav__link">
+  <a href="#how-storage-stays-bounded" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The default awa schema is migration-owned and default-shaped
+        How storage stays bounded
       
     </span>
   </a>
@@ -1958,10 +2072,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#custom-queue-storage-schemas" class="md-nav__link">
+  <a href="#default-and-custom-schemas" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Custom queue-storage schemas
+        Default and custom schemas
       
     </span>
   </a>
@@ -1969,10 +2083,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#-reset-is-rejected-for-schema-awa" class="md-nav__link">
+  <a href="#operator-rules" class="md-nav__link">
     <span class="md-ellipsis">
       
-        --reset is rejected for --schema awa
+        Operator rules
       
     </span>
   </a>
@@ -1980,60 +2094,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#driving-installs-and-upgrades-from-external-migration-tooling" class="md-nav__link">
+  <a href="#related-reading" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Driving installs and upgrades from external migration tooling
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Driving installs and upgrades from external migration tooling">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#fresh-install-no-canonical-data-yet" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Fresh install (no canonical data yet)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#upgrade-from-an-existing-canonical-only-deployment" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Upgrade from an existing canonical-only deployment
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#design-rationale" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Design rationale
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#see-also" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        See also
+        Related reading
       
     </span>
   </a>
@@ -2053,6 +2117,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2060,121 +2132,81 @@
   
 
 
-<h1 id="queue-storage-substrate-ownership-and-customisation">Queue-storage substrate: ownership and customisation<a class="headerlink" href="#queue-storage-substrate-ownership-and-customisation" title="Permanent link">&para;</a></h1>
-<p>Awa's queue-storage substrate is the set of per-schema tables, indexes, sequences, and helper functions the runtime relies on to claim, execute, and finalise jobs against the queue-storage engine. This page explains who owns those objects, how to customise them, and the guardrails that protect the default <code>awa</code> schema from accidental destructive operations.</p>
-<h2 id="ownership-contract">Ownership contract<a class="headerlink" href="#ownership-contract" title="Permanent link">&para;</a></h2>
+<h1 id="queue-storage">Queue storage<a class="headerlink" href="#queue-storage" title="Permanent link">&para;</a></h1>
+<p>Queue storage is Awa's PostgreSQL layout for runnable work, in-flight attempts, deferred work, terminal history, and the small control tables that coordinate workers. It is an implementation boundary, not an application API: producers and workers should use the Rust or Python clients, and operators should use the CLI, admin API, and documented read views.</p>
+<p>This page explains the storage shape an operator needs to understand. For the end-to-end runtime design, see <a href="../architecture/">Architecture</a>. For migration ownership and external migration runners, see <a href="../migrations/">Migrations</a>.</p>
+<h2 id="why-the-queue-is-split-into-planes">Why the queue is split into planes<a class="headerlink" href="#why-the-queue-is-split-into-planes" title="Permanent link">&para;</a></h2>
+<p>A single frequently-updated jobs table accumulates dead tuples and makes claiming, history retention, and long-running attempts compete for the same indexes. Awa instead gives each workload a storage shape suited to its lifecycle:</p>
 <table>
 <thead>
 <tr>
-<th>Owner</th>
-<th>Scope</th>
-<th>When it runs</th>
+<th>Plane</th>
+<th>Primary objects</th>
+<th>Purpose</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><strong><code>awa migrate</code></strong></td>
-<td>The canonical schema (<code>awa.schema_version</code>, <code>awa.runtime_instances</code>, <code>awa.storage_transition_state</code>, <code>awa.runtime_storage_backends</code>, etc.) <strong>plus</strong> the default queue-storage substrate at <code>awa.*</code> (<code>awa.ready_entries</code>, <code>awa.ready_tombstones</code>, <code>awa.ready_segments</code>, <code>awa.done_entries</code>, <code>awa.queue_terminal_count_deltas</code>, <code>awa.leases</code>, <code>awa.lease_claims</code>, <code>awa.lease_claim_batches</code>, <code>awa.lease_claim_closures</code>, <code>awa.lease_claim_closure_batches</code>, <code>awa.lease_claim_receipt_id_seq</code>, <code>awa.lease_claim_batch_id_seq</code>, <code>awa.queue_ring_state</code>, <code>awa.queue_claim_heads</code> (with its now-unused legacy ready-segment cache columns), <code>awa.queue_terminal_live_counts</code>, the partitions for each, the <code>awa.claim_ready_runtime</code> helper, and the <code>awa.install_queue_storage_substrate</code> function itself).</td>
-<td>Install time and operator-driven upgrades.</td>
+<td>Ready queue</td>
+<td><code>ready_entries_*</code>, ready segments, tombstones</td>
+<td>Append runnable work and claim it in ordered lanes. Whole ring slots can later be reclaimed.</td>
 </tr>
 <tr>
-<td><strong><code>QueueStorage::prepare_schema()</code> (Rust) / <code>awa storage prepare-queue-storage-schema</code> (CLI)</strong></td>
-<td>Non-default queue-storage schemas (anything other than <code>awa</code>), repair flows, test setups. Calls <code>awa.install_queue_storage_substrate(&lt;schema&gt;, ...)</code> and performs a small set of legacy upgrade fixups that don't belong in a forward-only DDL function.</td>
-<td>Custom-schema deployments; targeted repair; the test suite.</td>
+<td>Deferred queue</td>
+<td><code>deferred_jobs</code></td>
+<td>Hold scheduled and retryable work until maintenance promotes it.</td>
 </tr>
 <tr>
-<td><strong>The <code>awa.install_queue_storage_substrate(p_schema, ...)</code> SQL helper</strong></td>
-<td>Per-schema DDL only. Idempotent. Activation-neutral — does NOT touch <code>awa.runtime_storage_backends</code> or <code>awa.storage_transition_state</code>.</td>
-<td>Called by both <code>awa migrate</code> (for the default schema) and <code>prepare_schema()</code> (for custom schemas). Single source of truth for substrate DDL.</td>
+<td>Execution</td>
+<td>claim receipts, claim batches, closures, <code>leases_*</code>, <code>attempt_state</code></td>
+<td>Prove which attempt owns a job. Short jobs use compact receipt evidence; jobs needing mutable state materialise a lease.</td>
+</tr>
+<tr>
+<td>Terminal history</td>
+<td><code>done_entries_*</code>, compact completion batches, count deltas and rollups</td>
+<td>Retain completion facts without copying the full job body into every terminal row.</td>
+</tr>
+<tr>
+<td>Operator hold</td>
+<td><code>dlq_entries</code></td>
+<td>Keep explicitly dead-lettered work available for inspection, retry, or purge.</td>
+</tr>
+<tr>
+<td>Control</td>
+<td>queue metadata, lane heads, ring ledgers, runtimes, cron and uniqueness tables</td>
+<td>Coordinate dispatch and maintenance without putting mutable metadata on the hot history path.</td>
 </tr>
 </tbody>
 </table>
-<p>The helper takes a per-schema advisory transaction lock (<code>awa.queue_storage.install:&lt;schema&gt;</code>) so concurrent installs from Rust workers, the CLI, Python, or externally-extracted migration SQL serialise on the same key.</p>
-<h2 id="the-default-awa-schema-is-migration-owned-and-default-shaped">The default <code>awa</code> schema is migration-owned and default-shaped<a class="headerlink" href="#the-default-awa-schema-is-migration-owned-and-default-shaped" title="Permanent link">&para;</a></h2>
-<p>For <code>p_schema = 'awa'</code> the helper rejects non-default configuration with <code>ERRCODE = 22023</code>:</p>
-<ul>
-<li><code>lease_claim_receipts</code> must be <code>TRUE</code></li>
-<li><code>queue_slot_count</code> must be <code>16</code></li>
-<li><code>lease_slot_count</code> must be <code>8</code></li>
-<li><code>claim_slot_count</code> must be <code>8</code></li>
-</ul>
-<p>The default <code>awa.*</code> substrate is the single stable shape every fresh installation gets. If you need different slot counts or <code>lease_claim_receipts = FALSE</code>, use a custom queue-storage schema (see below). Attempts to tune the default schema get a clear error pointing at the custom-schema path.</p>
-<h2 id="custom-queue-storage-schemas">Custom queue-storage schemas<a class="headerlink" href="#custom-queue-storage-schemas" title="Permanent link">&para;</a></h2>
-<p>For non-default deployments — say a high-throughput tenant that wants <code>queue_slot_count = 32</code>, or a side-by-side rebuild during an incident — install a substrate under a different schema name:</p>
+<p>The public <code>{schema}.terminal_jobs</code> view hydrates terminal facts with retained job bodies. Physical ring tables are internal and must not be mutated directly.</p>
+<h2 id="how-storage-stays-bounded">How storage stays bounded<a class="headerlink" href="#how-storage-stays-bounded" title="Permanent link">&para;</a></h2>
+<p>Ready, receipt, lease, and terminal families are partitioned into ring slots. Maintenance advances each ring only after its reclaimability checks succeed, then truncates the old slot as a unit. Long-lived database snapshots can delay reclamation; they do not allow maintenance to skip the safety checks. Deferred and DLQ rows use their own promotion and retention paths rather than the ring.</p>
+<p>One worker holds the maintenance advisory lock at a time. That leader promotes due work, rescues stale attempts, rotates rings, folds count deltas, and publishes queue health. If it exits, another worker can take over from durable PostgreSQL state.</p>
+<h2 id="default-and-custom-schemas">Default and custom schemas<a class="headerlink" href="#default-and-custom-schemas" title="Permanent link">&para;</a></h2>
+<p><code>awa migrate</code> installs the canonical control objects and the default queue-storage substrate in the <code>awa</code> schema. That default has a stable shape and cannot be reset through <code>prepare-queue-storage-schema</code>; <code>DROP SCHEMA awa CASCADE</code> would also destroy migration and transition metadata and is not a supported recovery action.</p>
+<p>Custom storage schemas are an advanced operational tool for a separately sized substrate or a side-by-side transition:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare-queue-storage-schema<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>--schema<span class="w"> </span>my_jobs<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>--queue-slot-count<span class="w"> </span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span>--lease-slot-count<span class="w"> </span><span class="m">16</span>
 </span></code></pre></div>
-<p>The CLI calls <code>awa.install_queue_storage_substrate('my_jobs', 32, 16, 8, TRUE)</code> under the per-schema advisory lock. Activate the schema as the queue-storage backend via <code>awa storage prepare</code>, <code>awa storage enter-mixed-transition</code>, and <code>awa storage finalize</code> once you're ready. See <a href="../upgrade-0.5-to-0.6/">the upgrade guide</a> for the staged flow.</p>
-<h2 id="-reset-is-rejected-for-schema-awa"><code>--reset</code> is rejected for <code>--schema awa</code><a class="headerlink" href="#-reset-is-rejected-for-schema-awa" title="Permanent link">&para;</a></h2>
-<p><code>awa storage prepare-queue-storage-schema --reset</code> runs <code>DROP SCHEMA IF EXISTS &lt;schema&gt; CASCADE</code> before re-preparing. For <code>--schema awa</code> that would also drop <code>schema_version</code>, <code>runtime_instances</code>, <code>storage_transition_state</code>, and every other canonical migration table, leaving the database in an unrecoverable state.</p>
-<p>The CLI rejects this combination:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>Error: "Refusing to DROP SCHEMA awa CASCADE — schema 'awa' is the
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>default migration-owned queue-storage substrate and also contains the
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>canonical migration tables (schema_version, runtime_instances,
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>storage_transition_state, etc.). Use --schema &lt;other&gt; for a throwaway
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>substrate, or 'awa storage abort' to rewind an in-flight transition."
-</span></code></pre></div>
-<p>To rebuild a queue-storage substrate from scratch:</p>
+<p>The command invokes the idempotent <code>awa.install_queue_storage_substrate(...)</code> helper under a per-schema advisory transaction lock. The helper is activation-neutral: preparing a schema does not route work to it. Activation is a separate staged transition described in <a href="../upgrade-0.5-to-0.6/">Upgrading from 0.5 to 0.6</a>.</p>
+<p>The installer is <code>SECURITY INVOKER</code>; its caller needs DDL privileges on the target schema. Workers need runtime DML privileges and <code>TRUNCATE</code> for guarded ring reclamation, but do not need DDL. See <a href="../security/database-roles/">Database roles</a>.</p>
+<h2 id="operator-rules">Operator rules<a class="headerlink" href="#operator-rules" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Testing or recovery:</strong> target a custom schema name with <code>--schema &lt;other&gt;</code> and activate it via the storage transition flow.</li>
-<li><strong>Rewind an in-flight transition:</strong> use <code>awa storage abort</code>.</li>
-<li><strong>Full cluster rebuild:</strong> restore from backup, then run <code>awa migrate</code>.</li>
+<li>Treat physical queue-storage tables and helper functions as internal unless a page explicitly names a public surface.</li>
+<li>Use the CLI transition commands rather than editing <code>storage_transition_state</code> or <code>runtime_storage_backends</code>.</li>
+<li>Do not reset or drop the default <code>awa</code> schema. Restore from backup and rerun migrations for a full-cluster rebuild.</li>
+<li>Keep analytical transactions short on the primary; a pinned MVCC horizon delays best-effort ring reclamation.</li>
+<li>When using a custom schema, apply the same runtime grants to it and prepare it with the migrator role.</li>
 </ul>
-<p><code>DROP SCHEMA awa CASCADE</code> is not a supported operator action.</p>
-<h2 id="driving-installs-and-upgrades-from-external-migration-tooling">Driving installs and upgrades from external migration tooling<a class="headerlink" href="#driving-installs-and-upgrades-from-external-migration-tooling" title="Permanent link">&para;</a></h2>
-<p>Teams that already run their schema changes through a tool like Sqitch, Liquibase, or a hand-rolled migration runner do not need to invoke <code>awa migrate</code> or any other Rust binary. The migration set extracted with <code>awa migrate --sql</code> (or <code>--extract-to</code>) is complete: it includes the substrate DDL via the v023 helper, and the staged transition is driven by SQL functions.</p>
-<h3 id="fresh-install-no-canonical-data-yet">Fresh install (no canonical data yet)<a class="headerlink" href="#fresh-install-no-canonical-data-yet" title="Permanent link">&para;</a></h3>
-<p>After applying the migration files, the first runtime that boots calls <code>awa.storage_auto_finalize_if_fresh('awa')</code> which atomically advances <code>canonical → active</code> when <code>awa.jobs</code> is empty and no live runtimes have heartbeated. External tooling can call the same function as a post-migrate step to land in <code>active</code> before the first worker even starts:</p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">storage_auto_finalize_if_fresh</span><span class="p">(</span><span class="s1">'awa'</span><span class="p">);</span>
-</span></code></pre></div>
-<p><code>storage_auto_finalize_if_fresh</code> has <code>GRANT EXECUTE ... TO PUBLIC</code>, so the EXECUTE bit is open to any role. The function is <code>SECURITY INVOKER</code> and reads/writes <code>awa.storage_transition_state</code>, <code>awa.jobs</code>, <code>awa.runtime_instances</code>, and <code>awa.runtime_storage_backends</code>, so callers still need the normal runtime/migrator table privileges on those.</p>
-<h3 id="upgrade-from-an-existing-canonical-only-deployment">Upgrade from an existing canonical-only deployment<a class="headerlink" href="#upgrade-from-an-existing-canonical-only-deployment" title="Permanent link">&para;</a></h3>
-<p><code>storage_auto_finalize_if_fresh</code> refuses to short-circuit when canonical work or live runtimes exist. The operator drives the staged transition with three SQL function calls, each of which mirrors the equivalent <code>awa storage</code> CLI subcommand:</p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1">-- (1) Mark queue-storage as the prepared target.</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">storage_prepare</span><span class="p">(</span><span class="s1">'queue_storage'</span><span class="p">,</span><span class="w"> </span><span class="s1">'{"schema":"awa"}'</span><span class="p">::</span><span class="n">jsonb</span><span class="p">);</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="c1">-- (2) Bring up at least one worker with</span>
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="c1">--     transition_role=queue_storage_target. Stop any canonical-only</span>
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="c1">--     workers. Then flip routing into mixed mode:</span>
-</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">storage_enter_mixed_transition</span><span class="p">();</span>
-</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>
-</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="c1">-- (3) Wait for workers to drain the canonical backlog onto</span>
-</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="c1">--     queue-storage. The two SQL gates `storage_finalize` enforces</span>
-</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="c1">--     are observable directly:</span>
-</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="c1">--</span>
-</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="c1">--       SELECT awa.canonical_live_backlog();</span>
-</span><span id="__span-3-14"><a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="c1">--       -- must return 0 before finalize will advance.</span>
-</span><span id="__span-3-15"><a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a><span class="c1">--</span>
-</span><span id="__span-3-16"><a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="c1">--       SELECT count(*)</span>
-</span><span id="__span-3-17"><a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="c1">--       FROM awa.runtime_instances</span>
-</span><span id="__span-3-18"><a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="c1">--       WHERE storage_capability = 'canonical'</span>
-</span><span id="__span-3-19"><a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a><span class="c1">--         AND last_seen_at + make_interval(</span>
-</span><span id="__span-3-20"><a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a><span class="c1">--               secs =&gt; GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)</span>
-</span><span id="__span-3-21"><a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="c1">--             ) &gt;= now();</span>
-</span><span id="__span-3-22"><a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a><span class="c1">--       -- must also be 0 (no live canonical-only runtimes).</span>
-</span><span id="__span-3-23"><a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a><span class="c1">--</span>
-</span><span id="__span-3-24"><a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a><span class="c1">--     When both are 0, finalize:</span>
-</span><span id="__span-3-25"><a id="__codelineno-3-25" name="__codelineno-3-25" href="#__codelineno-3-25"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">storage_finalize</span><span class="p">();</span>
-</span></code></pre></div>
-<p><code>storage_enter_mixed_transition</code> rejects the call until at least one live <code>queue_storage_target</code> runtime is heartbeating. <code>storage_finalize</code> rejects while <code>awa.canonical_live_backlog() &gt; 0</code> or a canonical-only runtime is live.</p>
-<p>Once routing has flipped, a canonical attempt that re-schedules itself — snooze, retry backoff, or <code>RetryAfter</code> — leaves the canonical plane instead of returning to canonical <code>scheduled_jobs</code> (<a href="https://github.com/hardbyte/awa/issues/456">#456</a>). Ordinarily its fresh-id successor is written to the prepared schema's <code>deferred_jobs</code>. If the destination state claims uniqueness and a newer duplicate acquired that key while <code>running</code> was outside the mask, the attempted successor is recorded as a cancelled terminal row with a <code>rescheduled as duplicate</code> error; it never becomes executable and the newer claim holder wins. The canonical backlog therefore still converges for handlers that snooze on every run rather than completing. Pre-flip auto runtimes report <code>canonical_drain_only</code> after routing flips; once the backlog is empty they are idle and v040 allows finalization without waiting for those processes to restart or their heartbeat rows to expire.</p>
-<p>The orchestration (start new-mode workers, stop old-mode workers, wait for drain) is unchanged from the CLI flow — only the invocation surface is different.</p>
-<h2 id="design-rationale">Design rationale<a class="headerlink" href="#design-rationale" title="Permanent link">&para;</a></h2>
-<p>The split between migration-owned default substrate and helper-installed custom substrate exists for three reasons:</p>
+<h2 id="related-reading">Related reading<a class="headerlink" href="#related-reading" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong><code>awa migrate --sql</code> / <code>--extract-to</code> must reproduce the full default runtime schema</strong> for external migration tools to be useful. All substrate DDL is reachable from the migration through the SQL helper, so the extracted SQL is complete.</li>
-<li><strong>Migrations that depend on queue-storage tables can write unconditional DDL.</strong> Operations like the <code>done_entries</code> terminal-count delta append inside <code>awa.delete_job_compat()</code> need the delta table to exist. Migration ordering guarantees it.</li>
-<li><strong>The default schema cannot be accidentally destroyed.</strong> The reset guard above protects operators from a <code>DROP SCHEMA awa CASCADE</code> that would take the canonical migration tables with it.</li>
-</ul>
-<p>The helper is <code>SECURITY INVOKER</code> so callers need their own DDL privileges on the target schema; the runtime role does not gain DDL through the helper, which keeps the principle-of-least-privilege role model intact.</p>
-<h2 id="see-also">See also<a class="headerlink" href="#see-also" title="Permanent link">&para;</a></h2>
-<ul>
-<li><a href="../migrations/"><code>docs/migrations.md</code></a> — migration policy and the <code>awa migrate --sql</code> / <code>--extract-to</code> story.</li>
-<li><a href="../architecture/"><code>docs/architecture.md</code></a> — overall storage layering.</li>
-<li><a href="../security/"><code>docs/security.md</code></a> — role boundaries and the <code>SECURITY INVOKER</code> posture.</li>
-<li><a href="../upgrade-0.5-to-0.6/"><code>docs/upgrade-0.5-to-0.6.md</code></a> — operator flow for an existing cluster.</li>
+<li><a href="../architecture/">Architecture</a> — runtime, storage, lifecycle, and recovery.</li>
+<li><a href="../migrations/">Migrations</a> — migration ownership and extracted SQL.</li>
+<li><a href="../security/database-roles/">Database roles</a> — production role separation and grants.</li>
+<li><a href="../upgrade-0.5-to-0.6/">Storage upgrade guide</a> — staged activation and drain.</li>
+<li><a href="../adr/019-queue-storage-redesign/">ADR-019</a> and <a href="../adr/023-receipt-plane-ring-partitioning/">ADR-023</a> — decision rationale and consequences.</li>
 </ul>
 
 
@@ -2189,6 +2221,7 @@
 
 
                 
+
               </article>
             </div>
           
@@ -2294,6 +2327,10 @@
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

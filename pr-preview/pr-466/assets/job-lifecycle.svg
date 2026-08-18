@@ -1,70 +1,78 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 590" role="img">
-  <title>AWA job lifecycle</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 700" role="img" aria-labelledby="title desc">
+  <title id="title">AWA job state machine</title>
+  <desc id="desc">Scheduled and retryable jobs become available when due. Workers claim available jobs as running. A running attempt can complete, snooze, retry, wait for an external callback, fail, or cancel. Callback outcomes can resume, complete, fail, or retry the job.</desc>
   <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0 0 10 5 0 10z" fill="#47725a"/>
-    </marker>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#10341f" flood-opacity=".14"/>
-    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 10 5 0 10z" fill="context-stroke"/></marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#10341f" flood-opacity=".13"/></filter>
+    <style>
+      .canvas{fill:#eef8f1}.card{fill:#fff;stroke:#b9d6c4}.heading{fill:#173324}.copy{fill:#52675a}.line{fill:none;stroke:#47725a;stroke-width:3.5;stroke-linecap:round;stroke-linejoin:round}.callback{stroke:#47725a;stroke-dasharray:8 7}.label{fill:#376248}.deferred{fill:#fff5d9;stroke:#d7ad4f}.deferred-h{fill:#644b16}.deferred-c{fill:#735f31}.terminal{fill:#f8e6e3;stroke:#bd746a}.terminal-h{fill:#71342d}.terminal-c{fill:#81554f}.waiting{fill:#e7f0fb;stroke:#77a2cf}.waiting-h{fill:#244f76}.waiting-c{fill:#4c6b86}
+      @media (prefers-color-scheme:dark){.canvas{fill:#101713}.card{fill:#17221b;stroke:#3f6b50}.heading{fill:#eff8f2}.copy{fill:#b9c9bf}.line,.callback{stroke:#72c997}.label{fill:#a9dfbd}.deferred{fill:#342d19;stroke:#d7ad4f}.deferred-h{fill:#ffe39b}.deferred-c{fill:#dbc98d}.terminal{fill:#372321;stroke:#cf8277}.terminal-h{fill:#ffc1b7}.terminal-c{fill:#dba39b}.waiting{fill:#192d40;stroke:#77a2cf}.waiting-h{fill:#b9dcff}.waiting-c{fill:#a7c6df}}
+    </style>
   </defs>
-  <rect width="980" height="590" rx="28" fill="#eef8f1"/>
+  <rect class="canvas" width="1200" height="700" rx="28"/>
   <g font-family="Inter,system-ui,sans-serif">
-    <text x="490" y="46" text-anchor="middle" font-size="18" font-weight="750" fill="#17633e">DURABLE JOB STATE</text>
+    <text class="label" x="600" y="44" text-anchor="middle" font-size="20" font-weight="760">DURABLE JOB STATE</text>
 
-    <g fill="none" stroke="#47725a" stroke-width="3" marker-end="url(#arrow)">
-      <path d="M225 150h120"/>
-      <path d="M515 150h120"/>
-      <path d="M515 176c38 70 107 108 188 112"/>
-      <path d="M515 176c12 114 5 177-25 250"/>
-      <path d="M455 176c-57 74-144 111-235 112"/>
-      <path d="M640 320c-102 0-169-45-169-144" stroke-dasharray="8 7"/>
-      <path d="M340 320c98 0 151-46 151-144" stroke-dasharray="8 7"/>
-      <path d="M400 454H225"/>
-      <path d="M580 454h175"/>
+    <!-- Edges are drawn before cards and terminate on card boundaries. -->
+    <g class="line" marker-end="url(#arrow)">
+      <path d="M275 160H470"/><path d="M730 160H925"/>
+      <path d="M65 440C20 440 20 160 65 160"/><path d="M330 390C310 300 250 230 190 210"/>
+      <path d="M560 210C500 272 330 288 170 390"/><path d="M590 210C555 282 480 320 395 390"/>
+      <path d="M600 210V390"/><path d="M650 210C695 290 760 328 805 390"/><path d="M690 210C800 280 965 304 1030 390"/>
+    </g>
+
+    <!-- Resume is the only callback path drawn through the graph; the other
+         callback APIs are listed below so their crossing edges do not obscure
+         the handler-owned state transitions. -->
+    <g class="line callback" marker-end="url(#arrow)">
+      <path d="M630 390V210"/>
     </g>
 
     <g filter="url(#shadow)">
-      <rect x="55" y="112" width="170" height="76" rx="18" fill="#fff" stroke="#b9d6c4" stroke-width="2"/>
-      <text x="140" y="145" text-anchor="middle" font-size="20" font-weight="750" fill="#173324">available</text>
-      <text x="140" y="169" text-anchor="middle" font-size="13" fill="#52675a">runnable when due</text>
+      <rect class="card" x="65" y="110" width="210" height="100" rx="20" stroke-width="2"/>
+      <text class="heading" x="170" y="151" text-anchor="middle" font-size="22" font-weight="760">available</text>
+      <text class="copy" x="170" y="180" text-anchor="middle" font-size="14">runnable now</text>
 
-      <rect x="345" y="105" width="170" height="90" rx="18" fill="#17633e"/>
-      <text x="430" y="143" text-anchor="middle" font-size="20" font-weight="750" fill="#fff">running</text>
-      <text x="430" y="168" text-anchor="middle" font-size="13" fill="#d9f4e4">claimed + heartbeating</text>
+      <rect x="470" y="100" width="260" height="120" rx="22" fill="#17633e"/>
+      <text x="600" y="150" text-anchor="middle" font-size="24" font-weight="760" fill="#fff">running</text>
+      <text x="600" y="181" text-anchor="middle" font-size="14" fill="#d9f4e4">claimed + heartbeating</text>
 
-      <rect x="635" y="112" width="190" height="76" rx="18" fill="#d4eee0" stroke="#6bab83" stroke-width="2"/>
-      <text x="730" y="145" text-anchor="middle" font-size="20" font-weight="750" fill="#173324">completed</text>
-      <text x="730" y="169" text-anchor="middle" font-size="13" fill="#52675a">terminal success</text>
+      <rect x="925" y="110" width="210" height="100" rx="20" fill="#d4eee0" stroke="#6bab83" stroke-width="2"/>
+      <text x="1030" y="151" text-anchor="middle" font-size="22" font-weight="760" fill="#173324">completed</text>
+      <text x="1030" y="180" text-anchor="middle" font-size="14" fill="#52675a">terminal success</text>
 
-      <rect x="70" y="280" width="180" height="76" rx="18" fill="#fff5d9" stroke="#d7ad4f" stroke-width="2"/>
-      <text x="160" y="313" text-anchor="middle" font-size="20" font-weight="750" fill="#644b16">scheduled</text>
-      <text x="160" y="337" text-anchor="middle" font-size="13" fill="#735f31">snooze, same attempt</text>
+      <rect class="deferred" x="65" y="390" width="210" height="100" rx="20" stroke-width="2"/>
+      <text class="deferred-h" x="170" y="431" text-anchor="middle" font-size="22" font-weight="760">scheduled</text>
+      <text class="deferred-c" x="170" y="460" text-anchor="middle" font-size="14">future run · same attempt</text>
 
-      <rect x="640" y="280" width="180" height="76" rx="18" fill="#fff5d9" stroke="#d7ad4f" stroke-width="2"/>
-      <text x="730" y="313" text-anchor="middle" font-size="20" font-weight="750" fill="#644b16">retryable</text>
-      <text x="730" y="337" text-anchor="middle" font-size="13" fill="#735f31">future attempt</text>
+      <rect class="deferred" x="290" y="390" width="210" height="100" rx="20" stroke-width="2"/>
+      <text class="deferred-h" x="395" y="431" text-anchor="middle" font-size="22" font-weight="760">retryable</text>
+      <text class="deferred-c" x="395" y="460" text-anchor="middle" font-size="14">future run · next attempt</text>
 
-      <rect x="400" y="424" width="180" height="76" rx="18" fill="#e7f0fb" stroke="#77a2cf" stroke-width="2"/>
-      <text x="490" y="457" text-anchor="middle" font-size="20" font-weight="750" fill="#244f76">waiting_external</text>
-      <text x="490" y="481" text-anchor="middle" font-size="13" fill="#4c6b86">external callback</text>
+      <rect class="waiting" x="500" y="390" width="200" height="100" rx="20" stroke-width="2"/>
+      <text class="waiting-h" x="600" y="429" text-anchor="middle" font-size="20" font-weight="760">waiting_external</text>
+      <text class="waiting-c" x="600" y="458" text-anchor="middle" font-size="14">parked for callback</text>
 
-      <rect x="45" y="424" width="180" height="76" rx="18" fill="#f8e6e3" stroke="#bd746a" stroke-width="2"/>
-      <text x="135" y="457" text-anchor="middle" font-size="20" font-weight="750" fill="#71342d">cancelled</text>
-      <text x="135" y="481" text-anchor="middle" font-size="13" fill="#81554f">terminal</text>
+      <rect class="terminal" x="710" y="390" width="190" height="100" rx="20" stroke-width="2"/>
+      <text class="terminal-h" x="805" y="431" text-anchor="middle" font-size="22" font-weight="760">cancelled</text>
+      <text class="terminal-c" x="805" y="460" text-anchor="middle" font-size="14">terminal</text>
 
-      <rect x="755" y="424" width="180" height="76" rx="18" fill="#f8e6e3" stroke="#bd746a" stroke-width="2"/>
-      <text x="845" y="457" text-anchor="middle" font-size="20" font-weight="750" fill="#71342d">failed</text>
-      <text x="845" y="481" text-anchor="middle" font-size="13" fill="#81554f">terminal / DLQ</text>
+      <rect class="terminal" x="935" y="390" width="190" height="100" rx="20" stroke-width="2"/>
+      <text class="terminal-h" x="1030" y="431" text-anchor="middle" font-size="22" font-weight="760">failed</text>
+      <text class="terminal-c" x="1030" y="460" text-anchor="middle" font-size="14">terminal · DLQ</text>
     </g>
 
-    <g font-size="13" font-weight="650" fill="#47725a">
-      <text x="270" y="137">CLAIM</text>
-      <text x="557" y="137">SUCCESS</text>
-      <text x="557" y="235">RETRY</text>
-      <text x="280" y="238">SNOOZE</text>
-      <text x="505" y="316">WAIT</text>
-      <text x="520" y="540">CALLBACK RESOLVES → AVAILABLE</text>
+    <g class="label" font-size="13" font-weight="700">
+      <text x="350" y="147">CLAIM</text><text x="806" y="147">SUCCESS</text>
+      <text x="315" y="277">SNOOZE</text><text x="462" y="304">RETRY</text>
+      <text x="612" y="303">WAIT</text><text x="720" y="300">CANCEL</text><text x="878" y="294">TERMINAL / EXHAUSTED</text>
+    </g>
+
+    <g transform="translate(220 560)">
+      <rect class="card" width="760" height="88" rx="18" stroke-width="2"/>
+      <path class="line callback" d="M32 29h54" marker-end="url(#arrow)"/>
+      <text class="heading" x="108" y="34" font-size="15" font-weight="750">External callback outcomes</text>
+      <text class="copy" x="108" y="62" font-size="14">resume → running · complete → completed · retry → available · fail → failed · timeout → retryable or failed</text>
     </g>
   </g>
 </svg>

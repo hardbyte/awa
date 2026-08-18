@@ -55,6 +55,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +76,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/deployment/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1538,9 +1548,38 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="">
+            
   
   
   <span class="md-ellipsis">
@@ -1554,7 +1593,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1634,6 +1801,8 @@
       
         
           
+        
+      
         
       
         
@@ -1810,6 +1979,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1828,8 +2025,6 @@
       
         
           
-        
-      
         
       
         
@@ -1933,34 +2128,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -2197,6 +2364,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2224,7 +2399,7 @@
 </ul>
 <p><code>awa serve</code> is an operator UI and admin API. It is not the worker runtime.</p>
 <h2 id="queue-storage-cutover">Queue Storage Cutover<a class="headerlink" href="#queue-storage-cutover" title="Permanent link">&para;</a></h2>
-<p>Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x clusters must follow the staged storage-transition procedure in <a href="../upgrade-0.5-to-0.6/">upgrade-0.5-to-0.6.md</a>; <a href="../migrations/">migrations.md</a> covers the general migration contract and tooling.</p>
+<p>Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x clusters must follow the <a href="../upgrade-0.5-to-0.6/">staged storage-transition procedure</a>; <a href="../migrations/">Migrations</a> covers the general migration contract and tooling.</p>
 <p>Operationally:</p>
 <ul>
 <li>queue storage is the 0.6 worker engine</li>
@@ -2412,7 +2587,7 @@ producers and migrations.</p>
 <p>For a UI pinned to a less-trusted network or shared with stakeholders who shouldn't trigger retries, cancels, or pauses, run with <code>--read-only</code> (or set <code>AWA_READ_ONLY=1</code>):</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>serve<span class="w"> </span>--read-only
 </span></code></pre></div>
-<p>This forces read-only even when the Postgres connection is fully writable — the UI hides mutation buttons and every mutation endpoint returns 503. See <a href="../configuration/#read-only-mode">configuration.md#read-only-mode</a> for the tradeoff versus pointing at a read replica.</p>
+<p>This forces read-only even when the Postgres connection is fully writable — the UI hides mutation buttons and every mutation endpoint returns 503. See <a href="../configuration/#read-only-mode">Read-only mode</a> for the tradeoff versus pointing at a read replica.</p>
 <p>If you expose the callback receiver endpoints for <code>HttpWorker</code>, also configure <code>AWA_CALLBACK_HMAC_SECRET</code> (or <code>--callback-hmac-secret</code>) so <code>awa-ui</code> verifies <code>X-Awa-Signature</code> on callback requests. See <a href="../http-callbacks/">HTTP workers and callback signatures</a> for the worker, function, and receiver contract.</p>
 <h2 id="next">Next<a class="headerlink" href="#next" title="Permanent link">&para;</a></h2>
 <ul>
@@ -2435,6 +2610,7 @@ producers and migrations.</p>
 
 
                 
+
               </article>
             </div>
           
@@ -2540,6 +2716,10 @@ producers and migrations.</p>
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

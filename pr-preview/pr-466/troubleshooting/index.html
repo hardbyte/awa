@@ -55,6 +55,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +76,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/troubleshooting/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1314,9 +1324,38 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="">
+            
   
   
   <span class="md-ellipsis">
@@ -1330,7 +1369,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1888,6 +2055,8 @@
       
         
       
+        
+      
     
     
     
@@ -2054,6 +2223,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2072,8 +2269,6 @@
       
         
           
-        
-      
         
       
         
@@ -2177,34 +2372,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -2685,6 +2852,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2869,7 +3044,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 </span></code></pre></div>
 <p>Use an upsert: first-enqueue may create lane rows before any operator inserts a <code>queue_meta</code> row, so a plain <code>UPDATE</code> quietly affects zero rows. Raising <code>enqueue_shards</code> is a semantic switch from strict to partitioned FIFO; see <a href="../adr/025-sharded-enqueue-heads/">ADR-025</a>.</p>
 <p><strong>3. WAL or commit pressure on the database.</strong></p>
-<p>If batch size and shard count both look healthy, sample <code>pg_stat_activity</code> for <code>LWLock:WALWrite</code> / <code>LWLock:WALSync</code> waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in <a href="../deploying-on-managed-postgres/#pick-a-vcpu-size"><code>docs/deploying-on-managed-postgres.md</code></a> are useful reference points.</p>
+<p>If batch size and shard count both look healthy, sample <code>pg_stat_activity</code> for <code>LWLock:WALWrite</code> / <code>LWLock:WALSync</code> waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in <a href="../deploying-on-managed-postgres/#pick-a-vcpu-size">Managed Postgres sizing</a> are useful reference points.</p>
 <h2 id="leader-election-delays">Leader Election Delays<a class="headerlink" href="#leader-election-delays" title="Permanent link">&para;</a></h2>
 <h3 id="expected-behavior">Expected Behavior<a class="headerlink" href="#expected-behavior" title="Permanent link">&para;</a></h3>
 <p>Only one instance runs maintenance tasks at a time. Non-leaders retry every <code>10s</code> by default.</p>
@@ -3006,7 +3181,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>reduce terminal-row retention if the terminal history is much larger than needed; note that <code>failed_retention</code> is a floor — non-DLQ <code>failed</code> rows stay retryable for at least that long in both engines (queue storage carries in-floor failed rows forward at prune time), and the cumulative count of failed rows aged past the floor is visible as <code>QueueCounts.pruned_failed</code></li>
 <li>review autovacuum settings if lease churn is expected continuously</li>
 </ul>
-<p>If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in <code>docs/benchmarking.md</code>. Preventative guidance — reader placement, session timeouts, alerting, and autovacuum capacity flags — lives in <a href="../deploying-on-managed-postgres/#mvcc-discipline-long-running-readers-pin-the-whole-database"><code>deploying-on-managed-postgres.md</code></a>.</p>
+<p>If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in <a href="../benchmarking/">Benchmarking</a>. Preventative guidance — reader placement, session timeouts, alerting, and autovacuum capacity flags — lives in <a href="../deploying-on-managed-postgres/#mvcc-discipline-long-running-readers-pin-the-whole-database">Managed Postgres: MVCC discipline</a>.</p>
 <h2 id="somethings-in-the-dlq">Something's In The DLQ<a class="headerlink" href="#somethings-in-the-dlq" title="Permanent link">&para;</a></h2>
 <p>The Dead Letter Queue is where terminal failures land when a queue has DLQ enabled. These rows are never claimed. Operators retry them, purge them, or let retention remove them.</p>
 <p>Quick checks:</p>
@@ -3116,6 +3291,7 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 
 
                 
+
               </article>
             </div>
           
@@ -3221,6 +3397,10 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

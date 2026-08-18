@@ -55,6 +55,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +76,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/upgrade-0.5-to-0.6/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1449,9 +1459,38 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="">
+            
   
   
   <span class="md-ellipsis">
@@ -1465,7 +1504,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1545,6 +1712,8 @@
       
         
           
+        
+      
         
       
         
@@ -1721,6 +1890,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1739,8 +1936,6 @@
       
         
           
-        
-      
         
       
         
@@ -1844,34 +2039,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -2019,6 +2186,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2028,9 +2203,9 @@
 
 <h1 id="upgrade-checklist-05x-06">Upgrade Checklist: 0.5.x → 0.6<a class="headerlink" href="#upgrade-checklist-05x-06" title="Permanent link">&para;</a></h1>
 <blockquote>
-<p><strong>Planning to run 0.7?</strong> Finalize before upgrading: the 0.7 <code>awa migrate</code> refuses unfinalized clusters (<a href="../adr/037-canonical-engine-deprecation/">ADR-037</a>, <a href="../upgrade-0.6-to-0.7/">upgrade-0.6-to-0.7.md</a>).</p>
+<p><strong>Planning to run 0.7?</strong> Finalize before upgrading: the 0.7 <code>awa migrate</code> refuses unfinalized clusters (<a href="../adr/037-canonical-engine-deprecation/">ADR-037</a>, <a href="../upgrade-0.6-to-0.7/">Upgrade 0.6 to 0.7</a>).</p>
 </blockquote>
-<p>This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; <a href="../migrations/">migrations.md</a> covers the general migration contract and external tooling.</p>
+<p>This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; <a href="../migrations/">Migrations</a> covers the general migration contract and external tooling.</p>
 <blockquote>
 <p><strong>Fresh installs do not need this file.</strong> A new cluster runs <code>awa migrate</code> and starts workers; the first worker auto-finalizes via <code>awa.storage_auto_finalize_if_fresh()</code>. See migrations.md <a href="../migrations/#fresh-install-no-prior-canonical-data">"Fresh install"</a>. This checklist is for <strong>upgrading existing 0.5.x clusters</strong>, where canonical drain is unavoidable and auto-finalize correctly defers to the staged path.</p>
 </blockquote>
@@ -2220,10 +2395,10 @@
 </ul>
 <h2 id="cross-references">Cross-references<a class="headerlink" href="#cross-references" title="Permanent link">&para;</a></h2>
 <ul>
-<li><a href="../migrations/">migrations.md</a> — general migration contract and external tooling</li>
-<li><a href="../configuration/">configuration.md</a> — claim-ring / lease-ring sizing knobs</li>
-<li><a href="../adr/023-receipt-plane-ring-partitioning/"><code>docs/adr/023-receipt-plane-ring-partitioning.md</code></a> — receipt-plane partition design and reverse-migration recipe</li>
-<li><a href="../adr/025-sharded-enqueue-heads/"><code>docs/adr/025-sharded-enqueue-heads.md</code></a> — enqueue-head sharding design and partitioned-FIFO contract</li>
+<li><a href="../migrations/">Migrations</a> — general migration contract and external tooling</li>
+<li><a href="../configuration/">Configuration</a> — claim-ring / lease-ring sizing knobs</li>
+<li><a href="../adr/023-receipt-plane-ring-partitioning/">ADR-023: Receipt-plane ring partitioning</a> — receipt-plane partition design and reverse-migration recipe</li>
+<li><a href="../adr/025-sharded-enqueue-heads/">ADR-025: Sharded enqueue heads</a> — enqueue-head sharding design and partitioned-FIFO contract</li>
 <li><a href="../grafana/awa-dashboard.json"><code>docs/grafana/awa-dashboard.json</code></a> — Prometheus dashboard with the rotation/prune panels</li>
 </ul>
 
@@ -2239,6 +2414,7 @@
 
 
                 
+
               </article>
             </div>
           
@@ -2344,6 +2520,10 @@
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

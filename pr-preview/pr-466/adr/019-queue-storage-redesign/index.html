@@ -51,6 +51,12 @@
     
       <link rel="stylesheet" href="../../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -66,6 +72,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/adr/019-queue-storage-redesign/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1303,9 +1313,35 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="0">
+            
   
   
   <span class="md-ellipsis">
@@ -1319,7 +1355,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1399,6 +1563,8 @@
       
         
           
+        
+      
         
       
         
@@ -1575,6 +1741,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1593,8 +1787,6 @@
       
         
           
-        
-      
         
       
         
@@ -1698,34 +1890,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -2023,6 +2187,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2233,10 +2405,10 @@
 <li>Crash safety for the batcher relies on the normal rescue path, not an auxiliary replay log. If an in-memory completion batch is lost with the worker process, the live attempt remains visible to heartbeat/deadline rescue and is reclaimed that way.</li>
 </ul>
 <h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
-<p>Recorded local 5k-job runtime soak: <strong>9,537 jobs/s</strong>, <strong>3.671 ms pickup p50</strong>, <strong>22.013 ms pickup p95</strong>, <strong>417 exact final dead tuples</strong> (canonical runtime under the same workload: 9,686 jobs/s, 38.998 ms p95, dead tuples not sampled). The full command log, raw output, and per-table dead-tuple breakdown are in <a href="../bench/019-queue-storage-validation-2026-04-19/"><code>bench/019-queue-storage-validation-2026-04-19.md</code></a>.</p>
-<p>The phase-driven portable comparison harness lives in a separate repo: <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking">postgresql-job-queue-benchmarking</a>. That harness records producer, subscriber, and end-to-end latency on a shared timebase while also sampling throughput, queue depth, and dead tuples over time. Recent runs place Awa ahead of pgque on end-to-end latency and on sustained throughput in clean-phase scenarios, while pgque holds a comparable dead-tuple profile (both are append-only / partition-rotated). See <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/SYSTEM_COMPARISONS.md"><code>SYSTEM_COMPARISONS.md</code></a> for the per-system architectural notes and <a href="../../benchmarking/">docs/benchmarking.md</a> for awa's own regression methodology.</p>
-<p>The current pressure frontier after the split-head change is the lease plane: <code>queue_lanes</code> is no longer the dominant MVCC hotspot, but the mutable <code>active_leases</code> family still absorbs steady insert/delete churn and heartbeat updates. The current implementation now includes a short-job receipt path (<code>lease_claims</code> plus lazy materialization) that substantially reduces dead tuples for zero-deadline short jobs. Long-horizon profiling also showed that the append-only history alone was not enough: open-claim reads and rescue scans needed bounded access paths so they would not degrade into history scans. The original ADR-019 design used a bounded <code>open_receipt_claims</code> table for this; ADR-023 replaces it with partitioned <code>lease_claims</code>, explicit <code>lease_claim_closures</code>, compact <code>lease_claim_closure_batches</code>, live-set anti-joins over active partitions, and tiny per-slot rescue cursors in <code>claim_ring_slots</code>, eliminating the last per-claim MVCC churn source on the receipt plane. Further lease-plane work is still tracked in <a href="../../archive/0.6-storage-design/lease-plane-redesign-spike/"><code>lease-plane-redesign-spike.md</code></a>. The remaining queue-level coordination controls are implemented as bounded claimers, queue striping (<code>queue_stripe_count</code>), and per-queue enqueue-head sharding (<code>queue_meta.enqueue_shards</code>). The archived <a href="../../archive/0.6-storage-design/bounded-claimers-plan/"><code>bounded-claimers-plan.md</code></a> and <a href="../../archive/0.6-storage-design/queue-striping-plan/"><code>queue-striping-plan.md</code></a> capture design history; current operator guidance lives in <a href="../../configuration/#queue-storage-tuning"><code>configuration.md</code></a>.</p>
-<p>Spec-level safety is checked by the segmented-storage TLA+ family — <code>AwaSegmentedStorage</code>, <code>AwaSegmentedStorageRaces</code>, <code>AwaStorageLockOrder</code>, <code>AwaSegmentedStorageTrace</code> — under <a href="https://github.com/hardbyte/awa/tree/main/correctness/storage"><code>correctness/storage/</code></a>. The TLA+ action → Rust function correspondence is in <a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md"><code>correctness/storage/MAPPING.md</code></a>.</p>
+<p>Recorded local 5k-job runtime soak: <strong>9,537 jobs/s</strong>, <strong>3.671 ms pickup p50</strong>, <strong>22.013 ms pickup p95</strong>, <strong>417 exact final dead tuples</strong> (canonical runtime under the same workload: 9,686 jobs/s, 38.998 ms p95, dead tuples not sampled). The <a href="../bench/019-queue-storage-validation-2026-04-19/">full validation record</a> contains the command log, raw output, and per-table dead-tuple breakdown.</p>
+<p>The phase-driven portable comparison harness lives in a separate repo: <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking">postgresql-job-queue-benchmarking</a>. That harness records producer, subscriber, and end-to-end latency on a shared timebase while also sampling throughput, queue depth, and dead tuples over time. Recent runs place Awa ahead of pgque on end-to-end latency and on sustained throughput in clean-phase scenarios, while pgque holds a comparable dead-tuple profile (both are append-only / partition-rotated). See the <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/SYSTEM_COMPARISONS.md">cross-system comparison</a> for the per-system architectural notes and <a href="../../benchmarking/">AWA benchmarking</a> for awa's own regression methodology.</p>
+<p>The current pressure frontier after the split-head change is the lease plane: <code>queue_lanes</code> is no longer the dominant MVCC hotspot, but the mutable <code>active_leases</code> family still absorbs steady insert/delete churn and heartbeat updates. The current implementation now includes a short-job receipt path (<code>lease_claims</code> plus lazy materialization) that substantially reduces dead tuples for zero-deadline short jobs. Long-horizon profiling also showed that the append-only history alone was not enough: open-claim reads and rescue scans needed bounded access paths so they would not degrade into history scans. The original ADR-019 design used a bounded <code>open_receipt_claims</code> table for this; ADR-023 replaces it with partitioned <code>lease_claims</code>, explicit <code>lease_claim_closures</code>, compact <code>lease_claim_closure_batches</code>, live-set anti-joins over active partitions, and tiny per-slot rescue cursors in <code>claim_ring_slots</code>, eliminating the last per-claim MVCC churn source on the receipt plane. Further lease-plane work is still tracked in the <a href="https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/lease-plane-redesign-spike.md">lease-plane redesign spike</a>. The remaining queue-level coordination controls are implemented as bounded claimers, queue striping (<code>queue_stripe_count</code>), and per-queue enqueue-head sharding (<code>queue_meta.enqueue_shards</code>). The archived <a href="https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/bounded-claimers-plan.md">bounded-claimers plan</a> and <a href="https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/queue-striping-plan.md">queue-striping plan</a> capture design history; current operator guidance lives in <a href="../../configuration/#queue-storage-tuning">Queue storage tuning</a>.</p>
+<p>Spec-level safety is checked by the segmented-storage TLA+ family — <code>AwaSegmentedStorage</code>, <code>AwaSegmentedStorageRaces</code>, <code>AwaStorageLockOrder</code>, <code>AwaSegmentedStorageTrace</code> — under <a href="https://github.com/hardbyte/awa/tree/main/correctness/storage">the storage correctness models</a>. The <a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md">TLA+ action → Rust function mapping</a> records the correspondence.</p>
 <h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
 <h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
 <ul>
@@ -2280,6 +2452,7 @@
 
 
                 
+
               </article>
             </div>
           
@@ -2347,6 +2520,10 @@
     
     
       <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../javascripts/language-switch.js"></script>
+      
+        <script src="../../javascripts/agent-docs.js"></script>
       
     
   </body>

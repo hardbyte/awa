@@ -16,8 +16,6 @@
         <link rel="prev" href="../development/">
       
       
-        <link rel="next" href="../adr/">
-      
       
         
       
@@ -55,6 +53,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +74,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/benchmarking/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1309,9 +1317,35 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="0">
+            
   
   
   <span class="md-ellipsis">
@@ -1325,7 +1359,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1405,6 +1567,8 @@
       
         
           
+        
+      
         
       
         
@@ -1581,6 +1745,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1601,8 +1793,6 @@
       
         
           
-        
-      
         
       
         
@@ -1840,34 +2030,6 @@
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Cross-system comparison">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#2026-05-03-cross-system-reference-run" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        2026-05-03 cross-system reference run
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#queue-storage-striping-reference" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Queue-storage striping reference
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -2162,34 +2324,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -2303,34 +2437,6 @@
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Cross-system comparison">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#2026-05-03-cross-system-reference-run" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        2026-05-03 cross-system reference run
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#queue-storage-striping-reference" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Queue-storage striping reference
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -2629,6 +2735,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2753,91 +2867,6 @@
 <p><a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking"><strong>hardbyte/postgresql-job-queue-benchmarking</strong></a></p>
 <p>The companion repo currently benchmarks awa against pgque, procrastinate, pg-boss, river, oban, and pgmq using a shared subprocess contract: each adapter is a self-contained binary that emits one JSON sample per line. Headline numbers, per-system architectural notes, and reproducible run instructions are in that repo's <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/SYSTEM_COMPARISONS.md"><code>SYSTEM_COMPARISONS.md</code></a> and <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/results/2026-04-28/SUMMARY.md"><code>results/2026-04-28/SUMMARY.md</code></a>.</p>
 <p>The two tracks are deliberately separate. If they ever diverge on workload shape or thresholds, the awa-only benches in this file are canonical for awa's own numbers and the cross-system runner defers.</p>
-<h3 id="2026-05-03-cross-system-reference-run">2026-05-03 cross-system reference run<a class="headerlink" href="#2026-05-03-cross-system-reference-run" title="Permanent link">&para;</a></h3>
-<p>An overnight run of the companion benchmark repo compared <code>awa</code> 0.6 alpha builds with the same phase-driven harness. Treat these as reference results for shape and regression tracking, not universal product guarantees. These numbers are from pre-0.6.0 alpha builds; for the current 0.6.0 pinned-MVCC shape see the <a href="#mvcc-horizon-benchmark">MVCC Horizon Benchmark</a> section above and the #169 benchmark evidence in the <a href="https://github.com/hardbyte/awa/blob/main/CHANGELOG.md">CHANGELOG</a>.</p>
-<p>Key observations:</p>
-<ul>
-<li><code>awa</code> peak throughput improved by <code>49%</code> from 0.6.0-alpha.2 to 0.6.0-alpha.3 at 128 workers and one replica: <code>4,576</code> to <code>6,834</code> jobs/s. The same run showed a roughly <code>1.5x</code> to <code>1.7x</code> improvement across the worker-count matrix.</li>
-<li>Phase A matrix shape for <code>awa</code>: <code>296</code> -&gt; <code>1,115</code> -&gt; <code>3,961</code> -&gt; <code>6,834</code> jobs/s as worker count increased.</li>
-<li>Phase B <code>pgmq</code> peaked at <code>13,290</code> jobs/s at 16 workers and collapsed at 128 workers, matching the previously observed high-worker behaviour.</li>
-<li>Phase C multi-replica runs exposed the remaining <code>awa</code> topology sensitivity: at fixed total workers, throughput fell from <code>3,560</code> to <code>2,491</code> to <code>1,503</code> jobs/s across <code>1x64</code>, <code>2x32</code>, and <code>4x16</code>. That shape is consistent with fleet-wide completion flusher contention (<code>processes x AWA_COMPLETION_SHARDS</code>). <code>pgque</code> moved in the opposite direction in the same run (<code>18,660</code> -&gt; <code>34,388</code> -&gt; <code>38,810</code>), so this remains a useful comparison target rather than noise to smooth over.</li>
-<li>Phase D 60-minute <code>awa</code> soak sustained a median <code>5,369</code> jobs/s with median dead tuples around <code>396</code>, validating the ADR-019 / ADR-023 hot-path dead-tuple promise under sustained churn.</li>
-</ul>
-<p>Queue-storage e2e sweeps separate tuning from storage design. For the hot single-queue shape, <code>enqueue_shards = 4</code> plus larger completion batches sustained <code>7.9k</code> completed jobs/s with <code>200ms</code> p99 end-to-end latency and bounded depth. Increasing <code>claimers</code> did not materially improve that shape.</p>
-<p>When the application can accept partitioned ordering at the logical workload level, routing through several physical queues with <code>PartitionedQueue</code> is the preferred throughput lever: it creates independent claim and completion coordination streams rather than adding more claimers to one queue head.</p>
-<p>ADR-026 terminal-count deltas remove hot-path <code>queue_terminal_live_counts</code> updates. <code>done_entries</code> terminal paths append signed deltas, compact receipt completions are counted from retained <code>receipt_completion_batches_*</code> minus <code>receipt_completion_tombstones_*</code>, and exact reads include all retained evidence plus permanent rollups. Maintenance folds sealed <code>done_entries</code> delta slots into compact counters only when the MVCC horizon is not pinned by another backend snapshot or idle transaction id. Benchmark runs should therefore sample <code>queue_terminal_count_deltas_*</code>, <code>receipt_completion_batches_*</code>, and <code>queue_terminal_live_counts</code> so regressions distinguish pending append-only rows from mutable-counter dead tuples.</p>
-<p>The offered-rate benchmark exercises absorption directly and samples WAL. With one claimer, <code>claim_batch_size = 512</code>, <code>AWA_COMPLETION_BATCH_SIZE = 512</code>, the fused receipt completion path, and <code>max_workers = 1024</code> (which selects four queue-storage completion shards by default), a 10-second no-op run at <code>10k/s</code> offered load keeps durable completions at the offered rate, drains to zero backlog, and writes <code>1.80 KiB</code> WAL per completed job. <code>max_workers = 512</code> is close but does not consistently meet the 10k offered target, because no-op handlers hold permits while waiting for durable completion acknowledgement.</p>
-<p>First-principles WAL accounting compared the production path, a narrow <code>done_entries</code> row, and a deliberately non-production path that skipped durable terminal history entirely:</p>
-<table>
-<thead>
-<tr>
-<th>Shape</th>
-<th style="text-align: right;">Completed jobs/s</th>
-<th style="text-align: right;">p99 e2e</th>
-<th style="text-align: right;">WAL/job</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Tuned production queue storage</td>
-<td style="text-align: right;"><code>7,885/s</code></td>
-<td style="text-align: right;"><code>203 ms</code></td>
-<td style="text-align: right;"><code>2,241 B</code></td>
-</tr>
-<tr>
-<td>Narrow terminal history</td>
-<td style="text-align: right;"><code>8,337/s</code></td>
-<td style="text-align: right;"><code>205 ms</code></td>
-<td style="text-align: right;"><code>1,932 B</code></td>
-</tr>
-<tr>
-<td>Skip <code>done_entries</code> entirely</td>
-<td style="text-align: right;"><code>8,402/s</code></td>
-<td style="text-align: right;"><code>230 ms</code></td>
-<td style="text-align: right;"><code>1,441 B</code></td>
-</tr>
-</tbody>
-</table>
-<p>The adopted design keeps the durable terminal fact and public <code>{schema}.terminal_jobs</code> surface while avoiding duplicated ready-body fields. Successful receipt completions can now write compact <code>receipt_completion_batches_*</code> rows instead of one <code>done_entries_*</code> row per job. The skip-durable-history experiment remains rejected because it weakens the terminal-history contract.</p>
-<h3 id="queue-storage-striping-reference">Queue-storage striping reference<a class="headerlink" href="#queue-storage-striping-reference" title="Permanent link">&para;</a></h3>
-<p>Queue striping is a contention-control knob for workloads dominated by one hot logical queue. The companion benchmark repo includes an awa-only sweep of <code>queue_storage_queue_stripe_count</code> over <code>1</code>, <code>2</code>, and <code>4</code> at <code>64</code>, <code>128</code>, <code>256</code>, and <code>512</code> workers. The source artifact lives in companion benchmark PR <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/pull/21">#21</a>.</p>
-<p>Reference result:</p>
-<table>
-<thead>
-<tr>
-<th style="text-align: right;">Stripes</th>
-<th style="text-align: right;">64 workers</th>
-<th style="text-align: right;">128 workers</th>
-<th style="text-align: right;">256 workers</th>
-<th style="text-align: right;">512 workers</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align: right;">1</td>
-<td style="text-align: right;"><code>3,408/s</code></td>
-<td style="text-align: right;"><code>4,741/s</code></td>
-<td style="text-align: right;"><code>9,530/s</code></td>
-<td style="text-align: right;"><code>11,188/s</code></td>
-</tr>
-<tr>
-<td style="text-align: right;">2</td>
-<td style="text-align: right;"><code>4,654/s</code></td>
-<td style="text-align: right;"><code>7,667/s</code></td>
-<td style="text-align: right;"><code>11,975/s</code></td>
-<td style="text-align: right;"><code>11,173/s</code></td>
-</tr>
-<tr>
-<td style="text-align: right;">4</td>
-<td style="text-align: right;"><code>4,378/s</code></td>
-<td style="text-align: right;"><code>7,596/s</code></td>
-<td style="text-align: right;"><code>11,418/s</code></td>
-<td style="text-align: right;"><code>11,443/s</code></td>
-</tr>
-</tbody>
-</table>
-<p>The clearest gain was the <code>1 -&gt; 2</code> stripe step: at <code>128</code> workers throughput rose by <code>62%</code>, and at <code>256</code> workers throughput rose by <code>26%</code> while end-to-end p99 fell from <code>1,802 ms</code> to <code>1,027 ms</code>. <code>4</code> stripes mostly matched <code>2</code> stripes in this shape, with the only clear advantage at the <code>512</code> worker tail.</p>
-<p>Treat this as tuning guidance, not an out-of-the-box setting. The default stays <code>queue_storage_queue_stripe_count=1</code>; hot single-queue deployments should consider <code>2</code> after measuring their own worker/replica shape.</p>
 <h2 id="python-runtime-benchmarks">Python Runtime Benchmarks<a class="headerlink" href="#python-runtime-benchmarks" title="Permanent link">&para;</a></h2>
 <p>The Python benchmark script exercises the real <code>awa-python</code> worker path while reusing the same database-facing benchmark shapes as the Rust runtime:</p>
 <p><strong>Baseline scenarios</strong> (<code>--scenario baseline</code>):</p>
@@ -3200,6 +3229,7 @@
 
 
                 
+
               </article>
             </div>
           
@@ -3239,22 +3269,6 @@
             </div>
           </a>
         
-        
-          
-          <a href="../adr/" class="md-footer__link md-footer__link--next" aria-label="Next: Architecture decisions">
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Next
-              </span>
-              <div class="md-ellipsis">
-                Architecture decisions
-              </div>
-            </div>
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
-            </div>
-          </a>
         
       </nav>
     
@@ -3305,6 +3319,10 @@
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

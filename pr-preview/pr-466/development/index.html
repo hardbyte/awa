@@ -55,6 +55,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +76,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/development/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -90,7 +100,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#development-guide" class="md-skip">
+        <a href="#development" class="md-skip">
           Skip to content
         </a>
       
@@ -1309,9 +1319,35 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="0">
+            
   
   
   <span class="md-ellipsis">
@@ -1325,7 +1361,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1405,6 +1569,8 @@
       
         
           
+        
+      
         
       
         
@@ -1581,6 +1747,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1601,8 +1795,6 @@
       
         
           
-        
-      
         
       
         
@@ -1733,60 +1925,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#release-process" class="md-nav__link">
+  <a href="#repository-layout" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Release Process
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Release Process">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#workflow" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Workflow
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#steps" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Steps
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#why-pre-releases-matter" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Why pre-releases matter
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#crate-dependencies" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Crate Dependencies
+        Repository layout
       
     </span>
   </a>
@@ -1794,10 +1936,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#running-tests" class="md-nav__link">
+  <a href="#local-checks" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Running Tests
+        Local checks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#where-contributor-policy-lives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where contributor policy lives
       
     </span>
   </a>
@@ -1808,18 +1961,7 @@
   <a href="#authoring-schema-migrations" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Authoring Schema Migrations
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#pre-commit-checks-rust" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Pre-commit Checks (Rust)
+        Authoring schema migrations
       
     </span>
   </a>
@@ -1850,34 +1992,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -1925,60 +2039,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#release-process" class="md-nav__link">
+  <a href="#repository-layout" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Release Process
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Release Process">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#workflow" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Workflow
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#steps" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Steps
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#why-pre-releases-matter" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Why pre-releases matter
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#crate-dependencies" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Crate Dependencies
+        Repository layout
       
     </span>
   </a>
@@ -1986,10 +2050,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#running-tests" class="md-nav__link">
+  <a href="#local-checks" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Running Tests
+        Local checks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#where-contributor-policy-lives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where contributor policy lives
       
     </span>
   </a>
@@ -2000,18 +2075,7 @@
   <a href="#authoring-schema-migrations" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Authoring Schema Migrations
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#pre-commit-checks-rust" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Pre-commit Checks (Rust)
+        Authoring schema migrations
       
     </span>
   </a>
@@ -2031,6 +2095,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2038,164 +2110,86 @@
   
 
 
-<h1 id="development-guide">Development Guide<a class="headerlink" href="#development-guide" title="Permanent link">&para;</a></h1>
-<h2 id="release-process">Release Process<a class="headerlink" href="#release-process" title="Permanent link">&para;</a></h2>
-<p>Use pre-release tags before publishing a final version. Both crates.io and PyPI treat published versions as immutable — a botched release cannot be overwritten and the version number is burned.</p>
-<h3 id="workflow">Workflow<a class="headerlink" href="#workflow" title="Permanent link">&para;</a></h3>
-<ol>
-<li><strong>Alpha</strong> — early integration testing:
-   <div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>v0.x.0-alpha.1 → v0.x.0-alpha.2 → ...
-</span></code></pre></div></li>
-<li><strong>Release candidate</strong> — feature-complete, verifying in staging:
-   <div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>v0.x.0-rc.1 → v0.x.0-rc.2 → ...
-</span></code></pre></div></li>
-<li><strong>Final release</strong> — CI green, all checks pass:
-   <div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>v0.x.0
-</span></code></pre></div></li>
-</ol>
-<h3 id="steps">Steps<a class="headerlink" href="#steps" title="Permanent link">&para;</a></h3>
-<ol>
-<li>Bump version in these release manifests:</li>
-<li><code>Cargo.toml</code> (workspace <code>[workspace.package].version</code> and every workspace dependency whose version points at an Awa crate being released)</li>
-<li><code>awa/Cargo.toml</code> (<code>awa-testing</code> dev-dependency version)</li>
-<li><code>awa-cli/Cargo.toml</code> (<code>awa-ui</code> dependency version)</li>
-<li><code>awa-cli/pyproject.toml</code> (<code>[project].version</code> — controls CLI wheel version on PyPI)</li>
-<li><code>awa-python/Cargo.toml</code> (<code>version</code>, <code>awa-model</code>, <code>awa-worker</code> dep versions)</li>
-<li><code>awa-python/pyproject.toml</code> (<code>[project].version</code> — controls SDK wheel version on PyPI)</li>
-<li>Finalize the matching changelog section and commit the release preparation.</li>
-<li>Push a branch and open a PR against the branch being released. Apply the
-   <code>full-ci</code> label and wait for every check, including the TLA+ storage models.</li>
-<li>After merge, record the release branch's exact commit SHA and wait for the
-   automatically triggered <strong>CI</strong> workflow to pass completely. The Release
-   workflow refuses to publish unless this exact-SHA branch-push run succeeded;
-   a PR run against a pre-merge SHA is not sufficient.</li>
-<li>Tag and push the validated commit, for example:
-   <code>git tag v0.x.0-alpha.1 &amp;&amp; git push origin v0.x.0-alpha.1</code>.</li>
-<li>The Release workflow reruns the rolling-upgrade rehearsal on the tagged
-   commit, builds wheels, publishes to crates.io and PyPI, and creates a GitHub
-   Release with binary assets.</li>
-<li>When ready for final: bump the version to <code>0.x.0</code>, repeat steps 2–4 for the
-   final release preparation, then tag the validated commit as <code>v0.x.0</code>.</li>
-</ol>
-<h3 id="why-pre-releases-matter">Why pre-releases matter<a class="headerlink" href="#why-pre-releases-matter" title="Permanent link">&para;</a></h3>
-<p>v0.2.0 was published directly. The GitHub Release workflow tried to attach binary assets to an already-published release, which GitHub blocks. Pre-release tags avoid this because:</p>
-<ul>
-<li>Draft releases are created by the workflow, not manually</li>
-<li>If a pre-release has problems, you bump to <code>-alpha.2</code> instead of fighting immutable registries</li>
-</ul>
-<h2 id="crate-dependencies">Crate Dependencies<a class="headerlink" href="#crate-dependencies" title="Permanent link">&para;</a></h2>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa-macros  (proc-macro, no runtime deps)
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    │
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    ▼
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>awa-model   (core types + SQL, re-exports awa-macros::JobArgs)
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    │
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>    ├──────────────┬──────────────┐
-</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>    ▼              ▼              ▼
-</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>awa-worker     awa-ui          awa-cli
-</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>    │          (axum API +       (depends on awa-ui)
-</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>    │           embedded UI)
-</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>    ├──────────────┐
-</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a>    ▼              ▼
-</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>awa (facade)   awa-testing
-</span><span id="__span-3-14"><a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a>                   │
-</span><span id="__span-3-15"><a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>                   ▼
-</span><span id="__span-3-16"><a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>              awa-python (PyO3 bridge, separate workspace)
-</span></code></pre></div>
-<p>Key dependencies per crate:</p>
+<h1 id="development">Development<a class="headerlink" href="#development" title="Permanent link">&para;</a></h1>
+<p>This page is a short orientation for contributors building Awa locally. Release procedure, migration-author checklists, and CI policy are maintained in the repository's contributor files and workflow definitions because they change with the codebase and are not part of the user documentation contract.</p>
+<h2 id="repository-layout">Repository layout<a class="headerlink" href="#repository-layout" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
-<th>Crate</th>
-<th>Key deps</th>
+<th>Path</th>
+<th>Purpose</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>awa-model</code></td>
-<td>sqlx, blake3, serde, chrono, chrono-tz, croner</td>
+<td>Core types, SQL, and migrations</td>
 </tr>
 <tr>
 <td><code>awa-worker</code></td>
-<td>awa-model, tokio, opentelemetry</td>
+<td>Dispatch, execution, maintenance, and telemetry</td>
 </tr>
 <tr>
-<td><code>awa-ui</code></td>
-<td>awa-model, axum, rust-embed</td>
+<td><code>awa</code></td>
+<td>Public Rust facade</td>
 </tr>
 <tr>
-<td><code>awa-cli</code></td>
-<td>awa-model, awa-ui, axum, clap</td>
+<td><code>awa-cli</code> / <code>awa-ui</code></td>
+<td>Command-line tools and embedded admin interface</td>
 </tr>
 <tr>
 <td><code>awa-python</code></td>
-<td>awa-model, awa-worker, pyo3, pyo3-async-runtimes</td>
+<td>PyO3 Python package and Python worker API</td>
+</tr>
+<tr>
+<td><code>awa-testing</code></td>
+<td>Test support</td>
+</tr>
+<tr>
+<td><code>correctness</code></td>
+<td>Executable TLA+ models and trace checks</td>
+</tr>
+<tr>
+<td><code>docs</code></td>
+<td>MkDocs site and source ADRs</td>
 </tr>
 </tbody>
 </table>
-<h2 id="running-tests">Running Tests<a class="headerlink" href="#running-tests" title="Permanent link">&para;</a></h2>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Start Postgres</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span>--name<span class="w"> </span>awa-pg<span class="w"> </span>-e<span class="w"> </span><span class="nv">POSTGRES_PASSWORD</span><span class="o">=</span><span class="nb">test</span><span class="w"> </span>-e<span class="w"> </span><span class="nv">POSTGRES_DB</span><span class="o">=</span>awa_test<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span>-p<span class="w"> </span><span class="m">15432</span>:5432<span class="w"> </span>postgres:17-alpine
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="c1"># Rust</span>
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--workspace
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="c1"># Python</span>
-</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="nb">cd</span><span class="w"> </span>awa-python
-</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>uv<span class="w"> </span>run<span class="w"> </span>maturin<span class="w"> </span>develop
-</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span>uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>tests/<span class="w"> </span>-v
-</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>
-</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="c1"># TLA+ correctness models</span>
-</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>./correctness/run-tlc.sh<span class="w"> </span>core/AwaCore.tla
-</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>./correctness/run-tlc.sh<span class="w"> </span>protocol/AwaExtended.tla
+<h2 id="local-checks">Local checks<a class="headerlink" href="#local-checks" title="Permanent link">&para;</a></h2>
+<p>Start a supported PostgreSQL instance and provide its URL to the test suite:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span>--name<span class="w"> </span>awa-pg<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>-e<span class="w"> </span><span class="nv">POSTGRES_PASSWORD</span><span class="o">=</span><span class="nb">test</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>-e<span class="w"> </span><span class="nv">POSTGRES_DB</span><span class="o">=</span>awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span>-p<span class="w"> </span><span class="m">15432</span>:5432<span class="w"> </span>postgres:17-alpine
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="nb">export</span><span class="w"> </span><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--workspace
 </span></code></pre></div>
-<h2 id="authoring-schema-migrations">Authoring Schema Migrations<a class="headerlink" href="#authoring-schema-migrations" title="Permanent link">&para;</a></h2>
-<p>Policy: <a href="../adr/041-rolling-upgrade-policy/">ADR-041 — rolling-upgrade policy</a>. Use this checklist before opening a migration PR; version floors, exclusive migrations, and the newer-schema fail-safe live in <code>awa-model/src/migrations.rs</code>.</p>
-<p>Checklist for any new <code>awa-model/migrations/vNNN_*.sql</code>:</p>
-<p><strong>Every migration</strong></p>
-<ul class="task-list">
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Keep every object used by N−1 binaries compatible: no drops, type changes, or tightened constraints; make new objects and columns additive.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Make the migration safe to re-run with guards such as <code>IF NOT EXISTS</code> and guarded <code>DO</code> blocks.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> In the header, link the issue and state how N−1 binaries operate against the migrated schema.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Safe under live load: no long <code>ACCESS EXCLUSIVE</code> holds on hot tables; note the expected wall time on realistic data volumes.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> The current binary remains operable before migration, or startup applies the migration before any changed path runs. Test binary-first as well as migrate-first ordering.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Document requirements for external runners, which do not execute Rust preflights.</li>
-</ul>
-<p><strong>If compatibility first ships in an earlier-release patch</strong></p>
-<ul class="task-list">
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Add the released, verified patch to <code>MIGRATION_RUNTIME_VERSION_FLOORS</code>; test old, unparseable, and stale runtimes plus <code>--allow-live-runtimes</code>.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Keep the preflight race-free and record any observability-snapshot stall from its lock. Job and lease heartbeats must remain unaffected.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Publish the patch prerequisite before the migration and document it in the CHANGELOG and upgrade guide.</li>
-</ul>
-<p><strong>If it changes an on-disk representation or hot-path structure (expand → flip → contract)</strong></p>
-<ul class="task-list">
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Make the migration the <strong>expand</strong> phase only: seed the new representation, keep the old one authoritative, and store authority explicitly. Fresh installs may start on the new representation.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Gate the runtime <strong>flip</strong> on fresh fleet capability. Install the schema-owned per-feature capability constant with the expand migration; treat missing or unparseable evidence as incapable and make any override explicit.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Under the old-writer locks, the flip treats the old representation as source of truth, reconciles the complete new representation, verifies exact equivalence, and changes authority atomically. Shadow writes alone do not satisfy this requirement.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> The flip <strong>fences</strong> returning pre-flip binaries at the database boundary. Exercise the actual N−1 write path; a sentinel is insufficient if old code can advance through it.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> The <strong>contract</strong> migration (dropping the old representation) is deferred to a later minor, tracked as its own issue, and independently checked against that release's N−1 contract.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Model mixed-version interleavings in TLA+ when a state machine or lock order changes.</li>
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Rehearse migrate-first, binary-first, and overlapping rollouts with a released N−1 artifact. Include concurrent old/new workers, failures and retries, scheduled work, in-flight work, hard-kill and deadline rescue, flip/fence behavior, and exact job accounting; record the evidence. CI automation is <a href="https://github.com/hardbyte/awa/issues/427">#427</a>.</li>
-</ul>
-<p><strong>If no rolling-compatible design is practical</strong></p>
-<ul class="task-list">
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Explain in an ADR why expand/flip/contract and a version floor are insufficient, then add the migration to <code>EXCLUSIVE_WINDOW_MIGRATIONS</code> with refusal, override, and stale-heartbeat tests plus explicit operator documentation.</li>
-</ul>
-<p><strong>Docs</strong></p>
-<ul class="task-list">
-<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Update the CHANGELOG, the release upgrade guide when operator action is required, and <code>docs/stability.md</code> when the skew contract changes. Link compatibility claims to rehearsals of the claimed version topology; describe narrower evidence only by the behavior it covers.</li>
-</ul>
-<h2 id="pre-commit-checks-rust">Pre-commit Checks (Rust)<a class="headerlink" href="#pre-commit-checks-rust" title="Permanent link">&para;</a></h2>
-<p>Always run before committing Rust changes:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>cargo<span class="w"> </span>fmt<span class="w"> </span>--all
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="nv">SQLX_OFFLINE</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>cargo<span class="w"> </span>clippy<span class="w"> </span>--all-targets<span class="w"> </span>--all-features<span class="w"> </span>--<span class="w"> </span>-D<span class="w"> </span>warnings
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="nv">SQLX_OFFLINE</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>--workspace
+<p>The Python package uses <code>uv</code>:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nb">cd</span><span class="w"> </span>awa-python
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>uv<span class="w"> </span>run<span class="w"> </span>maturin<span class="w"> </span>develop
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>uv<span class="w"> </span>run<span class="w"> </span>pytest<span class="w"> </span>tests/<span class="w"> </span>-v
 </span></code></pre></div>
-<p>The Python crate lives in a separate workspace:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">cd</span><span class="w"> </span>awa-python
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>cargo<span class="w"> </span>fmt<span class="w"> </span>--all
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="nv">SQLX_OFFLINE</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>cargo<span class="w"> </span>clippy<span class="w"> </span>--all-targets<span class="w"> </span>--<span class="w"> </span>-D<span class="w"> </span>warnings
+<p>Run the core correctness models with the repository wrapper:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>./correctness/run-tlc.sh<span class="w"> </span>core/AwaCore.tla
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>./correctness/run-tlc.sh<span class="w"> </span>protocol/AwaExtended.tla
 </span></code></pre></div>
+<p>Before submitting Rust changes, format and run the same offline checks used by CI:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>cargo<span class="w"> </span>fmt<span class="w"> </span>--all
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">SQLX_OFFLINE</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>cargo<span class="w"> </span>clippy<span class="w"> </span>--all-targets<span class="w"> </span>--all-features<span class="w"> </span>--<span class="w"> </span>-D<span class="w"> </span>warnings
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="nv">SQLX_OFFLINE</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>--workspace
+</span></code></pre></div>
+<p><code>awa-python</code> is a separate Rust workspace; run formatting and clippy from that directory too.</p>
+<h2 id="where-contributor-policy-lives">Where contributor policy lives<a class="headerlink" href="#where-contributor-policy-lives" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="https://github.com/hardbyte/awa">Repository README</a> — project overview and workspace entry point.</li>
+<li><a href="https://github.com/hardbyte/awa/tree/main/.github/workflows">GitHub Actions workflows</a> — the current CI and release gates.</li>
+<li><a href="../adr/041-rolling-upgrade-policy/">ADR-041</a> — architectural policy for rolling-compatible migrations.</li>
+<li><a href="../benchmarking/">Benchmarking</a> — reproducible performance suites and how to interpret their results.</li>
+</ul>
+<p>When a schema change affects users or operators, update the relevant upgrade guide and <a href="../stability/">stability policy</a>. Detailed migration implementation checklists belong beside the migration code and review process rather than in the public product guide.</p>
+<h2 id="authoring-schema-migrations">Authoring schema migrations<a class="headerlink" href="#authoring-schema-migrations" title="Permanent link">&para;</a></h2>
+<p>Schema changes must follow <a href="../adr/041-rolling-upgrade-policy/">ADR-041's expand, capability-gated flip, and later contract policy</a>. The repository's contributor guidance and migration tests hold the implementation checklist; upgrade guides document any action required from operators.</p>
 
 
 
@@ -2209,6 +2203,7 @@
 
 
                 
+
               </article>
             </div>
           
@@ -2314,6 +2309,10 @@
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

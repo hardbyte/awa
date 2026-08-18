@@ -55,6 +55,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +76,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/dead-letter-queue/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1449,9 +1459,35 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="0">
+            
   
   
   <span class="md-ellipsis">
@@ -1465,7 +1501,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1545,6 +1709,8 @@
       
         
           
+        
+      
         
       
         
@@ -1721,6 +1887,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1739,8 +1933,6 @@
       
         
           
-        
-      
         
       
         
@@ -1844,34 +2036,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -2019,6 +2183,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2082,15 +2254,15 @@
 </span></code></pre></div>
 <p>Purging is destructive: the rows are deleted from <code>dlq_entries</code> and not recoverable through the DLQ tools. Use with care; prefer <code>retry-bulk</code> if you might want the data back.</p>
 <h2 id="retention">Retention<a class="headerlink" href="#retention" title="Permanent link">&para;</a></h2>
-<p>The maintenance leader periodically prunes DLQ rows older than the configured retention window. See <a href="../configuration/"><code>docs/configuration.md</code></a> for the <code>dlq_retention_*</code> knobs. Retention runs alongside the rotation / prune work for the queue and lease rings, so a busy DLQ does not delay queue-plane reclamation.</p>
+<p>The maintenance leader periodically prunes DLQ rows older than the configured retention window. See <a href="../configuration/">Configuration</a> for the <code>dlq_retention_*</code> knobs. Retention runs alongside the rotation / prune work for the queue and lease rings, so a busy DLQ does not delay queue-plane reclamation.</p>
 <h2 id="programmatic-access">Programmatic access<a class="headerlink" href="#programmatic-access" title="Permanent link">&para;</a></h2>
 <p>Rust callers use <code>awa_model::dlq</code> directly, or <code>awa::model::dlq</code> through the facade crate, for DLQ list, retry, move, and purge helpers. Admin helpers such as <code>awa::admin::fail_to_dlq</code>, <code>move_failed_to_dlq</code>, and <code>bulk_move_failed_to_dlq</code> route failed terminal jobs into the DLQ.</p>
 <p>Python callers use direct client methods: <code>list_dlq</code>, <code>get_dlq_job</code>, <code>dlq_depth</code>, <code>dlq_depth_by_queue</code>, <code>retry_from_dlq</code>, <code>bulk_retry_from_dlq</code>, <code>move_failed_to_dlq</code>, <code>purge_dlq</code>, and <code>purge_dlq_job</code>. <code>purge_dlq(...)</code> is the bulk purge helper; <code>purge_dlq_job(...)</code> purges one DLQ row by job ID. These wrap the same SQL helpers the CLI uses.</p>
 <h2 id="see-also">See also<a class="headerlink" href="#see-also" title="Permanent link">&para;</a></h2>
 <ul>
 <li><a href="../adr/020-dead-letter-queue/">ADR-020 — Dead Letter Queue</a> — design and trade-offs.</li>
-<li><a href="../configuration/">configuration.md</a> — <code>dlq_enabled</code> per queue, retention knobs.</li>
-<li><a href="../troubleshooting/">troubleshooting.md</a> — diagnosing why a particular job reached the DLQ.</li>
+<li><a href="../configuration/">Configuration</a> — <code>dlq_enabled</code> per queue, retention knobs.</li>
+<li><a href="../troubleshooting/">Troubleshooting</a> — diagnosing why a particular job reached the DLQ.</li>
 </ul>
 
 
@@ -2105,6 +2277,7 @@
 
 
                 
+
               </article>
             </div>
           
@@ -2210,6 +2383,10 @@
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

@@ -51,6 +51,12 @@
     
       <link rel="stylesheet" href="../../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -66,6 +72,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/adr/023-receipt-plane-ring-partitioning/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1303,9 +1313,35 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="0">
+            
   
   
   <span class="md-ellipsis">
@@ -1319,7 +1355,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1399,6 +1563,8 @@
       
         
           
+        
+      
         
       
         
@@ -1575,6 +1741,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1593,8 +1787,6 @@
       
         
           
-        
-      
         
       
         
@@ -1698,34 +1890,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -2056,6 +2220,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2091,7 +2263,7 @@
 <ul>
 <li>Do not change the heartbeat / deadline / callback-timeout rescue contract. Those continue to live on <code>attempt_state</code> and <code>active_leases</code>.</li>
 <li>Do not change the external API or the <code>(job_id, run_lease)</code> stale-writer guard.</li>
-<li>Do not introduce any new reservation or pre-start state. The archived <a href="../../archive/0.6-storage-design/lease-plane-redesign-spike/"><code>lease-plane-redesign-spike</code></a> record shows that direction has been tried and rejected repeatedly on cost grounds.</li>
+<li>Do not introduce any new reservation or pre-start state. The archived <a href="https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/lease-plane-redesign-spike.md">lease-plane redesign spike</a> record shows that direction has been tried and rejected repeatedly on cost grounds.</li>
 </ul>
 <h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
 <p>Apply ADR-019's rotation-and-prune pattern to the receipt plane. Remove <code>open_receipt_claims</code> as a distinct table.</p>
@@ -2193,12 +2365,12 @@
 <h3 id="update-based-soft-close-on-open_receipt_claims">UPDATE-based soft close on <code>open_receipt_claims</code><a class="headerlink" href="#update-based-soft-close-on-open_receipt_claims" title="Permanent link">&para;</a></h3>
 <p>Rejected. Marking a <code>closed_at</code> column and sweeping closed rows periodically keeps the table live-bounded, and a HOT-eligible <code>UPDATE</code> avoids a new heap tuple. But the sweep still performs <code>DELETE</code>s in batch, index bloat still tracks throughput, and the architectural outlier persists.</p>
 <h3 id="ship-06-with-receipts-off">Ship 0.6 with receipts off<a class="headerlink" href="#ship-06-with-receipts-off" title="Permanent link">&para;</a></h3>
-<p>Rejected. Shipping with receipts off lets 0.6 hit the dead-tuple budget today, but it leaves the short-job path on the mutable <code>leases</code> ring and defers the work tracked in the archived <a href="../../archive/0.6-storage-design/lease-plane-redesign-spike/"><code>lease-plane-redesign-spike</code></a>. ADR-019's vacuum-aware intent is only satisfied when receipts are on by default and do not regress the dead-tuple budget. This ADR is the path to that posture.</p>
+<p>Rejected. Shipping with receipts off lets 0.6 hit the dead-tuple budget today, but it leaves the short-job path on the mutable <code>leases</code> ring and defers the work tracked in the archived <a href="https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/lease-plane-redesign-spike.md">lease-plane redesign spike</a>. ADR-019's vacuum-aware intent is only satisfied when receipts are on by default and do not regress the dead-tuple budget. This ADR is the path to that posture.</p>
 <h2 id="relationship-to-earlier-adrs">Relationship to Earlier ADRs<a class="headerlink" href="#relationship-to-earlier-adrs" title="Permanent link">&para;</a></h2>
 <ul>
 <li>ADR-019 established the vacuum-aware discipline. This ADR applies that discipline to the one remaining hot table that did not follow it.</li>
 <li>ADR-013 (run-lease-guarded finalization) is unchanged. The authoritative record for <code>(job_id, run_lease)</code> staleness moves from a bounded mutable frontier to partitioned append-only tables; the guarantee does not.</li>
-<li>The archived <a href="../../archive/0.6-storage-design/lease-plane-redesign-spike/"><code>lease-plane-redesign-spike</code></a> identifies <code>open_receipt_claims</code> as the compromise that unblocked the receipt-backed path. This ADR is the follow-through that the spike anticipated.</li>
+<li>The archived <a href="https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/lease-plane-redesign-spike.md">lease-plane redesign spike</a> identifies <code>open_receipt_claims</code> as the compromise that unblocked the receipt-backed path. This ADR is the follow-through that the spike anticipated.</li>
 </ul>
 <h2 id="implementation-and-validation-status">Implementation and Validation Status<a class="headerlink" href="#implementation-and-validation-status" title="Permanent link">&para;</a></h2>
 <p>This ADR has been implemented for 0.6:</p>
@@ -2213,9 +2385,9 @@
 </ul>
 <p>Validation evidence is split by purpose:</p>
 <ul>
-<li>Runtime and long-horizon evidence lives in <a href="../bench/023-receipt-ring-validation-2026-04-26/"><code>bench/023-receipt-ring-validation-2026-04-26.md</code></a>. The recorded runs include the 115-minute 4x8 receipts-on long-horizon run and the 12-hour overnight run; receipt closure partitions stayed at 0 dead tuples across every phase, and receipt claims remained bounded.</li>
-<li>Spec and implementation mapping lives in <a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md"><code>correctness/storage/MAPPING.md</code></a>. The storage TLA+ family models claim-ring rotation, partition prune safety, receipt rescue, running cancel, and DLQ retry trace witnesses.</li>
-<li>Operator-facing tuning and defaults live in <a href="../../configuration/#queue-storage-tuning"><code>../configuration.md</code></a>.</li>
+<li>Runtime and long-horizon evidence lives in the <a href="../bench/023-receipt-ring-validation-2026-04-26/">receipt-ring validation record</a>. The recorded runs include the 115-minute 4x8 receipts-on long-horizon run and the 12-hour overnight run; receipt closure partitions stayed at 0 dead tuples across every phase, and receipt claims remained bounded.</li>
+<li>Spec and implementation correspondence lives in the <a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md">storage model mapping</a>. The storage TLA+ family models claim-ring rotation, partition prune safety, receipt rescue, running cancel, and DLQ retry trace witnesses.</li>
+<li>Operator-facing tuning and defaults live in <a href="../../configuration/#queue-storage-tuning">Queue storage tuning</a>.</li>
 </ul>
 <p>The detailed phase-by-phase implementation notes were intentionally kept out of this ADR. ADRs record the decision and its consequences; dated build logs, benchmark output, and branch-era investigation notes belong in validation artifacts or the 0.6 storage-design archive.</p>
 
@@ -2231,6 +2403,7 @@
 
 
                 
+
               </article>
             </div>
           
@@ -2298,6 +2471,10 @@
     
     
       <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../javascripts/language-switch.js"></script>
+      
+        <script src="../../javascripts/agent-docs.js"></script>
       
     
   </body>

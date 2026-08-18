@@ -55,6 +55,12 @@
     
       <link rel="stylesheet" href="../stylesheets/extra.css">
     
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
     <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
@@ -70,6 +76,10 @@
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://hardbyte.github.io/awa/upgrade-0.6-to-0.7/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -1477,9 +1487,38 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+    
+    
+      
         
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+          
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_7" id="__nav_5_7_label" tabindex="">
+            
   
   
   <span class="md-ellipsis">
@@ -1493,7 +1532,135 @@
   
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -1573,6 +1740,8 @@
       
         
           
+        
+      
         
       
         
@@ -1749,6 +1918,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1767,8 +1964,6 @@
       
         
           
-        
-      
         
       
         
@@ -1872,34 +2067,6 @@
     
   
     Benchmarking
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
   
 
     
@@ -2075,6 +2242,14 @@
               
               <article class="md-content__inner md-typeset">
                 
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
                   
 
 
@@ -2105,13 +2280,13 @@ needs a canonical implementation, and gives operators one unambiguous instructio
 <p>You are done with the storage step. Deploy 0.7 binaries and run <code>awa migrate</code> as usual.</p>
 <h2 id="if-you-are-on-06-not-yet-finalized">If you are on 0.6, not yet finalized<a class="headerlink" href="#if-you-are-on-06-not-yet-finalized" title="Permanent link">&para;</a></h2>
 <p>Complete the staged transition <strong>on your 0.6 binaries</strong> first
-(full procedure: <a href="../upgrade-0.5-to-0.6/">upgrade-0.5-to-0.6.md</a>):</p>
+(full procedure: <a href="../upgrade-0.5-to-0.6/">Upgrade 0.5 to 0.6</a>):</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
 </span></code></pre></div>
 <p>Then upgrade binaries to 0.7 and run <code>awa migrate</code>.</p>
-<p>If <code>finalize --wait</code> sits at a non-zero backlog that never falls while jobs are visibly executing, your workload probably contains <strong>perpetually snoozing jobs</strong> — handlers that end every run in <code>JobResult::Snooze</code>. On builds before <a href="https://github.com/hardbyte/awa/issues/456">#456</a> those re-entered canonical <code>scheduled_jobs</code> after each post-flip run, replenishing the backlog forever. Roll to a build carrying that fix (or apply the manual backlog migration in <a href="../upgrade-0.5-to-0.6/#known-issues">upgrade-0.5-to-0.6.md</a>) before waiting on finalize.</p>
+<p>If <code>finalize --wait</code> sits at a non-zero backlog that never falls while jobs are visibly executing, your workload probably contains <strong>perpetually snoozing jobs</strong> — handlers that end every run in <code>JobResult::Snooze</code>. On builds before <a href="https://github.com/hardbyte/awa/issues/456">#456</a> those re-entered canonical <code>scheduled_jobs</code> after each post-flip run, replenishing the backlog forever. Roll to a build carrying that fix (or apply the <a href="../upgrade-0.5-to-0.6/#known-issues">manual backlog migration</a>) before waiting on finalize.</p>
 <p>Remember the transition is a one-way door once queue-storage work is accepted; the 0.5→0.6
 guide covers the abort boundaries.</p>
 <h2 id="if-you-are-on-05x">If you are on 0.5.x<a class="headerlink" href="#if-you-are-on-05x" title="Permanent link">&para;</a></h2>
@@ -2232,6 +2407,7 @@ previous releases).</p>
 
 
                 
+
               </article>
             </div>
           
@@ -2273,13 +2449,13 @@ previous releases).</p>
         
         
           
-          <a href="../security/" class="md-footer__link md-footer__link--next" aria-label="Next: Security">
+          <a href="../security/" class="md-footer__link md-footer__link--next" aria-label="Next: Security overview">
             <div class="md-footer__title">
               <span class="md-footer__direction">
                 Next
               </span>
               <div class="md-ellipsis">
-                Security
+                Security overview
               </div>
             </div>
             <div class="md-footer__button md-icon">
@@ -2337,6 +2513,10 @@ previous releases).</p>
     
     
       <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
       
     
   </body>

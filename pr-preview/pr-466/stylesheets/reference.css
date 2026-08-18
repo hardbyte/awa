@@ -1,0 +1,30 @@
+.awa-status {
+  display: inline-block;
+  white-space: nowrap;
+  padding: 0.12rem 0.45rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.64rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.awa-status--proposed {
+  color: #8a6116;
+  background: color-mix(in srgb, #e3b75b 18%, transparent);
+}
+
+.awa-status--superseded,
+.awa-status--rejected {
+  color: #a3473e;
+  background: color-mix(in srgb, #d87569 15%, transparent);
+}
+
+[data-md-color-scheme="slate"] .awa-status--proposed {
+  color: #f0c96f;
+}
+
+[data-md-color-scheme="slate"] .awa-status--superseded,
+[data-md-color-scheme="slate"] .awa-status--rejected {
+  color: #f09b91;
+}
