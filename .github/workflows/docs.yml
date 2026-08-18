@@ -92,7 +92,7 @@ jobs:
           path: site
 
       - name: Publish pull request preview
-        uses: rossjrw/pr-preview-action@v1
+        uses: rossjrw/pr-preview-action@ffa7509e91a3ec8dfc2e5536c4d5c1acdf7a6de9 # v1.8.1
         with:
           source-dir: site
           preview-branch: gh-pages
@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Remove pull request preview
-        uses: rossjrw/pr-preview-action@v1
+        uses: rossjrw/pr-preview-action@ffa7509e91a3ec8dfc2e5536c4d5c1acdf7a6de9 # v1.8.1
         with:
           action: remove
           preview-branch: gh-pages
@@ -132,7 +132,7 @@ jobs:
           path: site
 
       - name: Publish production site
-        uses: JamesIves/github-pages-deploy-action@v4
+        uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4.9.0
         with:
           branch: gh-pages
           folder: site
