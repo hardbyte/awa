@@ -26,7 +26,6 @@ These links are curated for agents. Each target is the Markdown representation o
 ## Guides
 
 - [Guide index](guides/index.md): Use these guides once a quickstart is running.
-- [Configuration](configuration/index.md): AWA has three configuration surfaces: the Rust runtime (ClientBuilder + QueueConfig), the Python runtime (client.start()), and the CLI (awa serve, awa job, etc). This guide explains how they work rather than listing every option — use.
 - [Bridge adapters](bridge-adapters/index.md): Insert Awa jobs within existing transactions from non-sqlx Postgres libraries.
 - [Lifecycle hooks](lifecycle-hooks/index.md): Lifecycle hooks let application code react to the points in a job's life — when it starts, finishes, retries, parks on an external callback, and so on — without putting that logic inside the job handler itself. Typical uses are metrics.
 - [HTTP callbacks](http-callbacks/index.md): Awa has two callback-related surfaces.
@@ -36,17 +35,21 @@ These links are curated for agents. Each target is the Markdown representation o
 ## Operations
 
 - [Operations index](operations/index.md): AWA keeps its control plane in PostgreSQL, so safe operation begins with database privileges, migrations, compatibility, and observability.
+- [Configuration](configuration/index.md): AWA has three configuration surfaces: the Rust runtime (ClientBuilder + QueueConfig), the Python runtime (client.start()), and the CLI (awa serve, awa job, etc). This guide explains how they work rather than listing every option — use.
 - [Deployment](deployment/index.md): This guide covers how to deploy Awa workers and the web UI with Docker or Kubernetes.
 - [Managed Postgres](deploying-on-managed-postgres/index.md): This page collects the operational gotchas and sizing data we learned running awa workers against Google Cloud SQL and AlloyDB in staging. Most of it applies to any managed Postgres (Amazon RDS / Aurora, Azure Database for PostgreSQL.
-- [Migrations](migrations/index.md): This guide explains how to install and upgrade the Awa schema, integrate an external migration runner, and plan rollback. Release-specific prerequisites and transition procedures live in the relevant upgrade guide.
+- [Migration overview](migrations/index.md): This guide explains how to install and upgrade the Awa schema, integrate an external migration runner, and plan rollback. Release-specific prerequisites and transition procedures live in the relevant upgrade guide.
 - [Upgrade 0.5 to 0.6](upgrade-0.5-to-0.6/index.md): This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; Migrations covers the general migration.
 - [Upgrade 0.6 to 0.7](upgrade-0.6-to-0.7/index.md): The 0.6 → 0.7 upgrade is short: the storage step is "be finalized." Everything else in 0.7 is additive.
+- [Observability](grafana/index.md): Two dashboards are provided.
+- [Troubleshooting](troubleshooting/index.md): This guide covers the operational issues that come up most often in practice: stuck running jobs, leader-election delays, and heartbeat timeouts.
+
+## Security
+
 - [Security overview](security/index.md): Awa's security boundary has two parts: PostgreSQL privileges determine who can read or mutate queue state, while network placement and callback authentication determine which HTTP surfaces are reachable. Production deployments should.
 - [Database roles](security/database-roles/index.md): AWA can run with one database user, but production deployments should separate schema management from runtime execution.
 - [Deployable surfaces](security/deployable-surfaces/index.md): Awa ships one binary, but its runtime surfaces have different trust boundaries. Production deployments should not expose them all on one listener.
 - [Callback security](security/callback-security/index.md): The callback receiver exposes state-changing endpoints for externally executed attempts.
-- [Observability](grafana/index.md): Two dashboards are provided.
-- [Troubleshooting](troubleshooting/index.md): This guide covers the operational issues that come up most often in practice: stuck running jobs, leader-election delays, and heartbeat timeouts.
 
 ## Reference
 
