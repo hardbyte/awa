@@ -129,7 +129,7 @@ each heartbeat tick roots one at `heartbeat.tick`. Both are **`debug`**, so an
 `info` pipeline shows neither — they tick whether or not there is work, and at
 the default poll interval that would be ~5 traces/s per queue-claimer. Raise the
 filter when you want them; see
-[configuration.md](../configuration.md#worker-side-traces).
+[Worker-side traces](../configuration.md#worker-side-traces).
 
 Spans and log events for work on a *specific* queue carry both `queue` and the
 OTel `messaging.destination.name`, so

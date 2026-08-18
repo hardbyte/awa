@@ -3,14 +3,14 @@
 Awa supports three ways to host the HTTP callback ingress surface:
 
 1. **Bundled with the admin UI** — the default. `awa serve` exposes the admin UI plus the three callback routes from the same router.
-2. **Standalone receiver** — `awa callbacks serve` runs a router that mounts only the callback ingress endpoints. Use this when callbacks must be reachable from outside the operator network but the admin surface must remain private. See [`docs/http-callbacks.md`](./http-callbacks.md).
+2. **Standalone receiver** — `awa callbacks serve` runs a router that mounts only the callback ingress endpoints. Use this when callbacks must be reachable from outside the operator network but the admin surface must remain private. See [HTTP callbacks](./http-callbacks.md).
 3. **User-owned API layer** — mount the callback ingress routes inside your own application (FastAPI / Starlette / Flask / Django / axum / actix). This page covers option 3.
 
 The on-wire contract is identical across all three options:
 
 - Routes: `POST {prefix}/{callback_id}/{complete,fail,heartbeat}`.
 - Signature: BLAKE3 keyed-hash of the callback id, lowercase hex, in the `X-Awa-Signature` header.
-- Payloads: see [`docs/http-callbacks.md`](./http-callbacks.md#callback-receiver-contract).
+- Payloads: see the [callback receiver contract](./http-callbacks.md#callback-receiver-contract).
 
 When you host the routes yourself, **reuse the shared signing and URL helpers** from `awa::callback_contract` (Rust) or `awa.callback_contract` (Python) so your implementation cannot drift from the worker's. The helpers are exported specifically so this is a one-line dependency, not a copy-paste of the algorithm.
 

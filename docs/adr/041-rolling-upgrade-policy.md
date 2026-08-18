@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. The migration-authoring checklist is in [`docs/development.md`](../development.md#authoring-schema-migrations), and automated mixed-version rehearsal is tracked by [#427](https://github.com/hardbyte/awa/issues/427).
+Accepted. The [migration-authoring checklist](../development.md#authoring-schema-migrations) and automated mixed-version rehearsal tracked by [#427](https://github.com/hardbyte/awa/issues/427) carry this decision into practice.
 
 ## Context
 

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 mkdocs build --strict
+python3 scripts/build-agent-docs.py
 env -u RUSTC_WRAPPER cargo check -p awa --example quickstart
 python3 -m py_compile awa-python/examples/quickstart.py
 

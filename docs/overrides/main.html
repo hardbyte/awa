@@ -8,6 +8,17 @@
   </span>
 {% endblock %}
 
+{% block content %}
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  {{ super() }}
+{% endblock %}
+
 {% block extrahead %}
   {{ super() }}
   {% set social_title = page.title ~ " — " ~ config.site_name if page else config.site_name %}
@@ -18,4 +29,8 @@
   <meta property="og:description" content="{{ social_description | e }}">
   <meta property="og:type" content="website">
   <meta property="og:url" content="{{ social_url | e }}">
+  {% if page %}
+    <link rel="alternate" type="text/markdown" href="index.md">
+  {% endif %}
+  <link rel="help" type="text/plain" href="{{ 'llms.txt' | url }}" title="AWA documentation index for AI agents">
 {% endblock %}

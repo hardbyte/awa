@@ -26,7 +26,7 @@ AWA is a Postgres-native job queue for Rust and Python. Enqueue work in the same
 
 Business data and job state share PostgreSQL. A transaction either commits both the application change and its follow-up work, or neither. Workers claim runnable rows without a separate broker, keep active claims alive, and leave enough state behind for another worker to recover work after a crash.
 
-<div class="awa-grid" markdown>
+<div class="awa-grid">
 <a class="awa-card" href="concepts/transactional-enqueue/">
   <strong>Transactional by design</strong>
   <span>Commit an application write and its background job atomically.</span>

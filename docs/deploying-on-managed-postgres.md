@@ -2,7 +2,7 @@
 
 This page collects the operational gotchas and sizing data we learned running awa workers against Google Cloud SQL and AlloyDB in staging. Most of it applies to any managed Postgres (Amazon RDS / Aurora, Azure Database for PostgreSQL, etc.); GCP-specific advice is called out.
 
-The reference data here was captured on a single 4-pod consumer × 4-pod producer fleet against a dedicated benchmarking database on each engine, with `enqueue_shards = 16` and the queue-storage direct COPY producer path. See [`benchmarking.md`](benchmarking.md) for methodology and the `awa-bench-driver` reports for raw numbers and EXPLAIN traces.
+The reference data here was captured on a single 4-pod consumer × 4-pod producer fleet against a dedicated benchmarking database on each engine, with `enqueue_shards = 16` and the queue-storage direct COPY producer path. See [Benchmarking](benchmarking.md) for methodology and the `awa-bench-driver` reports for raw numbers and EXPLAIN traces.
 
 ## Pick a Postgres version
 
@@ -31,7 +31,7 @@ Sizing rule of thumb: pick the vCPU count for your steady-state completion targe
 
 ## IAM and Cloud SQL connectivity
 
-Migrations and custom queue-storage schema preparation need DDL-capable credentials. Ordinary workers can run with the runtime grants in [`security.md`](security.md) once `awa migrate` has materialized the default `awa` substrate, or once `awa storage prepare-queue-storage-schema` has materialized a custom queue-storage schema. If you rely on fresh-install auto-prepare from the first worker startup instead, that worker connection also needs the DDL privileges required by `prepare_schema()`.
+Migrations and custom queue-storage schema preparation need DDL-capable credentials. Ordinary workers can run with the [runtime database grants](security.md) once `awa migrate` has materialized the default `awa` substrate, or once `awa storage prepare-queue-storage-schema` has materialized a custom queue-storage schema. If you rely on fresh-install auto-prepare from the first worker startup instead, that worker connection also needs the DDL privileges required by `prepare_schema()`.
 
 > **0.7 design note (not yet shipped):** [ADR-042](adr/042-caller-owned-finalization-transactions.md) uses one ordinary transaction, transaction-scoped advisory locks, and no session state, so its caller-owned finalization protocol is compatible with transaction-mode pgbouncer/pgcat and RDS Proxy. Queue `LISTEN` remains session-scoped: [ADR-033](adr/033-per-key-execution-control.md) grant-close notifications require a direct/session-pooled listener or the #374 gated polling fallback. The sending `pg_notify` call itself remains transactional and pooler-safe.
 
@@ -94,7 +94,7 @@ DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 
 Use an upsert — first-enqueue may create lane rows before any operator inserts a `queue_meta` row, so a plain `UPDATE` can quietly affect zero rows.
 
-Going higher than 4 only helps when producer-side head-row contention is your bottleneck; raise it after measuring. Lowering it later is safe, but the FIFO contract changes — see [`configuration.md`](configuration.md#sharding-the-enqueue-head-per-queue) and [ADR-025](adr/025-sharded-enqueue-heads.md).
+Going higher than 4 only helps when producer-side head-row contention is your bottleneck; raise it after measuring. Lowering it later is safe, but the FIFO contract changes — see [enqueue-head sharding](configuration.md#sharding-the-enqueue-head-per-queue) and [ADR-025](adr/025-sharded-enqueue-heads.md).
 
 ## Producer path: use the direct COPY entry point
 
@@ -105,13 +105,13 @@ For any high-volume producer running against managed Postgres (rather than a Doc
 
 The compat-friendly `insert_many_copy_from_pool` / `client.insert_many_copy` path routes each row through the `awa.insert_job_compat()` SQL function once per row. On a real DB the per-row function-call cost (lane head update, NOTIFY, admin metadata) sums to ~100–150 ms per row on AlloyDB through the auth-proxy — fine when the goal is "one writer, strict compatibility", catastrophic when the goal is "burst 10⁶ jobs in seconds." The direct path runs at the inserts-per-second numbers in the sizing table above.
 
-See [`configuration.md`](configuration.md#producer-path-choice) for the full surface comparison.
+See [Producer path choice](configuration.md#producer-path-choice) for the full surface comparison.
 
 ## MVCC discipline: long-running readers pin the whole database
 
 Awa's queue storage keeps its hot path append-only and reclaims segments with `TRUNCATE`, but it is still a Postgres schema and is subject to the database-wide MVCC horizon. Any transaction holding an old snapshot — a `psql` session left `idle in transaction`, a BI tool with a long read transaction, `pg_dump`, a stuck migration — prevents vacuum and Awa's maintenance pruning from reclaiming row versions created after that snapshot, in every table in the database.
 
-Under sustained load this degrades throughput, not correctness: jobs are not lost, but completion rate sags and backlog accumulates until the pinning transaction releases, after which the backlog drains. Every per-row Postgres queue (River, Oban, pg-boss, Graphile, pgmq) shares this failure mode. The long-horizon scenario in [`benchmarking.md`](benchmarking.md) reproduces it on demand; [`troubleshooting.md`](troubleshooting.md#dead-tuples-growing-in-queue-storage) covers diagnosis on a live system.
+Under sustained load this degrades throughput, not correctness: jobs are not lost, but completion rate sags and backlog accumulates until the pinning transaction releases, after which the backlog drains. Every per-row Postgres queue (River, Oban, pg-boss, Graphile, pgmq) shares this failure mode. The long-horizon [benchmark scenario](benchmarking.md) reproduces it on demand; [Troubleshooting](troubleshooting.md#dead-tuples-growing-in-queue-storage) covers diagnosis on a live system.
 
 Operational rules, in priority order:
 
@@ -142,11 +142,11 @@ WHERE datname = current_database()
   AND backend_type = 'client backend';
 ```
 
-Alert when `max_xact_age_seconds` exceeds a few multiples of your normal longest job; `300` is a reasonable starting threshold for short-job workloads. The drill-down query for finding the offending session is in [`troubleshooting.md`](troubleshooting.md#inspect-long-transactions).
+Alert when `max_xact_age_seconds` exceeds a few multiples of your normal longest job; `300` is a reasonable starting threshold for short-job workloads. The drill-down query for finding the offending session is in [Inspect long transactions](troubleshooting.md#inspect-long-transactions).
 
 ### 4. Give autovacuum enough capacity
 
-The queue-storage substrate ships aggressive per-table autovacuum storage parameters on its hot mutable tables (ring state, heads, leases, claims), so per-table thresholds are normally not yours to tune. What managed-Postgres defaults often starve is instance-wide vacuum capacity. If the churn query in [`troubleshooting.md`](troubleshooting.md#inspect-table-churn) shows `autovacuum_count` flat while dead tuples climb on `leases%` or `attempt_state`, raise these flags:
+The queue-storage substrate ships aggressive per-table autovacuum storage parameters on its hot mutable tables (ring state, heads, leases, claims), so per-table thresholds are normally not yours to tune. What managed-Postgres defaults often starve is instance-wide vacuum capacity. If the [table churn query](troubleshooting.md#inspect-table-churn) shows `autovacuum_count` flat while dead tuples climb on `leases%` or `attempt_state`, raise these flags:
 
 - `autovacuum_max_workers` (default 3 is low for a busy queue database sharing the instance with application tables)
 - `autovacuum_vacuum_cost_limit` / lower `autovacuum_vacuum_cost_delay` so workers actually keep up

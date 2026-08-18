@@ -143,52 +143,6 @@ The companion repo currently benchmarks awa against pgque, procrastinate, pg-bos
 
 The two tracks are deliberately separate. If they ever diverge on workload shape or thresholds, the awa-only benches in this file are canonical for awa's own numbers and the cross-system runner defers.
 
-### 2026-05-03 cross-system reference run
-
-An overnight run of the companion benchmark repo compared `awa` 0.6 alpha builds with the same phase-driven harness. Treat these as reference results for shape and regression tracking, not universal product guarantees. These numbers are from pre-0.6.0 alpha builds; for the current 0.6.0 pinned-MVCC shape see the [MVCC Horizon Benchmark](#mvcc-horizon-benchmark) section above and the #169 benchmark evidence in the [CHANGELOG](https://github.com/hardbyte/awa/blob/main/CHANGELOG.md).
-
-Key observations:
-
-- `awa` peak throughput improved by `49%` from 0.6.0-alpha.2 to 0.6.0-alpha.3 at 128 workers and one replica: `4,576` to `6,834` jobs/s. The same run showed a roughly `1.5x` to `1.7x` improvement across the worker-count matrix.
-- Phase A matrix shape for `awa`: `296` -> `1,115` -> `3,961` -> `6,834` jobs/s as worker count increased.
-- Phase B `pgmq` peaked at `13,290` jobs/s at 16 workers and collapsed at 128 workers, matching the previously observed high-worker behaviour.
-- Phase C multi-replica runs exposed the remaining `awa` topology sensitivity: at fixed total workers, throughput fell from `3,560` to `2,491` to `1,503` jobs/s across `1x64`, `2x32`, and `4x16`. That shape is consistent with fleet-wide completion flusher contention (`processes x AWA_COMPLETION_SHARDS`). `pgque` moved in the opposite direction in the same run (`18,660` -> `34,388` -> `38,810`), so this remains a useful comparison target rather than noise to smooth over.
-- Phase D 60-minute `awa` soak sustained a median `5,369` jobs/s with median dead tuples around `396`, validating the ADR-019 / ADR-023 hot-path dead-tuple promise under sustained churn.
-
-Queue-storage e2e sweeps separate tuning from storage design. For the hot single-queue shape, `enqueue_shards = 4` plus larger completion batches sustained `7.9k` completed jobs/s with `200ms` p99 end-to-end latency and bounded depth. Increasing `claimers` did not materially improve that shape.
-
-When the application can accept partitioned ordering at the logical workload level, routing through several physical queues with `PartitionedQueue` is the preferred throughput lever: it creates independent claim and completion coordination streams rather than adding more claimers to one queue head.
-
-ADR-026 terminal-count deltas remove hot-path `queue_terminal_live_counts` updates. `done_entries` terminal paths append signed deltas, compact receipt completions are counted from retained `receipt_completion_batches_*` minus `receipt_completion_tombstones_*`, and exact reads include all retained evidence plus permanent rollups. Maintenance folds sealed `done_entries` delta slots into compact counters only when the MVCC horizon is not pinned by another backend snapshot or idle transaction id. Benchmark runs should therefore sample `queue_terminal_count_deltas_*`, `receipt_completion_batches_*`, and `queue_terminal_live_counts` so regressions distinguish pending append-only rows from mutable-counter dead tuples.
-
-The offered-rate benchmark exercises absorption directly and samples WAL. With one claimer, `claim_batch_size = 512`, `AWA_COMPLETION_BATCH_SIZE = 512`, the fused receipt completion path, and `max_workers = 1024` (which selects four queue-storage completion shards by default), a 10-second no-op run at `10k/s` offered load keeps durable completions at the offered rate, drains to zero backlog, and writes `1.80 KiB` WAL per completed job. `max_workers = 512` is close but does not consistently meet the 10k offered target, because no-op handlers hold permits while waiting for durable completion acknowledgement.
-
-First-principles WAL accounting compared the production path, a narrow `done_entries` row, and a deliberately non-production path that skipped durable terminal history entirely:
-
-| Shape                          | Completed jobs/s |  p99 e2e |   WAL/job |
-| ------------------------------ | ---------------: | -------: | --------: |
-| Tuned production queue storage |        `7,885/s` | `203 ms` | `2,241 B` |
-| Narrow terminal history        |        `8,337/s` | `205 ms` | `1,932 B` |
-| Skip `done_entries` entirely   |        `8,402/s` | `230 ms` | `1,441 B` |
-
-The adopted design keeps the durable terminal fact and public `{schema}.terminal_jobs` surface while avoiding duplicated ready-body fields. Successful receipt completions can now write compact `receipt_completion_batches_*` rows instead of one `done_entries_*` row per job. The skip-durable-history experiment remains rejected because it weakens the terminal-history contract.
-
-### Queue-storage striping reference
-
-Queue striping is a contention-control knob for workloads dominated by one hot logical queue. The companion benchmark repo includes an awa-only sweep of `queue_storage_queue_stripe_count` over `1`, `2`, and `4` at `64`, `128`, `256`, and `512` workers. The source artifact lives in companion benchmark PR [#21](https://github.com/hardbyte/postgresql-job-queue-benchmarking/pull/21).
-
-Reference result:
-
-| Stripes | 64 workers | 128 workers | 256 workers | 512 workers |
-| ------: | ---------: | ----------: | ----------: | ----------: |
-|       1 |  `3,408/s` |   `4,741/s` |   `9,530/s` |  `11,188/s` |
-|       2 |  `4,654/s` |   `7,667/s` |  `11,975/s` |  `11,173/s` |
-|       4 |  `4,378/s` |   `7,596/s` |  `11,418/s` |  `11,443/s` |
-
-The clearest gain was the `1 -> 2` stripe step: at `128` workers throughput rose by `62%`, and at `256` workers throughput rose by `26%` while end-to-end p99 fell from `1,802 ms` to `1,027 ms`. `4` stripes mostly matched `2` stripes in this shape, with the only clear advantage at the `512` worker tail.
-
-Treat this as tuning guidance, not an out-of-the-box setting. The default stays `queue_storage_queue_stripe_count=1`; hot single-queue deployments should consider `2` after measuring their own worker/replica shape.
-
 ## Python Runtime Benchmarks
 
 The Python benchmark script exercises the real `awa-python` worker path while reusing the same database-facing benchmark shapes as the Rust runtime:

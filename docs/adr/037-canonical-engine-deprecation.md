@@ -33,7 +33,7 @@ claimable.
    the upgrade guides.
 2. **Formal deprecation in 0.7.** Any runtime whose effective storage resolves to canonical
    logs a startup warning naming the transition steps and this ADR. Release notes and
-   [`docs/upgrade-0.6-to-0.7.md`](../upgrade-0.6-to-0.7.md) state the deprecation.
+   the [0.6 to 0.7 upgrade guide](../upgrade-0.6-to-0.7.md) state the deprecation.
 3. **Removal in 0.8.** Canonical claim, execution, and trigger paths are deleted. Upgrades
    step 0.5 → 0.6 (finalize) → 0.7 → 0.8. A read-only drain/inspection check may remain so
    0.8 can still refuse legibly rather than misbehave against a canonical remnant.

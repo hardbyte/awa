@@ -1,8 +1,8 @@
 # Upgrade Checklist: 0.5.x → 0.6
 
-> **Planning to run 0.7?** Finalize before upgrading: the 0.7 `awa migrate` refuses unfinalized clusters ([ADR-037](adr/037-canonical-engine-deprecation.md), [upgrade-0.6-to-0.7.md](upgrade-0.6-to-0.7.md)).
+> **Planning to run 0.7?** Finalize before upgrading: the 0.7 `awa migrate` refuses unfinalized clusters ([ADR-037](adr/037-canonical-engine-deprecation.md), [Upgrade 0.6 to 0.7](upgrade-0.6-to-0.7.md)).
 
-This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; [migrations.md](migrations.md) covers the general migration contract and external tooling.
+This is the operator-facing source of truth for moving an existing 0.5.x cluster to 0.6 (queue-storage-by-default). It defines the pre-flight, rollout phases, rollback boundary, and health checks; [Migrations](migrations.md) covers the general migration contract and external tooling.
 
 > **Fresh installs do not need this file.** A new cluster runs `awa migrate` and starts workers; the first worker auto-finalizes via `awa.storage_auto_finalize_if_fresh()`. See migrations.md ["Fresh install"](migrations.md#fresh-install-no-prior-canonical-data). This checklist is for **upgrading existing 0.5.x clusters**, where canonical drain is unavoidable and auto-finalize correctly defers to the staged path.
 
@@ -176,8 +176,8 @@ If any of these go wrong **before** any queue-storage work is accepted, `awa sto
 
 ## Cross-references
 
-- [migrations.md](migrations.md) — general migration contract and external tooling
-- [configuration.md](configuration.md) — claim-ring / lease-ring sizing knobs
-- [`docs/adr/023-receipt-plane-ring-partitioning.md`](adr/023-receipt-plane-ring-partitioning.md) — receipt-plane partition design and reverse-migration recipe
-- [`docs/adr/025-sharded-enqueue-heads.md`](adr/025-sharded-enqueue-heads.md) — enqueue-head sharding design and partitioned-FIFO contract
+- [Migrations](migrations.md) — general migration contract and external tooling
+- [Configuration](configuration.md) — claim-ring / lease-ring sizing knobs
+- [ADR-023: Receipt-plane ring partitioning](adr/023-receipt-plane-ring-partitioning.md) — receipt-plane partition design and reverse-migration recipe
+- [ADR-025: Sharded enqueue heads](adr/025-sharded-enqueue-heads.md) — enqueue-head sharding design and partitioned-FIFO contract
 - [`docs/grafana/awa-dashboard.json`](grafana/awa-dashboard.json) — Prometheus dashboard with the rotation/prune panels

@@ -104,15 +104,20 @@ html {
   width: 100%;
 }
 
-.awa-grid {
+.md-typeset .awa-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1rem;
   margin: 1.5rem 0 2.5rem;
 }
 
-.awa-card {
-  display: block;
+.md-typeset .awa-card {
+  display: flex;
+  min-width: 0;
+  min-height: 8.25rem;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0.8rem;
   padding: 1.15rem 1.2rem;
   border: 1px solid var(--awa-border);
   border-radius: 0.75rem;
@@ -121,19 +126,19 @@ html {
   transition: border-color 120ms ease, transform 120ms ease;
 }
 
-.awa-card:hover {
+.md-typeset .awa-card:hover {
   border-color: var(--md-accent-fg-color);
   transform: translateY(-2px);
 }
 
-.awa-card strong {
+.md-typeset .awa-card strong {
   display: block;
   margin-bottom: 0.35rem;
   color: var(--md-accent-fg-color);
   font-size: 1.05rem;
 }
 
-.awa-card span {
+.md-typeset .awa-card span {
   color: var(--awa-muted);
 }
 
@@ -148,7 +153,7 @@ html {
 .awa-diagram img {
   display: block;
   width: 100%;
-  max-height: 32rem;
+  height: auto;
 }
 
 .md-typeset .md-button--primary {
@@ -169,7 +174,11 @@ html {
     padding: 1.4rem;
   }
 
-  .awa-grid {
+  .md-typeset .awa-grid {
     grid-template-columns: 1fr;
+  }
+
+  .md-typeset .awa-card {
+    min-height: auto;
   }
 }

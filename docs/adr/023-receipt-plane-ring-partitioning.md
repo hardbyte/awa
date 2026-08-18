@@ -36,7 +36,7 @@ Non-goals:
 
 - Do not change the heartbeat / deadline / callback-timeout rescue contract. Those continue to live on `attempt_state` and `active_leases`.
 - Do not change the external API or the `(job_id, run_lease)` stale-writer guard.
-- Do not introduce any new reservation or pre-start state. The archived [`lease-plane-redesign-spike`](../archive/0.6-storage-design/lease-plane-redesign-spike.md) record shows that direction has been tried and rejected repeatedly on cost grounds.
+- Do not introduce any new reservation or pre-start state. The archived [lease-plane redesign spike](https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/lease-plane-redesign-spike.md) record shows that direction has been tried and rejected repeatedly on cost grounds.
 
 ## Decision
 
@@ -158,13 +158,13 @@ Rejected. Marking a `closed_at` column and sweeping closed rows periodically kee
 
 ### Ship 0.6 with receipts off
 
-Rejected. Shipping with receipts off lets 0.6 hit the dead-tuple budget today, but it leaves the short-job path on the mutable `leases` ring and defers the work tracked in the archived [`lease-plane-redesign-spike`](../archive/0.6-storage-design/lease-plane-redesign-spike.md). ADR-019's vacuum-aware intent is only satisfied when receipts are on by default and do not regress the dead-tuple budget. This ADR is the path to that posture.
+Rejected. Shipping with receipts off lets 0.6 hit the dead-tuple budget today, but it leaves the short-job path on the mutable `leases` ring and defers the work tracked in the archived [lease-plane redesign spike](https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/lease-plane-redesign-spike.md). ADR-019's vacuum-aware intent is only satisfied when receipts are on by default and do not regress the dead-tuple budget. This ADR is the path to that posture.
 
 ## Relationship to Earlier ADRs
 
 - ADR-019 established the vacuum-aware discipline. This ADR applies that discipline to the one remaining hot table that did not follow it.
 - ADR-013 (run-lease-guarded finalization) is unchanged. The authoritative record for `(job_id, run_lease)` staleness moves from a bounded mutable frontier to partitioned append-only tables; the guarantee does not.
-- The archived [`lease-plane-redesign-spike`](../archive/0.6-storage-design/lease-plane-redesign-spike.md) identifies `open_receipt_claims` as the compromise that unblocked the receipt-backed path. This ADR is the follow-through that the spike anticipated.
+- The archived [lease-plane redesign spike](https://github.com/hardbyte/awa/blob/main/docs/archive/0.6-storage-design/lease-plane-redesign-spike.md) identifies `open_receipt_claims` as the compromise that unblocked the receipt-backed path. This ADR is the follow-through that the spike anticipated.
 
 ## Implementation and Validation Status
 
@@ -180,8 +180,8 @@ This ADR has been implemented for 0.6:
 
 Validation evidence is split by purpose:
 
-- Runtime and long-horizon evidence lives in [`bench/023-receipt-ring-validation-2026-04-26.md`](bench/023-receipt-ring-validation-2026-04-26.md). The recorded runs include the 115-minute 4x8 receipts-on long-horizon run and the 12-hour overnight run; receipt closure partitions stayed at 0 dead tuples across every phase, and receipt claims remained bounded.
-- Spec and implementation mapping lives in [`correctness/storage/MAPPING.md`](https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md). The storage TLA+ family models claim-ring rotation, partition prune safety, receipt rescue, running cancel, and DLQ retry trace witnesses.
-- Operator-facing tuning and defaults live in [`../configuration.md`](../configuration.md#queue-storage-tuning).
+- Runtime and long-horizon evidence lives in the [receipt-ring validation record](bench/023-receipt-ring-validation-2026-04-26.md). The recorded runs include the 115-minute 4x8 receipts-on long-horizon run and the 12-hour overnight run; receipt closure partitions stayed at 0 dead tuples across every phase, and receipt claims remained bounded.
+- Spec and implementation correspondence lives in the [storage model mapping](https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md). The storage TLA+ family models claim-ring rotation, partition prune safety, receipt rescue, running cancel, and DLQ retry trace witnesses.
+- Operator-facing tuning and defaults live in [Queue storage tuning](../configuration.md#queue-storage-tuning).
 
 The detailed phase-by-phase implementation notes were intentionally kept out of this ADR. ADRs record the decision and its consequences; dated build logs, benchmark output, and branch-era investigation notes belong in validation artifacts or the 0.6 storage-design archive.

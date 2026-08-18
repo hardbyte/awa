@@ -79,7 +79,7 @@ Purging is destructive: the rows are deleted from `dlq_entries` and not recovera
 
 ## Retention
 
-The maintenance leader periodically prunes DLQ rows older than the configured retention window. See [`docs/configuration.md`](configuration.md) for the `dlq_retention_*` knobs. Retention runs alongside the rotation / prune work for the queue and lease rings, so a busy DLQ does not delay queue-plane reclamation.
+The maintenance leader periodically prunes DLQ rows older than the configured retention window. See [Configuration](configuration.md) for the `dlq_retention_*` knobs. Retention runs alongside the rotation / prune work for the queue and lease rings, so a busy DLQ does not delay queue-plane reclamation.
 
 ## Programmatic access
 
@@ -90,5 +90,5 @@ Python callers use direct client methods: `list_dlq`, `get_dlq_job`, `dlq_depth`
 ## See also
 
 - [ADR-020 — Dead Letter Queue](adr/020-dead-letter-queue.md) — design and trade-offs.
-- [configuration.md](configuration.md) — `dlq_enabled` per queue, retention knobs.
-- [troubleshooting.md](troubleshooting.md) — diagnosing why a particular job reached the DLQ.
+- [Configuration](configuration.md) — `dlq_enabled` per queue, retention knobs.
+- [Troubleshooting](troubleshooting.md) — diagnosing why a particular job reached the DLQ.

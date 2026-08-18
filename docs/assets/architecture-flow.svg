@@ -1,58 +1,62 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 470" role="img">
-  <title>AWA producers and workers coordinate through PostgreSQL</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" role="img" aria-labelledby="title desc">
+  <title id="title">AWA architecture</title>
+  <desc id="desc">Applications atomically commit business data and jobs to PostgreSQL. Workers claim jobs from PostgreSQL and write durable outcomes back. Operators inspect the same system of record.</desc>
   <defs>
-    <linearGradient id="bg" x1="0" x2="1">
-      <stop offset="0" stop-color="#eef8f1"/>
-      <stop offset="1" stop-color="#e7f3ed"/>
-    </linearGradient>
     <linearGradient id="db" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#17633e"/>
-      <stop offset="1" stop-color="#0d4d2e"/>
+      <stop offset="0" stop-color="#17633e"/><stop offset="1" stop-color="#0d4d2e"/>
     </linearGradient>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0 0 10 5 0 10z" fill="#287a51"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 10 5 0 10z" fill="context-stroke"/>
     </marker>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#10341f" flood-opacity=".16"/>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#10341f" flood-opacity=".14"/>
     </filter>
+    <style>
+      .surface{fill:#fff;stroke:#b9d6c4}.heading{fill:#173324}.copy{fill:#52675a}.line{fill:none;stroke:#287a51;stroke-width:4;stroke-linecap:round;stroke-linejoin:round}.label{fill:#17633e}.canvas{fill:#eef8f1}.tooling{fill:#d8ebe0}.tooling-text{fill:#345845}
+      @media (prefers-color-scheme:dark){.canvas{fill:#101713}.surface{fill:#17221b;stroke:#3f6b50}.heading{fill:#eff8f2}.copy{fill:#b9c9bf}.line{stroke:#55c58a}.label{fill:#8de2b1}.tooling{fill:#20392b}.tooling-text{fill:#c8ded0}}
+    </style>
   </defs>
-  <rect width="920" height="470" rx="28" fill="url(#bg)"/>
+  <rect class="canvas" width="1000" height="560" rx="28"/>
   <g font-family="Inter,system-ui,sans-serif">
-    <text x="460" y="40" text-anchor="middle" font-size="18" font-weight="700" fill="#17633e">ONE DURABLE COORDINATION PLANE</text>
+    <text class="label" x="500" y="42" text-anchor="middle" font-size="19" font-weight="750">ONE POSTGRESQL SYSTEM OF RECORD</text>
 
     <g filter="url(#shadow)">
-      <rect x="42" y="85" width="235" height="120" rx="18" fill="#fff" stroke="#b9d6c4" stroke-width="2"/>
-      <circle cx="82" cy="125" r="16" fill="#d4eee0"/>
-      <path d="M74 125h16m-8-8 8 8-8 8" fill="none" stroke="#17633e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-      <text x="110" y="125" font-size="21" font-weight="750" fill="#173324">Producers</text>
-      <text x="70" y="160" font-size="15" fill="#52675a">Rust · Python · SQL bridges</text>
-      <text x="70" y="184" font-size="14" fill="#52675a">Application transaction</text>
+      <rect class="surface" x="45" y="105" width="260" height="126" rx="20" stroke-width="2"/>
+      <circle cx="87" cy="148" r="18" fill="#d4eee0"/>
+      <path d="M78 148h18m-8-9 9 9-9 9" fill="none" stroke="#17633e" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text class="heading" x="119" y="151" font-size="23" font-weight="760">Applications</text>
+      <text class="copy" x="73" y="190" font-size="15">Rust · Python · SQL bridges</text>
+      <text class="copy" x="73" y="214" font-size="14">Own the application transaction</text>
 
-      <rect x="643" y="85" width="235" height="120" rx="18" fill="#fff" stroke="#b9d6c4" stroke-width="2"/>
-      <circle cx="683" cy="125" r="16" fill="#d4eee0"/>
-      <path d="M677 125l4 4 9-10" fill="none" stroke="#17633e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-      <text x="711" y="125" font-size="21" font-weight="750" fill="#173324">Workers</text>
-      <text x="670" y="160" font-size="15" fill="#52675a">Claim · heartbeat · execute</text>
-      <text x="670" y="184" font-size="14" fill="#52675a">Complete · retry · wait</text>
+      <rect x="363" y="208" width="274" height="196" rx="24" fill="url(#db)"/>
+      <ellipse cx="500" cy="253" rx="96" ry="25" fill="#55c58a" opacity=".35"/>
+      <path d="M404 253v90c0 16 43 29 96 29s96-13 96-29v-90" fill="none" stroke="#c4eed5" stroke-width="3"/>
+      <path d="M404 299c0 16 43 29 96 29s96-13 96-29" fill="none" stroke="#c4eed5" stroke-width="2" opacity=".78"/>
+      <text x="500" y="292" text-anchor="middle" font-size="25" font-weight="760" fill="#fff">PostgreSQL</text>
+      <text x="500" y="322" text-anchor="middle" font-size="15" fill="#e1f6e9">application data + AWA jobs</text>
 
-      <rect x="312" y="235" width="296" height="150" rx="22" fill="url(#db)"/>
-      <ellipse cx="460" cy="270" rx="102" ry="24" fill="#55c58a" opacity=".32"/>
-      <path d="M358 270v65c0 14 46 25 102 25s102-11 102-25v-65" fill="none" stroke="#b9ecd0" stroke-width="3"/>
-      <path d="M358 302c0 14 46 25 102 25s102-11 102-25" fill="none" stroke="#b9ecd0" stroke-width="2" opacity=".75"/>
-      <text x="460" y="300" text-anchor="middle" font-size="23" font-weight="760" fill="#fff">PostgreSQL</text>
-      <text x="460" y="329" text-anchor="middle" font-size="15" fill="#d9f4e4">application data + AWA jobs</text>
+      <rect class="surface" x="695" y="105" width="260" height="126" rx="20" stroke-width="2"/>
+      <circle cx="737" cy="148" r="18" fill="#d4eee0"/>
+      <path d="M729 148l5 5 11-13" fill="none" stroke="#17633e" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text class="heading" x="769" y="151" font-size="23" font-weight="760">Workers</text>
+      <text class="copy" x="723" y="190" font-size="15">Claim · heartbeat · execute</text>
+      <text class="copy" x="723" y="214" font-size="14">Complete · retry · wait</text>
     </g>
 
-    <path d="M210 205c25 57 62 81 102 91" fill="none" stroke="#287a51" stroke-width="4" marker-end="url(#arrow)"/>
-    <text x="222" y="257" font-size="14" font-weight="650" fill="#17633e">COMMIT</text>
-    <path d="M608 296c44-12 77-40 94-91" fill="none" stroke="#287a51" stroke-width="4" marker-end="url(#arrow)"/>
-    <text x="654" y="257" font-size="14" font-weight="650" fill="#17633e">CLAIM</text>
-    <path d="M750 205c-27 67-73 112-142 126" fill="none" stroke="#287a51" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arrow)"/>
-    <text x="700" y="312" font-size="14" font-weight="650" fill="#17633e">RESULT</text>
+    <!-- Each path ends on the edge of its target, so arrowheads remain connected. -->
+    <path class="line" d="M245 231 C270 290 312 315 363 315" marker-end="url(#arrow)"/>
+    <text class="label" x="270" y="276" font-size="14" font-weight="700">ATOMIC COMMIT</text>
+
+    <path class="line" d="M637 280 C680 266 710 247 734 231" marker-end="url(#arrow)"/>
+    <text class="label" x="655" y="253" font-size="14" font-weight="700">CLAIM</text>
+
+    <path class="line" d="M785 231 C758 307 704 348 637 351" stroke-dasharray="9 8" marker-end="url(#arrow)"/>
+    <text class="label" x="717" y="335" font-size="14" font-weight="700">DURABLE OUTCOME</text>
 
     <g>
-      <rect x="78" y="407" width="764" height="38" rx="19" fill="#d8ebe0"/>
-      <text x="460" y="431" text-anchor="middle" font-size="14" font-weight="650" fill="#345845">CLI · WEB UI · METRICS · TRACES · SQL INSPECTION</text>
+      <rect class="tooling" x="100" y="455" width="800" height="52" rx="26"/>
+      <text class="tooling-text" x="500" y="487" text-anchor="middle" font-size="15" font-weight="700">OPERATE · CLI · WEB UI · METRICS · TRACES · SQL</text>
+      <path class="line" d="M500 455V404" stroke-width="3" marker-end="url(#arrow)"/>
     </g>
   </g>
 </svg>

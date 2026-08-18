@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — the policy text is [`docs/stability.md`](../stability.md), which is normative
+Accepted — the [stability policy](../stability.md) is normative
 ([#369](https://github.com/hardbyte/awa/issues/369), roadmap decision D6).
 
 ## Context
@@ -20,7 +20,7 @@ required when a new surface replaces an older covered entry point.
 
 ## Decision
 
-Publish and maintain [`docs/stability.md`](../stability.md) as the single normative statement
+Publish and maintain the [stability policy](../stability.md) as the single normative statement
 of what is stable:
 
 - A **surface-by-surface map**: what each surface promises, what is explicitly internal.

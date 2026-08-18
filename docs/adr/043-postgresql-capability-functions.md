@@ -205,7 +205,7 @@ narrow direct privileges, but that profile is not the strict no-table-grant prof
 
 ### Public names and internal names
 
-Only entry points listed in [`docs/stability.md`](../stability.md) are public SQL contracts.
+Only entry points listed in the [stability policy](../stability.md) are public SQL contracts.
 
 Public functions use domain names, not implementation or rollout suffixes. The initial v1 surface
 is:

@@ -633,7 +633,7 @@ AWA_HEALTH_ADDR=0.0.0.0:8321
 
 Port `0` binds an ephemeral port (read it back with `Client::health_listener_addr()`).
 Unset means no listener. Endpoint semantics, response fields, and Kubernetes probe
-examples live in [deployment.md](deployment.md#health-checks); `awa health` covers
+examples live in [Deployment](deployment.md#health-checks); `awa health` covers
 probe-less environments from the CLI.
 
 ## Distributed tracing

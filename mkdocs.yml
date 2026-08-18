@@ -52,6 +52,13 @@ theme:
 
 extra_css:
   - stylesheets/extra.css
+  - stylesheets/reference.css
+  - stylesheets/language-switch.css
+  - stylesheets/agent-docs.css
+
+extra_javascript:
+  - javascripts/language-switch.js
+  - javascripts/agent-docs.js
 
 extra:
   social:
@@ -115,7 +122,11 @@ nav:
       - Migrations: migrations.md
       - Upgrade 0.5 to 0.6: upgrade-0.5-to-0.6.md
       - Upgrade 0.6 to 0.7: upgrade-0.6-to-0.7.md
-      - Security: security.md
+      - Security:
+          - Security overview: security.md
+          - Database roles: security/database-roles.md
+          - Deployable surfaces: security/deployable-surfaces.md
+          - Callback security: security/callback-security.md
       - Observability: grafana/README.md
       - Troubleshooting: troubleshooting.md
   - Reference:
@@ -124,19 +135,21 @@ nav:
       - Rust crates: reference/rust.md
       - Python API: reference/python.md
       - Stability policy: stability.md
+      - Architecture decisions: adr/README.md
   - Contributing:
       - Contributing index: contributing/index.md
       - Development: development.md
       - Benchmarking: benchmarking.md
-      - Architecture decisions: adr/README.md
 
-not_in_nav: |
+exclude_docs: |
   /0.7-planning-brief.md
-  /0.7-roadmap.md
   /positioning.md
   /test-plan.md
   /ui-design.md
   /archive/**
+
+not_in_nav: |
+  /0.7-roadmap.md
   /adr/[0-9]*.md
   /adr/bench/**
   /grafana/alerts/**

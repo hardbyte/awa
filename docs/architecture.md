@@ -2,17 +2,13 @@
 
 Awa (Māori: river) is a Postgres-native background job queue for Rust and Python. Postgres is the sole infrastructure dependency: there is no Redis, RabbitMQ, sidecar scheduler, or separate lease store. Producers enqueue inside ordinary Postgres transactions, workers claim and complete jobs through the same database, and one elected worker runs cluster-wide maintenance.
 
-This document is ordered by the questions operators and contributors usually need answered first:
+Awa keeps application data and background work in one transactional system of record. Producers commit jobs with their business writes; workers claim attempts using lease-guarded PostgreSQL transitions; maintenance makes deferred work runnable, rescues abandoned attempts, and reclaims old ring partitions. There is no second broker whose acknowledgement state can diverge from the database transaction.
 
-- What owns the runtime?
-- What deployment assumptions shape that runtime?
-- Where does state live?
-- How does a job move through storage?
-- How does Awa recover from crashes and stale attempts?
-- How are partitions rotated and reclaimed?
-- Which surfaces are operational rather than hot-path?
+![Awa system architecture](assets/architecture-system.svg)
 
-For migration details see [migrations.md](migrations.md). For user-facing knobs see [configuration.md](configuration.md).
+The diagram is the useful boundary: application processes produce work, worker processes execute it, and PostgreSQL is authoritative for both job state and coordination. The admin surface observes and controls that system; it is not part of the dispatch hot path.
+
+For migration details see [Migrations](migrations.md). For user-facing knobs see [Configuration](configuration.md).
 
 ## Terms
 

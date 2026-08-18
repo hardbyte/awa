@@ -1,3 +1,8 @@
+---
+hide:
+  - toc
+---
+
 # Job lifecycle
 
 A job moves through durable states in PostgreSQL. The handler returns the next outcome; AWA validates that the current worker still owns the claim before applying it.
@@ -17,8 +22,17 @@ A job moves through durable states in PostgreSQL. The handler returns the next o
 `running → scheduled → available`
 : A snooze defers the same attempt. It is useful for polling an external system without consuming the retry budget.
 
-`running → waiting_external → available`
-: The handler waits for an external callback. Resolving the callback makes the job runnable with the persisted callback result.
+`running → waiting_external → running`
+: The handler parks while an external operation runs. A resuming callback stores the result and returns the job to `running`, where the still-live handler observes it.
+
+`waiting_external → completed | failed`
+: A callback may finalize the job directly. Callback policy failure also moves the job to `failed`.
+
+`waiting_external → available`
+: An explicit callback retry starts the job again from scratch and resets its attempt count. This is distinct from resuming the parked handler.
+
+`waiting_external → retryable | failed`
+: When a callback deadline expires, maintenance retries the job if attempts remain and otherwise fails it.
 
 `running → failed | cancelled`
 : Terminal outcomes. Failed jobs can be retained in the dead-letter queue according to policy.

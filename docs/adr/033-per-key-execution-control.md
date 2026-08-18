@@ -4,7 +4,7 @@
 
 Accepted. Tracked in [#340](https://github.com/hardbyte/awa/issues/340). The worker-local baseline
 and the fleet-exact protocol remain experiment-gated by E5 in
-[`docs/0.7-roadmap.md`](../0.7-roadmap.md); acceptance fixes the contract and candidate constraints,
+[the 0.7 roadmap](../0.7-roadmap.md); acceptance fixes the contract and candidate constraints,
 not evidence that either tier has shipped.
 
 ## Context
