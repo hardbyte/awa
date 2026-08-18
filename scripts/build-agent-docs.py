@@ -55,8 +55,14 @@ def rewrite_link(
 
 
 def expand_snippets(text: str, repository_root: Path) -> str:
+    root = repository_root.resolve()
+
     def replace(match: re.Match[str]) -> str:
-        include = repository_root / match.group(2)
+        include = (root / match.group(2)).resolve()
+        try:
+            include.relative_to(root)
+        except ValueError:
+            raise SystemExit(f"snippet escapes repository: {match.group(2)}")
         if not include.is_file():
             raise SystemExit(f"snippet does not exist: {match.group(2)}")
         indent = match.group(1)

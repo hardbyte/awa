@@ -2,6 +2,7 @@
   const markdownUrl = () => new URL("index.md", window.location.href);
 
   const copyMarkdown = async (button) => {
+    const defaultLabel = "Copy Markdown";
     const response = await fetch(markdownUrl(), {
       headers: { Accept: "text/markdown" },
     });
@@ -9,10 +10,9 @@
       throw new Error(`Markdown request failed with ${response.status}`);
     }
     await navigator.clipboard.writeText(await response.text());
-    const original = button.textContent;
     button.textContent = "Copied";
     window.setTimeout(() => {
-      button.textContent = original;
+      button.textContent = defaultLabel;
     }, 1600);
   };
 
@@ -34,6 +34,9 @@
       } catch (error) {
         copy.textContent = "Copy failed";
         console.error(error);
+        window.setTimeout(() => {
+          copy.textContent = "Copy Markdown";
+        }, 1600);
       } finally {
         copy.disabled = false;
       }
