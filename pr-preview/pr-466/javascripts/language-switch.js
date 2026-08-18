@@ -60,13 +60,17 @@
     );
   }
 
-  function choose(language, navigate) {
-    saveLanguage(language);
+  function apply(language) {
     updateButtons(language);
     selectTabs(language);
+  }
+
+  function choose(language) {
+    saveLanguage(language);
+    apply(language);
 
     const destination = pairedGuideUrl(language);
-    if (navigate && destination && destination.href !== window.location.href) {
+    if (destination && destination.href !== window.location.href) {
       window.location.assign(destination);
     }
   }
@@ -84,11 +88,14 @@
     switcher.hidden = false;
     switcher.querySelectorAll("[data-awa-language]").forEach((button) => {
       button.addEventListener("click", () =>
-        choose(button.dataset.awaLanguage, true),
+        choose(button.dataset.awaLanguage),
       );
     });
 
-    choose(savedLanguage() || currentGuideLanguage() || "rust", false);
+    // Reflect the page's own language when on a guide page; fall back to the
+    // saved preference for tabbed pages. Displaying is not choosing, so the
+    // stored preference is left untouched.
+    apply(currentGuideLanguage() || savedLanguage() || "rust");
   }
 
   if (typeof document$ !== "undefined") {

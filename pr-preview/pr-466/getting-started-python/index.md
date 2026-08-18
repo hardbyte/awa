@@ -122,6 +122,7 @@ async def main():
             await asyncio.sleep(min(0.1, max(0, deadline - loop.time())))
     finally:
         await client.shutdown()
+        await client.close()
 
     print(f"Job {result.id} state: {result.state}")
 
