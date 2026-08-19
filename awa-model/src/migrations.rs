@@ -1112,7 +1112,13 @@ mod tests {
     }
 
     /// Case-insensitive whitespace-tolerant scan for a keyword sequence at
-    /// statement position (not preceded by an identifier character or a dot).
+    /// statement position.
+    ///
+    /// Both ends are checked for a word boundary. The leading check keeps
+    /// `autovacuum_vacuum_cost_delay` from reading as `VACUUM` and
+    /// `awa.create_x` from reading as `CREATE`; the trailing check keeps
+    /// `CREATE TABLESPACE` from reading as `CREATE TABLE` and the real
+    /// `vacuum_truncate` storage parameter from reading as `VACUUM`.
     fn find_statements(haystack: &str, keywords: &[&str]) -> Vec<usize> {
         let lower = haystack.to_ascii_lowercase();
         let bytes = lower.as_bytes();
@@ -1138,11 +1144,77 @@ mod tests {
                     break;
                 }
             }
+            // Trailing boundary: the keyword sequence must not run into a
+            // longer identifier.
+            if matched
+                && matches!(bytes.get(cursor), Some(c) if c.is_ascii_alphanumeric() || *c == b'_')
+            {
+                matched = false;
+            }
             if matched {
                 hits.push(start);
             }
         }
         hits
+    }
+
+    /// The scanner must not fire on longer identifiers that merely start with a
+    /// keyword, and must still fire on the real thing.
+    #[test]
+    fn find_statements_requires_word_boundaries_at_both_ends() {
+        // Leading boundary.
+        assert!(
+            find_statements("WITH (autovacuum_vacuum_cost_delay = 10)", &["vacuum"]).is_empty()
+        );
+        assert!(find_statements("SELECT awa.create_thing()", &["create", "thing"]).is_empty());
+        // Trailing boundary: `TABLESPACE` is not `TABLE`, and `vacuum_truncate`
+        // is a storage parameter, not a VACUUM.
+        assert!(
+            find_statements("CREATE TABLESPACE fast LOCATION '/x'", &["create", "table"])
+                .is_empty()
+        );
+        assert!(
+            find_statements("ALTER TABLE t SET (vacuum_truncate = false)", &["vacuum"]).is_empty()
+        );
+        assert!(find_statements("CREATE INDEXES_LATER", &["create", "index"]).is_empty());
+        // True positives still match, including across newlines and extra space.
+        assert_eq!(
+            find_statements("CREATE TABLE awa.t (x INT)", &["create", "table"]),
+            vec![0]
+        );
+        assert_eq!(
+            find_statements("create\n   table awa.t", &["create", "table"]),
+            vec![0]
+        );
+        assert_eq!(
+            find_statements("VACUUM ANALYZE awa.t", &["vacuum"]),
+            vec![0]
+        );
+        assert_eq!(
+            find_statements(
+                "CREATE INDEX IF NOT EXISTS i ON t (c)",
+                &["create", "index"]
+            ),
+            vec![0]
+        );
+    }
+
+    /// Dollar-quoted bodies and quoted literals are invisible to the top-level
+    /// scan, so a plpgsql `BEGIN`/`END` block is not transaction control.
+    #[test]
+    fn strip_to_top_level_removes_bodies_comments_and_literals() {
+        let sql = "CREATE OR REPLACE FUNCTION f() RETURNS void AS $fn$ \
+                   BEGIN COMMIT; END $fn$ LANGUAGE plpgsql; \
+                   -- COMMIT; in a comment \n \
+                   SELECT 'COMMIT;'; \
+                   /* COMMIT; in a block comment */ \
+                   CREATE TABLE IF NOT EXISTS awa.t (x INT);";
+        let top = strip_to_top_level(sql);
+        assert!(
+            find_statements(&top, &["commit"]).is_empty(),
+            "COMMIT inside a body, comment, or literal is not statement-level: {top}"
+        );
+        assert_eq!(find_statements(&top, &["create", "table"]).len(), 1);
     }
 
     /// Every migration version paired with the SQL file that defines it.
