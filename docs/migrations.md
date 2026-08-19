@@ -102,18 +102,7 @@ Applying unwrapped SQL through a runner that does **not** wrap it (piping into `
 
 Each extracted file is individually re-runnable, so a runner that crashes between applying a file and recording it can safely retry that file.
 
-### One-time V1 checksum repair (0.7)
-
-Migration v001 gained the same re-runnability guards the rest of the set already had, so its extracted file changed content once in 0.7. A runner that stores checksums of applied migrations — Flyway, Liquibase, and dbmate all do — will report a validation mismatch on V1 and refuse to apply pending migrations until the recorded checksum is updated. The applied schema is unaffected; only the stored checksum is stale.
-
-Re-extract, then accept the new checksum with your runner's repair command, for example:
-
-```bash
-awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
-flyway repair            # Liquibase: clear-checksums; dbmate: no checksums, nothing to do
-```
-
-Filenames are unchanged except `V17` and `V21`, whose descriptions contain `/`. Those two could never be written before (extraction aborted on them), so no previously extracted directory contains them under another name.
+0.7 changes two things about the extracted set, both one-time. Migration v001 gained the re-runnability guards the rest of the set already had, so its file content changed; if your runner validates checksums of applied migrations, re-extract and clear the recorded checksum for V1 (the applied schema is unaffected — only the stored checksum is stale). Filenames are unchanged except `V17` and `V21`, whose descriptions contain `/` and which no earlier extraction could write at all.
 
 `--from` / `--to` / `--version` select a range to *render*; they are only valid with `--sql` or `--extract-to`. Applying always brings the database to the current version, so `awa migrate` rejects them rather than silently applying a wider range.
 
