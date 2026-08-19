@@ -1,0 +1,3412 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/benchmarking/">
+      
+      
+        <link rel="prev" href="../development/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Benchmarking - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  
+  
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="Benchmarking — AWA">
+  <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/benchmarking/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#benchmarking-notes" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Benchmarking
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../security/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Security
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Migrations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migration overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" checked>
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#reference-environments" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reference Environments
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#north-star-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        North-Star Metrics
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#positioning-proof-checklist" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positioning Proof Checklist
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#methodology-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Methodology Notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mvcc-horizon-benchmark" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MVCC Horizon Benchmark
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="MVCC Horizon Benchmark">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#mvcc-bench-knobs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MVCC bench knobs
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-system-comparison" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-system comparison
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#python-runtime-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python Runtime Benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reference-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reference Results
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Reference Results">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#immediate-enqueue-throughput" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Immediate Enqueue Throughput
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sustained-hot-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sustained Hot Path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-runtime-baseline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python Runtime Baseline
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deep-backlog-drain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Backlog Drain
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#large-deferred-frontier" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Large Deferred Frontier
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#moderate-deferred-frontier-higher-due-rate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Moderate Deferred Frontier — Higher Due Rate
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#high-rate-deferred-frontier-10m-at-6ks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        High-Rate Deferred Frontier: 10M at 6k/s
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#concurrent-multi-queue-lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Concurrent Multi-Queue Lifecycle
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#progress-feature-overhead" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Progress Feature Overhead
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#failure-mode-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure-Mode Benchmarks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Failure-Mode Benchmarks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#benchmark-matrix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Benchmark matrix
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rust-harness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rust harness
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-harness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python harness
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#structured-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Structured output
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#interpreting-the-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Interpreting The Results
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How To Run
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="How To Run">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#happy-path-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Happy-path benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enqueue-contention-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enqueue contention benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#failure-mode-benchmarks-rust" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure-mode benchmarks (Rust)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#caveats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Caveats
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-system-numbers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-system numbers
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#reference-environments" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reference Environments
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#north-star-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        North-Star Metrics
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#positioning-proof-checklist" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positioning Proof Checklist
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#methodology-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Methodology Notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#mvcc-horizon-benchmark" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MVCC Horizon Benchmark
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="MVCC Horizon Benchmark">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#mvcc-bench-knobs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        MVCC bench knobs
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-system-comparison" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-system comparison
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#python-runtime-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python Runtime Benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reference-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reference Results
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Reference Results">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#immediate-enqueue-throughput" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Immediate Enqueue Throughput
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sustained-hot-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sustained Hot Path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-runtime-baseline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python Runtime Baseline
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deep-backlog-drain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Backlog Drain
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#large-deferred-frontier" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Large Deferred Frontier
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#moderate-deferred-frontier-higher-due-rate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Moderate Deferred Frontier — Higher Due Rate
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#high-rate-deferred-frontier-10m-at-6ks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        High-Rate Deferred Frontier: 10M at 6k/s
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#concurrent-multi-queue-lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Concurrent Multi-Queue Lifecycle
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#progress-feature-overhead" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Progress Feature Overhead
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#failure-mode-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure-Mode Benchmarks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Failure-Mode Benchmarks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#benchmark-matrix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Benchmark matrix
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rust-harness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rust harness
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-harness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python harness
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#structured-output" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Structured output
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#interpreting-the-results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Interpreting The Results
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-to-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How To Run
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="How To Run">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#happy-path-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Happy-path benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enqueue-contention-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enqueue contention benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#failure-mode-benchmarks-rust" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Failure-mode benchmarks (Rust)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-benchmarks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python benchmarks
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#caveats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Caveats
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-system-numbers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-system numbers
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
+                  
+
+
+  
+  
+
+
+<h1 id="benchmarking-notes">Benchmarking Notes<a class="headerlink" href="#benchmarking-notes" title="Permanent link">&para;</a></h1>
+<p>This document captures the benchmark harnesses used in the repo and a few reference results from named development and comparison environments.</p>
+<h2 id="reference-environments">Reference Environments<a class="headerlink" href="#reference-environments" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Developer laptop reference</strong>: Apple M5 MacBook Air (16 GB), PostgreSQL 17 in Docker (OrbStack). Several awa-only regression examples below come from this environment.</li>
+<li><strong>Dedicated enqueue reference</strong>: PostgreSQL 17 on a separate Linux host. These runs are useful for producer-path shape comparisons and are not published throughput claims.</li>
+<li><strong>Cross-system comparison reference</strong>: <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking">postgresql-job-queue-benchmarking</a>. That repo owns fair-comparison hardware, adapter configuration, raw output, and result summaries. Its default Postgres image is 17.2; <code>--pg-image postgres:18-alpine</code> selects PG18.</li>
+<li>Example commands assume a developer database URL: <code>postgres://postgres:test@localhost:15432/awa_test</code></li>
+<li>Benchmarks live in: <code>awa/tests/benchmark_test.rs</code> <code>awa/tests/scheduling_benchmark_test.rs</code> <code>awa/tests/failure_benchmark_test.rs</code></li>
+<li>Python worker benchmarks live in: <code>awa-python/scripts/benchmark_runtime.py</code></li>
+<li>Shared output schema: <code>awa/tests/bench_output.rs</code> (Rust) <code>awa-python/scripts/bench_output.py</code> (Python)</li>
+</ul>
+<p>These are engineering benchmarks, not published vendor-style numbers. The main goal is to compare shapes, validate architecture changes, and catch regressions. Treat each result as tied to the environment named beside it; do not compare numbers from different sections as though they came from one machine.</p>
+<h2 id="north-star-metrics">North-Star Metrics<a class="headerlink" href="#north-star-metrics" title="Permanent link">&para;</a></h2>
+<p>Awa's performance target is sustainable end-to-end queue work, not the largest enqueue-only number. A benchmark table should lead with:</p>
+<ul>
+<li><strong>completed jobs/sec</strong> — durable terminal transitions, not just handler returns</li>
+<li><strong>p99 end-to-end latency</strong> — producer enqueue to durable completion</li>
+<li><strong>queue depth / backlog growth</strong> — whether offered load is being absorbed or stored as future latency</li>
+<li><strong>WAL bytes per completed job</strong> — the main Postgres durability budget for the hot path</li>
+<li><strong>transaction commits per completed job</strong> — connection and commit pressure</li>
+<li><strong>dead tuples and prune lag</strong> — whether churn stays bounded under overlap readers, retries, and terminal bursts</li>
+</ul>
+<p>Producer throughput is still measured, especially for <code>INSERT</code> vs <code>COPY</code> and <code>enqueue_shards</code> sweeps, but it is a secondary producer-path diagnostic. A configuration that can enqueue <code>50k/s</code> and complete <code>5k/s</code> is a backlog and latency problem unless the workload is intentionally bursty and has enough headroom to drain before the SLA window closes.</p>
+<h2 id="positioning-proof-checklist">Positioning Proof Checklist<a class="headerlink" href="#positioning-proof-checklist" title="Permanent link">&para;</a></h2>
+<p>Queue storage changes Awa's comparison set.</p>
+<p>The interesting public question is no longer "can Postgres run jobs?" It is "can a Postgres job queue keep dispatch latency low while also keeping hot-path dead tuples bounded?"</p>
+<p>That means the benchmark burden for positioning is different from the benchmark burden for internal regressions. Before making the strongest public claim, the comparison needs to be rerun cleanly on the same hardware against the right reference points:</p>
+<ul>
+<li>Awa queue storage</li>
+<li>PgQue</li>
+<li>River</li>
+<li>optionally Oban Pro as a paid partitioned reference</li>
+</ul>
+<p>The benchmark set should include:</p>
+<ul>
+<li>idle pickup latency</li>
+<li>sustained runtime throughput and durable completion throughput</li>
+<li>overlap readers / MVCC horizon pressure</li>
+<li>mixed workload soak</li>
+<li>terminal-failure burst</li>
+<li>WAL bytes/job, commit pressure, queue depth, and dead-tuple pressure for every headline table</li>
+</ul>
+<p>Operational differences should be called out, not hidden:</p>
+<ul>
+<li>Awa does not require <code>pg_cron</code>; the worker runtime owns dispatch, rescue, rotation, and prune.</li>
+<li>PgQue is designed around a periodic ticker and recommends <code>pg_cron</code>.</li>
+<li>River and Oban are job frameworks rather than shared-log event queues, so they remain the more comparable references for worker semantics.</li>
+</ul>
+<p>Commands and raw output for any public-facing table should live in-repo under <code>docs/adr/bench/</code> or another stable location so the resulting claim is auditable.</p>
+<h2 id="methodology-notes">Methodology Notes<a class="headerlink" href="#methodology-notes" title="Permanent link">&para;</a></h2>
+<p>The most important lesson from this round of work is that benchmark isolation matters.</p>
+<p>The maintenance service is global to the worker instance. If a benchmark leaves behind millions of deferred rows in <code>awa.scheduled_jobs</code>, later "hot path" benchmarks may accidentally measure background promotion work as well. The sustained hot/deferred benchmarks reset runtime state first to avoid that pollution.</p>
+<p>Two benchmark shapes are used:</p>
+<ul>
+<li><strong>Burst/frontier benchmarks</strong>: seed a backlog, then drain it</li>
+<li><strong>Steady/sustained benchmarks</strong>: warm up, then measure a fixed time window</li>
+</ul>
+<p>Steady numbers are the better indicator of sustained runtime behavior.</p>
+<h2 id="mvcc-horizon-benchmark">MVCC Horizon Benchmark<a class="headerlink" href="#mvcc-horizon-benchmark" title="Permanent link">&para;</a></h2>
+<p><code>awa/tests/scheduling_benchmark_test.rs</code> also includes an ignored <code>test_mvcc_horizon_overlap_benchmark</code> scenario for the failure mode described in PlanetScale's "Keeping a Postgres queue healthy" post: overlapping long-lived transactions pin the MVCC horizon while queue churn continues.</p>
+<p>The benchmark:</p>
+<ul>
+<li>runs a steady producer feeding <code>awa.jobs_hot</code></li>
+<li>enables aggressive completed-job cleanup to generate update/delete churn</li>
+<li>starts overlapping <code>REPEATABLE READ</code> reader transactions on separate connections to hold old snapshots open</li>
+<li>samples per-second throughput, queue depth, and <code>pg_stat_user_tables</code> (<code>n_dead_tup</code>, vacuum counters) for <code>awa.jobs_hot</code></li>
+</ul>
+<p>Reader modes:</p>
+<ul>
+<li><code>idle_snapshot</code>: pins a snapshot and waits inside the transaction; useful for the pure MVCC-horizon case</li>
+<li><code>active_scan</code>: runs repeated queue scans inside the open transaction so the reader behaves more like overlapping analytics work on the primary</li>
+</ul>
+<p>Example:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--release<span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>scheduling_benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>test_mvcc_horizon_overlap_benchmark<span class="w"> </span>--<span class="w"> </span>--ignored<span class="w"> </span>--exact<span class="w"> </span>--nocapture
+</span></code></pre></div>
+<p>This scenario is also wired into <code>.github/workflows/nightly-chaos.yml</code> and runs on PostgreSQL 18 in the Rust nightly benchmark lane.</p>
+<p>The nightly lane uses a shorter CI profile so the benchmark stays cheap on shared runners while still exercising overlap readers and cleanup pressure:</p>
+<ul>
+<li><code>AWA_MVCC_JOB_RATE=400</code></li>
+<li><code>AWA_MVCC_BASELINE_SECS=5</code></li>
+<li><code>AWA_MVCC_OVERLAP_SECS=12</code></li>
+<li><code>AWA_MVCC_COOLDOWN_SECS=5</code></li>
+<li><code>AWA_MVCC_OVERLAP_READERS=2</code></li>
+<li><code>AWA_MVCC_OVERLAP_HOLD_SECS=12</code></li>
+<li><code>AWA_MVCC_OVERLAP_STAGGER_SECS=4</code></li>
+<li><code>AWA_MVCC_READER_MODE=active_scan</code></li>
+<li><code>AWA_MVCC_ANALYTICS_TICK_MS=500</code></li>
+</ul>
+<p>Nightly regression checks use per-run ratios (<code>overlap_handler_per_s</code> and <code>cooldown_handler_per_s</code> relative to the same run's baseline window) plus guardrails on <code>dead_tup_delta</code> and <code>max_available</code>.</p>
+<p>That nightly profile is intentionally short. It checks that Awa still behaves reasonably under overlapping analytical readers, but it is not the same thing as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a closer reproduction, increase duration and reader hold times and keep the readers in <code>active_scan</code> mode so queries overlap continuously rather than simulating only <code>idle in transaction</code>.</p>
+<p>A second ignored benchmark target now exists for that longer profile: <code>test_mvcc_horizon_planetscale_soak</code>. Its default shape is closer to the blog's mixed-workload setup:</p>
+<ul>
+<li><code>800</code> jobs/sec producer rate</li>
+<li><code>3</code> overlapping analytics readers</li>
+<li><code>120s</code> reader hold time</li>
+<li><code>20s</code> stagger between readers</li>
+<li><code>15m</code> overlap window with <code>active_scan</code></li>
+</ul>
+<p>That soak benchmark is wired into CI as a weekly/manual run, while the shorter <code>test_mvcc_horizon_overlap_benchmark</code> remains the daily nightly smoke.</p>
+<h3 id="mvcc-bench-knobs">MVCC bench knobs<a class="headerlink" href="#mvcc-bench-knobs" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>AWA_MVCC_JOB_RATE</code> — steady producer rate in jobs/sec</li>
+<li><code>AWA_MVCC_BASELINE_SECS</code> / <code>AWA_MVCC_OVERLAP_SECS</code> / <code>AWA_MVCC_COOLDOWN_SECS</code></li>
+<li><code>AWA_MVCC_OVERLAP_READERS</code> / <code>AWA_MVCC_OVERLAP_HOLD_SECS</code> / <code>AWA_MVCC_OVERLAP_STAGGER_SECS</code></li>
+<li><code>AWA_MVCC_READER_MODE</code> — <code>idle_snapshot</code> or <code>active_scan</code></li>
+<li><code>AWA_MVCC_ANALYTICS_TICK_MS</code> — cadence for repeated analytics scans in <code>active_scan</code> mode</li>
+<li><code>AWA_MVCC_CLEANUP_INTERVAL_MS</code> / <code>AWA_MVCC_CLEANUP_BATCH_SIZE</code></li>
+</ul>
+<h2 id="cross-system-comparison">Cross-system comparison<a class="headerlink" href="#cross-system-comparison" title="Permanent link">&para;</a></h2>
+<p>The awa benches in this file are the awa-only regression detection track — fast, precise, hard thresholds, awa code only. They are not designed for fair comparison with other systems.</p>
+<p>For cross-system comparison, the long-horizon harness lives in a separate repository so each system-under-test can be benchmarked through its public API on equal footing:</p>
+<p><a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking"><strong>hardbyte/postgresql-job-queue-benchmarking</strong></a></p>
+<p>The companion repo currently benchmarks awa against pgque, procrastinate, pg-boss, river, oban, and pgmq using a shared subprocess contract: each adapter is a self-contained binary that emits one JSON sample per line. Headline numbers, per-system architectural notes, and reproducible run instructions are in that repo's <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/SYSTEM_COMPARISONS.md"><code>SYSTEM_COMPARISONS.md</code></a> and <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/results/2026-04-28/SUMMARY.md"><code>results/2026-04-28/SUMMARY.md</code></a>.</p>
+<p>The two tracks are deliberately separate. If they ever diverge on workload shape or thresholds, the awa-only benches in this file are canonical for awa's own numbers and the cross-system runner defers.</p>
+<h2 id="python-runtime-benchmarks">Python Runtime Benchmarks<a class="headerlink" href="#python-runtime-benchmarks" title="Permanent link">&para;</a></h2>
+<p>The Python benchmark script exercises the real <code>awa-python</code> worker path while reusing the same database-facing benchmark shapes as the Rust runtime:</p>
+<p><strong>Baseline scenarios</strong> (<code>--scenario baseline</code>):</p>
+<ul>
+<li><code>copy</code>: Python client <code>enqueue_many_copy</code> direct queue-storage COPY throughput</li>
+<li><code>hot</code>: sustained worker throughput over pre-seeded <code>awa.jobs_hot</code></li>
+<li><code>scheduled</code>: sustained deferred promotion over pre-seeded <code>awa.scheduled_jobs</code></li>
+</ul>
+<p><strong>Failure scenarios</strong> (<code>--scenario failures</code>):</p>
+<ul>
+<li><code>terminal_1pct</code> / <code>10pct</code> / <code>50pct</code>: terminal failures</li>
+<li><code>retryable_1pct</code> / <code>10pct</code> / <code>50pct</code>: retry-once failures</li>
+<li><code>callback_timeout_10pct</code>: callback registration with short timeout</li>
+<li><code>mixed_50pct</code>: rotating through terminal, retryable, and success modes</li>
+</ul>
+<p>The worker-focused scenarios seed with SQL directly so the reported number is about Python handler dispatch and runtime behavior, not enqueue serialization.</p>
+<h2 id="reference-results">Reference Results<a class="headerlink" href="#reference-results" title="Permanent link">&para;</a></h2>
+<h3 id="immediate-enqueue-throughput">Immediate Enqueue Throughput<a class="headerlink" href="#immediate-enqueue-throughput" title="Permanent link">&para;</a></h3>
+<p>The enqueue path that is being measured here has a few important architectural properties:</p>
+<ul>
+<li>homogeneous inserts now route directly to <code>awa.jobs_hot</code> or <code>awa.scheduled_jobs</code> instead of going through the compatibility view</li>
+<li>admin metadata maintenance moved from row-level triggers to statement-level trigger batches</li>
+<li>COPY staging now reuses a session-local temp table and stages typed values instead of reparsing text on the final <code>INSERT ... SELECT</code></li>
+</ul>
+<p>Example reference result from the developer laptop reference:</p>
+<ul>
+<li>developer laptop reference (<code>Apple M5</code>, release build, v0.5.0-alpha.0):</li>
+<li><code>insert_only_single</code>: about <code>30k inserts/s</code></li>
+<li><code>copy_single</code>: about <code>43k inserts/s</code></li>
+<li><code>insert_contention_distinct</code> (4 producers x 3k): about <code>46k inserts/s</code></li>
+<li><code>copy_contention_distinct</code> (4 producers x 3k, chunk 1000): about <code>100k inserts/s</code></li>
+<li><code>insert_contention_same_queue</code> (4 producers x 3k): about <code>95k inserts/s</code></li>
+<li><code>copy_contention_same_queue</code> (4 producers x 3k, chunk 1000): about <code>67k inserts/s</code></li>
+</ul>
+<p>These are engineering comparisons, not product guarantees. Their main value is showing where the architecture bottlenecks move as the implementation changes.</p>
+<h3 id="sustained-hot-path">Sustained Hot Path<a class="headerlink" href="#sustained-hot-path" title="Permanent link">&para;</a></h3>
+<p>Measured with <code>test_runtime_sustained_hot_path</code> after resetting runtime state:</p>
+<ul>
+<li>warmup: 2s</li>
+<li>measurement window: 10s</li>
+<li>queue size seeded: 200,000 immediately-available jobs</li>
+</ul>
+<p>Example reference result from the developer laptop reference (release mode, v0.5.0-alpha.0):</p>
+<ul>
+<li>handler returns: about <code>5.6k jobs/s</code></li>
+<li>DB <code>completed</code> transitions: about <code>5.6k jobs/s</code></li>
+</ul>
+<p>This benchmark enables the in-memory OpenTelemetry exporter and the production alerting metrics path (queue depth, lag, wait-duration histogram). Back-to-back A/B testing in the same reference environment shows v0.5.0 is ~44% faster than v0.4.1 (5.9k vs 4.1k/s) — the promotion query optimizations more than offset the metrics instrumentation cost.</p>
+<h3 id="python-runtime-baseline">Python Runtime Baseline<a class="headerlink" href="#python-runtime-baseline" title="Permanent link">&para;</a></h3>
+<p>Measured with <code>awa-python/scripts/benchmark_runtime.py</code> on the developer laptop reference database:</p>
+<ul>
+<li><code>enqueue_many_copy</code>: about <code>16.2k jobs/s</code> (<code>50,000</code> jobs in <code>3.09s</code>)</li>
+<li>sustained hot path:</li>
+<li>handler returns: about <code>3.2k jobs/s</code></li>
+<li>DB <code>completed</code> transitions: about <code>3.1k jobs/s</code></li>
+</ul>
+<p>The <code>copy</code> scenario measures producer serialization and direct queue-storage COPY. The worker-focused scenarios seed with SQL so the runtime number is not dominated by Python-side enqueue serialization.</p>
+<h3 id="deep-backlog-drain">Deep Backlog Drain<a class="headerlink" href="#deep-backlog-drain" title="Permanent link">&para;</a></h3>
+<p><code>test_queue_storage_deep_backlog_drain_benchmark</code> is an ignored regression benchmark for the spike shape where a large ready backlog drains more slowly than the same fleet processes steady offered load. It seeds with direct queue-storage COPY, optionally analyzes <code>ready_entries</code>, then measures claim/complete throughput and claim latency while draining a fixed backlog.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">DATABASE_URL_QUEUE_STORAGE</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test_queue_storage<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nv">AWA_QS_DEEP_BACKLOG_JOBS</span><span class="o">=</span><span class="m">1000000</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nv">AWA_QS_DEEP_BACKLOG_SECONDS</span><span class="o">=</span><span class="m">120</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="nv">AWA_QS_DEEP_BACKLOG_CONSUMERS</span><span class="o">=</span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="nv">AWA_QS_DEEP_BACKLOG_SHARDS</span><span class="o">=</span><span class="m">16</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>queue_storage_benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span>test_queue_storage_deep_backlog_drain_benchmark<span class="w"> </span>--<span class="w"> </span>--exact<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</span></code></pre></div>
+<p>Useful knobs:</p>
+<ul>
+<li><code>AWA_QS_DEEP_BACKLOG_JOBS</code> — ready rows to seed (default <code>100000</code>)</li>
+<li><code>AWA_QS_DEEP_BACKLOG_COPY_BATCH</code> — direct COPY chunk size (default <code>1000</code>)</li>
+<li><code>AWA_QS_DEEP_BACKLOG_CONSUMERS</code> — concurrent claim/complete loops (default <code>8</code>)</li>
+<li><code>AWA_QS_DEEP_BACKLOG_CLAIM_BATCH_SIZE</code> — claim batch size (default <code>512</code>)</li>
+<li><code>AWA_QS_DEEP_BACKLOG_SHARDS</code> — <code>awa.queue_meta.enqueue_shards</code> upserted before seeding (default <code>16</code>)</li>
+<li><code>AWA_QS_DEEP_BACKLOG_ANALYZE</code> — run <code>ANALYZE</code> after seeding (default <code>1</code>)</li>
+</ul>
+<h3 id="large-deferred-frontier">Large Deferred Frontier<a class="headerlink" href="#large-deferred-frontier" title="Permanent link">&para;</a></h3>
+<p>Measured with <code>test_scheduled_steady_10m_due_1k_per_sec</code>:</p>
+<ul>
+<li>total deferred backlog: <code>10,000,000</code> rows</li>
+<li>due rate target: <code>1,000</code> jobs/s</li>
+<li>measurement window: 10s</li>
+</ul>
+<p>Isolated 4-thread Tokio runtime result (release mode, v0.5.0-alpha.0):</p>
+<ul>
+<li><code>9,000</code> of <code>10,000</code> due jobs completed within the window</li>
+<li>per-second completions: <code>0, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000</code> — perfectly steady after the first-tick startup delay</li>
+<li>pickup lateness:</li>
+<li><code>p50</code>: <code>229 ms</code></li>
+<li><code>p95</code>: <code>332 ms</code></li>
+<li><code>p99</code>: <code>343 ms</code></li>
+<li>promotion: <code>354</code> batches, mean <code>4.3 ms</code>, max <code>59 ms</code></li>
+<li>claim latency: mean <code>5.0 ms</code></li>
+</ul>
+<p>This demonstrates that the hot/deferred split with literal-state promotion queries handles a 10M-row deferred frontier with steady, predictable throughput.</p>
+<p><strong>Key optimization (v0.5.0):</strong> Promotion queries use literal state values (e.g., <code>WHERE state = 'scheduled'</code>) instead of parameterized (<code>WHERE state = $1</code>). This allows the Postgres planner to match the partial index <code>idx_awa_scheduled_jobs_run_at_scheduled</code> at plan time. With a parameterized query, the planner falls back to a full bitmap scan on multi-million-row tables, degrading promotion from ~4ms to ~400ms per batch (100x slower).</p>
+<h3 id="moderate-deferred-frontier-higher-due-rate">Moderate Deferred Frontier — Higher Due Rate<a class="headerlink" href="#moderate-deferred-frontier-higher-due-rate" title="Permanent link">&para;</a></h3>
+<p>Measured with <code>test_scheduled_steady_2m_due_4k_per_sec</code>:</p>
+<ul>
+<li>total deferred backlog: <code>2,000,000</code> rows</li>
+<li>due rate target: <code>4,000</code> jobs/s</li>
+<li>measurement window: 10s</li>
+</ul>
+<p>Result (v0.5.0-alpha.0):</p>
+<ul>
+<li>all <code>40,000</code> due jobs were picked and completed</li>
+<li>pickup lateness: <code>p50</code>: <code>0 ms</code>, <code>p95</code>: <code>0 ms</code>, <code>p99</code>: <code>57 ms</code></li>
+<li>promotion: <code>214</code> batches, mean <code>10.0 ms</code>, max <code>176 ms</code></li>
+<li>claim latency: mean <code>12.4 ms</code></li>
+</ul>
+<p>This validates the architecture at a realistic production scale: 2M deferred rows with 4k/s throughput and reliable promotion.</p>
+<h3 id="high-rate-deferred-frontier-10m-at-6ks">High-Rate Deferred Frontier: 10M at 6k/s<a class="headerlink" href="#high-rate-deferred-frontier-10m-at-6ks" title="Permanent link">&para;</a></h3>
+<p>Measured with <code>test_scheduled_steady_10m_due_6k_per_sec</code>:</p>
+<ul>
+<li>total deferred backlog: <code>10,000,000</code> rows</li>
+<li>due rate target: <code>6,000</code> jobs/s</li>
+<li>measurement window: 10s</li>
+</ul>
+<p>Result:</p>
+<ul>
+<li><code>58,686</code> of <code>60,000</code> target jobs completed within the window (98%)</li>
+<li>per-second completions: <code>2942, 6834, 6907, 4758, 5915, 5662, 7246, 6446, 5305, 6671</code></li>
+<li>pickup lateness: <code>p50</code>: <code>0 ms</code>, <code>p95</code>: <code>310 ms</code>, <code>p99</code>: <code>476 ms</code></li>
+<li>promotion: <code>242</code> batches, mean <code>6.4 ms</code>, max <code>99 ms</code></li>
+</ul>
+<p>This rate was previously a documented scaling limit (only 20-57k of 60k promoted, promotion at 1.7-3.6s per batch). The literal-state promotion fix (v0.5.0) eliminated the bottleneck entirely.</p>
+<p><strong>Promotion and completion throughput knobs:</strong></p>
+<ul>
+<li><code>promote_interval</code> (default <code>250 ms</code>): how often promotion runs</li>
+<li><code>AWA_COMPLETION_FLUSH_MS</code> (default <code>1 ms</code>): completion batcher flush interval</li>
+<li><code>AWA_COMPLETION_BATCH_SIZE</code> (default <code>512</code>): max rows per completion-batcher flush. Queue-storage short-job completion uses a fused receipt-claim lock, compact terminal insert, and compact claim-closure insert, so the default keeps finalization latency low while still amortising durable completion work under load.</li>
+<li><code>AWA_COMPLETION_SHARDS</code>: number of parallel completion flushers. The runtime default is storage-dependent: <code>8</code> for canonical storage. Queue storage starts at <code>1</code> for ordinary runtimes and uses <code>4</code> once the configured runtime worker capacity is at least <code>512</code>. Queue storage starts conservative because the terminal / receipt path already batches heavily and the effective fleet-wide flusher count is <code>processes × AWA_COMPLETION_SHARDS</code>. Override only after measuring end-to-end throughput, p99 latency, WAL bytes/job, and dead tuples for the target worker-process topology.</li>
+</ul>
+<p>Internal promotion constants are fixed in the runtime: <code>PROMOTE_BATCH_SIZE = 4,096</code> rows per promotion batch and <code>PROMOTE_MAX_BATCHES_PER_TICK = 32</code> batches per maintenance tick. They are not environment variables or builder options.</p>
+<h3 id="concurrent-multi-queue-lifecycle">Concurrent Multi-Queue Lifecycle<a class="headerlink" href="#concurrent-multi-queue-lifecycle" title="Permanent link">&para;</a></h3>
+<p>Measured with <code>concurrent_lifecycle_test.rs</code>. Four queues (<code>email:32</code>, <code>payments:16</code>, <code>analytics:64</code>, <code>webhooks:16</code> workers), 128 total workers, full insert → claim → execute → complete lifecycle.</p>
+<p>Queue-count sweep with 128 total workers, pool=50, 20k jobs (release mode):</p>
+<table>
+<thead>
+<tr>
+<th>Config</th>
+<th>Workers/queue</th>
+<th>Throughput</th>
+<th>Per-worker</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 queue × 128</td>
+<td>128</td>
+<td><code>~1.9k/s</code></td>
+<td><code>~14/s</code></td>
+</tr>
+<tr>
+<td>2 queues × 64</td>
+<td>64</td>
+<td><code>~2.0k/s</code></td>
+<td><code>~15/s</code></td>
+</tr>
+<tr>
+<td>4 queues × 32</td>
+<td>32</td>
+<td><code>~350/s</code></td>
+<td><code>~2.7/s</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key finding</strong>: 1-queue and 2-queue throughput is essentially identical, but 4 queues drops 5-6x. The cliff between 2 and 4 queues indicates that the per-queue dispatcher overhead (separate claim query, PgListener, semaphore) compounds non-linearly when many small queues share a pool.</p>
+<p>For comparison, the hot-path benchmark (200k pre-seeded into <code>jobs_hot</code> via SQL) reaches <code>~10k/s</code> because it bypasses insert triggers and has a fully warmed dispatch pipeline. The lifecycle benchmarks exercise the complete path including job-state triggers and notification.</p>
+<p><strong>Tuning guidelines</strong>:</p>
+<ul>
+<li>Size the connection pool to at least <code>num_queues * 4 + 20</code>. With 4 queues, that's 36+ connections.</li>
+<li>Prefer fewer queues with larger worker pools over many small queues. 2 queues × 64 workers performs the same as 1 × 128.</li>
+<li>Use multi-queue for isolation, priority, or rate limiting — not for throughput.</li>
+</ul>
+<p>A unified cross-queue claim query (one SQL round-trip claiming across all queues via <code>LATERAL JOIN</code>) could eliminate the per-queue dispatch overhead. Prototyping shows 16ms for 48 jobs across 2 queues — comparable to single-queue performance. This is tracked as a future optimization.</p>
+<h3 id="progress-feature-overhead">Progress Feature Overhead<a class="headerlink" href="#progress-feature-overhead" title="Permanent link">&para;</a></h3>
+<p>ADR-014 introduced the user-facing structured progress API and a two-tier heartbeat flush. In the current queue-storage engine, mutable progress lives in <code>{schema}.attempt_state</code> only after an attempt first needs per-attempt mutable state; short jobs that never report progress do not allocate an <code>attempt_state</code> row. Older benchmark notes refer to <code>progress</code> columns on <code>jobs_hot</code> / <code>scheduled_jobs</code>, which was the canonical-storage implementation.</p>
+<p>Performance impact was validated:</p>
+<ul>
+<li><strong>Zero overhead when no progress is set.</strong> The heartbeat service partitions jobs by pending progress; jobs without mutations use the heartbeat-only path, and <code>snapshot_pending_progress</code> returns empty when no generation has been bumped.</li>
+<li><strong>Completion remains narrow.</strong> Successful completion clears the progress snapshot while closing the attempt. On queue storage this is handled through the attempt-state / terminal-snapshot path rather than rewriting the ready row.</li>
+<li><strong>Sustained hot-path throughput</strong> was unchanged when the progress feature was added. Current hot-path throughput (~5.6k/s) reflects the additional v0.5.0 OTel metrics instrumentation, not progress overhead.</li>
+</ul>
+<h2 id="failure-mode-benchmarks">Failure-Mode Benchmarks<a class="headerlink" href="#failure-mode-benchmarks" title="Permanent link">&para;</a></h2>
+<p>The failure-mode benchmark suite measures throughput, drain time, and recovery behaviour when a configurable percentage of jobs fail, retry, hang, or trigger rescue paths. This answers a question the happy-path benchmarks cannot: <strong>how does failure impact healthy-job throughput?</strong></p>
+<h3 id="benchmark-matrix">Benchmark matrix<a class="headerlink" href="#benchmark-matrix" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>terminal_1pct</code> / <code>10pct</code> / <code>50pct</code></td>
+<td>N% of jobs fail terminally</td>
+</tr>
+<tr>
+<td><code>retryable_1pct</code> / <code>10pct</code> / <code>50pct</code></td>
+<td>N% of jobs fail once then succeed on retry</td>
+</tr>
+<tr>
+<td><code>callback_timeout_10pct</code></td>
+<td>10% register a callback that times out, then succeed on retry</td>
+</tr>
+<tr>
+<td><code>deadline_hang_10pct</code></td>
+<td>10% hang until deadline rescue fires, then succeed on retry</td>
+</tr>
+<tr>
+<td><code>snooze_once_10pct</code></td>
+<td>10% snooze once, then succeed</td>
+</tr>
+<tr>
+<td><code>mixed_all_modes</code></td>
+<td>50% success, 10% each of terminal/retryable/callback/deadline/snooze</td>
+</tr>
+<tr>
+<td><code>stale_heartbeat_rescue</code></td>
+<td>All jobs seeded as "running" with stale heartbeat — measures rescue-to-completion time</td>
+</tr>
+</tbody>
+</table>
+<h3 id="rust-harness">Rust harness<a class="headerlink" href="#rust-harness" title="Permanent link">&para;</a></h3>
+<p>Tests live in <code>awa/tests/failure_benchmark_test.rs</code>. Each scenario seeds jobs deterministically by mode, starts a Client with aggressive rescue intervals, drains to terminal states, and emits both human-readable output and a JSONL record. The full matrix command covers the 10 failure scenarios; the stale-heartbeat rescue benchmark is a separate test.</p>
+<h3 id="python-harness">Python harness<a class="headerlink" href="#python-harness" title="Permanent link">&para;</a></h3>
+<p>The Python benchmark (<code>awa-python/scripts/benchmark_runtime.py</code>) supports a failure-mode subset via <code>--scenario failures</code>:</p>
+<ul>
+<li><code>terminal_1pct</code> / <code>10pct</code> / <code>50pct</code></li>
+<li><code>retryable_1pct</code> / <code>10pct</code> / <code>50pct</code></li>
+<li><code>callback_timeout_10pct</code></li>
+<li><code>mixed_50pct</code></li>
+</ul>
+<p>Python also includes heartbeat rescue via <code>--scenario rescue</code>. It still does not include the Rust-only <code>deadline_hang</code> and <code>snooze_once</code> scenarios. The worker returns <code>RetryAfter</code>, <code>WaitForCallback</code>, <code>Cancel</code>, or raises exceptions based on the job's <code>mode</code> field.</p>
+<h3 id="structured-output">Structured output<a class="headerlink" href="#structured-output" title="Permanent link">&para;</a></h3>
+<p>Both Rust and Python benchmarks emit one JSONL record per scenario, prefixed with <code>@@BENCH_JSON@@</code> for extraction. Schema version 2:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">"schema_version"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">"scenario"</span><span class="p">:</span><span class="w"> </span><span class="s2">"terminal_10pct"</span><span class="p">,</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span><span class="nt">"language"</span><span class="p">:</span><span class="w"> </span><span class="s2">"rust"</span><span class="p">,</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="nt">"seeded"</span><span class="p">:</span><span class="w"> </span><span class="mi">5000</span><span class="p">,</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="nt">"metrics"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">    </span><span class="nt">"throughput"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">      </span><span class="nt">"handler_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">4200.0</span><span class="p">,</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">      </span><span class="nt">"db_finalized_per_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">4100.0</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">    </span><span class="p">},</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">    </span><span class="nt">"drain_time_s"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.22</span><span class="p">,</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">    </span><span class="nt">"rescue"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">      </span><span class="nt">"deadline_rescued"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">      </span><span class="nt">"callback_timeouts"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">  </span><span class="p">},</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="w">  </span><span class="nt">"outcomes"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="w">    </span><span class="nt">"completed"</span><span class="p">:</span><span class="w"> </span><span class="mi">4500</span><span class="p">,</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="w">    </span><span class="nt">"failed"</span><span class="p">:</span><span class="w"> </span><span class="mi">500</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>Extract JSONL from mixed stdout: <code>grep '@@BENCH_JSON@@' output.txt | sed 's/^@@BENCH_JSON@@//'</code></p>
+<p>For enqueue-only benchmarks (<code>insert_only_single</code>, <code>copy_single</code>, and the contention matrix), <code>metrics.enqueue_per_s</code> is emitted instead of <code>metrics.throughput</code>. Those records still include <code>"measurement": "enqueue"</code> in <code>metadata</code>, plus optional Postgres-side deltas such as <code>wal_bytes</code>, <code>temp_bytes_delta</code>, and <code>xact_commit_delta</code>.</p>
+<h2 id="interpreting-the-results">Interpreting The Results<a class="headerlink" href="#interpreting-the-results" title="Permanent link">&para;</a></h2>
+<p>Some practical guidelines:</p>
+<ul>
+<li>Compare like with like. Burst/frontier benchmarks and steady-state benchmarks answer different questions.</li>
+<li>Reset runtime state before sustained measurements if you want to isolate one path. Global background work can distort results.</li>
+<li>Prefer the <code>db_completed_delta</code> view when you care about end-to-end queue completion, not just handler return rate.</li>
+<li>Treat the numbers here as environment-specific reference points, not portable guarantees. For cross-system claims, use the companion comparison repo and its recorded environment.</li>
+</ul>
+<h2 id="how-to-run">How To Run<a class="headerlink" href="#how-to-run" title="Permanent link">&para;</a></h2>
+<h3 id="happy-path-benchmarks">Happy-path benchmarks<a class="headerlink" href="#happy-path-benchmarks" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>scheduling_benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>test_runtime_sustained_hot_path<span class="w"> </span>--<span class="w"> </span>--exact<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>scheduling_benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">  </span>test_scheduled_steady_2m_due_4k_per_sec<span class="w"> </span>--<span class="w"> </span>--exact<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</span></code></pre></div>
+<h3 id="enqueue-contention-benchmarks">Enqueue contention benchmarks<a class="headerlink" href="#enqueue-contention-benchmarks" title="Permanent link">&para;</a></h3>
+<p>These are the most useful benchmarks when you want to compare single-producer enqueue against multi-producer contention, or compare chunked <code>INSERT</code> with the COPY staging path under concurrent writers.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="nv">AWA_BENCH_CONTENTION_PRODUCERS</span><span class="o">=</span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="nv">AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER</span><span class="o">=</span><span class="m">3000</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span><span class="nv">AWA_BENCH_INSERT_BATCH_SIZE</span><span class="o">=</span><span class="m">1000</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">  </span><span class="nv">AWA_BENCH_COPY_CHUNK_SIZE</span><span class="o">=</span><span class="m">1000</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">  </span>test_enqueue_contention_matrix<span class="w"> </span>--<span class="w"> </span>--exact<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</span></code></pre></div>
+<p>This emits six JSONL records:</p>
+<ul>
+<li><code>insert_single</code></li>
+<li><code>copy_single</code></li>
+<li><code>insert_contention_distinct</code></li>
+<li><code>copy_contention_distinct</code></li>
+<li><code>insert_contention_same_queue</code></li>
+<li><code>copy_contention_same_queue</code></li>
+</ul>
+<p>The matrix hard-resets Awa runtime tables before each scenario so later cases do not inherit a larger or dirtier jobs table from earlier ones.</p>
+<p>By default, <code>AWA_BENCH_COPY_CHUNK_SIZE</code> should match <code>AWA_BENCH_INSERT_BATCH_SIZE</code> if you want the closest apples-to-apples comparison between chunked <code>INSERT</code> and chunked COPY staging. If you want to test the current "one bulk COPY per producer" shape instead, set <code>AWA_BENCH_COPY_CHUNK_SIZE</code> to <code>AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER</code>.</p>
+<p>The optional Postgres profile block in <code>metadata.db_profile</code> is meant to make server runs easier to interpret. In particular:</p>
+<ul>
+<li><code>wal_bytes</code> shows how much WAL the scenario generated</li>
+<li><code>temp_bytes_delta</code> and <code>temp_files_delta</code> show temp-file pressure</li>
+<li><code>xact_commit_delta</code> helps explain why many small commits degrade throughput</li>
+<li><code>tup_inserted_delta</code> shows how much table churn the database observed</li>
+</ul>
+<h3 id="failure-mode-benchmarks-rust">Failure-mode benchmarks (Rust)<a class="headerlink" href="#failure-mode-benchmarks-rust" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Full matrix (10 failure scenarios)</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>failure_benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">  </span>test_failure_bench_full_matrix<span class="w"> </span>--<span class="w"> </span>--exact<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="c1"># Single scenario</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>failure_benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">  </span>test_failure_bench_terminal_10pct<span class="w"> </span>--<span class="w"> </span>--exact<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="c1"># Stale heartbeat rescue</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>failure_benchmark_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="w">  </span>test_failure_bench_stale_heartbeat_rescue<span class="w"> </span>--<span class="w"> </span>--exact<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</span></code></pre></div>
+<h3 id="python-benchmarks">Python benchmarks<a class="headerlink" href="#python-benchmarks" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">cd</span><span class="w"> </span>awa-python
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>uv<span class="w"> </span>run<span class="w"> </span>maturin<span class="w"> </span>develop
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="c1"># Baseline scenarios (copy, hot, scheduled)</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="nv">PYTHONPATH</span><span class="o">=</span>scripts<span class="w"> </span><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>scripts/benchmark_runtime.py<span class="w"> </span>--scenario<span class="w"> </span>baseline
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="c1"># Failure scenarios</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="nv">PYTHONPATH</span><span class="o">=</span>scripts<span class="w"> </span><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="w">  </span>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>scripts/benchmark_runtime.py<span class="w"> </span>--scenario<span class="w"> </span>failures
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="c1"># Everything</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a><span class="nv">PYTHONPATH</span><span class="o">=</span>scripts<span class="w"> </span><span class="nv">DATABASE_URL</span><span class="o">=</span>postgres://postgres:test@localhost:15432/awa_test<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="w">  </span>uv<span class="w"> </span>run<span class="w"> </span>python<span class="w"> </span>scripts/benchmark_runtime.py<span class="w"> </span>--scenario<span class="w"> </span>all
+</span></code></pre></div>
+<h2 id="caveats">Caveats<a class="headerlink" href="#caveats" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Each number is tied to the environment stated near the result. The developer commands use a localhost database URL for convenience, but that URL is not a claim about where every result was produced.</li>
+<li>Ignored benchmark tests are not part of the normal unit/integration test pass.</li>
+<li>The current focus is relative behavior and architectural validation, not cross-machine leaderboard comparisons.</li>
+</ul>
+<h2 id="cross-system-numbers">Cross-system numbers<a class="headerlink" href="#cross-system-numbers" title="Permanent link">&para;</a></h2>
+<p>Cross-system comparison (awa vs pgque / procrastinate / pg-boss / river / oban / pgmq) lives in <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking">hardbyte/postgresql-job-queue-benchmarking</a>. That repo is the source of truth for fair-comparison numbers, chaos results across systems, and the long-horizon harness itself.</p>
+<p>The reasoning for the split: cross-system benches need to evolve at the pace of the systems being compared (each gets new releases, new public APIs, new adapter caveats), and the awa-only regression track in this file needs to evolve at awa's pace. Keeping them in one repo coupled their schedules and conflated "did awa regress?" with "is awa still faster than X?". They're separate questions; they're now in separate places.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../development/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Development">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Development
+              </div>
+            </div>
+          </a>
+        
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
+      
+    
+  </body>
+</html>
