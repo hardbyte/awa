@@ -110,7 +110,8 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
 **Every migration**
 
 - [ ] Keep every object used by N−1 binaries compatible: no drops, type changes, or tightened constraints; make new objects and columns additive.
-- [ ] Make the migration safe to re-run with guards such as `IF NOT EXISTS` and guarded `DO` blocks.
+- [ ] Make the migration safe to re-run: `IF NOT EXISTS` on `CREATE TABLE` / `SEQUENCE` / `INDEX`, `CREATE OR REPLACE` for functions and views, `DROP TRIGGER IF EXISTS` before each `CREATE TRIGGER`, guarded `DO` blocks for anything with no `IF NOT EXISTS` form (`CREATE TYPE`), and `ON CONFLICT (version) DO NOTHING` on the `awa.schema_version` row. `migrations::tests::every_migration_guards_its_ddl` enforces the top-level cases; `test_every_migration_is_individually_re_runnable` proves it against a real database.
+- [ ] Keep every step transaction-safe — the runner applies the whole pending range in one transaction, so no `CREATE INDEX CONCURRENTLY`, `VACUUM`, or statement-level `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT`. `migrations::tests::every_migration_step_is_transaction_safe` enforces this.
 - [ ] In the header, link the issue and state how N−1 binaries operate against the migrated schema.
 - [ ] Safe under live load: no long `ACCESS EXCLUSIVE` holds on hot tables; note the expected wall time on realistic data volumes.
 - [ ] The current binary remains operable before migration, or startup applies the migration before any changed path runs. Test binary-first as well as migrate-first ordering.

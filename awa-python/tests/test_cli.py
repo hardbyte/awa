@@ -153,6 +153,43 @@ def test_migrate_sql_without_db_url(tmp_path):
     assert "Migration V1" in result.stdout
 
 
+def test_migrate_sql_is_transaction_wrapped_by_default():
+    """`python -m awa migrate --sql | psql` must be atomic.
+
+    psql is autocommit, so unwrapped SQL half-applies on a mid-stream failure.
+    The wrapper and its advisory lock mirror the Rust CLI byte for byte; the
+    lock key comes from the shared binding rather than a duplicated literal.
+    """
+    result = _cli("migrate", "--sql", "--version", "1")
+    assert result.returncode == 0, result.stderr
+    assert "\nBEGIN;\n" in result.stdout
+    assert (
+        f"SELECT pg_advisory_xact_lock({awa.migration_lock_key()});" in result.stdout
+    )
+    assert result.stdout.rstrip().endswith("COMMIT;")
+    # Plain psql rolls the transaction back but still exits 0, so the header
+    # must tell the operator to pass ON_ERROR_STOP.
+    assert "ON_ERROR_STOP=1" in result.stdout
+
+
+def test_migrate_sql_no_transaction_omits_the_wrapper():
+    """External runners that own the transaction boundary opt out."""
+    result = _cli("migrate", "--sql", "--no-transaction", "--version", "1")
+    assert result.returncode == 0, result.stderr
+    assert "\nBEGIN;\n" not in result.stdout
+    assert (
+        f"SELECT pg_advisory_xact_lock({awa.migration_lock_key()});"
+        not in result.stdout
+    )
+    assert not result.stdout.rstrip().endswith("COMMIT;")
+
+
+def test_migrate_no_transaction_requires_sql():
+    result = _cli("migrate", "--no-transaction")
+    assert result.returncode == 1
+    assert "--no-transaction only applies to --sql output" in result.stderr
+
+
 def test_queue_stats_without_db_url_errors_cleanly():
     result = _cli("queue", "stats")
     assert result.returncode == 1

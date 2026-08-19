@@ -31,6 +31,7 @@ from awa._awa import (
     migrations,
     migrations_range,
     current_migration_version,
+    migration_lock_key,
     init_telemetry,
     shutdown_telemetry,
     # Exceptions
@@ -97,6 +98,7 @@ __all__ = [
     "migrations",
     "migrations_range",
     "current_migration_version",
+    "migration_lock_key",
     "init_telemetry",
     "shutdown_telemetry",
     # Exceptions

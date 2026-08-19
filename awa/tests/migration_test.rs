@@ -391,6 +391,334 @@ async fn test_migrations_are_idempotent() {
     assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
+/// Snapshot every catalog fact a migration could change: columns, indexes,
+/// constraints, view bodies, function bodies, and trigger definitions.
+///
+/// Used to prove convergence — replaying migrations over an already-migrated
+/// database must leave this snapshot byte-identical, not merely "not error".
+async fn schema_snapshot(pool: &PgPool) -> Vec<String> {
+    let queries = [
+        "SELECT format('COL %s.%s.%s %s %s %s', table_schema, table_name, column_name, \
+                data_type, is_nullable, coalesce(column_default, '')) \
+         FROM information_schema.columns WHERE table_schema = 'awa' \
+         ORDER BY table_name, column_name",
+        "SELECT format('IDX %s %s', indexname, indexdef) FROM pg_indexes \
+         WHERE schemaname = 'awa' ORDER BY indexname",
+        "SELECT format('FUN %s(%s) %s', p.proname, pg_get_function_identity_arguments(p.oid), \
+                md5(pg_get_functiondef(p.oid))) \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'awa' AND p.prokind = 'f' \
+         ORDER BY p.proname, pg_get_function_identity_arguments(p.oid)",
+        "SELECT format('TRG %s %s %s', c.relname, t.tgname, md5(pg_get_triggerdef(t.oid))) \
+         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'awa' AND NOT t.tgisinternal ORDER BY c.relname, t.tgname",
+        "SELECT format('VIEW %s %s', viewname, md5(definition)) FROM pg_views \
+         WHERE schemaname = 'awa' ORDER BY viewname",
+        "SELECT format('CON %s %s %s', conrelid::regclass::text, conname, \
+                pg_get_constraintdef(oid)) \
+         FROM pg_constraint WHERE connamespace = 'awa'::regnamespace ORDER BY conname",
+        "SELECT format('SEQ %s', sequencename) FROM pg_sequences \
+         WHERE schemaname = 'awa' ORDER BY sequencename",
+    ];
+    let mut snapshot = Vec::new();
+    for query in queries {
+        let rows: Vec<String> = sqlx::query_scalar(query)
+            .fetch_all(pool)
+            .await
+            .expect("schema snapshot query should succeed");
+        snapshot.extend(rows);
+    }
+    // Catalog scan order is not stable across rewrites (a re-created object
+    // gets a fresh OID), and names repeat across partitions, so sort the
+    // rendered facts rather than relying on any single ORDER BY.
+    snapshot.sort();
+    assert!(
+        !snapshot.is_empty(),
+        "snapshot of a migrated schema should not be empty"
+    );
+    snapshot
+}
+
+fn assert_snapshots_match(before: &[String], after: &[String], context: &str) {
+    let drifted: Vec<_> = before
+        .iter()
+        .zip(after.iter())
+        .filter(|(b, a)| b != a)
+        .take(5)
+        .map(|(b, a)| format!("\n  before: {b}\n  after:  {a}"))
+        .collect();
+    assert!(
+        before.len() == after.len() && drifted.is_empty(),
+        "{context}: schema drifted ({} entries before, {} after){}",
+        before.len(),
+        after.len(),
+        drifted.join("")
+    );
+}
+
+/// Replaying the *whole ordered migration set* over an already-migrated
+/// database must be a no-op.
+///
+/// This is the idempotency property the runner actually depends on: `run()`
+/// re-applies a version's own file whenever an older schema catches up, and
+/// several migrations deliberately replay earlier files (v027 → V23/V22).
+/// "Did not error" is not enough — the resulting catalog must be identical.
+#[tokio::test]
+async fn test_full_migration_replay_converges_to_identical_schema() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("initial migrate");
+
+    let before = schema_snapshot(&pool).await;
+
+    // Replay every migration in order against the fully-migrated schema, in
+    // one transaction — exactly what `run()` does after a `schema_version`
+    // rewind, and what an external runner does when it re-applies its set.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let mut tx = conn.begin().await.expect("begin replay");
+    for (version, _, sql) in migrations::migration_sql() {
+        sqlx::raw_sql(&sql)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|err| panic!("replay of migration v{version} failed: {err}"));
+    }
+    tx.commit().await.expect("commit replay");
+    drop(conn);
+
+    let after = schema_snapshot(&pool).await;
+    assert_snapshots_match(&before, &after, "full ordered replay");
+
+    // And the recorded history is still exactly one row per migration.
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, migrations::migration_sql().len() as i64);
+}
+
+/// Every migration file, applied a second time back-to-back at the point in
+/// history where it runs, must succeed and change nothing.
+///
+/// This is the retry property an external migration runner needs: a runner
+/// that crashes after applying a file but before recording it will re-apply
+/// that exact file against the schema it just produced.
+#[tokio::test]
+async fn test_every_migration_is_individually_re_runnable() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    for (version, _, sql) in migrations::migration_sql() {
+        sqlx::raw_sql(&sql)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|err| panic!("first apply of migration v{version} failed: {err}"));
+        sqlx::raw_sql(&sql)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("second apply of migration v{version} failed — not re-runnable: {err}")
+            });
+    }
+    drop(conn);
+
+    // A double-applied set must still land on the real current schema.
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+    let duplicate_versions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT version FROM awa.schema_version GROUP BY version \
+         HAVING count(*) > 1) AS d",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        duplicate_versions, 0,
+        "re-applying a migration must not duplicate its schema_version row"
+    );
+
+    // Cross-check against a clean install: double-applying must be
+    // indistinguishable from applying once.
+    let doubled = schema_snapshot(&pool).await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("clean migrate");
+    let clean = schema_snapshot(&pool).await;
+    assert_snapshots_match(&clean, &doubled, "double-applied vs clean install");
+}
+
+// ── Atomicity ────────────────────────────────────────────────────
+
+/// Install an event trigger that aborts the migration as soon as it creates an
+/// object matching `identity_pattern` (a SQL LIKE pattern over the DDL
+/// command's `object_identity`), so a run can be failed at a chosen point.
+///
+/// Injecting the failure through an event trigger — rather than corrupting the
+/// schema — keeps the failure realistic: the migration SQL itself is untouched
+/// and the abort happens mid-transaction, exactly like a genuine DDL error.
+///
+/// Event triggers need superuser, which the migration test database already
+/// requires (other tests here create and drop login roles).
+async fn arm_migration_abort(pool: &PgPool, identity_pattern: &str) {
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION public.awa_test_abort_migration() \
+           RETURNS event_trigger LANGUAGE plpgsql AS $fn$ \
+         BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger_ddl_commands() \
+                      WHERE object_identity LIKE '{identity_pattern}') THEN \
+             RAISE EXCEPTION 'injected migration failure'; \
+           END IF; \
+         END $fn$; \
+         DROP EVENT TRIGGER IF EXISTS awa_test_abort_migration; \
+         CREATE EVENT TRIGGER awa_test_abort_migration ON ddl_command_end \
+           EXECUTE FUNCTION public.awa_test_abort_migration();"
+    ))
+    .execute(pool)
+    .await
+    .expect("arming the migration abort event trigger requires superuser");
+}
+
+async fn disarm_migration_abort(pool: &PgPool) {
+    sqlx::raw_sql(
+        "DROP EVENT TRIGGER IF EXISTS awa_test_abort_migration; \
+         DROP FUNCTION IF EXISTS public.awa_test_abort_migration();",
+    )
+    .execute(pool)
+    .await
+    .expect("disarm should succeed");
+}
+
+/// A fresh install that fails part-way must leave *nothing* behind.
+///
+/// `run()` wraps the whole pending range in one transaction, so an abort in
+/// v002 must also undo every object v001 created — not leave a half-installed
+/// schema that the next run would have to reconcile.
+#[tokio::test]
+async fn test_failed_fresh_install_rolls_back_every_step() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    // `runtime_instances` is created by v002, so v001 has fully applied by the
+    // time the abort fires.
+    arm_migration_abort(&pool, "awa.runtime\\_instances").await;
+    let result = migrations::run(&pool).await;
+    disarm_migration_abort(&pool).await;
+
+    let err = result.expect_err("the injected failure should fail the migration");
+    assert!(
+        err.to_string().contains("injected migration failure"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing from v001 survived: no schema, so no tables, no version rows.
+    let schema_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !schema_exists,
+        "a failed fresh install must roll back the awa schema entirely"
+    );
+    assert_eq!(migrations::current_version(&pool).await.unwrap(), 0);
+
+    // The database is still usable: a clean retry reaches the current version.
+    migrations::run(&pool).await.expect("retry after rollback");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+}
+
+/// A failed *upgrade* must leave the prior schema exactly as it was.
+///
+/// The interesting case is a multi-step pending range: the abort fires several
+/// migrations in, and every earlier step in the same run must roll back with
+/// it, leaving the recorded version untouched.
+#[tokio::test]
+async fn test_failed_upgrade_leaves_prior_schema_untouched() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.expect("initial migrate");
+
+    let before = schema_snapshot(&pool).await;
+    let before_version = migrations::current_version(&pool).await.unwrap();
+
+    // Rewind so v002.. are pending again, then abort inside v004 — two
+    // migrations after the first pending step. The target is a function v004
+    // creates: against an already-current schema its `CREATE TABLE IF NOT
+    // EXISTS` emits no DDL, while `CREATE OR REPLACE FUNCTION` always does.
+    rewind_schema_version(&pool, 2).await;
+    arm_migration_abort(&pool, "awa.rebuild\\_admin\\_metadata%").await;
+    let result = migrations::run(&pool).await;
+    disarm_migration_abort(&pool).await;
+
+    let err = result.expect_err("the injected failure should fail the migration");
+    assert!(
+        err.to_string().contains("injected migration failure"),
+        "unexpected error: {err}"
+    );
+
+    // The aborted run recorded nothing: the version is still the rewound one,
+    // not the one the migrations it got through would have written.
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        1,
+        "an aborted upgrade must not commit any schema_version row"
+    );
+
+    // The rewind itself is outside the migration transaction, so restore the
+    // history rows the test removed and compare the physical schema.
+    migrations::run(&pool).await.expect("retry after rollback");
+    let after = schema_snapshot(&pool).await;
+    assert_snapshots_match(&before, &after, "aborted upgrade then retry");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        before_version
+    );
+}
+
+/// An aborted migration is never observable from another session.
+///
+/// The rollback tests above check the state the failing runner is left with;
+/// this one checks a *different* connection, so a partially-committed step
+/// leaking out to concurrent readers would be caught too.
+#[tokio::test]
+async fn test_aborted_migration_is_never_visible_to_another_session() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    // Observer connection, taken before the run so it never contends for the
+    // migration advisory lock.
+    let mut observer = PgConnection::connect(&migration_database_url())
+        .await
+        .expect("observer connection");
+
+    arm_migration_abort(&pool, "awa.runtime\\_instances").await;
+    let result = migrations::run(&pool).await;
+    disarm_migration_abort(&pool).await;
+    assert!(result.is_err(), "injected failure should fail the run");
+
+    // The observer never saw a partially-installed schema commit.
+    let visible: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+    assert!(
+        !visible,
+        "an aborted migration must never leave committed schema visible to other sessions"
+    );
+    observer.close().await.expect("close observer");
+}
+
 // ── 0.7 migrate gate (#370 / ADR-037) ────────────────────────────
 
 /// Rewind `schema_version` so `run()` sees pending migrations again. The
