@@ -1204,63 +1204,118 @@ mod tests {
     /// inside one — without rejecting a legal top-level `CASE … END`.
     #[test]
     fn transaction_control_scan_covers_synonyms_and_non_transactional_ddl() {
-        // `END` in statement form ends the transaction; in a `CASE` it does not.
-        assert_eq!(find_statements("END;", &["end", ";"]), vec![0]);
-        assert_eq!(find_statements("END WORK;", &["end", "work"]), vec![0]);
-        assert_eq!(
-            find_statements("END TRANSACTION;", &["end", "transaction"]),
-            vec![0]
-        );
-        for control in [
-            vec!["end", ";"],
-            vec!["end", "work"],
-            vec!["end", "transaction"],
+        // Does any top-level statement of `sql` start with `control`?
+        fn flags(sql: &str, control: &[&str]) -> bool {
+            top_level_statements(sql)
+                .iter()
+                .any(|statement| statement_starts_with(statement, control))
+        }
+
+        // `END` starts a statement only as transaction control. The `END` of a
+        // `CASE` is always mid-statement — including the *unparenthesized* form
+        // that ends the statement, which an earlier `["end", ";"]` pattern
+        // wrongly flagged. A parenthesized `END))` did not exercise that, which
+        // is why the earlier test passed while the lint was wrong.
+        assert!(flags("END;", &["end"]));
+        assert!(flags("END WORK;", &["end"]));
+        assert!(flags("END TRANSACTION;", &["end"]));
+        for sql in [
+            "CREATE OR REPLACE VIEW awa.v AS SELECT CASE WHEN enabled THEN 1 ELSE 0 END;",
+            "UPDATE awa.t SET x = CASE WHEN a THEN 1 ELSE 2 END;",
+            "CREATE INDEX IF NOT EXISTS i ON t ((CASE WHEN a THEN 1 ELSE 2 END));",
         ] {
             assert!(
-                find_statements(
-                    "CREATE INDEX IF NOT EXISTS i ON t ((CASE WHEN a THEN 1 ELSE 2 END));",
-                    &control,
-                )
-                .is_empty(),
-                "a top-level CASE … END must not read as transaction control"
+                !flags(sql, &["end"]),
+                "a CASE … END expression must not read as transaction control: {sql}"
             );
         }
 
+        // Likewise `VACUUM` starts a statement; `vacuum_truncate` is a storage
+        // parameter in the middle of an ALTER.
+        assert!(flags("VACUUM ANALYZE awa.t;", &["vacuum"]));
+        assert!(!flags(
+            "ALTER TABLE awa.t SET (vacuum_truncate = false);",
+            &["vacuum"]
+        ));
+
         // COMMIT/ROLLBACK PREPARED are covered by the plain forms.
-        assert!(!find_statements("COMMIT PREPARED 'x';", &["commit"]).is_empty());
-        assert!(!find_statements("ROLLBACK PREPARED 'x';", &["rollback"]).is_empty());
+        assert!(flags("COMMIT PREPARED 'x';", &["commit"]));
+        assert!(flags("ROLLBACK PREPARED 'x';", &["rollback"]));
 
         // Other synonyms and nesting forms.
-        assert!(!find_statements("ABORT;", &["abort"]).is_empty());
-        assert!(!find_statements("RELEASE my_savepoint;", &["release"]).is_empty());
-        assert!(
-            !find_statements("PREPARE TRANSACTION 'x';", &["prepare", "transaction"]).is_empty()
-        );
+        assert!(flags("ABORT;", &["abort"]));
+        assert!(flags("RELEASE my_savepoint;", &["release"]));
+        assert!(flags(
+            "PREPARE TRANSACTION 'x';",
+            &["prepare", "transaction"]
+        ));
         // A prepared *statement* is fine and must not match.
-        assert!(find_statements("PREPARE s AS SELECT 1;", &["prepare", "transaction"]).is_empty());
+        assert!(!flags(
+            "PREPARE s AS SELECT 1;",
+            &["prepare", "transaction"]
+        ));
 
         // Statements PostgreSQL refuses inside a transaction block.
-        assert!(!find_statements("CREATE DATABASE d;", &["create", "database"]).is_empty());
-        assert!(
-            !find_statements("ALTER SYSTEM SET work_mem = '5MB';", &["alter", "system"]).is_empty()
-        );
-        assert!(!find_statements("REINDEX DATABASE d;", &["reindex", "database"]).is_empty());
-        assert!(!find_statements("CLUSTER;", &["cluster"]).is_empty());
-        assert!(!find_statements("DISCARD ALL;", &["discard"]).is_empty());
-        assert!(!find_statements(
+        assert!(flags("CREATE DATABASE d;", &["create", "database"]));
+        assert!(flags(
+            "ALTER SYSTEM SET work_mem = '5MB';",
+            &["alter", "system"]
+        ));
+        assert!(flags("REINDEX DATABASE d;", &["reindex", "database"]));
+        assert!(flags("CLUSTER;", &["cluster"]));
+        assert!(flags("DISCARD ALL;", &["discard"]));
+        assert!(flags(
             "CREATE TABLESPACE ts LOCATION '/x';",
             &["create", "tablespace"]
-        )
-        .is_empty());
+        ));
         // ...but a normal CREATE TABLE is not a TABLESPACE, and vice versa.
-        assert!(find_statements(
+        assert!(!flags(
             "CREATE TABLE IF NOT EXISTS t (x INT);",
             &["create", "tablespace"]
-        )
-        .is_empty());
-        assert!(
-            find_statements("CREATE TABLESPACE ts LOCATION '/x';", &["create", "table"]).is_empty()
+        ));
+        assert!(!flags(
+            "CREATE TABLESPACE ts LOCATION '/x';",
+            &["create", "table"]
+        ));
+
+        // Control words appearing mid-statement are not statement starts.
+        assert!(!flags("COMMENT ON TABLE awa.t IS 'begin';", &["begin"]));
+        assert!(!flags(
+            "SELECT awa.f() FROM awa.t WHERE release_id = 1;",
+            &["release"]
+        ));
+    }
+
+    /// Statement splitting must ignore semicolons inside comments, string
+    /// literals, and dollar-quoted bodies.
+    #[test]
+    fn top_level_statements_splits_only_on_real_separators() {
+        let sql = "SELECT 'a;b'; -- c;d\n\
+                   CREATE OR REPLACE FUNCTION f() RETURNS void AS $fn$ \
+                   BEGIN PERFORM 1; END $fn$ LANGUAGE plpgsql; \
+                   CREATE TABLE IF NOT EXISTS awa.t (x INT);";
+        let statements = top_level_statements(sql);
+        assert_eq!(
+            statements.len(),
+            3,
+            "expected 3 statements, got {statements:?}"
         );
+        assert!(statement_starts_with(&statements[0], &["select"]));
+        assert!(statement_starts_with(
+            &statements[1],
+            &["create", "or", "replace", "function"]
+        ));
+        assert!(statement_starts_with(
+            &statements[2],
+            &["create", "table", "if", "not", "exists"]
+        ));
+        // The function body's own BEGIN/END never becomes a statement.
+        assert!(!statements
+            .iter()
+            .any(|st| statement_starts_with(st, &["begin"])));
+        assert!(!statements
+            .iter()
+            .any(|st| statement_starts_with(st, &["end"])));
     }
 
     /// Dollar-quoted bodies and quoted literals are invisible to the top-level
@@ -1279,6 +1334,29 @@ mod tests {
             "COMMIT inside a body, comment, or literal is not statement-level: {top}"
         );
         assert_eq!(find_statements(&top, &["create", "table"]).len(), 1);
+    }
+
+    /// The top-level statements of a migration step, `;`-delimited.
+    ///
+    /// Semicolons inside comments, string literals, and dollar-quoted bodies are
+    /// removed by [`strip_to_top_level`] first, so the remaining ones are real
+    /// statement separators.
+    fn top_level_statements(sql: &str) -> Vec<String> {
+        strip_to_top_level(sql)
+            .split(';')
+            .map(|statement| statement.trim().to_string())
+            .filter(|statement| !statement.is_empty())
+            .collect()
+    }
+
+    /// Whether a statement *begins* with a keyword sequence.
+    ///
+    /// This is the distinction the transaction-control lint needs: `END` starts
+    /// a statement only when it is transaction control, whereas the `END` of a
+    /// `CASE` expression is always mid-statement. Matching anywhere in the text
+    /// flagged `SELECT CASE WHEN a THEN 1 ELSE 0 END;` as a transaction end.
+    fn statement_starts_with(statement: &str, keywords: &[&str]) -> bool {
+        find_statements(statement, keywords).first() == Some(&0)
     }
 
     /// Every migration version paired with the SQL file that defines it.
@@ -1306,65 +1384,66 @@ mod tests {
     fn every_migration_step_is_transaction_safe() {
         for &(version, _, steps) in MIGRATIONS {
             for step in steps {
-                // `CONCURRENTLY` and `VACUUM` are checked against the raw text:
-                // they are never valid here, not even built inside a function
-                // body that the migration then calls. Matched as whole words so
-                // storage parameters like `autovacuum_vacuum_scale_factor` —
-                // which are legitimate in a `WITH (...)` clause — do not trip it.
-                for banned in ["concurrently", "vacuum"] {
-                    assert!(
-                        find_statements(step, &[banned]).is_empty(),
-                        "migration v{version} runs `{banned}`, which cannot execute \
-                         inside the single migration transaction"
-                    );
-                }
+                // `CONCURRENTLY` is a modifier rather than a statement start,
+                // so it is checked against the raw text — it is never valid
+                // here, not even built inside a function body the migration
+                // then calls. Matched as a whole word.
+                assert!(
+                    find_statements(step, &["concurrently"]).is_empty(),
+                    "migration v{version} runs a `CONCURRENTLY` statement, which cannot \
+                     execute inside the single migration transaction"
+                );
 
                 // Explicit transaction control, and the statements PostgreSQL
-                // refuses inside a transaction block at all. Checked at top
-                // level only — plpgsql bodies legitimately use BEGIN/END.
+                // refuses inside a transaction block at all.
+                //
+                // Matched at *statement start* only. That is what separates a
+                // transaction `END` from the `END` of a `CASE` expression, and
+                // a `VACUUM` statement from the legitimate `vacuum_truncate`
+                // storage parameter — both of which are mid-statement and were
+                // false positives when the scan matched anywhere in the text.
+                // plpgsql bodies are stripped before splitting, so their
+                // `BEGIN`/`END` blocks are invisible here.
                 //
                 // Every entry in the second group was verified against
                 // PostgreSQL 16 to fail with "cannot run inside a transaction
-                // block"; `COMMIT PREPARED` / `ROLLBACK PREPARED` need no entry
-                // because `commit` / `rollback` already match them.
-                //
-                // `END` is matched only in statement form (`END;`, `END WORK`,
-                // `END TRANSACTION`). A bare `end` would reject a top-level
-                // `CASE … END`, which is legal in an index expression.
-                let top = strip_to_top_level(step);
-                for control in [
-                    // Transaction control.
-                    vec!["begin"],
-                    vec!["commit"],
-                    vec!["rollback"],
-                    vec!["abort"],
-                    vec!["end", ";"],
-                    vec!["end", "work"],
-                    vec!["end", "transaction"],
-                    vec!["savepoint"],
-                    vec!["release"],
-                    vec!["start", "transaction"],
-                    vec!["prepare", "transaction"],
-                    // Statements PostgreSQL cannot run inside a transaction.
-                    vec!["create", "database"],
-                    vec!["drop", "database"],
-                    vec!["create", "tablespace"],
-                    vec!["drop", "tablespace"],
-                    vec!["alter", "system"],
-                    vec!["reindex", "database"],
-                    vec!["reindex", "system"],
-                    vec!["cluster"],
-                    vec!["discard"],
-                    vec!["create", "subscription"],
-                    vec!["alter", "subscription"],
-                    vec!["drop", "subscription"],
-                ] {
-                    assert!(
-                        find_statements(&top, &control).is_empty(),
-                        "migration v{version} issues `{}` at statement level; it cannot run \
-                         inside the single transaction the runner owns",
-                        control.join(" ")
-                    );
+                // block". `COMMIT PREPARED` / `ROLLBACK PREPARED` need no entry
+                // because `commit` / `rollback` already match them, and
+                // `END WORK` / `END TRANSACTION` are covered by `end`.
+                for statement in top_level_statements(step) {
+                    for control in [
+                        // Transaction control.
+                        vec!["begin"],
+                        vec!["commit"],
+                        vec!["rollback"],
+                        vec!["abort"],
+                        vec!["end"],
+                        vec!["savepoint"],
+                        vec!["release"],
+                        vec!["start", "transaction"],
+                        vec!["prepare", "transaction"],
+                        // Statements PostgreSQL cannot run inside a transaction.
+                        vec!["vacuum"],
+                        vec!["create", "database"],
+                        vec!["drop", "database"],
+                        vec!["create", "tablespace"],
+                        vec!["drop", "tablespace"],
+                        vec!["alter", "system"],
+                        vec!["reindex", "database"],
+                        vec!["reindex", "system"],
+                        vec!["cluster"],
+                        vec!["discard"],
+                        vec!["create", "subscription"],
+                        vec!["alter", "subscription"],
+                        vec!["drop", "subscription"],
+                    ] {
+                        assert!(
+                            !statement_starts_with(&statement, &control),
+                            "migration v{version} issues `{}`; it cannot run inside the \
+                             single transaction the runner owns",
+                            control.join(" ")
+                        );
+                    }
                 }
             }
         }
