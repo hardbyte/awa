@@ -1199,6 +1199,70 @@ mod tests {
         );
     }
 
+    /// The transaction-control scan must catch every spelling that would end or
+    /// nest the runner's transaction, and every statement PostgreSQL refuses
+    /// inside one — without rejecting a legal top-level `CASE … END`.
+    #[test]
+    fn transaction_control_scan_covers_synonyms_and_non_transactional_ddl() {
+        // `END` in statement form ends the transaction; in a `CASE` it does not.
+        assert_eq!(find_statements("END;", &["end", ";"]), vec![0]);
+        assert_eq!(find_statements("END WORK;", &["end", "work"]), vec![0]);
+        assert_eq!(
+            find_statements("END TRANSACTION;", &["end", "transaction"]),
+            vec![0]
+        );
+        for control in [
+            vec!["end", ";"],
+            vec!["end", "work"],
+            vec!["end", "transaction"],
+        ] {
+            assert!(
+                find_statements(
+                    "CREATE INDEX IF NOT EXISTS i ON t ((CASE WHEN a THEN 1 ELSE 2 END));",
+                    &control,
+                )
+                .is_empty(),
+                "a top-level CASE … END must not read as transaction control"
+            );
+        }
+
+        // COMMIT/ROLLBACK PREPARED are covered by the plain forms.
+        assert!(!find_statements("COMMIT PREPARED 'x';", &["commit"]).is_empty());
+        assert!(!find_statements("ROLLBACK PREPARED 'x';", &["rollback"]).is_empty());
+
+        // Other synonyms and nesting forms.
+        assert!(!find_statements("ABORT;", &["abort"]).is_empty());
+        assert!(!find_statements("RELEASE my_savepoint;", &["release"]).is_empty());
+        assert!(
+            !find_statements("PREPARE TRANSACTION 'x';", &["prepare", "transaction"]).is_empty()
+        );
+        // A prepared *statement* is fine and must not match.
+        assert!(find_statements("PREPARE s AS SELECT 1;", &["prepare", "transaction"]).is_empty());
+
+        // Statements PostgreSQL refuses inside a transaction block.
+        assert!(!find_statements("CREATE DATABASE d;", &["create", "database"]).is_empty());
+        assert!(
+            !find_statements("ALTER SYSTEM SET work_mem = '5MB';", &["alter", "system"]).is_empty()
+        );
+        assert!(!find_statements("REINDEX DATABASE d;", &["reindex", "database"]).is_empty());
+        assert!(!find_statements("CLUSTER;", &["cluster"]).is_empty());
+        assert!(!find_statements("DISCARD ALL;", &["discard"]).is_empty());
+        assert!(!find_statements(
+            "CREATE TABLESPACE ts LOCATION '/x';",
+            &["create", "tablespace"]
+        )
+        .is_empty());
+        // ...but a normal CREATE TABLE is not a TABLESPACE, and vice versa.
+        assert!(find_statements(
+            "CREATE TABLE IF NOT EXISTS t (x INT);",
+            &["create", "tablespace"]
+        )
+        .is_empty());
+        assert!(
+            find_statements("CREATE TABLESPACE ts LOCATION '/x';", &["create", "table"]).is_empty()
+        );
+    }
+
     /// Dollar-quoted bodies and quoted literals are invisible to the top-level
     /// scan, so a plpgsql `BEGIN`/`END` block is not transaction control.
     #[test]
@@ -1255,20 +1319,50 @@ mod tests {
                     );
                 }
 
-                // Explicit transaction control is checked at top level only —
-                // plpgsql bodies legitimately use BEGIN/END blocks.
+                // Explicit transaction control, and the statements PostgreSQL
+                // refuses inside a transaction block at all. Checked at top
+                // level only — plpgsql bodies legitimately use BEGIN/END.
+                //
+                // Every entry in the second group was verified against
+                // PostgreSQL 16 to fail with "cannot run inside a transaction
+                // block"; `COMMIT PREPARED` / `ROLLBACK PREPARED` need no entry
+                // because `commit` / `rollback` already match them.
+                //
+                // `END` is matched only in statement form (`END;`, `END WORK`,
+                // `END TRANSACTION`). A bare `end` would reject a top-level
+                // `CASE … END`, which is legal in an index expression.
                 let top = strip_to_top_level(step);
                 for control in [
+                    // Transaction control.
                     vec!["begin"],
                     vec!["commit"],
                     vec!["rollback"],
+                    vec!["abort"],
+                    vec!["end", ";"],
+                    vec!["end", "work"],
+                    vec!["end", "transaction"],
                     vec!["savepoint"],
+                    vec!["release"],
                     vec!["start", "transaction"],
+                    vec!["prepare", "transaction"],
+                    // Statements PostgreSQL cannot run inside a transaction.
+                    vec!["create", "database"],
+                    vec!["drop", "database"],
+                    vec!["create", "tablespace"],
+                    vec!["drop", "tablespace"],
+                    vec!["alter", "system"],
+                    vec!["reindex", "database"],
+                    vec!["reindex", "system"],
+                    vec!["cluster"],
+                    vec!["discard"],
+                    vec!["create", "subscription"],
+                    vec!["alter", "subscription"],
+                    vec!["drop", "subscription"],
                 ] {
                     assert!(
                         find_statements(&top, &control).is_empty(),
-                        "migration v{version} issues `{}` at statement level; the runner \
-                         owns the transaction boundary",
+                        "migration v{version} issues `{}` at statement level; it cannot run \
+                         inside the single transaction the runner owns",
                         control.join(" ")
                     );
                 }

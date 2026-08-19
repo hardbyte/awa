@@ -53,9 +53,14 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       # awa-python is a separate cargo workspace, so the root `cargo fmt --all`
-      # never reached it and its formatting drifted unnoticed.
+      # and `cargo clippy --workspace` never reached it and its formatting had
+      # drifted unnoticed. Build and test coverage for that crate stays in the
+      # "Python build + test" job, which compiles it via `maturin develop`.
       - name: cargo fmt (awa-python workspace)
         run: cargo fmt --all -- --check
+        working-directory: awa-python
+      - name: cargo clippy (awa-python workspace)
+        run: cargo clippy --all-targets --all-features -- -D warnings
         working-directory: awa-python
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
