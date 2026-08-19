@@ -1384,68 +1384,152 @@ mod tests {
     fn every_migration_step_is_transaction_safe() {
         for &(version, _, steps) in MIGRATIONS {
             for step in steps {
-                // `CONCURRENTLY` is a modifier rather than a statement start,
-                // so it is checked against the raw text — it is never valid
-                // here, not even built inside a function body the migration
-                // then calls. Matched as a whole word.
-                assert!(
-                    find_statements(step, &["concurrently"]).is_empty(),
-                    "migration v{version} runs a `CONCURRENTLY` statement, which cannot \
-                     execute inside the single migration transaction"
-                );
-
-                // Explicit transaction control, and the statements PostgreSQL
-                // refuses inside a transaction block at all.
-                //
-                // Matched at *statement start* only. That is what separates a
-                // transaction `END` from the `END` of a `CASE` expression, and
-                // a `VACUUM` statement from the legitimate `vacuum_truncate`
-                // storage parameter — both of which are mid-statement and were
-                // false positives when the scan matched anywhere in the text.
-                // plpgsql bodies are stripped before splitting, so their
-                // `BEGIN`/`END` blocks are invisible here.
-                //
-                // Every entry in the second group was verified against
-                // PostgreSQL 16 to fail with "cannot run inside a transaction
-                // block". `COMMIT PREPARED` / `ROLLBACK PREPARED` need no entry
-                // because `commit` / `rollback` already match them, and
-                // `END WORK` / `END TRANSACTION` are covered by `end`.
-                for statement in top_level_statements(step) {
-                    for control in [
-                        // Transaction control.
-                        vec!["begin"],
-                        vec!["commit"],
-                        vec!["rollback"],
-                        vec!["abort"],
-                        vec!["end"],
-                        vec!["savepoint"],
-                        vec!["release"],
-                        vec!["start", "transaction"],
-                        vec!["prepare", "transaction"],
-                        // Statements PostgreSQL cannot run inside a transaction.
-                        vec!["vacuum"],
-                        vec!["create", "database"],
-                        vec!["drop", "database"],
-                        vec!["create", "tablespace"],
-                        vec!["drop", "tablespace"],
-                        vec!["alter", "system"],
-                        vec!["reindex", "database"],
-                        vec!["reindex", "system"],
-                        vec!["cluster"],
-                        vec!["discard"],
-                        vec!["create", "subscription"],
-                        vec!["alter", "subscription"],
-                        vec!["drop", "subscription"],
-                    ] {
-                        assert!(
-                            !statement_starts_with(&statement, &control),
-                            "migration v{version} issues `{}`; it cannot run inside the \
-                             single transaction the runner owns",
-                            control.join(" ")
-                        );
-                    }
+                if let Some(violation) = transaction_safety_violation(step) {
+                    panic!("migration v{version}: {violation}");
                 }
             }
+        }
+    }
+
+    /// Why `step` cannot run inside the runner's single transaction, or `None`.
+    ///
+    /// Extracted from the corpus test so the rules themselves are testable: a
+    /// test that pokes `find_statements` proves the *scanner* works, not that
+    /// this lint applies it. Both bugs found in review were of that shape — the
+    /// test exercised a helper while the rule was wrong.
+    fn transaction_safety_violation(step: &str) -> Option<String> {
+        // Checked against the *raw* text, dollar-quoted bodies included: these
+        // are never valid here, and this repo routinely builds DDL with
+        // `EXECUTE format(...)` inside plpgsql, so a body-built `VACUUM` breaks
+        // the transaction just as surely as a direct one. Both are matched as
+        // whole words, so the real `vacuum_truncate` / `autovacuum_vacuum_*`
+        // storage parameters do not trip them.
+        //
+        // `CONCURRENTLY` is a modifier rather than a statement start, so the raw
+        // check is the only one that can see it at all.
+        for banned in ["concurrently", "vacuum"] {
+            if !find_statements(step, &[banned]).is_empty() {
+                return Some(format!(
+                    "runs `{banned}`, which cannot execute inside the single \
+                     migration transaction"
+                ));
+            }
+        }
+
+        // Explicit transaction control, and the statements PostgreSQL refuses
+        // inside a transaction block at all.
+        //
+        // Matched at *statement start* only. That is what separates a
+        // transaction `END` from the `END` of a `CASE` expression. plpgsql
+        // bodies are stripped before splitting, so their `BEGIN`/`END` blocks
+        // are invisible here — which is why the non-transactional statements
+        // above also get the raw check.
+        //
+        // Every entry in the second group was verified against PostgreSQL 16 to
+        // fail with "cannot run inside a transaction block". `COMMIT PREPARED` /
+        // `ROLLBACK PREPARED` need no entry because `commit` / `rollback`
+        // already match them, and `END WORK` / `END TRANSACTION` by `end`.
+        const CONTROL: &[&[&str]] = &[
+            // Transaction control.
+            &["begin"],
+            &["commit"],
+            &["rollback"],
+            &["abort"],
+            &["end"],
+            &["savepoint"],
+            &["release"],
+            &["start", "transaction"],
+            &["prepare", "transaction"],
+            // Statements PostgreSQL cannot run inside a transaction.
+            &["create", "database"],
+            &["drop", "database"],
+            &["create", "tablespace"],
+            &["drop", "tablespace"],
+            &["alter", "system"],
+            &["reindex", "database"],
+            &["reindex", "system"],
+            &["cluster"],
+            &["discard"],
+            &["create", "subscription"],
+            &["alter", "subscription"],
+            &["drop", "subscription"],
+        ];
+        for statement in top_level_statements(step) {
+            for control in CONTROL {
+                if statement_starts_with(&statement, control) {
+                    return Some(format!(
+                        "issues `{}`; it cannot run inside the single transaction \
+                         the runner owns",
+                        control.join(" ")
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The rule must reject every hazard and accept every legitimate shape.
+    ///
+    /// Drives `transaction_safety_violation` directly — the same function the
+    /// corpus test uses — so a rule that stops rejecting something fails here.
+    #[test]
+    fn transaction_safety_rule_rejects_hazards_and_accepts_valid_sql() {
+        let rejected = |sql: &str| transaction_safety_violation(sql).is_some();
+
+        // Direct statements.
+        for hazard in [
+            "VACUUM ANALYZE awa.jobs_hot;",
+            "CREATE INDEX CONCURRENTLY i ON awa.jobs_hot (id);",
+            "BEGIN;",
+            "COMMIT;",
+            "END;",
+            "ABORT;",
+            "ROLLBACK PREPARED 'x';",
+            "SAVEPOINT s;",
+            "RELEASE s;",
+            "START TRANSACTION;",
+            "PREPARE TRANSACTION 'x';",
+            "CREATE DATABASE d;",
+            "DROP TABLESPACE ts;",
+            "ALTER SYSTEM SET work_mem = '5MB';",
+            "REINDEX DATABASE awa_test;",
+            "CLUSTER awa.jobs_hot USING i;",
+            "DISCARD ALL;",
+            "CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p;",
+        ] {
+            assert!(rejected(hazard), "should be rejected: {hazard}");
+        }
+
+        // Built inside a plpgsql body and executed by the migration — the body
+        // is stripped, so only the raw check can see these.
+        assert!(rejected(
+            "CREATE OR REPLACE FUNCTION awa.f() RETURNS void LANGUAGE plpgsql AS $fn$ \
+             BEGIN EXECUTE format('VACUUM (ANALYZE) %I.jobs_hot', 'awa'); END $fn$;"
+        ));
+        assert!(rejected(
+            "CREATE OR REPLACE FUNCTION awa.f() RETURNS void LANGUAGE plpgsql AS $fn$ \
+             BEGIN EXECUTE 'CREATE INDEX CONCURRENTLY i ON awa.jobs_hot (id)'; END $fn$;"
+        ));
+
+        // Legitimate migration SQL must pass.
+        for benign in [
+            "CREATE TABLE IF NOT EXISTS awa.t (x INT);",
+            "ALTER TABLE awa.t SET (vacuum_truncate = false);",
+            "ALTER TABLE awa.t SET (autovacuum_vacuum_scale_factor = 0.05);",
+            "CREATE INDEX IF NOT EXISTS i ON awa.t ((CASE WHEN a THEN 1 ELSE 2 END));",
+            "CREATE OR REPLACE VIEW awa.v AS SELECT CASE WHEN a THEN 1 ELSE 0 END;",
+            "UPDATE awa.t SET x = CASE WHEN a THEN 1 ELSE 2 END;",
+            "CREATE TABLESPACE_LOOKALIKE_NOT_A_STATEMENT",
+            // A plpgsql body's own BEGIN/END block is not transaction control.
+            "CREATE OR REPLACE FUNCTION awa.f() RETURNS void LANGUAGE plpgsql AS $fn$ \
+             BEGIN PERFORM 1; END $fn$;",
+            "COMMENT ON TABLE awa.t IS 'begin; commit;';",
+        ] {
+            assert_eq!(
+                transaction_safety_violation(benign),
+                None,
+                "should be accepted: {benign}"
+            );
         }
     }
 
