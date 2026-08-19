@@ -2301,7 +2301,12 @@
 <h1 id="migration-guide">Migration Guide<a class="headerlink" href="#migration-guide" title="Permanent link">&para;</a></h1>
 <p>This guide explains how to install and upgrade the Awa schema, integrate an external migration runner, and plan rollback. Release-specific prerequisites and transition procedures live in the relevant upgrade guide.</p>
 <h2 id="migration-contract">Migration Contract<a class="headerlink" href="#migration-contract" title="Permanent link">&para;</a></h2>
-<p>Awa schema migrations are forward-only. The built-in runner serializes migration work, applies each migration transactionally, and makes migrations safe to re-run where practical.</p>
+<p>Awa schema migrations are forward-only, atomic, and idempotent:</p>
+<ul>
+<li><strong>Atomic.</strong> One <code>awa migrate</code> (or <code>migrations::run</code>) applies the whole pending range inside a single transaction guarded by a transaction-scoped advisory lock. A failed, cancelled, or interrupted run commits nothing — there is no half-applied schema to reconcile, and concurrent runners on the same database serialize and converge on one application. Every migration is transaction-safe by policy (no <code>CREATE INDEX CONCURRENTLY</code>, <code>VACUUM</code>, or explicit transaction control), which is what makes the single-transaction guarantee possible; a unit test enforces it.</li>
+<li><strong>Idempotent.</strong> Every migration is re-runnable: DDL is guarded (<code>IF NOT EXISTS</code>, <code>CREATE OR REPLACE</code>, <code>DROP TRIGGER IF EXISTS</code> before <code>CREATE TRIGGER</code>), and each records its own version with <code>ON CONFLICT (version) DO NOTHING</code>. Applying the set again — in whole or file by file — converges on a byte-identical schema rather than erroring. Tests apply every migration twice and compare the resulting catalog against a clean install.</li>
+</ul>
+<p>The runner applies only migrations newer than the recorded version, so a repeat run is normally a no-op regardless.</p>
 <p>Migration behavior fails closed:</p>
 <ul>
 <li>a binary refuses a schema newer than it understands;</li>
@@ -2348,21 +2353,36 @@
 <p>To manage Awa SQL with Flyway, Liquibase, dbmate, or another runner, extract the bundled migrations:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>migrate<span class="w"> </span>--extract-to<span class="w"> </span>./sql/awa
 </span></code></pre></div>
-<p>Use <code>awa migrate --sql</code> to print the same migration set to standard output.</p>
+<p>Use <code>awa migrate --sql</code> to print the same migration set to standard output. That output is wrapped in a single transaction that takes the runner's advisory lock, so piping it into <code>psql</code> is atomic and serialized exactly like <code>awa migrate</code>:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>awa<span class="w"> </span>migrate<span class="w"> </span>--sql<span class="w"> </span><span class="p">|</span><span class="w"> </span>psql<span class="w"> </span>-v<span class="w"> </span><span class="nv">ON_ERROR_STOP</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span>
+</span></code></pre></div>
+<p><code>ON_ERROR_STOP=1</code> is required to <em>detect</em> a failure, not to be safe from one. Plain <code>psql</code> reports the error, fails every following statement, turns the trailing <code>COMMIT</code> into a rollback — and still exits <code>0</code>, so a deploy script that gates on the exit status reads a fully rolled-back migration as success.</p>
+<p>The rendered SQL looks like this:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">BEGIN</span><span class="p">;</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">pg_advisory_xact_lock</span><span class="p">(</span><span class="mi">4708303813013489490</span><span class="p">);</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="c1">-- Migration V1: ...</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="k">COMMIT</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Pass <code>--no-transaction</code> to omit the wrapper when the consuming runner opens its own transaction per migration — Flyway, Liquibase, and dbmate all do. The per-version files written by <code>--extract-to</code> are never wrapped, for the same reason.</p>
+<p>Applying unwrapped SQL through a runner that does <strong>not</strong> wrap it (piping into <code>psql</code>, which is autocommit) is not atomic: a failure part-way leaves the schema half-migrated. Either keep the wrapper or make sure the runner supplies one.</p>
+<p>Each extracted file is individually re-runnable, so a runner that crashes between applying a file and recording it can safely retry that file.</p>
+<p>0.7 changes two things about the extracted set, both one-time. Migration v001 gained the re-runnability guards the rest of the set already had, so its file content changed; if your runner validates checksums of applied migrations, re-extract and clear the recorded checksum for V1 (the applied schema is unaffected — only the stored checksum is stale). Filenames are unchanged except <code>V17</code> and <code>V21</code>, whose descriptions contain <code>/</code> and which no earlier extraction could write at all.</p>
+<p><code>--from</code> / <code>--to</code> / <code>--version</code> select a range to <em>render</em>; they are only valid with <code>--sql</code> or <code>--extract-to</code>. Applying always brings the database to the current version, so <code>awa migrate</code> rejects them rather than silently applying a wider range.</p>
+<p><code>python -m awa migrate --sql</code> renders the identical output, wrapper included, and takes the same <code>--no-transaction</code> flag.</p>
 <p>The same SQL is available programmatically:</p>
 <ul>
-<li>Rust: <code>awa::migrations::migration_sql()</code></li>
-<li>Python: <code>awa.migrations()</code></li>
+<li>Rust: <code>awa::migrations::migration_sql()</code>, with the runner's advisory-lock key as <code>awa::migrations::MIGRATION_LOCK_KEY</code></li>
+<li>Python: <code>awa.migrations()</code>, with the key as <code>awa.migration_lock_key()</code></li>
 </ul>
 <p>Extracted SQL does not execute Rust preflights such as runtime version floors or exclusive-window checks. The external rollout must enforce the release guide's binary prerequisites and preserve the documented lock or ordering boundary before applying the SQL.</p>
 <p>Operational storage commands such as <code>storage prepare</code>, <code>storage enter-mixed-transition</code>, and <code>storage finalize</code> are not migration DDL. Run them only where the applicable upgrade guide instructs; do not append them to the extracted migration files.</p>
 <h2 id="check-schema-version">Check Schema Version<a class="headerlink" href="#check-schema-version" title="Permanent link">&para;</a></h2>
 <p>From SQL:</p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="k">MAX</span><span class="p">(</span><span class="k">version</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">schema_version</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">schema_version</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="k">MAX</span><span class="p">(</span><span class="k">version</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">schema_version</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">schema_version</span><span class="p">;</span>
 </span></code></pre></div>
 <p>From Rust:</p>
-<div class="language-rust highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">awa</span><span class="p">::</span><span class="n">migrations</span><span class="p">::</span><span class="n">current_version</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">awa</span><span class="p">::</span><span class="n">migrations</span><span class="p">::</span><span class="n">current_version</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pool</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </span></code></pre></div>
 <p>Schema versions increase monotonically. Application code should call <code>awa migrate</code> rather than depend on a particular numeric version.</p>
 <h2 id="rollback">Rollback<a class="headerlink" href="#rollback" title="Permanent link">&para;</a></h2>

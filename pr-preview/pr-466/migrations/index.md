@@ -6,7 +6,12 @@ This guide explains how to install and upgrade the Awa schema, integrate an exte
 
 ## Migration Contract
 
-Awa schema migrations are forward-only. The built-in runner serializes migration work, applies each migration transactionally, and makes migrations safe to re-run where practical.
+Awa schema migrations are forward-only, atomic, and idempotent:
+
+- **Atomic.** One `awa migrate` (or `migrations::run`) applies the whole pending range inside a single transaction guarded by a transaction-scoped advisory lock. A failed, cancelled, or interrupted run commits nothing — there is no half-applied schema to reconcile, and concurrent runners on the same database serialize and converge on one application. Every migration is transaction-safe by policy (no `CREATE INDEX CONCURRENTLY`, `VACUUM`, or explicit transaction control), which is what makes the single-transaction guarantee possible; a unit test enforces it.
+- **Idempotent.** Every migration is re-runnable: DDL is guarded (`IF NOT EXISTS`, `CREATE OR REPLACE`, `DROP TRIGGER IF EXISTS` before `CREATE TRIGGER`), and each records its own version with `ON CONFLICT (version) DO NOTHING`. Applying the set again — in whole or file by file — converges on a byte-identical schema rather than erroring. Tests apply every migration twice and compare the resulting catalog against a clean install.
+
+The runner applies only migrations newer than the recorded version, so a repeat run is normally a no-op regardless.
 
 Migration behavior fails closed:
 
@@ -76,12 +81,39 @@ To manage Awa SQL with Flyway, Liquibase, dbmate, or another runner, extract the
 awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
 ```
 
-Use `awa migrate --sql` to print the same migration set to standard output.
+Use `awa migrate --sql` to print the same migration set to standard output. That output is wrapped in a single transaction that takes the runner's advisory lock, so piping it into `psql` is atomic and serialized exactly like `awa migrate`:
+
+```bash
+awa migrate --sql | psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+```
+
+`ON_ERROR_STOP=1` is required to *detect* a failure, not to be safe from one. Plain `psql` reports the error, fails every following statement, turns the trailing `COMMIT` into a rollback — and still exits `0`, so a deploy script that gates on the exit status reads a fully rolled-back migration as success.
+
+The rendered SQL looks like this:
+
+```sql
+BEGIN;
+SELECT pg_advisory_xact_lock(4708303813013489490);
+-- Migration V1: ...
+COMMIT;
+```
+
+Pass `--no-transaction` to omit the wrapper when the consuming runner opens its own transaction per migration — Flyway, Liquibase, and dbmate all do. The per-version files written by `--extract-to` are never wrapped, for the same reason.
+
+Applying unwrapped SQL through a runner that does **not** wrap it (piping into `psql`, which is autocommit) is not atomic: a failure part-way leaves the schema half-migrated. Either keep the wrapper or make sure the runner supplies one.
+
+Each extracted file is individually re-runnable, so a runner that crashes between applying a file and recording it can safely retry that file.
+
+0.7 changes two things about the extracted set, both one-time. Migration v001 gained the re-runnability guards the rest of the set already had, so its file content changed; if your runner validates checksums of applied migrations, re-extract and clear the recorded checksum for V1 (the applied schema is unaffected — only the stored checksum is stale). Filenames are unchanged except `V17` and `V21`, whose descriptions contain `/` and which no earlier extraction could write at all.
+
+`--from` / `--to` / `--version` select a range to *render*; they are only valid with `--sql` or `--extract-to`. Applying always brings the database to the current version, so `awa migrate` rejects them rather than silently applying a wider range.
+
+`python -m awa migrate --sql` renders the identical output, wrapper included, and takes the same `--no-transaction` flag.
 
 The same SQL is available programmatically:
 
-- Rust: `awa::migrations::migration_sql()`
-- Python: `awa.migrations()`
+- Rust: `awa::migrations::migration_sql()`, with the runner's advisory-lock key as `awa::migrations::MIGRATION_LOCK_KEY`
+- Python: `awa.migrations()`, with the key as `awa.migration_lock_key()`
 
 Extracted SQL does not execute Rust preflights such as runtime version floors or exclusive-window checks. The external rollout must enforce the release guide's binary prerequisites and preserve the documented lock or ordering boundary before applying the SQL.
 

@@ -2270,9 +2270,9 @@
 <li><a href="../adr/041-rolling-upgrade-policy/">ADR-041</a> — architectural policy for rolling-compatible migrations.</li>
 <li><a href="../benchmarking/">Benchmarking</a> — reproducible performance suites and how to interpret their results.</li>
 </ul>
-<p>When a schema change affects users or operators, update the relevant upgrade guide and <a href="../stability/">stability policy</a>. Detailed migration implementation checklists belong beside the migration code and review process rather than in the public product guide.</p>
+<p>When a schema change affects users or operators, update the relevant upgrade guide and <a href="../stability/">stability policy</a>. Detailed migration implementation checklists belong beside the migration code and review process rather than in the public product guide — they live in <a href="https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations"><code>AGENTS.md</code></a>.</p>
 <h2 id="authoring-schema-migrations">Authoring schema migrations<a class="headerlink" href="#authoring-schema-migrations" title="Permanent link">&para;</a></h2>
-<p>Schema changes must follow <a href="../adr/041-rolling-upgrade-policy/">ADR-041's expand, capability-gated flip, and later contract policy</a>. The repository's contributor guidance and migration tests hold the implementation checklist; upgrade guides document any action required from operators.</p>
+<p>Schema changes must follow <a href="../adr/041-rolling-upgrade-policy/">ADR-041's expand, capability-gated flip, and later contract policy</a>. The implementation checklist lives in <a href="https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations"><code>AGENTS.md</code></a> alongside the migration tests that enforce it; upgrade guides document any action required from operators.</p>
 
 
 

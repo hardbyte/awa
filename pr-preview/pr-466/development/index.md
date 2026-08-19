@@ -63,8 +63,8 @@ SQLX_OFFLINE=true cargo build --workspace
 - [ADR-041](../adr/041-rolling-upgrade-policy/index.md) — architectural policy for rolling-compatible migrations.
 - [Benchmarking](../benchmarking/index.md) — reproducible performance suites and how to interpret their results.
 
-When a schema change affects users or operators, update the relevant upgrade guide and [stability policy](../stability/index.md). Detailed migration implementation checklists belong beside the migration code and review process rather than in the public product guide.
+When a schema change affects users or operators, update the relevant upgrade guide and [stability policy](../stability/index.md). Detailed migration implementation checklists belong beside the migration code and review process rather than in the public product guide — they live in [`AGENTS.md`](https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations).
 
 ## Authoring schema migrations
 
-Schema changes must follow [ADR-041's expand, capability-gated flip, and later contract policy](../adr/041-rolling-upgrade-policy/index.md). The repository's contributor guidance and migration tests hold the implementation checklist; upgrade guides document any action required from operators.
+Schema changes must follow [ADR-041's expand, capability-gated flip, and later contract policy](../adr/041-rolling-upgrade-policy/index.md). The implementation checklist lives in [`AGENTS.md`](https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations) alongside the migration tests that enforce it; upgrade guides document any action required from operators.
