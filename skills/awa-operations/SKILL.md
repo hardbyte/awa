@@ -48,7 +48,9 @@ awa migrate --extract-to ./out        # write SQL files for an external runner
 ```
 
 `--sql` output is wrapped in one transaction taking the runner's advisory lock,
-so `awa migrate --sql | psql "$DATABASE_URL"` is atomic. Pass `--no-transaction`
+so `awa migrate --sql | psql -v ON_ERROR_STOP=1 "$DATABASE_URL"` is atomic.
+`ON_ERROR_STOP=1` is what makes a failure *detectable*: plain psql rolls the
+transaction back but still exits 0. Pass `--no-transaction`
 when the consuming runner opens its own transaction per migration (Flyway,
 Liquibase, dbmate); `--extract-to` files are never wrapped, for that reason.
 `--from` / `--to` / `--version` select a range to render and are rejected on the

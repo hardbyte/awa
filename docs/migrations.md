@@ -79,7 +79,15 @@ To manage Awa SQL with Flyway, Liquibase, dbmate, or another runner, extract the
 awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
 ```
 
-Use `awa migrate --sql` to print the same migration set to standard output. That output is wrapped in a single transaction that takes the runner's advisory lock, so `awa migrate --sql | psql "$DATABASE_URL"` is atomic and serialized exactly like `awa migrate`:
+Use `awa migrate --sql` to print the same migration set to standard output. That output is wrapped in a single transaction that takes the runner's advisory lock, so piping it into `psql` is atomic and serialized exactly like `awa migrate`:
+
+```bash
+awa migrate --sql | psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+```
+
+`ON_ERROR_STOP=1` is required to *detect* a failure, not to be safe from one. Plain `psql` reports the error, fails every following statement, turns the trailing `COMMIT` into a rollback — and still exits `0`, so a deploy script that gates on the exit status reads a fully rolled-back migration as success.
+
+The rendered SQL looks like this:
 
 ```sql
 BEGIN;
@@ -93,6 +101,19 @@ Pass `--no-transaction` to omit the wrapper when the consuming runner opens its 
 Applying unwrapped SQL through a runner that does **not** wrap it (piping into `psql`, which is autocommit) is not atomic: a failure part-way leaves the schema half-migrated. Either keep the wrapper or make sure the runner supplies one.
 
 Each extracted file is individually re-runnable, so a runner that crashes between applying a file and recording it can safely retry that file.
+
+### One-time V1 checksum repair (0.7)
+
+Migration v001 gained the same re-runnability guards the rest of the set already had, so its extracted file changed content once in 0.7. A runner that stores checksums of applied migrations — Flyway, Liquibase, and dbmate all do — will report a validation mismatch on V1 and refuse to apply pending migrations until the recorded checksum is updated. The applied schema is unaffected; only the stored checksum is stale.
+
+Re-extract, then accept the new checksum with your runner's repair command, for example:
+
+```bash
+awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
+flyway repair            # Liquibase: clear-checksums; dbmate: no checksums, nothing to do
+```
+
+Filenames are unchanged except `V17` and `V21`, whose descriptions contain `/`. Those two could never be written before (extraction aborted on them), so no previously extracted directory contains them under another name.
 
 `--from` / `--to` / `--version` select a range to *render*; they are only valid with `--sql` or `--extract-to`. Applying always brings the database to the current version, so `awa migrate` rejects them rather than silently applying a wider range.
 

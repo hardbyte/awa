@@ -1229,7 +1229,7 @@ mod tests {
                             find_statements(tail, &guarded).first() == Some(&0),
                             "migration v{version} has an unguarded `{label}` \
                              (needs IF NOT EXISTS to stay re-runnable): …{}…",
-                            &tail[..tail.len().min(80)].replace('\n', " ")
+                            tail[..tail.len().min(80)].replace('\n', " ")
                         );
                     }
                 }
@@ -1243,7 +1243,7 @@ mod tests {
                         panic!(
                             "migration v{version} has a bare `{label}` (needs OR REPLACE \
                              to stay re-runnable): …{}…",
-                            &top[at..(at + 80).min(top.len())].replace('\n', " ")
+                            top[at..(at + 80).min(top.len())].replace('\n', " ")
                         );
                     }
                 }

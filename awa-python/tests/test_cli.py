@@ -167,6 +167,9 @@ def test_migrate_sql_is_transaction_wrapped_by_default():
         f"SELECT pg_advisory_xact_lock({awa.migration_lock_key()});" in result.stdout
     )
     assert result.stdout.rstrip().endswith("COMMIT;")
+    # Plain psql rolls the transaction back but still exits 0, so the header
+    # must tell the operator to pass ON_ERROR_STOP.
+    assert "ON_ERROR_STOP=1" in result.stdout
 
 
 def test_migrate_sql_no_transaction_omits_the_wrapper():

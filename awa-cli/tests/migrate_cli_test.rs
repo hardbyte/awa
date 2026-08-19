@@ -309,6 +309,13 @@ fn sql_output_is_transaction_wrapped_by_default() {
         rendered.trim_end().ends_with("COMMIT;"),
         "rendered SQL should close the transaction"
     );
+    // The wrapper makes a failure harmless but not visible: plain psql rolls
+    // back and still exits 0, so the header must tell the operator to pass
+    // ON_ERROR_STOP or a deploy script reads a rollback as success.
+    assert!(
+        rendered.contains("ON_ERROR_STOP=1"),
+        "rendered SQL should tell the operator to make psql fail loudly"
+    );
 }
 
 /// `--no-transaction` is the escape hatch for runners that open their own
@@ -413,7 +420,7 @@ fn extract_to_writes_every_migration() {
         migrations::migration_sql().len(),
         "every migration should be extracted, got {written:?}"
     );
-    for (version, _, sql) in migrations::migration_sql() {
+    for (version, description, sql) in migrations::migration_sql() {
         let prefix = format!("V{version}__");
         let name = written
             .iter()
@@ -422,6 +429,24 @@ fn extract_to_writes_every_migration() {
         assert!(
             !name.contains('/') && !name.contains('\\'),
             "extracted filename must be a single path component: {name}"
+        );
+        // Pin the compatibility guarantee: the only substitutions are spaces
+        // and path separators, so filenames this tool already published stay
+        // byte-identical and re-extracting cannot leave two files per version.
+        let expected: String = description
+            .chars()
+            .map(|ch| {
+                if matches!(ch, ' ' | '/' | '\\') {
+                    '_'
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        assert_eq!(
+            name.as_str(),
+            format!("V{version}__{expected}.sql"),
+            "extraction must not rename beyond spaces and path separators"
         );
         let contents = std::fs::read_to_string(dir.join(name)).expect("read extracted file");
         assert_eq!(contents, sql, "v{version} extracted with different SQL");
