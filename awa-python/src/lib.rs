@@ -81,6 +81,15 @@ fn current_migration_version() -> i32 {
     awa_model::migrations::CURRENT_VERSION
 }
 
+/// Advisory-lock key the migration runner takes to serialize concurrent runs.
+///
+/// Emitted SQL should take this same lock rather than a hard-coded copy, so the
+/// two can never drift.
+#[pyfunction]
+fn migration_lock_key() -> i64 {
+    awa_model::migrations::MIGRATION_LOCK_KEY
+}
+
 #[pymodule]
 fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
@@ -108,6 +117,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migrations, m)?)?;
     m.add_function(wrap_pyfunction!(migrations_range, m)?)?;
     m.add_function(wrap_pyfunction!(current_migration_version, m)?)?;
+    m.add_function(wrap_pyfunction!(migration_lock_key, m)?)?;
     m.add_function(wrap_pyfunction!(telemetry::init_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(telemetry::shutdown_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(callback_contract::sign_callback, m)?)?;

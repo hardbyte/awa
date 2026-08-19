@@ -50,7 +50,7 @@ awa --database-url $DATABASE_URL serve
 
 | Command | Description |
 | --- | --- |
-| `migrate` | Apply migrations, or extract / print SQL with `--sql` / `--extract-to` |
+| `migrate` | Apply migrations atomically, or extract / print SQL with `--sql` / `--extract-to` |
 | `job list` | List jobs with `--state` / `--kind` / `--queue` filters |
 | `job dump <id>` | Pretty-print one job and its full lifecycle metadata |
 | `job dump-run <id> [--attempt N]` | Pretty-print one attempt run |

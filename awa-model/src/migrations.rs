@@ -27,6 +27,12 @@ const EXCLUSIVE_WINDOW_MIGRATIONS: &[i32] = &[];
 /// feature capability state.
 const MIGRATION_RUNTIME_VERSION_FLOORS: &[(i32, &str)] = &[(43, "0.6.2")];
 
+/// Advisory-lock key that serializes migration runners against one database
+/// ("AWA_MIGR" as ASCII). Exposed so SQL emitted for an external runner can
+/// take the *same* lock the built-in runner takes, rather than a copy that
+/// could drift out of sync.
+pub const MIGRATION_LOCK_KEY: i64 = 0x4157_415f_4d49_4752;
+
 /// Heartbeat-staleness window (seconds) for the pre-flight live-runtime check.
 /// Matches the window used by the ADR-037 finalize gate and
 /// `awa.storage_auto_finalize_if_fresh`.
@@ -310,11 +316,13 @@ fn normalize_legacy_version(old_version: i32) -> i32 {
 
 /// Run all pending migrations against the database.
 ///
-/// Applies only migrations newer than the current schema version.
-/// V1 bootstraps the canonical schema from scratch; V2+ are incremental
-/// and use `IF NOT EXISTS` guards so they are safe to re-run. Legacy
-/// `schema_version` rows from pre-0.4 releases are normalized to the new
-/// numbering in [`current_version`] before the pending set is computed.
+/// Applies only migrations newer than the current schema version. Every
+/// migration is guarded (`IF NOT EXISTS`, `CREATE OR REPLACE`,
+/// `DROP TRIGGER IF EXISTS` before `CREATE TRIGGER`, and
+/// `ON CONFLICT DO NOTHING` on its `schema_version` row), so replaying one —
+/// or the whole set — converges instead of erroring. Legacy `schema_version`
+/// rows from pre-0.4 releases are normalized to the new numbering in
+/// [`current_version`] before the pending set is computed.
 ///
 /// Safe to call concurrently from any number of processes against the same
 /// database: a transaction-scoped advisory lock serializes runners, and every
@@ -331,7 +339,7 @@ pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
 /// pre-flights (`allow_live_runtimes`). The CLI wires this to
 /// `--allow-live-runtimes`; the default [`run`] never overrides the checks.
 pub async fn run_with_options(pool: &PgPool, options: MigrateOptions) -> Result<(), AwaError> {
-    let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
+    let lock_key: i64 = MIGRATION_LOCK_KEY;
 
     // Run the version check, ADR-037 finalize gate, and every migration step
     // inside a single transaction guarded by a *transaction-scoped* advisory
@@ -1031,6 +1039,626 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip SQL line comments, block comments, single-quoted literals, and
+    /// dollar-quoted bodies, leaving only top-level statement text.
+    ///
+    /// The lints below distinguish "what this migration executes directly"
+    /// from "what lives inside a function body". A plpgsql body legitimately
+    /// contains `BEGIN`/`END` and builds DDL with `format()`, so scanning the
+    /// raw text for transaction control would be all false positives.
+    fn strip_to_top_level(sql: &str) -> String {
+        let bytes = sql.as_bytes();
+        let mut out = String::with_capacity(sql.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if sql[i..].starts_with("--") {
+                i = sql[i..].find('\n').map_or(bytes.len(), |j| i + j);
+            } else if sql[i..].starts_with("/*") {
+                i = sql[i..].find("*/").map_or(bytes.len(), |j| i + j + 2);
+            } else if bytes[i] == b'\'' {
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if bytes[j] == b'\'' {
+                        if bytes.get(j + 1) == Some(&b'\'') {
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                i = (j + 1).min(bytes.len());
+            } else if bytes[i] == b'$' {
+                match dollar_tag(&sql[i..]) {
+                    Some(tag) => {
+                        let after = i + tag.len();
+                        i = sql[after..]
+                            .find(tag)
+                            .map_or(bytes.len(), |j| after + j + tag.len());
+                    }
+                    None => {
+                        out.push('$');
+                        i += 1;
+                    }
+                }
+            } else {
+                // SQL keywords are ASCII; migrations are ASCII-only SQL, but
+                // step by char boundary anyway so a stray UTF-8 comment body
+                // outside a stripped region can never panic.
+                let ch = sql[i..].chars().next().expect("in-bounds char boundary");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
+    /// `$tag$` / `$$` opening delimiter at the start of `rest`, if any.
+    fn dollar_tag(rest: &str) -> Option<&str> {
+        let mut end = 1;
+        for (offset, ch) in rest[1..].char_indices() {
+            if ch == '$' {
+                end = 1 + offset + 1;
+                return Some(&rest[..end]);
+            }
+            if !ch.is_ascii_alphanumeric() && ch != '_' {
+                return None;
+            }
+            end = 1 + offset + ch.len_utf8();
+        }
+        let _ = end;
+        None
+    }
+
+    /// Case-insensitive whitespace-tolerant scan for a keyword sequence at
+    /// statement position.
+    ///
+    /// Both ends are checked for a word boundary. The leading check keeps
+    /// `autovacuum_vacuum_cost_delay` from reading as `VACUUM` and
+    /// `awa.create_x` from reading as `CREATE`; the trailing check keeps
+    /// `CREATE TABLESPACE` from reading as `CREATE TABLE` and the real
+    /// `vacuum_truncate` storage parameter from reading as `VACUUM`.
+    fn find_statements(haystack: &str, keywords: &[&str]) -> Vec<usize> {
+        let lower = haystack.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let mut hits = Vec::new();
+        let first = keywords[0];
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(first) {
+            let start = from + rel;
+            from = start + 1;
+            let prev = start.checked_sub(1).map(|p| bytes[p]);
+            if matches!(prev, Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
+                continue;
+            }
+            let mut cursor = start + first.len();
+            let mut matched = true;
+            for keyword in &keywords[1..] {
+                let rest = &lower[cursor..];
+                let trimmed = rest.trim_start();
+                if trimmed.starts_with(keyword) {
+                    cursor = cursor + (rest.len() - trimmed.len()) + keyword.len();
+                } else {
+                    matched = false;
+                    break;
+                }
+            }
+            // Trailing boundary: the keyword sequence must not run into a
+            // longer identifier.
+            if matched
+                && matches!(bytes.get(cursor), Some(c) if c.is_ascii_alphanumeric() || *c == b'_')
+            {
+                matched = false;
+            }
+            if matched {
+                hits.push(start);
+            }
+        }
+        hits
+    }
+
+    /// The scanner must not fire on longer identifiers that merely start with a
+    /// keyword, and must still fire on the real thing.
+    #[test]
+    fn find_statements_requires_word_boundaries_at_both_ends() {
+        // Leading boundary.
+        assert!(
+            find_statements("WITH (autovacuum_vacuum_cost_delay = 10)", &["vacuum"]).is_empty()
+        );
+        assert!(find_statements("SELECT awa.create_thing()", &["create", "thing"]).is_empty());
+        // Trailing boundary: `TABLESPACE` is not `TABLE`, and `vacuum_truncate`
+        // is a storage parameter, not a VACUUM.
+        assert!(
+            find_statements("CREATE TABLESPACE fast LOCATION '/x'", &["create", "table"])
+                .is_empty()
+        );
+        assert!(
+            find_statements("ALTER TABLE t SET (vacuum_truncate = false)", &["vacuum"]).is_empty()
+        );
+        assert!(find_statements("CREATE INDEXES_LATER", &["create", "index"]).is_empty());
+        // True positives still match, including across newlines and extra space.
+        assert_eq!(
+            find_statements("CREATE TABLE awa.t (x INT)", &["create", "table"]),
+            vec![0]
+        );
+        assert_eq!(
+            find_statements("create\n   table awa.t", &["create", "table"]),
+            vec![0]
+        );
+        assert_eq!(
+            find_statements("VACUUM ANALYZE awa.t", &["vacuum"]),
+            vec![0]
+        );
+        assert_eq!(
+            find_statements(
+                "CREATE INDEX IF NOT EXISTS i ON t (c)",
+                &["create", "index"]
+            ),
+            vec![0]
+        );
+    }
+
+    /// The transaction-control scan must catch every spelling that would end or
+    /// nest the runner's transaction, and every statement PostgreSQL refuses
+    /// inside one — without rejecting a legal top-level `CASE … END`.
+    #[test]
+    fn transaction_control_scan_covers_synonyms_and_non_transactional_ddl() {
+        // Does any top-level statement of `sql` start with `control`?
+        fn flags(sql: &str, control: &[&str]) -> bool {
+            top_level_statements(sql)
+                .iter()
+                .any(|statement| statement_starts_with(statement, control))
+        }
+
+        // `END` starts a statement only as transaction control. The `END` of a
+        // `CASE` is always mid-statement — including the *unparenthesized* form
+        // that ends the statement, which an earlier `["end", ";"]` pattern
+        // wrongly flagged. A parenthesized `END))` did not exercise that, which
+        // is why the earlier test passed while the lint was wrong.
+        assert!(flags("END;", &["end"]));
+        assert!(flags("END WORK;", &["end"]));
+        assert!(flags("END TRANSACTION;", &["end"]));
+        for sql in [
+            "CREATE OR REPLACE VIEW awa.v AS SELECT CASE WHEN enabled THEN 1 ELSE 0 END;",
+            "UPDATE awa.t SET x = CASE WHEN a THEN 1 ELSE 2 END;",
+            "CREATE INDEX IF NOT EXISTS i ON t ((CASE WHEN a THEN 1 ELSE 2 END));",
+        ] {
+            assert!(
+                !flags(sql, &["end"]),
+                "a CASE … END expression must not read as transaction control: {sql}"
+            );
+        }
+
+        // Likewise `VACUUM` starts a statement; `vacuum_truncate` is a storage
+        // parameter in the middle of an ALTER.
+        assert!(flags("VACUUM ANALYZE awa.t;", &["vacuum"]));
+        assert!(!flags(
+            "ALTER TABLE awa.t SET (vacuum_truncate = false);",
+            &["vacuum"]
+        ));
+
+        // COMMIT/ROLLBACK PREPARED are covered by the plain forms.
+        assert!(flags("COMMIT PREPARED 'x';", &["commit"]));
+        assert!(flags("ROLLBACK PREPARED 'x';", &["rollback"]));
+
+        // Other synonyms and nesting forms.
+        assert!(flags("ABORT;", &["abort"]));
+        assert!(flags("RELEASE my_savepoint;", &["release"]));
+        assert!(flags(
+            "PREPARE TRANSACTION 'x';",
+            &["prepare", "transaction"]
+        ));
+        // A prepared *statement* is fine and must not match.
+        assert!(!flags(
+            "PREPARE s AS SELECT 1;",
+            &["prepare", "transaction"]
+        ));
+
+        // Statements PostgreSQL refuses inside a transaction block.
+        assert!(flags("CREATE DATABASE d;", &["create", "database"]));
+        assert!(flags(
+            "ALTER SYSTEM SET work_mem = '5MB';",
+            &["alter", "system"]
+        ));
+        assert!(flags("REINDEX DATABASE d;", &["reindex", "database"]));
+        assert!(flags("CLUSTER;", &["cluster"]));
+        assert!(flags("DISCARD ALL;", &["discard"]));
+        assert!(flags(
+            "CREATE TABLESPACE ts LOCATION '/x';",
+            &["create", "tablespace"]
+        ));
+        // ...but a normal CREATE TABLE is not a TABLESPACE, and vice versa.
+        assert!(!flags(
+            "CREATE TABLE IF NOT EXISTS t (x INT);",
+            &["create", "tablespace"]
+        ));
+        assert!(!flags(
+            "CREATE TABLESPACE ts LOCATION '/x';",
+            &["create", "table"]
+        ));
+
+        // Control words appearing mid-statement are not statement starts.
+        assert!(!flags("COMMENT ON TABLE awa.t IS 'begin';", &["begin"]));
+        assert!(!flags(
+            "SELECT awa.f() FROM awa.t WHERE release_id = 1;",
+            &["release"]
+        ));
+    }
+
+    /// Statement splitting must ignore semicolons inside comments, string
+    /// literals, and dollar-quoted bodies.
+    #[test]
+    fn top_level_statements_splits_only_on_real_separators() {
+        let sql = "SELECT 'a;b'; -- c;d\n\
+                   CREATE OR REPLACE FUNCTION f() RETURNS void AS $fn$ \
+                   BEGIN PERFORM 1; END $fn$ LANGUAGE plpgsql; \
+                   CREATE TABLE IF NOT EXISTS awa.t (x INT);";
+        let statements = top_level_statements(sql);
+        assert_eq!(
+            statements.len(),
+            3,
+            "expected 3 statements, got {statements:?}"
+        );
+        assert!(statement_starts_with(&statements[0], &["select"]));
+        assert!(statement_starts_with(
+            &statements[1],
+            &["create", "or", "replace", "function"]
+        ));
+        assert!(statement_starts_with(
+            &statements[2],
+            &["create", "table", "if", "not", "exists"]
+        ));
+        // The function body's own BEGIN/END never becomes a statement.
+        assert!(!statements
+            .iter()
+            .any(|st| statement_starts_with(st, &["begin"])));
+        assert!(!statements
+            .iter()
+            .any(|st| statement_starts_with(st, &["end"])));
+    }
+
+    /// Dollar-quoted bodies and quoted literals are invisible to the top-level
+    /// scan, so a plpgsql `BEGIN`/`END` block is not transaction control.
+    #[test]
+    fn strip_to_top_level_removes_bodies_comments_and_literals() {
+        let sql = "CREATE OR REPLACE FUNCTION f() RETURNS void AS $fn$ \
+                   BEGIN COMMIT; END $fn$ LANGUAGE plpgsql; \
+                   -- COMMIT; in a comment \n \
+                   SELECT 'COMMIT;'; \
+                   /* COMMIT; in a block comment */ \
+                   CREATE TABLE IF NOT EXISTS awa.t (x INT);";
+        let top = strip_to_top_level(sql);
+        assert!(
+            find_statements(&top, &["commit"]).is_empty(),
+            "COMMIT inside a body, comment, or literal is not statement-level: {top}"
+        );
+        assert_eq!(find_statements(&top, &["create", "table"]).len(), 1);
+    }
+
+    /// The top-level statements of a migration step, `;`-delimited.
+    ///
+    /// Semicolons inside comments, string literals, and dollar-quoted bodies are
+    /// removed by [`strip_to_top_level`] first, so the remaining ones are real
+    /// statement separators.
+    fn top_level_statements(sql: &str) -> Vec<String> {
+        strip_to_top_level(sql)
+            .split(';')
+            .map(|statement| statement.trim().to_string())
+            .filter(|statement| !statement.is_empty())
+            .collect()
+    }
+
+    /// Whether a statement *begins* with a keyword sequence.
+    ///
+    /// This is the distinction the transaction-control lint needs: `END` starts
+    /// a statement only when it is transaction control, whereas the `END` of a
+    /// `CASE` expression is always mid-statement. Matching anywhere in the text
+    /// flagged `SELECT CASE WHEN a THEN 1 ELSE 0 END;` as a transaction end.
+    fn statement_starts_with(statement: &str, keywords: &[&str]) -> bool {
+        find_statements(statement, keywords).first() == Some(&0)
+    }
+
+    /// Every migration version paired with the SQL file that defines it.
+    ///
+    /// A migration's step list may replay earlier files first (v027 re-runs
+    /// V23/V22 before its own step); the version's own file is always last.
+    fn own_step_per_version() -> Vec<(i32, &'static str)> {
+        MIGRATIONS
+            .iter()
+            .map(|&(version, _, steps)| {
+                (
+                    version,
+                    *steps.last().expect("every migration has at least one step"),
+                )
+            })
+            .collect()
+    }
+
+    // ── Atomicity: the whole run is one transaction, so every step must be
+    //    transaction-safe. A single `CREATE INDEX CONCURRENTLY` would make
+    //    `run()` fail outright ("cannot run inside a transaction block") and,
+    //    if ever worked around, would silently break all-or-nothing recovery.
+
+    #[test]
+    fn every_migration_step_is_transaction_safe() {
+        for &(version, _, steps) in MIGRATIONS {
+            for step in steps {
+                if let Some(violation) = transaction_safety_violation(step) {
+                    panic!("migration v{version}: {violation}");
+                }
+            }
+        }
+    }
+
+    /// Why `step` cannot run inside the runner's single transaction, or `None`.
+    ///
+    /// Extracted from the corpus test so the rules themselves are testable: a
+    /// test that pokes `find_statements` proves the *scanner* works, not that
+    /// this lint applies it. Both bugs found in review were of that shape — the
+    /// test exercised a helper while the rule was wrong.
+    fn transaction_safety_violation(step: &str) -> Option<String> {
+        // Checked against the *raw* text, dollar-quoted bodies included: these
+        // are never valid here, and this repo routinely builds DDL with
+        // `EXECUTE format(...)` inside plpgsql, so a body-built `VACUUM` breaks
+        // the transaction just as surely as a direct one. Both are matched as
+        // whole words, so the real `vacuum_truncate` / `autovacuum_vacuum_*`
+        // storage parameters do not trip them.
+        //
+        // `CONCURRENTLY` is a modifier rather than a statement start, so the raw
+        // check is the only one that can see it at all.
+        for banned in ["concurrently", "vacuum"] {
+            if !find_statements(step, &[banned]).is_empty() {
+                return Some(format!(
+                    "runs `{banned}`, which cannot execute inside the single \
+                     migration transaction"
+                ));
+            }
+        }
+
+        // Explicit transaction control, and the statements PostgreSQL refuses
+        // inside a transaction block at all.
+        //
+        // Matched at *statement start* only. That is what separates a
+        // transaction `END` from the `END` of a `CASE` expression. plpgsql
+        // bodies are stripped before splitting, so their `BEGIN`/`END` blocks
+        // are invisible here — which is why the non-transactional statements
+        // above also get the raw check.
+        //
+        // Every entry in the second group was verified against PostgreSQL 16 to
+        // fail with "cannot run inside a transaction block". `COMMIT PREPARED` /
+        // `ROLLBACK PREPARED` need no entry because `commit` / `rollback`
+        // already match them, and `END WORK` / `END TRANSACTION` by `end`.
+        const CONTROL: &[&[&str]] = &[
+            // Transaction control.
+            &["begin"],
+            &["commit"],
+            &["rollback"],
+            &["abort"],
+            &["end"],
+            &["savepoint"],
+            &["release"],
+            &["start", "transaction"],
+            &["prepare", "transaction"],
+            // Statements PostgreSQL cannot run inside a transaction.
+            &["create", "database"],
+            &["drop", "database"],
+            &["create", "tablespace"],
+            &["drop", "tablespace"],
+            &["alter", "system"],
+            &["reindex", "database"],
+            &["reindex", "system"],
+            &["cluster"],
+            &["discard"],
+            &["create", "subscription"],
+            &["alter", "subscription"],
+            &["drop", "subscription"],
+        ];
+        for statement in top_level_statements(step) {
+            for control in CONTROL {
+                if statement_starts_with(&statement, control) {
+                    return Some(format!(
+                        "issues `{}`; it cannot run inside the single transaction \
+                         the runner owns",
+                        control.join(" ")
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The rule must reject every hazard and accept every legitimate shape.
+    ///
+    /// Drives `transaction_safety_violation` directly — the same function the
+    /// corpus test uses — so a rule that stops rejecting something fails here.
+    #[test]
+    fn transaction_safety_rule_rejects_hazards_and_accepts_valid_sql() {
+        let rejected = |sql: &str| transaction_safety_violation(sql).is_some();
+
+        // Direct statements.
+        for hazard in [
+            "VACUUM ANALYZE awa.jobs_hot;",
+            "CREATE INDEX CONCURRENTLY i ON awa.jobs_hot (id);",
+            "BEGIN;",
+            "COMMIT;",
+            "END;",
+            "ABORT;",
+            "ROLLBACK PREPARED 'x';",
+            "SAVEPOINT s;",
+            "RELEASE s;",
+            "START TRANSACTION;",
+            "PREPARE TRANSACTION 'x';",
+            "CREATE DATABASE d;",
+            "DROP TABLESPACE ts;",
+            "ALTER SYSTEM SET work_mem = '5MB';",
+            "REINDEX DATABASE awa_test;",
+            "CLUSTER awa.jobs_hot USING i;",
+            "DISCARD ALL;",
+            "CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p;",
+        ] {
+            assert!(rejected(hazard), "should be rejected: {hazard}");
+        }
+
+        // Built inside a plpgsql body and executed by the migration — the body
+        // is stripped, so only the raw check can see these.
+        assert!(rejected(
+            "CREATE OR REPLACE FUNCTION awa.f() RETURNS void LANGUAGE plpgsql AS $fn$ \
+             BEGIN EXECUTE format('VACUUM (ANALYZE) %I.jobs_hot', 'awa'); END $fn$;"
+        ));
+        assert!(rejected(
+            "CREATE OR REPLACE FUNCTION awa.f() RETURNS void LANGUAGE plpgsql AS $fn$ \
+             BEGIN EXECUTE 'CREATE INDEX CONCURRENTLY i ON awa.jobs_hot (id)'; END $fn$;"
+        ));
+
+        // Legitimate migration SQL must pass.
+        for benign in [
+            "CREATE TABLE IF NOT EXISTS awa.t (x INT);",
+            "ALTER TABLE awa.t SET (vacuum_truncate = false);",
+            "ALTER TABLE awa.t SET (autovacuum_vacuum_scale_factor = 0.05);",
+            "CREATE INDEX IF NOT EXISTS i ON awa.t ((CASE WHEN a THEN 1 ELSE 2 END));",
+            "CREATE OR REPLACE VIEW awa.v AS SELECT CASE WHEN a THEN 1 ELSE 0 END;",
+            "UPDATE awa.t SET x = CASE WHEN a THEN 1 ELSE 2 END;",
+            "CREATE TABLESPACE_LOOKALIKE_NOT_A_STATEMENT",
+            // A plpgsql body's own BEGIN/END block is not transaction control.
+            "CREATE OR REPLACE FUNCTION awa.f() RETURNS void LANGUAGE plpgsql AS $fn$ \
+             BEGIN PERFORM 1; END $fn$;",
+            "COMMENT ON TABLE awa.t IS 'begin; commit;';",
+        ] {
+            assert_eq!(
+                transaction_safety_violation(benign),
+                None,
+                "should be accepted: {benign}"
+            );
+        }
+    }
+
+    // ── Idempotency: `run()` replays a version's own file whenever an older
+    //    schema catches up, external runners may retry a file after a crash,
+    //    and several migrations deliberately re-run earlier files (v027 →
+    //    V23/V22). Unguarded DDL would make any of those a hard error.
+
+    #[test]
+    fn every_migration_guards_its_ddl() {
+        for &(version, _, steps) in MIGRATIONS {
+            for step in steps {
+                let top = strip_to_top_level(step);
+
+                for (keywords, label) in [
+                    (vec!["create", "table"], "CREATE TABLE"),
+                    (vec!["create", "sequence"], "CREATE SEQUENCE"),
+                    (vec!["create", "index"], "CREATE INDEX"),
+                    (vec!["create", "unique", "index"], "CREATE UNIQUE INDEX"),
+                ] {
+                    for at in find_statements(&top, &keywords) {
+                        let tail = &top[at..];
+                        let mut guarded = keywords.clone();
+                        guarded.extend_from_slice(&["if", "not", "exists"]);
+                        assert!(
+                            find_statements(tail, &guarded).first() == Some(&0),
+                            "migration v{version} has an unguarded `{label}` \
+                             (needs IF NOT EXISTS to stay re-runnable): …{}…",
+                            tail[..tail.len().min(80)].replace('\n', " ")
+                        );
+                    }
+                }
+
+                // `CREATE FUNCTION` / `CREATE VIEW` must be replaceable.
+                for (keywords, label) in [
+                    (vec!["create", "function"], "CREATE FUNCTION"),
+                    (vec!["create", "view"], "CREATE VIEW"),
+                ] {
+                    if let Some(&at) = find_statements(&top, &keywords).first() {
+                        panic!(
+                            "migration v{version} has a bare `{label}` (needs OR REPLACE \
+                             to stay re-runnable): …{}…",
+                            top[at..(at + 80).min(top.len())].replace('\n', " ")
+                        );
+                    }
+                }
+
+                // `CREATE TRIGGER` has no IF NOT EXISTS, so each one must be
+                // preceded by a `DROP TRIGGER IF EXISTS` for the same name.
+                for at in find_statements(&top, &["create", "trigger"]) {
+                    let name: String = top[at..]
+                        .split_whitespace()
+                        .nth(2)
+                        .unwrap_or_default()
+                        .to_string();
+                    let preceding = top[..at].to_ascii_lowercase();
+                    let dropped = find_statements(
+                        &preceding,
+                        &[
+                            "drop",
+                            "trigger",
+                            "if",
+                            "exists",
+                            &name.to_ascii_lowercase(),
+                        ],
+                    );
+                    assert!(
+                        !dropped.is_empty(),
+                        "migration v{version} creates trigger `{name}` without a preceding \
+                         `DROP TRIGGER IF EXISTS {name}`, so re-running the file fails"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Each migration records exactly its own version, and records it in a way
+    /// that survives a replay. Without `ON CONFLICT DO NOTHING`, re-running a
+    /// file would abort the whole migration transaction on the primary key.
+    #[test]
+    fn every_migration_records_its_version_idempotently() {
+        for (version, own) in own_step_per_version() {
+            let top = strip_to_top_level(own);
+            let inserts = find_statements(&top, &["insert", "into", "awa.schema_version"]);
+            assert_eq!(
+                inserts.len(),
+                1,
+                "migration v{version} should record its version exactly once, found {}",
+                inserts.len()
+            );
+            let statement = &top[inserts[0]..];
+            let statement = &statement[..statement.find(';').map_or(statement.len(), |e| e + 1)];
+            // Stripping the quoted description leaves `values ( 43, )`, so
+            // collapse whitespace *and* the space after the opening paren.
+            let normalized = statement
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace("( ", "(");
+            assert!(
+                normalized.contains(&format!("values ({version},")),
+                "migration v{version} records a different version: {normalized}"
+            );
+            assert!(
+                normalized.contains("on conflict (version) do nothing"),
+                "migration v{version} must record its version with \
+                 `ON CONFLICT (version) DO NOTHING` so a replay is a no-op"
+            );
+        }
+    }
+
+    /// The version a migration records must match the key it is listed under,
+    /// and every listed version must be unique and ordered.
+    #[test]
+    fn migration_versions_are_unique_and_ordered() {
+        let mut previous = 0;
+        for &(version, _, _) in MIGRATIONS {
+            assert!(
+                version > previous,
+                "migration versions must strictly increase: v{version} follows v{previous}"
+            );
+            previous = version;
+        }
+        assert_eq!(
+            previous, CURRENT_VERSION,
+            "CURRENT_VERSION must match the highest listed migration"
+        );
+    }
 
     #[test]
     fn migration_sql_range_all() {
