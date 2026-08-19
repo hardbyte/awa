@@ -1,10 +1,10 @@
 """Awa Python quickstart — a complete runnable example.
 
-Requires: pip install awa-pg
+Requires: uv add awa-pg==0.6.6
 Requires: a running Postgres instance with DATABASE_URL set.
 
-Usage:
-    DATABASE_URL=postgres://localhost/mydb python examples/quickstart.py
+Usage from the repository's awa-python directory:
+    DATABASE_URL=postgres://localhost/mydb uv run python examples/quickstart.py
 """
 
 import asyncio
@@ -44,11 +44,43 @@ async def main():
     )
     print(f"Inserted job {job.id} (kind={job.kind}, state={job.state})")
 
-    await asyncio.sleep(1)
-    await client.shutdown()
+    # Verify it reaches a terminal state without relying on a fixed delay.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10
+    last_state = job.state
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for job {job.id} "
+                    f"(last state: {last_state})"
+                )
 
-    # Verify it completed
-    result = await client.get_job(job.id)
+            # get_job is a single read-only query, so cancelling this await
+            # cannot leave an application transaction partially committed.
+            try:
+                result = await asyncio.wait_for(
+                    client.get_job(job.id), timeout=remaining
+                )
+            except asyncio.TimeoutError as error:
+                raise TimeoutError(
+                    f"timed out waiting for job {job.id} "
+                    f"(last state: {last_state})"
+                ) from error
+
+            last_state = result.state
+            if result.state == awa.JobState.Completed:
+                break
+            if result.state in (awa.JobState.Failed, awa.JobState.Cancelled):
+                raise RuntimeError(
+                    f"job {result.id} ended in terminal state {result.state}"
+                )
+            await asyncio.sleep(min(0.1, max(0, deadline - loop.time())))
+    finally:
+        await client.shutdown()
+        await client.close()
+
     print(f"Job {result.id} state: {result.state}")
 
 

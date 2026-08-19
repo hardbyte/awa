@@ -92,10 +92,10 @@ See [docs/positioning.md](docs/positioning.md) for the category map and messagin
 ## Getting Started
 
 ```bash
-# 1. Install
-pip install 'awa-pg[ui]'       # Python SDK + dashboard binary
-# pip install awa-pg           # SDK only (no dashboard, smaller wheel)
-# or: cargo add awa            # Rust
+# 1. Add Awa to a Python project
+uv add 'awa-pg[ui]==0.6.6'     # Python SDK + dashboard binary
+# uv add awa-pg==0.6.6         # SDK only (no dashboard, smaller wheel)
+# or: cargo add awa@0.6.6      # Rust
 
 # 2. Start Postgres and run migrations
 awa --database-url $DATABASE_URL migrate
@@ -310,13 +310,13 @@ Cancellation is cooperative for running handlers:
 ### Python
 
 ```bash
-pip install awa-pg          # SDK: insert, worker, admin, progress
-pip install 'awa-pg[ui]'    # SDK + bundled `awa` binary for the dashboard
+uv add awa-pg==0.6.6            # SDK: insert, worker, admin, progress
+uv add 'awa-pg[ui]==0.6.6'      # SDK + bundled `awa` binary for the dashboard
 # or, just the CLI:
-pip install awa-cli         # CLI on its own: migrations, queue admin, web UI
+uv tool install awa-cli==0.6.6  # CLI on its own: migrations, queue admin, web UI
 ```
 
-`pip install awa-pg` stays small for workers and producers. The `[ui]` extra pulls in [`awa-cli`](https://pypi.org/project/awa-cli/), which ships the `awa` binary plus the embedded React dashboard; afterwards `python -m awa serve` (or `awa serve` directly) launches it.
+`uv add awa-pg==0.6.6` stays small for workers and producers. The `[ui]` extra pulls in [`awa-cli`](https://pypi.org/project/awa-cli/), which ships the `awa` binary plus the embedded React dashboard; afterwards `uv run python -m awa serve` (or `awa serve` directly) launches it.
 
 ### Rust
 
@@ -327,10 +327,10 @@ awa = "0.6"
 
 ### CLI
 
-Available via pip (no Rust toolchain needed) or cargo:
+Available as a uv tool (no Rust toolchain needed) or through cargo:
 
 ```bash
-pip install awa-cli
+uv tool install awa-cli==0.6.6
 # or: cargo install awa-cli
 
 awa --database-url $DATABASE_URL migrate
@@ -376,15 +376,17 @@ All coordination through Postgres. The Rust runtime owns dispatch, leases, heart
 | `awa-worker`  | Runtime: dispatch, heartbeat, maintenance          |
 | `awa-ui`      | Web UI (axum API + embedded React frontend)        |
 | `awa-cli`     | CLI binary (migrations, admin, serve)              |
-| `awa-python`  | PyO3 extension module (`pip install awa-pg`)       |
+| `awa-python`  | PyO3 extension module (`uv add awa-pg==0.6.6`)    |
 | `awa-testing` | Test helpers (`TestClient`)                        |
 
 ## Documentation
 
+**[Browse the documentation site →](https://hardbyte.github.io/awa/)**
+
 | Doc | Description |
 | --- | --- |
 | [Rust getting started](docs/getting-started-rust.md) | From `cargo add` to a job reaching `completed` |
-| [Python getting started](docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
+| [Python getting started](docs/getting-started-python.md) | From `uv init` to a job reaching `completed` |
 | [Deployment guide](docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
 | [Migration guide](docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
 | [0.5 → 0.6 upgrade](docs/upgrade-0.5-to-0.6.md) | Step-by-step operator checklist for the staged storage transition |

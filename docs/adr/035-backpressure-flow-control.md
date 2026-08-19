@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — number claimed; full design tracked in [#341](https://github.com/hardbyte/awa/issues/341) and experiment E6 in [`docs/0.7-roadmap.md`](../0.7-roadmap.md).
+Proposed — number claimed; full design tracked in [#341](https://github.com/hardbyte/awa/issues/341) and experiment E6 in [the 0.7 roadmap](../0.7-roadmap.md).
 
 ## Context
 

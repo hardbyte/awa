@@ -1,7 +1,7 @@
 # Public Surface Stability Policy
 
 > **Status: Accepted** ([ADR-036](adr/036-public-surface-stability-policy.md), from
-> [`0.7-roadmap.md`](0.7-roadmap.md) decision D6). This document is normative: release notes
+> [0.7 roadmap](0.7-roadmap.md) decision D6). This document is normative: release notes
 > list breaking changes against its surface list, and changes to the promises below are made
 > by amending this document in an ordinary reviewed PR.
 

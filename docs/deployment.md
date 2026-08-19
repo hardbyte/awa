@@ -25,7 +25,7 @@ In production, treat these as separate concerns:
 
 ## Queue Storage Cutover
 
-Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x clusters must follow the staged storage-transition procedure in [upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md); [migrations.md](migrations.md) covers the general migration contract and tooling.
+Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x clusters must follow the [staged storage-transition procedure](upgrade-0.5-to-0.6.md); [Migrations](migrations.md) covers the general migration contract and tooling.
 
 Operationally:
 
@@ -93,8 +93,8 @@ The nightly MVCC benchmark exists to catch changes that make this failure mode w
 
 The repository already includes Dockerfiles for the `awa` CLI:
 
-- [`docker/Dockerfile`](../docker/Dockerfile)
-- [`docker/Dockerfile.runtime`](../docker/Dockerfile.runtime)
+- [`docker/Dockerfile`](https://github.com/hardbyte/awa/blob/main/docker/Dockerfile)
+- [`docker/Dockerfile.runtime`](https://github.com/hardbyte/awa/blob/main/docker/Dockerfile.runtime)
 
 Build the CLI image locally:
 
@@ -276,7 +276,7 @@ For a UI pinned to a less-trusted network or shared with stakeholders who should
 awa --database-url "$DATABASE_URL" serve --read-only
 ```
 
-This forces read-only even when the Postgres connection is fully writable — the UI hides mutation buttons and every mutation endpoint returns 503. See [configuration.md#read-only-mode](configuration.md#read-only-mode) for the tradeoff versus pointing at a read replica.
+This forces read-only even when the Postgres connection is fully writable — the UI hides mutation buttons and every mutation endpoint returns 503. See [Read-only mode](configuration.md#read-only-mode) for the tradeoff versus pointing at a read replica.
 
 If you expose the callback receiver endpoints for `HttpWorker`, also configure `AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) so `awa-ui` verifies `X-Awa-Signature` on callback requests. See [HTTP workers and callback signatures](http-callbacks.md) for the worker, function, and receiver contract.
 

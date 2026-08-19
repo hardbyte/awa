@@ -11,7 +11,7 @@ Previews (live demo workload, both dashboards rendered against a local `grafana/
 | --------------------------------- | ----------------------------- |
 | ![](screenshots/awa-postgres.png) | ![](screenshots/awa-otel.png) |
 
-Alert rules (see [`alerts/`](alerts/)) import as Grafana unified-alerting file provisioning. Here's the rule browser after provisioning both variants, with the "no active runtime (Postgres)" rule firing after we stopped the demo worker:
+Alert rules (see the [alert provisioning guide](alerts/README.md)) import as Grafana unified-alerting file provisioning. Here's the rule browser after provisioning both variants, with the "no active runtime (Postgres)" rule firing after we stopped the demo worker:
 
 ![](screenshots/awa-alerts.png)
 
@@ -129,7 +129,7 @@ each heartbeat tick roots one at `heartbeat.tick`. Both are **`debug`**, so an
 `info` pipeline shows neither — they tick whether or not there is work, and at
 the default poll interval that would be ~5 traces/s per queue-claimer. Raise the
 filter when you want them; see
-[configuration.md](../configuration.md#worker-side-traces).
+[Worker-side traces](../configuration.md#worker-side-traces).
 
 Spans and log events for work on a *specific* queue carry both `queue` and the
 OTel `messaging.destination.name`, so

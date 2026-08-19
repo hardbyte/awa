@@ -17,6 +17,11 @@ awa-python/python/awa/lib_awa.dylib.dSYM/
 /awa-ui/static/assets
 /awa-ui/static/index.html
 
+# Documentation build and browser QA artifacts
+/site/
+/.playwright-cli/
+/output/playwright/
+
 # Local worktrees and generated artifacts
 /.claude/
 /artifacts/

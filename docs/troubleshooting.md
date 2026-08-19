@@ -216,7 +216,7 @@ Use an upsert: first-enqueue may create lane rows before any operator inserts a 
 
 **3. WAL or commit pressure on the database.**
 
-If batch size and shard count both look healthy, sample `pg_stat_activity` for `LWLock:WALWrite` / `LWLock:WALSync` waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in [`docs/deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#pick-a-vcpu-size) are useful reference points.
+If batch size and shard count both look healthy, sample `pg_stat_activity` for `LWLock:WALWrite` / `LWLock:WALSync` waits and confirm the database is sized for the offered rate. The per-vCPU sustained-completion and burst-enqueue numbers in [Managed Postgres sizing](deploying-on-managed-postgres.md#pick-a-vcpu-size) are useful reference points.
 
 ## Leader Election Delays
 
@@ -379,7 +379,7 @@ Pay particular attention to:
 - reduce terminal-row retention if the terminal history is much larger than needed; note that `failed_retention` is a floor — non-DLQ `failed` rows stay retryable for at least that long in both engines (queue storage carries in-floor failed rows forward at prune time), and the cumulative count of failed rows aged past the floor is visible as `QueueCounts.pruned_failed`
 - review autovacuum settings if lease churn is expected continuously
 
-If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in `docs/benchmarking.md`. Preventative guidance — reader placement, session timeouts, alerting, and autovacuum capacity flags — lives in [`deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#mvcc-discipline-long-running-readers-pin-the-whole-database).
+If you want to reproduce the behavior locally before changing settings, run the MVCC benchmark documented in [Benchmarking](benchmarking.md). Preventative guidance — reader placement, session timeouts, alerting, and autovacuum capacity flags — lives in [Managed Postgres: MVCC discipline](deploying-on-managed-postgres.md#mvcc-discipline-long-running-readers-pin-the-whole-database).
 
 ## Something's In The DLQ
 

@@ -30,23 +30,23 @@ The default queue-storage substrate in `awa.*` is migration-owned. Custom queue-
 awa --database-url "$DATABASE_URL" migrate
 ```
 
-### Rust
+=== "Rust"
 
-```rust
-awa::migrations::run(&pool).await?;
-```
+    ```rust
+    awa::migrations::run(&pool).await?;
+    ```
 
-### Python
+=== "Python"
 
-```python
-await client.migrate()
-```
+    ```python
+    await client.migrate()
+    ```
 
-or:
+    Or migrate without constructing a client:
 
-```python
-await awa.migrate(database_url)
-```
+    ```python
+    await awa.migrate(database_url)
+    ```
 
 ## Upgrade an Existing Database
 

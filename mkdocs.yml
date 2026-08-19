@@ -1,0 +1,162 @@
+site_name: AWA
+site_description: Postgres-native background jobs for Rust and Python
+site_url: https://hardbyte.github.io/awa/
+repo_url: https://github.com/hardbyte/awa
+repo_name: hardbyte/awa
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  language: en
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: Geist Mono
+  features:
+    - content.code.annotate
+    - content.code.copy
+    - content.tabs.link
+    - content.tooltips
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: awa-light
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
+  - stylesheets/reference.css
+  - stylesheets/language-switch.css
+  - stylesheets/agent-docs.css
+
+extra_javascript:
+  - javascripts/language-switch.js
+  - javascripts/agent-docs.js
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/hardbyte/awa
+  generator: false
+
+copyright: Copyright &copy; AWA contributors · MIT OR Apache-2.0
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path:
+        - .
+      check_paths: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - Home: index.md
+  - Start:
+      - Choose a client: start/index.md
+      - Rust: getting-started-rust.md
+      - Python: getting-started-python.md
+      - CLI: start/cli.md
+  - Concepts:
+      - How AWA works: concepts/index.md
+      - Job lifecycle: concepts/job-lifecycle.md
+      - Transactional enqueue: concepts/transactional-enqueue.md
+      - Architecture: architecture.md
+      - Queue storage: queue-storage-substrate.md
+  - Guides:
+      - Guide index: guides/index.md
+      - Bridge adapters: bridge-adapters.md
+      - Lifecycle hooks: lifecycle-hooks.md
+      - HTTP callbacks: http-callbacks.md
+      - Callback receivers: callback-receivers.md
+      - Dead-letter queue: dead-letter-queue.md
+  - Operations:
+      - Operations index: operations/index.md
+      - Configuration: configuration.md
+      - Deployment: deployment.md
+      - Managed Postgres: deploying-on-managed-postgres.md
+      - Migrations:
+          - Migration overview: migrations.md
+          - Upgrade 0.5 to 0.6: upgrade-0.5-to-0.6.md
+          - Upgrade 0.6 to 0.7: upgrade-0.6-to-0.7.md
+      - Observability: grafana/README.md
+      - Troubleshooting: troubleshooting.md
+  - Security:
+      - Security overview: security.md
+      - Database roles: security/database-roles.md
+      - Deployable surfaces: security/deployable-surfaces.md
+      - Callback security: security/callback-security.md
+  - Reference:
+      - Reference index: reference/index.md
+      - CLI commands: reference/cli.md
+      - Rust crates: reference/rust.md
+      - Python API: reference/python.md
+      - Stability policy: stability.md
+      - Architecture decisions: adr/README.md
+  - Contributing:
+      - Contributing index: contributing/index.md
+      - Development: development.md
+      - Benchmarking: benchmarking.md
+
+exclude_docs: |
+  /0.7-planning-brief.md
+  /positioning.md
+  /test-plan.md
+  /ui-design.md
+  /archive/**
+
+not_in_nav: |
+  /0.7-roadmap.md
+  /adr/[0-9]*.md
+  /adr/bench/**
+  /grafana/alerts/**
+
+validation:
+  omitted_files: warn
+  absolute_links: relative_to_docs
+  unrecognized_links: warn
+  anchors: warn

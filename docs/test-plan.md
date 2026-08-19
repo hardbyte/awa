@@ -249,7 +249,7 @@ The formal suite includes passing configs and expected-counterexample configs. T
 
 ## 0.7 Planned Validation
 
-Planned test matrix for the 0.7 cycle, mapped to the roadmap ([`0.7-roadmap.md`](0.7-roadmap.md)) and the release gates on the [#383 tracker](https://github.com/hardbyte/awa/issues/383). Rows move into the matrix above as they are implemented.
+Planned test matrix for the 0.7 cycle, mapped to the [0.7 roadmap](0.7-roadmap.md) and the release gates on the [#383 tracker](https://github.com/hardbyte/awa/issues/383). Rows move into the matrix above as they are implemented.
 
 V25 adds a focused `AwaKeyedExecution` model for grant safety, partial-legacy coverage scope, and the drain/epoch/verify/resume/activate-or-cancel lowering protocol; it also extends `AwaStorageLockOrder` for the short policy transition windows. V26 adds `AwaCallerOwnedCompletion` for completion-versus-rescue atomicity. These names are planned deliverables, not claims that model files already exist.
 

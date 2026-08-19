@@ -14,7 +14,7 @@ Queue striping is now a queue-storage tuning knob, not a separate engine.
 - Stats aggregate back to the logical queue; stripe names are an internal diagnostic surface.
 - Maintenance rotates/prunes the existing queue-storage table families; striping does not add a new job lifecycle state.
 
-The implementation lives in `awa-model/src/queue_storage.rs` (search for `queue_stripe_count`). Operator-facing configuration is documented in [`configuration.md`](../../configuration.md#queue-storage-tuning), and the runtime architecture is summarized in [`architecture.md`](../../architecture.md#queue-striping-and-claim-authority).
+The implementation lives in `awa-model/src/queue_storage.rs` (search for `queue_stripe_count`). Operator-facing configuration is documented in [`configuration.md`](../../configuration.md#queue-storage-tuning), and the runtime architecture is summarized in [`architecture.md`](../../architecture.md#enqueue-and-claim).
 
 ## Why this exists
 

@@ -2,6 +2,10 @@
 
 This guide takes you from `cargo add` to a job reaching `completed`.
 
+!!! note "Version used in this guide"
+
+    The install commands pin **v0.6.6**, the latest stable release. The canonical example is tested against both that release and the code on `main`; development-only 0.7 surfaces elsewhere on this site are identified by the site banner and stability labels.
+
 ## Mental Model
 
 Before writing code, it helps to know what Awa is doing for you:
@@ -31,7 +35,7 @@ export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 cargo new awa-rust-quickstart
 cd awa-rust-quickstart
 
-cargo add awa
+cargo add awa@0.6.6
 cargo add sqlx --features runtime-tokio-rustls,postgres
 cargo add tokio --features macros,rt-multi-thread,time
 cargo add serde --features derive
@@ -42,74 +46,10 @@ cargo add serde --features derive
 Put this in `src/main.rs`:
 
 ```rust
-use awa::{admin, insert_with, migrations, Client, InsertOpts, JobArgs, JobResult, QueueConfig};
-use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use std::{env, time::Duration};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SendEmail {
-    to: String,
-    subject: String,
-}
-
-impl JobArgs for SendEmail {
-    fn kind() -> &'static str {
-        "send_email"
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = env::var("DATABASE_URL")?;
-
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
-        .await?;
-
-    // This is your application's sqlx pool. Awa uses it for queue storage,
-    // but it does not become your general database abstraction.
-    migrations::run(&pool).await?;
-
-    let client = Client::builder(pool.clone())
-        .queue(
-            "email",
-            QueueConfig {
-                max_workers: 2,
-                ..Default::default()
-            },
-        )
-        .register::<SendEmail, _, _>(|args, _ctx| async move {
-            println!("sending email to {}: {}", args.to, args.subject);
-            Ok(JobResult::Completed)
-        })
-        .build()?;
-
-    client.start().await?;
-
-    let job = insert_with(
-        &pool,
-        &SendEmail {
-            to: "alice@example.com".into(),
-            subject: "Welcome".into(),
-        },
-        InsertOpts {
-            queue: "email".into(),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let job = admin::get_job(&pool, job.id).await?;
-    println!("job {} state = {:?}", job.id, job.state);
-
-    client.shutdown(Duration::from_secs(5)).await;
-    Ok(())
-}
+--8<-- "awa/examples/quickstart.rs"
 ```
+
+This page includes the repository's canonical example verbatim. The docs check compiles it on every change.
 
 ## 3. Run It
 
@@ -129,7 +69,14 @@ job 1 state = Completed
 Install the CLI if you want migration/admin/UI commands:
 
 ```bash
-pip install awa-cli
+uv tool install awa-cli==0.6.6
+```
+
+If uv reports that its tool directory is not on `PATH`, update your shell and
+open a new terminal before continuing:
+
+```bash
+uv tool update-shell
 ```
 
 Then inspect what happened:
@@ -152,7 +99,7 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - `Client::start()` spawns background tasks and returns immediately. Your service should usually stay alive until it receives a shutdown signal.
 - `Client::shutdown(Duration)` is the graceful drain path. Set your container or process shutdown timeout slightly above that duration.
 - If you only need to enqueue jobs from Rust, depend on `awa-model` instead of `awa`.
-- If your service runs a `tracing-opentelemetry` layer, distributed tracing is automatic: enqueues capture the current span's context and the worker's `job.execute` span continues that trace (retries link back instead — see [`configuration.md`](configuration.md#distributed-tracing) and [ADR-039](adr/039-trace-propagation.md)). To propagate onward from a handler (outgoing HTTP headers), use the ambient context — `awa_model::trace::current_traceparent()` — so the downstream span is a child of the execution span; `ctx.traceparent()` returns the stored *enqueue-site* context for inspection.
+- If your service runs a `tracing-opentelemetry` layer, distributed tracing is automatic: enqueues capture the current span's context and the worker's `job.execute` span continues that trace (retries link back instead — see [Distributed tracing](configuration.md#distributed-tracing) and [ADR-039](adr/039-trace-propagation.md)). To propagate onward from a handler (outgoing HTTP headers), use the ambient context — `awa_model::trace::current_traceparent()` — so the downstream span is a child of the execution span; `ctx.traceparent()` returns the stored *enqueue-site* context for inspection.
 
 When enqueueing from a request or service method that already writes app data, use your existing `sqlx` transaction and pass it to Awa:
 
@@ -196,7 +143,7 @@ let opts = InsertOpts {
 awa::insert_with(&pool, &UpdateCustomer { customer_id, payload }, opts).await?;
 ```
 
-At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#raising-enqueue_shards) for the operator-side knob.
+At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [queue configuration](configuration.md#sharding-the-enqueue-head-per-queue) for the operator-side knob.
 
 ## Next
 
@@ -204,8 +151,8 @@ At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sh
 - [Deployment guide](deployment.md)
 - [Migration guide](migrations.md)
 - [Troubleshooting](troubleshooting.md)
-- [Advanced Rust example](../awa/examples/etl_pipeline.rs)
-- [Deadline-bounded polling pattern](../awa/examples/poll_until_deadline.rs) — poll an external system every X until it's ready or the deadline expires, using `JobResult::Snooze` so polls don't burn attempts.
+- [Advanced Rust example](https://github.com/hardbyte/awa/blob/main/awa/examples/etl_pipeline.rs)
+- [Deadline-bounded polling pattern](https://github.com/hardbyte/awa/blob/main/awa/examples/poll_until_deadline.rs) — poll an external system every X until it's ready or the deadline expires, using `JobResult::Snooze` so polls don't burn attempts.
 
   **Dashboard mid-run** — three polling jobs in flight (1 failed terminally, 1 scheduled between snoozes, 1 completed).
 

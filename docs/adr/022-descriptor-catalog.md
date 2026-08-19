@@ -37,4 +37,4 @@ Descriptors are explicitly off the hot path — dispatcher, claim, completion ba
 
 Descriptors are deliberately off the queue-storage hot path. Dispatch, claim, and completion never touch `awa.queue_descriptors` or `awa.job_kind_descriptors`; only `awa.queue_meta` (pause/resume) remains on the dispatcher's queue-state read. This preserves the ADR-019 property that operator-facing metadata changes cannot affect dispatch throughput.
 
-See [architecture.md → Descriptors And Runtime Liveness](../architecture.md#descriptors-and-runtime-liveness) for the implementation details, hashing algorithm, and measured performance profile.
+See [Architecture → Descriptors and runtime liveness](../architecture.md#descriptors-and-runtime-liveness) for the implementation details, hashing algorithm, and measured performance profile.

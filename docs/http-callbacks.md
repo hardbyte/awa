@@ -201,18 +201,17 @@ let router = callback_router(
 .await?;
 ```
 
-Use [`HttpWorkerConfig::callback_path_prefix`](#configuration) on the worker side to match a non-default `--path-prefix` so the URLs the worker hands to your function point at the receiver.
+Use [`HttpWorkerConfig::callback_path_prefix`](#configure-the-worker) on the worker side to match a non-default `--path-prefix` so the URLs the worker hands to your function point at the receiver.
 
-If you want callbacks to land inside your own application (FastAPI, axum, etc.) rather than running Awa's receiver at all, see [`docs/callback-receivers.md`](./callback-receivers.md) for the user-owned API integration pattern.
+If you want callbacks to land inside your own application (FastAPI, axum, etc.) rather than running Awa's receiver at all, see [Callback receivers](./callback-receivers.md) for the user-owned API integration pattern.
 
 ## Function-side verification
 
 The signature primarily protects the Awa callback receiver from unauthorized completion requests. If the function endpoint is public, you may also verify the worker-to-function request before starting work. In that case the function must know the same 32-byte secret and recompute the BLAKE3 keyed hash over the received `callback_id`.
 
-Python example:
+Add the dependency with `uv add blake3`, then:
 
 ```python
-# pip install blake3
 import blake3
 import hmac
 
