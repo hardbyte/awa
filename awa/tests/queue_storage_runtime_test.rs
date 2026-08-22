@@ -14908,3 +14908,80 @@ async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
 
     client.shutdown(Duration::from_secs(5)).await;
 }
+
+/// The migration-owned `awa.jobs` compat view must surface receipt-plane
+/// running claims (`#422`): jobs held by open `lease_claim_batches` (and
+/// legacy row-local `lease_claims`) previously vanished from the view
+/// entirely — running=0 while workers held live work. The view also computes
+/// per-lane claim cursors once per statement (v044) instead of evaluating the
+/// volatile `sequence_next_value` per ready row, which is what made the view
+/// pathologically slow under an un-pruned backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_jobs_compat_view_reports_receipt_running_claims() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_compat_receipt_running";
+    let schema = "awa_qs_compat_running";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for id in 0..3 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    async fn read_state_counts(pool: &sqlx::PgPool, queue: &str) -> Vec<(String, i64)> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT state::text, count(*)::bigint FROM awa.jobs WHERE queue = $1 GROUP BY state",
+        )
+        .bind(queue)
+        .fetch_all(pool)
+        .await
+        .expect("read compat-view states")
+    }
+
+    let baseline = read_state_counts(&pool, queue).await;
+    assert_eq!(
+        baseline,
+        vec![("available".to_string(), 3)],
+        "before claiming, all enqueued jobs must be available and nothing else may appear"
+    );
+
+    // Claim through the runtime batch API so the claim cursor advances
+    // post-commit exactly as a real worker would; receipts mode records the
+    // claims as open compact batches rather than materialised leases.
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim two jobs into the receipt plane");
+    assert_eq!(claimed.len(), 2, "two jobs must be claimed");
+
+    let after = read_state_counts(&pool, queue).await;
+    let mut states: Vec<(String, i64)> = after;
+    states.sort();
+    assert_eq!(
+        states,
+        vec![
+            ("available".to_string(), 1),
+            ("running".to_string(), 2),
+        ],
+        "open receipt claims must be visible as running (#422), with the unclaimed remainder available"
+    );
+}

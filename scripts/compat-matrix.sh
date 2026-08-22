@@ -6,6 +6,12 @@
 # those skews with PINNED RELEASE ARTIFACTS (awa-pg wheels from PyPI — the
 # compiled runtime, not a source build of an old tag):
 #
+#   forward-0.6.6   latest released 0.6.x lifecycle (enqueue/claim/complete/
+#                   cancel) against the newest schema. Proves additive refresh
+#                   migrations past the 0.6 migrator's recognized ceiling
+#                   (v043, e.g. the #422 jobs_compat refresh) do not need a
+#                   0.6.x patch: workers carry no version gate, only the
+#                   migrator does.
 #   forward-0.6.2   supported N-1 lifecycle (enqueue/claim/complete/cancel)
 #                   against the newest schema in columns authority, followed
 #                   by a post-flip fence check.
@@ -88,10 +94,16 @@ SQL
 echo "── setup: pinned release artifacts (PyPI wheels)"
 uv venv --quiet --clear .compat-venv-060
 uv pip install --quiet --python .compat-venv-060 "awa-pg==0.6.0"
+uv venv --quiet --clear .compat-venv-066
+uv pip install --quiet --python .compat-venv-066 "awa-pg==0.6.6"
 uv venv --quiet --clear .compat-venv-062
 uv pip install --quiet --python .compat-venv-062 "awa-pg==0.6.2"
 uv venv --quiet --clear .compat-venv-057
 uv pip install --quiet --python .compat-venv-057 "awa-pg==0.5.7"
+
+echo "── leg: forward-0.6.6 (latest released 0.6.x lifecycle on newest schema)"
+DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.6 COMPAT_QUEUE=compat_forward_066 \
+  .compat-venv-066/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
 
 echo "── leg: forward-0.6.2 (supported N-1 lifecycle on newest schema)"
 DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.2 COMPAT_QUEUE=compat_forward_062 \
