@@ -14984,4 +14984,27 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
         ],
         "open receipt claims must be visible as running (#422), with the unclaimed remainder available"
     );
+
+    // Running rows must read from the claim ledger, not the pre-claim ready
+    // row: attempt is the incremented claim attempt, attempted_at is the
+    // claim time, and the 30s claim deadline surfaces as deadline_at.
+    type RunningProjection = (i16, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+    let running_rows: Vec<RunningProjection> = sqlx::query_as(
+        "SELECT attempt, attempted_at, deadline_at FROM awa.jobs \
+             WHERE queue = $1 AND state = 'running' ORDER BY id",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read running-row projections");
+    assert_eq!(running_rows.len(), 2);
+    for (attempt, attempted_at, deadline_at) in &running_rows {
+        assert_eq!(*attempt, 1, "running rows must project the claimed attempt");
+        let claimed_at = attempted_at.expect("running rows must expose the claim time");
+        let deadline = deadline_at.expect("the 30s claim deadline must surface on running rows");
+        assert!(
+            deadline > claimed_at,
+            "deadline_at must be the claim time plus the claim deadline"
+        );
+    }
 }

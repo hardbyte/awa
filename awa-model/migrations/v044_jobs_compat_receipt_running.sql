@@ -23,9 +23,18 @@
 --    running=0 while workers held live work. This ports the open-receipt
 --    shape the admin surface shipped in #410 (admin::state_counts /
 --    queue_counts_exact / queue_storage::open_receipt_running_claims_sql)
---    into the full-row view, with the same anti-join set against durable
---    closures, closure batches, materialised leases, and terminal/deferred/
---    DLQ supersession so no job appears in two states.
+--    into the full-row view, projecting the claim ledger's own attempt /
+--    claimed-at / deadline values so running rows read the same as
+--    materialised leases do. The anti-join set against durable closures,
+--    closure batches, materialised leases, and terminal/deferred/DLQ
+--    supersession means a job reports at most one state outside the brief
+--    post-commit cursor-lag window the claim protocol itself has (receipt
+--    evidence commits before the lane's claim cursor advances — identical
+--    to the admin surfaces; it self-heals on the lane's next claim). Like
+--    the admin surface, the running legs join ready_entries for the job
+--    body, so an open claim whose ready row were missing would not be
+--    listed; prune guards (`queue_prune_has_unclosed_claim_refs_tx`) make
+--    that unreachable.
 --
 -- N-1 compatibility: this is a server-side refresh of an awa-schema
 -- function and view. No runtime parses the body; binaries of any version
@@ -259,12 +268,12 @@ BEGIN
             ready.args,
             'running'::awa.job_state AS state,
             ready.priority,
-            ready.attempt,
-            ready.max_attempts,
+            claims.attempt,
+            claims.max_attempts,
             ready.run_at,
-            NULL::timestamptz AS heartbeat_at,
-            NULL::timestamptz AS deadline_at,
-            ready.attempted_at,
+            attempt.heartbeat_at,
+            claims.deadline_at,
+            claims.claimed_at AS attempted_at,
             NULL::timestamptz AS finalized_at,
             ready.created_at,
             awa.queue_storage_payload_errors(ready.payload) AS errors,
@@ -334,12 +343,12 @@ BEGIN
             ready.args,
             'running'::awa.job_state AS state,
             ready.priority,
-            ready.attempt,
-            ready.max_attempts,
+            batches.attempts[items.ord],
+            batches.max_attempts[items.ord],
             ready.run_at,
-            NULL::timestamptz AS heartbeat_at,
-            NULL::timestamptz AS deadline_at,
-            ready.attempted_at,
+            attempt.heartbeat_at,
+            batches.deadline_at,
+            batches.claimed_at AS attempted_at,
             NULL::timestamptz AS finalized_at,
             ready.created_at,
             awa.queue_storage_payload_errors(ready.payload) AS errors,
@@ -364,7 +373,7 @@ BEGIN
             batches.run_leases,
             batches.receipt_ids,
             batches.lane_seqs
-        ) AS items(job_id, run_lease, receipt_id, lane_seq)
+        ) WITH ORDINALITY AS items(job_id, run_lease, receipt_id, lane_seq, ord)
         JOIN %1$I.ready_entries AS ready
           ON ready.ready_slot = batches.ready_slot
          AND ready.ready_generation = batches.ready_generation
