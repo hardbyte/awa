@@ -243,7 +243,7 @@ this roadmap and not yet filed.
 | 036 | Public surface stability policy | Accepted | #369 / D6 |
 | 037 | Canonical engine deprecation & removal | Accepted | #370 / D2 |
 | 042 | Caller-owned finalization transactions | Accepted | #401 / #342 |
-| 03x | Segment/cursor storage evolution | Draft from E1/E3; status decided at Gate A | #295 |
+| 044 | Segment/cursor storage evolution | Gate A decided 2026-08-22: RFC graduates to 0.8 with evidence; allocator ideas shipped in place via v027–v043 | #295 |
 
 ---
 

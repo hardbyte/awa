@@ -2,342 +2,346 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://hardbyte.github.io/awa/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/0.7-roadmap/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/architecture/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/benchmarking/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/bridge-adapters/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/callback-receivers/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/configuration/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/dead-letter-queue/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/deploying-on-managed-postgres/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/deployment/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/development/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/getting-started-python/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/getting-started-rust/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/http-callbacks/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/lifecycle-hooks/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/migrations/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/queue-storage-substrate/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/security/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/stability/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/troubleshooting/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/upgrade-0.5-to-0.6/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/upgrade-0.6-to-0.7/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/001-postgres-only/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/002-blake3-uniqueness/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/003-heartbeat-deadline-hybrid/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/004-pyo3-async-bridge/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/005-priority-aging/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/006-awa-transaction/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/007-periodic-cron-jobs/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/008-copy-batch-ingestion/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/009-python-sync-support/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/010-rate-limiting/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/011-weighted-concurrency/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/012-hot-deferred-job-storage/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/013-run-lease-and-guarded-finalization/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/014-structured-progress/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/015-post-commit-lifecycle-hooks/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/016-rust-postgres-enqueue-adapter-api/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/017-python-transaction-bridging/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/018-http-worker/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/019-queue-storage-redesign/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/020-dead-letter-queue/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/021-enhanced-external-wait/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/022-descriptor-catalog/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/023-receipt-plane-ring-partitioning/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/025-sharded-enqueue-heads/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/026-narrow-terminal-history/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/027-callback-ingress-surface/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/028-maintenance-only-runtime-role/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/029-transactional-followup-jobs/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/030-batch-operations/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/031-partitioned-queues/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/032-failed-terminal-retention/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/033-per-key-execution-control/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/034-job-dependencies/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/035-backpressure-flow-control/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/036-public-surface-stability-policy/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/037-canonical-engine-deprecation/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/038-queue-runtime-overrides/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/039-trace-propagation/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/040-append-only-ring-rotation-ledger/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/041-rolling-upgrade-policy/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/042-caller-owned-finalization-transactions/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/043-postgresql-capability-functions/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
+    </url>
+    <url>
+         <loc>https://hardbyte.github.io/awa/adr/044-storage-evolution-gate-a/</loc>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/bench/019-queue-storage-validation-2026-04-19/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/bench/023-completion-write-amplification-2026-05-02/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/adr/bench/023-receipt-ring-validation-2026-04-26/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/concepts/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/concepts/job-lifecycle/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/concepts/transactional-enqueue/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/contributing/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/grafana/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/grafana/alerts/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/guides/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/operations/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/reference/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/reference/cli/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/reference/python/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/reference/rust/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/security/callback-security/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/security/database-roles/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/security/deployable-surfaces/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/start/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
     <url>
          <loc>https://hardbyte.github.io/awa/start/cli/</loc>
-         <lastmod>2026-08-19</lastmod>
+         <lastmod>2026-08-23</lastmod>
     </url>
 </urlset>

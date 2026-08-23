@@ -53,6 +53,7 @@ Each record preserves its status, context, decision, consequences, and alternati
 | 041 | [Rolling upgrade policy](041-rolling-upgrade-policy/index.md) | Rolling upgrades use expand → capability-gated flip → later contract; version floors guard expand migrations, while database fences and real N-1 rehearsals guard irreversible flips. |  |
 | 042 | [Caller-owned finalization transactions](042-caller-owned-finalization-transactions/index.md) | A distinct handler type commits application rows and exact-lease completion in one transaction through a least-privilege finalization function (#401). |  |
 | 043 | [PostgreSQL capability functions and least-privilege runtime roles](043-postgresql-capability-functions/index.md) | Replace blanket runtime table/function grants with allowlisted, role-specific capability entry points owned by a bounded execution role (#452); blanket definer conversion is rejected. | <span class="awa-status awa-status--proposed">Proposed</span> |
+| 044 | [Gate A — storage evolution for 0.7](044-storage-evolution-gate-a/index.md) | The #295 segment-engine RFC graduates to 0.8: the allocator ideas landed inside the engine as staged migrations and measured better; the remaining WAL headroom has no in-place delivery path (#295, #383). |  |
 
 ## Correctness evidence
 

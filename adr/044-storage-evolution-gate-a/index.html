@@ -10,31 +10,27 @@
       
       
       
-        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/">
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/044-storage-evolution-gate-a/">
       
       
-        <link rel="prev" href="../stability/">
-      
-      
-        <link rel="next" href="../contributing/">
       
       
         
       
       
-      <link rel="icon" href="../assets/logo.svg">
+      <link rel="icon" href="../../assets/logo.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
-        <title>Architecture decisions - AWA</title>
+        <title>ADR-044: Gate A — storage evolution for 0.7; the segment-engine RFC graduates to 0.8 - AWA</title>
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
       
       
 
@@ -53,15 +49,15 @@
       
     
     
-      <link rel="stylesheet" href="../stylesheets/extra.css">
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
     
-      <link rel="stylesheet" href="../stylesheets/reference.css">
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
     
-      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
     
-      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
     
-    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -72,14 +68,14 @@
   
   
   <meta name="theme-color" content="#17633e">
-  <meta property="og:title" content="Architecture decisions — AWA">
+  <meta property="og:title" content="ADR-044: Gate A — storage evolution for 0.7; the segment-engine RFC graduates to 0.8 — AWA">
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/044-storage-evolution-gate-a/">
   
     <link rel="alternate" type="text/markdown" href="index.md">
   
-  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -100,7 +96,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#architecture-decision-records" class="md-skip">
+        <a href="#adr-044-gate-a-storage-evolution-for-07-the-segment-engine-rfc-graduates-to-08" class="md-skip">
           Skip to content
         </a>
       
@@ -128,9 +124,9 @@
 
 <header class="md-header" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href=".." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
       
-  <img src="../assets/logo.svg" alt="logo">
+  <img src="../../assets/logo.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -147,7 +143,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Architecture decisions
+              ADR-044: Gate A — storage evolution for 0.7; the segment-engine RFC graduates to 0.8
             
           </span>
         </div>
@@ -260,7 +256,7 @@
   
   
     <li class="md-tabs__item">
-      <a href=".." class="md-tabs__link">
+      <a href="../.." class="md-tabs__link">
         
   
   
@@ -281,7 +277,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../start/" class="md-tabs__link">
+        <a href="../../start/" class="md-tabs__link">
           
   
   
@@ -303,7 +299,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../concepts/" class="md-tabs__link">
+        <a href="../../concepts/" class="md-tabs__link">
           
   
   
@@ -325,7 +321,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../guides/" class="md-tabs__link">
+        <a href="../../guides/" class="md-tabs__link">
           
   
   
@@ -347,7 +343,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../operations/" class="md-tabs__link">
+        <a href="../../operations/" class="md-tabs__link">
           
   
   
@@ -369,7 +365,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../security/" class="md-tabs__link">
+        <a href="../../security/" class="md-tabs__link">
           
   
   
@@ -387,13 +383,11 @@
   
   
   
-    
-  
   
     
     
-      <li class="md-tabs__item md-tabs__item--active">
-        <a href="../reference/" class="md-tabs__link">
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
           
   
   
@@ -415,7 +409,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../contributing/" class="md-tabs__link">
+        <a href="../../contributing/" class="md-tabs__link">
           
   
   
@@ -451,9 +445,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href=".." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
       
-  <img src="../assets/logo.svg" alt="logo">
+  <img src="../../assets/logo.svg" alt="logo">
 
     </a>
     AWA
@@ -480,7 +474,7 @@
   
   
     <li class="md-nav__item">
-      <a href=".." class="md-nav__link">
+      <a href="../.." class="md-nav__link">
         
   
   
@@ -536,7 +530,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../start/" class="md-nav__link ">
+            <a href="../../start/" class="md-nav__link ">
               
   
   
@@ -580,7 +574,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../getting-started-rust/" class="md-nav__link">
+      <a href="../../getting-started-rust/" class="md-nav__link">
         
   
   
@@ -608,7 +602,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../getting-started-python/" class="md-nav__link">
+      <a href="../../getting-started-python/" class="md-nav__link">
         
   
   
@@ -636,7 +630,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../start/cli/" class="md-nav__link">
+      <a href="../../start/cli/" class="md-nav__link">
         
   
   
@@ -702,7 +696,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../concepts/" class="md-nav__link ">
+            <a href="../../concepts/" class="md-nav__link ">
               
   
   
@@ -746,7 +740,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../concepts/job-lifecycle/" class="md-nav__link">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
         
   
   
@@ -774,7 +768,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../concepts/transactional-enqueue/" class="md-nav__link">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
         
   
   
@@ -802,7 +796,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../architecture/" class="md-nav__link">
+      <a href="../../architecture/" class="md-nav__link">
         
   
   
@@ -830,7 +824,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../queue-storage-substrate/" class="md-nav__link">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
         
   
   
@@ -898,7 +892,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../guides/" class="md-nav__link ">
+            <a href="../../guides/" class="md-nav__link ">
               
   
   
@@ -942,7 +936,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../bridge-adapters/" class="md-nav__link">
+      <a href="../../bridge-adapters/" class="md-nav__link">
         
   
   
@@ -970,7 +964,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../lifecycle-hooks/" class="md-nav__link">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
         
   
   
@@ -998,7 +992,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../http-callbacks/" class="md-nav__link">
+      <a href="../../http-callbacks/" class="md-nav__link">
         
   
   
@@ -1026,7 +1020,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../callback-receivers/" class="md-nav__link">
+      <a href="../../callback-receivers/" class="md-nav__link">
         
   
   
@@ -1054,7 +1048,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../dead-letter-queue/" class="md-nav__link">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
         
   
   
@@ -1124,7 +1118,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../operations/" class="md-nav__link ">
+            <a href="../../operations/" class="md-nav__link ">
               
   
   
@@ -1168,7 +1162,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../configuration/" class="md-nav__link">
+      <a href="../../configuration/" class="md-nav__link">
         
   
   
@@ -1196,7 +1190,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../deployment/" class="md-nav__link">
+      <a href="../../deployment/" class="md-nav__link">
         
   
   
@@ -1224,7 +1218,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../deploying-on-managed-postgres/" class="md-nav__link">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
         
   
   
@@ -1312,7 +1306,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../migrations/" class="md-nav__link">
+      <a href="../../migrations/" class="md-nav__link">
         
   
   
@@ -1340,7 +1334,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../upgrade-0.5-to-0.6/" class="md-nav__link">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
         
   
   
@@ -1368,7 +1362,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../upgrade-0.6-to-0.7/" class="md-nav__link">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
         
   
   
@@ -1404,7 +1398,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../grafana/" class="md-nav__link">
+      <a href="../../grafana/" class="md-nav__link">
         
   
   
@@ -1432,7 +1426,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../troubleshooting/" class="md-nav__link">
+      <a href="../../troubleshooting/" class="md-nav__link">
         
   
   
@@ -1529,7 +1523,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+      <a href="../../security/" class="md-nav__link">
         
   
   
@@ -1557,7 +1551,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/database-roles/" class="md-nav__link">
+      <a href="../../security/database-roles/" class="md-nav__link">
         
   
   
@@ -1585,7 +1579,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/deployable-surfaces/" class="md-nav__link">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
         
   
   
@@ -1613,7 +1607,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/callback-security/" class="md-nav__link">
+      <a href="../../security/callback-security/" class="md-nav__link">
         
   
   
@@ -1645,8 +1639,6 @@
       
   
   
-    
-  
   
   
     
@@ -1670,23 +1662,20 @@
     
     
       
-        
-        
-      
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../reference/" class="md-nav__link ">
+            <a href="../../reference/" class="md-nav__link ">
               
   
   
@@ -1704,13 +1693,13 @@
             </a>
             
               
-              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="">
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
                 <span class="md-nav__icon md-icon"></span>
               </label>
             
           </div>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1730,7 +1719,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../reference/cli/" class="md-nav__link">
+      <a href="../../reference/cli/" class="md-nav__link">
         
   
   
@@ -1758,7 +1747,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../reference/rust/" class="md-nav__link">
+      <a href="../../reference/rust/" class="md-nav__link">
         
   
   
@@ -1786,7 +1775,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../reference/python/" class="md-nav__link">
+      <a href="../../reference/python/" class="md-nav__link">
         
   
   
@@ -1814,7 +1803,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../stability/" class="md-nav__link">
+      <a href="../../stability/" class="md-nav__link">
         
   
   
@@ -1839,37 +1828,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Architecture decisions
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
         
   
   
@@ -1885,59 +1847,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#index" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Index
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#correctness-evidence" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Correctness evidence
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#conventions" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Conventions
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -1984,7 +1893,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../contributing/" class="md-nav__link ">
+            <a href="../../contributing/" class="md-nav__link ">
               
   
   
@@ -2028,7 +1937,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../development/" class="md-nav__link">
+      <a href="../../development/" class="md-nav__link">
         
   
   
@@ -2056,7 +1965,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../benchmarking/" class="md-nav__link">
+      <a href="../../benchmarking/" class="md-nav__link">
         
   
   
@@ -2111,10 +2020,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#index" class="md-nav__link">
+  <a href="#status" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Index
+        Status
       
     </span>
   </a>
@@ -2122,10 +2031,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#correctness-evidence" class="md-nav__link">
+  <a href="#context" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Correctness evidence
+        Context
       
     </span>
   </a>
@@ -2133,13 +2042,52 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#conventions" class="md-nav__link">
+  <a href="#decision" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Conventions
+        Decision
       
     </span>
   </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#answers-to-the-rfcs-five-questions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Answers to the RFC's five questions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#consequences" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Consequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Consequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#reversal-conditions-what-reopens-the-redesign-for-08" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reversal conditions (what reopens the redesign for 0.8)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2171,294 +2119,147 @@
   
 
 
-<h1 id="architecture-decision-records">Architecture Decision Records<a class="headerlink" href="#architecture-decision-records" title="Permanent link">&para;</a></h1>
-<p>Each file in this directory captures a single architectural decision — its context, the decision itself, the alternatives considered, and the consequences. ADRs are written when a decision has a non-obvious rationale, trades off across concerns, or will be hard to change later.</p>
-<p>Each record preserves its status, context, decision, consequences, and alternatives. Accepted decisions are the default in the index; only exceptional states are labelled. Superseded and rejected records remain available as historical context.</p>
-<h2 id="index">Index<a class="headerlink" href="#index" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th style="text-align: right;">#</th>
-<th>Decision</th>
-<th>Summary</th>
-<th>Status</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align: right;">001</td>
-<td><a href="001-postgres-only/">Postgres-only</a></td>
-<td>Single storage backend, no pluggable adapter layer.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">002</td>
-<td><a href="002-blake3-uniqueness/">BLAKE3 uniqueness</a></td>
-<td>Uniqueness keys hashed with BLAKE3, claims in <code>awa.job_unique_claims</code>.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">003</td>
-<td><a href="003-heartbeat-deadline-hybrid/">Heartbeat + deadline hybrid</a></td>
-<td>Two independent rescue paths cover crash and runaway failure modes.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">004</td>
-<td><a href="004-pyo3-async-bridge/">PyO3 async bridge</a></td>
-<td>Python workers are callbacks invoked by the Rust runtime via PyO3.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">005</td>
-<td><a href="005-priority-aging/">Priority aging</a></td>
-<td>Effective priority aging prevents starvation; canonical uses maintenance aging, queue storage uses claim-time aging.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">006</td>
-<td><a href="006-awa-transaction/">AwaTransaction as narrow SQL surface</a></td>
-<td>Python transaction bridge exposes only insert + commit/rollback.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">007</td>
-<td><a href="007-periodic-cron-jobs/">Periodic cron jobs</a></td>
-<td>Leader-elected scheduler with atomic CTE enqueue.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">008</td>
-<td><a href="008-copy-batch-ingestion/">COPY batch ingestion</a></td>
-<td>Session-local staging table + COPY for 10k+-row inserts.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">009</td>
-<td><a href="009-python-sync-support/">Python sync support</a></td>
-<td>Every async method has a <code>_sync</code> counterpart for Django/Flask.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">010</td>
-<td><a href="010-rate-limiting/">Per-queue rate limiting</a></td>
-<td>Per-worker token bucket composes with both concurrency modes.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">011</td>
-<td><a href="011-weighted-concurrency/">Weighted concurrency</a></td>
-<td>Global worker pool with per-queue min guarantees and weighted overflow.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">012</td>
-<td><a href="012-hot-deferred-job-storage/">Hot / deferred job storage</a></td>
-<td>Manual hot/cold split of the <code>awa.jobs</code> heap.</td>
-<td><span class="awa-status awa-status--superseded">Superseded by 019</span></td>
-</tr>
-<tr>
-<td style="text-align: right;">013</td>
-<td><a href="013-run-lease-and-guarded-finalization/">Run lease and guarded finalization</a></td>
-<td><code>run_lease</code> is the per-attempt identity; every finalize matches on it.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">014</td>
-<td><a href="014-structured-progress/">Structured progress and metadata</a></td>
-<td>JSONB progress buffer with heartbeat piggyback + atomic state-transition flush.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">015</td>
-<td><a href="015-post-commit-lifecycle-hooks/">Builder-side lifecycle hooks</a></td>
-<td>Builder-side hooks fire after claim start and guarded finalization commits.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">016</td>
-<td><a href="016-rust-postgres-enqueue-adapter-api/">Public Rust Postgres enqueue adapter API</a></td>
-<td>Public Postgres insert-preparation contract plus built-in tokio-postgres adapter.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">017</td>
-<td><a href="017-python-transaction-bridging/">Python insert-only transaction bridging</a></td>
-<td>Python <code>awa.Transaction</code> is a thin wrapper over the Rust insert path.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">018</td>
-<td><a href="018-http-worker/">HTTP Worker for serverless job dispatch</a></td>
-<td><code>Worker</code> impl that dispatches to Lambda / Cloud Run via HTTP + BLAKE3-signed callbacks.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">019</td>
-<td><a href="019-queue-storage-redesign/">Queue Storage Engine</a></td>
-<td>Append-only ready / terminal entries, narrow <code>active_leases</code>, optional <code>attempt_state</code>, rotating segments.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">020</td>
-<td><a href="020-dead-letter-queue/">Dead Letter Queue</a></td>
-<td>First-class DLQ storage family with per-queue opt-in, retention, and operator retry/purge.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">021</td>
-<td><a href="021-enhanced-external-wait/">Sequential callbacks and callback heartbeats</a></td>
-<td><code>wait_for_callback()</code> + <code>resume_external()</code> for multi-step orchestration; <code>heartbeat_callback</code> for long-running externals.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">022</td>
-<td><a href="022-descriptor-catalog/">Descriptor catalog</a></td>
-<td><code>queue_descriptors</code> / <code>job_kind_descriptors</code> tables, BLAKE3-hashed, code-declared, off the hot path.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">023</td>
-<td><a href="023-receipt-plane-ring-partitioning/">Receipt plane ring partitioning</a></td>
-<td>Partitioned <code>lease_claims</code>, explicit closures, and compact closure batches replace <code>open_receipt_claims</code>; receipts default on in 0.6.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">024</td>
-<td>Deferred <code>done_entries</code> materialisation</td>
-<td>Investigated as a rotation guard; reverted in <code>053fec1</code> once a simpler integration test gave equivalent coverage.</td>
-<td><span class="awa-status awa-status--rejected">Rejected</span></td>
-</tr>
-<tr>
-<td style="text-align: right;">025</td>
-<td><a href="025-sharded-enqueue-heads/">Sharded enqueue heads</a></td>
-<td>Per-queue <code>enqueue_shards</code> (default 1) spreads <code>queue_enqueue_heads</code> row-lock contention across N rows; FIFO becomes per-shard at S&gt;1.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">026</td>
-<td><a href="026-narrow-terminal-history/">Narrow terminal history</a></td>
-<td>Ready-backed terminal rows store only terminal facts, compact receipt completions use batch terminal history, and exact counts combine retained compact batches with append-only <code>done_entries</code> terminal-count deltas plus async sealed-slot rollup.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">027</td>
-<td><a href="027-callback-ingress-surface/">Callback ingress as a deployable surface</a></td>
-<td>Separate signed callback ingress from the admin UI/API and expose callback-only embedding/CLI paths.</td>
-<td><span class="awa-status awa-status--proposed">Proposed</span></td>
-</tr>
-<tr>
-<td style="text-align: right;">028</td>
-<td><a href="028-maintenance-only-runtime-role/">Maintenance-only runtime role</a></td>
-<td>Run promotion, rescue, pruning, and metadata maintenance without claiming or executing user jobs.</td>
-<td><span class="awa-status awa-status--proposed">Proposed</span></td>
-</tr>
-<tr>
-<td style="text-align: right;">029</td>
-<td><a href="029-transactional-followup-jobs/">Transactional follow-up jobs</a></td>
-<td>Durable lifecycle side effects are delivered by enqueuing follow-up Awa jobs — atomically with the triggering state UPDATE for worker-driven outcomes and for callback resolution via the worker <code>Client</code>, best-effort in a separate transaction for maintenance rescue; hooks remain for observation.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">030</td>
-<td><a href="030-batch-operations/">Durable batch operations for operator bulk mutation</a></td>
-<td>Filter-driven async bulk mutation with preview, progress, cancellation, retention, and maintenance-led execution; v0.6 starts with <code>set_priority</code> and <code>move_queue</code>.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">031</td>
-<td><a href="031-partitioned-queues/">Partitioned queues</a></td>
-<td>First-class logical queue partitioning over ordinary physical queues, with domain-separated key routing and Python per-job COPY opts.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">032</td>
-<td><a href="032-failed-terminal-retention/">Failed terminal retention floor</a></td>
-<td>Queue-storage prune carries in-floor <code>failed</code> terminal rows forward into the live segment as wide synthetic rows so they stay retryable for at least <code>failed_retention</code>; rows aged past the floor are folded into <code>queue_terminal_rollups.pruned_failed_count</code> and surfaced via <code>QueueCounts.pruned_failed</code>.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">033</td>
-<td><a href="033-per-key-execution-control/">Per-key execution control</a></td>
-<td>Fleet-exact keyed grants with shard locality, bounded lane probing, and transactional closure wakeups; fairness remains separate (#340).</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">034</td>
-<td><a href="034-job-dependencies/">Job dependencies</a></td>
-<td>Single-parent A→B chaining: <code>waiting_on</code> parking state promoted transactionally by the parent's guarded finalization, with an <code>on_parent_failure</code> policy (#14).</td>
-<td><span class="awa-status awa-status--proposed">Proposed</span></td>
-</tr>
-<tr>
-<td style="text-align: right;">035</td>
-<td><a href="035-backpressure-flow-control/">Backpressure and flow control</a></td>
-<td>Soft depth signals from lane-head cursors by default, opt-in hard rejection, paced-producer helpers (#341).</td>
-<td><span class="awa-status awa-status--proposed">Proposed</span></td>
-</tr>
-<tr>
-<td style="text-align: right;">036</td>
-<td><a href="036-public-surface-stability-policy/">Public surface stability policy</a></td>
-<td><code>docs/stability.md</code> is the normative surface-by-surface compatibility map, deprecation policy, and binary/schema skew statement (#369); enforced via #402 semver checks and the #367 compat matrix.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">037</td>
-<td><a href="037-canonical-engine-deprecation/">Canonical engine deprecation</a></td>
-<td>0.7 <code>awa migrate</code> refuses unfinalized clusters (fresh installs exempt); canonical deprecated with a startup warning in 0.7, claim/execution/trigger paths removed in 0.8 (#370).</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">038</td>
-<td><a href="038-queue-runtime-overrides/">Queue runtime overrides</a></td>
-<td>Hot-reloadable per-queue dispatch knobs via nullable <code>queue_meta</code> override columns, refreshed by dispatchers on a slow cadence; rate-limit retune and non-zero deadline changes only (Tier 2: #397).</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">039</td>
-<td><a href="039-trace-propagation/">End-to-end trace propagation</a></td>
-<td>W3C <code>traceparent</code> captured at enqueue into the reserved <code>awa:traceparent</code> metadata key; first attempts join the producer trace as remote children, retries start fresh root traces with span links; OTel messaging semantic conventions on both sides; default-on, <code>AWA_TRACE_CAPTURE=off</code> kill switch (#110).</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">040</td>
-<td><a href="040-append-only-ring-rotation-ledger/">Append-only ring-rotation ledgers</a></td>
-<td>Ring cursors move from mutable <code>{ring}_ring_state</code> singletons to append-only <code>{ring}_ring_rotations</code> ledgers (cursor = max-generation row; CAS on the generation PK); staged <code>columns</code> -&gt; <code>ledger</code> authority supports the 0.6.2/0.7 rollout; queue prune appends <code>queue_terminal_rollup_deltas</code> folded by horizon-gated maintenance (#371).</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">041</td>
-<td><a href="041-rolling-upgrade-policy/">Rolling upgrade policy</a></td>
-<td>Rolling upgrades use expand → capability-gated flip → later contract; version floors guard expand migrations, while database fences and real N-1 rehearsals guard irreversible flips.</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">042</td>
-<td><a href="042-caller-owned-finalization-transactions/">Caller-owned finalization transactions</a></td>
-<td>A distinct handler type commits application rows and exact-lease completion in one transaction through a least-privilege finalization function (#401).</td>
-<td></td>
-</tr>
-<tr>
-<td style="text-align: right;">043</td>
-<td><a href="043-postgresql-capability-functions/">PostgreSQL capability functions and least-privilege runtime roles</a></td>
-<td>Replace blanket runtime table/function grants with allowlisted, role-specific capability entry points owned by a bounded execution role (#452); blanket definer conversion is rejected.</td>
-<td><span class="awa-status awa-status--proposed">Proposed</span></td>
-</tr>
-<tr>
-<td style="text-align: right;">044</td>
-<td><a href="044-storage-evolution-gate-a/">Gate A — storage evolution for 0.7</a></td>
-<td>The #295 segment-engine RFC graduates to 0.8: the allocator ideas landed inside the engine as staged migrations and measured better; the remaining WAL headroom has no in-place delivery path (#295, #383).</td>
-<td></td>
-</tr>
-</tbody>
-</table>
-<h2 id="correctness-evidence">Correctness evidence<a class="headerlink" href="#correctness-evidence" title="Permanent link">&para;</a></h2>
-<p>Executable TLA+ models live under <a href="https://github.com/hardbyte/awa/tree/main/correctness"><code>correctness/</code></a>. The storage models cover segmented storage, storage races, lock ordering, and trace refinement; the runtime models cover claim, rescue, callbacks, batching, cron, and view-trigger concurrency. Benchmark evidence belongs with the benchmark artifacts, not in this decision index.</p>
-<h2 id="conventions">Conventions<a class="headerlink" href="#conventions" title="Permanent link">&para;</a></h2>
+<h1 id="adr-044-gate-a-storage-evolution-for-07-the-segment-engine-rfc-graduates-to-08">ADR-044: Gate A — storage evolution for 0.7; the segment-engine RFC graduates to 0.8<a class="headerlink" href="#adr-044-gate-a-storage-evolution-for-07-the-segment-engine-rfc-graduates-to-08" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Accepted — decided 2026-08-22 against the evidence listed below. This is the
+<strong>Gate A</strong> scope decision defined in the <a href="../../0.7-roadmap/">0.7 roadmap §5</a>
+and required by the <a href="https://github.com/hardbyte/awa/issues/383">#383</a>
+performance contract ("Record the #295 Gate A decision"). It resolves
+<a href="https://github.com/hardbyte/awa/issues/295">#295</a> for the 0.7 scope: no
+segment-storage restructuring migrations enter 0.7; the RFC graduates to 0.8
+with its evidence attached.</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p><a href="https://github.com/hardbyte/awa/issues/295">#295</a> proposes replacing
+queue_storage's mutable lifecycle shape with append-only rotation segments plus
+a cursor allocator, motivated by the #169 finding that a pinned MVCC horizon
+degraded a 0.6-era engine from 799 → 387 jobs/s at 800 jobs/s offered over a
+2-hour pin. The roadmap's decision D1 defaulted to <em>evolution of the existing
+engine via staged migrations</em> and made that default reversible only by Gate A:
+restructuring migrations enter 0.7 <strong>only if all three</strong> hold:</p>
+<ol>
+<li>a prototype is ≥ parity clean-phase and strictly better at the 1,600/s
+   pinned-horizon shape;</li>
+<li>≥40% of WAL/job is attributable to removable architecture (E3), i.e. the
+   redesign has proven headroom;</li>
+<li>the change is deliverable as staged in-place migrations (per D1) with TLA+
+   deltas identified.</li>
+</ol>
+<p>Since that rule was written, the 0.7 performance campaign landed the allocator
+ideas <em>inside</em> the current engine as staged migrations, and measured them:</p>
 <ul>
-<li>Status is one of: <strong>Accepted</strong>, <strong>Proposed</strong>, <strong>Superseded by ADR-XXX</strong>, <strong>Deprecated</strong>, <strong>Rejected</strong>. Superseded ADRs stay in the directory as historical context.</li>
-<li>Relationships to later ADRs that change implementation but not decision are recorded in a bottom-of-doc <code>## Relationship to ADR-XXX</code> section rather than a top-of-doc <code>## Note</code>.</li>
-<li>ADRs should be narrative: context, rationale, what-was-considered. Deep implementation detail belongs in <a href="../architecture/"><code>../architecture.md</code></a> or a companion design doc, with the ADR holding the decision and its alternatives.</li>
-<li>New ADRs claim the next number in a small placeholder PR before writing to avoid collisions.</li>
+<li><strong>v027/v039</strong> — sequence-backed lane cursors and cache-free ready-segment
+  routing: the claim path walks the <code>ready_segments</code> control plane ordered by
+  <code>next_lane_seq</code> with an index short-circuit at <code>LIMIT 1</code> (the "cursor
+  allocator" of the RFC, in situ).</li>
+<li><strong>#409 / v043 (#371)</strong> — idle rotation skip, then append-only ring-rotation
+  ledgers: the ring singletons stopped being hot mutable rows entirely.
+  Pinned-horizon soak: dead tuples flat at ~6 versus 145–298 accrual on the
+  pre-ledger intermediate (<a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/tree/main/results/2026-07-11-awa-07-alpha-gate">2026-07-11 gate</a>).</li>
+<li><strong>#410 / v042</strong> — compact deadline receipt claims removed ~83k steady-state
+  live <code>lease_claims</code> rows at 256-worker saturation (the E2/#246 fix).</li>
+<li><strong>Release-candidate cells (2026-08-22)</strong> — main @ <code>8c27951</code> vs v0.6.0 at
+  W=256 depth-target saturation: <strong>11,945/s @ p99 317 ms vs 10,568/s @ p99
+  532 ms</strong> (+13% throughput, −40% tail), ref800 parity at p99 21 ms.</li>
+<li><strong>E3 attribution</strong> (recorded on #415): ~52% of WAL bytes at saturation are
+  B-tree/index maintenance — above the 40% headroom threshold. The landed work
+  did <strong>not</strong> reduce it (WAL byte-parity with v0.6.0 per 5k cell: 1,142 vs
+  1,143 MB); E9.4b confirmed BRIN cannot serve the ordered-LIMIT claim
+  contract, so no in-place migration captures this share.</li>
+</ul>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p><strong>Gate A resolves to evolution: no segment-storage restructuring migrations
+enter 0.7.</strong> The RFC's remaining scope graduates to 0.8 with this evidence
+attached. Concretely:</p>
+<ol>
+<li><strong>Criteria (i) fails as specified, and its question is answered anyway.</strong>
+   No side-by-side prototype (P-b/P-c) was built. Instead the strongest
+   candidate allocator shape — segments + cursors + append-only ledgers — was
+   implemented inside the engine behind six individually-tested migrations and
+   measured better at every recorded shape. The motivating degradation
+   mechanism (dead-tuple accumulation on hot control rows under a pinned MVCC
+   horizon) is eliminated at the representation level, not mitigated.</li>
+<li><strong>Criterion (ii) passes the threshold but not the delivery test in (iii).</strong>
+   The ~52% index-maintenance WAL share is real headroom, but capturing it
+   requires changing what the lifecycle rows <em>are</em> (index-avoiding segment
+   storage), which D1 correctly prices as a third engine identity or an
+   expand→flip→contract lifecycle swap of the core tables — exactly the cost
+   0.5→0.6 paid, with restore-only rollback. No staged-migration path to that
+   reduction has been identified (BRIN rejected; the composite lane indexes
+   are load-bearing for the ordered-LIMIT claim contract).</li>
+<li><strong>Criterion (iii) held for everything actually shipped</strong> — v016 through
+   v043 restructured cursors, routing, receipts, terminal history, and ring
+   bookkeeping in place, each individually benchmarked, without a new engine
+   identity. That delivery record is itself evidence the engine absorbs
+   structural change; it does not evidence a ceiling.</li>
+</ol>
+<p>What 0.7 ships instead of restructuring: the landed stack above, plus the E9
+deployment guidance (<code>wal_compression=lz4</code>, leave <code>commit_delay</code> at 0, do not
+pin <code>plan_cache_mode</code>) routed to the operations handbook (#379) and
+<code>awa doctor</code> advisories (#373).</p>
+<h2 id="answers-to-the-rfcs-five-questions">Answers to the RFC's five questions<a class="headerlink" href="#answers-to-the-rfcs-five-questions" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Claim allocator</strong> — answered by construction: per-lane sequence cursors
+   (<code>queue_claim_heads.seq_name</code>), a non-overlapping ready-segment control
+   plane for O(1) routing, <code>FOR UPDATE SKIP LOCKED</code> on the head row for
+   fairness, and append-only rotation ledgers so the allocator's bookkeeping
+   is vacuum-cold under any MVCC horizon. Per-row retries/heartbeats/
+   cancellation compose unchanged (ADR-023 receipt plane, ADR-003 rescue).</li>
+<li><strong>Receipt plane integration</strong> — survived and strengthened: ring-partitioned
+   receipts (ADR-023) now write compact batch claims (v038) and compact
+   deadline claims (v042); terminal history folds into narrow rollups
+   (ADR-026 + v043 deltas). No redesign needed to keep them.</li>
+<li><strong>Migration story</strong> — the staged expand→flip→contract pattern with a
+   released stepping-stone (ADR-037, ADR-040, ADR-041) is now proven twice.
+   A third engine identity would repeat the 0.5→0.6 operator cost without a
+   measured win; if 0.8 takes up the segment design, it should reuse this
+   machinery rather than a hard cutoff.</li>
+<li><strong>Comparable designs</strong> — pgque holds flat under pinned horizons by trading
+   away per-job state. Awa kept the full job-queue contract and removed the
+   degradation mechanism (hot-row churn) surgically; the residual WAL gap vs
+   pgque (~2 KiB/job) is dominated by contract evidence — per-attempt identity,
+   receipts, terminal batches — plus index maintenance, not by avoidable
+   bookkeeping.</li>
+<li><strong>TLA+ coverage</strong> — the ledger migration updated <code>AwaStorageLockOrder</code>,
+   <code>AwaDeadTupleContract</code> (ledgers modeled as cold <code>RowVacuum</code> with
+   horizon-gated folds), added the <code>MixedFleet</code> staged-upgrade invariant, and
+   TLC caught a real authority-read TOCTOU during #371. A segment redesign
+   re-models all of this; that cost belongs to whatever release takes it.</li>
+</ol>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<ul>
+<li>0.7's performance story rests on measured parity-or-better cells against
+  v0.6.0 and the elimination of the pinned-MVCC degradation mechanism, not on
+  a storage replacement.</li>
+<li>The known residual ceilings are explicit and tracked: <strong>#418</strong> (claim yield
+  capped at one generation per call under extreme fragmentation — latent,
+  requires deeper fragmentation than bench shapes produce; the candidate fix
+  is a claim-CTE change, deliverable in place) and the <strong>~52% WAL share</strong> of
+  index maintenance (documented as the price of the claim contract until an
+  index-avoiding shape exists).</li>
+<li>The 60-minute pinned-MVCC reference soak in <strong>ledger authority</strong> remains an
+  open #383 performance-contract item for the release candidate; it validates
+  the shipped design and does not gate this decision (its mechanism-level
+  evidence is already recorded).</li>
+</ul>
+<h3 id="reversal-conditions-what-reopens-the-redesign-for-08">Reversal conditions (what reopens the redesign for 0.8)<a class="headerlink" href="#reversal-conditions-what-reopens-the-redesign-for-08" title="Permanent link">&para;</a></h3>
+<p>Any of these, evidenced on released artifacts, reopens #295 with priority:</p>
+<ul>
+<li>sustained WAL-flush-bound ceilings at documented operator shapes after the
+  tuning presets ship;</li>
+<li>
+<h1 id="418-class-fragmentation-wedges-observed-in-a-real-fleet-not-only-bench">418-class fragmentation wedges observed in a real fleet (not only bench<a class="headerlink" href="#418-class-fragmentation-wedges-observed-in-a-real-fleet-not-only-bench" title="Permanent link">&para;</a></h1>
+  shapes);</li>
+<li>long-horizon latency drift or bloat reappearing in ledger authority during
+  the pinned-MVCC soak or nightly chaos runs.</li>
+</ul>
+<h2 id="references">References<a class="headerlink" href="#references" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="https://github.com/hardbyte/awa/issues/295">#295</a> — the RFC this gate closes for 0.7</li>
+<li><a href="https://github.com/hardbyte/awa/issues/383">#383</a> — performance contract naming Gate A</li>
+<li><a href="../../0.7-roadmap/">0.7 roadmap</a> — D1, §5 experiments, Gate A rule</li>
+<li><a href="../../archive/0.6-storage-design/issue-169-storage-spike/">#169 spike</a> — original degradation evidence</li>
+<li><a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking/tree/main/results/2026-07-11-awa-07-alpha-gate">bench repo 2026-07-11 gate</a>
+  and 2026-08-22 RC cells — measured comparisons cited above</li>
 </ul>
 
 
@@ -2493,44 +2294,6 @@
       
         <footer class="md-footer">
   
-    
-      
-      <nav class="md-footer__inner md-grid" aria-label="Footer" >
-        
-          
-          <a href="../stability/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Stability policy">
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-            </div>
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Previous
-              </span>
-              <div class="md-ellipsis">
-                Stability policy
-              </div>
-            </div>
-          </a>
-        
-        
-          
-          <a href="../contributing/" class="md-footer__link md-footer__link--next" aria-label="Next: Contributing index">
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Next
-              </span>
-              <div class="md-ellipsis">
-                Contributing index
-              </div>
-            </div>
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
-            </div>
-          </a>
-        
-      </nav>
     
   
   <div class="md-footer-meta md-typeset">
@@ -2575,14 +2338,14 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
       
-        <script src="../javascripts/language-switch.js"></script>
+        <script src="../../javascripts/language-switch.js"></script>
       
-        <script src="../javascripts/agent-docs.js"></script>
+        <script src="../../javascripts/agent-docs.js"></script>
       
     
   </body>
