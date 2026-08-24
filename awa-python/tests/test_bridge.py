@@ -47,7 +47,10 @@ def awa_client():
     c = awa.Client(DATABASE_URL)
     c.migrate()
     reset_sync(c)
-    return c
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 def _configure_django():

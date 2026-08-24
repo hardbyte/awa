@@ -26,7 +26,21 @@ async def client():
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'uniq_%'")
     await tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        await c.close()
+
+
+@pytest.fixture
+def sync_client():
+    c = awa.Client(DATABASE_URL)
+    c.migrate()
+    reset_sync(c)
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 @dataclass
@@ -292,11 +306,9 @@ async def test_no_unique_opts_allows_duplicates(client):
 # ── Sync variant ─────────────────────────────────────────────────────
 
 
-def test_unique_insert_sync():
+def test_unique_insert_sync(sync_client):
     """Sync insert with unique_opts works."""
-    c = awa.Client(DATABASE_URL)
-    c.migrate()
-    reset_sync(c)
+    c = sync_client
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_sync'")
     tx.commit()
@@ -367,11 +379,9 @@ async def test_unique_insert_transaction_rollback(client):
     assert job.id > 0
 
 
-def test_unique_insert_in_sync_transaction():
+def test_unique_insert_in_sync_transaction(sync_client):
     """Sync transactional unique insert works."""
-    c = awa.Client(DATABASE_URL)
-    c.migrate()
-    reset_sync(c)
+    c = sync_client
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_stx'")
     tx.commit()

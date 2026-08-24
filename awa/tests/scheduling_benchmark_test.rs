@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod ci_timing;
+use ci_timing::scaled_timeout;
+
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
@@ -77,6 +80,7 @@ async fn clean_cron_names(pool: &sqlx::PgPool, names: &[String]) {
 }
 
 async fn wait_for_leader(client: &Client, timeout: Duration) {
+    let timeout = scaled_timeout(timeout);
     let start = Instant::now();
     loop {
         let health = client.health_check().await;
@@ -92,6 +96,7 @@ async fn wait_for_leader(client: &Client, timeout: Duration) {
 }
 
 async fn wait_for_dispatch(client: &Client, timeout: Duration) {
+    let timeout = scaled_timeout(timeout);
     let start = Instant::now();
     loop {
         let health = client.health_check().await;
@@ -648,7 +653,7 @@ async fn recv_n(
     n: usize,
     timeout: Duration,
 ) -> Vec<PickupEvent> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + scaled_timeout(timeout);
     let mut out = Vec::with_capacity(n);
     while out.len() < n {
         let now = Instant::now();
@@ -812,7 +817,7 @@ async fn test_runtime_completion_gap() {
             break;
         }
         assert!(
-            completion_start.elapsed() < Duration::from_secs(30),
+            completion_start.elapsed() < scaled_timeout(Duration::from_secs(30)),
             "Timed out waiting for completed rows after handlers returned"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1510,7 +1515,7 @@ async fn run_scheduled_frontier_benchmark(queue: &str, total_jobs: i64, due_now:
             break completed;
         }
         assert!(
-            completion_start.elapsed() < Duration::from_secs(30),
+            completion_start.elapsed() < scaled_timeout(Duration::from_secs(30)),
             "Timed out waiting for completed rows after due jobs were picked up"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;

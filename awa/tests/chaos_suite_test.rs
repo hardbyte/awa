@@ -20,6 +20,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod ci_timing;
+use ci_timing::{scaled_staleness, scaled_timeout};
+
 /// Serializes the chaos tests: the maintenance leader-election advisory lock
 /// is global per database, so any test's live client can hold leadership
 /// while another test waits for one of ITS clients to be elected. Running
@@ -251,24 +254,6 @@ async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> 
 
 fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
     counts.get(state).copied().unwrap_or(0)
-}
-
-fn chaos_timeout_multiplier() -> f64 {
-    if let Ok(raw) = std::env::var("AWA_CHAOS_TIMEOUT_MULTIPLIER") {
-        if let Ok(parsed) = raw.parse::<f64>() {
-            return parsed.max(1.0);
-        }
-    }
-
-    if std::env::var_os("CI").is_some() {
-        3.0
-    } else {
-        1.0
-    }
-}
-
-fn scaled_timeout(timeout: Duration) -> Duration {
-    timeout.mul_f64(chaos_timeout_multiplier())
 }
 
 async fn wait_for_counts(
@@ -1155,7 +1140,7 @@ fn complete_client(pool: sqlx::PgPool, queue: &str) -> Client {
         .heartbeat_interval(Duration::from_millis(50))
         .promote_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
         .register_worker(CompleteWorker)
@@ -1802,7 +1787,7 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
         .heartbeat_interval(Duration::from_millis(50))
         .promote_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
         .register_worker(MixedFleetRustWorker { tx })
@@ -1915,38 +1900,55 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
             }
         }
 
-        let quiet_deadline = tokio::time::sleep(scaled_timeout(Duration::from_millis(250)));
-        tokio::pin!(quiet_deadline);
-        loop {
-            tokio::select! {
-                marker = rx.recv() => {
-                    let marker = marker.expect("Rust mixed-fleet receiver closed unexpectedly");
-                    assert!(
-                        expected_markers.contains(&marker),
-                        "Unexpected Rust marker processed after expected drain: {marker}"
-                    );
-                    assert!(
-                        completed_markers.insert(marker.clone()),
-                        "Marker completed more than once after expected drain: {marker}"
-                    );
-                }
-                line = python_worker.stdout_lines.recv() => {
-                    let line = line.expect("Python mixed-fleet worker stdout closed unexpectedly");
-                    if line.contains("COMPLETE mode=worker_chaos_probe") {
-                        let marker = mixed_fleet_marker_from_line(&line)
-                            .unwrap_or_else(|| panic!("Python completion line missing marker: {line}"))
-                            .to_string();
-                        assert!(
-                            expected_markers.contains(&marker),
-                            "Unexpected Python marker processed after expected drain: {marker}"
-                        );
-                        assert!(
-                            completed_markers.insert(marker.clone()),
-                            "Marker completed more than once after expected drain: {marker}"
-                        );
-                    }
-                }
-                () = &mut quiet_deadline => break,
+        // Both fleets have reported every expected marker. Confirm the
+        // queue itself is terminal before asserting no marker completed
+        // twice: the previous shape watched the two completion streams for
+        // a fixed 250ms quiet window, which is an assert-after-drain race
+        // (#335, #399) — a duplicate arriving at 251ms was missed, and on a
+        // contended runner the window expired while work was still moving.
+        // Queue state is the authoritative drain signal, so wait on that,
+        // then drain whatever the streams have already buffered.
+        wait_for_counts(
+            &pool,
+            &queue,
+            |counts| {
+                state_count(counts, "completed") == expected_markers.len() as i64
+                    && state_count(counts, "running") == 0
+                    && state_count(counts, "available") == 0
+                    && state_count(counts, "retryable") == 0
+                    && state_count(counts, "scheduled") == 0
+            },
+            Duration::from_secs(30),
+        )
+        .await;
+
+        // The queue is terminal, so no further completion can be produced.
+        // Anything still buffered in either stream is a duplicate or an
+        // unexpected marker — both are real failures, and `try_recv` sees
+        // them without reintroducing a wall-clock window.
+        while let Ok(marker) = rx.try_recv() {
+            assert!(
+                expected_markers.contains(&marker),
+                "Unexpected Rust marker processed after queue drain: {marker}"
+            );
+            assert!(
+                completed_markers.insert(marker.clone()),
+                "Marker completed more than once after queue drain: {marker}"
+            );
+        }
+        while let Ok(line) = python_worker.stdout_lines.try_recv() {
+            if line.contains("COMPLETE mode=worker_chaos_probe") {
+                let marker = mixed_fleet_marker_from_line(&line)
+                    .unwrap_or_else(|| panic!("Python completion line missing marker: {line}"))
+                    .to_string();
+                assert!(
+                    expected_markers.contains(&marker),
+                    "Unexpected Python marker processed after queue drain: {marker}"
+                );
+                assert!(
+                    completed_markers.insert(marker.clone()),
+                    "Marker completed more than once after queue drain: {marker}"
+                );
             }
         }
 
@@ -2003,7 +2005,7 @@ async fn test_runtime_recovers_after_terminating_postgres_connections() {
         )
         .heartbeat_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .promote_interval(Duration::from_millis(50))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
@@ -2410,7 +2412,7 @@ async fn test_full_postgres_outage_recovers_with_metrics() {
         )
         .heartbeat_interval(Duration::from_millis(50))
         .heartbeat_rescue_interval(Duration::from_millis(100))
-        .heartbeat_staleness(Duration::from_millis(250))
+        .heartbeat_staleness(scaled_staleness(Duration::from_millis(250)))
         .promote_interval(Duration::from_millis(50))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
