@@ -422,7 +422,10 @@ mod tests {
             .await
             .expect("Failed to connect to admin database for completion tests");
         let create_sql = format!("CREATE DATABASE {database_name}");
-        match sqlx::query(&create_sql).execute(&admin_pool).await {
+        match sqlx::query(awa_model::audited_sql(create_sql))
+            .execute(&admin_pool)
+            .await
+        {
             Ok(_) => {}
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {}

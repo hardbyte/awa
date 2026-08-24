@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use assert_cmd::Command;
+use awa_model::audited_sql;
 use awa_model::migrations;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
@@ -75,7 +76,7 @@ async fn ensure_test_database() {
     if !exists {
         // CREATE DATABASE takes no bind parameters. Tolerate the duplicate
         // race under per-test processes (cargo-nextest CI shards).
-        if let Err(err) = sqlx::raw_sql(&format!("CREATE DATABASE {TEST_DB_NAME}"))
+        if let Err(err) = sqlx::raw_sql(audited_sql(format!("CREATE DATABASE {TEST_DB_NAME}")))
             .execute(&mut admin)
             .await
         {
@@ -363,7 +364,7 @@ async fn rendered_sql_installs_the_current_schema_and_replays_cleanly() {
     let mut conn = PgConnection::connect(&test_database_url())
         .await
         .expect("connect");
-    sqlx::raw_sql(&rendered)
+    sqlx::raw_sql(audited_sql(rendered.clone()))
         .execute(&mut conn)
         .await
         .expect("rendered SQL should install the schema");
@@ -374,7 +375,7 @@ async fn rendered_sql_installs_the_current_schema_and_replays_cleanly() {
         .expect("read schema version");
     assert_eq!(version, migrations::CURRENT_VERSION);
 
-    sqlx::raw_sql(&rendered)
+    sqlx::raw_sql(audited_sql(rendered.clone()))
         .execute(&mut conn)
         .await
         .expect("rendered SQL should be safe to re-apply");
@@ -504,7 +505,11 @@ async fn rendered_sql_is_atomic_only_with_the_transaction_wrapper() {
     let mut conn = connect().await;
     for (_, path) in &files {
         let sql = std::fs::read_to_string(path).expect("read extracted sql");
-        if sqlx::raw_sql(&sql).execute(&mut conn).await.is_err() {
+        if sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(&mut conn)
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -521,7 +526,9 @@ async fn rendered_sql_is_atomic_only_with_the_transaction_wrapper() {
     )
     .expect("utf-8 sql");
     let mut conn = connect().await;
-    let _ = sqlx::raw_sql(&wrapped).execute(&mut conn).await;
+    let _ = sqlx::raw_sql(audited_sql(wrapped.clone()))
+        .execute(&mut conn)
+        .await;
     conn.close().await.expect("close");
     let wrapped_leftovers = awa_relation_count(&pool).await;
 

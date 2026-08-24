@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use assert_cmd::Command;
+use awa_model::audited_sql;
 use awa_model::{migrations, storage, QueueStorage};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
@@ -74,7 +75,7 @@ async fn ensure_test_database() {
             .expect("check db existence");
     if !exists {
         // CREATE DATABASE does not support bind parameters.
-        sqlx::raw_sql(&format!("CREATE DATABASE {TEST_DB_NAME}"))
+        sqlx::raw_sql(audited_sql(format!("CREATE DATABASE {TEST_DB_NAME}")))
             .execute(&mut admin)
             .await
             .expect("create finalize cli test db");
@@ -123,10 +124,12 @@ async fn reset_schema(pool: &PgPool) {
 }
 
 async fn prepare_queue_storage_schema(pool: &PgPool, schema: &str) {
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(pool)
-        .await
-        .expect("drop qs schema");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .expect("drop qs schema");
     let store = QueueStorage::from_existing_schema(schema).expect("qs schema validates");
     store.prepare_schema(pool).await.expect("prepare qs schema");
 }

@@ -7,6 +7,7 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
+use awa::audited_sql;
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage, QueueStorage};
 use awa::{InsertOpts, InsertParams, JobArgs, UniqueOpts};
 use serde::{Deserialize, Serialize};
@@ -162,10 +163,12 @@ async fn simulate_non_canonical_compat_routing(pool: &PgPool) {
 }
 
 async fn install_queue_storage_backend(pool: &PgPool, schema: &str) {
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(pool)
-        .await
-        .expect("queue storage test schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .expect("queue storage test schema should drop cleanly");
 
     let store =
         QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
@@ -176,10 +179,12 @@ async fn install_queue_storage_backend(pool: &PgPool, schema: &str) {
 }
 
 async fn prepare_queue_storage_schema(pool: &PgPool, schema: &str) {
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(pool)
-        .await
-        .expect("queue storage test schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .expect("queue storage test schema should drop cleanly");
 
     let store =
         QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
@@ -206,13 +211,13 @@ fn assert_safe_generated_role_name(role: &str) {
 
 async fn create_login_role(pool: &PgPool, role: &str) {
     assert_safe_generated_role_name(role);
-    sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+    sqlx::query(audited_sql(format!("DROP ROLE IF EXISTS {role}")))
         .execute(pool)
         .await
         .expect("test role should be dropped before create");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "CREATE ROLE {role} LOGIN PASSWORD 'awa_test_password'"
-    ))
+    )))
     .execute(pool)
     .await
     .expect("test role should be created");
@@ -220,7 +225,7 @@ async fn create_login_role(pool: &PgPool, role: &str) {
 
 async fn drop_login_role(pool: &PgPool, role: &str) {
     assert_safe_generated_role_name(role);
-    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+    let _ = sqlx::query(audited_sql(format!("DROP ROLE IF EXISTS {role}")))
         .execute(pool)
         .await;
 }
@@ -232,7 +237,7 @@ async fn grant_runtime_privileges(pool: &PgPool, role: &str, include_truncate: b
     } else {
         "SELECT, INSERT, UPDATE, DELETE"
     };
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(audited_sql(format!(
         r#"
         GRANT CONNECT ON DATABASE awa_migration_test TO {role};
         GRANT USAGE ON SCHEMA awa TO {role};
@@ -241,7 +246,7 @@ async fn grant_runtime_privileges(pool: &PgPool, role: &str, include_truncate: b
         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {role};
         REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) FROM {role};
         "#
-    ))
+    )))
     .execute(pool)
     .await
     .expect("runtime grants should apply");
@@ -479,7 +484,7 @@ async fn test_full_migration_replay_converges_to_identical_schema() {
     let mut conn = pool.acquire().await.expect("acquire");
     let mut tx = conn.begin().await.expect("begin replay");
     for (version, _, sql) in migrations::migration_sql() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(audited_sql(sql.clone()))
             .execute(&mut *tx)
             .await
             .unwrap_or_else(|err| panic!("replay of migration v{version} failed: {err}"));
@@ -512,11 +517,11 @@ async fn test_every_migration_is_individually_re_runnable() {
 
     let mut conn = pool.acquire().await.expect("acquire");
     for (version, _, sql) in migrations::migration_sql() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(audited_sql(sql.clone()))
             .execute(&mut *conn)
             .await
             .unwrap_or_else(|err| panic!("first apply of migration v{version} failed: {err}"));
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(audited_sql(sql.clone()))
             .execute(&mut *conn)
             .await
             .unwrap_or_else(|err| {
@@ -564,7 +569,7 @@ async fn test_every_migration_is_individually_re_runnable() {
 /// Event triggers need superuser, which the migration test database already
 /// requires (other tests here create and drop login roles).
 async fn arm_migration_abort(pool: &PgPool, identity_pattern: &str) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(audited_sql(format!(
         "CREATE OR REPLACE FUNCTION public.awa_test_abort_migration() \
            RETURNS event_trigger LANGUAGE plpgsql AS $fn$ \
          BEGIN \
@@ -576,7 +581,7 @@ async fn arm_migration_abort(pool: &PgPool, identity_pattern: &str) {
          DROP EVENT TRIGGER IF EXISTS awa_test_abort_migration; \
          CREATE EVENT TRIGGER awa_test_abort_migration ON ddl_command_end \
            EXECUTE FUNCTION public.awa_test_abort_migration();"
-    ))
+    )))
     .execute(pool)
     .await
     .expect("arming the migration abort event trigger requires superuser");
@@ -951,7 +956,10 @@ async fn test_step_through_upgrade_preserves_data() {
     let v1_sql = migrations::migration_sql();
     let (v1_version, _, v1_up) = &v1_sql[0];
     assert_eq!(*v1_version, 1);
-    sqlx::raw_sql(v1_up).execute(&pool).await.unwrap();
+    sqlx::raw_sql(audited_sql(v1_up.clone()))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, 1);
@@ -986,7 +994,10 @@ async fn test_step_through_upgrade_preserves_data() {
     // Step 3: apply the remaining migrations the way a 0.6-line binary
     // would (raw migration SQL) and verify the seeded data survives.
     for (_version, _desc, sql) in migrations::migration_sql_range(1, migrations::CURRENT_VERSION) {
-        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let version = migrations::current_version(&pool).await.unwrap();
@@ -1098,7 +1109,10 @@ async fn test_migration_sql_matches_run() {
 
     reset_schema(&pool).await;
     for (_version, _desc, sql) in migrations::migration_sql() {
-        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let tables_from_sql: Vec<String> = sqlx::query_scalar(
@@ -1123,7 +1137,10 @@ async fn test_v023_migrates_legacy_default_queue_storage_tables() {
     reset_schema(&pool).await;
 
     for (_version, _desc, sql) in migrations::migration_sql_range(0, 22) {
-        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     sqlx::raw_sql(
@@ -1245,7 +1262,10 @@ async fn test_v027_rebuckets_existing_terminal_live_counts() {
     reset_schema(&pool).await;
 
     for (_version, _desc, sql) in migrations::migration_sql_range(0, 26) {
-        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     sqlx::raw_sql(
@@ -1319,7 +1339,10 @@ async fn test_legacy_version_upgrade() {
     reset_schema(&pool).await;
 
     let v1_sql = &migrations::migration_sql()[0].2;
-    sqlx::raw_sql(v1_sql).execute(&pool).await.unwrap();
+    sqlx::raw_sql(audited_sql(v1_sql.clone()))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     sqlx::raw_sql(
         r#"
@@ -1333,8 +1356,14 @@ async fn test_legacy_version_upgrade() {
 
     let v2_sql = &migrations::migration_sql()[1].2;
     let v3_sql = &migrations::migration_sql()[2].2;
-    sqlx::raw_sql(v2_sql).execute(&pool).await.unwrap();
-    sqlx::raw_sql(v3_sql).execute(&pool).await.unwrap();
+    sqlx::raw_sql(audited_sql(v2_sql.clone()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(audited_sql(v3_sql.clone()))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     sqlx::raw_sql(
         r#"
@@ -1392,7 +1421,10 @@ async fn test_migration_sql_range_produces_valid_schema() {
 
     // Apply only V1+V2 via range, then verify V2 artifacts exist but V3+ don't.
     for (_version, _desc, sql) in migrations::migration_sql_range(0, 2) {
-        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let has_runtime: bool = sqlx::query_scalar(
@@ -1413,7 +1445,10 @@ async fn test_migration_sql_range_produces_valid_schema() {
 
     // Now apply V3+V4 via range and verify.
     for (_version, _desc, sql) in migrations::migration_sql_range(2, migrations::CURRENT_VERSION) {
-        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        sqlx::raw_sql(audited_sql(sql.clone()))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let has_maintenance: bool = sqlx::query_scalar(
@@ -1623,10 +1658,12 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
     prepare_queue_storage_schema(&pool, schema).await;
 
     let index_name = format!("idx_{schema}_done_0_failed_queue");
-    sqlx::query(&format!("DROP INDEX IF EXISTS {schema}.{index_name}"))
-        .execute(&pool)
-        .await
-        .expect("failed done_entries test index should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP INDEX IF EXISTS {schema}.{index_name}"
+    )))
+    .execute(&pool)
+    .await
+    .expect("failed done_entries test index should drop cleanly");
 
     sqlx::raw_sql(
         r#"
@@ -1661,9 +1698,9 @@ async fn test_v031_backfills_queue_storage_failed_done_metric_index() {
         .await
         .expect("v031 should rerun cleanly");
 
-    let has_done_failed_index: bool = sqlx::query_scalar(&format!(
+    let has_done_failed_index: bool = sqlx::query_scalar(audited_sql(format!(
         "SELECT to_regclass('{schema}.{index_name}') IS NOT NULL"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("failed done_entries index probe should succeed");
@@ -1695,14 +1732,14 @@ async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
     prepare_queue_storage_schema(&pool, schema).await;
 
     // Strip the v042 additions to mimic a schema installed before #246.
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(audited_sql(format!(
         r#"
         ALTER TABLE {schema}.claim_ring_slots
             DROP COLUMN IF EXISTS batch_deadline_cursor_deadline_at,
             DROP COLUMN IF EXISTS batch_deadline_cursor_batch_id;
         DROP INDEX IF EXISTS {schema}.idx_{schema}_lease_claim_batches_0_deadline_cursor;
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("stripping v042 additions should succeed");
@@ -1751,13 +1788,13 @@ async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
     // just child 0 — enumerate the installed children and assert the
     // partial sweep index (deadline_at IS NOT NULL, so zero-deadline
     // traffic never maintains entries) exists on each.
-    let child_slots: Vec<String> = sqlx::query_scalar(&format!(
+    let child_slots: Vec<String> = sqlx::query_scalar(audited_sql(format!(
         "SELECT substring(tablename FROM 'lease_claim_batches_(\\d+)$')
          FROM pg_tables
          WHERE schemaname = '{schema}'
            AND tablename ~ '^lease_claim_batches_\\d+$'
          ORDER BY 1"
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .expect("enumerate lease_claim_batches children");
@@ -1769,9 +1806,9 @@ async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
         let index_name = format!("idx_{schema}_lease_claim_batches_{slot}_deadline_cursor");
         // Resolve by OID (relnames are truncated to 63 chars) and read the
         // definition in one probe; NULL means the index is missing.
-        let index_def: Option<String> = sqlx::query_scalar(&format!(
+        let index_def: Option<String> = sqlx::query_scalar(audited_sql(format!(
             "SELECT pg_get_indexdef(to_regclass('{schema}.{index_name}')::oid)"
-        ))
+        )))
         .fetch_one(&pool)
         .await
         .expect("index definition probe should succeed");
@@ -1794,10 +1831,12 @@ async fn test_v042_refreshes_compact_deadline_cursors_and_index() {
     // ledger loop now running alongside the v042 compact-deadline loop, a
     // leaked probe schema multiplies the single-tx lock footprint of the
     // reinstall and can trip max_locks_per_transaction under concurrency.
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("compact-deadline probe schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("compact-deadline probe schema should drop cleanly");
 }
 
 async fn rollups_failed_column_exists(pool: &PgPool, schema: &str) -> bool {
@@ -1830,9 +1869,9 @@ async fn test_v032_backfills_queue_storage_pruned_failed_rollup_column() {
     prepare_queue_storage_schema(&pool, schema).await;
 
     // Simulate a substrate prepared by a pre-v032 binary.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "ALTER TABLE {schema}.queue_terminal_rollups DROP COLUMN pruned_failed_count"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("pruned_failed_count test column should drop cleanly");
@@ -1918,10 +1957,12 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     // v043 discovery loop reinstalls every existing queue-storage schema,
     // and reinstalling a stale copy here only wastes a large single-tx
     // lock footprint (and can trip max_locks_per_transaction).
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("leftover ledger probe schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("leftover ledger probe schema should drop cleanly");
 
     migrations::run(&pool).await.unwrap();
 
@@ -1933,7 +1974,7 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     // cursor columns on each singleton. Seed the queue cursor at a
     // non-genesis position (current_slot = 3, generation = 19) so the ledger
     // seed is observable.
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(audited_sql(format!(
         r#"
         DROP TABLE {schema}.queue_ring_rotations;
         DROP TABLE {schema}.lease_ring_rotations;
@@ -1962,7 +2003,7 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
 
         UPDATE {schema}.queue_ring_state SET current_slot = 3, generation = 19 WHERE singleton;
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("downgrade to pre-v043 substrate shape should succeed");
@@ -1992,9 +2033,9 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     );
 
     // Authority defaults to 'columns' on upgrade.
-    let authority: String = sqlx::query_scalar(&format!(
+    let authority: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("authority row should exist after upgrade");
@@ -2005,10 +2046,10 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
 
     // The queue ledger was seeded from the legacy cursor exactly: the
     // current row carries (generation = 19, slot = 3).
-    let (ledger_slot, ledger_gen): (i32, i64) = sqlx::query_as(&format!(
+    let (ledger_slot, ledger_gen): (i32, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.queue_ring_rotations \
          ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("queue ledger cursor should be readable after upgrade");
@@ -2019,9 +2060,9 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     );
 
     // The authority resolver returns the compat columns (== ledger here).
-    let (cursor_slot, cursor_gen): (i32, i64) = sqlx::query_as(&format!(
+    let (cursor_slot, cursor_gen): (i32, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.ring_cursor('queue')"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("ring_cursor('queue') should resolve after upgrade");
@@ -2040,10 +2081,10 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     );
 
     // A claim after upgrade routes off the resolved cursor without error.
-    let claimed: i64 = sqlx::query_scalar(&format!(
+    let claimed: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.claim_ready_runtime(\
          'v043_upgrade_q'::text, 8::bigint, 0::double precision, 0::double precision)"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("claim_ready_runtime must route off the resolved cursor after upgrade");
@@ -2053,7 +2094,7 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
     // Simulate the unreleased shipped-v043 shape: drop the compat columns,
     // leaving only the ledger. Rerun v043; it must re-ADD the columns seeded
     // FROM the ledger max (3, 19) and keep authority 'columns'.
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(audited_sql(format!(
         r#"
         DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.queue_ring_state;
         DROP TRIGGER reject_compat_ring_cursor_update_after_flip ON {schema}.lease_ring_state;
@@ -2062,7 +2103,7 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
         ALTER TABLE {schema}.lease_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
         ALTER TABLE {schema}.claim_ring_state DROP COLUMN current_slot, DROP COLUMN generation;
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("dev-shape column drop should succeed");
@@ -2074,9 +2115,9 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
         .await
         .expect("v043 should rerun cleanly against the dev shape");
 
-    let (restored_slot, restored_gen): (i32, i64) = sqlx::query_as(&format!(
+    let (restored_slot, restored_gen): (i32, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT current_slot, generation FROM {schema}.queue_ring_state WHERE singleton"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("columns should be restored from the ledger");
@@ -2091,10 +2132,12 @@ async fn test_v043_expand_only_restores_compat_columns_and_seeds_ledger() {
 
     // Clean up so a later `migrations::run` (this or another test) does not
     // reinstall this schema through the v043 discovery loop.
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("ledger probe schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("ledger probe schema should drop cleanly");
 }
 
 /// #371 v043 staged upgrade: a FRESH queue-storage install starts directly
@@ -2108,19 +2151,21 @@ async fn test_v043_fresh_install_starts_in_ledger_authority() {
     reset_schema(&pool).await;
 
     let schema = "awa_queue_storage_v043_fresh";
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("leftover fresh probe schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("leftover fresh probe schema should drop cleanly");
 
     migrations::run(&pool).await.unwrap();
 
     // Fresh install of a custom schema (never existed before).
     prepare_queue_storage_schema(&pool, schema).await;
 
-    let authority: String = sqlx::query_scalar(&format!(
+    let authority: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("authority row should exist on a fresh install");
@@ -2130,18 +2175,20 @@ async fn test_v043_fresh_install_starts_in_ledger_authority() {
     );
 
     // ring_cursor resolves the genesis ledger cursor (0, 0).
-    let (slot, generation): (i32, i64) = sqlx::query_as(&format!(
+    let (slot, generation): (i32, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.ring_cursor('queue')"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("ring_cursor('queue') should resolve on a fresh install");
     assert_eq!((slot, generation), (0, 0), "fresh genesis cursor is (0, 0)");
 
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("fresh probe schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("fresh probe schema should drop cleanly");
 }
 
 #[tokio::test]
@@ -2162,10 +2209,12 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
         "freshly prepared queue-storage schema should be ready"
     );
 
-    sqlx::query(&format!("DROP SEQUENCE {schema}.job_id_seq CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("test sequence drop should succeed");
+    sqlx::query(audited_sql(format!(
+        "DROP SEQUENCE {schema}.job_id_seq CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("test sequence drop should succeed");
 
     assert!(
         !storage::queue_storage_schema_ready(&pool, schema)
@@ -2175,9 +2224,9 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP SEQUENCE {schema}.lease_claim_receipt_id_seq CASCADE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("test receipt sequence drop should succeed");
@@ -2190,9 +2239,9 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP SEQUENCE {schema}.lease_claim_batch_id_seq CASCADE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("test compact claim batch sequence drop should succeed");
@@ -2205,10 +2254,12 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!("DROP TABLE {schema}.ready_tombstones CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("test ready_tombstones drop should succeed");
+    sqlx::query(audited_sql(format!(
+        "DROP TABLE {schema}.ready_tombstones CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("test ready_tombstones drop should succeed");
 
     assert!(
         !storage::queue_storage_schema_ready(&pool, schema)
@@ -2218,9 +2269,9 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP TABLE {schema}.receipt_completion_batches CASCADE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("test receipt_completion_batches drop should succeed");
@@ -2233,10 +2284,12 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!("DROP TABLE {schema}.lease_claim_batches CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("test lease_claim_batches drop should succeed");
+    sqlx::query(audited_sql(format!(
+        "DROP TABLE {schema}.lease_claim_batches CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("test lease_claim_batches drop should succeed");
 
     assert!(
         !storage::queue_storage_schema_ready(&pool, schema)
@@ -2246,9 +2299,9 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP TABLE {schema}.receipt_completion_tombstones CASCADE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("test receipt_completion_tombstones drop should succeed");
@@ -2261,9 +2314,9 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP TABLE {schema}.queue_terminal_count_deltas CASCADE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("test queue_terminal_count_deltas drop should succeed");
@@ -2276,9 +2329,9 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "ALTER TABLE {schema}.lease_claim_closure_batches DROP COLUMN receipt_ranges"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("test receipt_ranges drop should succeed");
@@ -2291,9 +2344,9 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP FUNCTION {schema}.claim_ready_runtime(text, bigint, double precision, double precision)"
-    ))
+    )))
         .execute(&pool)
         .await
         .expect("test claim function drop should succeed");
@@ -2306,13 +2359,13 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
     );
 
     prepare_queue_storage_schema(&pool, schema).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP FUNCTION {schema}.claim_ready_runtime(text, bigint, double precision, double precision)"
-    ))
+    )))
         .execute(&pool)
         .await
         .expect("test claim function drop before stub should succeed");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         CREATE FUNCTION {schema}.claim_ready_runtime(
             p_queue TEXT,
@@ -2326,7 +2379,7 @@ async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() 
             SELECT NULL::bigint WHERE FALSE
         $$;
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("test stale claim function create should succeed");
@@ -2348,10 +2401,12 @@ async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_curren
     migrations::run(&pool).await.unwrap();
 
     let schema = "awa_queue_storage_trusted_marker";
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("queue storage test schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("queue storage test schema should drop cleanly");
     let store =
         QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
     store
@@ -2359,7 +2414,7 @@ async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_curren
         .await
         .expect("queue storage schema preparation should succeed");
 
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(audited_sql(format!(
         r#"
         INSERT INTO {schema}.done_entries (
             ready_slot, ready_generation, job_id, kind, queue, state,
@@ -2381,7 +2436,7 @@ async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_curren
         SET terminal_counter_trusted_at = now()
         WHERE singleton = TRUE;
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("seed current-shape terminal counters");
@@ -2391,10 +2446,10 @@ async fn test_prepare_schema_preserves_trusted_terminal_counter_marker_on_curren
         .await
         .expect("idempotent prepare_schema should succeed");
 
-    let trusted: bool = sqlx::query_scalar(&format!(
+    let trusted: bool = sqlx::query_scalar(audited_sql(format!(
         "SELECT terminal_counter_trusted_at IS NOT NULL \
          FROM {schema}.queue_ring_state WHERE singleton = TRUE"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("trust marker query should succeed");
@@ -2414,10 +2469,12 @@ async fn test_v030_preserves_untrusted_terminal_counter_marker_on_empty_schema()
     migrations::run(&pool).await.unwrap();
 
     let schema = "awa_queue_storage_untrusted_marker";
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("queue storage test schema should drop cleanly");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("queue storage test schema should drop cleanly");
     let store =
         QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
     store
@@ -2425,26 +2482,26 @@ async fn test_v030_preserves_untrusted_terminal_counter_marker_on_empty_schema()
         .await
         .expect("queue storage schema preparation should succeed");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_ring_state \
          SET terminal_counter_trusted_at = NULL \
          WHERE singleton = TRUE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("clear trust marker");
 
     for (_version, _desc, sql) in migrations::migration_sql_range(29, 30) {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(audited_sql(sql.clone()))
             .execute(&pool)
             .await
             .expect("v030 migration should rerun cleanly");
     }
 
-    let trusted: bool = sqlx::query_scalar(&format!(
+    let trusted: bool = sqlx::query_scalar(audited_sql(format!(
         "SELECT terminal_counter_trusted_at IS NOT NULL \
          FROM {schema}.queue_ring_state WHERE singleton = TRUE"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("trust marker query should succeed");
@@ -3258,9 +3315,9 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
     assert_eq!(row.queue, "compat_refusal_queue");
     assert_eq!(row.state, awa::JobState::Available);
 
-    let lane_seq: i64 = sqlx::query_scalar(&format!(
+    let lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT lane_seq FROM {schema}.ready_entries WHERE job_id = $1"
-    ))
+    )))
     .bind(row.id)
     .fetch_one(&pool)
     .await
@@ -3270,9 +3327,9 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
         "insert_job_compat must reserve queue-storage lanes through the sequence allocator"
     );
 
-    let ready_segments: i64 = sqlx::query_scalar(&format!(
+    let ready_segments: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.ready_segments WHERE queue = $1"
-    ))
+    )))
     .bind("compat_refusal_queue")
     .fetch_one(&pool)
     .await
@@ -3657,7 +3714,10 @@ async fn test_legacy_v3_only_upgrade() {
     reset_schema(&pool).await;
 
     let v1_sql = &migrations::migration_sql()[0].2;
-    sqlx::raw_sql(v1_sql).execute(&pool).await.unwrap();
+    sqlx::raw_sql(audited_sql(v1_sql.clone()))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     sqlx::raw_sql(
         r#"

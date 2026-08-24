@@ -4,6 +4,7 @@
 //! active queue_storage schema from `awa.runtime_storage_backends` and operates
 //! against that backend.
 
+use crate::audited_sql;
 use crate::error::AwaError;
 use crate::job::JobRow;
 use crate::queue_storage::QueueStorage;
@@ -214,7 +215,7 @@ pub async fn bulk_move_failed_to_dlq(
 pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRow>, AwaError> {
     let store = active_queue_storage(pool).await?;
     let schema = store.schema();
-    let rows: Vec<QueueStorageDlqRow> = sqlx::query_as(&format!(
+    let rows: Vec<QueueStorageDlqRow> = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT
             job_id,
@@ -252,7 +253,7 @@ pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRo
         ORDER BY dlq_at DESC, job_id DESC
         LIMIT $6
         "#
-    ))
+    )))
     .bind(&filter.kind)
     .bind(&filter.queue)
     .bind(&filter.tag)
@@ -270,7 +271,7 @@ pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRo
 pub async fn get_dlq_job(pool: &PgPool, job_id: i64) -> Result<Option<DlqRow>, AwaError> {
     let store = active_queue_storage(pool).await?;
     let schema = store.schema();
-    let row: Option<QueueStorageDlqRow> = sqlx::query_as(&format!(
+    let row: Option<QueueStorageDlqRow> = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT
             job_id,
@@ -296,7 +297,7 @@ pub async fn get_dlq_job(pool: &PgPool, job_id: i64) -> Result<Option<DlqRow>, A
         ORDER BY dlq_at DESC
         LIMIT 1
         "#
-    ))
+    )))
     .bind(job_id)
     .fetch_optional(pool)
     .await?;
@@ -306,10 +307,10 @@ pub async fn get_dlq_job(pool: &PgPool, job_id: i64) -> Result<Option<DlqRow>, A
 
 pub async fn dlq_depth(pool: &PgPool, queue: Option<&str>) -> Result<i64, AwaError> {
     let store = active_queue_storage(pool).await?;
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.dlq_entries WHERE ($1::text IS NULL OR queue = $1)",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -318,7 +319,7 @@ pub async fn dlq_depth(pool: &PgPool, queue: Option<&str>) -> Result<i64, AwaErr
 
 pub async fn dlq_depth_by_queue(pool: &PgPool) -> Result<Vec<(String, i64)>, AwaError> {
     let store = active_queue_storage(pool).await?;
-    sqlx::query_as::<_, (String, i64)>(&format!(
+    sqlx::query_as::<_, (String, i64)>(audited_sql(format!(
         r#"
         SELECT queue, count(*)::bigint
         FROM {}.dlq_entries
@@ -326,7 +327,7 @@ pub async fn dlq_depth_by_queue(pool: &PgPool) -> Result<Vec<(String, i64)>, Awa
         ORDER BY count(*) DESC, queue ASC
         "#,
         store.schema()
-    ))
+    )))
     .fetch_all(pool)
     .await
     .map_err(Into::into)
@@ -391,7 +392,7 @@ pub async fn purge_dlq(
     }
 
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(&format!(
+    let result = sqlx::query(audited_sql(format!(
         r#"
         DELETE FROM {}.dlq_entries
         WHERE ($1::text IS NULL OR kind = $1)
@@ -409,7 +410,7 @@ pub async fn purge_dlq(
           )
         "#,
         store.schema()
-    ))
+    )))
     .bind(&filter.kind)
     .bind(&filter.queue)
     .bind(&filter.tag)
@@ -422,10 +423,10 @@ pub async fn purge_dlq(
 
 pub async fn purge_dlq_job(pool: &PgPool, job_id: i64) -> Result<bool, AwaError> {
     let store = active_queue_storage(pool).await?;
-    let result = sqlx::query(&format!(
+    let result = sqlx::query(audited_sql(format!(
         "DELETE FROM {}.dlq_entries WHERE job_id = $1",
         store.schema()
-    ))
+    )))
     .bind(job_id)
     .execute(pool)
     .await?;
@@ -445,7 +446,7 @@ pub async fn cleanup_dlq(
 ) -> Result<u64, AwaError> {
     let store = active_queue_storage(pool).await?;
     let retention_secs = retention.as_secs().min(i64::MAX as u64) as i64;
-    let result = sqlx::query(&format!(
+    let result = sqlx::query(audited_sql(format!(
         r#"
         DELETE FROM {}.dlq_entries
         WHERE job_id IN (
@@ -459,7 +460,7 @@ pub async fn cleanup_dlq(
         "#,
         store.schema(),
         store.schema()
-    ))
+    )))
     .bind(retention_secs)
     .bind(batch_size)
     .bind(queue)

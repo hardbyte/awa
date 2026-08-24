@@ -40,7 +40,7 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let result = bind_json_args(sqlx::query(&query), &json_args)
+            let result = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                 .execute(&mut **tx_ref)
                 .await
                 .map_err(map_sqlx_error)?;
@@ -61,7 +61,7 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let row = bind_json_args(sqlx::query(&query), &json_args)
+            let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                 .fetch_one(&mut **tx_ref)
                 .await
                 .map_err(map_sqlx_error)?;
@@ -82,7 +82,7 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let row = bind_json_args(sqlx::query(&query), &json_args)
+            let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                 .fetch_optional(&mut **tx_ref)
                 .await
                 .map_err(map_sqlx_error)?;
@@ -106,7 +106,7 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let rows = bind_json_args(sqlx::query(&query), &json_args)
+            let rows = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                 .fetch_all(&mut **tx_ref)
                 .await
                 .map_err(map_sqlx_error)?;
@@ -576,7 +576,7 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let result = bind_json_args(sqlx::query(&query), &json_args)
+                let result = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                     .execute(&mut **tx_ref)
                     .await
                     .map_err(map_sqlx_error)?;
@@ -598,7 +598,7 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let row = bind_json_args(sqlx::query(&query), &json_args)
+                let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                     .fetch_one(&mut **tx_ref)
                     .await
                     .map_err(map_sqlx_error)?;
@@ -620,7 +620,7 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let row = bind_json_args(sqlx::query(&query), &json_args)
+                let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                     .fetch_optional(&mut **tx_ref)
                     .await
                     .map_err(map_sqlx_error)?;
@@ -645,7 +645,7 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let rows = bind_json_args(sqlx::query(&query), &json_args)
+                let rows = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
                     .fetch_all(&mut **tx_ref)
                     .await
                     .map_err(map_sqlx_error)?;

@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Changed
+
+- **Upgraded to sea-orm 2.0.2 stable and sqlx 0.9 ([#443](https://github.com/hardbyte/awa/issues/443)).** sea-orm moves from the 2.0.0 release candidates (sqlx 0.8) to the stable line built on sqlx 0.9, which unifies the dependency for `awa-seaorm` consumers. For library users the visible change is sqlx 0.9's injection guard: query functions only accept `&'static str` or an explicit assertion, so dynamically assembled SQL must opt in via [`awa::audited_sql`](https://docs.rs/awa) (new re-export). Awa's own call sites interpolate only validated identifiers — schema names are checked against `[a-z0-9_]+` before any SQL is built — and pass all external values as bind parameters; the helper documents that invariant at each opt-in. sqlx's combined runtime+TLS features were removed in 0.9, so builds now select `runtime-tokio` + `tls-rustls-ring` explicitly (the same ring provider with webpki roots `runtime-tokio-rustls` selected previously). No schema, migration, or behavioural changes.
+
 ### Fixed
 
 - **Nightly flake gates now carry runner-contention margin ([#399](https://github.com/hardbyte/awa/issues/399), [#434](https://github.com/hardbyte/awa/issues/434)).** Four assertion shapes in the chaos and benchmark suites were tight enough that shared-runner CPU contention failed them while every invariant they exist for was intact, eroding the 14-consecutive-green-nightlies release gate. `awa/tests/ci_timing.rs` now holds the scaling for all of them, and it only ever loosens a bound, and only when `CI` is set:

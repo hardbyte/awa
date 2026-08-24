@@ -7,6 +7,7 @@
 //! (heartbeat_batch on a receipts-mode store does not write
 //! leases.heartbeat_at).
 
+use awa_model::audited_sql;
 use awa_model::{QueueStorage, QueueStorageConfig};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -71,10 +72,12 @@ async fn prepare_schema_does_not_create_state_hb_index() {
     })
     .expect("construct QueueStorage");
 
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("clean any prior schema");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("clean any prior schema");
     store
         .prepare_schema(&pool)
         .await
@@ -86,7 +89,7 @@ async fn prepare_schema_does_not_create_state_hb_index() {
         "fresh prepare_schema must not create idx_*_state_hb"
     );
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(audited_sql(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)
         .await
         .expect("cleanup test schema");

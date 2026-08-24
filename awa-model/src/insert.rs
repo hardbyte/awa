@@ -1,3 +1,4 @@
+use crate::audited_sql;
 use crate::error::{map_sqlx_error, AwaError};
 use crate::job::{InsertOpts, InsertParams, JobRow, JobState};
 use crate::unique::compute_unique_key;
@@ -416,7 +417,7 @@ where
     let rows = precompute_rows(jobs)?;
     let query = build_multi_insert_query(rows.len());
 
-    let mut sql_query = sqlx::query_as::<_, JobRow>(&query);
+    let mut sql_query = sqlx::query_as::<_, JobRow>(audited_sql(query));
 
     for row in &rows {
         sql_query = sql_query

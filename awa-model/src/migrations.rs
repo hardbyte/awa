@@ -495,7 +495,7 @@ async fn apply_migrations(
             info!(version, description, "Applying migration v{version}");
             let started = std::time::Instant::now();
             for step in steps {
-                sqlx::raw_sql(step).execute(&mut *conn).await?;
+                sqlx::raw_sql(*step).execute(&mut *conn).await?;
             }
             let elapsed_ms = started.elapsed().as_millis();
             info!(

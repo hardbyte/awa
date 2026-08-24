@@ -4,6 +4,7 @@
 
 pub mod setup;
 
+use awa_model::audited_sql;
 use awa_model::{AwaError, JobArgs, JobRow};
 use awa_worker::context::ProgressState;
 use awa_worker::{JobContext, JobError, JobResult, Worker};
@@ -262,9 +263,9 @@ impl TestClient {
         let target_queue = match queue {
             Some(queue) => queue.to_string(),
             None => {
-                let resolved: Option<String> = sqlx::query_scalar(&format!(
+                let resolved: Option<String> = sqlx::query_scalar(audited_sql(format!(
                     "SELECT queue FROM {schema}.ready_entries WHERE kind = $1 ORDER BY job_id ASC LIMIT 1"
-                ))
+                )))
                 .bind(worker.kind())
                 .fetch_optional(&self.pool)
                 .await?;

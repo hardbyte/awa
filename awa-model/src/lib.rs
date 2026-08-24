@@ -79,3 +79,14 @@ pub trait JobArgs: serde::Serialize {
         serde_json::to_value(self)
     }
 }
+
+/// Accept dynamically assembled SQL after manual audit, for sqlx >= 0.9.
+///
+/// Awa interpolates only validated SQL identifiers (see `validate_ident` in
+/// `queue_storage`) and fixed text fragments into query strings; every value
+/// that originates from jobs, queues, filters, or API callers travels through
+/// bind parameters. sqlx cannot see that invariant, so call sites that build
+/// query text with `format!` must opt in here.
+pub fn audited_sql(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(sql.into())
+}

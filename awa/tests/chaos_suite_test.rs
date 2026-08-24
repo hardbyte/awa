@@ -4,6 +4,7 @@
 //! nightly/manual chaos lane.
 
 use async_trait::async_trait;
+use awa::audited_sql;
 use awa::model::{insert_with, migrations, InsertOpts, QueueStorageConfig};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -217,7 +218,7 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
              ) AS counts \
              GROUP BY state"
         );
-        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+        let rows: Vec<(String, i64)> = sqlx::query_as(audited_sql(sql.clone()))
             .bind(queue)
             .fetch_all(pool)
             .await
@@ -344,7 +345,7 @@ async fn kind_state_count(pool: &sqlx::PgPool, queue: &str, kind: &str, state: &
                 ) AS running_jobs
                 "#,
             );
-            return sqlx::query_scalar(&sql)
+            return sqlx::query_scalar(audited_sql(sql.clone()))
                 .bind(queue)
                 .bind(kind)
                 .fetch_one(pool)
@@ -449,7 +450,7 @@ async fn backdate_compact_claims(
         ON CONFLICT (job_id, run_lease) DO NOTHING
         "#,
     );
-    sqlx::query(&shield_sql)
+    sqlx::query(audited_sql(shield_sql.clone()))
         .bind(queue)
         .bind(kind)
         .execute(pool)
@@ -478,7 +479,7 @@ async fn backdate_compact_claims(
                       updated_at = EXCLUDED.updated_at
         "#,
     );
-    let member_rows = sqlx::query(&attempt_sql)
+    let member_rows = sqlx::query(audited_sql(attempt_sql.clone()))
         .bind(queue)
         .bind(kind)
         .execute(pool)
@@ -504,7 +505,7 @@ async fn backdate_compact_claims(
           ))
         "#,
     );
-    sqlx::query(&batch_sql)
+    sqlx::query(audited_sql(batch_sql.clone()))
         .bind(queue)
         .bind(kind)
         .execute(pool)
@@ -558,7 +559,7 @@ async fn backdate_running_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> 
               )
             "#,
         );
-        let receipt_rows = sqlx::query(&receipt_sql)
+        let receipt_rows = sqlx::query(audited_sql(receipt_sql.clone()))
             .bind(queue)
             .bind(kind)
             .execute(pool)
@@ -587,7 +588,7 @@ async fn backdate_running_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> 
               AND leases.state = 'running'
             "#,
         );
-        let lease_rows = sqlx::query(&lease_sql)
+        let lease_rows = sqlx::query(audited_sql(lease_sql.clone()))
             .bind(queue)
             .bind(kind)
             .execute(pool)
@@ -651,7 +652,7 @@ async fn backdate_running_jobs(pool: &sqlx::PgPool, queue: &str) -> u64 {
               )
             "#,
         );
-        let receipt_rows = sqlx::query(&receipt_sql)
+        let receipt_rows = sqlx::query(audited_sql(receipt_sql.clone()))
             .bind(queue)
             .execute(pool)
             .await
@@ -670,7 +671,7 @@ async fn backdate_running_jobs(pool: &sqlx::PgPool, queue: &str) -> u64 {
               AND state = 'running'
             "#,
         );
-        let lease_rows = sqlx::query(&lease_sql)
+        let lease_rows = sqlx::query(audited_sql(lease_sql.clone()))
             .bind(queue)
             .execute(pool)
             .await
@@ -707,7 +708,7 @@ async fn backdate_retryable_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -
               AND state = 'retryable'
             "#,
         );
-        return sqlx::query(&sql)
+        return sqlx::query(audited_sql(sql.clone()))
             .bind(queue)
             .bind(kind)
             .execute(pool)
@@ -743,7 +744,7 @@ async fn backdate_callback_timeouts(pool: &sqlx::PgPool, queue: &str) -> u64 {
               AND state = 'waiting_external'
             "#,
         );
-        return sqlx::query(&sql)
+        return sqlx::query(audited_sql(sql.clone()))
             .bind(queue)
             .execute(pool)
             .await

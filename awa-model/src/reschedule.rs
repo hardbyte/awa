@@ -22,6 +22,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
+use crate::audited_sql;
 use crate::error::{map_sqlx_error, AwaError};
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
@@ -302,21 +303,22 @@ async fn migrate_to_queue_storage(
     // `finalized_at` comes from the same statement as `run_at`: retention and
     // cleanup compare it against the database clock, so stamping it from the
     // worker would let clock skew shift those decisions.
-    let (new_id, run_at, db_now): (i64, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(&format!(
-        r#"
+    let (new_id, run_at, db_now): (i64, DateTime<Utc>, DateTime<Utc>) =
+        sqlx::query_as(audited_sql(format!(
+            r#"
         SELECT nextval('{schema}.job_id_seq')::bigint,
                CASE WHEN $1 THEN now() + awa.backoff_duration($2::smallint, $3::smallint)
                     ELSE now() + make_interval(secs => $4) END,
                now()
         "#
-    ))
-    .bind(use_backoff)
-    .bind(job.attempt)
-    .bind(job.max_attempts)
-    .bind(delay_secs)
-    .fetch_one(tx.as_mut())
-    .await
-    .map_err(map_sqlx_error)?;
+        )))
+        .bind(use_backoff)
+        .bind(job.attempt)
+        .bind(job.max_attempts)
+        .bind(delay_secs)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
     let mut errors: Vec<serde_json::Value> = job.errors.clone().unwrap_or_default();
     if let Some(error) = error {

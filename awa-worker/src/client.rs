@@ -14,6 +14,7 @@ use awa_model::admin::{
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
+use awa_model::audited_sql;
 use awa_model::{
     storage as transition, JobArgs, PartitionedQueue, PeriodicJob, QueueStorageConfig,
 };
@@ -2167,7 +2168,7 @@ impl Client {
         let leader = self.leader.load(Ordering::SeqCst);
         let effective_storage = self.effective_storage.read().await.clone();
         let available_rows = if let Some(store) = effective_storage.queue_storage_store() {
-            sqlx::query_as::<_, (String, i64)>(&format!(
+            sqlx::query_as::<_, (String, i64)>(audited_sql(format!(
                 r#"
                 SELECT
                     enqueues.queue,
@@ -2190,7 +2191,7 @@ impl Client {
                 store.schema(),
                 store.schema(),
                 store.schema()
-            ))
+            )))
             .fetch_all(&self.pool)
             .await
             .unwrap_or_default()
@@ -2626,7 +2627,10 @@ mod tests {
             .await
             .expect("Failed to connect to admin database for client tests");
         let create_sql = format!("CREATE DATABASE {database_name}");
-        match sqlx::query(&create_sql).execute(&admin_pool).await {
+        match sqlx::query(audited_sql(create_sql))
+            .execute(&admin_pool)
+            .await
+        {
             Ok(_) => {}
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {}
@@ -2654,13 +2658,13 @@ mod tests {
 
     async fn apply_migrations_through(pool: &PgPool, version: i32) {
         for (_version, _desc, sql) in migrations::migration_sql_range(0, version) {
-            sqlx::raw_sql(&sql).execute(pool).await.unwrap();
+            sqlx::raw_sql(audited_sql(sql)).execute(pool).await.unwrap();
         }
     }
 
     async fn drop_queue_storage_schema(pool: &PgPool, schema: &str) {
         let sql = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
-        sqlx::query(&sql)
+        sqlx::query(audited_sql(sql))
             .execute(pool)
             .await
             .expect("Failed to drop queue storage schema");
@@ -2871,7 +2875,7 @@ mod tests {
         );
         let start = Instant::now();
         loop {
-            let done: bool = sqlx::query_scalar(&sql)
+            let done: bool = sqlx::query_scalar(audited_sql(sql.clone()))
                 .bind(job_id)
                 .fetch_one(pool)
                 .await
@@ -3263,7 +3267,7 @@ mod tests {
         for (_version, _desc, sql) in
             migrations::migration_sql_range(9, migrations::CURRENT_VERSION)
         {
-            sqlx::raw_sql(&sql)
+            sqlx::raw_sql(audited_sql(sql))
                 .execute(&pool)
                 .await
                 .expect("raw migration application should succeed mid-drain");

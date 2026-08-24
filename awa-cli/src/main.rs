@@ -1687,9 +1687,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             ..Default::default()
                         })?;
                         if reset {
-                            sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                                .execute(&pool)
-                                .await?;
+                            sqlx::query(awa_model::audited_sql(format!(
+                                "DROP SCHEMA IF EXISTS {schema} CASCADE"
+                            )))
+                            .execute(&pool)
+                            .await?;
                         }
                         store.prepare_schema(&pool).await?;
                         println!(

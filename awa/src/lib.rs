@@ -11,7 +11,7 @@ pub use awa_model;
 
 // Re-export core model types (includes JobArgs derive macro via awa-model)
 pub use awa_model::{
-    self as model, adapter, admin, bridge, callback_contract, insert, insert_many,
+    self as model, adapter, admin, audited_sql, bridge, callback_contract, insert, insert_many,
     insert_many_copy, insert_many_copy_from_pool, insert_with, map_sqlx_error, migrations,
     partition_for_ordering_key, partition_hash64, prepare_job_insert, prepare_raw_job_insert,
     storage, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow, InsertOpts,

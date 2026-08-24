@@ -4,6 +4,7 @@
 //! Docker Compose and boots a primary/replica stack on demand.
 
 use async_trait::async_trait;
+use awa::audited_sql;
 use awa::model::{insert_with, migrations, InsertOpts};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -397,7 +398,7 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
              ) AS counts \
              GROUP BY state"
         );
-        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+        let rows: Vec<(String, i64)> = sqlx::query_as(audited_sql(sql.clone()))
             .bind(queue)
             .fetch_all(pool)
             .await
@@ -520,7 +521,7 @@ async fn storage_debug(pool: &sqlx::PgPool, queue: &str) -> String {
                   ) AS rollups \
                   USING (queue, priority))"
         );
-        sqlx::query_scalar::<_, i64>(&sql)
+        sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
             .bind(queue)
             .fetch_one(pool)
             .await
@@ -539,11 +540,11 @@ async fn assert_unfolded_terminal_rollup_is_visible(pool: &sqlx::PgPool) {
         .await
         .expect("failover smoke should use queue storage");
     let queue = format!("failover_rollup_probe_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.queue_terminal_rollup_deltas ( \
              queue, priority, pruned_completed_delta, pruned_failed_delta \
          ) VALUES ($1, 0, 3, 0)"
-    ))
+    )))
     .bind(&queue)
     .execute(pool)
     .await
