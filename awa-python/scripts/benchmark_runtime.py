@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import quantiles
@@ -1076,6 +1077,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     asyncio.run(async_main(parse_args()))
+
+    # Exit before the interpreter finalizer phase: the pyo3-async-runtimes
+    # tokio runtime is process-global and its outstanding tasks hold Python
+    # references, so finalization can SIGSEGV after correct output (#434,
+    # #228, PyO3/pyo3#1415). `tests/_subprocess_exit.py` does the same for
+    # the chaos helpers.
+    #
+    # The flushes are load-bearing: `os._exit` skips stdio, this script does
+    # not pass `flush=True` per print, and the nightly tees stdout into the
+    # artifact the regression checker reads.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
