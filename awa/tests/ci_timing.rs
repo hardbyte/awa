@@ -30,9 +30,15 @@
 
 use std::time::Duration;
 
+/// Upper bound on the override. `Duration::mul_f64` panics on a non-finite
+/// or overflowing result, so an unbounded override would turn a typo into a
+/// failed nightly rather than a loose bound.
+const MAX_MULTIPLIER: f64 = 100.0;
+
 /// How much slack to give contention-sensitive bounds. `1.0` locally,
-/// `3.0` on CI, or the `AWA_CHAOS_TIMEOUT_MULTIPLIER` override (clamped
-/// to `>= 1.0` so the override can only ever loosen).
+/// `3.0` on CI, or the `AWA_CHAOS_TIMEOUT_MULTIPLIER` override (clamped to
+/// `1.0 ..= MAX_MULTIPLIER` so the override can only ever loosen, and can
+/// never produce a duration `mul_f64` refuses).
 pub fn chaos_timeout_multiplier() -> f64 {
     let override_var = std::env::var("AWA_CHAOS_TIMEOUT_MULTIPLIER").ok();
     multiplier_from(override_var.as_deref(), std::env::var_os("CI").is_some())
@@ -41,9 +47,14 @@ pub fn chaos_timeout_multiplier() -> f64 {
 /// The multiplier decision, with the environment passed in so it can be
 /// tested without mutating process-global state.
 fn multiplier_from(override_var: Option<&str>, is_ci: bool) -> f64 {
-    if let Some(parsed) = override_var.and_then(|raw| raw.parse::<f64>().ok()) {
-        // Clamped so an override can only ever loosen a bound.
-        return parsed.max(1.0);
+    // `"inf"` and `"nan"` parse successfully as f64, and both reach
+    // `Duration::mul_f64`, which panics rather than saturating. Treat a
+    // non-finite override as no override at all.
+    if let Some(parsed) = override_var
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|parsed| parsed.is_finite())
+    {
+        return parsed.clamp(1.0, MAX_MULTIPLIER);
     }
 
     if is_ci {
@@ -107,6 +118,39 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_override_falls_back_to_the_environment() {
+        // These all parse as f64 and would otherwise reach `mul_f64`, which
+        // panics on a non-finite result instead of saturating.
+        for raw in ["inf", "-inf", "infinity", "NaN", "nan"] {
+            assert_eq!(multiplier_from(Some(raw), true), 3.0, "raw={raw}");
+            assert_eq!(multiplier_from(Some(raw), false), 1.0, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn oversized_override_is_clamped() {
+        assert_eq!(multiplier_from(Some("1e308"), true), MAX_MULTIPLIER);
+        assert_eq!(multiplier_from(Some("10000"), true), MAX_MULTIPLIER);
+    }
+
+    #[test]
+    fn every_multiplier_produces_a_usable_duration() {
+        // `Duration::mul_f64` panics rather than saturating, so the clamp is
+        // what keeps a bad override from failing the nightly it was set to
+        // rescue.
+        for raw in [
+            "inf", "-inf", "NaN", "1e308", "10000", "0", "-1", "banana", "",
+        ] {
+            for is_ci in [true, false] {
+                let m = multiplier_from(Some(raw), is_ci);
+                assert!(m.is_finite() && (1.0..=MAX_MULTIPLIER).contains(&m));
+                // Would panic if the multiplier were unbounded.
+                let _ = Duration::from_secs(60).mul_f64(m);
+            }
+        }
+    }
+
+    #[test]
     fn scaling_a_timeout_grows_it() {
         // 250ms staleness against a 50ms heartbeat interval is a 5x margin
         // locally; on CI it becomes 15x, which is what stops a contended
@@ -137,5 +181,6 @@ mod tests {
         assert_eq!(contention_floor(45), contention_floor(45).max(1));
         let absurd = (45.0_f64 / multiplier_from(Some("10000"), true)).floor() as i64;
         assert_eq!(absurd.max(1), 1);
+        assert_eq!(contention_floor(0), 1);
     }
 }

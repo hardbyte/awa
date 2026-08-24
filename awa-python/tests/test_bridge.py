@@ -45,9 +45,9 @@ class BridgePayment:
 def awa_client():
     """Awa sync client for verifying job insertion."""
     c = awa.Client(DATABASE_URL)
-    c.migrate()
-    reset_sync(c)
     try:
+        c.migrate()
+        reset_sync(c)
         yield c
     finally:
         c.close()

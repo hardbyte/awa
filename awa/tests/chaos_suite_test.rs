@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 mod ci_timing;
-use ci_timing::{scaled_staleness, scaled_timeout};
+use ci_timing::{chaos_timeout_multiplier, scaled_staleness, scaled_timeout};
 
 /// Serializes the chaos tests: the maintenance leader-election advisory lock
 /// is global per database, so any test's live client can hold leadership
@@ -871,6 +871,24 @@ impl PythonHelperProcess {
         }
     }
 
+    /// Close the helper's stdout and wait for the reader task to reach EOF.
+    ///
+    /// `stdout_lines.try_recv()` can report `Empty` while a line the helper
+    /// already flushed is still sitting in the OS pipe, because a spawned
+    /// task has to move it into the channel first. Killing the child closes
+    /// the write end — bytes already in the pipe stay readable — so once the
+    /// reader has seen EOF and dropped its sender, the channel holds every
+    /// line the helper emitted and nothing further can arrive.
+    async fn drain_stdout(&mut self) {
+        if self.child.id().is_some() {
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
+        }
+        // JoinHandle is Unpin, so this awaits completion without consuming it;
+        // `stop()` may still abort it afterwards.
+        let _ = (&mut self.stdout_reader).await;
+    }
+
     async fn stop(mut self) {
         self.stdout_reader.abort();
         if self.child.id().is_none() {
@@ -915,6 +933,16 @@ async fn start_python_helper(
         .env("DATABASE_URL", database_url())
         .env("MIXED_QUEUE", queue)
         .env("MIXED_MODE", mode)
+        // The helper configures its own client, so it needs the same
+        // staleness margin as the Rust side of a mixed-fleet test — a
+        // contended Python event loop can miss an unscaled window and have
+        // a live attempt rescued, which is the duplicate-completion flake
+        // from the Rust side all over again. Pass the *resolved* multiplier
+        // rather than relying on the child re-deriving it from `CI`.
+        .env(
+            "AWA_CHAOS_TIMEOUT_MULTIPLIER",
+            chaos_timeout_multiplier().to_string(),
+        )
         .env("PYTHONUNBUFFERED", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1923,9 +1951,12 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
         .await;
 
         // The queue is terminal, so no further completion can be produced.
-        // Anything still buffered in either stream is a duplicate or an
-        // unexpected marker — both are real failures, and `try_recv` sees
-        // them without reintroducing a wall-clock window.
+        // Anything still in either stream is a duplicate or an unexpected
+        // marker, and both are real failures.
+        //
+        // The Rust worker sends on this channel from inside `perform`, before
+        // the completion is written, so a terminal queue means every send is
+        // already queued and `try_recv` sees it.
         while let Ok(marker) = rx.try_recv() {
             assert!(
                 expected_markers.contains(&marker),
@@ -1936,7 +1967,11 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
                 "Marker completed more than once after queue drain: {marker}"
             );
         }
-        while let Ok(line) = python_worker.stdout_lines.try_recv() {
+        // The Python helper needs the extra hop closed first: its line goes
+        // through an OS pipe and a reader task, neither of which is ordered
+        // against the database commit.
+        python_worker.drain_stdout().await;
+        while let Some(line) = python_worker.stdout_lines.recv().await {
             if line.contains("COMPLETE mode=worker_chaos_probe") {
                 let marker = mixed_fleet_marker_from_line(&line)
                     .unwrap_or_else(|| panic!("Python completion line missing marker: {line}"))

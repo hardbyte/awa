@@ -21,12 +21,15 @@ DATABASE_URL = os.environ.get(
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
-    await c.migrate()
-    await reset_async(c)
-    tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'uniq_%'")
-    await tx.commit()
+    # Everything after construction goes inside the try: a failure in
+    # migrate/reset would otherwise skip close() and park pooled
+    # connections, which is the exact failure this file's guard exists for.
     try:
+        await c.migrate()
+        await reset_async(c)
+        tx = await c.transaction()
+        await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'uniq_%'")
+        await tx.commit()
         yield c
     finally:
         await c.close()
@@ -35,9 +38,9 @@ async def client():
 @pytest.fixture
 def sync_client():
     c = awa.Client(DATABASE_URL)
-    c.migrate()
-    reset_sync(c)
     try:
+        c.migrate()
+        reset_sync(c)
         yield c
     finally:
         c.close()
