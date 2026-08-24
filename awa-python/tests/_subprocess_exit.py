@@ -8,10 +8,13 @@ from typing import NoReturn
 
 
 def _flush_std_streams() -> None:
-    """`os._exit` skips stdio flushing, so callers that do not pass
-    `flush=True` on every print would lose buffered output when stdout is a
-    pipe. Both current callers do flush per print; this keeps the next one
-    from having to know that."""
+    """Flush stdout and stderr before a forced exit, tolerating a closed stream.
+
+    `os._exit` skips stdio, so callers may rely on this for their final
+    flush rather than passing `flush=True` on every print. A raising flush
+    is swallowed: letting it propagate would hand control back to normal
+    interpreter finalization, which is what the caller is avoiding.
+    """
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()

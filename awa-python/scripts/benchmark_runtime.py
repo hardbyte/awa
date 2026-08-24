@@ -1075,6 +1075,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _flush_std_streams() -> None:
+    """Flush stdout and stderr, tolerating an already-closed stream.
+
+    `os._exit` skips stdio, this script uses buffered output rather than
+    `flush=True` per print, and the nightly tees stdout into the artifact the
+    regression checker reads — so without this the artifact comes out empty.
+
+    A raising flush would propagate out of `main` and hand control back to
+    normal interpreter finalization, which is the crash path the caller is
+    avoiding. Mirrors `_flush_std_streams` in `tests/_subprocess_exit.py`;
+    duplicated because that module lives outside this script's import path.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+
+
 def main() -> None:
     asyncio.run(async_main(parse_args()))
 
@@ -1083,12 +1102,7 @@ def main() -> None:
     # references, so finalization can SIGSEGV after correct output (#434,
     # #228, PyO3/pyo3#1415). `tests/_subprocess_exit.py` does the same for
     # the chaos helpers.
-    #
-    # The flushes are load-bearing: `os._exit` skips stdio, this script does
-    # not pass `flush=True` per print, and the nightly tees stdout into the
-    # artifact the regression checker reads.
-    sys.stdout.flush()
-    sys.stderr.flush()
+    _flush_std_streams()
     os._exit(0)
 
 
