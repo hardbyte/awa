@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 from dataclasses import dataclass
 
@@ -14,6 +15,27 @@ class ChaosProbe:
 @dataclass
 class SimpleChaosJob:
     seq: int
+
+
+def _staleness_ms(nominal_ms: int) -> int:
+    """Scale a heartbeat-staleness window by the runner-contention
+    multiplier the Rust side resolved and passed down.
+
+    Unscaled, a contended runner can stall this process's event loop past
+    the window and have the runtime rescue a *live* attempt, producing a
+    genuine duplicate completion in a mixed-fleet test. Mirrors
+    `awa/tests/ci_timing.rs::scaled_staleness`, including its refusal of
+    non-finite or oversized values.
+    """
+    raw = os.environ.get("AWA_CHAOS_TIMEOUT_MULTIPLIER")
+    try:
+        multiplier = float(raw) if raw is not None else 1.0
+    except ValueError:
+        multiplier = 1.0
+    if not math.isfinite(multiplier):
+        multiplier = 1.0
+    multiplier = min(max(multiplier, 1.0), 100.0)
+    return int(nominal_ms * multiplier)
 
 
 async def main() -> None:
@@ -46,7 +68,7 @@ async def main() -> None:
             heartbeat_interval_ms=50,
             promote_interval_ms=50,
             heartbeat_rescue_interval_ms=100,
-            heartbeat_staleness_ms=250,
+            heartbeat_staleness_ms=_staleness_ms(250),
         )
         print(f"READY mode={mode} pid={os.getpid()}", flush=True)
         await asyncio.Event().wait()
@@ -96,7 +118,7 @@ async def main() -> None:
         await client.start(
             [queue_config],
             heartbeat_rescue_interval_ms=100,
-            heartbeat_staleness_ms=500,
+            heartbeat_staleness_ms=_staleness_ms(500),
             deadline_rescue_interval_ms=100,
             **start_kwargs,
         )

@@ -109,7 +109,7 @@ jobs:
         run: cargo build --workspace
 
   rust-test:
-    name: Rust tests (${{ matrix.shard }})
+    name: Rust tests (pg${{ matrix.postgres }}, ${{ matrix.shard }})
     needs: [rust-build]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
@@ -123,6 +123,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Postgres majors we support. The schema, its partitioning, and the
+        # planner behaviour the claim path depends on are all version-
+        # sensitive, so the whole sharded suite runs on each major rather
+        # than a smoke subset.
+        postgres: ["17", "18"]
         shard:
           - migrations-1
           - migrations-2
@@ -132,7 +137,7 @@ jobs:
           - rest
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
@@ -164,14 +169,18 @@ jobs:
   # canonical, so this leg re-runs it with the queue-storage engine active on a
   # fresh database (a separate DB avoids cross-engine job_unique_claims carryover).
   rust-test-queue-storage:
-    name: Rust tests (queue_storage)
+    name: Rust tests (queue_storage, pg${{ matrix.postgres }})
     needs: [rust-build]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["17", "18"]
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
@@ -274,10 +283,20 @@ jobs:
 
   # ─── Python (awa-python) ────────────────────────────────
   python-build-test:
-    name: Python build + test
+    name: Python build + test (py${{ matrix.python }})
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The newest two interpreters only. The wheel is abi3-py310 so one
+        # artifact covers the whole 3.10+ support window, and abi3 keeps the
+        # C API stable across it; these legs exercise the SDK's asyncio
+        # integration (pyo3-async-runtimes), which is where version skew
+        # actually lands — and it lands on the newest releases. When a new
+        # CPython ships, add it here and drop the oldest.
+        python: ["3.13", "3.14"]
     services:
       postgres:
         image: postgres:17-alpine
@@ -300,14 +319,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "awa-python -> awa-python/target"
+          key: "py${{ matrix.python }}"
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "${{ matrix.python }}"
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
       - name: Create venv and install deps
         run: |
-          uv venv .venv
+          uv venv .venv --python "${{ matrix.python }}"
           uv pip install maturin pytest pytest-asyncio asyncpg django greenlet psycopg psycopg-binary sqlalchemy
       - name: Build extension (maturin develop)
         run: .venv/bin/maturin develop
