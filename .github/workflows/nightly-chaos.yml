@@ -340,6 +340,10 @@ jobs:
           " || true
       - name: Run Python worker benchmarks (sweep, jitter, rescue)
         timeout-minutes: 15
+        env:
+          # A native crash here prints no Python frame on its own; #434 was
+          # diagnosable only from the shell's "Segmentation fault" line.
+          PYTHONFAULTHANDLER: "1"
         run: |
           set -o pipefail
           PYTHONPATH=scripts .venv/bin/python scripts/benchmark_runtime.py --scenario workers \

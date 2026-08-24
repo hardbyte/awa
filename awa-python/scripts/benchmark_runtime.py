@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import quantiles
@@ -1074,8 +1075,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _flush_std_streams() -> None:
+    """Flush stdout and stderr, tolerating an already-closed stream.
+
+    `os._exit` skips stdio, this script uses buffered output rather than
+    `flush=True` per print, and the nightly tees stdout into the artifact the
+    regression checker reads — so without this the artifact comes out empty.
+
+    A raising flush would propagate out of `main` and hand control back to
+    normal interpreter finalization, which is the crash path the caller is
+    avoiding. Mirrors `_flush_std_streams` in `tests/_subprocess_exit.py`;
+    duplicated because that module lives outside this script's import path.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+
+
 def main() -> None:
     asyncio.run(async_main(parse_args()))
+
+    # Exit before the interpreter finalizer phase: the pyo3-async-runtimes
+    # tokio runtime is process-global and its outstanding tasks hold Python
+    # references, so finalization can SIGSEGV after correct output (#434,
+    # #228, PyO3/pyo3#1415). `tests/_subprocess_exit.py` does the same for
+    # the chaos helpers.
+    _flush_std_streams()
+    os._exit(0)
 
 
 if __name__ == "__main__":
