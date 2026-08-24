@@ -29,6 +29,59 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tes
 Read the redirected log and check the real exit status; do not trust a green
 exit code from a piped or backgrounded command.
 
+### Version matrix
+
+CI runs the sharded Rust suite and the queue-storage leg against **Postgres 17
+and 18** — both majors run the whole suite, because the schema, its
+partitioning, and the planner behaviour the claim path depends on are all
+version-sensitive.
+
+The Python suite runs on the **newest two CPython releases**. The support
+window is whatever `requires-python` says (3.10+), and the `abi3-py310` wheel
+covers all of it from one artifact, so the legs are not there to prove the
+ABI — they exercise the asyncio integration (`pyo3-async-runtimes`), which is
+where version skew actually lands. The `pyproject.toml` classifiers therefore
+track the support window, not the test matrix. When a new CPython ships, add it
+to the matrix and drop the oldest.
+
+### Contention-sensitive assertions in the nightly suites
+
+The nightly chaos and benchmark suites run on shared runners whose CPU
+allocation varies run to run. Three assertion shapes are sensitive to that and
+must go through `awa/tests/ci_timing.rs` rather than hard-coding a bound:
+
+| Shape | Helper | Failure if too tight |
+| --- | --- | --- |
+| Wall-clock wait for a state | `scaled_timeout` | Spurious timeout |
+| `heartbeat_staleness` on a chaos client | `scaled_staleness` | The runtime rescues a *live* attempt and the test sees a genuine duplicate completion — a margin bug that reads as a correctness bug |
+| "at least N of these happened" floor | `contention_floor` | Gate fires while every invariant it exists for is intact |
+
+All three only ever loosen a bound, and only when `CI` is set, so a local run
+keeps the strict values and a real regression still fails fast on a developer
+machine. `AWA_CHAOS_TIMEOUT_MULTIPLIER` overrides the factor (clamped to
+`>= 1.0`).
+
+A minimum-progress floor must sit below the *observed* operating point, not the
+nominal one. The receipt-plane rotation gate is the cautionary example (#399):
+its floor came from the 1s rotate interval's tick rate, but rotation is driven
+by the maintenance loop reaching a rotate decision, so the healthy steady state
+sat flush against the floor and the gate fired at 41-vs-45 with every
+architectural bound perfect.
+
+Measurement windows are *not* timeouts — `recv_until`'s duration defines what a
+benchmark samples, so it stays unscaled.
+
+### Connection budget in the Python suite
+
+`awa-python/tests/conftest.py` defaults test clients to a small pool and fails
+the session if backend count grows across it. Two conventions follow (#420):
+
+- A fixture that builds a client must `yield` it and close it in a `finally`,
+  never `return` it. Returning leaves pool teardown to GC timing, which parks
+  server connections for up to sqlx's 10-minute idle timeout.
+- Pass `max_connections` explicitly only when the test is *about* pool sizing.
+  Otherwise take the conftest default, so one test cannot starve the next.
+
 ## Schema Migrations
 
 Migrations are forward-only and must stay rolling-upgrade compatible. Version

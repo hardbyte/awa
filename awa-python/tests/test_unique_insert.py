@@ -21,12 +21,29 @@ DATABASE_URL = os.environ.get(
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
-    await c.migrate()
-    await reset_async(c)
-    tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'uniq_%'")
-    await tx.commit()
-    return c
+    # Everything after construction goes inside the try: a failure in
+    # migrate/reset would otherwise skip close() and park pooled
+    # connections, which is the exact failure this file's guard exists for.
+    try:
+        await c.migrate()
+        await reset_async(c)
+        tx = await c.transaction()
+        await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'uniq_%'")
+        await tx.commit()
+        yield c
+    finally:
+        await c.close()
+
+
+@pytest.fixture
+def sync_client():
+    c = awa.Client(DATABASE_URL)
+    try:
+        c.migrate()
+        reset_sync(c)
+        yield c
+    finally:
+        c.close()
 
 
 @dataclass
@@ -292,11 +309,9 @@ async def test_no_unique_opts_allows_duplicates(client):
 # ── Sync variant ─────────────────────────────────────────────────────
 
 
-def test_unique_insert_sync():
+def test_unique_insert_sync(sync_client):
     """Sync insert with unique_opts works."""
-    c = awa.Client(DATABASE_URL)
-    c.migrate()
-    reset_sync(c)
+    c = sync_client
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_sync'")
     tx.commit()
@@ -367,11 +382,9 @@ async def test_unique_insert_transaction_rollback(client):
     assert job.id > 0
 
 
-def test_unique_insert_in_sync_transaction():
+def test_unique_insert_in_sync_transaction(sync_client):
     """Sync transactional unique insert works."""
-    c = awa.Client(DATABASE_URL)
-    c.migrate()
-    reset_sync(c)
+    c = sync_client
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_stx'")
     tx.commit()
