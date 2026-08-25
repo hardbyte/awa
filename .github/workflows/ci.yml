@@ -443,6 +443,39 @@ jobs:
           pip install dist/*.whl
           awa --help
 
+  windows-wheel-build:
+    name: Windows wheel build
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build SDK wheel (maturin)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: --release --out awa-python/dist --manifest-path awa-python/Cargo.toml
+      - name: Install and import SDK wheel
+        shell: pwsh
+        run: |
+          python -m pip install (Resolve-Path awa-python/dist/*.whl)
+          python -c "import awa"
+      - name: Build CLI wheel (maturin)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: --release --out awa-cli/dist --manifest-path awa-cli/Cargo.toml
+      - name: Install and run CLI wheel
+        shell: pwsh
+        run: |
+          python -m pip install (Resolve-Path awa-cli/dist/*.whl)
+          awa --help
+
   # ─── CLI smoke test ─────────────────────────────────────
   cli-smoke:
     name: CLI smoke test

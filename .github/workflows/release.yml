@@ -523,6 +523,8 @@ jobs:
             target: x86_64
           - os: macos-latest
             target: aarch64
+          - os: windows-latest
+            target: x86_64
     steps:
       - uses: actions/checkout@v6
 
@@ -565,6 +567,8 @@ jobs:
             target: x86_64
           - os: macos-latest
             target: aarch64
+          - os: windows-latest
+            target: x86_64
     steps:
       - uses: actions/checkout@v6
 
