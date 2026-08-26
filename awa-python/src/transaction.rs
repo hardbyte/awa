@@ -40,10 +40,13 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let result = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                .execute(&mut **tx_ref)
-                .await
-                .map_err(map_sqlx_error)?;
+            let result = bind_json_args(
+                sqlx::query(awa_model::caller_provided_sql(query)),
+                &json_args,
+            )
+            .execute(&mut **tx_ref)
+            .await
+            .map_err(map_sqlx_error)?;
             Ok(result.rows_affected() as i64)
         })
     }
@@ -61,10 +64,13 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                .fetch_one(&mut **tx_ref)
-                .await
-                .map_err(map_sqlx_error)?;
+            let row = bind_json_args(
+                sqlx::query(awa_model::caller_provided_sql(query)),
+                &json_args,
+            )
+            .fetch_one(&mut **tx_ref)
+            .await
+            .map_err(map_sqlx_error)?;
             row_to_py_dict(&row)
         })
     }
@@ -82,10 +88,13 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                .fetch_optional(&mut **tx_ref)
-                .await
-                .map_err(map_sqlx_error)?;
+            let row = bind_json_args(
+                sqlx::query(awa_model::caller_provided_sql(query)),
+                &json_args,
+            )
+            .fetch_optional(&mut **tx_ref)
+            .await
+            .map_err(map_sqlx_error)?;
             match row {
                 Some(row) => row_to_py_dict(&row),
                 None => Ok(Python::attach(|py| py.None())),
@@ -106,10 +115,13 @@ impl PyTransaction {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
-            let rows = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                .fetch_all(&mut **tx_ref)
-                .await
-                .map_err(map_sqlx_error)?;
+            let rows = bind_json_args(
+                sqlx::query(awa_model::caller_provided_sql(query)),
+                &json_args,
+            )
+            .fetch_all(&mut **tx_ref)
+            .await
+            .map_err(map_sqlx_error)?;
             Python::attach(|py| {
                 let list = pyo3::types::PyList::empty(py);
                 for row in &rows {
@@ -576,10 +588,13 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let result = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                    .execute(&mut **tx_ref)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                let result = bind_json_args(
+                    sqlx::query(awa_model::caller_provided_sql(query)),
+                    &json_args,
+                )
+                .execute(&mut **tx_ref)
+                .await
+                .map_err(map_sqlx_error)?;
                 Ok(result.rows_affected() as i64)
             })
         })
@@ -598,10 +613,13 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                    .fetch_one(&mut **tx_ref)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                let row = bind_json_args(
+                    sqlx::query(awa_model::caller_provided_sql(query)),
+                    &json_args,
+                )
+                .fetch_one(&mut **tx_ref)
+                .await
+                .map_err(map_sqlx_error)?;
                 row_to_py_dict(&row)
             })
         })
@@ -620,10 +638,13 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let row = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                    .fetch_optional(&mut **tx_ref)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                let row = bind_json_args(
+                    sqlx::query(awa_model::caller_provided_sql(query)),
+                    &json_args,
+                )
+                .fetch_optional(&mut **tx_ref)
+                .await
+                .map_err(map_sqlx_error)?;
                 match row {
                     Some(row) => row_to_py_dict(&row),
                     None => Ok(Python::attach(|py| py.None())),
@@ -645,10 +666,13 @@ impl PySyncTransaction {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let mut guard = tx.lock().await;
                 let tx_ref = sync_tx_ref(&mut guard)?;
-                let rows = bind_json_args(sqlx::query(awa_model::audited_sql(query)), &json_args)
-                    .fetch_all(&mut **tx_ref)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                let rows = bind_json_args(
+                    sqlx::query(awa_model::caller_provided_sql(query)),
+                    &json_args,
+                )
+                .fetch_all(&mut **tx_ref)
+                .await
+                .map_err(map_sqlx_error)?;
                 Python::attach(|py| {
                     let list = pyo3::types::PyList::empty(py);
                     for row in &rows {

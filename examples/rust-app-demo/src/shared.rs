@@ -1,15 +1,14 @@
 #![allow(dead_code)]
 
 use awa::{
-    admin, insert_with, migrations, Client, InsertOpts, JobArgs, JobContext, JobError,
-    JobResult, JobState, PeriodicJob, QueueConfig, Worker,
+    admin, insert_with, migrations, Client, InsertOpts, JobArgs, JobContext, JobError, JobResult,
+    JobState, PeriodicJob, QueueConfig, Worker,
 };
 use axum::Json;
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use awa::audited_sql;
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe, PgPool, Row};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -133,8 +132,7 @@ struct CacheWarmWorker;
 struct ReportWorker;
 
 fn decode_args<T: for<'de> Deserialize<'de>>(ctx: &JobContext) -> Result<T, JobError> {
-    serde_json::from_value(ctx.job.args.clone())
-        .map_err(|err| JobError::terminal(err.to_string()))
+    serde_json::from_value(ctx.job.args.clone()).map_err(|err| JobError::terminal(err.to_string()))
 }
 
 // ── Email: completes in ~5s with progress ─────────────────────────
@@ -196,7 +194,10 @@ impl Worker for InventorySyncWorker {
             let pct = ((i + 1) as f64 / total_items as f64 * 100.0) as u8;
             let sku = format!("SKU-{:04}", i + 1);
 
-            ctx.set_progress(pct.min(100), &format!("Validating {sku} ({}/{total_items})", i + 1));
+            ctx.set_progress(
+                pct.min(100),
+                &format!("Validating {sku} ({}/{total_items})", i + 1),
+            );
             ctx.update_metadata(json!({
                 "supplier": args.supplier,
                 "last_sku": sku,
@@ -358,7 +359,7 @@ pub async fn prepare_schema(pool: &PgPool) -> Result<(), Box<dyn std::error::Err
 }
 
 pub async fn ensure_app_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(audited_sql(format!(
+    sqlx::query(AssertSqlSafe(format!(
         r#"
         CREATE TABLE IF NOT EXISTS {ORDERS_TABLE} (
             order_id TEXT PRIMARY KEY,
@@ -375,7 +376,7 @@ pub async fn ensure_app_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 pub async fn clear_demo_data(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(audited_sql(format!("DELETE FROM {ORDERS_TABLE}")))
+    sqlx::query(AssertSqlSafe(format!("DELETE FROM {ORDERS_TABLE}")))
         .execute(pool)
         .await?;
     sqlx::query("DELETE FROM awa.jobs WHERE queue LIKE 'rust_store_%'")
@@ -462,7 +463,7 @@ pub async fn create_checkout(
     let resolved_order_id = order_id.unwrap_or_else(|| format!("ord_{}", Uuid::new_v4().simple()));
 
     let mut tx = pool.begin().await?;
-    let inserted = sqlx::query(audited_sql(format!(
+    let inserted = sqlx::query(AssertSqlSafe(format!(
         r#"
         INSERT INTO {ORDERS_TABLE} (order_id, customer_email, total_cents, status)
         VALUES ($1, $2, $3, 'submitted')
@@ -510,7 +511,7 @@ pub async fn create_checkout(
 }
 
 pub async fn list_recent_orders(pool: &PgPool) -> Result<Json<Vec<OrderSummary>>, sqlx::Error> {
-    let rows = sqlx::query(audited_sql(format!(
+    let rows = sqlx::query(AssertSqlSafe(format!(
         r#"
         SELECT order_id, customer_email, total_cents, status, created_at
         FROM {ORDERS_TABLE}

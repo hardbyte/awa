@@ -531,6 +531,18 @@ fn validate_ident(ident: &str) -> Result<(), AwaError> {
     }
 }
 
+/// Gate a schema name that came back from the database before it is
+/// interpolated into query text. Mirrors the [`validate_ident`] check
+/// [`QueueStorage::new`] applies to configured names.
+fn validate_active_schema(schema: String) -> Result<String, AwaError> {
+    validate_ident(&schema).map_err(|_| {
+        AwaError::Validation(format!(
+            "active queue-storage schema name is not a valid SQL identifier: {schema:?}"
+        ))
+    })?;
+    Ok(schema)
+}
+
 fn ready_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.ready_entries_{slot}")
 }
@@ -1090,6 +1102,24 @@ mod identifier_tests {
             assert!(
                 validate_ident(ident).is_err(),
                 "identifier should be rejected: {ident}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_schema_read_path_rejects_names_the_constructor_would_reject() {
+        // `active_schema` interpolates its result into query text, so the
+        // same gate the constructor applies has to hold on the read path.
+        for schema in ["Awa", "awa-queue", "123awa", "awa.queue", "awa\"; DROP"] {
+            assert!(
+                super::validate_active_schema(schema.to_string()).is_err(),
+                "active schema name should be rejected: {schema}"
+            );
+        }
+        for schema in ["awa", "awa_shadow", "_awa123"] {
+            assert_eq!(
+                super::validate_active_schema(schema.to_string()).expect("should be accepted"),
+                schema
             );
         }
     }
@@ -2835,13 +2865,23 @@ impl QueueStorage {
         "attempt_state"
     }
 
+    /// Read the active queue-storage schema name from the transition state.
+    ///
+    /// The name is re-validated with [`validate_ident`] before it is handed
+    /// back. Callers interpolate it into query text, so the check has to
+    /// happen on the read path too and not only in [`Self::new`] — a name
+    /// that never passed the constructor (hand-edited row, restore from an
+    /// older or foreign database) must not reach a `format!`. No supported
+    /// deployment can store a rejected name, since every writer of this row
+    /// goes through the constructor first.
     pub async fn active_schema(pool: &PgPool) -> Result<Option<String>, AwaError> {
-        sqlx::query_scalar(
+        let schema: Option<String> = sqlx::query_scalar(
             "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'",
         )
         .fetch_optional(pool)
         .await
-        .map_err(map_sqlx_error)
+        .map_err(map_sqlx_error)?;
+        schema.map(validate_active_schema).transpose()
     }
 
     /// Transaction-aware variant of [`Self::active_schema`] — read the
@@ -2850,12 +2890,13 @@ impl QueueStorage {
     pub async fn active_schema_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<Option<String>, AwaError> {
-        sqlx::query_scalar(
+        let schema: Option<String> = sqlx::query_scalar(
             "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'",
         )
         .fetch_optional(tx.as_mut())
         .await
-        .map_err(map_sqlx_error)
+        .map_err(map_sqlx_error)?;
+        schema.map(validate_active_schema).transpose()
     }
 
     fn materialize_runtime_payload(
@@ -4448,6 +4489,11 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
+        // `copy_in_raw` is outside sqlx 0.9's `SqlSafeStr` guard, so this
+        // site cannot opt in through `audited_sql`. It carries the same
+        // invariant by hand: `schema` passed `validate_ident`, the sentinel
+        // is a const, and every row value is CSV-encoded into the COPY
+        // stream rather than into the statement.
         let copy_sql = format!(
             "COPY {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
@@ -4835,6 +4881,11 @@ impl QueueStorage {
         self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
 
         let schema = self.schema();
+        // `copy_in_raw` is outside sqlx 0.9's `SqlSafeStr` guard, so this
+        // site cannot opt in through `audited_sql`. It carries the same
+        // invariant by hand: `schema` passed `validate_ident`, the sentinel
+        // is a const, and every row value is CSV-encoded into the COPY
+        // stream rather than into the statement.
         let copy_sql = format!(
             "COPY {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
