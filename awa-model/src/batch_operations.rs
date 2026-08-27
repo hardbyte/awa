@@ -1,3 +1,4 @@
+use crate::audited_sql;
 use crate::error::{map_sqlx_error, AwaError};
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
@@ -1023,7 +1024,7 @@ async fn max_matching_queue_storage_job_id(
     let schema = QueueStorage::active_schema(pool)
         .await?
         .ok_or_else(|| AwaError::Validation("queue storage is not active".to_string()))?;
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         r#"
         WITH candidates AS (
             SELECT
@@ -1069,7 +1070,7 @@ async fn max_matching_queue_storage_job_id(
           AND ($6::timestamptz IS NULL OR created_at >= $6)
           AND ($7::timestamptz IS NULL OR created_at < $7)
         "#
-    ))
+    )))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)
@@ -1165,7 +1166,7 @@ async fn load_matching_queue_storage_job_ids(
     let schema = QueueStorage::active_schema(pool)
         .await?
         .ok_or_else(|| AwaError::Validation("queue storage is not active".to_string()))?;
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         r#"
         WITH candidates AS (
             SELECT
@@ -1215,7 +1216,7 @@ async fn load_matching_queue_storage_job_ids(
         ORDER BY id ASC
         LIMIT $10
         "#
-    ))
+    )))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)
@@ -1316,7 +1317,7 @@ async fn count_matching_queue_storage_jobs(
     let schema = QueueStorage::active_schema(pool)
         .await?
         .ok_or_else(|| AwaError::Validation("queue storage is not active".to_string()))?;
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         r#"
         WITH candidates AS (
             SELECT
@@ -1364,7 +1365,7 @@ async fn count_matching_queue_storage_jobs(
           AND ($8::bigint IS NULL OR id > $8)
           AND ($9::bigint IS NULL OR id <= $9)
         "#
-    ))
+    )))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)
@@ -1388,7 +1389,7 @@ async fn load_matching_queue_storage_jobs(
     limit: i64,
 ) -> Result<Vec<JobRow>, AwaError> {
     let schema = _store.schema();
-    let ids: Vec<i64> = sqlx::query_scalar(&format!(
+    let ids: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
         r#"
         WITH candidates AS (
             SELECT
@@ -1438,7 +1439,7 @@ async fn load_matching_queue_storage_jobs(
         ORDER BY id ASC
         LIMIT $10
         "#
-    ))
+    )))
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)

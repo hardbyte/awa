@@ -11,9 +11,9 @@ mod shared;
 use shared::{
     build_demo_client, clear_demo_data, create_checkout, create_pool, hero_scheduled_time,
     prepare_schema, seed_available_cache_jobs, seed_failed_syncs, seed_pending_payments,
-    seed_scale, seed_scheduled_reports, wait_for_cron_sync, wait_for_many, CACHE_QUEUE, CRON_NAME,
-    EMAIL_QUEUE, GenerateRevenueReport, OPS_QUEUE, PAYMENTS_QUEUE, REPORTS_QUEUE,
-    WarmProductCache,
+    seed_scale, seed_scheduled_reports, wait_for_cron_sync, wait_for_many, GenerateRevenueReport,
+    WarmProductCache, CACHE_QUEUE, CRON_NAME, EMAIL_QUEUE, OPS_QUEUE, PAYMENTS_QUEUE,
+    REPORTS_QUEUE,
 };
 
 fn parse_scale() -> &'static str {

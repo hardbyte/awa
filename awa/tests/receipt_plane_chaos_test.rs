@@ -7,6 +7,7 @@
 //! barrier between TRUNCATE and concurrent inserts, and the orphan-
 //! lease race between admin cancel and materialize.
 
+use awa::audited_sql;
 use awa::model::{
     admin, insert, migrations, storage, PruneOutcome, QueueStorage, QueueStorageConfig,
     RotateOutcome,
@@ -106,10 +107,12 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str, claim_slot_count: usize
         ..Default::default()
     })
     .expect("queue storage");
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(pool)
-        .await
-        .expect("drop store schema");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .expect("drop store schema");
     sqlx::raw_sql(
         r#"
         TRUNCATE
@@ -139,50 +142,50 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str, claim_slot_count: usize
 }
 
 async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.lease_claims",
         store.schema()
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("count lease_claims")
 }
 
 async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.lease_claim_closures",
         store.schema()
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("count lease_claim_closures")
 }
 
 async fn lease_claim_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.lease_claim_batches",
         store.schema()
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("count lease_claim_batches")
 }
 
 async fn lease_claim_closure_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.lease_claim_closure_batches",
         store.schema()
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("count lease_claim_closure_batches")
 }
 
 async fn leases_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.leases",
         store.schema()
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("count leases")
@@ -197,7 +200,7 @@ async fn insert_synthetic_open_claim(
     queue: &str,
     claimed_at: chrono::DateTime<Utc>,
 ) {
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.lease_claims (
             claim_slot, job_id, run_lease, ready_slot, ready_generation,
@@ -205,7 +208,7 @@ async fn insert_synthetic_open_claim(
             claimed_at, materialized_at
         ) VALUES ($1, $2, $3, 0, 0, $4, 2, 1, 25, $2, $5, NULL)
         "#
-    ))
+    )))
     .bind(claim_slot)
     .bind(job_id)
     .bind(run_lease)
@@ -230,7 +233,7 @@ async fn insert_synthetic_claim_with_ready_row(
     queue: &str,
     claimed_at: chrono::DateTime<Utc>,
 ) {
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.ready_entries (
             ready_slot, ready_generation, job_id, kind, queue,
@@ -242,7 +245,7 @@ async fn insert_synthetic_claim_with_ready_row(
             clock_timestamp(), clock_timestamp(), clock_timestamp(), '{{}}'::jsonb
         )
         "#
-    ))
+    )))
     .bind(job_id)
     .bind(queue)
     .bind(run_lease)
@@ -402,9 +405,9 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
         "expected at least one SkippedActive, got {skipped_count}"
     );
 
-    let survived: i64 = sqlx::query_scalar(&format!(
+    let survived: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claims_0 WHERE job_id = 99999"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count survivor");
@@ -445,10 +448,10 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
         Utc::now(),
     )
     .await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome) \
          VALUES (0, 77777, 77777, 'completed')"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("seed closure");
@@ -456,9 +459,9 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
     store.rotate_claims(&pool).await.expect("rotate off 0");
 
     let mut reader_tx = pool.begin().await.expect("begin reader tx");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "LOCK TABLE {schema}.lease_claims_0, {schema}.lease_claim_closures_0, {schema}.lease_claim_closure_batches_0 IN ACCESS SHARE MODE"
-    ))
+    )))
     .execute(reader_tx.as_mut())
     .await
     .expect("LOCK TABLE ACCESS SHARE");
@@ -483,10 +486,12 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
         "prune must succeed once reader releases, got {pruned:?}"
     );
 
-    let post: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
-        .fetch_one(&pool)
-        .await
-        .expect("count post-prune");
+    let post: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.lease_claims_0"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count post-prune");
     assert_eq!(post, 0, "TRUNCATE must clear lease_claims_0");
 }
 
@@ -547,9 +552,9 @@ async fn test_admin_cancel_during_materialize_no_orphan_lease() {
         .await
         .expect("enqueue chaos cancel job");
 
-    let job_id: i64 = sqlx::query_scalar(&format!(
+    let job_id: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT job_id FROM {schema}.ready_entries WHERE queue = $1 ORDER BY job_id DESC LIMIT 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -566,7 +571,7 @@ async fn test_admin_cancel_during_materialize_no_orphan_lease() {
 
     // Inject a synthetic leases row simulating a concurrent
     // materialize that committed in the cancel race window.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.leases (
             lease_slot, lease_generation, ready_slot, ready_generation,
@@ -578,7 +583,7 @@ async fn test_admin_cancel_during_materialize_no_orphan_lease() {
             25, $1, NULL, NULL, clock_timestamp()
         )
         "#
-    ))
+    )))
     .bind(job_id)
     .bind(queue)
     .bind(run_lease)

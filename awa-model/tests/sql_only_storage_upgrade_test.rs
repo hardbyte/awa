@@ -10,6 +10,7 @@
 //! transition is driven by the SQL functions defined in v010/v013/v014.
 //! Tests below call those functions directly via raw SQL.
 
+use awa_model::audited_sql;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::LazyLock;
@@ -748,7 +749,7 @@ async fn seed_canonical_running_job_with_mask(
     run_lease: i64,
     mask: &str,
 ) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         r#"
         INSERT INTO awa.jobs_hot (
             kind, queue, args, state, priority, attempt, max_attempts,
@@ -762,7 +763,7 @@ async fn seed_canonical_running_job_with_mask(
         )
         RETURNING id
         "#
-    ))
+    )))
     .bind(unique_key.to_vec())
     .bind(run_lease)
     .fetch_one(pool)

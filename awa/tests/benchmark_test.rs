@@ -9,6 +9,7 @@
 
 mod bench_output;
 
+use awa::audited_sql;
 use awa::model::{
     insert_many, insert_many_copy_from_pool, migrations, QueueStorage, QueueStorageConfig,
 };
@@ -51,7 +52,7 @@ async fn ensure_pgstattuple(pool: &sqlx::PgPool) {
 
 async fn recreate_queue_storage_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
     let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
-    sqlx::query(&drop_sql)
+    sqlx::query(audited_sql(drop_sql.clone()))
         .execute(pool)
         .await
         .expect("Failed to drop queue storage benchmark schema");

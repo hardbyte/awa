@@ -5,6 +5,7 @@
 //!
 //! Each test uses a unique queue name to avoid interference when running in parallel.
 
+use awa::audited_sql;
 use awa_macros::JobArgs;
 use awa_model::{insert_many, insert_with, migrations, InsertOpts, JobRow, JobState, UniqueOpts};
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,10 @@ async fn ensure_database_exists(url: &str) {
         .await
         .expect("Failed to connect to admin database for scale tests");
     let create_sql = format!("CREATE DATABASE {database_name}");
-    match sqlx::query(&create_sql).execute(&admin_pool).await {
+    match sqlx::query(audited_sql(create_sql.clone()))
+        .execute(&admin_pool)
+        .await
+    {
         Ok(_) => {}
         Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
         Err(err) => panic!("Failed to create scale test database {database_name}: {err}"),

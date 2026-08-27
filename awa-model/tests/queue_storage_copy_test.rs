@@ -1,3 +1,4 @@
+use awa_model::audited_sql;
 use awa_model::{
     migrations, AwaError, InsertOpts, InsertParams, QueueStorage, QueueStorageConfig, UniqueOpts,
 };
@@ -28,10 +29,13 @@ async fn setup_store_with_config(
     migrations::run(&pool).await.expect("run migrations");
 
     let store = QueueStorage::new(config).expect("create queue storage");
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema()))
-        .execute(&pool)
-        .await
-        .expect("drop queue storage schema");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {} CASCADE",
+        store.schema()
+    )))
+    .execute(&pool)
+    .await
+    .expect("drop queue storage schema");
     store
         .prepare_schema(&pool)
         .await
@@ -106,7 +110,7 @@ fn bench_env_usize(name: &str, default: usize) -> usize {
 }
 
 async fn lane_available_count(pool: &PgPool, schema: &str, queues: Vec<String>) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         r#"
         SELECT COALESCE(
             sum(GREATEST(
@@ -123,7 +127,7 @@ async fn lane_available_count(pool: &PgPool, schema: &str, queues: Vec<String>) 
          AND qc.enqueue_shard = qe.enqueue_shard
         WHERE qe.queue = ANY($1)
         "#
-    ))
+    )))
     .bind(queues)
     .fetch_one(pool)
     .await
@@ -175,10 +179,10 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
         .expect("copy enqueue");
     assert_eq!(inserted, 3);
 
-    let ready: Vec<(i64, i64, Option<serde_json::Value>)> = sqlx::query_as(&format!(
+    let ready: Vec<(i64, i64, Option<serde_json::Value>)> = sqlx::query_as(audited_sql(format!(
         "SELECT lane_seq, (args->>'seq')::bigint, payload FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -200,13 +204,13 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
         "default payloads should persist as SQL NULL in COPY rows"
     );
 
-    let (compact_payload_bytes, expanded_payload_bytes): (i32, i32) = sqlx::query_as(&format!(
+    let (compact_payload_bytes, expanded_payload_bytes): (i32, i32) = sqlx::query_as(audited_sql(format!(
         "SELECT COALESCE(pg_column_size(payload), 0)::int, \
                 pg_column_size('{{\"metadata\":{{}},\"tags\":[],\"errors\":[],\"progress\":null}}'::jsonb)::int \
            FROM {}.ready_entries \
           WHERE queue = $1 AND lane_seq = $2",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .bind(default.0)
     .fetch_one(&pool)
@@ -221,10 +225,10 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
         "compact payload should use fewer JSONB bytes ({compact_payload_bytes} >= {expanded_payload_bytes})"
     );
 
-    let deferred_count: i64 = sqlx::query_scalar(&format!(
+    let deferred_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1 AND state = 'scheduled'",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -269,10 +273,10 @@ async fn queue_storage_copy_rolls_back_on_unique_conflict() {
         "unexpected error: {err:?}"
     );
 
-    let ready_count: i64 = sqlx::query_scalar(&format!(
+    let ready_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -316,10 +320,10 @@ async fn queue_storage_batch_rolls_back_on_batched_unique_conflict() {
         "unexpected error: {err:?}"
     );
 
-    let ready_count: i64 = sqlx::query_scalar(&format!(
+    let ready_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -363,10 +367,10 @@ async fn queue_storage_copy_rolls_back_on_existing_unique_conflict() {
         "unexpected error: {err:?}"
     );
 
-    let ready_count: i64 = sqlx::query_scalar(&format!(
+    let ready_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -415,10 +419,10 @@ async fn queue_storage_copy_concurrent_lane_seq_is_dense() {
         );
     }
 
-    let lane_seqs: Vec<i64> = sqlx::query_scalar(&format!(
+    let lane_seqs: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
         "SELECT lane_seq FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -481,10 +485,10 @@ async fn queue_storage_copy_independent_stores_keep_lane_seq_unique() {
         );
     }
 
-    let lane_seqs: Vec<i64> = sqlx::query_scalar(&format!(
+    let lane_seqs: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
         "SELECT lane_seq FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -517,19 +521,19 @@ async fn queue_storage_sequence_sync_does_not_rewind_hot_reservations() {
         .await
         .expect("seed lane");
 
-    let seq_name: String = sqlx::query_scalar(&format!(
+    let seq_name: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT seq_name FROM {}.queue_enqueue_heads WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
     .expect("read enqueue sequence name");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "CREATE TABLE {}.sequence_sync_seen (lane_seq BIGINT PRIMARY KEY)",
         store.schema()
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("create sequence seen table");
@@ -549,10 +553,10 @@ async fn queue_storage_sequence_sync_does_not_rewind_hot_reservations() {
             .expect("connect sync pool");
         sync_start.wait().await;
         for _ in 0..(reserver_count * rounds) {
-            sqlx::query(&format!(
+            sqlx::query(audited_sql(format!(
                 "SELECT {}.set_sequence_next($1, 1::bigint)",
                 sync_schema
-            ))
+            )))
             .bind(&seq_name)
             .execute(&pool)
             .await
@@ -575,19 +579,19 @@ async fn queue_storage_sequence_sync_does_not_rewind_hot_reservations() {
             start.wait().await;
             for _ in 0..rounds {
                 let mut tx = pool.begin().await.expect("begin reserve tx");
-                let range_start: i64 = sqlx::query_scalar(&format!(
+                let range_start: i64 = sqlx::query_scalar(audited_sql(format!(
                     "SELECT {}.reserve_enqueue_seq($1, 2::smallint, 0::smallint, $2::bigint)",
                     schema
-                ))
+                )))
                 .bind(&queue)
                 .bind(values_per_round)
                 .fetch_one(tx.as_mut())
                 .await
                 .expect("reserve enqueue sequence range");
-                sqlx::query(&format!(
+                sqlx::query(audited_sql(format!(
                     "INSERT INTO {}.sequence_sync_seen (lane_seq) SELECT generate_series($1::bigint, $2::bigint)",
                     schema
-                ))
+                )))
                 .bind(range_start)
                 .bind(range_start + values_per_round - 1)
                 .execute(tx.as_mut())
@@ -603,10 +607,10 @@ async fn queue_storage_sequence_sync_does_not_rewind_hot_reservations() {
         reserver.await.expect("join reserver task");
     }
 
-    let (seen, distinct_seen): (i64, i64) = sqlx::query_as(&format!(
+    let (seen, distinct_seen): (i64, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT count(*)::bigint, count(DISTINCT lane_seq)::bigint FROM {}.sequence_sync_seen",
         store.schema()
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count reserved sequence values");
@@ -630,10 +634,10 @@ async fn queue_storage_copy_distributes_across_stripes() {
         .expect("copy enqueue striped");
     assert_eq!(inserted, 8);
 
-    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, i64)> = sqlx::query_as(audited_sql(format!(
         "SELECT queue, lane_seq FROM {}.ready_entries ORDER BY queue, lane_seq",
         store.schema()
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .expect("read striped ready rows");
@@ -700,10 +704,10 @@ async fn queue_storage_copy_escapes_csv_special_values() {
         .expect("copy enqueue escape matrix");
     assert_eq!(inserted, jobs.len());
 
-    let ready: Vec<(String, serde_json::Value, serde_json::Value)> = sqlx::query_as(&format!(
+    let ready: Vec<(String, serde_json::Value, serde_json::Value)> = sqlx::query_as(audited_sql(format!(
         "SELECT kind, args, payload FROM {}.ready_entries WHERE queue = $1 ORDER BY (args->>'seq')::int",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -721,10 +725,10 @@ async fn queue_storage_copy_escapes_csv_special_values() {
         serde_json::Value,
         serde_json::Value,
         Option<Vec<u8>>,
-    ) = sqlx::query_as(&format!(
+    ) = sqlx::query_as(audited_sql(format!(
         "SELECT kind, args, payload, unique_key FROM {}.deferred_jobs WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await

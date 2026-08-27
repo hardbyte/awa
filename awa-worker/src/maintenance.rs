@@ -1,6 +1,7 @@
 use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
+use awa_model::audited_sql;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
@@ -2087,7 +2088,7 @@ impl MaintenanceService {
         rescue_kind: &'static str,
     ) -> Result<Vec<JobRow>, awa_model::AwaError> {
         let ids: Vec<i64> = {
-            let query = sqlx::query_scalar(candidates_sql);
+            let query = sqlx::query_scalar(audited_sql(candidates_sql));
             let query = match staleness_ms {
                 Some(ms) => query.bind(ms),
                 None => query,
@@ -2101,7 +2102,7 @@ impl MaintenanceService {
         let mut rescued = Vec::new();
         for id in ids {
             let attempt = {
-                let query = sqlx::query_as::<_, JobRow>(per_row_sql).bind(id);
+                let query = sqlx::query_as::<_, JobRow>(audited_sql(per_row_sql)).bind(id);
                 let query = match staleness_ms {
                     Some(ms) => query.bind(ms),
                     None => query,
@@ -2589,7 +2590,7 @@ impl MaintenanceService {
         let mut tx = self.pool.begin().await?;
         let promote_start = std::time::Instant::now();
         let sql = Self::promote_sql(state);
-        let promoted_rows: Vec<(String,)> = sqlx::query_as(&sql)
+        let promoted_rows: Vec<(String,)> = sqlx::query_as(audited_sql(sql))
             .bind(PROMOTE_BATCH_SIZE)
             .fetch_all(&mut *tx)
             .await?;
@@ -3039,7 +3040,7 @@ impl MaintenanceService {
         let retention_secs = i64::try_from(self.dlq_retention.as_secs()).unwrap_or(i64::MAX);
 
         let global_result = if override_queues.is_empty() {
-            sqlx::query(&format!(
+            sqlx::query(audited_sql(format!(
                 r#"
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
@@ -3048,13 +3049,13 @@ impl MaintenanceService {
                     LIMIT $2
                 )
                 "#
-            ))
+            )))
             .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .execute(&self.pool)
             .await
         } else {
-            sqlx::query(&format!(
+            sqlx::query(audited_sql(format!(
                 r#"
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
@@ -3064,7 +3065,7 @@ impl MaintenanceService {
                     LIMIT $2
                 )
                 "#
-            ))
+            )))
             .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(&override_queues)
@@ -3087,7 +3088,7 @@ impl MaintenanceService {
                 continue;
             };
             let retention_secs = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
-            match sqlx::query(&format!(
+            match sqlx::query(audited_sql(format!(
                 r#"
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
@@ -3097,7 +3098,7 @@ impl MaintenanceService {
                     LIMIT $2
                 )
                 "#
-            ))
+            )))
             .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(queue)
@@ -3405,7 +3406,7 @@ impl MaintenanceService {
         // accepted approximation for the cheap gauge. Surfaces that need the
         // exact running count (which DOES expand lease_claim_batches) go
         // through QueueStorage::queue_counts_exact() / admin::state_counts().
-        let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
+        let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(audited_sql(format!(
             r#"
             WITH head_signal AS (
                 SELECT
@@ -3543,7 +3544,7 @@ impl MaintenanceService {
               ON dlq.queue = queues.queue
             ORDER BY queues.queue
             "#
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         {
@@ -3732,7 +3733,10 @@ mod tests {
             .await
             .expect("Failed to connect to admin database for maintenance tests");
         let create_sql = format!("CREATE DATABASE {database_name}");
-        match sqlx::query(&create_sql).execute(&admin_pool).await {
+        match sqlx::query(audited_sql(create_sql))
+            .execute(&admin_pool)
+            .await
+        {
             Ok(_) => {}
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
             Err(err) => panic!("Failed to create maintenance test database {database_name}: {err}"),

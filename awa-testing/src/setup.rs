@@ -1,5 +1,6 @@
 //! Common test setup utilities for Awa integration tests.
 
+use awa_model::audited_sql;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -214,14 +215,14 @@ pub async fn clean_queue(pool: &PgPool, queue: &str) {
 /// leaves the rest of the lane (and its `job_unique_claims`) behind.
 async fn clean_queue_substrate(pool: &PgPool, schema: &str, queue: &str) {
     // Release unique claims first, while the rows that carry the job ids exist.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DELETE FROM awa.job_unique_claims WHERE job_id IN (
              SELECT job_id FROM {schema}.ready_entries WHERE queue = $1
              UNION SELECT job_id FROM {schema}.deferred_jobs WHERE queue = $1
              UNION SELECT job_id FROM {schema}.leases WHERE queue = $1
              UNION SELECT job_id FROM {schema}.done_entries WHERE queue = $1
              UNION SELECT job_id FROM {schema}.dlq_entries WHERE queue = $1)"
-    ))
+    )))
     .bind(queue)
     .execute(pool)
     .await
@@ -234,11 +235,13 @@ async fn clean_queue_substrate(pool: &PgPool, schema: &str, queue: &str) {
         "done_entries",
         "dlq_entries",
     ] {
-        sqlx::query(&format!("DELETE FROM {schema}.{plane} WHERE queue = $1"))
-            .bind(queue)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|err| panic!("Failed to clean {plane} for queue {queue}: {err}"));
+        sqlx::query(audited_sql(format!(
+            "DELETE FROM {schema}.{plane} WHERE queue = $1"
+        )))
+        .bind(queue)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|err| panic!("Failed to clean {plane} for queue {queue}: {err}"));
     }
 }
 

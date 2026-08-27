@@ -51,6 +51,7 @@
 //! ```
 
 use async_trait::async_trait;
+use awa::audited_sql;
 use awa::model::{insert, migrations, QueueStorage, QueueStorageConfig};
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
@@ -113,10 +114,12 @@ async fn pool() -> sqlx::PgPool {
 }
 
 async fn drop_schema(pool: &sqlx::PgPool, schema: &str) {
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(pool)
-        .await
-        .expect("Failed to drop schema");
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await
+    .expect("Failed to drop schema");
 }
 
 /// Sample peak `n_dead_tup` across every partition matching the LIKE
@@ -145,9 +148,9 @@ async fn sample_per_partition_dead_tup(
 /// Current ring cursor: the max-generation row of the ring's rotation
 /// ledger (#371).
 async fn ring_state(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
-    sqlx::query_as::<_, (i32, i64)>(&format!(
+    sqlx::query_as::<_, (i32, i64)>(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.{ring}_ring_rotations ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("ring cursor read failed")

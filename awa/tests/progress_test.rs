@@ -2,6 +2,7 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
+use awa::audited_sql;
 use awa::model::admin;
 use awa::{JobArgs, JobContext, JobError, JobResult, JobState, Worker};
 use awa_testing::TestClient;
@@ -88,19 +89,19 @@ async fn ensure_database_exists(url: &str) {
     let terminate_sql = format!(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{database_name}' AND pid <> pg_backend_pid()"
     );
-    sqlx::query(&terminate_sql)
+    sqlx::query(audited_sql(terminate_sql.clone()))
         .execute(&admin_pool)
         .await
         .expect("Failed to terminate existing progress test connections");
 
     let drop_sql = format!("DROP DATABASE IF EXISTS {database_name}");
-    sqlx::query(&drop_sql)
+    sqlx::query(audited_sql(drop_sql.clone()))
         .execute(&admin_pool)
         .await
         .expect("Failed to drop progress test database");
 
     let create_sql = format!("CREATE DATABASE {database_name}");
-    sqlx::query(&create_sql)
+    sqlx::query(audited_sql(create_sql.clone()))
         .execute(&admin_pool)
         .await
         .expect("Failed to create progress test database");

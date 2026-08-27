@@ -3,6 +3,7 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
+use awa::audited_sql;
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
     BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
@@ -167,13 +168,15 @@ async fn ensure_template_database() -> &'static str {
                     .expect("Failed to list leftover queue_storage test databases");
             for leftover in leftovers {
                 validate_database_name(&leftover);
-                sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS {leftover} WITH (FORCE)"))
-                    .execute(&admin_pool)
-                    .await
-                    .expect("Failed to drop leftover queue_storage test database");
+                sqlx::raw_sql(audited_sql(format!(
+                    "DROP DATABASE IF EXISTS {leftover} WITH (FORCE)"
+                )))
+                .execute(&admin_pool)
+                .await
+                .expect("Failed to drop leftover queue_storage test database");
             }
 
-            sqlx::raw_sql(&format!("CREATE DATABASE {template_name}"))
+            sqlx::raw_sql(audited_sql(format!("CREATE DATABASE {template_name}")))
                 .execute(&admin_pool)
                 .await
                 .expect("Failed to create queue_storage template database");
@@ -219,7 +222,10 @@ async fn setup_pool(max_connections: u32) -> (TestDbGuard, sqlx::PgPool) {
     let create_sql = format!("CREATE DATABASE {db_name} TEMPLATE {template_name}");
     let mut attempts = 0;
     loop {
-        match sqlx::raw_sql(&create_sql).execute(&admin_pool).await {
+        match sqlx::raw_sql(audited_sql(create_sql.clone()))
+            .execute(&admin_pool)
+            .await
+        {
             Ok(_) => break,
             // 55006: "source database is being accessed by other users" —
             // another test is mid-copy from the same template. Retry.
@@ -302,7 +308,7 @@ async fn test_queue_storage_prepare_schema_concurrent_startups_serialize() {
 
 async fn recreate_store_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
     let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
-    sqlx::query(&drop_sql)
+    sqlx::query(audited_sql(drop_sql.clone()))
         .execute(pool)
         .await
         .expect("Failed to drop queue_storage schema");
@@ -505,7 +511,7 @@ async fn attempt_state_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
         "SELECT count(*)::bigint FROM {}.attempt_state",
         store.schema()
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count attempt_state rows")
@@ -513,7 +519,7 @@ async fn attempt_state_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
 
 async fn lease_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     let sql = format!("SELECT count(*)::bigint FROM {}.leases", store.schema());
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count leases")
@@ -524,7 +530,7 @@ async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
         "SELECT count(*)::bigint FROM {}.lease_claims",
         store.schema()
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count lease_claims")
@@ -535,7 +541,7 @@ async fn lease_claim_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i
         "SELECT count(*)::bigint FROM {}.lease_claim_batches",
         store.schema()
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count lease_claim_batches")
@@ -609,7 +615,7 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
         )
         "#,
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count open receipt claims (derived)")
@@ -617,7 +623,7 @@ async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> 
 
 async fn receipt_claim_slot_for_job(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) -> i32 {
     let schema = store.schema();
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         r#"
         SELECT claim_slot
         FROM (
@@ -635,7 +641,7 @@ async fn receipt_claim_slot_for_job(pool: &sqlx::PgPool, store: &QueueStorage, j
         ORDER BY run_lease DESC
         LIMIT 1
         "#
-    ))
+    )))
     .bind(job_id)
     .fetch_one(pool)
     .await
@@ -650,7 +656,7 @@ async fn receipt_claim_count_in_child(
 ) -> i64 {
     let claim_child = format!("{schema}.lease_claims_{claim_slot}");
     let claim_batch_child = format!("{schema}.lease_claim_batches_{claim_slot}");
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(audited_sql(format!(
         r#"
         SELECT
             (SELECT count(*)::bigint FROM {claim_child} WHERE job_id = $1)
@@ -662,7 +668,7 @@ async fn receipt_claim_count_in_child(
                 WHERE items.job_id = $1
             ), 0)
         "#
-    ))
+    )))
     .bind(job_id)
     .fetch_one(pool)
     .await
@@ -674,7 +680,7 @@ async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) ->
         "SELECT count(*)::bigint FROM {}.lease_claim_closures",
         store.schema()
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count lease_claim_closures")
@@ -685,7 +691,7 @@ async fn lease_claim_closure_batch_count(pool: &sqlx::PgPool, store: &QueueStora
         "SELECT count(*)::bigint FROM {}.lease_claim_closure_batches",
         store.schema()
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count lease_claim_closure_batches")
@@ -696,7 +702,7 @@ async fn ready_tombstone_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64
         "SELECT count(*)::bigint FROM {}.ready_tombstones",
         store.schema()
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count ready_tombstones")
@@ -707,7 +713,7 @@ async fn ready_segment_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
         "SELECT count(*)::bigint FROM {}.ready_segments",
         store.schema()
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(audited_sql(sql.clone()))
         .fetch_one(pool)
         .await
         .expect("Failed to count ready_segments")
@@ -715,7 +721,7 @@ async fn ready_segment_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
 
 async fn tombstone_ready_job(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) {
     let schema = store.schema();
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.ready_tombstones (
             ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq, job_id
@@ -725,7 +731,7 @@ async fn tombstone_ready_job(pool: &sqlx::PgPool, store: &QueueStorage, job_id: 
         WHERE job_id = $1
         ON CONFLICT DO NOTHING
         "#
-    ))
+    )))
     .bind(job_id)
     .execute(pool)
     .await
@@ -740,11 +746,11 @@ async fn claim_cursor_for(
     enqueue_shard: i16,
 ) -> i64 {
     let schema = store.schema();
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT {schema}.sequence_next_value(seq_name)
          FROM {schema}.queue_claim_heads
          WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
-    ))
+    )))
     .bind(queue)
     .bind(priority)
     .bind(enqueue_shard)
@@ -832,7 +838,7 @@ async fn enqueue_job<T: JobArgs>(
         )
     };
 
-    sqlx::query_scalar::<_, i64>(&query)
+    sqlx::query_scalar::<_, i64>(audited_sql(query.clone()))
         .bind(&queue_names)
         .fetch_one(pool)
         .await
@@ -900,7 +906,7 @@ async fn age_receipt_claim(
     age: Duration,
 ) {
     let age_millis = i64::try_from(age.as_millis()).expect("test receipt age fits in i64 millis");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         WITH aged_rows AS (
             UPDATE {schema}.lease_claims
@@ -921,7 +927,7 @@ async fn age_receipt_claim(
         SELECT (SELECT count(*) FROM aged_rows) + (SELECT count(*) FROM aged_batches)
         "#,
         schema = store.schema()
-    ))
+    )))
     .bind(age_millis)
     .bind(job_id)
     .bind(run_lease)
@@ -938,13 +944,13 @@ async fn age_attempt_heartbeat(
     age: Duration,
 ) {
     let age_millis = i64::try_from(age.as_millis()).expect("test heartbeat age fits in i64 millis");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {}.attempt_state
          SET heartbeat_at = clock_timestamp() - ($1 * interval '1 millisecond'),
              updated_at = clock_timestamp()
          WHERE job_id = $2 AND run_lease = $3",
         store.schema()
-    ))
+    )))
     .bind(age_millis)
     .bind(job_id)
     .bind(run_lease)
@@ -981,10 +987,10 @@ async fn wait_for_callback_job(
 }
 
 async fn dlq_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.dlq_entries WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -992,10 +998,10 @@ async fn dlq_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i6
 }
 
 async fn failed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.done_entries WHERE queue = $1 AND state = 'failed'",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -1053,10 +1059,10 @@ async fn wait_for_failed_done_count(
 }
 
 async fn completed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.done_entries WHERE queue = $1 AND state = 'completed'",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -1064,10 +1070,10 @@ async fn completed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: 
 }
 
 async fn completed_terminal_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.terminal_jobs WHERE queue = $1 AND state = 'completed'",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -1079,10 +1085,10 @@ async fn receipt_completion_batch_count(
     store: &QueueStorage,
     queue: &str,
 ) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.receipt_completion_batches WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -1090,10 +1096,10 @@ async fn receipt_completion_batch_count(
 }
 
 async fn receipt_completion_tombstone_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.receipt_completion_tombstones",
         store.schema()
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("Failed to count receipt completion tombstones")
@@ -1110,7 +1116,7 @@ async fn done_body_columns(
     Option<DateTime<Utc>>,
     Option<serde_json::Value>,
 ) {
-    sqlx::query_as(&format!(
+    sqlx::query_as(audited_sql(format!(
         r#"
         SELECT args, max_attempts, run_at, created_at, payload
         FROM {}.done_entries
@@ -1119,7 +1125,7 @@ async fn done_body_columns(
         LIMIT 1
         "#,
         store.schema()
-    ))
+    )))
     .bind(job_id)
     .fetch_one(pool)
     .await
@@ -1137,7 +1143,7 @@ async fn terminal_view_body_columns(
     DateTime<Utc>,
     serde_json::Value,
 ) {
-    sqlx::query_as(&format!(
+    sqlx::query_as(audited_sql(format!(
         r#"
         SELECT args, max_attempts, run_at, created_at, payload
         FROM {}.terminal_jobs
@@ -1146,7 +1152,7 @@ async fn terminal_view_body_columns(
         LIMIT 1
         "#,
         store.schema()
-    ))
+    )))
     .bind(job_id)
     .fetch_one(pool)
     .await
@@ -1154,10 +1160,10 @@ async fn terminal_view_body_columns(
 }
 
 async fn dlq_reason(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) -> String {
-    sqlx::query_scalar::<_, String>(&format!(
+    sqlx::query_scalar::<_, String>(audited_sql(format!(
         "SELECT dlq_reason FROM {}.dlq_entries WHERE job_id = $1 ORDER BY dlq_at DESC LIMIT 1",
         store.schema()
-    ))
+    )))
     .bind(job_id)
     .fetch_one(pool)
     .await
@@ -1446,7 +1452,7 @@ async fn test_queue_storage_claim_runtime_does_not_write_ready_segment_cache() {
     )
     .await;
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         UPDATE {schema}.queue_claim_heads
         SET ready_segment_slot = -17,
@@ -1454,7 +1460,7 @@ async fn test_queue_storage_claim_runtime_does_not_write_ready_segment_cache() {
             ready_segment_next_lane_seq = -19
         WHERE queue = $1
         "#
-    ))
+    )))
     .bind(queue)
     .execute(&pool)
     .await
@@ -1467,7 +1473,7 @@ async fn test_queue_storage_claim_runtime_does_not_write_ready_segment_cache() {
     let claimed = claimed.into_iter().next().expect("missing claimed job");
 
     let (cached_slot, cached_generation, cached_next): (Option<i32>, Option<i64>, Option<i64>) =
-        sqlx::query_as(&format!(
+        sqlx::query_as(audited_sql(format!(
             r#"
             SELECT ready_segment_slot, ready_segment_generation, ready_segment_next_lane_seq
             FROM {schema}.queue_claim_heads
@@ -1475,7 +1481,7 @@ async fn test_queue_storage_claim_runtime_does_not_write_ready_segment_cache() {
               AND priority = $2
               AND enqueue_shard = $3
             "#
-        ))
+        )))
         .bind(queue)
         .bind(claimed.claim.priority)
         .bind(claimed.claim.enqueue_shard)
@@ -1595,9 +1601,9 @@ async fn test_queue_storage_cancel_available_tombstones_and_retains_ready_backin
         1,
         "available cancel should tombstone the ready lane"
     );
-    let retained_ready_rows: i64 = sqlx::query_scalar(&format!(
+    let retained_ready_rows: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -1752,9 +1758,9 @@ async fn test_queue_storage_batch_ready_noop_does_not_tombstone() {
         .expect("set_priority no-op should not fail");
     assert!(!moved, "set_priority to the existing priority is a no-op");
 
-    let tombstones: i64 = sqlx::query_scalar(&format!(
+    let tombstones: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.ready_tombstones WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -1799,10 +1805,10 @@ async fn test_queue_storage_ready_tombstone_head_advances_claim_cursor() {
         "exact counts must not report tombstoned ready rows as available"
     );
 
-    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(1_i64)
     .bind(0.0_f64)
@@ -1864,10 +1870,10 @@ async fn test_queue_storage_ready_tombstone_non_head_does_not_skip_live_prefix()
         "only the non-tombstoned prefix row should be available"
     );
 
-    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(2_i64)
     .bind(0.0_f64)
@@ -2033,15 +2039,15 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     .await;
 
     // Seeded state: cursor (slot 0, generation 0), slot_count = 4.
-    let (initial_slot, initial_gen): (i32, i64) = sqlx::query_as(&format!(
+    let (initial_slot, initial_gen): (i32, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read initial claim ring cursor");
-    let initial_count: i32 = sqlx::query_scalar(&format!(
+    let initial_count: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT slot_count FROM {schema}.claim_ring_state WHERE singleton = TRUE"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read initial claim ring slot_count");
@@ -2052,9 +2058,9 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     // #371: per-slot generations are derived from the ledger cursor, so the
     // seeded shape is (a) the slot rows exist and (b) the genesis cursor is
     // the single ledger row (0, 0).
-    let slot_rows: Vec<i32> = sqlx::query_scalar(&format!(
+    let slot_rows: Vec<i32> = sqlx::query_scalar(audited_sql(format!(
         "SELECT slot FROM {schema}.claim_ring_slots ORDER BY slot"
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .expect("read initial claim ring slot rows");
@@ -2063,9 +2069,9 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         vec![0, 1, 2, 3],
         "seeded slot table should hold one row per ring slot"
     );
-    let ledger_rows: i64 = sqlx::query_scalar(&format!(
+    let ledger_rows: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.claim_ring_rotations"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count initial claim ring ledger rows");
@@ -2090,9 +2096,9 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
             other => panic!("rotate_claims step {step} unexpected outcome: {other:?}"),
         }
     }
-    let (idle_slot, idle_gen): (i32, i64) = sqlx::query_as(&format!(
+    let (idle_slot, idle_gen): (i32, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read claim ring cursor after idle rotations");
@@ -2119,15 +2125,15 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     // reset() re-seeds the ring to the initial shape — the ledger back to a
     // single genesis cursor (0, 0), claim_ring_slots back to one row per slot.
     store.reset(&pool).await.expect("reset should succeed");
-    let (reset_slot, reset_gen): (i32, i64) = sqlx::query_as(&format!(
+    let (reset_slot, reset_gen): (i32, i64) = sqlx::query_as(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read claim ring cursor after reset");
-    let reset_count: i32 = sqlx::query_scalar(&format!(
+    let reset_count: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT slot_count FROM {schema}.claim_ring_state WHERE singleton = TRUE"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read claim ring slot_count after reset");
@@ -2135,9 +2141,9 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     assert_eq!(reset_gen, 0);
     assert_eq!(reset_count, 4);
 
-    let post_reset_rows: Vec<i32> = sqlx::query_scalar(&format!(
+    let post_reset_rows: Vec<i32> = sqlx::query_scalar(audited_sql(format!(
         "SELECT slot FROM {schema}.claim_ring_slots ORDER BY slot"
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .expect("read claim ring slot rows after reset");
@@ -2146,9 +2152,9 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         vec![0, 1, 2, 3],
         "reset should restore the seeded claim-ring slot table"
     );
-    let post_reset_ledger: i64 = sqlx::query_scalar(&format!(
+    let post_reset_ledger: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.claim_ring_rotations"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count claim ring ledger rows after reset");
@@ -2185,23 +2191,23 @@ async fn test_successful_prunes_report_database_phase_timings() {
     .await;
 
     for ring in ["queue", "lease", "claim"] {
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             "INSERT INTO {schema}.{ring}_ring_rotations (generation, slot) VALUES (1, 1)"
-        ))
+        )))
         .execute(&pool)
         .await
         .unwrap_or_else(|err| panic!("advance {ring} ring: {err}"));
     }
 
     let filenodes = || async {
-        sqlx::query_as::<_, (i64, i64, i64)>(&format!(
+        sqlx::query_as::<_, (i64, i64, i64)>(audited_sql(format!(
             r#"
             SELECT
                 pg_relation_filenode('{schema}.ready_entries_0'::regclass)::bigint,
                 pg_relation_filenode('{schema}.leases_0'::regclass)::bigint,
                 pg_relation_filenode('{schema}.lease_claims_0'::regclass)::bigint
             "#
-        ))
+        )))
         .fetch_one(&pool)
         .await
         .expect("read ring child filenodes")
@@ -2265,17 +2271,17 @@ async fn test_maintenance_idle_prune_replaces_child_filenode_once() {
     };
     let _store = create_store_with_config(&pool, store_config.clone()).await;
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.queue_ring_rotations (generation, slot) VALUES (1, 1)"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance empty queue ring");
 
     let child_filenode = || async {
-        sqlx::query_scalar::<_, i64>(&format!(
+        sqlx::query_scalar::<_, i64>(audited_sql(format!(
             "SELECT pg_relation_filenode('{schema}.ready_entries_0'::regclass)::bigint"
-        ))
+        )))
         .fetch_one(&pool)
         .await
         .expect("read queue child filenode")
@@ -2357,7 +2363,7 @@ async fn test_idle_gate_holds_rotation_open_until_sealed_slots_reclaimed() {
     // (2, 2). The current cursor is the max-generation row, so slot 2 is
     // open and slots 0/1 are sealed.
     for (slot, generation) in [(0_i32, 0_i64), (1, 1)] {
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             "INSERT INTO {schema}.done_entries (
                 ready_slot, ready_generation, job_id, kind, queue, state,
                 priority, attempt, run_lease, lane_seq, enqueue_shard,
@@ -2366,7 +2372,7 @@ async fn test_idle_gate_holds_rotation_open_until_sealed_slots_reclaimed() {
                       'completed'::awa.job_state, 2::smallint, 1::smallint,
                       1::bigint, $5::bigint, 0::smallint, now(), now(),
                       '{{}}'::jsonb)"
-        ))
+        )))
         .bind(slot)
         .bind(generation)
         .bind(8_000_000_i64 + i64::from(slot))
@@ -2378,10 +2384,10 @@ async fn test_idle_gate_holds_rotation_open_until_sealed_slots_reclaimed() {
     }
     // Advance the cursor by appending to the rotation ledger exactly as
     // two busy rotations would (genesis (0, 0) already exists from install).
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.queue_ring_rotations (generation, slot) \
          VALUES (1, 1), (2, 2)"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance cursor as two busy rotations would");
@@ -2633,9 +2639,9 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     // Sanity: the claim landed in slot 0 and compact claim-local batch
     // evidence closes it without an explicit per-job closure row.
     let slot0_claims = receipt_claim_count_in_child(&pool, schema, 0, job_id).await;
-    let slot0_closures: i64 = sqlx::query_scalar(&format!(
+    let slot0_closures: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures_0"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count lease_claim_closures_0");
@@ -2749,7 +2755,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     // Prune the oldest initialized slot. The completed claim has a
     // compact receipt batch, so PartitionTruncateSafety holds even
     // without a completed-closure row, and prune TRUNCATEs both children.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         UPDATE {schema}.claim_ring_slots
         SET rescue_cursor_claimed_at = clock_timestamp(),
@@ -2757,7 +2763,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
             rescue_cursor_run_lease = 1
         WHERE slot = 0
         "#
-    ))
+    )))
     .bind(job_id)
     .execute(&pool)
     .await
@@ -2773,20 +2779,21 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
     }
 
     // Claim-ring children for slot 0 are now empty.
-    let post_prune_claims: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
-            .fetch_one(&pool)
-            .await
-            .expect("count lease_claims_0 after prune");
-    let post_prune_claim_batches: i64 = sqlx::query_scalar(&format!(
+    let post_prune_claims: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.lease_claims_0"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count lease_claims_0 after prune");
+    let post_prune_claim_batches: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claim_batches_0"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count lease_claim_batches_0 after prune");
-    let post_prune_closures: i64 = sqlx::query_scalar(&format!(
+    let post_prune_closures: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures_0"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count lease_claim_closures_0 after prune");
@@ -2802,7 +2809,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         post_prune_closures, 0,
         "lease_claim_closures_0 must be empty post-prune"
     );
-    let cursor_reset: (bool, i64, i64) = sqlx::query_as(&format!(
+    let cursor_reset: (bool, i64, i64) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT
             rescue_cursor_claimed_at = '-infinity'::timestamptz,
@@ -2811,7 +2818,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         FROM {schema}.claim_ring_slots
         WHERE slot = 0
         "#
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read claim rescue cursor after claim prune");
@@ -2861,17 +2868,17 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
         RotateOutcome::SkippedIdle { slot, .. } => assert_eq!(slot, 0),
         other => panic!("expected SkippedIdle {{ slot: 0 }}, got {other:?}"),
     }
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.lease_ring_rotations (generation, slot)
         VALUES (1, 1)
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance lease ring cursor for prune setup");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         UPDATE {schema}.claim_ring_slots
         SET rescue_cursor_claimed_at = clock_timestamp(),
@@ -2879,7 +2886,7 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
             rescue_cursor_run_lease = 7
         WHERE slot = 0
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("seed claim rescue cursor before lease prune");
@@ -2893,7 +2900,7 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
         "lease prune should truncate empty lease slot 0, got {prune:?}"
     );
 
-    let cursor: (bool, i64, i64) = sqlx::query_as(&format!(
+    let cursor: (bool, i64, i64) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT
             rescue_cursor_claimed_at = '-infinity'::timestamptz,
@@ -2902,7 +2909,7 @@ async fn test_prune_oldest_leases_does_not_reset_claim_rescue_cursor() {
         FROM {schema}.claim_ring_slots
         WHERE slot = 0
         "#
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read claim rescue cursor after lease prune");
@@ -2936,14 +2943,14 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
     .await;
 
     // Synthesize an open claim in slot 0 without a matching closure.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.lease_claims (
             claim_slot, job_id, run_lease, ready_slot, ready_generation,
             queue, priority, attempt, max_attempts, lane_seq
         ) VALUES (0, 999, 1, 0, 0, 'synthetic', 2, 1, 25, 999)
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("seed open claim");
@@ -2957,9 +2964,9 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
     }
 
     let mut reader_tx = pool.begin().await.expect("begin claim reader tx");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "LOCK TABLE {schema}.lease_claims_0, {schema}.lease_claim_closures_0, {schema}.lease_claim_closure_batches_0 IN ACCESS SHARE MODE"
-    ))
+    )))
     .execute(reader_tx.as_mut())
     .await
     .expect("lock claim children in access share mode");
@@ -2983,9 +2990,9 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
     reader_tx.rollback().await.expect("release reader lock");
 
     // The claim is still there — not lost.
-    let survived: i64 = sqlx::query_scalar(&format!(
+    let survived: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claims_0 WHERE job_id = 999"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count survivor");
@@ -3022,22 +3029,22 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
     // The ring is empty at this point, so `rotate_claims` idle-skips
     // (#371); append a rotation to the ledger to move the cursor off
     // slot 0 directly so prune targets it.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.claim_ring_rotations (generation, slot) VALUES (1, 1)"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance claim ring cursor away from slot 0");
 
     let mut writer_tx = pool.begin().await.expect("begin claim writer tx");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.lease_claims (
             claim_slot, job_id, run_lease, ready_slot, ready_generation,
             queue, priority, attempt, max_attempts, lane_seq
         ) VALUES (0, 1001, 1, 0, 0, 'synthetic', 2, 1, 25, 1001)
         "#
-    ))
+    )))
     .execute(writer_tx.as_mut())
     .await
     .expect("seed uncommitted open claim");
@@ -3097,9 +3104,9 @@ async fn test_prune_oldest_claims_rechecks_open_claim_after_lock_wait() {
         "post-lock proof must see the committed open claim, got {outcome:?}"
     );
 
-    let survived: i64 = sqlx::query_scalar(&format!(
+    let survived: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claims_0 WHERE job_id = 1001"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count post-lock survivor");
@@ -3132,16 +3139,16 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
     )
     .await;
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DELETE FROM {schema}.ready_segments WHERE ready_slot = 0 AND queue = $1"
-    ))
+    )))
     .bind(queue)
     .execute(&pool)
     .await
     .expect("remove seed ready segment");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DELETE FROM {schema}.ready_entries WHERE job_id = $1"
-    ))
+    )))
     .bind(seed_job_id)
     .execute(&pool)
     .await
@@ -3159,16 +3166,16 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         matches!(idle, RotateOutcome::SkippedIdle { slot: 0, .. }),
         "empty ready slot 0 should idle-skip: {idle:?}"
     );
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.queue_ring_rotations (generation, slot) VALUES (1, 1)"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance queue ring cursor off slot 0 for prune setup");
 
     let post_lock_job_id = 1_000_091_i64;
     let mut writer_tx = pool.begin().await.expect("begin ready writer tx");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.ready_entries (
             ready_slot, ready_generation, job_id, kind, queue, args, priority,
@@ -3180,13 +3187,13 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
             NULL, clock_timestamp(), NULL, NULL, '{{}}'::jsonb
         )
         "#
-    ))
+    )))
     .bind(post_lock_job_id)
     .bind(queue)
     .execute(writer_tx.as_mut())
     .await
     .expect("seed uncommitted ready row");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.ready_segments (
             ready_slot, ready_generation, queue, priority, enqueue_shard,
@@ -3195,7 +3202,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq)
         DO NOTHING
         "#
-    ))
+    )))
     .bind(queue)
     .execute(writer_tx.as_mut())
     .await
@@ -3256,9 +3263,9 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         "post-lock proof must see the committed pending ready row, got {outcome:?}"
     );
 
-    let survived: i64 = sqlx::query_scalar(&format!(
+    let survived: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.ready_entries_0 WHERE job_id = $1"
-    ))
+    )))
     .bind(post_lock_job_id)
     .fetch_one(&pool)
     .await
@@ -3560,10 +3567,10 @@ async fn test_compact_batch_claims_are_visible_as_open() {
     // `deadline_at` (the deadline-backed shape the chaos tests exercise) —
     // no worker runs, so nothing materializes into `leases` or closes the
     // claim.
-    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(claim_count)
     // p_deadline_secs > 0 → the batch carries a non-NULL deadline_at.
@@ -3669,7 +3676,7 @@ async fn test_compact_batch_claims_are_visible_as_open() {
     // already landed in done_entries and assert it is NOT double-listed
     // as running.
     let stale_job_id = 9_600_001_i64;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.lease_claims (
             claim_slot, receipt_id, job_id, run_lease, ready_slot,
             ready_generation, queue, priority, attempt,
@@ -3677,13 +3684,13 @@ async fn test_compact_batch_claims_are_visible_as_open() {
         ) VALUES (0, 96001, $1, 7, 0, 0, $2,
                   2::smallint, 1::smallint, 25::smallint, 9601::bigint,
                   0::smallint, now(), now() + interval '5 minutes')"
-    ))
+    )))
     .bind(stale_job_id)
     .bind(queue)
     .execute(&pool)
     .await
     .expect("seed legacy row-local claim");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.ready_entries (
             ready_slot, ready_generation, job_id, kind, queue, args, priority,
             attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at,
@@ -3691,13 +3698,13 @@ async fn test_compact_batch_claims_are_visible_as_open() {
         ) VALUES (0, 0, $1, 'stale_claim_job', $2, '{{}}'::jsonb, 2,
                   1, 7, 25, 9601, 0, now(), now(), now(), NULL, NULL,
                   '{{}}'::jsonb)"
-    ))
+    )))
     .bind(stale_job_id)
     .bind(queue)
     .execute(&pool)
     .await
     .expect("seed matching ready row for the row-local claim");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.done_entries (
             ready_slot, ready_generation, job_id, kind, queue, state,
             priority, attempt, run_lease, lane_seq, enqueue_shard,
@@ -3705,7 +3712,7 @@ async fn test_compact_batch_claims_are_visible_as_open() {
         ) VALUES (0, 0, $1, 'stale_claim_job', $2, 'completed'::awa.job_state,
                   2::smallint, 1::smallint, 7::bigint, 9601::bigint,
                   0::smallint, now(), now(), '{{}}'::jsonb)"
-    ))
+    )))
     .bind(stale_job_id)
     .bind(queue)
     .execute(&pool)
@@ -3773,15 +3780,15 @@ async fn test_lease_claim_partition_routing() {
     // idle-skips (#371); append the cursor hops to the ledger directly,
     // exactly as a rotation of a busy ring would (slot = generation mod
     // slot_count).
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.claim_ring_rotations (generation, slot) VALUES (1, 1), (2, 2)"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance claim ring cursor for routing setup");
-    let current_slot: i32 = sqlx::query_scalar(&format!(
+    let current_slot: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT slot FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read current claim slot");
@@ -3839,9 +3846,9 @@ async fn test_lease_claim_partition_routing() {
         "claim evidence must be in claim slot child"
     );
 
-    let closure_in_child: i64 = sqlx::query_scalar(&format!(
+    let closure_in_child: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures_2 WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -3851,13 +3858,13 @@ async fn test_lease_claim_partition_routing() {
         "compact successful completion should not write an explicit closure row"
     );
 
-    let compact_batch_claim_slot: i32 = sqlx::query_scalar(&format!(
+    let compact_batch_claim_slot: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT claim_slot
          FROM {schema}.receipt_completion_batches
          WHERE job_ids @> ARRAY[$1]::bigint[]
          ORDER BY batch_id DESC
          LIMIT 1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -3871,14 +3878,14 @@ async fn test_lease_claim_partition_routing() {
         .claim
         .receipt_id
         .expect("receipt claim should carry receipt_id");
-    let compact_batch_closes_receipt: bool = sqlx::query_scalar(&format!(
+    let compact_batch_closes_receipt: bool = sqlx::query_scalar(audited_sql(format!(
         "SELECT EXISTS (
              SELECT 1
              FROM {schema}.lease_claim_closure_batches AS batches
              WHERE batches.claim_slot = $1
                AND batches.receipt_ranges @> $2
          )"
-    ))
+    )))
     .bind(current_slot)
     .bind(receipt_id)
     .fetch_one(&pool)
@@ -3994,10 +4001,10 @@ async fn test_lease_claim_rotation_isolation() {
 /// ring's append-only rotation ledger (#371). The `{ring}_ring_state`
 /// singleton no longer carries the cursor columns.
 async fn ring_cursor(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
-    sqlx::query_as::<_, (i32, i64)>(&format!(
+    sqlx::query_as::<_, (i32, i64)>(audited_sql(format!(
         "SELECT slot, generation FROM {schema}.{ring}_ring_rotations \
          ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("read ring cursor")
@@ -4007,9 +4014,9 @@ async fn ring_cursor(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64
 /// install (the genesis cursor); grows by one per rotation and is trimmed
 /// back to one wrap (`slot_count` rows) by the maintenance fold.
 async fn ring_ledger_row_count(pool: &sqlx::PgPool, schema: &str, ring: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.{ring}_ring_rotations"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("count ring ledger rows")
@@ -4020,9 +4027,9 @@ async fn ring_ledger_row_count(pool: &sqlx::PgPool, schema: &str, ring: &str) ->
 /// deterministic form of "no dead tuple was created", independent of
 /// pg_stat flush timing.
 async fn ring_row_identity(pool: &sqlx::PgPool, schema: &str, table: &str) -> (String, String) {
-    sqlx::query_as::<_, (String, String)>(&format!(
+    sqlx::query_as::<_, (String, String)>(audited_sql(format!(
         "SELECT ctid::text, xmin::text FROM {schema}.{table}"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("read ring-state row identity")
@@ -4082,7 +4089,7 @@ async fn test_idle_ring_rotation_skips_without_ring_state_churn() {
         "lease_ring_state",
         "claim_ring_state",
     ] {
-        sqlx::query(&format!("VACUUM {schema}.{table}"))
+        sqlx::query(audited_sql(format!("VACUUM {schema}.{table}")))
             .execute(&pool)
             .await
             .expect("vacuum ring-state table");
@@ -4441,10 +4448,10 @@ async fn test_ring_rotation_ledger_append_is_a_generation_cas() {
     assert_eq!((current_slot, generation), (0, 0), "genesis cursor");
 
     // First appender wins generation 1 at slot 1 (= 1 mod 4).
-    let winner = sqlx::query(&format!(
+    let winner = sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.queue_ring_rotations (generation, slot) \
          VALUES (1, 1) ON CONFLICT (generation) DO NOTHING"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("winning rotation append");
@@ -4459,10 +4466,10 @@ async fn test_ring_rotation_ledger_append_is_a_generation_cas() {
     // the generation PK and writes nothing — the lost race rotate maps to
     // SkippedBusy. Even a different target slot cannot double-advance the
     // generation.
-    let loser = sqlx::query(&format!(
+    let loser = sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.queue_ring_rotations (generation, slot) \
          VALUES (1, 2) ON CONFLICT (generation) DO NOTHING"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("losing rotation append");
@@ -4492,11 +4499,11 @@ async fn test_ring_rotation_ledger_append_is_a_generation_cas() {
 /// Force a schema into compat ('columns') authority, simulating a rolling
 /// upgrade where the ledgers were seeded but the fleet has not yet flipped.
 async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) {
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.ring_cursor_authority SET authority = $1, \
          flipped_at = CASE WHEN $1 = 'ledger' THEN now() ELSE NULL END \
          WHERE singleton"
-    ))
+    )))
     .bind(authority)
     .execute(pool)
     .await
@@ -4507,7 +4514,7 @@ async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) 
     // those columns from the ledger after moving authority back to columns.
     if authority == "columns" {
         for ring in ["queue", "lease", "claim"] {
-            sqlx::query(&format!(
+            sqlx::query(audited_sql(format!(
                 "UPDATE {schema}.{ring}_ring_state AS state \
                  SET current_slot = cursor.slot, generation = cursor.generation \
                  FROM ( \
@@ -4516,7 +4523,7 @@ async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) 
                      ORDER BY generation DESC LIMIT 1 \
                  ) AS cursor \
                  WHERE state.singleton"
-            ))
+            )))
             .execute(pool)
             .await
             .expect("restore compat cursor from ledger");
@@ -4525,9 +4532,9 @@ async fn set_ring_authority(pool: &sqlx::PgPool, schema: &str, authority: &str) 
 }
 
 async fn ring_authority(pool: &sqlx::PgPool, schema: &str) -> String {
-    sqlx::query_scalar::<_, String>(&format!(
+    sqlx::query_scalar::<_, String>(audited_sql(format!(
         "SELECT authority FROM {schema}.ring_cursor_authority WHERE singleton"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("read ring authority")
@@ -4535,9 +4542,9 @@ async fn ring_authority(pool: &sqlx::PgPool, schema: &str) -> String {
 
 /// The compat-authority cursor: the mutable singleton columns.
 async fn ring_columns_cursor(pool: &sqlx::PgPool, schema: &str, ring: &str) -> (i32, i64) {
-    sqlx::query_as::<_, (i32, i64)>(&format!(
+    sqlx::query_as::<_, (i32, i64)>(audited_sql(format!(
         "SELECT current_slot, generation FROM {schema}.{ring}_ring_state WHERE singleton"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .expect("read ring columns cursor")
@@ -4557,7 +4564,7 @@ async fn insert_flip_test_runtime(
     } else {
         "now()"
     };
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO awa.runtime_instances ( \
             instance_id, hostname, pid, version, binary_version, \
             storage_capability, transition_role, started_at, last_seen_at, \
@@ -4569,7 +4576,7 @@ async fn insert_flip_test_runtime(
             'queue_storage', 'queue_storage_target', now() - interval '1 minute', {last_seen}, \
             1000, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, NULL, '[]'::jsonb \
          )"
-    ))
+    )))
     .bind(id)
     .bind(binary_version)
     .execute(pool)
@@ -4658,9 +4665,9 @@ async fn test_compat_mode_reconciles_externally_casd_columns() {
 
     // Simulate a live 0.6 rotator advancing the columns twice WITHOUT
     // touching the ledger (raw SQL, exactly the pre-#371 write path).
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_ring_state SET current_slot = 2, generation = 2 WHERE singleton"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("simulate 0.6 external CAS");
@@ -4731,9 +4738,9 @@ async fn test_flip_reconciles_ledgers_and_fences_old_cursor_updates() {
         ("lease", 1, 3_i64),
         ("claim", 2, 2_i64),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             "UPDATE {schema}.{ring}_ring_state SET current_slot = $1, generation = $2 WHERE singleton"
-        ))
+        )))
         .bind(slot)
         .bind(generation)
         .execute(&pool)
@@ -4777,9 +4784,9 @@ async fn test_flip_reconciles_ledgers_and_fences_old_cursor_updates() {
             "{ring} compat cursor poisoned at flip"
         );
     }
-    let initialized_queue_slots: i64 = sqlx::query_scalar(&format!(
+    let initialized_queue_slots: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.queue_ring_slots WHERE generation >= 0"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count legacy queue prune candidates");
@@ -4791,9 +4798,9 @@ async fn test_flip_reconciles_ledgers_and_fences_old_cursor_updates() {
     // This is the exact cursor mutation shape used by the pre-ledger
     // rotator. The -1 sentinel alone would let it compute and persist slot
     // zero; the trigger must reject that write once authority is ledger.
-    let old_rotate = sqlx::query(&format!(
+    let old_rotate = sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_ring_state SET current_slot = 0, generation = 0 WHERE singleton"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect_err("old-style cursor advance must be fenced after the flip");
@@ -4997,10 +5004,10 @@ async fn test_terminal_rollup_delta_fold_defers_under_pinned_horizon() {
     assert!(!outcome.skipped_mvcc_pinned);
     assert_eq!(outcome.folded_delta_rows, 1);
     assert_eq!(pruned_delta_row_count(&pool, schema, queue).await, 0);
-    let folded: i64 = sqlx::query_scalar::<_, i64>(&format!(
+    let folded: i64 = sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint \
          FROM {schema}.queue_terminal_rollups WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -5291,9 +5298,9 @@ async fn test_legacy_zero_deadline_claim_conversion_error_rolls_back() {
     )
     .await;
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.ready_entries SET payload = '{{\"metadata\":\"bad\"}}'::jsonb WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .execute(&pool)
     .await
@@ -5309,9 +5316,9 @@ async fn test_legacy_zero_deadline_claim_conversion_error_rolls_back() {
         "failed conversion must not leave an unrescueable legacy zero-deadline lease"
     );
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.ready_entries SET payload = '{{}}'::jsonb WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .execute(&pool)
     .await
@@ -5358,9 +5365,9 @@ async fn test_legacy_zero_deadline_claim_without_receipts_succeeds() {
         "legacy non-receipts claims must not carry receipt identities"
     );
 
-    let deadline_at: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
+    let deadline_at: Option<DateTime<Utc>> = sqlx::query_scalar(audited_sql(format!(
         "SELECT deadline_at FROM {schema}.leases WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -5388,18 +5395,20 @@ async fn test_legacy_zero_deadline_claim_without_receipts_succeeds() {
 async fn test_lease_claim_migration_preserves_rows() {
     let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_claim_migration";
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .expect("drop schema");
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    sqlx::query(audited_sql(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .expect("drop schema");
+    sqlx::query(audited_sql(format!("CREATE SCHEMA {schema}")))
         .execute(&pool)
         .await
         .expect("create schema");
 
     // Stand up the legacy regular-table shape so the migration path
     // runs on `prepare_schema`.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         CREATE TABLE {schema}.lease_claims (
             job_id BIGINT NOT NULL,
@@ -5418,12 +5427,12 @@ async fn test_lease_claim_migration_preserves_rows() {
             PRIMARY KEY (job_id, run_lease)
         )
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("legacy lease_claims");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         CREATE TABLE {schema}.lease_claim_closures (
             job_id BIGINT NOT NULL,
@@ -5433,13 +5442,13 @@ async fn test_lease_claim_migration_preserves_rows() {
             PRIMARY KEY (job_id, run_lease)
         )
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("legacy lease_claim_closures");
 
     for job_id in 1..=5_i64 {
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             r#"
             INSERT INTO {schema}.lease_claims
                 (job_id, run_lease, ready_slot, ready_generation, queue,
@@ -5448,20 +5457,20 @@ async fn test_lease_claim_migration_preserves_rows() {
             VALUES ($1, 1, 0, 0, 'legacy', 2, 1, 25, $1, ($1 % 2)::smallint,
                     now(), NULL, TIMESTAMPTZ '2030-01-01 00:00:00+00')
             "#
-        ))
+        )))
         .bind(job_id)
         .execute(&pool)
         .await
         .expect("seed lease_claims row");
     }
     for job_id in [1_i64, 2] {
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             r#"
             INSERT INTO {schema}.lease_claim_closures
                 (job_id, run_lease, outcome, closed_at)
             VALUES ($1, 1, 'completed', now())
             "#
-        ))
+        )))
         .bind(job_id)
         .execute(&pool)
         .await
@@ -5531,16 +5540,16 @@ async fn test_lease_claim_migration_preserves_rows() {
 
     // All pre-existing rows landed in the current claim slot (the
     // max-generation ledger row, #371).
-    let current_slot: i32 = sqlx::query_scalar(&format!(
+    let current_slot: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT slot FROM {schema}.claim_ring_rotations ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read current slot");
 
-    let claims_count: i64 = sqlx::query_scalar(&format!(
+    let claims_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claims WHERE claim_slot = $1"
-    ))
+    )))
     .bind(current_slot)
     .fetch_one(&pool)
     .await
@@ -5550,7 +5559,7 @@ async fn test_lease_claim_migration_preserves_rows() {
         "all 5 legacy claim rows must migrate into current_slot"
     );
 
-    let preserved_claim_shape: (i16, bool) = sqlx::query_as(&format!(
+    let preserved_claim_shape: (i16, bool) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT enqueue_shard,
                deadline_at = TIMESTAMPTZ '2030-01-01 00:00:00+00'
@@ -5558,15 +5567,15 @@ async fn test_lease_claim_migration_preserves_rows() {
         WHERE job_id = 3
           AND run_lease = 1
         "#
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read migrated claim metadata");
     assert_eq!(preserved_claim_shape, (1, true));
 
-    let closures_count: i64 = sqlx::query_scalar(&format!(
+    let closures_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures WHERE claim_slot = $1"
-    ))
+    )))
     .bind(current_slot)
     .fetch_one(&pool)
     .await
@@ -5583,11 +5592,12 @@ async fn test_lease_claim_migration_preserves_rows() {
         .await
         .expect("prepare_schema idempotent after migration");
 
-    let claims_count_after: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims"))
-            .fetch_one(&pool)
-            .await
-            .expect("count claims after idempotent call");
+    let claims_count_after: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.lease_claims"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count claims after idempotent call");
     assert_eq!(
         claims_count_after, 5,
         "idempotent prepare must not duplicate"
@@ -6366,9 +6376,9 @@ async fn test_queue_storage_custom_metadata_completion_uses_wide_terminal_row() 
     );
     assert_eq!(completed_terminal_count(&pool, &store, queue).await, 1);
 
-    let metadata: serde_json::Value = sqlx::query_scalar(&format!(
+    let metadata: serde_json::Value = sqlx::query_scalar(audited_sql(format!(
         "SELECT payload->'metadata' FROM {schema}.terminal_jobs WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -6927,8 +6937,8 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
 
     // Verify deadline_at landed on the compact claim batch and that no
     // per-job lease_claims row was written.
-    let deadline_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(&format!(
-        "SELECT deadline_at FROM {schema}.lease_claim_batches WHERE batch_id = $1"
+    let deadline_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(audited_sql(
+        format!("SELECT deadline_at FROM {schema}.lease_claim_batches WHERE batch_id = $1"),
     ))
     .bind(claimed[0].claim.claim_batch_id)
     .fetch_one(&pool)
@@ -6938,9 +6948,9 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
         deadline_at.is_some(),
         "deadline_at must be set on the claim batch when deadline_duration > 0"
     );
-    let row_claims: i64 = sqlx::query_scalar(&format!(
+    let row_claims: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.lease_claims"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count lease_claims");
@@ -6949,11 +6959,11 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
         "deadline-backed claims must not write row-local lease_claims rows"
     );
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.lease_claim_batches \
          SET deadline_at = clock_timestamp() - interval '1 millisecond' \
          WHERE batch_id = $1"
-    ))
+    )))
     .bind(claimed[0].claim.claim_batch_id)
     .execute(&pool)
     .await
@@ -6968,10 +6978,10 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
 
     // Closure evidence is compact: a lease_claim_closure_batches row with
     // outcome='deadline_expired' covering the member's receipt_id.
-    let outcome: String = sqlx::query_scalar(&format!(
+    let outcome: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT outcome FROM {schema}.lease_claim_closure_batches \
          WHERE receipt_ranges @> $1::bigint"
-    ))
+    )))
     .bind(claimed[0].claim.receipt_id)
     .fetch_one(&pool)
     .await
@@ -6986,9 +6996,9 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
         .expect("claim after promote should succeed");
     let reclaimed = if reclaimed.is_empty() {
         // The rescued row lands in deferred_jobs with backoff; promote it.
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             "UPDATE {schema}.deferred_jobs SET run_at = clock_timestamp() WHERE job_id = $1"
-        ))
+        )))
         .bind(job_id)
         .execute(&pool)
         .await
@@ -7094,7 +7104,7 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
         .await
         .expect("complete first receipt job");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         UPDATE {schema}.lease_claim_batches
         SET deadline_at = CASE
@@ -7103,7 +7113,7 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
         END
         WHERE batch_id IN ($1, $2)
         "#
-    ))
+    )))
     .bind(first_batch)
     .bind(second_batch)
     .execute(&pool)
@@ -7119,9 +7129,9 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
         "terminal evidence should close the expired first claim and the future second claim must not be rescued"
     );
 
-    let cursor_batch: i64 = sqlx::query_scalar(&format!(
+    let cursor_batch: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT batch_deadline_cursor_batch_id FROM {schema}.claim_ring_slots WHERE slot = $1"
-    ))
+    )))
     .bind(claimed[0].claim.claim_slot)
     .fetch_one(&pool)
     .await
@@ -7131,11 +7141,11 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
         "batch deadline cursor should advance past the completed batch instead of rechecking it forever"
     );
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.lease_claim_batches \
          SET deadline_at = clock_timestamp() - interval '1 second' \
          WHERE batch_id = $1"
-    ))
+    )))
     .bind(second_batch)
     .execute(&pool)
     .await
@@ -7150,9 +7160,9 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
 
     // Compact members close compactly: rescue writes a
     // lease_claim_closure_batches row, never a row-local closure.
-    let row_closures: i64 = sqlx::query_scalar(&format!(
+    let row_closures: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.lease_claim_closures"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count receipt closures");
@@ -7160,9 +7170,9 @@ async fn test_queue_storage_receipt_deadline_rescue_cursor_advances_over_termina
         row_closures, 0,
         "compact members must not write row-local closures"
     );
-    let expired_closures: i64 = sqlx::query_scalar(&format!(
+    let expired_closures: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.lease_claim_closure_batches WHERE outcome = 'deadline_expired'"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count deadline_expired closure batches");
@@ -7214,10 +7224,10 @@ async fn test_queue_storage_compact_deadline_claim_completes_normally() {
         .await
         .expect("complete deadline-backed compact claim");
 
-    let completed: String = sqlx::query_scalar(&format!(
+    let completed: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT outcome FROM {schema}.lease_claim_closure_batches \
          WHERE receipt_ranges @> $1::bigint"
-    ))
+    )))
     .bind(claimed[0].claim.receipt_id)
     .fetch_one(&pool)
     .await
@@ -7226,9 +7236,9 @@ async fn test_queue_storage_compact_deadline_claim_completes_normally() {
 
     // Rescue must not touch the completed member even after the deadline
     // passes: closure evidence wins.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.lease_claim_batches SET deadline_at = clock_timestamp() - interval '1 second'"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("expire completed batch deadline");
@@ -7243,7 +7253,7 @@ async fn test_queue_storage_compact_deadline_claim_completes_normally() {
 
     // Claim-prune count proof shape: claims (rows + batch members) must
     // equal closures (explicit + compact closed_count).
-    let (claims_total, closures_total): (i64, i64) = sqlx::query_as(&format!(
+    let (claims_total, closures_total): (i64, i64) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT
             (SELECT count(*)::bigint FROM {schema}.lease_claims)
@@ -7251,7 +7261,7 @@ async fn test_queue_storage_compact_deadline_claim_completes_normally() {
             (SELECT count(*)::bigint FROM {schema}.lease_claim_closures)
             + (SELECT COALESCE(sum(closed_count), 0)::bigint FROM {schema}.lease_claim_closure_batches)
         "#
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count claim/closure totals");
@@ -7337,9 +7347,9 @@ async fn test_queue_storage_compact_deadline_partial_batch_rescues_only_expired_
         .await
         .expect("complete one member of the deadline batch");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.lease_claim_batches SET deadline_at = clock_timestamp() - interval '1 second'"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("expire shared batch deadline");
@@ -7351,17 +7361,17 @@ async fn test_queue_storage_compact_deadline_partial_batch_rescues_only_expired_
     assert_eq!(rescued.len(), 1, "only the open member is rescued");
     assert_eq!(rescued[0].id, second);
 
-    let completed_outcome: String = sqlx::query_scalar(&format!(
+    let completed_outcome: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT outcome FROM {schema}.lease_claim_closure_batches WHERE receipt_ranges @> $1::bigint"
-    ))
+    )))
     .bind(completed_entry.claim.receipt_id)
     .fetch_one(&pool)
     .await
     .expect("completed member closure");
     assert_eq!(completed_outcome, "completed");
-    let expired_outcome: String = sqlx::query_scalar(&format!(
+    let expired_outcome: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT outcome FROM {schema}.lease_claim_closure_batches WHERE receipt_ranges @> $1::bigint"
-    ))
+    )))
     .bind(open_entry.claim.receipt_id)
     .fetch_one(&pool)
     .await
@@ -7369,9 +7379,9 @@ async fn test_queue_storage_compact_deadline_partial_batch_rescues_only_expired_
     assert_eq!(expired_outcome, "deadline_expired");
 
     // Cursor advances past the batch once every member is closed.
-    let cursor_batch: i64 = sqlx::query_scalar(&format!(
+    let cursor_batch: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT batch_deadline_cursor_batch_id FROM {schema}.claim_ring_slots WHERE slot = $1"
-    ))
+    )))
     .bind(open_entry.claim.claim_slot)
     .fetch_one(&pool)
     .await
@@ -7382,7 +7392,7 @@ async fn test_queue_storage_compact_deadline_partial_batch_rescues_only_expired_
         "batch deadline cursor should advance past the fully-closed batch"
     );
 
-    let (claims_total, closures_total): (i64, i64) = sqlx::query_as(&format!(
+    let (claims_total, closures_total): (i64, i64) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT
             (SELECT count(*)::bigint FROM {schema}.lease_claims)
@@ -7390,7 +7400,7 @@ async fn test_queue_storage_compact_deadline_partial_batch_rescues_only_expired_
             (SELECT count(*)::bigint FROM {schema}.lease_claim_closures)
             + (SELECT COALESCE(sum(closed_count), 0)::bigint FROM {schema}.lease_claim_closure_batches)
         "#
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count claim/closure totals");
@@ -7444,14 +7454,14 @@ async fn test_queue_storage_legacy_row_deadline_claim_still_rescued() {
     // row-local lease_claims row with an (already expired) deadline and no
     // batch row — exactly what in-flight deadline claims look like when a
     // 0.6 node wrote them just before the upgrade landed.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DELETE FROM {schema}.lease_claim_batches WHERE batch_id = $1"
-    ))
+    )))
     .bind(entry.claim.claim_batch_id)
     .execute(&pool)
     .await
     .expect("remove compact batch row");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.lease_claims (
             claim_slot, receipt_id, job_id, run_lease, ready_slot,
@@ -7462,7 +7472,7 @@ async fn test_queue_storage_legacy_row_deadline_claim_still_rescued() {
             clock_timestamp() - interval '1 second'
         )
         "#
-    ))
+    )))
     .bind(entry.claim.claim_slot)
     .bind(entry.claim.receipt_id)
     .bind(entry.job.id)
@@ -7486,9 +7496,9 @@ async fn test_queue_storage_legacy_row_deadline_claim_still_rescued() {
     assert_eq!(rescued.len(), 1);
     assert_eq!(rescued[0].id, job_id);
 
-    let outcome: String = sqlx::query_scalar(&format!(
+    let outcome: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT outcome FROM {schema}.lease_claim_closures WHERE job_id = $1 AND run_lease = $2"
-    ))
+    )))
     .bind(job_id)
     .bind(entry.job.run_lease)
     .fetch_one(&pool)
@@ -7542,9 +7552,9 @@ async fn test_queue_storage_expired_deadline_batch_blocks_prune_until_rescued() 
         RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
         other => panic!("expected rotate to slot 1, got {other:?}"),
     }
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.lease_claim_batches SET deadline_at = clock_timestamp() - interval '1 second'"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("expire sealed-slot batch deadline");
@@ -7584,7 +7594,7 @@ async fn test_queue_storage_expired_deadline_batch_blocks_prune_until_rescued() 
         other => panic!("expected Pruned {{ slot: 0 }}, got {other:?}"),
     }
 
-    let (cursor_deadline_reset, cursor_batch): (bool, i64) = sqlx::query_as(&format!(
+    let (cursor_deadline_reset, cursor_batch): (bool, i64) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT
             batch_deadline_cursor_deadline_at = '-infinity'::timestamptz,
@@ -7592,7 +7602,7 @@ async fn test_queue_storage_expired_deadline_batch_blocks_prune_until_rescued() 
         FROM {schema}.claim_ring_slots
         WHERE slot = 0
         "#
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read batch deadline cursor after prune");
@@ -7702,12 +7712,12 @@ async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_w
     )
     .await;
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
         VALUES ($1, $2, clock_timestamp(), clock_timestamp())
         "#
-    ))
+    )))
     .bind(job_b)
     .bind(claim_b.job.run_lease)
     .execute(&pool)
@@ -7730,13 +7740,13 @@ async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_w
         "fresh heartbeat on job B must not prevent rescuing stale job C"
     );
 
-    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(&format!(
+    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT rescue_cursor_claimed_at, rescue_cursor_job_id, rescue_cursor_run_lease
         FROM {schema}.claim_ring_slots
         WHERE slot = $1
         "#
-    ))
+    )))
     .bind(claim_a.claim.claim_slot)
     .fetch_one(&pool)
     .await
@@ -7747,14 +7757,14 @@ async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_w
         "fresh job B must not pin the sweep cursor ahead of stale job C"
     );
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         UPDATE {schema}.attempt_state
         SET heartbeat_at = clock_timestamp() - interval '300 seconds',
             updated_at = clock_timestamp()
         WHERE job_id = $1 AND run_lease = $2
         "#
-    ))
+    )))
     .bind(job_b)
     .bind(claim_b.job.run_lease)
     .execute(&pool)
@@ -7771,13 +7781,13 @@ async fn test_queue_storage_receipt_rescue_cursor_sweeps_past_fresh_claims_and_w
         "second rescue should wrap and close the formerly fresh claim"
     );
 
-    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(&format!(
+    let cursor: (DateTime<Utc>, i64, i64) = sqlx::query_as(audited_sql(format!(
         r#"
         SELECT rescue_cursor_claimed_at, rescue_cursor_job_id, rescue_cursor_run_lease
         FROM {schema}.claim_ring_slots
         WHERE slot = $1
         "#
-    ))
+    )))
     .bind(claim_a.claim.claim_slot)
     .fetch_one(&pool)
     .await
@@ -8165,7 +8175,7 @@ async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rota
         ),
         other => panic!("expected idle lease ring before materialization, got {other:?}"),
     }
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.lease_ring_rotations (generation, slot)
         SELECT cursor.generation + 1,
@@ -8179,13 +8189,13 @@ async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rota
         ) AS cursor
         WHERE state.singleton = TRUE
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance lease ring cursor for materialization regression setup");
-    let rotated_lease_slot: i32 = sqlx::query_scalar(&format!(
+    let rotated_lease_slot: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT slot FROM {schema}.lease_ring_rotations ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("read advanced lease ring cursor");
@@ -8203,9 +8213,9 @@ async fn test_queue_storage_completes_materialized_receipt_after_lease_ring_rota
         )
         .await
         .expect("register callback and materialize receipt claim");
-    let materialized_lease_slot: i32 = sqlx::query_scalar(&format!(
+    let materialized_lease_slot: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT lease_slot FROM {schema}.leases WHERE job_id = $1 AND run_lease = $2"
-    ))
+    )))
     .bind(claimed[0].job.id)
     .bind(claimed[0].job.run_lease)
     .fetch_one(&pool)
@@ -8573,11 +8583,11 @@ async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence
     assert_eq!(claimed[0].claim.lane_seq, 1);
 
     let claim_cursor = || async {
-        sqlx::query_scalar::<_, i64>(&format!(
+        sqlx::query_scalar::<_, i64>(audited_sql(format!(
             "SELECT {schema}.sequence_next_value(seq_name)
              FROM {schema}.queue_claim_heads
              WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
-        ))
+        )))
         .bind(queue)
         .bind(2_i16)
         .bind(0_i16)
@@ -8588,9 +8598,9 @@ async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence
     assert_eq!(claim_cursor().await, 2);
 
     let mut tx = pool.begin().await.expect("begin enqueue reservation");
-    let reserved: i64 = sqlx::query_scalar(&format!(
+    let reserved: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(2_i16)
     .bind(0_i16)
@@ -8654,11 +8664,11 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
     assert_eq!(claimed[0].claim.lane_seq, 1);
 
     let claim_cursor = || async {
-        sqlx::query_scalar::<_, i64>(&format!(
+        sqlx::query_scalar::<_, i64>(audited_sql(format!(
             "SELECT {schema}.sequence_next_value(seq_name)
              FROM {schema}.queue_claim_heads
              WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
-        ))
+        )))
         .bind(queue)
         .bind(2_i16)
         .bind(0_i16)
@@ -8669,9 +8679,9 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
     assert_eq!(claim_cursor().await, 2);
 
     let mut reservation_tx = pool.begin().await.expect("begin enqueue reservation");
-    let reserved: i64 = sqlx::query_scalar(&format!(
+    let reserved: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(2_i16)
     .bind(0_i16)
@@ -8689,9 +8699,9 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
     let later = tokio::spawn(async move {
         let mut tx = later_pool.begin().await.expect("begin later enqueue");
         later_started_task.notify_one();
-        let lane_seq: i64 = sqlx::query_scalar(&format!(
+        let lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
             "SELECT {later_schema}.reserve_enqueue_seq($1, $2, $3, $4)"
-        ))
+        )))
         .bind(&later_queue)
         .bind(2_i16)
         .bind(0_i16)
@@ -8700,23 +8710,23 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
         .await
         .expect("reserve later enqueue sequence");
 
-        let job_id: i64 = sqlx::query_scalar(&format!(
+        let job_id: i64 = sqlx::query_scalar(audited_sql(format!(
             "SELECT nextval('{later_schema}.job_id_seq'::regclass)::bigint"
-        ))
+        )))
         .fetch_one(tx.as_mut())
         .await
         .expect("allocate later job id");
-        let (ready_slot, ready_generation): (i32, i64) = sqlx::query_as(&format!(
+        let (ready_slot, ready_generation): (i32, i64) = sqlx::query_as(audited_sql(format!(
             "SELECT slot, generation
              FROM {later_schema}.queue_ring_rotations
              ORDER BY generation DESC
              LIMIT 1"
-        ))
+        )))
         .fetch_one(tx.as_mut())
         .await
         .expect("current queue ring");
 
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             r#"
             INSERT INTO {later_schema}.ready_entries (
                 ready_slot, ready_generation, job_id, kind, queue, args,
@@ -8731,7 +8741,7 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
                 NULL, NULL, '{{}}'::jsonb
             )
             "#
-        ))
+        )))
         .bind(ready_slot)
         .bind(ready_generation)
         .bind(job_id)
@@ -8741,7 +8751,7 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
         .await
         .expect("insert later ready row");
 
-        sqlx::query(&format!(
+        sqlx::query(audited_sql(format!(
             r#"
             INSERT INTO {later_schema}.ready_segments (
                 ready_slot, ready_generation, queue, priority, enqueue_shard,
@@ -8749,7 +8759,7 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
             )
             VALUES ($1, $2, $3, 2, 0, $4, $4 + 1, clock_timestamp())
             "#
-        ))
+        )))
         .bind(ready_slot)
         .bind(ready_generation)
         .bind(&later_queue)
@@ -8834,11 +8844,11 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .await;
 
     let claim_cursor = || async {
-        sqlx::query_scalar::<_, i64>(&format!(
+        sqlx::query_scalar::<_, i64>(audited_sql(format!(
             "SELECT {schema}.sequence_next_value(seq_name)
              FROM {schema}.queue_claim_heads
              WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
-        ))
+        )))
         .bind(queue)
         .bind(2_i16)
         .bind(0_i16)
@@ -8846,11 +8856,11 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         .await
         .expect("claim cursor")
     };
-    let claim_seq_name: String = sqlx::query_scalar(&format!(
+    let claim_seq_name: String = sqlx::query_scalar(audited_sql(format!(
         "SELECT seq_name
          FROM {schema}.queue_claim_heads
          WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
-    ))
+    )))
     .bind(queue)
     .bind(2_i16)
     .bind(0_i16)
@@ -8858,10 +8868,10 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .await
     .expect("claim sequence name");
 
-    let first: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+    let first: Vec<RawReceiptClaimRow> = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(1_i64)
     .bind(0.0_f64)
@@ -8889,7 +8899,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         "raw claim intentionally leaves the post-commit claim cursor advance unsent"
     );
 
-    let claim_attempt_batches: i64 = sqlx::query_scalar(&format!(
+    let claim_attempt_batches: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT COALESCE(sum(claimed_count), 0)::bigint
          FROM {schema}.ready_claim_attempt_batches
          WHERE ready_slot = $1
@@ -8901,7 +8911,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
            AND first_lane_seq <= $7
            AND next_lane_seq > $7
            AND lane_ranges @> int8range($7, $7 + 1, '[)')"
-    ))
+    )))
     .bind(first[0].ready_slot)
     .bind(first[0].ready_generation)
     .bind(queue)
@@ -8920,18 +8930,18 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     let mut locked_claim_child = pool.begin().await.expect("begin claim child lock");
     let claim_child = format!("{schema}.lease_claims_{}", first[0].claim_slot);
     let claim_batch_child = format!("{schema}.lease_claim_batches_{}", first[0].claim_slot);
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "LOCK TABLE {claim_child}, {claim_batch_child} IN ACCESS EXCLUSIVE MODE"
-    ))
+    )))
     .execute(locked_claim_child.as_mut())
     .await
     .expect("lock old claim child");
 
     let recovered_while_claim_child_locked = tokio::time::timeout(Duration::from_secs(2), async {
-        sqlx::query_as::<_, (i64, i64, i64, i32)>(&format!(
+        sqlx::query_as::<_, (i64, i64, i64, i32)>(audited_sql(format!(
             "SELECT job_id, run_lease, lane_seq, claim_slot
                  FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-        ))
+        )))
         .bind(queue)
         .bind(1_i64)
         .bind(0.0_f64)
@@ -8969,10 +8979,10 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         other => panic!("expected claim ring to rotate to slot 1, got {other:?}"),
     }
 
-    let second: Vec<(i64, i64, i64, i32)> = sqlx::query_as(&format!(
+    let second: Vec<(i64, i64, i64, i32)> = sqlx::query_as(audited_sql(format!(
         "SELECT job_id, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(1_i64)
     .bind(0.0_f64)
@@ -8991,7 +9001,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         "spent receipt evidence should advance the stale claim cursor over the emitted attempt"
     );
 
-    let receipt_rows: i64 = sqlx::query_scalar(&format!(
+    let receipt_rows: i64 = sqlx::query_scalar(audited_sql(format!(
         r#"
         WITH claim_items AS (
             SELECT job_id, run_lease
@@ -9008,7 +9018,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         )
         SELECT count(*)::bigint FROM claim_items
         "#
-    ))
+    )))
     .bind(job_id)
     .bind(1_i64)
     .fetch_one(&pool)
@@ -9034,10 +9044,10 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         .await
         .expect("reset claim cursor for closed-receipt phase");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome)
          VALUES ($1, $2, $3, 'completed')"
-    ))
+    )))
     .bind(0_i32)
     .bind(job_id)
     .bind(1_i64)
@@ -9045,10 +9055,10 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .await
     .expect("close first receipt");
 
-    let after_closure: Vec<(i64, i64, i64, i32)> = sqlx::query_as(&format!(
+    let after_closure: Vec<(i64, i64, i64, i32)> = sqlx::query_as(audited_sql(format!(
         "SELECT job_id, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(1_i64)
     .bind(0.0_f64)
@@ -9095,11 +9105,11 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         .await
         .expect("complete through compact receipt batch");
 
-    let compact_terminal_batches: i64 = sqlx::query_scalar(&format!(
+    let compact_terminal_batches: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint
          FROM {schema}.receipt_completion_batches
          WHERE job_ids @> ARRAY[$1]::bigint[]"
-    ))
+    )))
     .bind(compact_job_id)
     .fetch_one(&pool)
     .await
@@ -9118,31 +9128,31 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         .await
         .expect("reset claim cursor for compact terminal-evidence phase");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DELETE FROM {schema}.lease_claim_closure_batches
          WHERE claim_slot = $1"
-    ))
+    )))
     .bind(compact_claim_slot)
     .execute(&pool)
     .await
     .expect("remove compact claim-ring closure evidence");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DELETE FROM {schema}.lease_claim_closures WHERE job_id = $1 AND run_lease = $2"
-    ))
+    )))
     .bind(compact_job_id)
     .bind(compact_run_lease)
     .execute(&pool)
     .await
     .expect("remove explicit closure evidence");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DELETE FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2"
-    ))
+    )))
     .bind(compact_job_id)
     .bind(compact_run_lease)
     .execute(&pool)
     .await
     .expect("remove claim evidence");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         DELETE FROM {schema}.lease_claim_batches AS claim_batches
         WHERE EXISTS (
@@ -9151,14 +9161,14 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
             WHERE items.job_id = $1 AND items.run_lease = $2
         )
         "#
-    ))
+    )))
     .bind(compact_job_id)
     .bind(compact_run_lease)
     .execute(&pool)
     .await
     .expect("remove compact claim evidence");
 
-    let remaining_attempt_batches: i64 = sqlx::query_scalar(&format!(
+    let remaining_attempt_batches: i64 = sqlx::query_scalar(audited_sql(format!(
         r#"
         SELECT count(*)::bigint
         FROM {schema}.ready_claim_attempt_batches
@@ -9172,7 +9182,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
           AND next_lane_seq > $7
           AND lane_ranges @> int8range($7, $7 + 1, '[)')
         "#
-    ))
+    )))
     .bind(compact_claimed[0].claim.ready_slot)
     .bind(compact_claimed[0].claim.ready_generation)
     .bind(queue)
@@ -9188,10 +9198,10 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
         "ready-claim-attempt evidence must remain until the ready slot is pruned with ready_entries"
     );
 
-    let after_receipt_prune: Vec<(i64, i64, i64, i32)> = sqlx::query_as(&format!(
+    let after_receipt_prune: Vec<(i64, i64, i64, i32)> = sqlx::query_as(audited_sql(format!(
         "SELECT job_id, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(1_i64)
     .bind(0.0_f64)
@@ -9250,11 +9260,11 @@ async fn test_queue_storage_receipt_multi_row_claim_dedupes_when_cursor_advance_
     }
 
     let claim_cursor = || async {
-        sqlx::query_scalar::<_, i64>(&format!(
+        sqlx::query_scalar::<_, i64>(audited_sql(format!(
             "SELECT {schema}.sequence_next_value(seq_name)
              FROM {schema}.queue_claim_heads
              WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
-        ))
+        )))
         .bind(queue)
         .bind(2_i16)
         .bind(0_i16)
@@ -9266,10 +9276,10 @@ async fn test_queue_storage_receipt_multi_row_claim_dedupes_when_cursor_advance_
     // Raw claim of the whole lane in one batch; calling the SQL function
     // directly leaves the post-commit claim cursor advance unsent, exactly
     // as a worker crash between commit and advance would.
-    let first: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+    let first: Vec<RawReceiptClaimRow> = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(batch_len)
     .bind(0.0_f64)
@@ -9297,7 +9307,7 @@ async fn test_queue_storage_receipt_multi_row_claim_dedupes_when_cursor_advance_
 
     // The whole claimed range is durably recorded as attempt-ledger evidence,
     // so recovery can dedup every lane without the per-row probe.
-    let attempt_batch_total: i64 = sqlx::query_scalar(&format!(
+    let attempt_batch_total: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT COALESCE(sum(claimed_count), 0)::bigint
          FROM {schema}.ready_claim_attempt_batches
          WHERE ready_slot = $1
@@ -9306,7 +9316,7 @@ async fn test_queue_storage_receipt_multi_row_claim_dedupes_when_cursor_advance_
            AND priority = $4
            AND enqueue_shard = $5
            AND lane_ranges @> int8range(1, $6 + 1, '[)')"
-    ))
+    )))
     .bind(first[0].ready_slot)
     .bind(first[0].ready_generation)
     .bind(queue)
@@ -9323,10 +9333,10 @@ async fn test_queue_storage_receipt_multi_row_claim_dedupes_when_cursor_advance_
 
     // Re-claim with the stale cursor: every lane in the batch must be deduped,
     // and the cursor must advance past the whole spent range.
-    let second: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+    let second: Vec<RawReceiptClaimRow> = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(batch_len)
     .bind(0.0_f64)
@@ -9916,9 +9926,9 @@ async fn test_queue_storage_prune_waits_until_ready_tombstone_cursor_spent() {
     );
 
     let mut reader_tx = pool.begin().await.expect("begin ready reader tx");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "LOCK TABLE {schema}.ready_entries_0, {schema}.done_entries_0, {schema}.ready_tombstones_0, {schema}.receipt_completion_batches_0, {schema}.receipt_completion_tombstones_0, {schema}.queue_terminal_count_deltas_0 IN ACCESS SHARE MODE"
-    ))
+    )))
     .execute(reader_tx.as_mut())
     .await
     .expect("lock queue prune children in access share mode");
@@ -9944,10 +9954,10 @@ async fn test_queue_storage_prune_waits_until_ready_tombstone_cursor_spent() {
         .await
         .expect("release ready reader lock");
 
-    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
+    let claimed: Vec<RawReceiptClaimRow> = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
-    ))
+    )))
     .bind(queue)
     .bind(1_i64)
     .bind(0.0_f64)
@@ -9977,9 +9987,9 @@ async fn test_queue_storage_prune_waits_until_ready_tombstone_cursor_spent() {
         0,
         "queue prune should truncate tombstones with the matching ready slot"
     );
-    let ready_rows: i64 = sqlx::query_scalar(&format!(
+    let ready_rows: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -10027,9 +10037,9 @@ async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard
     )
     .await;
 
-    let ready_heads: Vec<(i16, i64)> = sqlx::query_as(&format!(
+    let ready_heads: Vec<(i16, i64)> = sqlx::query_as(audited_sql(format!(
         "SELECT enqueue_shard, lane_seq FROM {schema}.ready_entries WHERE queue = $1 ORDER BY enqueue_shard"
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -10096,7 +10106,7 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
     let schema = "awa_qs_legacy_pruned_rollup";
     let store = create_store(&pool, schema).await;
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.queue_lanes (
             queue,
@@ -10109,7 +10119,7 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
         ON CONFLICT (queue, priority) DO UPDATE
         SET pruned_completed_count = EXCLUDED.pruned_completed_count
         "#
-    ))
+    )))
     .bind(queue)
     .execute(&pool)
     .await
@@ -10126,18 +10136,18 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
         .await
         .expect("Failed to rerun queue storage schema preparation");
 
-    let legacy_lane_rollup: i64 = sqlx::query_scalar(&format!(
+    let legacy_lane_rollup: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT pruned_completed_count FROM {schema}.queue_lanes WHERE queue = $1 AND priority = 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
     .expect("Failed to read legacy lane rollup after backfill");
     assert_eq!(legacy_lane_rollup, 0);
 
-    let cold_rollup: i64 = sqlx::query_scalar(&format!(
+    let cold_rollup: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT pruned_completed_count FROM {schema}.queue_terminal_rollups WHERE queue = $1 AND priority = 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -10225,7 +10235,7 @@ async fn test_available_count_matches_ready_entries_scan() {
     ) {
         let schema = store.schema();
         // Ground-truth scan — same available-row predicate as the exact API.
-        let scan: i64 = sqlx::query_scalar(&format!(
+        let scan: i64 = sqlx::query_scalar(audited_sql(format!(
             "SELECT count(*)::bigint
              FROM {schema}.ready_entries AS ready
              JOIN {schema}.queue_claim_heads AS claims
@@ -10244,7 +10254,7 @@ async fn test_available_count_matches_ready_entries_scan() {
                      AND tomb.enqueue_shard = ready.enqueue_shard
                      AND tomb.lane_seq = ready.lane_seq
                )"
-        ))
+        )))
         .bind(queue)
         .fetch_one(pool)
         .await
@@ -10266,7 +10276,7 @@ async fn test_available_count_matches_ready_entries_scan() {
         // asserts a never-undercount invariant on the hot-path
         // approximation, which is allowed to drift up by the number
         // of mid-ring deletes since the last claim on that lane.
-        let derived_approx: i64 = sqlx::query_scalar(&format!(
+        let derived_approx: i64 = sqlx::query_scalar(audited_sql(format!(
             "SELECT COALESCE(
                 sum(GREATEST(
                     {schema}.sequence_next_value(qe.seq_name)
@@ -10281,7 +10291,7 @@ async fn test_available_count_matches_ready_entries_scan() {
               AND qc.priority = qe.priority
               AND qc.enqueue_shard = qe.enqueue_shard
              WHERE qe.queue = $1"
-        ))
+        )))
         .bind(queue)
         .fetch_one(pool)
         .await
@@ -10340,7 +10350,7 @@ async fn test_available_count_matches_ready_entries_scan() {
 
     // ── checkpoint 5: cancel an available row ────────────────────────
     // Pick a still-available job at priority 2 and cancel it.
-    let candidate: i64 = sqlx::query_scalar(&format!(
+    let candidate: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT job_id
          FROM {schema}.ready_entries AS ready
          JOIN {schema}.queue_claim_heads AS claims
@@ -10352,7 +10362,7 @@ async fn test_available_count_matches_ready_entries_scan() {
            AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
          ORDER BY ready.lane_seq ASC
          LIMIT 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -10411,13 +10421,13 @@ async fn test_available_count_matches_ready_entries_scan() {
     // Same compat route in reverse. The SQL function cannot safely move the
     // non-transactional claim sequence before its caller's transaction commits,
     // so this pins the exact API count and never-undercount hot-path contract.
-    let compat_id: i64 = sqlx::query_scalar(&format!(
+    let compat_id: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT job_id
          FROM {schema}.ready_entries
          WHERE queue = $1 AND kind = 'compat_kind'
          ORDER BY lane_seq DESC
          LIMIT 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -10453,13 +10463,13 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
         .await
         .expect("Failed to enqueue striped jobs");
 
-    let physical_queues: Vec<String> = sqlx::query_scalar(&format!(
+    let physical_queues: Vec<String> = sqlx::query_scalar(audited_sql(format!(
         r#"
         SELECT DISTINCT queue
         FROM {schema}.ready_entries
         ORDER BY queue
         "#
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .expect("Failed to read physical stripe queues");
@@ -10885,11 +10895,11 @@ async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_clo
         1,
         "idempotent compact success should keep one claim-closure batch"
     );
-    let closure_batch_segment: (i32, i64, i32) = sqlx::query_as(&format!(
+    let closure_batch_segment: (i32, i64, i32) = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, ready_generation, closed_count
          FROM {schema}.lease_claim_closure_batches
          WHERE claim_slot = $1"
-    ))
+    )))
     .bind(claimed[0].claim.claim_slot)
     .fetch_one(&pool)
     .await
@@ -10903,11 +10913,11 @@ async fn test_queue_storage_compact_receipt_completion_is_idempotent_without_clo
         ),
         "compact closure batches must carry ready segment metadata for prune count proofs"
     );
-    let closure_receipt_ids: Vec<i64> = sqlx::query_scalar(&format!(
+    let closure_receipt_ids: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
         "SELECT receipt_ids
          FROM {schema}.lease_claim_closure_batches
          WHERE claim_slot = $1"
-    ))
+    )))
     .bind(claimed[0].claim.claim_slot)
     .fetch_one(&pool)
     .await
@@ -11086,10 +11096,10 @@ async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
         0,
         "fold must drain the unfolded rollup deltas"
     );
-    let folded: i64 = sqlx::query_scalar::<_, i64>(&format!(
+    let folded: i64 = sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint \
          FROM {schema}.queue_terminal_rollups WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -11144,10 +11154,10 @@ async fn test_queue_storage_prune_carries_failed_rows_inside_retention_floor() {
     }
     let carried_job_id = job_ids[1];
     let expired_job_id = job_ids[2];
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.done_entries SET finalized_at = now() - interval '2 hours' \
          WHERE job_id = $1"
-    ))
+    )))
     .bind(expired_job_id)
     .execute(&pool)
     .await
@@ -11180,9 +11190,9 @@ async fn test_queue_storage_prune_carries_failed_rows_inside_retention_floor() {
     // The fresh failed row was carried to the live slot as a wide,
     // self-contained row; the completed and expired rows are gone.
     assert_eq!(done_entries_count(&pool, schema, queue).await, 1);
-    let (carried_slot, carried_state): (i32, String) = sqlx::query_as(&format!(
+    let (carried_slot, carried_state): (i32, String) = sqlx::query_as(audited_sql(format!(
         "SELECT ready_slot, state::text FROM {schema}.done_entries WHERE job_id = $1"
-    ))
+    )))
     .bind(carried_job_id)
     .fetch_one(&pool)
     .await
@@ -11270,10 +11280,10 @@ async fn test_queue_storage_retry_failed_outcome_surfaces_pruned_rows() {
     }
     let carried_job_id = job_ids[0];
     let expired_job_id = job_ids[1];
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.done_entries SET finalized_at = now() - interval '2 hours' \
          WHERE job_id = $1"
-    ))
+    )))
     .bind(expired_job_id)
     .execute(&pool)
     .await
@@ -11459,9 +11469,9 @@ async fn test_queue_storage_prune_carry_forward_survives_retry_and_rebuild() {
     // self-contained wide rows in the live slot with intact bodies.
     assert_eq!(done_entries_count(&pool, schema, queue).await, 2);
     for &failed_id in &failed_ids {
-        let (carried_slot, carried_state): (i32, String) = sqlx::query_as(&format!(
+        let (carried_slot, carried_state): (i32, String) = sqlx::query_as(audited_sql(format!(
             "SELECT ready_slot, state::text FROM {schema}.done_entries WHERE job_id = $1"
-        ))
+        )))
         .bind(failed_id)
         .fetch_one(&pool)
         .await
@@ -11741,9 +11751,9 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         1,
         "exactly one done row after first carry"
     );
-    let first_slot: i32 = sqlx::query_scalar(&format!(
+    let first_slot: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT ready_slot FROM {schema}.done_entries WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -11760,12 +11770,12 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
     // the ring busy. After the three hops the cursor is (slot 0,
     // generation 4), which makes `oldest_initialized_ring_slot` target
     // slot 1 for the second prune.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.queue_ring_rotations (generation, slot)
         VALUES (2, 2), (3, 3), (4, 0)
         "#
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("lap queue ring cursor around to slot 0 for re-carry setup");
@@ -11792,9 +11802,9 @@ async fn test_queue_storage_prune_re_carries_failed_row_exactly_once() {
         1,
         "re-carry must not duplicate the done row"
     );
-    let second_slot: i32 = sqlx::query_scalar(&format!(
+    let second_slot: i32 = sqlx::query_scalar(audited_sql(format!(
         "SELECT ready_slot FROM {schema}.done_entries WHERE job_id = $1"
-    ))
+    )))
     .bind(job_id)
     .fetch_one(&pool)
     .await
@@ -11987,10 +11997,10 @@ async fn test_queue_terminal_count_delta_rollup_skips_empty_old_slots() {
     // are derived from the ledger. A loaded ring laps the same way; this
     // test only needs the sealed-slot bookkeeping, not the traffic that
     // would normally drive it.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.queue_ring_rotations (generation, slot) \
          SELECT g, g::int FROM generate_series(1, 21) AS g"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("advance queue ring cursor to slot 21");
@@ -11998,17 +12008,17 @@ async fn test_queue_terminal_count_delta_rollup_skips_empty_old_slots() {
     let target_slot = 20_i32;
     // Sealed-slot generation is derived from the ledger (#371): the
     // largest generation whose slot equals target_slot.
-    let target_generation: i64 = sqlx::query_scalar(&format!(
+    let target_generation: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT generation FROM {schema}.queue_ring_rotations \
          WHERE slot = $1 ORDER BY generation DESC LIMIT 1"
-    ))
+    )))
     .bind(target_slot)
     .fetch_one(&pool)
     .await
     .expect("target slot generation");
     assert!(target_generation >= 0);
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.queue_terminal_count_deltas (
             ready_slot, ready_generation, queue, priority, enqueue_shard,
@@ -12016,7 +12026,7 @@ async fn test_queue_terminal_count_delta_rollup_skips_empty_old_slots() {
         )
         VALUES ($1, $2, $3, 1, 0, 0, 7)
         "#
-    ))
+    )))
     .bind(target_slot)
     .bind(target_generation)
     .bind(queue)
@@ -12059,10 +12069,10 @@ async fn seed_terminal_rows_with_kind(
     // Insert N done_entries rows at (ready_slot=0, priority=2,
     // enqueue_shard=0). lane_seq stays unique per call by reading the
     // current max and adding rownums.
-    let next_lane_seq: i64 = sqlx::query_scalar::<_, i64>(&format!(
+    let next_lane_seq: i64 = sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT COALESCE(max(lane_seq), 0)::bigint + 1 \
          FROM {schema}.done_entries WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12073,7 +12083,7 @@ async fn seed_terminal_rows_with_kind(
     .fetch_one(pool)
     .await
     .unwrap_or(1_000_000);
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.done_entries (
             ready_slot, ready_generation, job_id, kind, queue, state,
@@ -12097,7 +12107,7 @@ async fn seed_terminal_rows_with_kind(
             '{{}}'::jsonb
         FROM generate_series(1, $6::int) AS g
         "#
-    ))
+    )))
     .bind(next_job_id)
     .bind(kind)
     .bind(queue)
@@ -12108,7 +12118,7 @@ async fn seed_terminal_rows_with_kind(
     .await
     .expect("seed done_entries");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         r#"
         INSERT INTO {schema}.queue_terminal_live_counts AS counts (
             ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
@@ -12128,7 +12138,7 @@ async fn seed_terminal_rows_with_kind(
         ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
         SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
         "#
-    ))
+    )))
     .bind(queue)
     .bind(next_job_id)
     .bind(n as i32)
@@ -12138,10 +12148,10 @@ async fn seed_terminal_rows_with_kind(
 }
 
 async fn first_failed_job_id(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT job_id FROM {schema}.done_entries \
          WHERE queue = $1 AND state = 'failed' LIMIT 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12149,10 +12159,10 @@ async fn first_failed_job_id(pool: &sqlx::PgPool, schema: &str, queue: &str) -> 
 }
 
 async fn first_cancelled_job_id(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT job_id FROM {schema}.done_entries \
          WHERE queue = $1 AND state = 'cancelled' LIMIT 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12188,9 +12198,9 @@ async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
     assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
 
-    let target_id: i64 = sqlx::query_scalar::<_, i64>(&format!(
+    let target_id: i64 = sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT job_id FROM {schema}.done_entries WHERE queue = $1 LIMIT 1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -12222,9 +12232,9 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
     // Seed 7 terminal rows with matching counter entries, then manually
     // poison the counter to simulate rollover drift.
     seed_terminal_rows(&pool, schema, queue, "completed", 7).await;
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_terminal_live_counts SET live_terminal_count = 999 WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .execute(&pool)
     .await
@@ -12284,7 +12294,7 @@ async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
     //     counter increment.
     //  2. Manually clearing the trust marker (operator hasn't yet run
     //     `awa storage rebuild-terminal-counters`).
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "INSERT INTO {schema}.done_entries (
             ready_slot, ready_generation, job_id, kind, queue, state,
             priority, attempt, run_lease, lane_seq, enqueue_shard,
@@ -12292,15 +12302,15 @@ async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
         ) VALUES (0, 1, 7000000, 'chaos_job', $1, 'completed'::awa.job_state,
                   2::smallint, 1::smallint, 1::bigint, 9999::bigint,
                   0::smallint, now(), now(), '{{}}'::jsonb)"
-    ))
+    )))
     .bind(queue)
     .execute(&pool)
     .await
     .expect("seed orphan done row");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_ring_state \
          SET terminal_counter_trusted_at = NULL WHERE singleton = TRUE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("clear trust marker");
@@ -12399,10 +12409,10 @@ async fn test_queue_terminal_counts_include_compact_receipt_batches() {
         "trusted exact counts include retained compact receipt batches directly"
     );
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_ring_state \
          SET terminal_counter_trusted_at = NULL WHERE singleton = TRUE"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("clear trust marker");
@@ -12417,9 +12427,9 @@ async fn test_queue_terminal_counts_include_compact_receipt_batches() {
         "untrusted path must count compact receipt completions via terminal_jobs"
     );
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "TRUNCATE TABLE {schema}.queue_terminal_live_counts, {schema}.queue_terminal_count_deltas"
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("clear counters before rebuild");
@@ -12446,10 +12456,10 @@ async fn test_queue_terminal_counts_include_compact_receipt_batches() {
 }
 
 async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT COALESCE(SUM(live_terminal_count), 0)::bigint \
          FROM {schema}.queue_terminal_live_counts WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12457,10 +12467,10 @@ async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
 }
 
 async fn terminal_delta_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT COALESCE(SUM(terminal_delta), 0)::bigint \
          FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12468,10 +12478,10 @@ async fn terminal_delta_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i
 }
 
 async fn terminal_delta_row_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint \
          FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12489,7 +12499,7 @@ async fn terminal_counter_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) ->
 /// same folded-plus-pending sum the production count readers do — the sum
 /// is stable across fold timing while still pinning the exact totals.
 async fn pruned_rollup_sums(pool: &sqlx::PgPool, schema: &str, queue: &str) -> (i64, i64) {
-    sqlx::query_as::<_, (i64, i64)>(&format!(
+    sqlx::query_as::<_, (i64, i64)>(audited_sql(format!(
         "SELECT
              COALESCE((
                  SELECT SUM(pruned_completed_count)
@@ -12507,7 +12517,7 @@ async fn pruned_rollup_sums(pool: &sqlx::PgPool, schema: &str, queue: &str) -> (
                  SELECT SUM(pruned_failed_delta)
                  FROM {schema}.queue_terminal_rollup_deltas WHERE queue = $1
              ), 0)::bigint"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12517,10 +12527,10 @@ async fn pruned_rollup_sums(pool: &sqlx::PgPool, schema: &str, queue: &str) -> (
 /// Number of unfolded `queue_terminal_rollup_deltas` rows for a queue
 /// (#371). Zero after a fold clears the horizon-gated deltas.
 async fn pruned_delta_row_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint \
          FROM {schema}.queue_terminal_rollup_deltas WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12528,9 +12538,9 @@ async fn pruned_delta_row_count(pool: &sqlx::PgPool, schema: &str, queue: &str) 
 }
 
 async fn done_entries_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
@@ -12681,9 +12691,9 @@ async fn backdate_one_lane_ready_job_run_at(
     job_id: i64,
     run_at: DateTime<Utc>,
 ) {
-    let updated_ready = sqlx::query(&format!(
+    let updated_ready = sqlx::query(audited_sql(format!(
         "UPDATE {schema}.ready_entries SET run_at = $1 WHERE job_id = $2"
-    ))
+    )))
     .bind(run_at)
     .bind(job_id)
     .execute(pool)
@@ -12695,7 +12705,7 @@ async fn backdate_one_lane_ready_job_run_at(
         "expected exactly one ready row for manual aging backdate"
     );
 
-    let updated_segment = sqlx::query(&format!(
+    let updated_segment = sqlx::query(audited_sql(format!(
         r#"
         WITH target AS (
             SELECT
@@ -12719,7 +12729,7 @@ async fn backdate_one_lane_ready_job_run_at(
           AND segment.first_lane_seq = target.lane_seq
           AND segment.next_lane_seq = target.lane_seq + 1
         "#
-    ))
+    )))
     .bind(run_at)
     .bind(job_id)
     .execute(pool)
@@ -12888,9 +12898,9 @@ async fn test_queue_storage_aged_completion_stays_compact_and_keeps_lane_priorit
         "both successful completions should use compact receipt batches"
     );
 
-    let stored_priority: i16 = sqlx::query_scalar(&format!(
+    let stored_priority: i16 = sqlx::query_scalar(audited_sql(format!(
         "SELECT priority FROM {schema}.terminal_jobs WHERE job_id = $1"
-    ))
+    )))
     .bind(low_id)
     .fetch_one(&pool)
     .await
@@ -12943,9 +12953,9 @@ async fn test_queue_storage_bounded_claimers_can_steal_idle_slot() {
         .expect("instance A should acquire claimer")
         .expect("instance A should get a claimer slot");
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_claimer_leases SET last_claimed_at = $1 WHERE queue = $2 AND claimer_slot = $3"
-    ))
+    )))
     .bind(Utc::now() - chrono::Duration::milliseconds(1_000))
     .bind(queue)
     .bind(lease_a.claimer_slot)
@@ -12982,9 +12992,9 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
         .expect("instance should acquire claimer")
         .expect("instance should get a claimer slot");
 
-    let before: DateTime<Utc> = sqlx::query_scalar(&format!(
+    let before: DateTime<Utc> = sqlx::query_scalar(audited_sql(format!(
         "SELECT last_claimed_at FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = $2"
-    ))
+    )))
     .bind(queue)
     .bind(lease.claimer_slot)
     .fetch_one(&pool)
@@ -13011,9 +13021,9 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
         .expect("fresh lease claim should succeed");
     assert_eq!(claimed.len(), 1);
 
-    let after_fresh: DateTime<Utc> = sqlx::query_scalar(&format!(
+    let after_fresh: DateTime<Utc> = sqlx::query_scalar(audited_sql(format!(
         "SELECT last_claimed_at FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = $2"
-    ))
+    )))
     .bind(queue)
     .bind(lease.claimer_slot)
     .fetch_one(&pool)
@@ -13024,9 +13034,9 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
         "fresh heartbeat should not rewrite queue_claimer_leases"
     );
 
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_claimer_leases SET last_claimed_at = $1 WHERE queue = $2 AND claimer_slot = $3"
-    ))
+    )))
     .bind(
         Utc::now()
             - chrono::Duration::from_std(idle_threshold + Duration::from_secs(1))
@@ -13058,9 +13068,9 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
         .expect("stale lease claim should succeed");
     assert_eq!(claimed.len(), 1);
 
-    let after_stale: DateTime<Utc> = sqlx::query_scalar(&format!(
+    let after_stale: DateTime<Utc> = sqlx::query_scalar(audited_sql(format!(
         "SELECT last_claimed_at FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = $2"
-    ))
+    )))
     .bind(queue)
     .bind(lease.claimer_slot)
     .fetch_one(&pool)
@@ -13104,9 +13114,9 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
     );
 
     let mut reader_tx = pool.begin().await.expect("Failed to begin reader lock tx");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "LOCK TABLE {schema}.ready_entries_0, {schema}.done_entries_0 IN ACCESS SHARE MODE"
-    ))
+    )))
     .execute(reader_tx.as_mut())
     .await
     .expect("Failed to lock ready/done reader tables");
@@ -14022,20 +14032,20 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
     assert_eq!(jobs[1].id, scheduled_id);
     assert_eq!(jobs[1].state, JobState::Scheduled);
 
-    let ready_count: i64 = sqlx::query_scalar(&format!(
+    let ready_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
     .expect("Failed to count ready entries");
     assert_eq!(ready_count, 1);
 
-    let deferred_count: i64 = sqlx::query_scalar(&format!(
+    let deferred_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -14055,26 +14065,26 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
             .fetch_one(&pool)
             .await
             .expect("Failed to count remaining awa.jobs rows");
-    let retained_ready_after_delete: i64 = sqlx::query_scalar(&format!(
+    let retained_ready_after_delete: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
     .expect("Failed to recount ready entries");
-    let tombstones_after_delete: i64 = sqlx::query_scalar(&format!(
+    let tombstones_after_delete: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.ready_tombstones WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
     .expect("Failed to count ready tombstones");
-    let deferred_after_delete: i64 = sqlx::query_scalar(&format!(
+    let deferred_after_delete: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
         store.schema()
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -14127,9 +14137,9 @@ async fn test_priority_aging_lifts_effective_priority_and_records_original() {
     // Backdate past two aging windows so floor(elapsed / interval) = 2,
     // i.e. a priority-4 row's effective priority becomes 2.
     let aging_interval = Duration::from_millis(100);
-    let job_id = sqlx::query_scalar::<_, i64>(&format!(
+    let job_id = sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT job_id FROM {schema}.ready_entries WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -14279,7 +14289,7 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
         format!("DELETE FROM {schema}.queue_lanes WHERE queue = $1 AND priority = $2"),
         format!("DELETE FROM {schema}.ready_entries WHERE queue = $1 AND priority = $2"),
     ] {
-        sqlx::query(&stmt)
+        sqlx::query(audited_sql(stmt.clone()))
             .bind(queue)
             .bind(4_i16)
             .execute(&pool)
@@ -14295,8 +14305,9 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
         .await
         .expect("post-rollback enqueue should self-heal via cache invalidation");
 
-    let (next_seq, ready_count, max_lane_seq): (i64, i64, Option<i64>) = sqlx::query_as(&format!(
-        "SELECT
+    let (next_seq, ready_count, max_lane_seq): (i64, i64, Option<i64>) =
+        sqlx::query_as(audited_sql(format!(
+            "SELECT
              {schema}.sequence_next_value(heads.seq_name),
              count(ready.*)::bigint,
              max(ready.lane_seq)
@@ -14307,12 +14318,12 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
           AND ready.enqueue_shard = heads.enqueue_shard
          WHERE heads.queue = $1 AND heads.priority = $2
          GROUP BY heads.seq_name"
-    ))
-    .bind(queue)
-    .bind(4_i16)
-    .fetch_one(&pool)
-    .await
-    .expect("queue_enqueue_heads row should exist after recovery");
+        )))
+        .bind(queue)
+        .bind(4_i16)
+        .fetch_one(&pool)
+        .await
+        .expect("queue_enqueue_heads row should exist after recovery");
 
     assert_eq!(
         ready_count, 3,
@@ -14404,14 +14415,14 @@ async fn test_queue_storage_multi_shard_round_trip_through_completion() {
     }
 
     // Every shard should surface at least one public terminal row.
-    let shard_counts: Vec<(i16, i64)> = sqlx::query_as(&format!(
+    let shard_counts: Vec<(i16, i64)> = sqlx::query_as(audited_sql(format!(
         "SELECT enqueue_shard, count(*)::bigint
          FROM {schema}.terminal_jobs
          WHERE queue = $1
            AND state = 'completed'
          GROUP BY enqueue_shard
          ORDER BY enqueue_shard"
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -14434,7 +14445,7 @@ async fn test_queue_storage_multi_shard_round_trip_through_completion() {
     // lane_seq)` tuple. Each shard's `lane_seq` starts independently at
     // 1, so at S=4 with 4 jobs per shard there must be at least one
     // tuple that repeats.
-    let max_dupes: i64 = sqlx::query_scalar(&format!(
+    let max_dupes: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT COALESCE(max(c), 0)::bigint FROM (
              SELECT count(*) AS c
              FROM {schema}.terminal_jobs
@@ -14442,7 +14453,7 @@ async fn test_queue_storage_multi_shard_round_trip_through_completion() {
                AND state = 'completed'
              GROUP BY ready_slot, queue, priority, lane_seq
          ) AS grouped"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -14496,9 +14507,9 @@ async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
         .await;
     }
 
-    let direct_ready_count: i64 = sqlx::query_scalar(&format!(
+    let direct_ready_count: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_one(&pool)
     .await
@@ -14615,9 +14626,9 @@ async fn test_queue_storage_ordering_key_routes_to_stable_shard() {
         }
     }
 
-    let rows: Vec<(i64, i16)> = sqlx::query_as(&format!(
+    let rows: Vec<(i64, i16)> = sqlx::query_as(audited_sql(format!(
         "SELECT job_id, enqueue_shard FROM {schema}.ready_entries WHERE queue = $1"
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -14704,13 +14715,13 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
         }
     }
 
-    let pre_counts: Vec<(i16, i64)> = sqlx::query_as(&format!(
+    let pre_counts: Vec<(i16, i64)> = sqlx::query_as(audited_sql(format!(
         "SELECT enqueue_shard, count(*)::bigint
          FROM {schema}.ready_entries
          WHERE queue = $1
          GROUP BY enqueue_shard
          ORDER BY enqueue_shard"
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -14726,12 +14737,12 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let done_count: i64 = sqlx::query_scalar(&format!(
+        let done_count: i64 = sqlx::query_scalar(audited_sql(format!(
             "SELECT count(*)::bigint
              FROM {schema}.terminal_jobs
              WHERE queue = $1
                AND state = 'completed'"
-        ))
+        )))
         .bind(queue)
         .fetch_one(&pool)
         .await
@@ -14747,7 +14758,7 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let heads: Vec<(i16, i64, i64)> = sqlx::query_as(&format!(
+    let heads: Vec<(i16, i64, i64)> = sqlx::query_as(audited_sql(format!(
         "SELECT claims.enqueue_shard,
                 {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
                 {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
@@ -14758,7 +14769,7 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
           AND enqueues.enqueue_shard = claims.enqueue_shard
          WHERE claims.queue = $1
          ORDER BY claims.enqueue_shard"
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -14845,12 +14856,12 @@ async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
         }
     }
 
-    let pre_shards: Vec<i16> = sqlx::query_scalar(&format!(
+    let pre_shards: Vec<i16> = sqlx::query_scalar(audited_sql(format!(
         "SELECT DISTINCT enqueue_shard
          FROM {schema}.ready_entries
          WHERE queue = $1
          ORDER BY enqueue_shard"
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await
@@ -14889,13 +14900,13 @@ async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
         .await;
     }
 
-    let done_shards: Vec<i16> = sqlx::query_scalar(&format!(
+    let done_shards: Vec<i16> = sqlx::query_scalar(audited_sql(format!(
         "SELECT DISTINCT enqueue_shard
          FROM {schema}.terminal_jobs
          WHERE queue = $1
            AND state = 'completed'
          ORDER BY enqueue_shard"
-    ))
+    )))
     .bind(queue)
     .fetch_all(&pool)
     .await

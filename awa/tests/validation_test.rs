@@ -4,6 +4,7 @@
 //! and uses unique queue names to avoid interference when running in parallel.
 //! All tests target real Postgres.
 
+use awa::audited_sql;
 use awa_macros::JobArgs;
 use awa_model::{insert_many, insert_with, migrations, InsertOpts, JobRow, JobState, UniqueOpts};
 use serde::{Deserialize, Serialize};
@@ -69,7 +70,10 @@ async fn ensure_database_exists(url: &str) {
         .await
         .expect("Failed to connect to admin database for validation tests");
     let create_sql = format!("CREATE DATABASE {database_name}");
-    match sqlx::query(&create_sql).execute(&admin_pool).await {
+    match sqlx::query(audited_sql(create_sql.clone()))
+        .execute(&admin_pool)
+        .await
+    {
         Ok(_) => {}
         Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
         Err(err) => panic!("Failed to create validation test database {database_name}: {err}"),

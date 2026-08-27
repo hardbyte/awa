@@ -16,6 +16,7 @@
 //! old scan idiom (with `permission denied for schema pg_toast`) and passes
 //! once discovery uses catalog lookups gated on `has_schema_privilege()`.
 
+use awa_model::audited_sql;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 
@@ -40,9 +41,9 @@ async fn migrations_apply_as_non_superuser_owner() {
 
     // A least-privilege login role: explicitly NOSUPERUSER so it is subject
     // to the same schema ACLs (pg_toast etc.) a managed-Postgres owner hits.
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "CREATE ROLE \"{role}\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{password}'"
-    ))
+    )))
     .execute(&admin)
     .await
     .expect("create least-privilege role");
@@ -50,18 +51,22 @@ async fn migrations_apply_as_non_superuser_owner() {
     // A fresh database owned by that role: it can CREATE the awa schema, and
     // every object it creates is owned by it — matching the real deployment.
     // (CREATE DATABASE cannot run inside a transaction.)
-    sqlx::query(&format!("CREATE DATABASE \"{db}\" OWNER \"{role}\""))
-        .execute(&admin)
-        .await
-        .expect("create owned database");
+    sqlx::query(audited_sql(format!(
+        "CREATE DATABASE \"{db}\" OWNER \"{role}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create owned database");
 
     let result = run_migrations_as(&database_url(), &db, &role, password).await;
 
     // Always tear down, regardless of the outcome.
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"))
-        .execute(&admin)
-        .await;
-    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
+    let _ = sqlx::query(audited_sql(format!(
+        "DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await;
+    let _ = sqlx::query(audited_sql(format!("DROP ROLE IF EXISTS \"{role}\"")))
         .execute(&admin)
         .await;
     admin.close().await;

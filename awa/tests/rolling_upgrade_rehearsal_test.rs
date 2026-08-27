@@ -5,6 +5,7 @@
 //! worker is a PyPI wheel installed by the workflow, not a source checkout.
 
 use async_trait::async_trait;
+use awa::audited_sql;
 use awa::model::{
     admin,
     cron::{pause_cron_job, trigger_cron_job, upsert_cron_job, PeriodicJob},
@@ -705,7 +706,7 @@ async fn schema_version(pool: &sqlx::PgPool) -> i32 {
 
 async fn ring_cursor_pair(pool: &sqlx::PgPool, ring: &str) -> ((i32, i64), (i32, i64)) {
     let (column_slot, column_generation, ledger_slot, ledger_generation) =
-        sqlx::query_as::<_, (i32, i64, i32, i64)>(&format!(
+        sqlx::query_as::<_, (i32, i64, i32, i64)>(audited_sql(format!(
             "SELECT state.current_slot, state.generation, ledger.slot, ledger.generation \
          FROM awa.{ring}_ring_state AS state \
          CROSS JOIN LATERAL ( \
@@ -713,7 +714,7 @@ async fn ring_cursor_pair(pool: &sqlx::PgPool, ring: &str) -> ((i32, i64), (i32,
              ORDER BY generation DESC LIMIT 1 \
          ) AS ledger \
          WHERE state.singleton"
-        ))
+        )))
         .fetch_one(pool)
         .await
         .expect("read ring cursors");

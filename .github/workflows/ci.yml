@@ -49,7 +49,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          workspaces: |
+            . -> target
+            examples/rust-app-demo -> target
       - name: cargo fmt
         run: cargo fmt --all -- --check
       # awa-python is a separate cargo workspace, so the root `cargo fmt --all`
@@ -64,6 +66,15 @@ jobs:
         working-directory: awa-python
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # examples/rust-app-demo is a third cargo workspace and depends on awa by
+      # path, so a change to awa's public API or its sqlx major can break it
+      # while every other job stays green. Same reasoning as awa-python above.
+      - name: cargo fmt (rust-app-demo workspace)
+        run: cargo fmt --all -- --check
+        working-directory: examples/rust-app-demo
+      - name: cargo clippy (rust-app-demo workspace)
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: examples/rust-app-demo
       - name: Check CI test-shard membership
         run: ./scripts/ci-test-shard.sh check
 

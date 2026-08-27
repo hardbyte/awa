@@ -57,6 +57,7 @@
 //! ```
 
 use async_trait::async_trait;
+use awa::audited_sql;
 use awa::model::{insert::insert_with, migrations, storage, QueueStorage, QueueStorageConfig};
 use awa::worker::TransitionWorkerRole;
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
@@ -267,9 +268,9 @@ async fn reset_schema(pool: &sqlx::PgPool, queue_storage_schema: &str) {
         .execute(pool)
         .await
         .expect("drop awa schema");
-    sqlx::query(&format!(
+    sqlx::query(audited_sql(format!(
         "DROP SCHEMA IF EXISTS {queue_storage_schema} CASCADE"
-    ))
+    )))
     .execute(pool)
     .await
     .expect("drop queue-storage schema");
@@ -287,9 +288,11 @@ async fn reset_schema(pool: &sqlx::PgPool, queue_storage_schema: &str) {
     .await
     .unwrap_or_default();
     for schema in leftover_schemas {
-        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(audited_sql(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE"
+        )))
+        .execute(pool)
+        .await;
     }
 }
 
@@ -347,10 +350,10 @@ async fn queue_storage_non_completed_terminal_count(
     schema: &str,
     queue: &str,
 ) -> i64 {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT count(*)::bigint FROM {schema}.terminal_jobs \
          WHERE queue = $1 AND state IN ('failed', 'cancelled')"
-    ))
+    )))
     .bind(queue)
     .fetch_one(pool)
     .await
