@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- **`awa --help` no longer prints the resolved `DATABASE_URL`.** The CLI still accepts `DATABASE_URL` as its database target, and help still identifies the environment variable, but credentials and other connection details from its current value are hidden.
+
 ## [0.6.6] — 2026-08-14
 
 Patch release: storage-transition convergence and recovery fixes. No migrations, schema changes, or public API changes.

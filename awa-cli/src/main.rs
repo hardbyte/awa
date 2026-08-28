@@ -14,7 +14,7 @@ mod storage_wait;
 )]
 struct Cli {
     /// Database URL (not required for migrate --sql without --pending)
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: Option<String>,
 
     #[command(subcommand)]
