@@ -1327,18 +1327,15 @@ impl Client {
     /// when an active schema simply predates this binary's migrations (a
     /// binary-first rolling upgrade). The operator fix differs, so name the
     /// actual cause.
-    async fn queue_storage_not_ready_error(
-        &self,
+    fn queue_storage_not_ready_error(
         schema: &str,
         role_hint: &str,
+        schema_version: i32,
     ) -> awa_model::AwaError {
-        let version = awa_model::migrations::current_version_readonly(&self.pool)
-            .await
-            .unwrap_or(0);
-        if version > 0 && version < awa_model::migrations::CURRENT_VERSION {
+        if schema_version > 0 && schema_version < awa_model::migrations::CURRENT_VERSION {
             return awa_model::AwaError::Validation(format!(
                 "queue storage schema '{schema}' is missing relations this runtime requires: \
-                 schema version {version} is older than this binary's version {}; \
+                 schema version {schema_version} is older than this binary's version {}; \
                  run `awa migrate` before starting this runtime",
                 awa_model::migrations::CURRENT_VERSION
             ));
@@ -1356,7 +1353,7 @@ impl Client {
 
         let status = transition::status(&self.pool).await?;
         let expected_schema = Self::expected_queue_storage_schema(&status)?;
-        let prepared_schema_ready = if let Some(schema) = expected_schema.as_deref() {
+        let mut prepared_schema_ready = if let Some(schema) = expected_schema.as_deref() {
             if runtime.store.schema() != schema {
                 return Err(awa_model::AwaError::Validation(format!(
                     "queue storage runtime configured for schema '{}' but transition state requires '{}'",
@@ -1368,6 +1365,18 @@ impl Client {
         } else {
             false
         };
+        let mut observed_schema_version = 0;
+        if let Some(schema) = expected_schema.as_deref() {
+            if !prepared_schema_ready {
+                observed_schema_version =
+                    awa_model::migrations::current_version_readonly(&self.pool).await?;
+                if observed_schema_version == awa_model::migrations::CURRENT_VERSION {
+                    // The migration may have committed between the readiness and version probes.
+                    prepared_schema_ready =
+                        transition::queue_storage_schema_ready(&self.pool, schema).await?;
+                }
+            }
+        }
 
         match self.transition_role {
             TransitionWorkerRole::CanonicalDrain => Ok(RuntimeStorage::Canonical),
@@ -1378,16 +1387,22 @@ impl Client {
                     )
                 })?;
                 if !prepared_schema_ready {
-                    return Err(self
-                        .queue_storage_not_ready_error(&schema, "queue-storage-target")
-                        .await);
+                    return Err(Self::queue_storage_not_ready_error(
+                        &schema,
+                        "queue-storage-target",
+                        observed_schema_version,
+                    ));
                 }
                 Ok(RuntimeStorage::QueueStorage(runtime.clone()))
             }
             TransitionWorkerRole::Auto => {
                 if let Some(schema) = expected_schema.as_deref() {
                     if !prepared_schema_ready {
-                        return Err(self.queue_storage_not_ready_error(schema, "0.6").await);
+                        return Err(Self::queue_storage_not_ready_error(
+                            schema,
+                            "0.6",
+                            observed_schema_version,
+                        ));
                     }
                 }
 

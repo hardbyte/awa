@@ -374,7 +374,13 @@ jobs:
   # ─── Notify on failure ───────────────────────────────────
   notify-failure:
     name: Create issue on failure
-    needs: [tla-storage, postgres-failover-smoke, rust-nightly, python-nightly]
+    needs:
+      - tla-storage
+      - compat-matrix
+      - postgres-failover-smoke
+      - rolling-upgrade-rehearsal
+      - rust-nightly
+      - python-nightly
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -391,7 +397,9 @@ jobs:
 
           **Failed jobs:**
           - tla-storage: ${{ needs.tla-storage.result }}
+          - compat-matrix: ${{ needs.compat-matrix.result }}
           - postgres-failover-smoke: ${{ needs.postgres-failover-smoke.result }}
+          - rolling-upgrade-rehearsal: ${{ needs.rolling-upgrade-rehearsal.result }}
           - rust-nightly: ${{ needs.rust-nightly.result }}
           - python-nightly: ${{ needs.python-nightly.result }}
 
