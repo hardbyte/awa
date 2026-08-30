@@ -130,7 +130,7 @@ enum Commands {
         #[arg(long, default_value = "5", env = "AWA_CACHE_TTL")]
         cache_ttl: u64,
         /// Hex-encoded 32-byte key used to verify callback signatures.
-        #[arg(long, env = "AWA_CALLBACK_HMAC_SECRET")]
+        #[arg(long, env = "AWA_CALLBACK_HMAC_SECRET", hide_env_values = true)]
         callback_hmac_secret: Option<String>,
         /// Force the server into read-only mode regardless of DB privilege.
         ///
@@ -213,7 +213,7 @@ enum CallbackCommands {
         pool_acquire_timeout: u64,
         /// Hex-encoded 32-byte key used to verify callback signatures.
         /// Required unless `--allow-unsigned` is set.
-        #[arg(long, env = "AWA_CALLBACK_HMAC_SECRET")]
+        #[arg(long, env = "AWA_CALLBACK_HMAC_SECRET", hide_env_values = true)]
         callback_hmac_secret: Option<String>,
         /// Path prefix the callback routes are mounted under. Defaults to
         /// `/api/callbacks`, matching the built-in `awa serve` layout.
