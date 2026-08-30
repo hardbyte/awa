@@ -4,9 +4,16 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-08-31
+
+Patch release: CLI help credential redaction and dependency security updates. No migrations, schema changes, or public API changes.
+
 ### Fixed
 
 - **CLI help no longer prints credential-bearing environment values.** `awa --help` hides the resolved `DATABASE_URL`, while `awa serve --help` and `awa callbacks serve --help` hide `AWA_CALLBACK_HMAC_SECRET`. The CLI still accepts those environment variables and help still identifies their names, but their current values are never rendered.
+  - If help output containing either value was captured in CI logs, support bundles, or another shared location, remove that output where possible and rotate the exposed credential.
+- **The bundled admin UI no longer resolves the vulnerable `seroval` 1.5.1 transitive dependency.** The lockfile now selects 1.5.6, which contains the fix for [GHSA-mv8w-475r-vwqw](https://github.com/advisories/GHSA-mv8w-475r-vwqw).
+- **Rust transitive dependencies with published advisories are updated.** Both Rust lockfiles now select `h2` 0.4.16, fixing [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258), and the main workspace selects `crossbeam-epoch` 0.9.20, fixing [RUSTSEC-2026-0204](https://rustsec.org/advisories/RUSTSEC-2026-0204).
 
 ## [0.6.6] — 2026-08-14
 

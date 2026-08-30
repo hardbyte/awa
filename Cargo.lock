@@ -383,7 +383,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "awa"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "awa-cli"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "assert_cmd",
  "awa-model",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "awa-metrics"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "awa-model",
  "opentelemetry",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "awa-seaorm"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "awa",
  "awa-testing",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "awa-testing"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "awa-ui"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "awa-metrics",
  "awa-model",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1023,9 +1023,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1494,9 +1494,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
