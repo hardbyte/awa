@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- **`awa --help` no longer prints the resolved `DATABASE_URL`.** The CLI still accepts `DATABASE_URL` as its database target, and help still identifies the environment variable, but credentials and other connection details from its current value are hidden.
+- **CLI help no longer prints credential-bearing environment values.** `awa --help` hides the resolved `DATABASE_URL`, while `awa serve --help` and `awa callbacks serve --help` hide `AWA_CALLBACK_HMAC_SECRET`. The CLI still accepts those environment variables and help still identifies their names, but their current values are never rendered.
 
 ## [0.6.6] — 2026-08-14
 
