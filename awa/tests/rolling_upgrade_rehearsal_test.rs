@@ -1,7 +1,7 @@
 //! Released-artifact rolling-upgrade rehearsal (#427).
 //!
-//! This first cell exercises migrate-first operation from the latest released
-//! 0.6 patch to the current v043 schema while traffic remains live. The old
+//! These cells exercise migration and rolling operation from the latest
+//! released 0.6 patch to the current schema while traffic remains live. The old
 //! worker is a PyPI wheel installed by the workflow, not a source checkout.
 
 use async_trait::async_trait;
@@ -829,22 +829,25 @@ async fn test_migrate_first_mixed_fleet_flip_and_fence() {
     wait_for_accepted(&producer, 25, Duration::from_secs(20)).await;
     let old_before_migration = old_worker.completed().len();
 
-    // Apply v041-v043 while the released runtime and producer remain live.
+    // Apply all current migrations while the released runtime and producer remain live.
     migrations::run(&pool)
         .await
         .expect("current migrations must accept a live 0.6.3 runtime");
-    assert_eq!(schema_version(&pool).await, 43);
+    assert_eq!(schema_version(&pool).await, migrations::CURRENT_VERSION);
     let authority: String =
         sqlx::query_scalar("SELECT authority FROM awa.ring_cursor_authority WHERE singleton")
             .fetch_one(&pool)
             .await
             .expect("read ring authority");
     assert_eq!(authority, "columns");
-    report.phase("migrated_to_v043_columns_authority");
+    report.phase("migrated_to_current_columns_authority");
 
     let current_completed = Arc::new(Mutex::new(HashSet::new()));
     let current = current_client(pool.clone(), &queue, current_completed.clone());
-    current.start().await.expect("start current worker on v043");
+    current
+        .start()
+        .await
+        .expect("start current worker on current schema");
     wait_for_mixed_fleet(
         &old_worker,
         old_before_migration,
@@ -981,8 +984,8 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     migrations::run(&pool)
         .await
         .expect("migrate with released deadline worker live");
-    assert_eq!(schema_version(&pool).await, 43);
-    report.phase("migrated_to_v043");
+    assert_eq!(schema_version(&pool).await, migrations::CURRENT_VERSION);
+    report.phase("migrated_to_current");
 
     let inserted = insert_with(
         &pool,
@@ -1092,7 +1095,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
 }
 
 /// Binary-first upgrade order: the current binary is deployed before
-/// v041-v043 apply. The current runtime requires relations those migrations
+/// the current migrations apply. The current runtime requires relations they
 /// add, so on the released artifact's v040 schema it must refuse startup
 /// loudly — naming pending migrations, not silently degrading — while the
 /// released fleet keeps draining traffic. The roll completes only after the
@@ -1154,7 +1157,7 @@ async fn test_binary_first_current_refuses_v040_then_rolls_after_migration() {
     migrations::run(&pool)
         .await
         .expect("migration must apply with the released fleet live");
-    assert_eq!(schema_version(&pool).await, 43);
+    assert_eq!(schema_version(&pool).await, migrations::CURRENT_VERSION);
     let authority: String =
         sqlx::query_scalar("SELECT authority FROM awa.ring_cursor_authority WHERE singleton")
             .fetch_one(&pool)
@@ -1288,7 +1291,7 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     migrations::run(&pool)
         .await
         .expect("migration must apply with the released fleet and banked backlog live");
-    assert_eq!(schema_version(&pool).await, 43);
+    assert_eq!(schema_version(&pool).await, migrations::CURRENT_VERSION);
 
     let simple_completed = Arc::new(Mutex::new(HashSet::new()));
     let current = workload_client(
@@ -1300,7 +1303,7 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
     current
         .start()
         .await
-        .expect("start current workload runtime on v043");
+        .expect("start current workload runtime on current schema");
     wait_for_mixed_fleet(
         &old_worker,
         old_before_migration,
@@ -1496,7 +1499,7 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
 /// Overlapped upgrade order: the current deployment and the migration race
 /// under live released traffic. A rolling deployment keeps restarting its new
 /// pods, so the current runtime start-retries through its schema refusal and
-/// must come up unaided the moment v041-v043 commit. Both versions must then
+/// must come up unaided the moment the current migrations commit. Both versions must then
 /// claim and complete work concurrently before any flip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires a released awa-pg 0.6.3 environment"]
@@ -1549,7 +1552,7 @@ async fn test_overlap_current_roll_races_live_migration() {
     let (current, migration_result) = tokio::join!(start_retry, migrations::run(&pool));
     migration_result.expect("migration must apply with both fleets and the producer live");
     report.phase("migration_committed_during_roll");
-    assert_eq!(schema_version(&pool).await, 43);
+    assert_eq!(schema_version(&pool).await, migrations::CURRENT_VERSION);
 
     // Both versions claim and complete concurrently after migration, before
     // any flip.
