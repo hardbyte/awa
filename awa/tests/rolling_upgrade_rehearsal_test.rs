@@ -1050,7 +1050,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
     // a producer insert. Before failing, dump the rows that identify the
     // writer — the deferred row's `errors`/`attempt` and any closure carry
     // each rescue path's distinct fingerprint.
-    if pending.state != JobState::Running {
+    if pending.state != JobState::Running || pending.attempt != 1 {
         let deferred: Vec<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(d) FROM awa.deferred_jobs AS d WHERE d.job_id = $1",
         )
