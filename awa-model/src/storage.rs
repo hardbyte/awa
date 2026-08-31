@@ -139,23 +139,56 @@ where
         .map_err(AwaError::from)
 }
 
+/// How many times [`flip_ring_authority`] re-runs the flip after losing a
+/// deadlock race. Matches the migration runner's bound for the same class of
+/// transient loss at an atomic transaction boundary.
+const FLIP_DEADLOCK_RETRIES: u32 = 5;
+
 /// Flip a schema's ring-cursor authority `columns -> ledger` (one-way,
 /// idempotent). Refuses unless `force` when a fresh-heartbeat runtime is not
 /// known to be flip-aware. Returns the resulting authority (`"ledger"`).
-pub async fn flip_ring_authority<'e, E>(
-    executor: E,
+///
+/// The flip runs while the current fleet keeps claiming, so its
+/// `claim_ring_slots` writes can lose a PostgreSQL deadlock race
+/// (SQLSTATE `40P01`) against a concurrent `claim_ready_runtime` call. The
+/// server-side function is a single atomic transaction, so a detected
+/// deadlock rolls it back whole and re-running re-evaluates the refusal gate
+/// from scratch. Retry that one error bounded with backoff — the same policy
+/// `migrations::run` applies at its own atomic boundary — so the operator's
+/// one-time cutover (and the maintenance auto-flip) doesn't surface a raw
+/// deadlock for a designed, recoverable loss. Refusals and every other error
+/// still return immediately.
+pub async fn flip_ring_authority(
+    pool: &PgPool,
     schema: &str,
     force: bool,
-) -> Result<String, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    sqlx::query_scalar::<_, String>("SELECT awa.flip_ring_authority($1, $2)")
-        .bind(schema)
-        .bind(force)
-        .fetch_one(executor)
-        .await
-        .map_err(AwaError::from)
+) -> Result<String, AwaError> {
+    let mut retry = 0;
+    loop {
+        match sqlx::query_scalar::<_, String>("SELECT awa.flip_ring_authority($1, $2)")
+            .bind(schema)
+            .bind(force)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(authority) => return Ok(authority),
+            Err(sqlx::Error::Database(database))
+                if database.code().as_deref() == Some("40P01") && retry < FLIP_DEADLOCK_RETRIES =>
+            {
+                retry += 1;
+                let delay = std::time::Duration::from_millis(50 * (1 << (retry - 1)));
+                tracing::warn!(
+                    retry,
+                    max_retries = FLIP_DEADLOCK_RETRIES,
+                    delay_ms = delay.as_millis(),
+                    schema,
+                    "ring-authority flip lost a deadlock race to live traffic; retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(AwaError::from(error)),
+        }
+    }
 }
 
 fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
