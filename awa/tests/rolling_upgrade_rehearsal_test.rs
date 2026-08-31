@@ -770,13 +770,40 @@ async fn wait_for_mixed_fleet(
 /// is stale, while stamped current heartbeats may remain fresh. Mirrors the
 /// operator flow the migrate-first cell proved: refusal is asserted there;
 /// these cells assert a live stamped fleet does not block the flip.
+///
+/// The flip runs under live current traffic by design, so its
+/// `claim_ring_slots` writes can lose a deadlock race against a concurrent
+/// claim (observed under 2-core contention: SQLSTATE 40P01 at
+/// `flip_ring_authority` line 108 vs `claim_ready_runtime`). PostgreSQL
+/// detects the cycle and the flip rolls back atomically, so a bounded retry
+/// re-runs the whole gate — the same policy `migrations::run` applies at its
+/// atomic boundary (#433). Only 40P01 retries; a refusal or any other error
+/// still fails the cell.
 async fn flip_after_released_heartbeats_stale(pool: &sqlx::PgPool) {
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let flipped: String = sqlx::query_scalar("SELECT awa.flip_ring_authority($1, FALSE, 0.5)")
-        .bind("awa")
-        .fetch_one(pool)
-        .await
-        .expect("flip after released heartbeats become stale");
+    let mut retry = 0;
+    let flipped: String = loop {
+        match sqlx::query_scalar("SELECT awa.flip_ring_authority($1, FALSE, 0.5)")
+            .bind("awa")
+            .fetch_one(pool)
+            .await
+        {
+            Ok(authority) => break authority,
+            Err(sqlx::Error::Database(database))
+                if database.code().as_deref() == Some("40P01") && retry < 5 =>
+            {
+                retry += 1;
+                let delay = Duration::from_millis(50 * (1 << (retry - 1)));
+                eprintln!(
+                    "[rehearsal] flip lost a deadlock race to live traffic \
+                     (retry {retry}/5, backing off {}ms)",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => panic!("flip after released heartbeats become stale: {error}"),
+        }
+    };
     assert_eq!(flipped, "ledger");
 }
 
