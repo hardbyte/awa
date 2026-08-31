@@ -1015,6 +1015,45 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
         .await
         .expect("load expired compact claim")
         .expect("expired compact claim must remain visible");
+    // This assert failed once in CI (nightly 33314091717, #434) with the job
+    // already Retryable, and the panic destroyed the evidence of *which* path
+    // rescued it: `load_job` only reports Retryable for a job with an open
+    // compact claim once a `deferred_jobs` row exists for the same
+    // `run_lease`, so the writer was a claims-aware rescue/supersession, not
+    // a producer insert. Before failing, dump the rows that identify the
+    // writer — the deferred row's `errors`/`attempt` and any closure carry
+    // each rescue path's distinct fingerprint.
+    if pending.state != JobState::Running {
+        let deferred: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(d) FROM awa.deferred_jobs AS d WHERE d.job_id = $1",
+        )
+        .bind(inserted.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| vec![serde_json::json!({ "deferred_query_error": e.to_string() })]);
+        let closures: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT run_lease, outcome FROM awa.lease_claim_closures WHERE job_id = $1",
+        )
+        .bind(inserted.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| vec![(-1, e.to_string())]);
+        let batch_closures: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(c) FROM awa.lease_claim_batches AS batches \
+             CROSS JOIN LATERAL unnest(batches.job_ids, batches.receipt_ids) AS items(job_id, receipt_id) \
+             JOIN awa.lease_claim_closure_batches AS c \
+               ON c.claim_slot = batches.claim_slot AND items.receipt_id <@ c.receipt_ranges \
+             WHERE items.job_id = $1",
+        )
+        .bind(inserted.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| vec![serde_json::json!({ "batch_closure_query_error": e.to_string() })]);
+        eprintln!(
+            "[diag] job {} state={:?} attempt={} errors={:?}\n[diag] deferred={deferred:?}\n[diag] closures={closures:?}\n[diag] batch_closures={batch_closures:?}",
+            inserted.id, pending.state, pending.attempt, pending.errors
+        );
+    }
     assert_eq!(pending.state, JobState::Running);
     assert_eq!(pending.attempt, 1);
     let heartbeat_is_fresh: bool = sqlx::query_scalar(
