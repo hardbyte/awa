@@ -89,6 +89,13 @@ The advisory lock is session-scoped: as long as the connection is alive, the loc
 
 ## Consequences
 
+Migration v045 requires cron-before-storage lock ordering across the complete
+pending range: released atomic enqueue locks cron before calling the storage
+insert path. The Rust migrator drains cron first; external runners must do the
+same. `AwaCronMigration` checks the two-party lock cycle, with a missing-drain
+counterexample; SQL tests inspect the actual held locks and the released 0.6.7
+rehearsal exercises live migration. See the upgrade guide for the evaluation pause.
+
 ### Positive
 
 - **No external dependencies.** Schedules live in Postgres, evaluated by the existing leader. No systemd, no Kubernetes CronJob, no `pg_cron`.

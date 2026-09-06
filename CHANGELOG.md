@@ -15,6 +15,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
   startup while staying inert; `restore-owner` provides bulk restoration.
   Read-only plans avoid the evidence writer lock. See the 0.6→0.7 upgrade guide
   for rollout and external runners.
+  The migrator drains cron enqueue before the complete pending DDL range to
+  avoid a released-worker lock-order deadlock; external runners must preserve
+  this ordering, and cron evaluation pauses until migration commit.
 
 ### Dependencies
 - Update the frontend seroval dependency to 1.6.4 (supersedes PR #453).

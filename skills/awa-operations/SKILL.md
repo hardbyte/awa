@@ -68,6 +68,12 @@ runner must enforce version floors and exclusive windows itself. Do not append
 `storage prepare`/`enter-mixed-transition`/`finalize` to extracted migration
 files; those are not migration DDL.
 
+For a pending range crossing v045, acquire `LOCK TABLE awa.cron_jobs IN ACCESS
+EXCLUSIVE MODE` before the first pending DDL in that transaction if the table
+already exists. The Rust migrator does this automatically. Cron evaluation
+pauses until commit; the lock prevents a released enqueue from deadlocking with
+earlier storage DDL. See the 0.6→0.7 upgrade guide for the rollout boundary.
+
 Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
 
 ## Rolling Upgrades
