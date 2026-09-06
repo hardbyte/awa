@@ -4,6 +4,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- Preserve canonical callback resolution during mixed storage transitions (#462),
+  including lease fencing and transaction rollback.
+- Add `storage enter-mixed-transition --quiesced` for a stopped fleet, refusing
+  fresh runtime snapshots and retaining canonical backlog/finalize gates (#457).
+
 ## [0.6.7] — 2026-08-31
 
 Patch release: CLI help credential redaction and dependency security updates. No migrations, schema changes, or public API changes.
