@@ -2,9 +2,13 @@
 -- https://github.com/hardbyte/awa/issues/481
 -- N-1 retains additive sync; owned definitions/tombstones survive its UPSERT.
 -- Its atomic enqueue is fenced by BEFORE UPDATE returning NULL on retired rows.
--- No hot job/lease table is locked. Catalog-only expansion plus triggers on the
--- small cron/runtime control tables; expected sub-second absent DDL contention.
--- External runners apply the entire file transactionally under AWA_MIGR;
+-- This step takes no hot job/lease table locks. The Rust runner drains cron
+-- enqueues before ALL pending DDL and holds cron_jobs ACCESS EXCLUSIVE through
+-- commit, matching released enqueue's cron-before-storage lock order. Cron
+-- evaluation pauses for the whole pending range (several seconds from v040).
+-- External runners must likewise LOCK TABLE awa.cron_jobs IN ACCESS EXCLUSIVE
+-- MODE before the FIRST pending migration, if cron_jobs already exists, within
+-- the same transaction under AWA_MIGR. Locking only at v045 is too late.
 -- no compatibility patch prerequisite is needed for unowned/default operation.
 -- Operator actions on owned schedules require current clients (ADR-007).
 

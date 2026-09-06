@@ -189,6 +189,18 @@ uses a separate read/insert path and is outside the owned-schedule operator
 contract. Old physical deletion is rejected. Existing jobs and retries are not
 cancelled. Restore uses current database time, without replaying retired time.
 
+The Rust migrator drains cron enqueues before applying the pending range, holding
+`cron_jobs` in `ACCESS EXCLUSIVE` mode through commit. This prevents a lock-order
+cycle between released cron enqueue and earlier storage DDL. Cron evaluation
+pauses for the whole range (several seconds when upgrading from v040), then
+resumes under its missed-fire policy. Ordinary workers may still encounter the
+existing storage-DDL contention handled by the migration retry policy.
+
+External SQL runners crossing v045 in a transaction with earlier migrations must
+likewise acquire `LOCK TABLE awa.cron_jobs IN ACCESS EXCLUSIVE MODE` before the
+**first** pending migration, when the table already exists. Acquiring it only at
+v045 is too late. A fresh install has no old cron enqueues to drain.
+
 External SQL runners must apply the complete migration transactionally under
 the migration lock and retain the runtime-snapshot statement trigger: it makes
 old and new evidence writers share the same retirement serializer. Do not disable

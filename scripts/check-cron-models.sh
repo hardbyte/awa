@@ -19,6 +19,19 @@ if ! grep -q 'Action property RetiredCannotFire is violated' "$witness"; then
 fi
 rm -f "$witness"
 ./correctness/run-tlc.sh races/AwaCronDefinitions.tla
+./correctness/run-tlc.sh races/AwaCronMigration.tla
+witness=$(mktemp)
+if ./correctness/run-tlc.sh races/AwaCronMigration.tla races/AwaCronMigrationNoDrain.cfg > "$witness" 2>&1; then
+    cat "$witness"
+    rm -f "$witness"
+    exit 1
+fi
+cat "$witness"
+if ! grep -q 'Invariant NoLockCycle is violated' "$witness"; then
+    rm -f "$witness"
+    exit 1
+fi
+rm -f "$witness"
 ./correctness/run-tlc.sh races/AwaCronDefinitions.tla races/AwaCronDefinitionsLiveness.cfg
 witness=$(mktemp)
 if ./correctness/run-tlc.sh races/AwaCronDefinitions.tla races/AwaCronDefinitionsNoGate.cfg > "$witness" 2>&1; then

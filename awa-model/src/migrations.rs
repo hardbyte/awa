@@ -470,6 +470,15 @@ async fn apply_migrations(
     }
 
     if !(has_schema && current == CURRENT_VERSION) {
+        // v045 alters cron_jobs. Released atomic enqueue locks cron_jobs first,
+        // then reads job/storage relations that earlier pending migrations alter.
+        // Drain it before ANY pending DDL: acquiring this lock only inside v045
+        // reverses that order when upgrading from released v040 (#481).
+        if current < 45 && relation_exists(conn, "cron_jobs").await? {
+            sqlx::query("LOCK TABLE awa.cron_jobs IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *conn)
+                .await?;
+        }
         let pending: Vec<i32> = MIGRATIONS
             .iter()
             .filter(|&&(v, _, _)| v > current)

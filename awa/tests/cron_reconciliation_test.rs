@@ -43,6 +43,45 @@ async fn init(pool: &PgPool) {
     migrations::run(pool).await.unwrap();
 }
 
+#[sqlx::test]
+async fn migration_drains_cron_before_locking_job_relations(pool: PgPool) {
+    init(&pool).await;
+    // Replay the released 0.6.7 pending range on an empty, rerunnable schema.
+    sqlx::query("DELETE FROM awa.schema_version WHERE version > 40")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut old_enqueue = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE awa.cron_jobs IN ROW EXCLUSIVE MODE")
+        .execute(&mut *old_enqueue)
+        .await
+        .unwrap();
+    let migrating_pool = pool.clone();
+    let migrating = tokio::spawn(async move { migrations::run(&migrating_pool).await });
+    let conflicting_locks: i64 = tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let waiting: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_locks WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND relation = 'awa.cron_jobs'::regclass AND NOT granted LIMIT 1")
+                    .fetch_optional(&pool).await.unwrap();
+                if let Some(pid) = waiting {
+                    break sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_locks WHERE pid = $1 AND granted AND mode = 'AccessExclusiveLock' AND relation IS NOT NULL AND relation <> 'awa.cron_jobs'::regclass")
+                        .bind(pid).fetch_one(&pool).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    ).await.unwrap();
+    old_enqueue.rollback().await.unwrap();
+    migrating.await.unwrap().unwrap();
+    assert_eq!(
+        conflicting_locks, 0,
+        "migration must drain old cron enqueues before holding job-relation DDL locks"
+    );
+}
+
 #[test]
 fn explicit_authority_and_canonical_manifest() {
     assert!(PeriodicReconciliation::authoritative(" ", "revision", Duration::ZERO).is_err());
