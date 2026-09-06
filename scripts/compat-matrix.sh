@@ -31,6 +31,8 @@
 #
 # The support statement lives in docs/stability.md.
 set -euo pipefail
+# Preserve Python stacks if a pinned native wheel crashes during teardown.
+export PYTHONFAULTHANDLER=1
 
 PGHOST=${PGHOST:-localhost}
 PGPORT=${PGPORT:-5432}
