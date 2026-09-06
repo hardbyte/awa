@@ -138,6 +138,8 @@ jobs:
         run: cargo build -p awa-cli
       - name: Enable native crash evidence
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
           mkdir -p compat-crash-artifacts
           sudo sysctl -w kernel.core_pattern="$PWD/compat-crash-artifacts/core.%p"
       - name: Run compat matrix (pinned release artifacts vs newest schema)

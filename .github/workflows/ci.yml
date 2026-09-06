@@ -358,6 +358,45 @@ jobs:
           .venv/bin/python examples/sync_api.py
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+  # A targeted old-interpreter regression supplements the newest-two full suite.
+  python-shutdown:
+    name: Python 3.12 wheel shutdown
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    defaults:
+      run:
+        working-directory: awa-python
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "awa-python -> awa-python/target"
+          key: py-shutdown-312
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.3"
+      - uses: astral-sh/setup-uv@v8.2.0
+      - name: Build and install actual SDK wheel
+        run: |
+          uv venv .venv --python 3.12.3
+          uv pip install maturin pytest pytest-asyncio asyncpg
+          .venv/bin/maturin build --out dist
+          uv pip install --no-deps dist/*.whl
+      - name: Assert interpreter finalization joins native callbacks
+        run: .venv/bin/pytest tests/test_interpreter_shutdown.py -v
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
   # ─── Frontend ──────────────────────────────────────────
   frontend-lint:
     name: Frontend lint + typecheck

@@ -57,6 +57,8 @@ jobs:
         run: cargo build -p awa-cli
       - name: Enable native crash evidence
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
           mkdir -p compat-crash-artifacts
           sudo sysctl -w kernel.core_pattern="$PWD/compat-crash-artifacts/core.%p"
       - name: Run compat matrix (pinned release artifacts vs newest schema)
@@ -69,7 +71,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: compat-native-evidence-${{ github.run_id }}
+          name: nightly-compat-native-evidence-${{ github.run_id }}
           path: compat-crash-artifacts/
           retention-days: 30
 
@@ -319,6 +321,8 @@ jobs:
         run: .venv/bin/maturin develop --release
       - name: Wait for Postgres
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Assert native completion shutdown ordering
+        run: .venv/bin/pytest tests/test_interpreter_shutdown.py -v
       - name: Create artifact directory
         run: mkdir -p artifacts/nightly
       - name: Run Python chaos recovery test

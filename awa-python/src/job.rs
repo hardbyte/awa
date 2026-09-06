@@ -283,7 +283,7 @@ impl PyJob {
         let run_lease = self.run_lease;
         let queue_storage = self.queue_storage.clone();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let (snapshot, target_generation) = {
                 let guard = buffer.lock().expect("progress lock poisoned");
                 match guard.pending_snapshot() {
@@ -438,7 +438,7 @@ impl PyJob {
         let has_expressions =
             filter.is_some() || on_complete.is_some() || on_fail.is_some() || transform.is_some();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let timeout = std::time::Duration::from_secs_f64(timeout_seconds);
             let callback_id = if has_expressions {
                 let config = awa_model::admin::CallbackConfig {
@@ -493,7 +493,7 @@ impl PyJob {
             pyo3::exceptions::PyValueError::new_err(format!("invalid callback token UUID: {e}"))
         })?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let entered = enter_callback_wait(&pool, job_id, run_lease, token_uuid)
                 .await
                 .map_err(map_awa_error)?;

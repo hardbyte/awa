@@ -93,14 +93,19 @@ FROM (SELECT slot, generation FROM awa.claim_ring_rotations ORDER BY generation 
 WHERE state.singleton;
 SQL
 
-echo "── setup: pinned release artifacts (PyPI wheels)"
-uv venv --quiet --clear .compat-venv-060
+# Released wheels cannot acquire Awa's new native completion join. On older
+# CPython, interpreter finalization can force-unwind their Rust callback thread
+# (python/cpython#87135). Pin a fixed interpreter for binary/schema evidence;
+# current-wheel shutdown is separately regressed on Python 3.12 in CI.
+COMPAT_PYTHON=${COMPAT_PYTHON:-3.13.12}
+echo "── setup: pinned release artifacts (PyPI wheels, Python ${COMPAT_PYTHON})"
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-060
 uv pip install --quiet --python .compat-venv-060 "awa-pg==0.6.0"
-uv venv --quiet --clear .compat-venv-066
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-066
 uv pip install --quiet --python .compat-venv-066 "awa-pg==0.6.6"
-uv venv --quiet --clear .compat-venv-062
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-062
 uv pip install --quiet --python .compat-venv-062 "awa-pg==0.6.2"
-uv venv --quiet --clear .compat-venv-057
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-057
 uv pip install --quiet --python .compat-venv-057 "awa-pg==0.5.7"
 
 # Repeat only on an explicitly requested diagnostic run. A failed process

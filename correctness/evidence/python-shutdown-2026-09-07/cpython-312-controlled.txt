@@ -1,0 +1,57 @@
+warning: Error disabling address space randomization: Operation not permitted
+Breakpoint 1 at 0x6b1e60: file ../Python/pylifecycle.c, line 1554.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7fd9b136a6c0 (LWP 19)]
+[New Thread 0x7fd9a8fff6c0 (LWP 20)]
+[New Thread 0x7fd9b11696c0 (LWP 21)]
+CLOSE PASS
+warning: 1554	../Python/pylifecycle.c: No such file or directory
+
+Thread 1 "python" hit Breakpoint 1, finalize_modules (tstate=tstate@entry=0xba7748 <_PyRuntime+459656>) at ../Python/pylifecycle.c:1554
+[Switching to thread 4 (Thread 0x7fd9b11696c0 (LWP 21))]
+#0  0x00007fd9b3d62bdf in clock_nanosleep () from /lib/x86_64-linux-gnu/libc.so.6
+Breakpoint 2 at 0x4bb0de: file ../Python/thread_pthread.h, line 360.
+
+Thread 4 "tokio-rt-worker" hit Breakpoint 2, PyThread_exit_thread () at ../Python/thread_pthread.h:360
+warning: 360	../Python/thread_pthread.h: No such file or directory
+#0  PyThread_exit_thread () at ../Python/thread_pthread.h:360
+#1  0x00000000004a4c43 in take_gil (tstate=tstate@entry=0x7fd99c001a10) at ../Python/ceval_gil.c:353
+#2  0x00000000005fc71e in PyEval_RestoreThread (tstate=tstate@entry=0x7fd99c001a10) at ../Python/ceval_gil.c:708
+#3  0x000000000064e614 in pysleep (timeout=<optimized out>) at ../Modules/timemodule.c:2191
+#4  time_sleep (self=<optimized out>, timeout_obj=<optimized out>) at ../Modules/timemodule.c:425
+#5  0x0000000000581e42 in cfunction_vectorcall_O (func=<built-in method sleep of module object at remote 0x7fd9b3bde3e0>, args=0x7fd9b0f65118, nargsf=<optimized out>, kwnames=<optimized out>) at ../Include/cpython/methodobject.h:50
+#6  0x0000000000549835 in _PyObject_VectorcallTstate (kwnames=<optimized out>, nargsf=<optimized out>, args=<optimized out>, callable=<built-in method sleep of module object at remote 0x7fd9b3bde3e0>, tstate=0x7fd99c001a10) at ../Include/internal/pycore_call.h:92
+#7  PyObject_Vectorcall (callable=<built-in method sleep of module object at remote 0x7fd9b3bde3e0>, args=<optimized out>, nargsf=<optimized out>, kwnames=<optimized out>) at ../Objects/call.c:325
+#8  0x00000000005d7429 in _PyEval_EvalFrameDefault (tstate=<optimized out>, frame=<optimized out>, throwflag=<optimized out>) at Python/bytecodes.c:2706
+#9  0x000000000054ca34 in _PyObject_VectorcallTstate (kwnames=('context',), nargsf=<optimized out>, args=0x7fd9b2ff4d20, callable=<function at remote 0x7fd9b317d3a0>, tstate=0x7fd99c001a10) at ../Include/internal/pycore_call.h:92
+#10 method_vectorcall (method=<optimized out>, args=0x7fd9b2ff4d28, nargsf=<optimized out>, kwnames=('context',)) at ../Objects/classobject.c:61
+#11 0x000000000054b059 in PyObject_Call () at ../Objects/call.c:376
+#12 0x00007fd9b26ab2d3 in <(pyo3_async_runtimes::generic::CheckedCompletor, &pyo3::instance::Bound<pyo3::types::any::PyAny>, pyo3::instance::Bound<pyo3::types::any::PyAny>, pyo3::instance::Bound<pyo3::types::any::PyAny>) as pyo3::call::PyCallArgs>::call () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#13 0x00007fd9b26aacb0 in pyo3_async_runtimes::generic::set_result () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#14 0x00007fd9b2695fbc in <tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::job::PyJob>::flush_progress::{closure#2}, ()>::{closure#0}::{closure#0}::{closure#0}> as core::future::future::Future>::poll () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#15 0x00007fd9b1fdf314 in <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::client::PyClient>::close::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#16 0x00007fd9b1da3b6f in <tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::client::PyClient>::close::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#17 0x00007fd9b2cdd84b in <tokio::runtime::blocking::pool::Inner>::run () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#18 0x00007fd9b2cf0b23 in std::sys::backtrace::__rust_begin_short_backtrace::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()> () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#19 0x00007fd9b2cf1221 in <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#20 0x00007fd9b2d7f1bf in <std::sys::thread::unix::Thread>::new::thread_start () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#21 0x00007fd9b3d12b84 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#22 0x00007fd9b3d9fb64 in clone () from /lib/x86_64-linux-gnu/libc.so.6
+warning: 133	../Include/internal/pycore_pystate.h: No such file or directory
+
+Thread 4 "tokio-rt-worker" received signal SIGSEGV, Segmentation fault.
+0x000000000061c746 in _PyInterpreterState_GET () at ../Include/internal/pycore_pystate.h:133
+#0  0x000000000061c746 in _PyInterpreterState_GET () at ../Include/internal/pycore_pystate.h:133
+#1  get_gc_state () at ../Modules/gcmodule.c:134
+#2  PyObject_GC_Del (op=0x7fd9b30083c0) at ../Modules/gcmodule.c:2398
+#3  0x00007fd9b26aae7d in pyo3_async_runtimes::generic::set_result () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#4  0x00007fd9b2695fbc in <tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::job::PyJob>::flush_progress::{closure#2}, ()>::{closure#0}::{closure#0}::{closure#0}> as core::future::future::Future>::poll () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#5  0x00007fd9b1fdf314 in <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::client::PyClient>::close::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#6  0x00007fd9b1da3b6f in <tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::client::PyClient>::close::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#7  0x00007fd9b2cdd84b in <tokio::runtime::blocking::pool::Inner>::run () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#8  0x00007fd9b2cf0b23 in std::sys::backtrace::__rust_begin_short_backtrace::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()> () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#9  0x00007fd9b2cf1221 in <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#10 0x00007fd9b2d7f1bf in <std::sys::thread::unix::Thread>::new::thread_start () from /opt/awa062/lib/python3.12/site-packages/awa/_awa.abi3.so
+#11 0x00007fd9b3d12b84 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fd9b3d9fb64 in clone () from /lib/x86_64-linux-gnu/libc.so.6

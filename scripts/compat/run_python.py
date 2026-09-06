@@ -43,11 +43,15 @@ def main() -> int:
         core = artifacts / f"core.{child.pid}"
         if core.exists():
             with (artifacts / f"backtrace-{child.pid}.txt").open("w") as output:
-                subprocess.run(
-                    ["gdb", "--batch", "-ex", "set pagination off", "-ex", "info sharedlibrary",
-                     "-ex", "thread apply all bt full", str(Path(interpreter).resolve()), str(core)],
-                    stdout=output, stderr=subprocess.STDOUT, check=False,
-                )
+                try:
+                    subprocess.run(
+                        ["gdb", "--batch", "-ex", "set pagination off", "-ex", "info sharedlibrary",
+                         "-ex", "thread apply all bt full", str(Path(interpreter).resolve()), str(core)],
+                        stdout=output, stderr=subprocess.STDOUT, check=False,
+                    )
+                except OSError as error:
+                    print(f"Could not collect backtrace: {error}", file=output)
+
     return 128 - code if code < 0 else code
 
 
