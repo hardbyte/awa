@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const awaBinary = process.env.AWA_BINARY ?? path.resolve(__dirname, "../../../../target/debug/awa");
+const awaBinary = process.env.AWA_BINARY ?? path.resolve(__dirname, "../../../target/debug/awa");
 const databaseUrl =
   process.env.DATABASE_URL ??
   "postgres://postgres:test@localhost:15432/awa_test";
