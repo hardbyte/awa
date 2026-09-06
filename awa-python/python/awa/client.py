@@ -11,6 +11,8 @@ use or for legacy code that uses the ``_sync`` method suffixes directly.
 
 from __future__ import annotations
 
+import json
+
 import datetime as dt
 from typing import Any, Awaitable, Callable, Literal, TypedDict, TypeVar
 
@@ -112,6 +114,22 @@ class AsyncClient:
         await client.shutdown()
         await client.close()
     """
+
+    def periodic_reconciliation(self, owner: str, revision: str, *, grace_seconds: float = 60.0) -> None:
+        """Declare all registered schedules as this owner's complete desired set.
+
+        Calling this with no schedules explicitly declares an empty desired set.
+        Omit this method to retain additive registration.
+        """
+        self._raw.periodic_reconciliation(owner, revision, grace_seconds=grace_seconds)
+
+    async def cron_reconciliation_plan(self, owner: str) -> dict[str, Any]:
+        """Explain the current declaration agreement and retirement blockers."""
+        return json.loads(await self._raw.cron_reconciliation_plan(owner))
+
+    async def cron_owner_action(self, action: dict[str, Any], *, actor: str = "python", apply: bool = False) -> dict[str, Any]:
+        """Preview an adopt, retire, retire_owner, or restore action; apply explicitly."""
+        return json.loads(await self._raw.cron_owner_action(json.dumps(action), actor=actor, apply=apply))
 
     def __init__(self, database_url: str, max_connections: int = 10) -> None:
         self._raw = RawClient(database_url, max_connections)
@@ -948,6 +966,22 @@ class Client:
         job = client.insert(SendEmail(to="alice@example.com", subject="Hi"))
         print(f"Enqueued job {job.id}")
     """
+
+    def periodic_reconciliation(self, owner: str, revision: str, *, grace_seconds: float = 60.0) -> None:
+        """Declare all registered schedules as this owner's complete desired set.
+
+        Calling this with no schedules explicitly declares an empty desired set.
+        Omit this method to retain additive registration.
+        """
+        self._raw.periodic_reconciliation(owner, revision, grace_seconds=grace_seconds)
+
+    def cron_reconciliation_plan(self, owner: str) -> dict[str, Any]:
+        """Explain the current declaration agreement and retirement blockers."""
+        return json.loads(self._raw.cron_reconciliation_plan_sync(owner))
+
+    def cron_owner_action(self, action: dict[str, Any], *, actor: str = "python", apply: bool = False) -> dict[str, Any]:
+        """Preview an adopt, retire, retire_owner, or restore action; apply explicitly."""
+        return json.loads(self._raw.cron_owner_action_sync(json.dumps(action), actor=actor, apply=apply))
 
     def __init__(self, database_url: str, max_connections: int = 10) -> None:
         self._raw = RawClient(database_url, max_connections)

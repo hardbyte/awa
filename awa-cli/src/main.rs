@@ -307,7 +307,17 @@ fn access_for(command: &Commands) -> context::Access {
             | QueueCommands::Overrides { .. } => Mutating,
         },
         Commands::Cron { command } => match command {
-            CronCommands::List => ReadOnly,
+            CronCommands::List | CronCommands::Plan { .. } => ReadOnly,
+            CronCommands::Adopt { options, .. }
+            | CronCommands::Retire { options, .. }
+            | CronCommands::RetireOwner { options, .. }
+            | CronCommands::Restore { options, .. } => {
+                if options.apply {
+                    Mutating
+                } else {
+                    ReadOnly
+                }
+            }
             CronCommands::Remove { .. } => Mutating,
         },
         Commands::Storage { command } => match command {
@@ -713,8 +723,51 @@ enum BatchOpsCommands {
     },
 }
 
+#[derive(Args)]
+struct CronActionOptions {
+    /// Commit the displayed operation; omitted means dry-run
+    #[arg(long)]
+    apply: bool,
+    /// Audit label for the operator
+    #[arg(long, default_value = "cli")]
+    actor: String,
+}
+
 #[derive(Subcommand)]
 enum CronCommands {
+    /// Explain reconciliation for an owner using fresh runtime declarations
+    Plan {
+        owner: String,
+        #[arg(long)]
+        manifest: Option<std::path::PathBuf>,
+    },
+    /// Explicitly adopt an unowned schedule or transfer from --expected-owner
+    Adopt {
+        name: String,
+        owner: String,
+        #[arg(long)]
+        expected_owner: Option<String>,
+        #[command(flatten)]
+        options: CronActionOptions,
+    },
+    /// Retire a schedule, preserving its durable tombstone
+    Retire {
+        name: String,
+        #[command(flatten)]
+        options: CronActionOptions,
+    },
+    /// Explicitly decommission an owner, including when no runtime is live
+    RetireOwner {
+        owner: String,
+        #[command(flatten)]
+        options: CronActionOptions,
+    },
+    /// Restore a retired schedule from now, without replaying retired time
+    Restore {
+        name: String,
+        #[command(flatten)]
+        options: CronActionOptions,
+    },
     /// List all registered cron job schedules
     List,
     /// Remove a cron job schedule by name
@@ -1600,6 +1653,90 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
 
                 Commands::Cron { command } => match command {
+                    CronCommands::Plan { owner, manifest } => {
+                        let plan = if let Some(path) = manifest {
+                            let jobs = serde_json::from_slice::<Vec<awa_model::PeriodicJob>>(
+                                &std::fs::read(path)?,
+                            )?;
+                            awa_model::cron_reconciliation::preview(&pool, &owner, &jobs).await?
+                        } else {
+                            awa_model::cron_reconciliation::plan(&pool, &owner).await?
+                        };
+                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                    }
+                    CronCommands::Adopt {
+                        name,
+                        owner,
+                        expected_owner,
+                        options,
+                    } => {
+                        let action = awa_model::cron_reconciliation::CronOwnerAction::Adopt {
+                            name,
+                            owner_id: owner,
+                            expected_owner,
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &awa_model::cron_reconciliation::operate(
+                                    &pool,
+                                    action,
+                                    &options.actor,
+                                    options.apply
+                                )
+                                .await?
+                            )?
+                        );
+                    }
+                    CronCommands::Retire { name, options } => {
+                        let action =
+                            awa_model::cron_reconciliation::CronOwnerAction::Retire { name };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &awa_model::cron_reconciliation::operate(
+                                    &pool,
+                                    action,
+                                    &options.actor,
+                                    options.apply
+                                )
+                                .await?
+                            )?
+                        );
+                    }
+                    CronCommands::RetireOwner { owner, options } => {
+                        let action = awa_model::cron_reconciliation::CronOwnerAction::RetireOwner {
+                            owner_id: owner,
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &awa_model::cron_reconciliation::operate(
+                                    &pool,
+                                    action,
+                                    &options.actor,
+                                    options.apply
+                                )
+                                .await?
+                            )?
+                        );
+                    }
+                    CronCommands::Restore { name, options } => {
+                        let action =
+                            awa_model::cron_reconciliation::CronOwnerAction::Restore { name };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &awa_model::cron_reconciliation::operate(
+                                    &pool,
+                                    action,
+                                    &options.actor,
+                                    options.apply
+                                )
+                                .await?
+                            )?
+                        );
+                    }
                     CronCommands::List => {
                         let schedules = awa_model::cron::list_cron_jobs(&pool).await?;
                         if schedules.is_empty() {
@@ -1607,7 +1744,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             println!(
                                 "{:<25} {:<20} {:<12} {:<12} {:<25} {:<10}",
-                                "NAME", "CRON", "TIMEZONE", "MISSED", "KIND", "QUEUE"
+                                "NAME",
+                                "CRON",
+                                "TIMEZONE",
+                                "MISSED",
+                                "KIND",
+                                "QUEUE / OWNER / STATE"
                             );
                             for s in &schedules {
                                 println!(
@@ -1617,7 +1759,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     s.timezone,
                                     s.missed_fire_policy,
                                     s.kind,
-                                    s.queue,
+                                    format!(
+                                        "{} / {} / {}",
+                                        s.queue,
+                                        s.owner_id.as_deref().unwrap_or("unowned"),
+                                        if s.retired_at.is_some() {
+                                            "retired"
+                                        } else if s.paused_at.is_some() {
+                                            "paused"
+                                        } else {
+                                            "active"
+                                        }
+                                    ),
                                 );
                             }
                             println!("\n{} schedules listed.", schedules.len());

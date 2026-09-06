@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const awaBinary = path.resolve(__dirname, "../../../target/debug/awa");
+const awaBinary = process.env.AWA_BINARY ?? path.resolve(__dirname, "../../../../target/debug/awa");
 const databaseUrl =
   process.env.DATABASE_URL ??
   "postgres://postgres:test@localhost:15432/awa_test";
@@ -16,14 +16,12 @@ const queueSlotCount = 16;
 const leaseSlotCount = 8;
 
 export default async function globalSetup() {
-  try {
-    execSync(`${awaBinary} --database-url ${databaseUrl} migrate`, {
-      stdio: "pipe",
-      timeout: 30_000,
-    });
-  } catch {
-    console.warn("Could not run migrations before E2E seed");
-  }
+  execSync(`${awaBinary} --database-url ${databaseUrl} migrate`, {
+    stdio: "pipe",
+    timeout: 60_000,
+    maxBuffer: 16 * 1024 * 1024,
+    env: { ...process.env, RUST_LOG: "warn" },
+  });
 
   // Build the queue-storage schema via the CLI (the same code path the
   // runtime takes) instead of hand-rolling DDL. The hand-rolled version
@@ -44,7 +42,8 @@ export default async function globalSetup() {
         `--reset`,
       {
         stdio: "pipe",
-        timeout: 30_000,
+        timeout: 60_000,
+        env: { ...process.env, RUST_LOG: "warn" },
       }
     );
   } catch (e) {
@@ -61,6 +60,7 @@ export default async function globalSetup() {
   const user = pgUrl.username;
 
   const sql = `
+    INSERT INTO awa.cron_jobs(name,cron_expr,kind) VALUES ('e2e_cron_owner','* * * * *','e2e_job') ON CONFLICT DO NOTHING;
     -- The CLI's prepare-queue-storage-schema (above) created the
     -- queue_storage tables. This block only seeds test data + the
     -- control-plane catalogs that drive the dashboard tests.

@@ -104,3 +104,43 @@ The advisory lock is session-scoped: as long as the connection is alive, the loc
 - **Leader bottleneck.** All cron evaluation happens on the leader. For thousands of schedules this could become a bottleneck, though in practice most deployments have dozens, not thousands.
 - **No automatic orphan cleanup.** Decommissioned schedules must be removed manually. This is an intentional trade-off for multi-deployment safety.
 - **Coalesced by default.** If a schedule was down for 24 hours, only the most recent fire is recovered unless the schedule explicitly opts into `catch_up`.
+
+
+## Owner-scoped reconciliation (#481)
+
+Opt-in authoritative registration declares a complete manifest for one stable
+owner; omitted configuration remains additive. Explicit authoritative empty is
+valid. Names remain globally unique. Ownership is claimed/transferred only by
+an operator. Retirement is a durable tombstone, distinct from pause: restoring
+sets the evaluation boundary to database time and does not replay retired time.
+
+Every runtime publishes protocol capability and, when authoritative, a canonical
+full-definition manifest independently of leadership. The reporter commits its
+snapshot and declaration together. Database time controls freshness (at least
+30 seconds or three snapshot intervals) and grace. All fresh database runtimes
+must support the protocol. Zero declarations, mixed manifests, conflicts, and
+retired desired names block automatic retirement. All live declarations' grace
+requirements must be satisfied. A missed evidence window resets agreement.
+
+One transaction advisory lock serializes runtime snapshot writes (including old
+binaries through a statement trigger), declaration publication, owner lifecycle
+operations, and reconciliation. Owner rows additionally serialize owner state.
+No job/lease heartbeat takes this lock. Publication checks agreement so a short
+conflict between leader passes resets the durable grace clock. Reconciliation
+rechecks under the same lock, then retires absent rows atomically. Lock order is
+protocol lock, owner row, schedule rows ordered by name. The protocol is a
+trusted-runtime coordination boundary, not authorization between SQL roles.
+
+Retired schedule rows survive old UPSERT and reject physical deletion. The
+BEFORE UPDATE fence suppresses the actual old atomic-enqueue UPDATE, so its
+RETURNING relation is empty and no job is inserted. Owned definition updates
+require the matching manager context; lifecycle changes require the operator
+context. These transaction-local contexts are internal, not public SQL APIs.
+Old manual-trigger clients must be retired before managing owned schedules;
+manual trigger uses a read/insert path and is not the old automatic-enqueue
+contract. Current manual trigger locks/rechecks retirement. Already accepted
+jobs, retries, DLQ work, and user enqueues remain independent of schedule state.
+
+No global pruning, automatic owner decommissioning, or physical tombstone purge
+is provided. Explicit retire-owner works without live declarations. Re-registering
+a retired name reports a conflict until an explicit operator restoration.

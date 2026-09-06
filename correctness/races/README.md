@@ -25,3 +25,17 @@ These models cover feature-specific or bug-specific interleavings that are too l
 ./correctness/run-tlc.sh races/AwaViewTrigger.tla
 ./correctness/run-tlc.sh races/AwaViewTrigger.tla races/AwaViewTriggerOld.cfg
 ```
+
+
+## Periodic ownership (#481)
+
+`AwaCronOwnership` complements the fire-time/CAS model in `AwaCron` with
+complete owner manifests, old/new capability evidence, convergence, evidence
+expiry, and durable retirement. Publish and reconcile are serialized database
+transactions; enqueue races them independently. The safety configuration checks
+retirement durability and both old/new enqueue fences. The no-fence configuration
+must produce a `RetiredCannotFire` counterexample. The liveness configuration
+checks eventual retirement with stable capable declarations and fair maintenance.
+
+Run `scripts/check-cron-models.sh` from the repository root. Published N-1 SQL
+paths are tested separately by `scripts/rehearse-cron-ownership.sh`.

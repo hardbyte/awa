@@ -7,11 +7,11 @@ use crate::error::AwaError;
 use crate::job::JobRow;
 use chrono::{DateTime, Utc};
 use croner::Cron;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgExecutor;
 
 /// How AWA handles cron fires missed because evaluation was delayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CronMissedFirePolicy {
     /// Enqueue only the latest due fire. This preserves pre-existing behavior.
@@ -42,7 +42,7 @@ impl CronMissedFirePolicy {
 /// A periodic job schedule definition.
 ///
 /// Created via `PeriodicJob::builder(name, cron_expr).build(args)`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeriodicJob {
     /// Unique name identifying this schedule (e.g., "daily_report").
     pub name: String,
@@ -256,6 +256,10 @@ impl PeriodicJobBuilder {
 /// A row from the `awa.cron_jobs` table.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct CronJobRow {
+    pub owner_id: Option<String>,
+    pub retired_at: Option<DateTime<Utc>>,
+    pub retired_by: Option<String>,
+    pub retired_revision: Option<String>,
     pub name: String,
     pub cron_expr: String,
     pub timezone: String,
@@ -292,7 +296,7 @@ pub async fn upsert_cron_job<'e, E>(executor: E, job: &PeriodicJob) -> Result<()
 where
     E: PgExecutor<'e>,
 {
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO awa.cron_jobs (name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata, missed_fire_policy)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -308,6 +312,7 @@ where
             metadata = EXCLUDED.metadata,
             missed_fire_policy = EXCLUDED.missed_fire_policy,
             updated_at = now()
+        WHERE awa.cron_jobs.owner_id IS NULL AND awa.cron_jobs.retired_at IS NULL
         "#,
     )
     .bind(&job.name)
@@ -324,6 +329,9 @@ where
     .execute(executor)
     .await?;
 
+    if result.rows_affected() == 0 {
+        return Err(AwaError::Validation(format!("cron schedule {} is owned or retired; explicit adoption, matching owner, or restoration required", job.name)));
+    }
     Ok(())
 }
 
@@ -451,6 +459,7 @@ where
             WHERE name = $1
               AND (last_enqueued_at IS NOT DISTINCT FROM $3)
               AND paused_at IS NULL
+              AND retired_at IS NULL
             RETURNING name, kind, queue, args, priority, max_attempts, tags, metadata
         )
         SELECT inserted.*
@@ -494,7 +503,8 @@ where
         WITH cron AS (
             SELECT name, kind, queue, args, priority, max_attempts, tags, metadata
             FROM awa.cron_jobs
-            WHERE name = $1
+            WHERE name = $1 AND retired_at IS NULL
+            FOR SHARE
         )
         SELECT inserted.*
         FROM cron

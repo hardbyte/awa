@@ -206,3 +206,43 @@ test.describe("Cron page", () => {
     expect(job.state).toBe("available");
   });
 });
+
+
+test("owner operations preview, adopt, retire and restore", async ({ page, request }) => {
+  await loadCronPage(page);
+  await page.getByText("Adopt or transfer a schedule", { exact: true }).click();
+  await page.getByRole("textbox", { name: "Schedule name", exact: true }).fill("e2e_cron_owner");
+  await page.getByRole("textbox", { name: "New owner", exact: true }).fill("e2e-owner");
+  await page.getByRole("button", { name: "Preview", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Apply adopt" })).toBeVisible();
+  let rows = await (await request.get("/api/cron")).json();
+  expect(rows.find((r: { name: string }) => r.name === "e2e_cron_owner").owner_id).toBeNull();
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  const summary = firstCronSummary(page, "e2e_cron_owner");
+  await expect(summary).toContainText("e2e-owner");
+  const row = summary.locator("xpath=ancestor::div[contains(@class, 'rounded-lg')][1]");
+  await row.getByRole("button", { name: "Retire", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Apply retire" })).toBeVisible();
+  await expect(row.getByText(/^retired$/)).toHaveCount(0);
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(row.getByText(/^retired$/)).toBeVisible();
+  await expect(row.getByRole("button", { name: "Trigger now" })).toBeDisabled();
+  rows = await (await request.get("/api/cron")).json();
+  expect(rows.find((r: { name: string }) => r.name === "e2e_cron_owner").next_fire_at).toBeNull();
+  await row.getByRole("button", { name: "Restore", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Apply restore" })).toBeVisible();
+  await page.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(row.getByRole("button", { name: "Retire", exact: true })).toBeVisible();
+  await expect(row.getByRole("button", { name: "Trigger now" })).toBeEnabled();
+});
+
+test("read-only capabilities hide ownership mutations", async ({ page }) => {
+  await page.route("**/api/capabilities", async route => {
+    const response = await route.fetch();
+    await route.fulfill({ response, json: { ...await response.json(), read_only: true } });
+  });
+  await loadCronPage(page);
+  await expect(page.getByText("Adopt or transfer a schedule", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^(Retire|Restore|Preview owner retirement)$/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Trigger now" }).first()).toBeDisabled();
+});

@@ -38,6 +38,8 @@ use uuid::Uuid;
 pub enum BuildError {
     #[error("at least one queue must be configured")]
     NoQueuesConfigured,
+    #[error("invalid periodic reconciliation: {0}")]
+    InvalidPeriodicReconciliation(String),
     #[error("queue descriptor declared for unknown queue '{queue}'")]
     QueueDescriptorWithoutQueue { queue: String },
     #[error("queue '{queue}' configured more than once")]
@@ -148,6 +150,7 @@ pub struct ClientBuilder {
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
     periodic_jobs: Vec<PeriodicJob>,
+    periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
@@ -206,6 +209,7 @@ impl ClientBuilder {
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
             periodic_jobs: Vec::new(),
+            periodic_reconciliation: None,
             global_max_workers: None,
             leader_election_interval: None,
             leader_check_interval: None,
@@ -947,6 +951,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Declare that this client's periodic registrations are the complete desired
+    /// set for one owner. An explicit empty set is authoritative too.
+    pub fn periodic_reconciliation(mut self, config: awa_model::PeriodicReconciliation) -> Self {
+        self.periodic_reconciliation = Some(config);
+        self
+    }
+
     /// Serve `GET /healthz` and `GET /readyz` on this address while the
     /// runtime is running (#368). Defaults to off; the `AWA_HEALTH_ADDR`
     /// environment variable is honoured when this is not set. Port 0 binds
@@ -959,6 +970,13 @@ impl ClientBuilder {
 
     /// Build the client.
     pub fn build(self) -> Result<Client, BuildError> {
+        if let Some(config) = &self.periodic_reconciliation {
+            config
+                .validate()
+                .map_err(|e| BuildError::InvalidPeriodicReconciliation(e.to_string()))?;
+            awa_model::cron_reconciliation::canonical_manifest(&self.periodic_jobs)
+                .map_err(|e| BuildError::InvalidPeriodicReconciliation(e.to_string()))?;
+        }
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
         }
@@ -1099,6 +1117,7 @@ impl ClientBuilder {
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
             periodic_jobs: Arc::new(self.periodic_jobs),
+            periodic_reconciliation: self.periodic_reconciliation,
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
             dispatcher_handles: RwLock::new(Vec::new()),
@@ -1195,6 +1214,7 @@ pub struct Client {
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
+    periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
     /// Cancellation token for heartbeat + maintenance — kept alive during drain.
@@ -1247,6 +1267,8 @@ pub struct Client {
 
 #[derive(Clone)]
 struct RuntimeReporterState {
+    periodic_jobs: Arc<Vec<PeriodicJob>>,
+    periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
     queue_descriptors: HashMap<String, QueueDescriptor>,
@@ -1497,6 +1519,8 @@ impl Client {
 
     fn runtime_reporter_state(&self) -> RuntimeReporterState {
         RuntimeReporterState {
+            periodic_jobs: self.periodic_jobs.clone(),
+            periodic_reconciliation: self.periodic_reconciliation.clone(),
             pool: self.pool.clone(),
             queues: self.queues.clone(),
             queue_descriptors: self.queue_descriptors.clone(),
@@ -1639,6 +1663,15 @@ impl Client {
             None
         };
 
+        // Publish only after fallible startup preparation succeeds. Ownership
+        // checks share the publication transaction, so a failed start cannot
+        // leave an authoritative empty declaration behind.
+        if self.periodic_reconciliation.is_some() {
+            self.runtime_reporter_state()
+                .publish_evidence_checked(true)
+                .await?;
+        }
+
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
         let runtime_worker_capacity = self.global_max_workers.unwrap_or_else(|| {
@@ -1722,7 +1755,11 @@ impl Client {
             self.leader.clone(),
             self.maintenance_alive.clone(),
             self.service_cancel.clone(),
-            self.periodic_jobs.clone(),
+            if self.periodic_reconciliation.is_some() {
+                Arc::new(Vec::new())
+            } else {
+                self.periodic_jobs.clone()
+            },
             self.in_flight.clone(),
             effective_storage.clone(),
             self.enqueue_specs.clone(),
@@ -2274,6 +2311,36 @@ impl Client {
 }
 
 impl RuntimeReporterState {
+    async fn publish_evidence(&self) -> Result<(), awa_model::AwaError> {
+        self.publish_evidence_checked(false).await
+    }
+
+    async fn publish_evidence_checked(&self, check: bool) -> Result<(), awa_model::AwaError> {
+        let snapshot = self.snapshot_input().await;
+        let mut tx = self.pool.begin().await?;
+        awa_model::cron_reconciliation::lock(&mut tx).await?;
+        admin::upsert_runtime_snapshot(&mut *tx, &snapshot).await?;
+        if let Some(config) = &self.periodic_reconciliation {
+            awa_model::cron_reconciliation::publish(
+                &mut tx,
+                self.instance_id,
+                config,
+                &self.periodic_jobs,
+            )
+            .await?;
+            if check {
+                awa_model::cron_reconciliation::check_registration(
+                    &mut tx,
+                    config,
+                    &self.periodic_jobs,
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn storage_capability(&self) -> StorageCapability {
         if !self.queue_storage_capable {
             return StorageCapability::Canonical;
@@ -2490,8 +2557,7 @@ impl RuntimeReporterState {
             );
         }
 
-        let snapshot = self.snapshot_input().await;
-        if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
+        if let Err(err) = self.publish_evidence().await {
             warn!(error = %err, "Failed to publish runtime snapshot");
         }
 

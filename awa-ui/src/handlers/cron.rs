@@ -31,7 +31,11 @@ pub async fn list_cron_jobs(
     let response: Vec<CronJobResponse> = jobs
         .into_iter()
         .map(|row| {
-            let next_fire_at = cron::next_fire_time(&row.cron_expr, &row.timezone);
+            let next_fire_at = if row.retired_at.is_some() {
+                None
+            } else {
+                cron::next_fire_time(&row.cron_expr, &row.timezone)
+            };
             CronJobResponse { row, next_fire_at }
         })
         .collect();
@@ -83,4 +87,44 @@ pub async fn resume_cron_job(
     }
     state.invalidate_dashboard_caches();
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Current owner plans, including the exact declaration evidence and blockers.
+pub async fn reconciliation_status(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<awa_model::cron_reconciliation::CronReconciliationPlan>>, ApiError> {
+    let mut plans = Vec::new();
+    for owner in awa_model::cron_reconciliation::owners(&state.pool).await? {
+        plans.push(awa_model::cron_reconciliation::plan(&state.pool, &owner).await?);
+    }
+    Ok(Json(plans))
+}
+
+#[derive(Deserialize)]
+pub struct CronActionRequest {
+    #[serde(flatten)]
+    pub action: awa_model::cron_reconciliation::CronOwnerAction,
+    pub actor: String,
+    #[serde(default)]
+    pub apply: bool,
+}
+/// Preview by default; committing requires an explicit apply flag and writable mode.
+pub async fn owner_action(
+    State(state): State<AppState>,
+    Json(request): Json<CronActionRequest>,
+) -> Result<Json<awa_model::cron_reconciliation::CronActionPlan>, ApiError> {
+    if request.apply {
+        state.require_writable()?;
+    }
+    let result = awa_model::cron_reconciliation::operate(
+        &state.pool,
+        request.action,
+        &request.actor,
+        request.apply,
+    )
+    .await?;
+    if request.apply {
+        state.invalidate_dashboard_caches();
+    }
+    Ok(Json(result))
 }

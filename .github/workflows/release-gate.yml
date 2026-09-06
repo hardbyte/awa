@@ -35,6 +35,20 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
+  cron-protocol-models:
+    name: Cron ownership protocol models
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check safety, liveness, and missing-fence witness
+        run: scripts/check-cron-models.sh > cron-models.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cron-protocol-models-${{ github.sha }}
+          path: cron-models.log
+
   rolling-upgrade-rehearsal:
     name: Released N-1 → candidate upgrade rehearsal
     runs-on: ubuntu-latest
@@ -73,6 +87,10 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
           AWA_N_MINUS_ONE_PYTHON: .compat-venv-gate/bin/python
           AWA_REHEARSAL_ARTIFACT_DIR: ${{ github.workspace }}/rehearsal-artifacts
+      - name: Rehearse released cron ownership fence
+        run: scripts/rehearse-cron-ownership.sh > cron-rehearsal.log 2>&1
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
       - name: Collect Postgres logs
         if: failure()
         run: docker logs "${{ job.services.postgres.id }}" > postgres.log 2>&1 || true
@@ -84,6 +102,7 @@ jobs:
           path: |
             rehearsal-artifacts/
             rehearsal-output.log
+            cron-rehearsal.log
             postgres.log
           retention-days: 90
           if-no-files-found: warn

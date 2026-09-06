@@ -166,3 +166,36 @@ flip the stale compat columns are poisoned, so a pre-flip binary fails loudly an
 back across the flip is **not** supported — roll back only to another 0.7 build. Before
 the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downgrade path (unchanged from
 previous releases).
+
+
+## v045: opt-in periodic ownership
+
+v045 adds ownership, retirement, and normalized desired-declaration control
+state. Existing unowned additive schedules retain their behavior. Apply the
+migration before starting an authoritative runtime; a binary-first authoritative
+startup refuses until the schema is present. No existing schedule is adopted or
+retired by migration.
+
+Roll every runtime to a cron-protocol-capable build before expecting automatic
+retirement. Fresh older instances conservatively block it even if their cron
+configuration is unrelated. Then explicitly adopt the owner's existing schedule
+names and enable complete-set registration. Inspect `awa cron plan OWNER` before
+removing declarations. A stopped fleet is an outage, never a delete signal;
+use explicit `cron retire-owner OWNER --apply` for decommissioning.
+
+Use current operator clients for owned schedules. The released 0.6.7 automatic
+enqueue and additive UPSERT paths are fenced on retired rows; old manual trigger
+uses a separate read/insert path and is outside the owned-schedule operator
+contract. Old physical deletion is rejected. Existing jobs and retries are not
+cancelled. Restore uses current database time, without replaying retired time.
+
+External SQL runners must apply the complete migration transactionally under
+the migration lock and retain the runtime-snapshot statement trigger: it makes
+old and new evidence writers share the same retirement serializer. Do not disable
+it or write declaration state independently of the snapshot transaction. The
+lock protects control-plane decisions only, not ordinary job/lease heartbeats.
+
+Reproduce the released-artifact proof with
+`scripts/rehearse-cron-ownership.sh` (disposable DATABASE_URL required); the cron
+model suite is `scripts/check-cron-models.sh`. Existing ring-authority rollback
+restrictions still apply independently of cron ownership.

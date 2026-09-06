@@ -1,3 +1,4 @@
+import { fetchCronReconciliation, cronOwnerAction, type CronActionPlan, type CronOwnerAction } from "../lib/api";
 import { useMemo, useState } from "react";
 import {
   useQuery,
@@ -86,11 +87,62 @@ export function CronPage() {
     },
   });
 
+  const [actionPlan, setActionPlan] = useState<CronActionPlan | null>(null);
+  const [adoptName, setAdoptName] = useState("");
+  const [adoptOwner, setAdoptOwner] = useState("");
+  const [expectedOwner, setExpectedOwner] = useState("");
+  const reconciliation = useQuery({ queryKey: ["cron-reconciliation"], queryFn: fetchCronReconciliation, refetchInterval: poll.interval });
+  const ownerMutation = useMutation({
+    mutationFn: ({ action, apply }: { action: CronOwnerAction; apply: boolean }) => cronOwnerAction(action, apply),
+    onSuccess: (plan) => {
+      if (plan.applied) {
+        setActionPlan(null);
+        void invalidateCron();
+        void queryClient.invalidateQueries({ queryKey: ["cron-reconciliation"] });
+        toast.success("Schedule operation applied");
+      } else { setActionPlan(plan); }
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const preview = (action: CronOwnerAction) => ownerMutation.mutate({ action, apply: false });
+
   const cronJobs = cronQuery.data ?? [];
 
   return (
     <div className="space-y-4">
       <Heading level={2}>Cron Schedules</Heading>
+      {(reconciliation.data ?? []).map((plan) => (
+        <details key={plan.owner_id} className="rounded-lg border p-3">
+          <summary className="cursor-pointer font-medium">
+            {plan.owner_id}: {plan.blockers.length ? plan.blockers.join(", ").replace(/_/g, " ") : "converged"}
+            {plan.retirements.length > 0 && ` · ${plan.retirements.length} schedules to retire`}
+          </summary>
+          <div className="space-y-2 pt-2 text-sm">
+            <p>Grace remaining: {Math.ceil(plan.grace_remaining_ms / 1000)}s</p>
+            {plan.conflicts.map((conflict) => <p key={conflict}>{conflict}</p>)}
+            {plan.blocking_instances.length > 0 && <p>Unsupported instances: {plan.blocking_instances.join(", ")}</p>}
+            {plan.retirements.length > 0 && <p>Would retire: {plan.retirements.join(", ")}</p>}
+            {plan.declarations.map((d) => <p key={d.instance_id} className="break-all">{d.instance_id} · revision {d.revision} · manifest {d.desired_hash} · expires {d.expires_at}</p>)}
+            {!readOnly && <Button intent="outline" size="xs" onPress={() => preview({ action: "retire_owner", owner_id: plan.owner_id })}>Preview owner retirement</Button>}
+          </div>
+        </details>
+      ))}
+      {reconciliation.isError && <p className="text-danger">Unable to load reconciliation status.</p>}
+      {!readOnly && <details className="rounded-lg border p-3">
+        <summary className="cursor-pointer">Adopt or transfer a schedule</summary>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <input aria-label="Schedule name" placeholder="Schedule name" className="rounded border p-2" value={adoptName} onChange={(e) => setAdoptName(e.target.value)} />
+          <input aria-label="New owner" placeholder="New owner" className="rounded border p-2" value={adoptOwner} onChange={(e) => setAdoptOwner(e.target.value)} />
+          <input aria-label="Expected current owner" placeholder="Current owner (blank if unowned)" className="rounded border p-2" value={expectedOwner} onChange={(e) => setExpectedOwner(e.target.value)} />
+          <Button isDisabled={!adoptName || !adoptOwner || ownerMutation.isPending} onPress={() => preview({ action: "adopt", name: adoptName, owner_id: adoptOwner, expected_owner: expectedOwner || null })}>Preview</Button>
+        </div>
+      </details>}
+      {actionPlan && <div role="status" className="space-y-2 rounded-lg border p-4">
+        <p>Apply {actionPlan.action.action.replace(/_/g, " ")} to: {actionPlan.schedules.join(", ") || "no schedules"}?</p>
+        <p className="text-sm text-muted-fg">Retirement stops future scheduled runs. Restore starts from now. Already enqueued jobs continue.</p>
+        <Button isDisabled={readOnly || ownerMutation.isPending} onPress={() => ownerMutation.mutate({ action: actionPlan.action, apply: true })}>Apply</Button>
+        <Button intent="outline" onPress={() => setActionPlan(null)}>Cancel</Button>
+      </div>}
 
       {cronJobs.length > 0 ? (
         <div className="space-y-3">
@@ -109,6 +161,7 @@ export function CronPage() {
               typeof cj.metadata === "object" &&
               Object.keys(cj.metadata as Record<string, unknown>).length > 0;
             const isPaused = cj.paused_at != null;
+            const isRetired = cj.retired_at != null;
             const targetQueuePaused = pausedQueues.has(cj.queue);
             const mutating =
               pauseMutation.isPending || resumeMutation.isPending;
@@ -145,6 +198,8 @@ export function CronPage() {
                     </svg>
 
                     <span className="font-medium">{cj.name}</span>
+                    {cj.owner_id && <Badge intent="secondary">{cj.owner_id}</Badge>}
+                    {isRetired && <Badge intent="warning">retired</Badge>}
                     {isPaused && (
                       <Badge intent="warning" className="text-[10px]">
                         paused
@@ -177,7 +232,7 @@ export function CronPage() {
                     )}
 
                     <span className="ml-auto flex items-center gap-3 text-sm text-muted-fg">
-                      {cj.next_fire_at && !isPaused && (
+                      {cj.next_fire_at && !isPaused && !isRetired && (
                         <span
                           className="text-success"
                           title={formatInTimezone(cj.next_fire_at, cj.timezone)}
@@ -195,6 +250,7 @@ export function CronPage() {
                     </span>
                   </button>
 
+                  {!readOnly && <Button intent="outline" size="xs" isDisabled={ownerMutation.isPending} onPress={() => preview({ action: isRetired ? "restore" : "retire", name: cj.name })}>{isRetired ? "Restore" : "Retire"}</Button>}
                   {isPaused ? (
                     <Button
                       intent="outline"
@@ -202,7 +258,7 @@ export function CronPage() {
                       onPress={() => {
                         resumeMutation.mutate(cj.name);
                       }}
-                      isDisabled={readOnly || mutating}
+                      isDisabled={readOnly || mutating || isRetired}
                     >
                       Resume
                     </Button>
@@ -213,7 +269,7 @@ export function CronPage() {
                       onPress={() => {
                         pauseMutation.mutate(cj.name);
                       }}
-                      isDisabled={readOnly || mutating}
+                      isDisabled={readOnly || mutating || isRetired}
                     >
                       Pause
                     </Button>
@@ -225,7 +281,7 @@ export function CronPage() {
                     onPress={() => {
                       triggerMutation.mutate(cj.name);
                     }}
-                    isDisabled={readOnly || triggerMutation.isPending}
+                    isDisabled={readOnly || triggerMutation.isPending || isRetired}
                   >
                     Trigger now
                   </Button>
