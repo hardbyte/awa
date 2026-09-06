@@ -1251,9 +1251,41 @@ impl MaintenanceService {
 
     /// Sync all registered periodic job schedules to `awa.cron_jobs` via UPSERT.
     ///
-    /// Additive only — does NOT delete schedules not in the local set (multi-deployment safe).
+    /// Unowned registrations stay additive. Owned schedules reconcile only from
+    /// the shared fleet evidence, independently of this leader's local set.
     #[tracing::instrument(skip(self), name = "maintenance.cron_sync")]
     async fn sync_periodic_jobs_to_db(&self) {
+        match awa_model::cron_reconciliation::owners(&self.pool).await {
+            Ok(owners) => {
+                for owner in owners {
+                    match awa_model::cron_reconciliation::reconcile(&self.pool, &owner).await {
+                        Ok(plan) => {
+                            let outcome = plan
+                                .blockers
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("converged")
+                                .to_owned();
+                            self.metrics
+                                .cron_reconciliation_decisions
+                                .add(1, &[opentelemetry::KeyValue::new("outcome", outcome)]);
+                            if plan.applied {
+                                self.metrics
+                                    .cron_retired
+                                    .add(plan.retirements.len() as u64, &[]);
+                            }
+
+                            info!(owner = %owner, hash = ?plan.desired_hash, blockers = ?plan.blockers, blocking_instances = ?plan.blocking_instances, grace_remaining_ms = plan.grace_remaining_ms, proposed_retirements = plan.retirements.len(), applied = plan.applied, "Periodic reconciliation");
+                        }
+                        Err(err) => {
+                            error!(owner = %owner, error = %err, "Periodic reconciliation failed")
+                        }
+                    }
+                }
+            }
+            Err(err) => error!(error = %err, "Failed to load cron reconciliation owners"),
+        }
+
         if self.periodic_jobs.is_empty() {
             return;
         }
@@ -1464,7 +1496,7 @@ impl MaintenanceService {
         let now = Utc::now();
 
         for row in &cron_rows {
-            if row.is_paused() {
+            if row.is_paused() || row.retired_at.is_some() {
                 debug!(cron_name = %row.name, "Skipping paused cron schedule");
                 continue;
             }
@@ -3602,6 +3634,10 @@ mod tests {
         missed_fire_policy: CronMissedFirePolicy,
     ) -> CronJobRow {
         CronJobRow {
+            owner_id: None,
+            retired_at: None,
+            retired_by: None,
+            retired_revision: None,
             name: "test_cron".to_string(),
             cron_expr: cron_expr.to_string(),
             timezone: "UTC".to_string(),

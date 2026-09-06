@@ -1918,6 +1918,7 @@ where
     sqlx::query(
         r#"
         INSERT INTO awa.runtime_instances (
+            cron_protocol,
             instance_id,
             hostname,
             pid,
@@ -1941,9 +1942,10 @@ where
             job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+            1, $1, $2, $3, $4, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT (instance_id) DO UPDATE SET
+            cron_protocol = EXCLUDED.cron_protocol,
             hostname = EXCLUDED.hostname,
             pid = EXCLUDED.pid,
             version = EXCLUDED.version,

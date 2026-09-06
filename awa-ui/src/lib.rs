@@ -131,6 +131,11 @@ pub async fn router_with_identity(
         // Cron
         .route("/cron", get(handlers::cron::list_cron_jobs))
         .route(
+            "/cron/reconciliation",
+            get(handlers::cron::reconciliation_status),
+        )
+        .route("/cron/owner-action", post(handlers::cron::owner_action))
+        .route(
             "/cron/{name}/trigger",
             post(handlers::cron::trigger_cron_job),
         )

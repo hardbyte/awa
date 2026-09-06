@@ -85,6 +85,11 @@ const WAIT_DURATION_BUCKETS_SECONDS: [f64; 14] = [
 /// Awa worker metrics backed by OpenTelemetry.
 #[derive(Clone)]
 pub struct AwaMetrics {
+    /// Reconciliation decisions, labelled by bounded outcome/refusal reason.
+    pub cron_reconciliation_decisions: Counter<u64>,
+    /// Schedules retired automatically after fleet convergence.
+    pub cron_retired: Counter<u64>,
+
     /// Total jobs inserted.
     pub jobs_inserted: Counter<u64>,
     /// Per-batch size distribution for the direct queue-storage COPY enqueue
@@ -243,6 +248,8 @@ impl AwaMetrics {
     /// the registration too.
     pub fn new(meter: &Meter) -> Self {
         Self {
+            cron_reconciliation_decisions: meter.u64_counter("awa.cron.reconciliation.decisions").build(),
+            cron_retired: meter.u64_counter("awa.cron.retired").build(),
             jobs_inserted: meter
                 .u64_counter(names::JOB_INSERTED)
                 .with_description("Number of jobs inserted")

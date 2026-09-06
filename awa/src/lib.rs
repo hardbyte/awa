@@ -30,3 +30,5 @@ pub use awa_worker::{
 
 #[cfg(feature = "http-worker")]
 pub use awa_worker::{HttpWorker, HttpWorkerConfig, HttpWorkerMode};
+
+pub use awa_model::PeriodicReconciliation;

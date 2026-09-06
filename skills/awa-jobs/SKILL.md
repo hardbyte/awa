@@ -181,6 +181,23 @@ so `missed_fire_policy` governs catch-up on resume. Cron pause and queue pause
 are independent. To purge in-flight cron work, pause the schedule, then
 bulk-cancel jobs filtered by `metadata.cron_name`.
 
+### Complete owned schedule sets (v045+)
+
+Default registration stays additive. Opt in with
+`PeriodicReconciliation::authoritative(owner, revision, grace)?` passed to
+Rust's `.periodic_reconciliation(config)`, or Python's
+`client.periodic_reconciliation(owner, revision, grace_seconds=60)`. All periodic
+registrations then form that owner's complete set; explicitly configuring this
+with zero schedules means an authoritative empty set. Owner/revision must be
+non-empty. Names stay globally unique. Never opt in for a partial declaration.
+
+Existing unowned names require explicit adoption. Conflicting ownership or
+retired desired names fail startup; code registration cannot restore retirement.
+Every runtime must support the protocol before absent owned schedules retire,
+with matching live manifests through grace. Outage alone never removes schedules.
+Restoration is an operator action and starts evaluation from now without catch-up
+for retired time. Existing jobs/retries/DLQ work are unaffected.
+
 ## Callbacks
 
 **In-process callbacks** park a job on an external event and resume the same

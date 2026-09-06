@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 44;
+pub const CURRENT_VERSION: i32 = 45;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -261,6 +261,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Refresh jobs_compat(): materialized claim cursors and receipt-plane running rows (#422)",
         &[V44_UP],
     ),
+    (45, "Owner-scoped periodic reconciliation (#481)", &[V45_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -305,6 +306,7 @@ const V40_UP: &str = include_str!("../migrations/v040_finalize_with_drain_runtim
 const V41_UP: &str = include_str!("../migrations/v041_queue_runtime_overrides.sql");
 const V42_UP: &str = include_str!("../migrations/v042_compact_deadline_claims.sql");
 const V43_UP: &str = include_str!("../migrations/v043_ring_rotation_ledger.sql");
+const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
 const V44_UP: &str = include_str!("../migrations/v044_jobs_compat_receipt_running.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.

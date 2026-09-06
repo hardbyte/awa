@@ -163,6 +163,10 @@ export interface QueueRuntimeSummary {
 }
 
 export interface CronJobRow {
+  owner_id: string | null;
+  retired_at: string | null;
+  retired_by: string | null;
+  retired_revision: string | null;
   name: string;
   cron_expr: string;
   timezone: string;
@@ -608,4 +612,38 @@ export function fetchDistinctKinds(): Promise<string[]> {
 
 export function fetchDistinctQueues(): Promise<string[]> {
   return apiFetch("/stats/queues");
+}
+
+
+export interface CronReconciliationPlan {
+  owner_id: string;
+  desired_hash: string | null;
+  blockers: string[];
+  blocking_instances: string[];
+  conflicts: string[];
+  additions: string[];
+  updates: string[];
+  retirements: string[];
+  grace_remaining_ms: number;
+  agreed_since: string | null;
+  evaluated_at: string;
+  declarations: { instance_id: string; revision: string; desired_hash: string; expires_at: string }[];
+}
+export type CronOwnerAction =
+  | { action: "adopt"; name: string; owner_id: string; expected_owner: string | null }
+  | { action: "retire" | "restore"; name: string }
+  | { action: "retire_owner"; owner_id: string };
+export interface CronActionPlan {
+  action: CronOwnerAction;
+  schedules: string[];
+  applied: boolean;
+}
+export function fetchCronReconciliation(): Promise<CronReconciliationPlan[]> {
+  return apiFetch("/cron/reconciliation");
+}
+export function cronOwnerAction(action: CronOwnerAction, apply = false): Promise<CronActionPlan> {
+  return apiFetch("/cron/owner-action", {
+    method: "POST",
+    body: JSON.stringify({ ...action, actor: "web-ui", apply }),
+  });
 }

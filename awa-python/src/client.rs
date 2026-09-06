@@ -462,6 +462,7 @@ pub struct PyClient {
     pool: PgPool,
     workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
     periodic_jobs: Arc<Mutex<Vec<PeriodicJob>>>,
+    periodic_reconciliation: Arc<Mutex<Option<awa_model::PeriodicReconciliation>>>,
     queue_descriptors: Arc<Mutex<HashMap<String, QueueDescriptor>>>,
     job_kind_descriptors: Arc<Mutex<HashMap<String, JobKindDescriptor>>>,
     lifecycle: Arc<Mutex<RuntimeLifecycle>>,
@@ -501,6 +502,7 @@ impl PyClient {
             pool,
             workers: Arc::new(RwLock::new(HashMap::new())),
             periodic_jobs: Arc::new(Mutex::new(Vec::new())),
+            periodic_reconciliation: Arc::new(Mutex::new(None)),
             queue_descriptors: Arc::new(Mutex::new(HashMap::new())),
             job_kind_descriptors: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(Mutex::new(RuntimeLifecycle::Idle)),
@@ -755,6 +757,91 @@ impl PyClient {
         )?;
 
         Ok(decorator.into_any().unbind())
+    }
+
+    /// Explicit complete-set declaration; empty periodic registration is intentional.
+    #[pyo3(signature = (owner, revision, *, grace_seconds=60.0))]
+    fn periodic_reconciliation(
+        &self,
+        owner: String,
+        revision: String,
+        grace_seconds: f64,
+    ) -> PyResult<()> {
+        let grace = Duration::try_from_secs_f64(grace_seconds)
+            .map_err(|_| validation_error("cron grace_seconds must be finite and nonnegative"))?;
+        let config = awa_model::PeriodicReconciliation::authoritative(owner, revision, grace)
+            .map_err(map_awa_error)?;
+        *self
+            .periodic_reconciliation
+            .lock()
+            .expect("periodic reconciliation mutex poisoned") = Some(config);
+        Ok(())
+    }
+
+    fn cron_reconciliation_plan<'py>(
+        &self,
+        py: Python<'py>,
+        owner: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = awa_model::cron_reconciliation::plan(&pool, &owner)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string(&result).map_err(|e| validation_error(e.to_string()))
+        })
+    }
+
+    fn cron_reconciliation_plan_sync(&self, py: Python<'_>, owner: String) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let result = awa_model::cron_reconciliation::plan(&pool, &owner)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string(&result).map_err(|e| validation_error(e.to_string()))
+            })
+        })
+    }
+
+    #[pyo3(signature = (action_json, *, actor="python".to_string(), apply=false))]
+    fn cron_owner_action<'py>(
+        &self,
+        py: Python<'py>,
+        action_json: String,
+        actor: String,
+        apply: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let action = serde_json::from_str(&action_json)
+            .map_err(|e| validation_error(format!("invalid cron action: {e}")))?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = awa_model::cron_reconciliation::operate(&pool, action, &actor, apply)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string(&result).map_err(|e| validation_error(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (action_json, *, actor="python".to_string(), apply=false))]
+    fn cron_owner_action_sync(
+        &self,
+        py: Python<'_>,
+        action_json: String,
+        actor: String,
+        apply: bool,
+    ) -> PyResult<String> {
+        let pool = self.pool.clone();
+        let action = serde_json::from_str(&action_json)
+            .map_err(|e| validation_error(format!("invalid cron action: {e}")))?;
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let result = awa_model::cron_reconciliation::operate(&pool, action, &actor, apply)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string(&result).map_err(|e| validation_error(e.to_string()))
+            })
+        })
     }
 
     /// Register a periodic (cron) job schedule.
@@ -1897,6 +1984,14 @@ impl PyClient {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
         }
 
+        if let Some(config) = self
+            .periodic_reconciliation
+            .lock()
+            .expect("periodic reconciliation mutex poisoned")
+            .clone()
+        {
+            builder = builder.periodic_reconciliation(config);
+        }
         // Register periodic jobs
         let periodic_jobs = self
             .periodic_jobs

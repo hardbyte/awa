@@ -280,3 +280,70 @@ async fn test_list_response_includes_paused_state() {
         .await
         .unwrap();
 }
+
+#[sqlx::test]
+async fn owner_action_requires_apply_and_writable_mode(pool: sqlx::PgPool) {
+    awa_model::migrations::run(&pool).await.unwrap();
+    seed_cron_schedule(&pool, "owner_api").await;
+    let readonly = awa_ui::router_with(
+        pool.clone(),
+        std::time::Duration::ZERO,
+        None,
+        awa_ui::state::ReadOnlyMode::ReadOnly,
+    )
+    .await
+    .unwrap();
+    let request = |apply: bool| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/cron/owner-action")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "action":"retire", "name":"owner_api", "actor":"test", "apply":apply,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let response = readonly.clone().oneshot(request(false)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let plan: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(plan["applied"], false);
+    assert_eq!(
+        readonly.oneshot(request(true)).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let retired: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT retired_at FROM awa.cron_jobs WHERE name='owner_api'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(retired.is_none());
+    let writable = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        writable
+            .clone()
+            .oneshot(request(true))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let response = writable
+        .oneshot(
+            Request::builder()
+                .uri("/api/cron")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let rows: Vec<Value> =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(!rows[0]["retired_at"].is_null());
+    assert!(rows[0]["next_fire_at"].is_null());
+}

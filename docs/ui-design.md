@@ -190,3 +190,15 @@ To build the frontend for embedding:
 cd awa-ui/frontend
 npm run build        # Output to awa-ui/static/, picked up by rust-embed
 ```
+
+
+### Cron ownership API
+
+`GET /api/cron/reconciliation` returns owner plans with declarations, blockers,
+conflicts, additions/updates/retirements, and grace evidence.
+`POST /api/cron/owner-action` accepts an action (`adopt`, `retire`, `retire_owner`,
+`restore`), its `name`/`owner_id` and adoption `expected_owner`, an `actor`, and
+`apply` (defaults false). It returns `{action, schedules, applied}`. Committing
+requires writable mode. Existing `/api/cron` rows add owner and retirement audit
+fields; retired rows have no next-fire prediction. The UI previews operations
+before an explicit Apply and distinguishes paused from retired schedules.

@@ -4,6 +4,8 @@ pub mod batch_operations;
 pub mod bridge;
 pub mod callback_contract;
 pub mod cron;
+pub mod cron_reconciliation;
+pub use cron_reconciliation::PeriodicReconciliation;
 pub mod dlq;
 pub mod error;
 pub mod insert;

@@ -159,7 +159,7 @@ awa dlq purge --kind SendEmail           # destructive; --all required if unfilt
 
 ## Cron
 
-The CLI cron surface is `list` and `remove <name>` only. Pause, resume, and
+The default CLI cron surface includes `list` and `remove <name>`. Pause, resume, and
 trigger are admin operations (the web UI and admin API, and the Python client),
 not the CLI. Only the maintenance leader evaluates due schedules; enqueue is
 atomic and re-checks `paused_at` inside the same statement, so a pause races
@@ -167,6 +167,25 @@ cleanly against a fire — a pause takes effect even if it lands between the
 evaluator's read and the enqueue. Schedules are declared in application code;
 for timezone and missed-fire (`coalesce`/`catch_up`) semantics, see the
 `awa-jobs` skill.
+
+### Owned schedules (v045+)
+
+Use current operator clients. `awa cron plan OWNER` explains fleet capability,
+manifest disagreement, zero-live refusal, conflicts, grace, and retirement
+candidates. `--manifest PATH` previews a JSON array of proposed definitions
+without publishing it. `cron adopt NAME OWNER` (optionally
+`--expected-owner OLD` for transfer), `cron retire NAME`,
+`cron retire-owner OWNER`, and `cron restore NAME` default to dry-run; `--apply`
+commits and `--actor LABEL` identifies the operator. The web UI provides previews
+and Apply too. Owned/retired rows cannot be physically removed.
+
+A retired schedule differs from pause: no current automatic/manual firing,
+no resurrection by registration, and explicit restore starts from now without
+replaying retired time. Legacy automatic enqueue and UPSERT honor the database
+fence; legacy manual-trigger clients are outside this operator contract. Zero
+live declarations never auto-retire an owner. Use retire-owner explicitly to
+decommission a fleet. Keep the v045 snapshot trigger installed; it serializes
+legacy evidence publication with retirement without locking job heartbeats.
 
 ## Storage Transitions
 

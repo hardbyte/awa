@@ -218,3 +218,50 @@ async def test_periodic_fires_and_executes(client):
         assert args["format"] == "html"
     else:
         assert args.format == "html"
+
+@pytest.mark.asyncio
+async def test_authoritative_owner_and_operator_actions(client):
+    import uuid
+    owner = "owner481_" + uuid.uuid4().hex
+    name = "owned481_" + uuid.uuid4().hex
+    @client.task(DailyReport, queue="owner481")
+    async def handle(job):
+        return None
+
+    client.periodic_reconciliation(owner, "python-test", grace_seconds=0)
+    client.periodic(name, "0 9 * * *", DailyReport, DailyReport("pdf"), queue="owner481")
+    await client.start([("owner481", 1)], **RUNTIME_START_KWARGS)
+    plan = await client.cron_reconciliation_plan(owner)
+    assert plan["declarations"][0]["revision"] == "python-test"
+    assert plan["desired_hash"]
+    preview = await client.cron_owner_action({"action": "retire", "name": name})
+    assert not preview["applied"]
+    assert preview["schedules"] == [name]
+    row = next(row for row in await client.list_cron_jobs() if row["name"] == name)
+    assert row["owner_id"] == owner and row["retired_at"] is None
+    await client.cron_owner_action({"action": "retire", "name": name}, apply=True)
+    row = next(row for row in await client.list_cron_jobs() if row["name"] == name)
+    assert row["retired_at"] is not None
+    await client.cron_owner_action({"action": "restore", "name": name}, apply=True)
+    row = next(row for row in await client.list_cron_jobs() if row["name"] == name)
+    assert row["retired_at"] is None and row["last_enqueued_at"] is not None
+
+@pytest.mark.asyncio
+async def test_authoritative_configuration_rejects_invalid_values(client):
+    for owner, revision, grace in [("", "rev", 0), ("owner", "", 0), ("owner", "rev", -1), ("owner", "rev", float("nan"))]:
+        with pytest.raises(Exception, match="cron"):
+            client.periodic_reconciliation(owner, revision, grace_seconds=grace)
+
+
+def test_sync_owner_api_parity():
+    import uuid
+    c = awa.Client(DATABASE_URL)
+    try:
+        owner = "sync481_" + uuid.uuid4().hex
+        c.periodic_reconciliation(owner, "sync-revision", grace_seconds=0)
+        plan = c.cron_reconciliation_plan(owner)
+        assert "zero_live_declarations" in plan["blockers"]
+        result = c.cron_owner_action({"action": "retire_owner", "owner_id": owner})
+        assert not result["applied"] and result["schedules"] == []
+    finally:
+        c.close()

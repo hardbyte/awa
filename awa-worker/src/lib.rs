@@ -1,3 +1,4 @@
+pub use awa_model::PeriodicReconciliation;
 mod cancel_listener;
 pub mod client;
 mod completion;
