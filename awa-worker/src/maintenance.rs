@@ -1275,7 +1275,14 @@ impl MaintenanceService {
                                     .add(plan.retirements.len() as u64, &[]);
                             }
 
-                            info!(owner = %owner, hash = ?plan.desired_hash, blockers = ?plan.blockers, blocking_instances = ?plan.blocking_instances, grace_remaining_ms = plan.grace_remaining_ms, proposed_retirements = plan.retirements.len(), applied = plan.applied, "Periodic reconciliation");
+                            if plan.applied
+                                && (!plan.retirements.is_empty()
+                                    || !plan.updates.is_empty()
+                                    || !plan.additions.is_empty())
+                            {
+                                info!(owner = %owner, retired = plan.retirements.len(), updated = plan.updates.len(), added = plan.additions.len(), "Periodic reconciliation applied changes");
+                            }
+                            debug!(owner = %owner, hash = ?plan.desired_hash, blockers = ?plan.blockers, blocking_instances = ?plan.blocking_instances, grace_remaining_ms = plan.grace_remaining_ms, proposed_retirements = plan.retirements.len(), applied = plan.applied, "Periodic reconciliation");
                         }
                         Err(err) => {
                             error!(owner = %owner, error = %err, "Periodic reconciliation failed")

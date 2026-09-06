@@ -864,14 +864,19 @@ client.periodic("invoice", "0 9 * * *", Invoice, Invoice(...))
 Calling `periodic_reconciliation` with no schedules deliberately declares an
 empty complete set. Omitting it never authorizes retirement. Rust validates the
 configuration at construction/build; Python rejects invalid owner, revision,
-and grace values when configured. Both fail startup on ownership/retirement
-conflicts. Existing unowned schedules require explicit adoption.
+and grace values when configured. Both fail startup on foreign ownership
+conflicts. Existing unowned schedules require explicit adoption. A retired name
+owned by this deployment allows startup but stays inert and appears as an
+`ownership_or_retirement_conflict` until explicitly restored.
 
 Every runtime reports capability. Authoritative runtimes also publish a hash of
 the complete normalized definitions, including args/metadata, independently of
-leadership. Identical manifests are stored once per owner/hash. Changed
-manifests synchronize definitions in one batch; unchanged snapshots do not
-rewrite the schedule table. The leader checks all owners every cron sync pass
+leadership. Identical manifests are stored once per owner/hash. New names can
+be inserted during a rollout, but existing definitions change in one batch only
+when fresh, capable runtimes agree on one manifest with no ownership or retirement
+conflicts. Definition updates do not wait for retirement grace. Mixed revisions
+retain the last agreed definitions rather than alternating on each heartbeat.
+Unchanged snapshots do not rewrite the schedule table. The leader checks all owners every cron sync pass
 (60 seconds), using only database evidence.
 
 Automatic retirement requires a fresh capable fleet, at least one live
@@ -893,6 +898,7 @@ awa cron retire invoice                               # preview
 awa cron retire invoice --apply
 awa cron retire-owner billing-workers --apply          # explicit decommission
 awa cron restore invoice --apply
+awa cron restore-owner billing-workers --apply          # restore all retired owned names
 ```
 
 Owner operations print JSON and default to dry-run; `--apply` commits after
@@ -913,9 +919,14 @@ retired rows must use lifecycle operations so their tombstones survive.
 
 Python exposes `cron_reconciliation_plan(owner)` and
 `cron_owner_action(action, actor="python", apply=False)` on async and sync
-clients. The action object uses `action: adopt | retire | retire_owner | restore`,
+clients. The action object uses `action: adopt | retire | retire_owner | restore | restore_owner`,
 with `name` or `owner_id`; adoption also supplies `expected_owner` (null for
 unowned). Async methods are awaited.
+
+Read-only plans use a consistent committed snapshot without acquiring the
+evidence writer lock. Apply always rechecks under that lock. Operator actions
+reset agreement only for the affected owner(s); transfers reset both sides.
+Unowned retired registrations are quiet skips.
 
 Metrics: `awa.cron.reconciliation.decisions` counts decisions with a bounded
 `outcome` label (a blocker code or `converged`); `awa.cron.retired` counts

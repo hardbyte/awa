@@ -128,7 +128,7 @@ class AsyncClient:
         return json.loads(await self._raw.cron_reconciliation_plan(owner))
 
     async def cron_owner_action(self, action: dict[str, Any], *, actor: str = "python", apply: bool = False) -> dict[str, Any]:
-        """Preview an adopt, retire, retire_owner, or restore action; apply explicitly."""
+        """Preview an adopt, retire, retire_owner, restore, or restore_owner action; apply explicitly."""
         return json.loads(await self._raw.cron_owner_action(json.dumps(action), actor=actor, apply=apply))
 
     def __init__(self, database_url: str, max_connections: int = 10) -> None:
@@ -980,7 +980,7 @@ class Client:
         return json.loads(self._raw.cron_reconciliation_plan_sync(owner))
 
     def cron_owner_action(self, action: dict[str, Any], *, actor: str = "python", apply: bool = False) -> dict[str, Any]:
-        """Preview an adopt, retire, retire_owner, or restore action; apply explicitly."""
+        """Preview an adopt, retire, retire_owner, restore, or restore_owner action; apply explicitly."""
         return json.loads(self._raw.cron_owner_action_sync(json.dumps(action), actor=actor, apply=apply))
 
     def __init__(self, database_url: str, max_connections: int = 10) -> None:

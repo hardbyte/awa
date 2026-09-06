@@ -19,7 +19,7 @@ fn config(owner: &str, grace: u64) -> PeriodicReconciliation {
 }
 async fn runtime(conn: &mut sqlx::PgConnection, id: Uuid, capable: bool) {
     sqlx::query("INSERT INTO awa.runtime_instances(instance_id,pid,version,started_at,last_seen_at,snapshot_interval_ms,healthy,postgres_connected,poll_loop_alive,heartbeat_alive,maintenance_alive,shutting_down,leader,cron_protocol) VALUES ($1,1,'test',clock_timestamp(),clock_timestamp(),1000,true,true,true,true,true,false,false,$2) ON CONFLICT(instance_id) DO UPDATE SET last_seen_at=clock_timestamp(),cron_protocol=EXCLUDED.cron_protocol")
-        .bind(id).bind(if capable {Some(1i32)} else {None}).execute(conn).await.unwrap();
+        .bind(id).bind(if capable {Some(reconcile::CRON_PROTOCOL_VERSION)} else {None}).execute(conn).await.unwrap();
 }
 async fn publish(pool: &PgPool, id: Uuid, c: &PeriodicReconciliation, jobs: &[PeriodicJob]) {
     let manifest = reconcile::PeriodicManifest::new(jobs).unwrap();
@@ -531,5 +531,261 @@ async fn released_old_leader_cannot_fire_retired_schedule(pool: PgPool) {
     println!(
         "{}",
         serde_json::json!({"protocol":"cron-ownership-v1","old_artifact":"awa=0.6.7","schema":migrations::CURRENT_VERSION,"live_old_leader_fenced":true,"released_upsert_preserves_tombstone":true,"released_atomic_enqueue_fenced":true})
+    );
+}
+
+#[sqlx::test]
+async fn review_mixed_manifests_do_not_flip_definitions(pool: PgPool) {
+    init(&pool).await;
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = config("billing", 0);
+    let mut old = job("invoice");
+    old.cron_expr = "0 9 * * *".into();
+    let mut new = old.clone();
+    new.cron_expr = "0 10 * * *".into();
+    publish(&pool, a, &c, &[old.clone()]).await;
+    for _ in 0..2 {
+        publish(&pool, b, &c, &[new.clone(), job("new-name")]).await;
+        assert_eq!(get(&pool, "invoice").await.cron_expr, old.cron_expr);
+        publish(&pool, a, &c, &[old.clone()]).await;
+        assert_eq!(get(&pool, "invoice").await.cron_expr, old.cron_expr);
+    }
+    assert_eq!(
+        get(&pool, "new-name").await.owner_id.as_deref(),
+        Some("billing")
+    );
+    publish(&pool, a, &c, &[new.clone(), job("new-name")]).await;
+    assert_eq!(get(&pool, "invoice").await.cron_expr, new.cron_expr);
+}
+
+#[sqlx::test]
+async fn review_operator_action_preserves_unrelated_owner_and_row_locks(pool: PgPool) {
+    init(&pool).await;
+    publish(
+        &pool,
+        Uuid::new_v4(),
+        &config("billing", 60_000),
+        &[job("invoice")],
+    )
+    .await;
+    publish(
+        &pool,
+        Uuid::new_v4(),
+        &config("mail", 60_000),
+        &[job("reminder")],
+    )
+    .await;
+    let before: (Option<String>, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT synced_hash,agreed_since FROM awa.cron_owners WHERE owner_id='mail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    reconcile::operate(
+        &pool,
+        reconcile::CronOwnerAction::Retire {
+            name: "invoice".into(),
+        },
+        "test",
+        true,
+    )
+    .await
+    .unwrap();
+    let after = sqlx::query_as::<_, (Option<String>, Option<chrono::DateTime<Utc>>)>(
+        "SELECT synced_hash,agreed_since FROM awa.cron_owners WHERE owner_id='mail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        before, after,
+        "billing action must not restart mail's agreement"
+    );
+    let mut row_lock = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM awa.cron_jobs WHERE name='reminder' FOR UPDATE")
+        .execute(&mut *row_lock)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        reconcile::operate(
+            &pool,
+            reconcile::CronOwnerAction::Restore {
+                name: "invoice".into(),
+            },
+            "test",
+            true,
+        ),
+    )
+    .await
+    .expect("unrelated cron row lock must not block billing action")
+    .unwrap();
+    row_lock.rollback().await.unwrap();
+}
+
+#[sqlx::test]
+async fn review_retired_additive_registration_is_quiet(pool: PgPool) {
+    init(&pool).await;
+    cron::upsert_cron_job(&pool, &job("unowned")).await.unwrap();
+    reconcile::operate(
+        &pool,
+        reconcile::CronOwnerAction::Retire {
+            name: "unowned".into(),
+        },
+        "test",
+        true,
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        cron::upsert_cron_job(&pool, &job("unowned"))
+            .await
+            .expect("retired additive schedule is an inert skip");
+    }
+    assert!(get(&pool, "unowned").await.retired_at.is_some());
+    let error = cron::delete_cron_job(&pool, "unowned")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("retired"), "{error}");
+    assert!(!error.contains("durable ownership"), "{error}");
+}
+
+#[sqlx::test]
+async fn review_read_only_plans_do_not_wait_for_evidence_writer(pool: PgPool) {
+    init(&pool).await;
+    let mut writer = pool.begin().await.unwrap();
+    reconcile::lock(&mut writer).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        reconcile::preview(&pool, "billing", &[job("invoice")]),
+    )
+    .await
+    .expect("preview must read a committed snapshot without the evidence lock")
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), reconcile::plan(&pool, "billing"))
+        .await
+        .expect("plan must not block evidence publication")
+        .unwrap();
+    writer.rollback().await.unwrap();
+}
+
+#[sqlx::test]
+async fn review_conflicts_never_persist_agreement_on_heartbeat(pool: PgPool) {
+    init(&pool).await;
+    cron::upsert_cron_job(&pool, &job("unowned")).await.unwrap();
+    let id = Uuid::new_v4();
+    for _ in 0..2 {
+        publish(&pool, id, &config("billing", 60_000), &[job("unowned")]).await;
+        let since: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT agreed_since FROM awa.cron_owners WHERE owner_id='billing'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            since.is_none(),
+            "a conflicting heartbeat cannot start agreement"
+        );
+        reconcile::reconcile(&pool, "billing").await.unwrap();
+    }
+}
+
+#[sqlx::test]
+async fn retired_desired_names_allow_startup_and_owner_restore(pool: PgPool) {
+    init(&pool).await;
+    let c = config("billing", 0);
+    publish(
+        &pool,
+        Uuid::new_v4(),
+        &c,
+        &[job("invoice"), job("statement")],
+    )
+    .await;
+    cron::pause_cron_job(&pool, "invoice", Some("test"))
+        .await
+        .unwrap();
+    reconcile::operate(
+        &pool,
+        reconcile::CronOwnerAction::RetireOwner {
+            owner_id: "billing".into(),
+        },
+        "test",
+        true,
+    )
+    .await
+    .unwrap();
+    let client = awa::Client::builder(pool.clone())
+        .queue("test", awa::QueueConfig::default())
+        .periodic_reconciliation(c)
+        .periodic(job("invoice"))
+        .periodic(job("statement"))
+        .build()
+        .unwrap();
+    client
+        .start()
+        .await
+        .expect("a retired desired schedule stays inert without failing startup");
+    client.shutdown(Duration::from_secs(2)).await;
+    let plan = reconcile::plan(&pool, "billing").await.unwrap();
+    assert!(plan
+        .blockers
+        .contains(&"ownership_or_retirement_conflict".into()));
+    assert!(plan.agreed_since.is_none());
+    let action = reconcile::CronOwnerAction::RestoreOwner {
+        owner_id: "billing".into(),
+    };
+    let preview = reconcile::operate(&pool, action.clone(), "test", false)
+        .await
+        .unwrap();
+    assert_eq!(preview.schedules, ["invoice", "statement"]);
+    assert!(get(&pool, "invoice").await.retired_at.is_some());
+    let restored_after: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    reconcile::operate(&pool, action, "test", true)
+        .await
+        .unwrap();
+    for name in ["invoice", "statement"] {
+        let row = get(&pool, name).await;
+        assert!(row.retired_at.is_none());
+        assert!(row.last_enqueued_at.unwrap() >= restored_after);
+    }
+    assert!(get(&pool, "invoice").await.paused_at.is_some());
+}
+
+#[sqlx::test]
+async fn protocol_capability_matches_schema_and_legacy_reset_is_idempotent(pool: PgPool) {
+    init(&pool).await;
+    let schema_version: i32 = sqlx::query_scalar("SELECT awa.cron_protocol_version()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(schema_version, reconcile::CRON_PROTOCOL_VERSION);
+    publish(
+        &pool,
+        Uuid::new_v4(),
+        &config("billing", 60_000),
+        &[job("invoice")],
+    )
+    .await;
+    let old = Uuid::new_v4();
+    let mut conn = pool.acquire().await.unwrap();
+    runtime(&mut conn, old, false).await;
+    let version: String =
+        sqlx::query_scalar("SELECT xmin::text FROM awa.cron_owners WHERE owner_id='billing'")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    runtime(&mut conn, old, false).await;
+    let repeated: String =
+        sqlx::query_scalar("SELECT xmin::text FROM awa.cron_owners WHERE owner_id='billing'")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        version, repeated,
+        "already cleared agreement must not generate another dead tuple"
     );
 }

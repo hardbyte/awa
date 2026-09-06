@@ -104,7 +104,8 @@ pub async fn reconciliation_status(
 pub struct CronActionRequest {
     #[serde(flatten)]
     pub action: awa_model::cron_reconciliation::CronOwnerAction,
-    pub actor: String,
+    /// Optional operator label; otherwise identify the serving UI instance.
+    pub actor: Option<String>,
     #[serde(default)]
     pub apply: bool,
 }
@@ -116,13 +117,15 @@ pub async fn owner_action(
     if request.apply {
         state.require_writable()?;
     }
-    let result = awa_model::cron_reconciliation::operate(
-        &state.pool,
-        request.action,
-        &request.actor,
-        request.apply,
-    )
-    .await?;
+    let actor = request
+        .actor
+        .unwrap_or_else(|| match state.instance.name.as_deref() {
+            Some(name) => format!("web-ui:{name}"),
+            None => "web-ui".to_owned(),
+        });
+    let result =
+        awa_model::cron_reconciliation::operate(&state.pool, request.action, &actor, request.apply)
+            .await?;
     if request.apply {
         state.invalidate_dashboard_caches();
     }

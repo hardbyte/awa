@@ -10,7 +10,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
   retirement/restoration, and CLI/API/UI dry-run/status. v045 preserves default
   additive sync and fences released 0.6.7 automatic enqueue on retired rows.
   Owned-schedule operator actions require current clients; existing jobs/retries
-  are unaffected. See the 0.6→0.7 upgrade guide for rollout and external runners.
+  are unaffected. Mixed-manifest rollouts retain the last agreed definitions;
+  lifecycle actions reset only affected owners. Retired desired names allow
+  startup while staying inert; `restore-owner` provides bulk restoration.
+  Read-only plans avoid the evidence writer lock. See the 0.6→0.7 upgrade guide
+  for rollout and external runners.
 
 ### Dependencies
 - Update the frontend seroval dependency to 1.6.4 (supersedes PR #453).

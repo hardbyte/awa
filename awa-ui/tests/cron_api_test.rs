@@ -300,7 +300,7 @@ async fn owner_action_requires_apply_and_writable_mode(pool: sqlx::PgPool) {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "action":"retire", "name":"owner_api", "actor":"test", "apply":apply,
+                    "action":"retire", "name":"owner_api", "apply":apply,
                 })
                 .to_string(),
             ))
@@ -321,9 +321,18 @@ async fn owner_action_requires_apply_and_writable_mode(pool: sqlx::PgPool) {
             .await
             .unwrap();
     assert!(retired.is_none());
-    let writable = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
-        .await
-        .unwrap();
+    let writable = awa_ui::router_with_identity(
+        pool.clone(),
+        std::time::Duration::ZERO,
+        None,
+        awa_ui::state::ReadOnlyMode::Writable,
+        awa_ui::state::InstanceIdentity {
+            name: Some("qa-fleet".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         writable
             .clone()
@@ -345,5 +354,6 @@ async fn owner_action_requires_apply_and_writable_mode(pool: sqlx::PgPool) {
     let rows: Vec<Value> =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(!rows[0]["retired_at"].is_null());
+    assert_eq!(rows[0]["retired_by"], "web-ui:qa-fleet");
     assert!(rows[0]["next_fire_at"].is_null());
 }

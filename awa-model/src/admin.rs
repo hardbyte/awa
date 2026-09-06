@@ -1942,7 +1942,7 @@ where
             job_kind_descriptor_hashes
         )
         VALUES (
-            1, $1, $2, $3, $4, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+            $20, $1, $2, $3, $4, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             cron_protocol = EXCLUDED.cron_protocol,
@@ -1991,6 +1991,7 @@ where
     .bind(Json(&snapshot.queues))
     .bind(Json(&snapshot.queue_descriptor_hashes))
     .bind(Json(&snapshot.job_kind_descriptor_hashes))
+    .bind(crate::cron_reconciliation::CRON_PROTOCOL_VERSION)
     .execute(executor)
     .await?;
 

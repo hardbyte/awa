@@ -229,8 +229,10 @@ test("owner operations preview, adopt, retire and restore", async ({ page, reque
   await expect(row.getByRole("button", { name: "Trigger now" })).toBeDisabled();
   rows = await (await request.get("/api/cron")).json();
   expect(rows.find((r: { name: string }) => r.name === "e2e_cron_owner").next_fire_at).toBeNull();
-  await row.getByRole("button", { name: "Restore", exact: true }).click();
-  await expect(page.getByRole("status").filter({ hasText: "Apply restore" })).toBeVisible();
+  const ownerPanel = page.locator("details").filter({ has: page.locator("summary", { hasText: "e2e-owner:" }) });
+  await ownerPanel.locator("summary").click();
+  await ownerPanel.getByRole("button", { name: "Preview owner restoration", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Apply restore_owner" })).toBeVisible();
   await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(row.getByRole("button", { name: "Retire", exact: true })).toBeVisible();
   await expect(row.getByRole("button", { name: "Trigger now" })).toBeEnabled();
@@ -243,6 +245,6 @@ test("read-only capabilities hide ownership mutations", async ({ page }) => {
   });
   await loadCronPage(page);
   await expect(page.getByText("Adopt or transfer a schedule", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /^(Retire|Restore|Preview owner retirement)$/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^(Retire|Restore|Preview owner retirement|Preview owner restoration)$/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Trigger now" }).first()).toBeDisabled();
 });

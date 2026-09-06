@@ -175,9 +175,15 @@ manifest disagreement, zero-live refusal, conflicts, grace, and retirement
 candidates. `--manifest PATH` previews a JSON array of proposed definitions
 without publishing it. `cron adopt NAME OWNER` (optionally
 `--expected-owner OLD` for transfer), `cron retire NAME`,
-`cron retire-owner OWNER`, and `cron restore NAME` default to dry-run; `--apply`
+`cron retire-owner OWNER`, `cron restore NAME`, and `cron restore-owner OWNER`
+default to dry-run; `--apply`
 commits and `--actor LABEL` identifies the operator. The web UI provides previews
-and Apply too. Owned/retired rows cannot be physically removed.
+and Apply too. Restore-owner restores only retired rows, preserving pause and
+starting their evaluation from now. Owned/retired rows cannot be physically removed.
+Reintroducing a retired desired name does not fail startup, but it remains inert
+until restoration. Plan/preview reads do not hold the evidence writer lock;
+apply rechecks the decision. Actions reset only affected owners, including both
+sides of an ownership transfer.
 
 A retired schedule differs from pause: no current automatic/manual firing,
 no resurrection by registration, and explicit restore starts from now without

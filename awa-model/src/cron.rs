@@ -296,8 +296,9 @@ pub async fn upsert_cron_job<'e, E>(executor: E, job: &PeriodicJob) -> Result<()
 where
     E: PgExecutor<'e>,
 {
-    let result = sqlx::query(
+    let accepted: bool = sqlx::query_scalar(
         r#"
+        WITH upsert AS (
         INSERT INTO awa.cron_jobs (name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata, missed_fire_policy)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (name) DO UPDATE SET
@@ -313,6 +314,11 @@ where
             missed_fire_policy = EXCLUDED.missed_fire_policy,
             updated_at = now()
         WHERE awa.cron_jobs.owner_id IS NULL AND awa.cron_jobs.retired_at IS NULL
+        RETURNING 1
+        )
+        SELECT EXISTS(SELECT 1 FROM upsert) OR EXISTS(
+            SELECT 1 FROM awa.cron_jobs WHERE name=$1 AND owner_id IS NULL AND retired_at IS NOT NULL
+        )
         "#,
     )
     .bind(&job.name)
@@ -326,11 +332,11 @@ where
     .bind(&job.tags)
     .bind(&job.metadata)
     .bind(job.missed_fire_policy.as_str())
-    .execute(executor)
+    .fetch_one(executor)
     .await?;
 
-    if result.rows_affected() == 0 {
-        return Err(AwaError::Validation(format!("cron schedule {} is owned or retired; explicit adoption, matching owner, or restoration required", job.name)));
+    if !accepted {
+        return Err(AwaError::Validation(format!("cron schedule {} is owned by another manager; explicit adoption or matching owner required", job.name)));
     }
     Ok(())
 }

@@ -311,7 +311,8 @@ fn access_for(command: &Commands) -> context::Access {
             CronCommands::Adopt { options, .. }
             | CronCommands::Retire { options, .. }
             | CronCommands::RetireOwner { options, .. }
-            | CronCommands::Restore { options, .. } => {
+            | CronCommands::Restore { options, .. }
+            | CronCommands::RestoreOwner { options, .. } => {
                 if options.apply {
                     Mutating
                 } else {
@@ -765,6 +766,12 @@ enum CronCommands {
     /// Restore a retired schedule from now, without replaying retired time
     Restore {
         name: String,
+        #[command(flatten)]
+        options: CronActionOptions,
+    },
+    /// Restore all retired schedules belonging to an owner, from now
+    RestoreOwner {
+        owner: String,
         #[command(flatten)]
         options: CronActionOptions,
     },
@@ -1724,6 +1731,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     CronCommands::Restore { name, options } => {
                         let action =
                             awa_model::cron_reconciliation::CronOwnerAction::Restore { name };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &awa_model::cron_reconciliation::operate(
+                                    &pool,
+                                    action,
+                                    &options.actor,
+                                    options.apply
+                                )
+                                .await?
+                            )?
+                        );
+                    }
+                    CronCommands::RestoreOwner { owner, options } => {
+                        let action =
+                            awa_model::cron_reconciliation::CronOwnerAction::RestoreOwner {
+                                owner_id: owner,
+                            };
                         println!(
                             "{}",
                             serde_json::to_string_pretty(

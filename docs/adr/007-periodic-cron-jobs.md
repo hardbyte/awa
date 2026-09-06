@@ -110,8 +110,8 @@ The advisory lock is session-scoped: as long as the connection is alive, the loc
 
 Opt-in authoritative registration declares a complete manifest for one stable
 owner; omitted configuration remains additive. Explicit authoritative empty is
-valid. Names remain globally unique. Ownership is claimed/transferred only by
-an operator. Retirement is a durable tombstone, distinct from pause: restoring
+valid. Names remain globally unique. New names are owned on first declaration;
+existing names can be adopted/transferred only by an operator. Retirement is a durable tombstone, distinct from pause: restoring
 sets the evaluation boundary to database time and does not replay retired time.
 
 Every runtime publishes protocol capability and, when authoritative, a canonical
@@ -121,6 +121,13 @@ snapshot and declaration together. Database time controls freshness (at least
 must support the protocol. Zero declarations, mixed manifests, conflicts, and
 retired desired names block automatic retirement. All live declarations' grace
 requirements must be satisfied. A missed evidence window resets agreement.
+New names may be inserted immediately; existing definitions synchronize only
+with a single capable live manifest and no conflicts, without waiting for
+retirement grace. This preserves stable definitions through mixed-revision
+rollouts. A synchronized hash certifies active ownership of all desired names;
+operator actions invalidate that certificate only for affected owners (both
+sides of a transfer). Unsynchronized manifests check conflicts before agreement
+is persisted, so heartbeat and leader passes cannot alternate the grace clock.
 
 One transaction advisory lock serializes runtime snapshot writes (including old
 binaries through a statement trigger), declaration publication, owner lifecycle
@@ -128,7 +135,9 @@ operations, and reconciliation. Owner rows additionally serialize owner state.
 No job/lease heartbeat takes this lock. Publication checks agreement so a short
 conflict between leader passes resets the durable grace clock. Reconciliation
 rechecks under the same lock, then retires absent rows atomically. Lock order is
-protocol lock, owner row, schedule rows ordered by name. The protocol is a
+protocol lock before any row locks, with schedule rows ordered by name.
+Read-only plans and previews use one repeatable-read snapshot without taking
+the protocol lock; apply reevaluates under the serializer. The protocol is a
 trusted-runtime coordination boundary, not authorization between SQL roles.
 
 Retired schedule rows survive old UPSERT and reject physical deletion. The
@@ -143,4 +152,6 @@ jobs, retries, DLQ work, and user enqueues remain independent of schedule state.
 
 No global pruning, automatic owner decommissioning, or physical tombstone purge
 is provided. Explicit retire-owner works without live declarations. Re-registering
-a retired name reports a conflict until an explicit operator restoration.
+a retired name allows startup but stays inert and reports a plan conflict until
+an explicit operator restoration. Restore-owner provides a bulk operation for
+retired schedules after decommissioning. Foreign ownership still fails startup.
