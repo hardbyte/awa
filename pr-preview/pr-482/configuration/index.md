@@ -923,3 +923,7 @@ Metrics: `awa.cron.reconciliation.decisions` counts decisions with a bounded
 `outcome` label (a blocker code or `converged`); `awa.cron.retired` counts
 automatically retired schedules. Owner/revision/instance details are in plans
 and structured logs, not unbounded metric labels.
+
+Authoritative clients prepare the canonical manifest once when built and share it
+across snapshot reports. Repeated publication sends the stored hash; unchanged
+manifest bodies are neither re-encoded under the protocol lock nor rewritten.

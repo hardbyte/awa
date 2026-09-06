@@ -4245,6 +4245,9 @@ unowned). Async methods are awaited.</p>
 <code>outcome</code> label (a blocker code or <code>converged</code>); <code>awa.cron.retired</code> counts
 automatically retired schedules. Owner/revision/instance details are in plans
 and structured logs, not unbounded metric labels.</p>
+<p>Authoritative clients prepare the canonical manifest once when built and share it
+across snapshot reports. Repeated publication sends the stored hash; unchanged
+manifest bodies are neither re-encoded under the protocol lock nor rewritten.</p>
 
 
 
