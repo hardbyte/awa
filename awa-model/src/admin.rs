@@ -270,6 +270,32 @@ async fn active_queue_storage_in_tx(
         .transpose()
 }
 
+/// Callback ownership can remain canonical while new jobs route to queue storage.
+/// Lock transition state through the caller's transaction so finalize cannot
+/// change the fallback boundary halfway through a callback operation (#462).
+async fn callback_queue_storage_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+) -> Result<Option<QueueStorage>, AwaError> {
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM awa.storage_transition_state WHERE singleton FOR SHARE",
+    )
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(store) = active_queue_storage_in_tx(tx).await? else {
+        return Ok(None);
+    };
+    if state.as_deref() == Some("mixed_transition")
+        && store
+            .callback_job_in_tx(tx, callback_id, None, false)
+            .await?
+            .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(store))
+}
+
 fn queue_storage_current_jobs_cte(schema: &str) -> String {
     format!(
         r#"
@@ -3357,7 +3383,7 @@ async fn complete_external_in_tx_inner(
     run_lease: Option<i64>,
     resume: bool,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         return store
             .complete_external_in_tx(tx, callback_id, payload, run_lease, resume)
             .await;
@@ -3369,7 +3395,7 @@ async fn complete_external_in_tx_inner(
         let payload_json = payload.unwrap_or(serde_json::Value::Null);
         sqlx::query_as::<_, JobRow>(
             r#"
-            UPDATE awa.jobs
+            UPDATE awa.jobs_hot
             SET state = 'running',
                 callback_id = NULL,
                 callback_timeout_at = NULL,
@@ -3393,7 +3419,7 @@ async fn complete_external_in_tx_inner(
         // Complete: terminal state, clear everything.
         sqlx::query_as::<_, JobRow>(
             r#"
-            UPDATE awa.jobs
+            UPDATE awa.jobs_hot
             SET state = 'completed',
                 finalized_at = now(),
                 callback_id = NULL,
@@ -3443,7 +3469,7 @@ pub async fn fail_external_in_tx(
     error: &str,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         return store
             .fail_external_with_error_entry_in_tx(
                 tx,
@@ -3456,7 +3482,7 @@ pub async fn fail_external_in_tx(
 
     let row = sqlx::query_as::<_, JobRow>(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET state = 'failed',
             finalized_at = now(),
             callback_id = NULL,
@@ -3514,13 +3540,13 @@ pub async fn retry_external_in_tx(
     callback_id: Uuid,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         return store.retry_external_in_tx(tx, callback_id, run_lease).await;
     }
 
     let row = sqlx::query_as::<_, JobRow>(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET state = 'available',
             attempt = 0,
             run_at = now(),
@@ -3561,14 +3587,16 @@ pub async fn heartbeat_callback(
     callback_id: Uuid,
     timeout: std::time::Duration,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    if let Some(store) = callback_queue_storage_in_tx(&mut tx, callback_id).await? {
+        tx.commit().await?;
         return store.heartbeat_callback(pool, callback_id, timeout).await;
     }
 
     let timeout_secs = timeout.as_secs_f64();
     let row = sqlx::query_as::<_, JobRow>(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET callback_timeout_at = now() + make_interval(secs => $2)
         WHERE callback_id = $1 AND state = 'waiting_external'
         RETURNING *
@@ -3576,9 +3604,10 @@ pub async fn heartbeat_callback(
     )
     .bind(callback_id)
     .bind(timeout_secs)
-    .fetch_optional(pool)
+    .fetch_optional(tx.as_mut())
     .await?;
 
+    tx.commit().await?;
     row.ok_or(AwaError::CallbackNotFound {
         callback_id: callback_id.to_string(),
     })
@@ -3944,7 +3973,7 @@ pub async fn resolve_callback_in_tx(
     default_action: DefaultAction,
     run_lease: Option<i64>,
 ) -> Result<ResolveOutcome, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         let job = store
             .callback_job_in_tx(tx, callback_id, run_lease, true)
             .await?
@@ -4011,7 +4040,7 @@ pub async fn resolve_callback_in_tx(
         ResolveAction::Complete(transformed_payload) => {
             let completed_job = sqlx::query_as::<_, JobRow>(
                 r#"
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'completed',
                     finalized_at = now(),
                     callback_id = NULL,
@@ -4048,7 +4077,7 @@ pub async fn resolve_callback_in_tx(
 
             let failed_job = sqlx::query_as::<_, JobRow>(
                 r#"
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'failed',
                     finalized_at = now(),
                     callback_id = NULL,

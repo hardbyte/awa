@@ -328,7 +328,7 @@ fn access_for(command: &Commands) -> context::Access {
             StorageCommands::Prepare { .. }
             | StorageCommands::PrepareQueueStorageSchema { .. }
             | StorageCommands::Abort
-            | StorageCommands::EnterMixedTransition
+            | StorageCommands::EnterMixedTransition { .. }
             | StorageCommands::Finalize { .. }
             | StorageCommands::RebuildTerminalCounters
             | StorageCommands::FlipRingAuthority { .. } => Mutating,
@@ -808,7 +808,12 @@ enum StorageCommands {
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
     /// Enter mixed transition and begin routing new writes to the prepared engine
-    EnterMixedTransition,
+    EnterMixedTransition {
+        /// Flip with all workers stopped; refuse any fresh runtime heartbeat.
+        /// Keep workers stopped until this command returns, then restart them.
+        #[arg(long)]
+        quiesced: bool,
+    },
     /// Finalize the storage transition once drain and capability gates pass
     Finalize {
         /// Dry-run: print the readiness report and exit. Exits 0 when
@@ -1887,8 +1892,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let report = awa_model::storage::status_report(&pool).await?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     }
-                    StorageCommands::EnterMixedTransition => {
-                        awa_model::storage::enter_mixed_transition(&pool).await?;
+                    StorageCommands::EnterMixedTransition { quiesced } => {
+                        if quiesced {
+                            awa_model::storage::enter_mixed_transition_quiesced(&pool).await?;
+                        } else {
+                            awa_model::storage::enter_mixed_transition(&pool).await?;
+                        }
                         let report = awa_model::storage::status_report(&pool).await?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     }

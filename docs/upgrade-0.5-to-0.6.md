@@ -143,6 +143,40 @@ awa --database-url "$DATABASE_URL" storage status
 #     post-flip.
 ```
 
+## Quiesced alternative to the witness runtime
+
+A CLI carrying [#457](https://github.com/hardbyte/awa/issues/457) accepts
+`awa storage enter-mixed-transition --quiesced` after `storage prepare`.
+This path runs without a schema migration and replaces Phase 2 steps 6–7.
+It is intended for a stopped fleet, not a live rollout:
+
+1. Stop producers and drain canonical work before stopping workers if you want
+   a fully role-free cutover. Inspect `canonical_live_backlog`, including scheduled
+   work and jobs waiting for external callbacks.
+2. Stop every worker and keep them stopped. Wait for runtime heartbeats to expire
+   (at least 30 seconds, or three snapshot intervals when longer). The command
+   refuses **any** fresh runtime, including unhealthy or shutting-down ones.
+3. Run `awa storage enter-mixed-transition --quiesced`. The liveness check and
+   routing change serialize against runtime snapshot writes. Stale heartbeats
+   do not fence a paused process; preventing old workers from returning during
+   this window remains an operator responsibility.
+4. Run `awa storage finalize --check`, then `awa storage finalize` when ready.
+   Restart workers on 0.6 and resume producers; new auto-role workers resolve
+   queue storage at startup.
+
+The command preserves canonical jobs and does not bypass finalization gates.
+If canonical backlog remains, drain it with canonical drain workers before
+finalizing; restarting only auto-role workers after the flip will not execute
+canonical work. Use the live staged path above when a stop-and-drain window
+is impractical.
+
+Callback APIs carrying [#462](https://github.com/hardbyte/awa/issues/462) resolve
+callbacks left on canonical jobs throughout `mixed_transition`, including
+completion, resume, failure, retry, heartbeat and CEL resolution. Lease checks
+and transaction rollback still apply. Run a 0.6 backport containing this fix
+before flipping a cluster with outstanding callbacks; a fix installed only in
+0.7 arrives too late for an unfinalized cluster.
+
 ## Health checks per step
 
 | After step | Watch for |
