@@ -232,7 +232,7 @@ test("owner operations preview, adopt, retire and restore", async ({ page, reque
   const ownerPanel = page.locator("details").filter({ has: page.locator("summary", { hasText: "e2e-owner:" }) });
   await ownerPanel.locator("summary").click();
   await ownerPanel.getByRole("button", { name: "Preview owner restoration", exact: true }).click();
-  await expect(page.getByRole("status").filter({ hasText: "Apply restore_owner" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Apply restore owner" })).toBeVisible();
   await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(row.getByRole("button", { name: "Retire", exact: true })).toBeVisible();
   await expect(row.getByRole("button", { name: "Trigger now" })).toBeEnabled();
