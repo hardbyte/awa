@@ -49,8 +49,8 @@ Reconcile(o) ==
  /\ Consensus(o) /\ agreed[o] = 1
  /\ retired' = retired \cup {n \in Names : OwnerOf(n) = o /\ n \notin Wanted(o)}
  /\ UNCHANGED <<live,capable,declared,owner,desired,agreed,fired,phase>>
-\* A legacy UPSERT never clears the retirement tombstone.
-LegacyUpsert == UNCHANGED vars
+\* Physical delete/UPSERT tombstone fencing is covered by released SQL-path
+\* rehearsals, not a stuttering pseudo-action in this state model.
 Enqueue(i,n) ==
  /\ i \in live /\ phase = 0
  /\ (FenceEnabled => n \notin retired)
@@ -63,7 +63,7 @@ Next == \/ \E i \in Instances,o \in Owners,s \in SUBSET Names,a,b \in BOOLEAN: P
         \/ \E i \in Instances: Expire(i)
         \/ \E o \in Owners: Observe(o) \/ Reconcile(o)
         \/ \E i \in Instances,n \in Names: Enqueue(i,n)
-        \/ ResetFire \/ LegacyUpsert
+        \/ ResetFire
 Spec == Init /\ [][Next]_vars
 TypeOK == /\ live \subseteq Instances /\ retired \subseteq Names
           /\ agreed \in [Owners -> {0,1}]

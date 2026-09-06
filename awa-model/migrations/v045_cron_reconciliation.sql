@@ -61,7 +61,8 @@ CREATE OR REPLACE FUNCTION awa.cron_unknown_runtime() RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
 BEGIN
     IF NEW.cron_protocol IS DISTINCT FROM awa.cron_protocol_version() THEN
-        UPDATE awa.cron_owners SET agreed_since = NULL, evidence_until = NULL;
+        UPDATE awa.cron_owners SET agreed_since = NULL, evidence_until = NULL
+        WHERE agreed_since IS NOT NULL OR evidence_until IS NOT NULL;
     END IF;
     RETURN NEW;
 END $$;
@@ -76,7 +77,11 @@ DECLARE
     v_owner TEXT := current_setting('awa.cron_owner', true);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        IF OLD.owner_id IS NOT NULL OR OLD.retired_at IS NOT NULL THEN
+        IF OLD.retired_at IS NOT NULL THEN
+            RAISE EXCEPTION 'cron schedule % is retired; its tombstone must be retained (restore it explicitly to reactivate)', OLD.name
+                USING ERRCODE = '55000';
+        END IF;
+        IF OLD.owner_id IS NOT NULL THEN
             RAISE EXCEPTION 'cron schedule % has durable ownership; retire it instead of deleting', OLD.name
                 USING ERRCODE = '55000';
         END IF;

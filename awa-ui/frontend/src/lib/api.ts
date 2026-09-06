@@ -632,7 +632,7 @@ export interface CronReconciliationPlan {
 export type CronOwnerAction =
   | { action: "adopt"; name: string; owner_id: string; expected_owner: string | null }
   | { action: "retire" | "restore"; name: string }
-  | { action: "retire_owner"; owner_id: string };
+  | { action: "retire_owner" | "restore_owner"; owner_id: string };
 export interface CronActionPlan {
   action: CronOwnerAction;
   schedules: string[];
@@ -644,6 +644,6 @@ export function fetchCronReconciliation(): Promise<CronReconciliationPlan[]> {
 export function cronOwnerAction(action: CronOwnerAction, apply = false): Promise<CronActionPlan> {
   return apiFetch("/cron/owner-action", {
     method: "POST",
-    body: JSON.stringify({ ...action, actor: "web-ui", apply }),
+    body: JSON.stringify({ ...action, apply }),
   });
 }

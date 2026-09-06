@@ -242,7 +242,10 @@ async def test_authoritative_owner_and_operator_actions(client):
     await client.cron_owner_action({"action": "retire", "name": name}, apply=True)
     row = next(row for row in await client.list_cron_jobs() if row["name"] == name)
     assert row["retired_at"] is not None
-    await client.cron_owner_action({"action": "restore", "name": name}, apply=True)
+    restore = {"action": "restore_owner", "owner_id": owner}
+    preview = await client.cron_owner_action(restore)
+    assert not preview["applied"] and preview["schedules"] == [name]
+    await client.cron_owner_action(restore, apply=True)
     row = next(row for row in await client.list_cron_jobs() if row["name"] == name)
     assert row["retired_at"] is None and row["last_enqueued_at"] is not None
 
@@ -263,5 +266,7 @@ def test_sync_owner_api_parity():
         assert "zero_live_declarations" in plan["blockers"]
         result = c.cron_owner_action({"action": "retire_owner", "owner_id": owner})
         assert not result["applied"] and result["schedules"] == []
+        restored = c.cron_owner_action({"action": "restore_owner", "owner_id": owner})
+        assert not restored["applied"] and restored["schedules"] == []
     finally:
         c.close()

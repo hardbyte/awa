@@ -1,5 +1,6 @@
 //! Owner-scoped periodic declarations and reconciliation. All decisions use
-//! database time and the same transaction serializer as runtime evidence writes.
+//! database time. Writes share the runtime-evidence transaction serializer;
+//! previews read a consistent committed snapshot without taking the writer lock.
 use crate::{
     cron::{self, CronJobRow, PeriodicJob},
     AwaError,
@@ -12,6 +13,9 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
+
+/// This binary's publication capability; checked against the schema-owned version.
+pub const CRON_PROTOCOL_VERSION: i32 = 1;
 
 /// Explicit opt-in: all periodic jobs registered on this client form the
 /// owner's complete desired set, including an explicitly configured empty set.
@@ -151,19 +155,36 @@ pub async fn publish(
     }
     sqlx::query("INSERT INTO awa.cron_declarations(instance_id, owner_id, revision, desired_hash, grace_ms) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(instance_id) DO UPDATE SET owner_id=EXCLUDED.owner_id, revision=EXCLUDED.revision, desired_hash=EXCLUDED.desired_hash, grace_ms=EXCLUDED.grace_ms, last_seen_at=clock_timestamp()")
         .bind(instance).bind(&config.owner_id).bind(&config.revision).bind(hash).bind(config.grace_ms).execute(&mut *conn).await?;
-    let synced: Option<String> =
-        sqlx::query_scalar("SELECT synced_hash FROM awa.cron_owners WHERE owner_id=$1")
-            .bind(&config.owner_id)
-            .fetch_one(&mut *conn)
-            .await?;
-    if synced.as_ref() != Some(hash) {
-        sqlx::query("SELECT set_config('awa.cron_owner', $1, true)")
-            .bind(&config.owner_id)
-            .execute(&mut *conn)
-            .await?;
-        // One batch per changed manifest, never one statement per schedule per
-        // heartbeat. The INSERT itself establishes ownership atomically.
+    if !known {
         sqlx::query(r#"
+            INSERT INTO awa.cron_jobs(name,cron_expr,timezone,kind,queue,args,priority,max_attempts,tags,metadata,missed_fire_policy,owner_id)
+            SELECT name,cron_expr,timezone,kind,queue,args,priority,max_attempts,tags,metadata,missed_fire_policy,$2
+            FROM jsonb_to_recordset($1) AS j(name TEXT,cron_expr TEXT,timezone TEXT,kind TEXT,queue TEXT,args JSONB,priority SMALLINT,max_attempts SMALLINT,tags TEXT[],metadata JSONB,missed_fire_policy TEXT)
+            ORDER BY name
+            ON CONFLICT(name) DO NOTHING
+        "#).bind(manifest).bind(&config.owner_id).execute(&mut *conn).await?;
+    }
+    evaluate_locked(conn, &config.owner_id, true, false).await?;
+    Ok(())
+}
+
+async fn sync_definitions(
+    conn: &mut PgConnection,
+    owner: &str,
+    hash: &str,
+) -> Result<(), AwaError> {
+    let manifest: serde_json::Value = sqlx::query_scalar(
+        "SELECT manifest FROM awa.cron_manifests WHERE owner_id=$1 AND desired_hash=$2",
+    )
+    .bind(owner)
+    .bind(hash)
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query("SELECT set_config('awa.cron_owner', $1, true)")
+        .bind(owner)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(r#"
             INSERT INTO awa.cron_jobs(name,cron_expr,timezone,kind,queue,args,priority,max_attempts,tags,metadata,missed_fire_policy,owner_id)
             SELECT name,cron_expr,timezone,kind,queue,args,priority,max_attempts,tags,metadata,missed_fire_policy,$2
             FROM jsonb_to_recordset($1) AS j(name TEXT,cron_expr TEXT,timezone TEXT,kind TEXT,queue TEXT,args JSONB,priority SMALLINT,max_attempts SMALLINT,tags TEXT[],metadata JSONB,missed_fire_policy TEXT)
@@ -172,17 +193,15 @@ pub async fn publish(
             WHERE awa.cron_jobs.owner_id=EXCLUDED.owner_id AND awa.cron_jobs.retired_at IS NULL
               AND ROW(awa.cron_jobs.cron_expr,awa.cron_jobs.timezone,awa.cron_jobs.kind,awa.cron_jobs.queue,awa.cron_jobs.args,awa.cron_jobs.priority,awa.cron_jobs.max_attempts,awa.cron_jobs.tags,awa.cron_jobs.metadata,awa.cron_jobs.missed_fire_policy)
                   IS DISTINCT FROM ROW(EXCLUDED.cron_expr,EXCLUDED.timezone,EXCLUDED.kind,EXCLUDED.queue,EXCLUDED.args,EXCLUDED.priority,EXCLUDED.max_attempts,EXCLUDED.tags,EXCLUDED.metadata,EXCLUDED.missed_fire_policy)
-        "#).bind(manifest).bind(&config.owner_id).execute(&mut *conn).await?;
-        sqlx::query("UPDATE awa.cron_owners SET synced_hash=$2 WHERE owner_id=$1")
-            .bind(&config.owner_id)
-            .bind(hash)
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("SELECT set_config('awa.cron_owner', '', true)")
-            .execute(&mut *conn)
-            .await?;
-    }
-    evaluate_locked(conn, &config.owner_id, true, false).await?;
+        "#).bind(manifest).bind(owner).execute(&mut *conn).await?;
+    sqlx::query("UPDATE awa.cron_owners SET synced_hash=$2 WHERE owner_id=$1")
+        .bind(owner)
+        .bind(hash)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("SELECT set_config('awa.cron_owner', '', true)")
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -196,9 +215,12 @@ pub async fn check_registration(
     let conn = &mut **tx;
     lock(conn).await?;
     let names: Vec<_> = jobs.iter().map(|j| j.name.as_str()).collect();
-    let conflicts: Vec<String> = sqlx::query_scalar("SELECT name FROM awa.cron_jobs WHERE name=ANY($1) AND (owner_id IS DISTINCT FROM $2 OR retired_at IS NOT NULL) ORDER BY name").bind(&names).bind(&config.owner_id).fetch_all(&mut *conn).await?;
+    let conflicts: Vec<String> = sqlx::query_scalar("SELECT name FROM awa.cron_jobs WHERE name=ANY($1) AND owner_id IS DISTINCT FROM $2 ORDER BY name").bind(&names).bind(&config.owner_id).fetch_all(&mut *conn).await?;
     if !conflicts.is_empty() {
-        return Err(AwaError::Validation(format!("cron schedules {} are owned by another manager or retired; explicit adoption/transfer/restore required", conflicts.join(", "))));
+        return Err(AwaError::Validation(format!(
+            "cron schedules {} are owned by another manager; explicit adoption/transfer required",
+            conflicts.join(", ")
+        )));
     }
     Ok(())
 }
@@ -221,6 +243,7 @@ fn definition(row: &CronJobRow) -> Result<PeriodicJob, AwaError> {
 
 #[derive(Default, sqlx::FromRow)]
 struct OwnerAgreement {
+    synced_hash: Option<String>,
     agreed_hash: Option<String>,
     agreed_since: Option<DateTime<Utc>>,
     evidence_until: Option<DateTime<Utc>>,
@@ -235,7 +258,7 @@ async fn evaluate_locked(
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&mut *conn)
         .await?;
-    let state: Option<OwnerAgreement> = sqlx::query_as(if persist { "SELECT agreed_hash,agreed_since,evidence_until FROM awa.cron_owners WHERE owner_id=$1 FOR UPDATE" } else { "SELECT agreed_hash,agreed_since,evidence_until FROM awa.cron_owners WHERE owner_id=$1" }).bind(owner).fetch_optional(&mut *conn).await?;
+    let state: Option<OwnerAgreement> = sqlx::query_as(if persist { "SELECT synced_hash,agreed_hash,agreed_since,evidence_until FROM awa.cron_owners WHERE owner_id=$1 FOR UPDATE" } else { "SELECT synced_hash,agreed_hash,agreed_since,evidence_until FROM awa.cron_owners WHERE owner_id=$1" }).bind(owner).fetch_optional(&mut *conn).await?;
     let blocking_instances: Vec<Uuid> = sqlx::query_scalar("SELECT instance_id FROM awa.runtime_instances WHERE last_seen_at + make_interval(secs => GREATEST(30.0, snapshot_interval_ms * 0.003)) > $1 AND cron_protocol IS DISTINCT FROM awa.cron_protocol_version() ORDER BY instance_id").bind(now).fetch_all(&mut *conn).await?;
     let declarations: Vec<CronDeclaration> = sqlx::query_as("SELECT d.instance_id,d.revision,d.desired_hash,d.grace_ms, LEAST(d.last_seen_at,r.last_seen_at) + make_interval(secs => GREATEST(30.0,r.snapshot_interval_ms * 0.003)) AS expires_at FROM awa.cron_declarations d JOIN awa.runtime_instances r USING(instance_id) WHERE d.owner_id=$1 AND LEAST(d.last_seen_at,r.last_seen_at) + make_interval(secs => GREATEST(30.0,r.snapshot_interval_ms * 0.003)) > $2 AND NOT r.shutting_down ORDER BY d.instance_id")
         .bind(owner).bind(now).fetch_all(&mut *conn).await?;
@@ -279,6 +302,16 @@ async fn evaluate_locked(
             .await?;
             let jobs: Vec<PeriodicJob> = serde_json::from_value(manifest)?;
             describe_changes(conn, owner, &jobs, &mut p).await?;
+        } else if state.as_ref().and_then(|s| s.synced_hash.as_ref()) != p.desired_hash.as_ref() {
+            // A synchronized hash certifies all its desired names are active and
+            // owned. Operator actions invalidate that certificate for affected
+            // owners. Only unsynchronized/conflicting manifests need this scan;
+            // the healthy heartbeat never decodes the full manifest in Rust.
+            let conflicts = sqlx::query_as::<_, CronJobRow>(
+                "SELECT j.* FROM awa.cron_manifests m CROSS JOIN LATERAL jsonb_array_elements(m.manifest) d JOIN awa.cron_jobs j ON j.name=d->>'name' WHERE m.owner_id=$1 AND m.desired_hash=$2 AND (j.owner_id IS DISTINCT FROM $1 OR j.retired_at IS NOT NULL) ORDER BY j.name"
+            ).bind(owner).bind(&p.desired_hash).fetch_all(&mut *conn).await?;
+            p.conflicts
+                .extend(conflicts.iter().map(|row| conflict_description(row, owner)));
         }
     }
     if !p.conflicts.is_empty() {
@@ -287,6 +320,7 @@ async fn evaluate_locked(
     if p.blockers.is_empty() {
         let grace = p.declarations.iter().map(|d| d.grace_ms).max().unwrap_or(0);
         let OwnerAgreement {
+            synced_hash,
             agreed_hash: old_hash,
             agreed_since: since,
             evidence_until: until,
@@ -301,6 +335,14 @@ async fn evaluate_locked(
             .saturating_sub((now - since).num_milliseconds())
             .max(0);
         if persist {
+            if synced_hash != p.desired_hash {
+                sync_definitions(
+                    conn,
+                    owner,
+                    p.desired_hash.as_deref().expect("consensus hash"),
+                )
+                .await?;
+            }
             sqlx::query("UPDATE awa.cron_owners SET agreed_hash=$2,agreed_since=$3,evidence_until=$4 WHERE owner_id=$1")
                 .bind(owner).bind(&p.desired_hash).bind(since).bind(p.declarations.iter().map(|d|d.expires_at).min()).execute(&mut *conn).await?;
         }
@@ -325,6 +367,18 @@ async fn evaluate_locked(
     Ok(p)
 }
 
+fn conflict_description(row: &CronJobRow, owner: &str) -> String {
+    if row.owner_id.as_deref() != Some(owner) {
+        format!(
+            "{}: owned by {}; explicit adoption/transfer required",
+            row.name,
+            row.owner_id.as_deref().unwrap_or("<unowned>")
+        )
+    } else {
+        format!("{}: retired; explicit restore required", row.name)
+    }
+}
+
 async fn describe_changes(
     conn: &mut PgConnection,
     owner: &str,
@@ -344,14 +398,9 @@ async fn describe_changes(
     for job in jobs {
         match by_name.get(job.name.as_str()) {
             None => p.additions.push(job.name.clone()),
-            Some(row) if row.owner_id.as_deref() != Some(owner) => p.conflicts.push(format!(
-                "{}: owned by {}; explicit adoption/transfer required",
-                job.name,
-                row.owner_id.as_deref().unwrap_or("<unowned>")
-            )),
-            Some(row) if row.retired_at.is_some() => p
-                .conflicts
-                .push(format!("{}: retired; explicit restore required", job.name)),
+            Some(row) if row.owner_id.as_deref() != Some(owner) || row.retired_at.is_some() => {
+                p.conflicts.push(conflict_description(row, owner))
+            }
             Some(row) => {
                 if serde_json::to_value(definition(row)?)? != serde_json::to_value(job)? {
                     p.updates.push(job.name.clone());
@@ -380,8 +429,9 @@ pub async fn preview(
 ) -> Result<CronReconciliationPlan, AwaError> {
     PeriodicReconciliation::authoritative(owner, "preview", Duration::ZERO)?;
     let (_, hash) = canonical_manifest(jobs)?;
-    let mut tx = pool.begin().await?;
-    lock(&mut tx).await?;
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
     let mut p = evaluate_locked(&mut tx, owner, false, false).await?;
     if p.desired_hash.as_ref() != Some(&hash) {
         p.blockers.push("manifest_not_published".into());
@@ -415,8 +465,14 @@ async fn evaluate(
     owner: &str,
     apply: bool,
 ) -> Result<CronReconciliationPlan, AwaError> {
-    let mut tx = pool.begin().await?;
-    lock(&mut tx).await?;
+    let mut tx = if apply {
+        let mut tx = pool.begin().await?;
+        lock(&mut tx).await?;
+        tx
+    } else {
+        pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?
+    };
     let p = evaluate_locked(&mut tx, owner, apply, apply).await?;
     tx.commit().await?;
     Ok(p)
@@ -447,6 +503,9 @@ pub enum CronOwnerAction {
     Restore {
         name: String,
     },
+    RestoreOwner {
+        owner_id: String,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronActionPlan {
@@ -465,25 +524,33 @@ pub async fn operate(
             "cron operator actor must be non-empty".into(),
         ));
     }
-    let mut tx = pool.begin().await?;
-    lock(&mut tx).await?;
-    let rows = sqlx::query_as::<_, CronJobRow>(if apply {
-        "SELECT * FROM awa.cron_jobs ORDER BY name FOR UPDATE"
+    let mut tx = if apply {
+        let mut tx = pool.begin().await?;
+        lock(&mut tx).await?;
+        tx
     } else {
-        "SELECT * FROM awa.cron_jobs ORDER BY name"
-    })
-    .fetch_all(&mut *tx)
-    .await?;
-    let selected: Vec<_> = rows
-        .iter()
-        .filter(|r| match &action {
-            CronOwnerAction::RetireOwner { owner_id } => r.owner_id.as_ref() == Some(owner_id),
-            CronOwnerAction::Adopt { name, .. }
-            | CronOwnerAction::Retire { name }
-            | CronOwnerAction::Restore { name } => &r.name == name,
-        })
-        .collect();
-    if selected.is_empty() && !matches!(&action, CronOwnerAction::RetireOwner { .. }) {
+        pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?
+    };
+    let (name, owner) = match &action {
+        CronOwnerAction::RetireOwner { owner_id } | CronOwnerAction::RestoreOwner { owner_id } => {
+            (None, Some(owner_id))
+        }
+        CronOwnerAction::Adopt { name, .. }
+        | CronOwnerAction::Retire { name }
+        | CronOwnerAction::Restore { name } => (Some(name), None),
+    };
+    let retired = match action {
+        CronOwnerAction::RetireOwner { .. } => Some(false),
+        CronOwnerAction::RestoreOwner { .. } => Some(true),
+        _ => None,
+    };
+    let selected = sqlx::query_as::<_, CronJobRow>(if apply {
+        "SELECT * FROM awa.cron_jobs WHERE (name=$1 OR owner_id=$2) AND ($3::boolean IS NULL OR (retired_at IS NOT NULL)=$3) ORDER BY name FOR UPDATE"
+    } else {
+        "SELECT * FROM awa.cron_jobs WHERE (name=$1 OR owner_id=$2) AND ($3::boolean IS NULL OR (retired_at IS NOT NULL)=$3) ORDER BY name"
+    }).bind(name).bind(owner).bind(retired).fetch_all(&mut *tx).await?;
+    if selected.is_empty() && name.is_some() {
         return Err(AwaError::Validation("cron schedule not found".into()));
     }
     if let CronOwnerAction::Adopt {
@@ -515,19 +582,24 @@ pub async fn operate(
                 .await?;
                 sqlx::query("UPDATE awa.cron_jobs SET owner_id=$2,updated_at=clock_timestamp() WHERE name=ANY($1)").bind(&selected_names).bind(owner_id).execute(&mut *tx).await?;
             }
-            CronOwnerAction::Restore { .. } => {
+            CronOwnerAction::Restore { .. } | CronOwnerAction::RestoreOwner { .. } => {
                 sqlx::query("UPDATE awa.cron_jobs SET retired_at=NULL,retired_by=NULL,retired_revision=NULL,last_enqueued_at=clock_timestamp(),updated_at=clock_timestamp() WHERE name=ANY($1) AND retired_at IS NOT NULL").bind(&selected_names).execute(&mut *tx).await?;
             }
             _ => {
                 sqlx::query("UPDATE awa.cron_jobs SET retired_at=clock_timestamp(),retired_by=$2,retired_revision='operator',updated_at=clock_timestamp() WHERE name=ANY($1) AND retired_at IS NULL").bind(&selected_names).bind(actor).execute(&mut *tx).await?;
             }
         }
-        // Adoption, transfer and restoration begin a new agreement window.
+        // Invalidate both sides of a transfer, but never unrelated owners.
+        let mut affected: BTreeSet<_> = selected
+            .iter()
+            .filter_map(|r| r.owner_id.as_deref())
+            .collect();
+        if let CronOwnerAction::Adopt { owner_id, .. } = &action {
+            affected.insert(owner_id);
+        }
         sqlx::query(
-            "UPDATE awa.cron_owners SET synced_hash=NULL,agreed_since=NULL,evidence_until=NULL",
-        )
-        .execute(&mut *tx)
-        .await?;
+            "UPDATE awa.cron_owners SET synced_hash=NULL,agreed_hash=NULL,agreed_since=NULL,evidence_until=NULL WHERE owner_id=ANY($1)",
+        ).bind(affected.into_iter().collect::<Vec<_>>()).execute(&mut *tx).await?;
     }
     let p = CronActionPlan {
         action,

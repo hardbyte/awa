@@ -123,7 +123,10 @@ export function CronPage() {
             {plan.blocking_instances.length > 0 && <p>Unsupported instances: {plan.blocking_instances.join(", ")}</p>}
             {plan.retirements.length > 0 && <p>Would retire: {plan.retirements.join(", ")}</p>}
             {plan.declarations.map((d) => <p key={d.instance_id} className="break-all">{d.instance_id} · revision {d.revision} · manifest {d.desired_hash} · expires {d.expires_at}</p>)}
-            {!readOnly && <Button intent="outline" size="xs" onPress={() => preview({ action: "retire_owner", owner_id: plan.owner_id })}>Preview owner retirement</Button>}
+            {!readOnly && <div className="flex gap-2">
+              <Button intent="outline" size="xs" onPress={() => preview({ action: "retire_owner", owner_id: plan.owner_id })}>Preview owner retirement</Button>
+              <Button intent="outline" size="xs" onPress={() => preview({ action: "restore_owner", owner_id: plan.owner_id })}>Preview owner restoration</Button>
+            </div>}
           </div>
         </details>
       ))}

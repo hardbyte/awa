@@ -248,8 +248,8 @@ impl AwaMetrics {
     /// the registration too.
     pub fn new(meter: &Meter) -> Self {
         Self {
-            cron_reconciliation_decisions: meter.u64_counter("awa.cron.reconciliation.decisions").build(),
-            cron_retired: meter.u64_counter("awa.cron.retired").build(),
+            cron_reconciliation_decisions: meter.u64_counter("awa.cron.reconciliation.decisions").with_description("Periodic reconciliation decisions by outcome").build(),
+            cron_retired: meter.u64_counter("awa.cron.retired").with_description("Periodic schedules retired by authoritative reconciliation").build(),
             jobs_inserted: meter
                 .u64_counter(names::JOB_INSERTED)
                 .with_description("Number of jobs inserted")

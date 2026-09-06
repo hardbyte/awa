@@ -191,8 +191,11 @@ registrations then form that owner's complete set; explicitly configuring this
 with zero schedules means an authoritative empty set. Owner/revision must be
 non-empty. Names stay globally unique. Never opt in for a partial declaration.
 
-Existing unowned names require explicit adoption. Conflicting ownership or
-retired desired names fail startup; code registration cannot restore retirement.
+Existing unowned names require explicit adoption. Foreign ownership fails
+startup. Retired names owned by this deployment allow startup but stay inert
+and appear as plan conflicts; code registration cannot restore retirement.
+During a rolling deploy, new names may be inserted immediately; existing
+definitions change only after the capable live fleet agrees on one manifest.
 Every runtime must support the protocol before absent owned schedules retire,
 with matching live manifests through grace. Outage alone never removes schedules.
 Restoration is an operator action and starts evaluation from now without catch-up

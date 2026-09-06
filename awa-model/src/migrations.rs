@@ -306,8 +306,8 @@ const V40_UP: &str = include_str!("../migrations/v040_finalize_with_drain_runtim
 const V41_UP: &str = include_str!("../migrations/v041_queue_runtime_overrides.sql");
 const V42_UP: &str = include_str!("../migrations/v042_compact_deadline_claims.sql");
 const V43_UP: &str = include_str!("../migrations/v043_ring_rotation_ledger.sql");
-const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
 const V44_UP: &str = include_str!("../migrations/v044_jobs_compat_receipt_running.sql");
+const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
