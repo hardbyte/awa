@@ -2281,6 +2281,12 @@
 <h3 id="leader-liveness-verification">Leader liveness verification<a class="headerlink" href="#leader-liveness-verification" title="Permanent link">&para;</a></h3>
 <p>The advisory lock is session-scoped: as long as the connection is alive, the lock is held. But if the connection drops silently, Postgres releases the lock and another node becomes leader -- while the old node may still think it's leader. Awa verifies liveness by pinging the leader connection every 30 seconds (<code>SELECT 1</code>). If the ping fails, the node re-enters the election loop.</p>
 <h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<p>Migration v045 requires cron-before-storage lock ordering across the complete
+pending range: released atomic enqueue locks cron before calling the storage
+insert path. The Rust migrator drains cron first; external runners must do the
+same. <code>AwaCronMigration</code> checks the two-party lock cycle, with a missing-drain
+counterexample; SQL tests inspect the actual held locks and the released 0.6.7
+rehearsal exercises live migration. See the upgrade guide for the evaluation pause.</p>
 <h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
 <ul>
 <li><strong>No external dependencies.</strong> Schedules live in Postgres, evaluated by the existing leader. No systemd, no Kubernetes CronJob, no <code>pg_cron</code>.</li>
