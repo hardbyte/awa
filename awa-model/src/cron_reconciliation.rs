@@ -100,6 +100,21 @@ pub fn canonical_manifest(jobs: &[PeriodicJob]) -> Result<(serde_json::Value, St
     Ok((value, hash))
 }
 
+/// Canonical declaration prepared once for immutable client configuration.
+/// Encoding/hashing happens outside the evidence transaction and is independent
+/// of heartbeat cadence. The serialized manifest is sent only when first seen.
+#[derive(Debug, Clone)]
+pub struct PeriodicManifest {
+    value: serde_json::Value,
+    hash: String,
+}
+impl PeriodicManifest {
+    pub fn new(jobs: &[PeriodicJob]) -> Result<Self, AwaError> {
+        let (value, hash) = canonical_manifest(jobs)?;
+        Ok(Self { value, hash })
+    }
+}
+
 pub async fn lock(conn: &mut PgConnection) -> Result<(), AwaError> {
     sqlx::query("SELECT awa.cron_protocol_lock()")
         .execute(conn)
@@ -113,11 +128,12 @@ pub async fn publish(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: Uuid,
     config: &PeriodicReconciliation,
-    jobs: &[PeriodicJob],
+    prepared: &PeriodicManifest,
 ) -> Result<(), AwaError> {
     let conn = &mut **tx;
     config.validate()?;
-    let (manifest, hash) = canonical_manifest(jobs)?;
+    let manifest = &prepared.value;
+    let hash = &prepared.hash;
     lock(conn).await?;
     sqlx::query("INSERT INTO awa.cron_owners(owner_id) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(&config.owner_id)
@@ -127,20 +143,20 @@ pub async fn publish(
         "SELECT EXISTS(SELECT 1 FROM awa.cron_manifests WHERE owner_id=$1 AND desired_hash=$2)",
     )
     .bind(&config.owner_id)
-    .bind(&hash)
+    .bind(hash)
     .fetch_one(&mut *conn)
     .await?;
     if !known {
-        sqlx::query("INSERT INTO awa.cron_manifests(owner_id,desired_hash,manifest) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(&config.owner_id).bind(&hash).bind(&manifest).execute(&mut *conn).await?;
+        sqlx::query("INSERT INTO awa.cron_manifests(owner_id,desired_hash,manifest) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(&config.owner_id).bind(hash).bind(manifest).execute(&mut *conn).await?;
     }
     sqlx::query("INSERT INTO awa.cron_declarations(instance_id, owner_id, revision, desired_hash, grace_ms) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(instance_id) DO UPDATE SET owner_id=EXCLUDED.owner_id, revision=EXCLUDED.revision, desired_hash=EXCLUDED.desired_hash, grace_ms=EXCLUDED.grace_ms, last_seen_at=clock_timestamp()")
-        .bind(instance).bind(&config.owner_id).bind(&config.revision).bind(&hash).bind(config.grace_ms).execute(&mut *conn).await?;
+        .bind(instance).bind(&config.owner_id).bind(&config.revision).bind(hash).bind(config.grace_ms).execute(&mut *conn).await?;
     let synced: Option<String> =
         sqlx::query_scalar("SELECT synced_hash FROM awa.cron_owners WHERE owner_id=$1")
             .bind(&config.owner_id)
             .fetch_one(&mut *conn)
             .await?;
-    if synced.as_ref() != Some(&hash) {
+    if synced.as_ref() != Some(hash) {
         sqlx::query("SELECT set_config('awa.cron_owner', $1, true)")
             .bind(&config.owner_id)
             .execute(&mut *conn)
@@ -156,10 +172,10 @@ pub async fn publish(
             WHERE awa.cron_jobs.owner_id=EXCLUDED.owner_id AND awa.cron_jobs.retired_at IS NULL
               AND ROW(awa.cron_jobs.cron_expr,awa.cron_jobs.timezone,awa.cron_jobs.kind,awa.cron_jobs.queue,awa.cron_jobs.args,awa.cron_jobs.priority,awa.cron_jobs.max_attempts,awa.cron_jobs.tags,awa.cron_jobs.metadata,awa.cron_jobs.missed_fire_policy)
                   IS DISTINCT FROM ROW(EXCLUDED.cron_expr,EXCLUDED.timezone,EXCLUDED.kind,EXCLUDED.queue,EXCLUDED.args,EXCLUDED.priority,EXCLUDED.max_attempts,EXCLUDED.tags,EXCLUDED.metadata,EXCLUDED.missed_fire_policy)
-        "#).bind(&manifest).bind(&config.owner_id).execute(&mut *conn).await?;
+        "#).bind(manifest).bind(&config.owner_id).execute(&mut *conn).await?;
         sqlx::query("UPDATE awa.cron_owners SET synced_hash=$2 WHERE owner_id=$1")
             .bind(&config.owner_id)
-            .bind(&hash)
+            .bind(hash)
             .execute(&mut *conn)
             .await?;
         sqlx::query("SELECT set_config('awa.cron_owner', '', true)")

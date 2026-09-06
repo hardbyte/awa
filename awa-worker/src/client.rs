@@ -970,13 +970,17 @@ impl ClientBuilder {
 
     /// Build the client.
     pub fn build(self) -> Result<Client, BuildError> {
-        if let Some(config) = &self.periodic_reconciliation {
+        let periodic_manifest = if let Some(config) = &self.periodic_reconciliation {
             config
                 .validate()
                 .map_err(|e| BuildError::InvalidPeriodicReconciliation(e.to_string()))?;
-            awa_model::cron_reconciliation::canonical_manifest(&self.periodic_jobs)
-                .map_err(|e| BuildError::InvalidPeriodicReconciliation(e.to_string()))?;
-        }
+            Some(Arc::new(
+                awa_model::cron_reconciliation::PeriodicManifest::new(&self.periodic_jobs)
+                    .map_err(|e| BuildError::InvalidPeriodicReconciliation(e.to_string()))?,
+            ))
+        } else {
+            None
+        };
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
         }
@@ -1118,6 +1122,7 @@ impl ClientBuilder {
             callback_rescue_interval: self.callback_rescue_interval,
             periodic_jobs: Arc::new(self.periodic_jobs),
             periodic_reconciliation: self.periodic_reconciliation,
+            periodic_manifest,
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
             dispatcher_handles: RwLock::new(Vec::new()),
@@ -1215,6 +1220,7 @@ pub struct Client {
     callback_rescue_interval: Option<Duration>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
+    periodic_manifest: Option<Arc<awa_model::cron_reconciliation::PeriodicManifest>>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
     /// Cancellation token for heartbeat + maintenance — kept alive during drain.
@@ -1269,6 +1275,7 @@ pub struct Client {
 struct RuntimeReporterState {
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     periodic_reconciliation: Option<awa_model::PeriodicReconciliation>,
+    periodic_manifest: Option<Arc<awa_model::cron_reconciliation::PeriodicManifest>>,
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
     queue_descriptors: HashMap<String, QueueDescriptor>,
@@ -1521,6 +1528,7 @@ impl Client {
         RuntimeReporterState {
             periodic_jobs: self.periodic_jobs.clone(),
             periodic_reconciliation: self.periodic_reconciliation.clone(),
+            periodic_manifest: self.periodic_manifest.clone(),
             pool: self.pool.clone(),
             queues: self.queues.clone(),
             queue_descriptors: self.queue_descriptors.clone(),
@@ -2325,7 +2333,9 @@ impl RuntimeReporterState {
                 &mut tx,
                 self.instance_id,
                 config,
-                &self.periodic_jobs,
+                self.periodic_manifest
+                    .as_deref()
+                    .expect("authoritative client has a prepared manifest"),
             )
             .await?;
             if check {

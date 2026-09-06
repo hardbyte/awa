@@ -20,10 +20,11 @@ async fn runtime(conn: &mut sqlx::PgConnection, id: Uuid, capable: bool) {
         .bind(id).bind(if capable {Some(1i32)} else {None}).execute(conn).await.unwrap();
 }
 async fn publish(pool: &PgPool, id: Uuid, c: &PeriodicReconciliation, jobs: &[PeriodicJob]) {
+    let manifest = reconcile::PeriodicManifest::new(jobs).unwrap();
     let mut tx = pool.begin().await.unwrap();
     reconcile::lock(&mut tx).await.unwrap();
     runtime(&mut tx, id, true).await;
-    reconcile::publish(&mut tx, id, c, jobs).await.unwrap();
+    reconcile::publish(&mut tx, id, c, &manifest).await.unwrap();
     tx.commit().await.unwrap();
 }
 async fn get(pool: &PgPool, name: &str) -> cron::CronJobRow {
@@ -237,9 +238,14 @@ async fn conflicting_publication_serializes_before_reconciliation(pool: PgPool) 
     let mut tx = pool.begin().await.unwrap();
     reconcile::lock(&mut tx).await.unwrap();
     runtime(&mut tx, b, true).await;
-    reconcile::publish(&mut tx, b, &config("billing", 0), &[job("invoice")])
-        .await
-        .unwrap();
+    reconcile::publish(
+        &mut tx,
+        b,
+        &config("billing", 0),
+        &reconcile::PeriodicManifest::new(&[job("invoice")]).unwrap(),
+    )
+    .await
+    .unwrap();
     let other = pool.clone();
     let task = tokio::spawn(async move { reconcile::reconcile(&other, "billing").await.unwrap() });
     tokio::time::sleep(Duration::from_millis(50)).await;
