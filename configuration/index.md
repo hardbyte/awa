@@ -839,3 +839,102 @@ Inspect the config with `awa context list` (marks the default and production con
 - [Deployment guide](../deployment/index.md)
 - [Migration guide](../migrations/index.md)
 - [Troubleshooting](../troubleshooting/index.md)
+
+
+## Owner-scoped periodic reconciliation
+
+Default `periodic()` registration is additive: removing code does not remove
+its database schedule. Opt in only when a client declares an owner's **complete**
+desired set. Owners are stable deployment identifiers; revisions are opaque
+release labels. Schedule names remain globally unique across owners.
+
+```rust
+use awa::PeriodicReconciliation;
+use std::time::Duration;
+
+let ownership = PeriodicReconciliation::authoritative(
+    "billing-workers", "release-2026-09", Duration::from_secs(60),
+)?;
+// Client::builder(pool).periodic_reconciliation(ownership).periodic(invoice)
+```
+
+```python
+client.periodic_reconciliation("billing-workers", "release-2026-09", grace_seconds=60)
+client.periodic("invoice", "0 9 * * *", Invoice, Invoice(...))
+```
+
+Calling `periodic_reconciliation` with no schedules deliberately declares an
+empty complete set. Omitting it never authorizes retirement. Rust validates the
+configuration at construction/build; Python rejects invalid owner, revision,
+and grace values when configured. Both fail startup on foreign ownership
+conflicts. Existing unowned schedules require explicit adoption. A retired name
+owned by this deployment allows startup but stays inert and appears as an
+`ownership_or_retirement_conflict` until explicitly restored.
+
+Every runtime reports capability. Authoritative runtimes also publish a hash of
+the complete normalized definitions, including args/metadata, independently of
+leadership. Identical manifests are stored once per owner/hash. New names can
+be inserted during a rollout, but existing definitions change in one batch only
+when fresh, capable runtimes agree on one manifest with no ownership or retirement
+conflicts. Definition updates do not wait for retirement grace. Mixed revisions
+retain the last agreed definitions rather than alternating on each heartbeat.
+Unchanged snapshots do not rewrite the schedule table. The leader checks all owners every cron sync pass
+(60 seconds), using only database evidence.
+
+Automatic retirement requires a fresh capable fleet, at least one live
+complete declaration, a common manifest, and agreement through every
+participant's grace period. Freshness uses database time and the larger of
+30 seconds or three runtime snapshot intervals. A brief conflicting declaration
+resets the grace clock even between leader passes. Evidence gaps reset it too.
+Zero live declarations never decommission an owner. Grace is not a guarantee of
+instant retirement: the next leader sync pass applies the decision.
+
+```bash
+awa cron plan billing-workers
+# Optional JSON array of full PeriodicJob definitions; does not publish it:
+awa cron plan billing-workers --manifest desired-schedules.json
+awa cron adopt invoice billing-workers                 # preview
+awa cron adopt invoice billing-workers --apply         # explicit adoption
+awa cron adopt invoice new-owner --expected-owner billing-workers --apply
+awa cron retire invoice                               # preview
+awa cron retire invoice --apply
+awa cron retire-owner billing-workers --apply          # explicit decommission
+awa cron restore invoice --apply
+awa cron restore-owner billing-workers --apply          # restore all retired owned names
+```
+
+Owner operations print JSON and default to dry-run; `--apply` commits after
+rechecking current state. `--actor` records an operator label. Plan output reports
+additions, updates, retirement candidates, conflicts, blocking instances,
+revision/hash evidence, agreement time, and remaining grace. Blocker codes are
+`unsupported_runtime_protocol`, `zero_live_declarations`,
+`mixed_desired_manifests`, `ownership_or_retirement_conflict`, `grace_period`, and
+(for an unpublished preview) `manifest_not_published`.
+
+Retired rows remain indefinitely and cannot fire automatically or through the
+current manual-trigger API. Old additive UPSERTs cannot resurrect them. Restore
+is explicit and sets the next-fire boundary to database time; it does not replay
+retired time as a catch-up pause would. Pause remains independent and survives
+restore. Already accepted jobs, their retries and DLQ entries continue normally.
+`cron remove` remains available for unowned, non-retired schedules; owned or
+retired rows must use lifecycle operations so their tombstones survive.
+
+Python exposes `cron_reconciliation_plan(owner)` and
+`cron_owner_action(action, actor="python", apply=False)` on async and sync
+clients. The action object uses `action: adopt | retire | retire_owner | restore | restore_owner`,
+with `name` or `owner_id`; adoption also supplies `expected_owner` (null for
+unowned). Async methods are awaited.
+
+Read-only plans use a consistent committed snapshot without acquiring the
+evidence writer lock. Apply always rechecks under that lock. Operator actions
+reset agreement only for the affected owner(s); transfers reset both sides.
+Unowned retired registrations are quiet skips.
+
+Metrics: `awa.cron.reconciliation.decisions` counts decisions with a bounded
+`outcome` label (a blocker code or `converged`); `awa.cron.retired` counts
+automatically retired schedules. Owner/revision/instance details are in plans
+and structured logs, not unbounded metric labels.
+
+Authoritative clients prepare the canonical manifest once when built and share it
+across snapshot reports. Repeated publication sends the stored hash; unchanged
+manifest bodies are neither re-encoded under the protocol lock nor rewritten.

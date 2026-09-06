@@ -102,3 +102,15 @@ artifacts** ([#367](https://github.com/hardbyte/awa/issues/367)):
 Every stable release's changelog lists breaking changes against this document's surface list.
 If a change breaks something *not* listed here, it is not a breaking change — but if that
 surprises users repeatedly, the fix is to amend this document, not to argue.
+
+
+### Periodic ownership (v045)
+
+The opt-in owner protocol leaves unowned additive registration unchanged. Its
+mixed-version guarantee covers the released 0.6.7 automatic cron enqueue and
+additive UPSERT paths on the expanded schema, tested by
+`scripts/rehearse-cron-ownership.sh`. Fresh legacy runtimes block automatic
+retirement. Owned-schedule operator actions require current CLI/API clients;
+legacy manual-trigger clients are not covered by the retirement guarantee.
+The protocol does not change already-enqueued job or retry semantics. The
+existing ring-authority fence and schema migration fail-safe remain independent.

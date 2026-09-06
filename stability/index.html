@@ -1943,6 +1943,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Relationship to release notes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#periodic-ownership-v045" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Periodic ownership (v045)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
     </ul>
@@ -2219,6 +2236,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Relationship to release notes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#periodic-ownership-v045" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Periodic ownership (v045)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
     </ul>
@@ -2404,6 +2438,15 @@ artifacts</strong> (<a href="https://github.com/hardbyte/awa/issues/367">#367</a
 <p>Every stable release's changelog lists breaking changes against this document's surface list.
 If a change breaks something <em>not</em> listed here, it is not a breaking change — but if that
 surprises users repeatedly, the fix is to amend this document, not to argue.</p>
+<h3 id="periodic-ownership-v045">Periodic ownership (v045)<a class="headerlink" href="#periodic-ownership-v045" title="Permanent link">&para;</a></h3>
+<p>The opt-in owner protocol leaves unowned additive registration unchanged. Its
+mixed-version guarantee covers the released 0.6.7 automatic cron enqueue and
+additive UPSERT paths on the expanded schema, tested by
+<code>scripts/rehearse-cron-ownership.sh</code>. Fresh legacy runtimes block automatic
+retirement. Owned-schedule operator actions require current CLI/API clients;
+legacy manual-trigger clients are not covered by the retirement guarantee.
+The protocol does not change already-enqueued job or retry semantics. The
+existing ring-authority fence and schema migration fail-safe remain independent.</p>
 
 
 
