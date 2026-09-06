@@ -201,3 +201,13 @@ Reproduce the released-artifact proof with
 `scripts/rehearse-cron-ownership.sh` (disposable DATABASE_URL required); the cron
 model suite is `scripts/check-cron-models.sh`. Existing ring-authority rollback
 restrictions still apply independently of cron ownership.
+
+Reintroducing a retired desired name in a later deploy does not fail startup.
+It remains inert and visible as an ownership/retirement blocker until an operator
+restores it. Use `awa cron restore NAME` or `awa cron restore-owner OWNER` to
+preview, then add `--apply`. Restore-owner affects only that owner's retired
+schedules, preserves pause state, and starts evaluation from current database
+time. Foreign ownership still fails startup and requires explicit transfer.
+During mixed-manifest rollouts, existing definitions retain their last agreed
+value; new names can be inserted immediately. Definition updates wait for fresh
+capable fleet agreement, while removals additionally wait through grace.
