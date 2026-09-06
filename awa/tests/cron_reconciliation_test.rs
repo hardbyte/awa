@@ -1,5 +1,7 @@
 //! Isolated database tests for the owner protocol, independent of other suites'
 //! runtime snapshots and deliberately stale legacy participants.
+mod ci_timing;
+
 use awa::model::{cron, cron_reconciliation as reconcile, migrations};
 use awa::{PeriodicJob, PeriodicReconciliation};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -408,10 +410,13 @@ async fn released_old_leader_cannot_fire_retired_schedule(pool: PgPool) {
         .unwrap();
     let mut output = tokio::io::BufReader::new(old.stdout.take().unwrap());
     let mut ready = String::new();
-    tokio::time::timeout(Duration::from_secs(30), output.read_line(&mut ready))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(30)),
+        output.read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(ready.contains("READY"), "{ready}");
     // Binary-first: opted-in current startup refuses before v045, without
     // partially publishing evidence or launching background services.
@@ -490,10 +495,13 @@ async fn released_old_leader_cannot_fire_retired_schedule(pool: PgPool) {
         .unwrap();
     let mut out = tokio::io::BufReader::new(returning.stdout.take().unwrap());
     let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(30), out.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        ci_timing::scaled_timeout(Duration::from_secs(30)),
+        out.read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     if line.contains("READY") {
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(
