@@ -1,0 +1,3158 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/architecture/">
+      
+      
+        <link rel="prev" href="../concepts/transactional-enqueue/">
+      
+      
+        <link rel="next" href="../queue-storage-substrate/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Architecture - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+      <link rel="stylesheet" href="../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  
+  
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="Architecture — AWA">
+  <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/architecture/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#awa-architecture-overview" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Architecture
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../security/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Security
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#terms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Terms
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#runtime-shape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Runtime Shape
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#deployment-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deployment Model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#storage-planes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Storage Planes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#storage-surfaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Storage Surfaces
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#job-lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Job Lifecycle
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#enqueue-and-claim" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enqueue And Claim
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#completion-and-callbacks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Completion And Callbacks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recovery-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recovery Model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#partition-rotation-and-reclamation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Partition Rotation And Reclamation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#maintenance-leader" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Maintenance Leader
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#operator-surfaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Operator Surfaces
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Operator Surfaces">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#descriptors-and-runtime-liveness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Descriptors And Runtime Liveness
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dlq" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DLQ
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cron" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cron
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#observability-and-correctness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Observability And Correctness
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#crate-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Crate Structure
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Migrations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migration overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#terms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Terms
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#runtime-shape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Runtime Shape
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#deployment-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deployment Model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#storage-planes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Storage Planes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#storage-surfaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Storage Surfaces
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#job-lifecycle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Job Lifecycle
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#enqueue-and-claim" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enqueue And Claim
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#completion-and-callbacks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Completion And Callbacks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recovery-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recovery Model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#partition-rotation-and-reclamation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Partition Rotation And Reclamation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#maintenance-leader" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Maintenance Leader
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#operator-surfaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Operator Surfaces
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Operator Surfaces">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#descriptors-and-runtime-liveness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Descriptors And Runtime Liveness
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dlq" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DLQ
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cron" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cron
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#observability-and-correctness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Observability And Correctness
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#crate-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Crate Structure
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
+                  
+
+
+  
+  
+
+
+<h1 id="awa-architecture-overview">Awa Architecture Overview<a class="headerlink" href="#awa-architecture-overview" title="Permanent link">&para;</a></h1>
+<p>Awa (Māori: river) is a Postgres-native background job queue for Rust and Python. Postgres is the sole infrastructure dependency: there is no Redis, RabbitMQ, sidecar scheduler, or separate lease store. Producers enqueue inside ordinary Postgres transactions, workers claim and complete jobs through the same database, and one elected worker runs cluster-wide maintenance.</p>
+<p>Awa keeps application data and background work in one transactional system of record. Producers commit jobs with their business writes; workers claim attempts using lease-guarded PostgreSQL transitions; maintenance makes deferred work runnable, rescues abandoned attempts, and reclaims old ring partitions. There is no second broker whose acknowledgement state can diverge from the database transaction.</p>
+<p><img alt="Awa system architecture" src="../assets/architecture-system.svg" /></p>
+<p>The diagram is the useful boundary: application processes produce work, worker processes execute it, and PostgreSQL is authoritative for both job state and coordination. The admin surface observes and controls that system; it is not part of the dispatch hot path.</p>
+<p>For migration details see <a href="../migrations/">Migrations</a>. For user-facing knobs see <a href="../configuration/">Configuration</a>.</p>
+<h2 id="terms">Terms<a class="headerlink" href="#terms" title="Permanent link">&para;</a></h2>
+<ul>
+<li>A <strong>claim</strong> is the storage transition that makes a ready job belong to one attempt. It increments <code>run_lease</code>; later completion, retry, rescue, and cancellation must match that lease number.</li>
+<li>A <strong>deferred</strong> job is not claimable yet. Future <code>run_at</code> jobs and snoozed jobs are <code>scheduled</code>; retry backoff and <code>RetryAfter</code> rows are <code>retryable</code>. Maintenance promotes due deferred rows into the ready ring.</li>
+<li>A <strong>lane</strong> is one ordered <code>(queue, priority, enqueue_shard)</code> stream. Raising the shard count creates more lanes for the same logical queue.</li>
+<li>A <strong>lease</strong> is the durable live-attempt row used when an attempt needs mutable execution state such as heartbeat, progress, callbacks, or deadlines.</li>
+<li>A <strong>receipt</strong> is the lighter claim evidence used for short attempts. A receipt can be a row in <code>lease_claims_*</code> or an item inside a compact <code>lease_claim_batches_*</code> row. Compact batch claims carry a claim-batch id and one-based item index so completion can validate the exact item without searching the batch by receipt range. Receipt attempts close through durable closure evidence: explicit closure rows for non-success and cold paths, or compact claim-local closure batches for successful hot-path completions. Successful completions also write compact terminal history that is exposed through <code>terminal_jobs</code>. Open receipts are derived by anti-joining row and batch claims against every closure-evidence family.</li>
+<li>A <strong>segment</strong> is a ring partition. Awa rotates segments and truncates whole old segments instead of vacuuming hot history row by row.</li>
+<li>A <strong>ready tombstone</strong> is an append-only marker that excludes an immutable ready row from future claims.</li>
+</ul>
+<h2 id="runtime-shape">Runtime Shape<a class="headerlink" href="#runtime-shape" title="Permanent link">&para;</a></h2>
+<p>The runtime is three cooperating layers:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Owns</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Application code</td>
+<td>Producer transactions, Rust handlers, Python handlers, optional HTTP worker targets</td>
+<td>Enqueue can commit or roll back with the application's own writes. Rust and Python workers share the same storage engine.</td>
+</tr>
+<tr>
+<td>Worker runtime</td>
+<td>Dispatchers, executor tasks, guarded completion, per-process heartbeat refresh, maintenance leader election</td>
+<td>Every worker process runs these services. Only one process wins the maintenance lock at a time.</td>
+</tr>
+<tr>
+<td>Postgres</td>
+<td>Queue state, execution state, control metadata, uniqueness, cron rows, runtime snapshots</td>
+<td>Postgres is the coordination point for visibility, claim ownership, recovery, callbacks, and operator state.</td>
+</tr>
+</tbody>
+</table>
+<p>The important ownership split is simple: every worker can dispatch and heartbeat its own attempts, but exactly one elected maintenance leader runs cluster-wide promotion, rescue, queue/lease/claim ring rotation and prune, DLQ cleanup, descriptor cleanup, cron evaluation, metadata refresh, and queue-health publication.</p>
+<p>While a storage transition is unfinalized, the leader promotes the deferred backlog and runs the rescue sweeps of <em>both</em> planes regardless of which engine it resolved at startup, so a drain cannot stall — and mid-flight jobs cannot wedge — on which runtime happens to hold the lock (<a href="https://github.com/hardbyte/awa/issues/456">#456</a>). The extra passes are no-ops once the cluster is finalized.</p>
+<h2 id="deployment-model">Deployment Model<a class="headerlink" href="#deployment-model" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Awa assumes one shared Postgres database and any number of Rust or Python worker processes.</li>
+<li>Each process registers the queues and job kinds it can execute.</li>
+<li>Queue work is awakened by <code>LISTEN/NOTIFY</code> with polling as the fallback.</li>
+<li>The maintenance leader is elected inside the same worker fleet; no <code>pg_cron</code> or external scheduler is required.</li>
+<li>Long analytical reads should run on replicas or with disciplined timeouts, because long-lived primary transactions can delay best-effort partition prune.</li>
+</ul>
+<h2 id="storage-planes">Storage Planes<a class="headerlink" href="#storage-planes" title="Permanent link">&para;</a></h2>
+<p>Queue storage is the worker engine in 0.6. It is not one mutable jobs heap; it is split into queue, execution, and control planes so each plane carries the right kind of churn.</p>
+<table>
+<thead>
+<tr>
+<th>Plane</th>
+<th>Tables</th>
+<th>Shape</th>
+<th>Why it matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue</td>
+<td><code>ready_entries_*</code>, <code>ready_claim_attempt_batches_*</code>, <code>ready_tombstones_*</code>, <code>ready_segments_*</code>, <code>done_entries_*</code>, <code>receipt_completion_batches_*</code>, <code>receipt_completion_tombstones_*</code>, <code>queue_terminal_count_deltas_*</code></td>
+<td>Ring partitions by <code>ready_slot</code> plus compact ready-segment and attempt-emission maps</td>
+<td>Runnable and terminal rows stay append-first; emitted attempts leave compact queue-slot-local batch/range evidence so stale claim cursors do not need to scan claim-ring partitions; rare ready mutations append tombstones instead of deleting ready rows; claim routes through compact ready segments before reading ready rows; successful receipt completions can use compact batch terminal history; <code>done_entries</code> terminal-count changes append signed deltas, compact completions are counted from retained batches, and the whole segment is reclaimed by queue-ring prune.</td>
+</tr>
+<tr>
+<td>Queue backlog</td>
+<td><code>deferred_jobs</code></td>
+<td>Plain table</td>
+<td>Scheduled and retryable work stays out of the hot claim path until promotion.</td>
+</tr>
+<tr>
+<td>Operator hold</td>
+<td><code>dlq_entries</code></td>
+<td>Plain table</td>
+<td>DLQ rows are explicit operator backlog with retry, purge, and retention cleanup.</td>
+</tr>
+<tr>
+<td>Receipt execution</td>
+<td><code>lease_claims_*</code>, <code>lease_claim_batches_*</code>, <code>lease_claim_closures_*</code>, <code>lease_claim_closure_batches_*</code></td>
+<td>Ring partitions by <code>claim_slot</code></td>
+<td>Short attempts avoid mutable lease rows. Zero-deadline hot claims can store many receipts in one compact claim-batch row; deadline-backed claims keep row-local claim evidence for indexed deadline rescue. A compact claim can still materialize into a lease if the worker later needs mutable attempt state. Each receipt gets an immutable <code>receipt_id</code>; compact completion validates row-local receipts by tuple identity and compact-batch receipts by returned batch id/index plus receipt id before writing closure batches. Stale-rescue and deadline-rescue scans use the same per-attempt advisory key before closing rescue-eligible receipts.</td>
+</tr>
+<tr>
+<td>Materialized execution</td>
+<td><code>leases_*</code>, <code>attempt_state</code></td>
+<td>Lease ring plus mutable state table</td>
+<td>Attempts escalate here when they need callback waiting, progress, or other mutable attempt state.</td>
+</tr>
+<tr>
+<td>Control</td>
+<td><code>queue_lanes</code>, heads, ring-state tables, <code>queue_meta</code>, descriptors, runtimes, cron, uniqueness</td>
+<td>Narrow metadata tables</td>
+<td>Claim cursors, queue state, operator metadata, uniqueness, and liveness are kept separate from payload history.</td>
+</tr>
+</tbody>
+</table>
+<p>The asymmetry is intentional. Ready/done, lease, and receipt tables are ring-pruned because they are hot. Deferred and DLQ rows are backlog/hold tables with their own promotion, retry, purge, and retention paths. Control tables stay narrow because they are the coordination surface dispatchers and maintenance touch most often.</p>
+<h2 id="storage-surfaces">Storage Surfaces<a class="headerlink" href="#storage-surfaces" title="Permanent link">&para;</a></h2>
+<p>Most applications should use the Rust, Python, CLI, or UI APIs rather than querying queue-storage tables directly. The SQL objects still matter for operators, adapters, and incident read-outs, so Awa separates read surfaces from physical transition surfaces:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Role</th>
+<th>Consumer contract</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>awa.insert_job()</code></td>
+<td>Planned public v1 SQL producer capability under #342. It presents one stable request/result/error contract, uses a final <code>opts jsonb DEFAULT '{}'::jsonb</code> extension point, computes ADR-033 concurrency routing authoritatively from logical keys, and delegates to the active storage implementation.</td>
+<td>Public SQL contract once shipped. Prefer configured direct COPY for trusted high-volume producers that accept ADR-043's broader privilege profile.</td>
+</tr>
+<tr>
+<td><code>awa.jobs</code> / <code>awa.insert_job_compat()</code></td>
+<td>Canonical compatibility plumbing used during the storage transition and by current Rust/Python adapters. When queue storage is active, the runtime does not claim or complete from <code>awa.jobs</code>; compatibility inserts route into the active backend, and SQL deletes of ready rows append ready tombstones.</td>
+<td><code>insert_job_compat</code> remains the transitional SQL producer contract listed in <code>docs/stability.md</code> until #342 ships <code>awa.insert_job()</code> and completes its migration/deprecation step. Its storage internals and other <code>_compat</code> helpers remain internal.</td>
+</tr>
+<tr>
+<td><code>{schema}.terminal_jobs</code></td>
+<td>Read-only hydrated view over queue-storage terminal history. It joins narrow <code>done_entries_*</code> rows and compact <code>receipt_completion_batches_*</code> rows back to retained <code>ready_entries_*</code> bodies.</td>
+<td>Public read surface for SQL inspection and reporting of terminal queue-storage rows. It is not a write or transition surface.</td>
+</tr>
+<tr>
+<td><code>ready_entries_*</code></td>
+<td>Physical runnable queue ring.</td>
+<td>Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths.</td>
+</tr>
+<tr>
+<td><code>ready_claim_attempt_batches_*</code></td>
+<td>Physical attempt-emission ledger keyed by ready slot/generation and lane ranges.</td>
+<td>Internal storage. Claim writes one compact batch row in the same transaction as the receipt/lease claims; stale claim-cursor recovery treats covered lanes as durable evidence that those lanes already emitted <code>run_lease + 1</code>. Queue prune truncates it with the matching ready segment.</td>
+</tr>
+<tr>
+<td><code>ready_tombstones_*</code></td>
+<td>Physical ledger for ready lanes made unavailable by cancellation, priority aging, or similar out-of-band ready mutations.</td>
+<td>Internal storage. Claim treats matching rows as spent lane evidence and exact-count paths skip them; maintenance truncates it with the matching ready segment.</td>
+</tr>
+<tr>
+<td><code>ready_segments_*</code></td>
+<td>Compact control-plane map from committed ready lane ranges to their ready slot/generation.</td>
+<td>Internal storage. Claim uses it to choose the target ready segment before validating <code>ready_entries_*</code>; ranges are split when the lane-head <code>run_at</code> timestamp changes so claim-time priority aging stays exact as the cursor advances; queue prune truncates the matching ready-slot child.</td>
+</tr>
+<tr>
+<td><code>queue_claim_heads</code> ready-segment columns</td>
+<td>Legacy nullable ready-slot/generation cache beside the per-lane claim cursor.</td>
+<td><strong>Unused.</strong> <code>claim_ready_runtime</code> resolves the target ready slot from <code>ready_segments_*</code> on every claim instead of caching it here — the per-claim <code>UPDATE</code> of this singleton row was the dominant dead-tuple source under a pinned MVCC horizon. The columns are retained for rolling-upgrade compatibility; dropping them is deferred to a major version.</td>
+</tr>
+<tr>
+<td><code>done_entries_*</code></td>
+<td>Physical terminal fact ring for failed, cancelled, non-receipt, and wide terminal rows. Ready-backed rows can intentionally omit duplicated body columns.</td>
+<td>Internal storage. Direct readers must tolerate nullable duplicated body fields and must not assume all completed rows are present here; use <code>{schema}.terminal_jobs</code> for hydrated terminal rows.</td>
+</tr>
+<tr>
+<td><code>receipt_completion_batches_*</code></td>
+<td>Compact physical terminal history for successful receipt-backed completions. Each row stores one completion batch and expands through <code>{schema}.terminal_jobs</code>.</td>
+<td>Internal storage. Optimized for hot-path append and queue-ring truncate; not a public query surface. Claim-closure proof for these completions lives in claim-slot-local <code>lease_claim_closure_batches_*</code> rows. SQL compatibility delete may scan retained compact batches by job id, but the hot path does not maintain a <code>job_ids</code> index for that cold operation.</td>
+</tr>
+<tr>
+<td><code>receipt_completion_tombstones_*</code></td>
+<td>Cold deletion ledger for completed rows synthesized from <code>receipt_completion_batches_*</code>.</td>
+<td>Internal storage. SQL compatibility delete writes here so <code>terminal_jobs</code> can hide a compact completed row without mutating the compact batch.</td>
+</tr>
+<tr>
+<td><code>queue_terminal_count_deltas_*</code></td>
+<td>Append-only signed terminal-count ledger for <code>done_entries</code> mutations. <code>done_entries</code> inserts append positive deltas; retry, discard, DLQ move, and compatibility delete of <code>done_entries</code> rows append negative deltas.</td>
+<td>Internal derived storage. Exact count reads include pending deltas plus retained compact completion batches minus compact tombstones; maintenance folds sealed-slot deltas into <code>queue_terminal_live_counts</code> and prune truncates the matching delta segment.</td>
+</tr>
+<tr>
+<td><code>queue_terminal_live_counts</code>, <code>queue_terminal_rollups</code></td>
+<td>Folded <code>done_entries</code> counters for retained queue segments and permanent terminal counters for pruned queue segments.</td>
+<td>Internal derived storage. Rebuild live counts from <code>{schema}.done_entries</code> if the trust marker is cleared or after a counter incident; compact completions remain counted from retained batches until prune folds them into rollups.</td>
+</tr>
+<tr>
+<td><code>deferred_jobs</code></td>
+<td>Physical scheduled/retryable backlog table.</td>
+<td>Internal storage. Promotion, retry, snooze, and cancellation own its transitions.</td>
+</tr>
+<tr>
+<td><code>dlq_entries</code></td>
+<td>Durable operator hold table for DLQ-enabled terminal failures.</td>
+<td>Operator surface through CLI/UI/API; direct SQL inspection is reasonable, direct mutation is not.</td>
+</tr>
+<tr>
+<td><code>lease_claims_*</code> / <code>lease_claim_batches_*</code> / <code>lease_claim_closures_*</code> / <code>lease_claim_closure_batches_*</code></td>
+<td>Receipt-plane execution history for short attempts.</td>
+<td>Internal storage. Live receipt attempts are row claims or compact batch items without durable closure evidence. Explicit closures cover non-success and cold paths; compact closure batches cover successful hot-path completions, expose a range-indexed receipt membership proof, and carry ready segment metadata for prune count proofs. Maintenance uses <code>claim_ring_slots</code> rescue cursors to keep stale and deadline scans bounded when closed receipt history cannot yet be truncated.</td>
+</tr>
+<tr>
+<td><code>leases_*</code> / <code>attempt_state</code></td>
+<td>Materialized execution state for heartbeat, callbacks, progress, and other mutable attempt data.</td>
+<td>Internal storage. Runtime and rescue paths own mutations.</td>
+</tr>
+<tr>
+<td><code>queue_lanes</code>, queue heads, <code>{ring}_ring_rotations</code> ledgers, <code>{ring}_ring_state</code> config, <code>queue_terminal_rollup_deltas</code>, <code>queue_meta</code></td>
+<td>Claim cursors, enqueue heads, append-only rotation-ledger cursors (current cursor = max-generation row; ADR-040), ring config, pending prune-rollup deltas, and queue storage configuration.</td>
+<td>Internal control surface except documented configuration fields such as <code>queue_meta.enqueue_shards</code>. If no <code>queue_meta</code> row exists for a queue, enqueue defaults to one shard; operators should configure shard counts with an UPSERT before load tests or production traffic.</td>
+</tr>
+<tr>
+<td>descriptors, runtime snapshots, cron tables</td>
+<td>Operator metadata and scheduler declarations.</td>
+<td>Public through Awa APIs and UI; SQL reads are acceptable for reporting. Writes should go through the corresponding Awa APIs.</td>
+</tr>
+</tbody>
+</table>
+<p>ADR-019 is the storage-engine source of truth; ADR-023 supersedes it for the receipt plane, and ADR-026 refines terminal history:</p>
+<ul>
+<li><a href="../adr/019-queue-storage-redesign/">ADR-019: Queue Storage Engine</a></li>
+<li><a href="../adr/023-receipt-plane-ring-partitioning/">ADR-023: Receipt Plane Ring Partitioning</a></li>
+<li><a href="../adr/026-narrow-terminal-history/">ADR-026: Narrow Terminal History</a></li>
+</ul>
+<p>For how the per-schema substrate is installed and who owns which objects, see <a href="../queue-storage-substrate/">Queue-storage substrate</a>. The default <code>awa.*</code> substrate is materialised by <code>awa migrate</code>; custom queue-storage schemas are installed via the <code>awa.install_queue_storage_substrate()</code> SQL helper that <code>prepare_schema()</code> and <code>awa storage prepare-queue-storage-schema</code> both call into.</p>
+<h2 id="job-lifecycle">Job Lifecycle<a class="headerlink" href="#job-lifecycle" title="Permanent link">&para;</a></h2>
+<p>Core transitions:</p>
+<table>
+<thead>
+<tr>
+<th>From</th>
+<th>To</th>
+<th>Trigger</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>insert</td>
+<td><code>available</code></td>
+<td>Immediate enqueue.</td>
+</tr>
+<tr>
+<td>insert</td>
+<td><code>scheduled</code></td>
+<td>Future <code>run_at</code>.</td>
+</tr>
+<tr>
+<td><code>scheduled</code> / <code>retryable</code></td>
+<td><code>available</code></td>
+<td>Maintenance promotion when <code>run_at &lt;= now()</code>.</td>
+</tr>
+<tr>
+<td><code>available</code></td>
+<td><code>running</code></td>
+<td>Dispatcher claim; <code>run_lease</code> increments.</td>
+</tr>
+<tr>
+<td><code>running</code></td>
+<td><code>completed</code></td>
+<td>Handler succeeds.</td>
+</tr>
+<tr>
+<td><code>running</code></td>
+<td><code>retryable</code></td>
+<td>Handler returns a retryable failure, or <code>RetryAfter</code>.</td>
+</tr>
+<tr>
+<td><code>running</code></td>
+<td><code>scheduled</code></td>
+<td>Handler snoozes; the attempt is not counted.</td>
+</tr>
+<tr>
+<td><code>running</code></td>
+<td><code>waiting_external</code></td>
+<td>Handler parks for callback or sequential wait.</td>
+</tr>
+<tr>
+<td><code>waiting_external</code></td>
+<td><code>running</code></td>
+<td><code>resume_external</code> resumes a sequential wait.</td>
+</tr>
+<tr>
+<td><code>running</code> / <code>waiting_external</code></td>
+<td><code>cancelled</code></td>
+<td>Handler cancel, admin cancel, rescue cancellation, or a transition-time re-schedule superseded by a newer unique-claim holder.</td>
+</tr>
+<tr>
+<td><code>running</code> / <code>waiting_external</code></td>
+<td><code>failed</code></td>
+<td>Attempts exhausted, terminal error, or callback timeout exhaustion.</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td><code>dlq_entries</code></td>
+<td>Optional per-queue DLQ routing.</td>
+</tr>
+</tbody>
+</table>
+<p><code>run_lease</code> increments at claim time. Runtime mutations carry <code>(job_id, run_lease)</code>, so stale completions, retries, snoozes, cancels, and callback resumes lose after rescue, admin cancellation, or re-claim.</p>
+<p>During a storage transition, a canonical re-schedule acquires any unique claim required by its destination state before its queue-storage successor can become executable. If a newer duplicate acquired the key while the running state was outside the job's <code>unique_states</code> mask, the newer job keeps the claim and the old attempt is recorded as cancelled terminal evidence with <code>rescheduled as duplicate</code>.</p>
+<p>Terminal rows differ by storage backend:</p>
+<ul>
+<li>In queue storage, terminal history is reclaimed by queue-ring prune. Successful receipt-backed completions normally write compact rows in <code>receipt_completion_batches_*</code> and compact claim-local closure evidence in <code>lease_claim_closure_batches_*</code>; custom terminal payload snapshots live in <code>done_entries_*</code> so read surfaces preserve per-job metadata. Awa-owned provenance metadata from priority aging or queue/priority moves remains compact-safe. Failed, cancelled, non-receipt, and wide terminal snapshots live in <code>done_entries_*</code>. Ready-backed terminal rows are narrow: immutable job-body fields stay in the retained <code>ready_entries_*</code> row and public/admin reads hydrate through the storage surfaces described above. Unclaimed ready cancellation and priority aging do not delete ready rows; they append <code>ready_tombstones_*</code> rows so claim and exact-count paths skip the old lane until queue prune reclaims the segment. <code>done_entries</code> terminal-count changes append to <code>queue_terminal_count_deltas_*</code>; exact count reads include those pending deltas plus retained compact batches minus compact tombstones until maintenance folds sealed slots into compact live counters or prune folds the whole segment into permanent rollups. Receipt claims that materialize into <code>leases</code> for callbacks or mutable attempt state still complete through the lease-deleting path; that path identifies the lease by stable ready-lane and attempt keys because the lease ring may have rotated since the original claim.</li>
+<li>DLQ-enabled terminal failures are routed or moved into <code>dlq_entries</code> instead of ordinary terminal history; that table has explicit retention cleanup plus operator retry/purge.</li>
+<li>In the canonical compatibility path, terminal rows in <code>awa.jobs_hot</code> use row-by-row retention cleanup.</li>
+</ul>
+<p>Progress is cleared on successful completion and preserved across retry, snooze, cancel, fail, and rescue. On queue storage, mutable progress snapshots live in <code>attempt_state</code> once an attempt first needs that mutable state; they are not rewrites of the immutable ready row. Cancellation is cooperative for live handlers: Rust handlers can poll <code>ctx.is_cancelled()</code>, Python handlers can poll <code>job.is_cancelled()</code>, and stale storage writes are still rejected by the <code>run_lease</code> guard if a handler misses the signal.</p>
+<h2 id="enqueue-and-claim">Enqueue And Claim<a class="headerlink" href="#enqueue-and-claim" title="Permanent link">&para;</a></h2>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>sequenceDiagram
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    autonumber
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    participant P as Producer
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    participant Q as Queue storage
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    participant D as Dispatcher
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    participant R as Ring state
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    participant E as Executor
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    P-&gt;&gt;Q: single insert or direct COPY enqueue inside app transaction
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    Q-&gt;&gt;Q: append ready_entries or deferred_jobs
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    Q--&gt;&gt;D: NOTIFY awa:&lt;queue&gt;
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    D-&gt;&gt;D: pre-acquire local permits
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>    D-&gt;&gt;Q: claim_runtime_batch_with_aging_for_instance
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>    Q-&gt;&gt;Q: lock queue_claim_heads FOR UPDATE SKIP LOCKED
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>    Q-&gt;&gt;R: read lease and claim ring cursors
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>    Q-&gt;&gt;Q: append receipt or materialize lease
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>    Q--&gt;&gt;D: claimed jobs + run_lease snapshots
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>    D-&gt;&gt;E: execute handlers
+</span></code></pre></div>
+<p>Enqueue is transactional: if the producer's outer transaction rolls back, the job never becomes visible. Immediate jobs reserve a lane sequence range under a transaction-scoped lane lock, append to <code>ready_entries_*</code>, and append a compact <code>ready_segments</code> range for the committed lane sequence range; future scheduled or retryable jobs append to <code>deferred_jobs</code>. The lane lock is held until commit or rollback so a later producer cannot make lane <code>N+1</code> visible while lane <code>N</code> can still commit.</p>
+<p><code>deferred_jobs</code> is deliberately outside the claim path. The maintenance leader promotes due <code>scheduled</code> and <code>retryable</code> rows into <code>ready_entries_*</code> in batches and notifies the target queues. Cron schedules are just producers for ordinary jobs: when a schedule fires, the cron transaction records the fire and enqueues the job atomically, using <code>ready_entries_*</code> for immediate fires or <code>deferred_jobs</code> when the enqueue carries a future <code>run_at</code>.</p>
+<p>There are two COPY-shaped producer paths:</p>
+<ul>
+<li>Direct queue-storage COPY is the high-throughput path: Rust producers use a configured <code>QueueStorage::enqueue_params_copy()</code>, and Python producers use <code>enqueue_many_copy()</code>. Direct-copy producers must use the same queue-storage configuration as the worker fleet, especially <code>queue_stripe_count</code> / <code>queue_storage_queue_stripe_count</code>.</li>
+<li><code>insert_many_copy()</code> is the compatibility path. It stages rows with COPY, then takes one of two branches. If any staged row has a <code>unique_key</code>, every row is replayed through <code>POSTGRES_INSERT_JOB_SQL</code> inside a per-row savepoint so SQLSTATE <code>23505</code> can skip that duplicate without aborting the batch; that statement itself calls <code>awa.insert_job_compat()</code>. An all-non-unique batch uses one lateral <code>awa.insert_job_compat()</code> call per staged row without savepoints. Both branches therefore preserve cross-storage behavior. The planned <code>awa.insert_job()</code> public capability becomes the clean stable SQL contract after #342 ships its migration and conformance artifacts.</li>
+</ul>
+<p>Claim is cursor-based rather than heap-scan based:</p>
+<ul>
+<li><code>queue_meta.enqueue_shards</code> controls how many independent enqueue/claim head rows a queue has. The default is one shard. Raising it changes the ordering contract to FIFO within <code>(queue, priority, enqueue_shard)</code>, with no global ordering promise across shards.</li>
+<li><code>queue_enqueue_heads</code> owns the sequence name for each <code>(physical queue, priority, enqueue_shard)</code> lane. Producers reserve lane sequence ranges under a transaction-scoped advisory lock keyed by that sequence name.</li>
+<li><code>ready_segments</code> maps committed lane sequence ranges to the ready slot/generation that stores their immutable ready rows. Claim consults this compact map on every claim to resolve the target ready slot — ordered by <code>next_lane_seq</code> so the <code>(queue, priority, enqueue_shard, next_lane_seq, …)</code> index short-circuits at <code>LIMIT 1</code> — then validates the target ready head.</li>
+<li><code>queue_claim_heads</code> advances monotonically during claim (via its lane sequence cursor) and is the authority for the next claimable lane position on the same shard-qualified lane. It still carries the legacy <code>ready_segment_*</code> cache columns, now unused — see the storage table above.</li>
+<li>The dispatcher pre-acquires execution permits before claiming, so every claimed <code>running</code> job has reserved local capacity.</li>
+<li><code>PartitionedQueue</code> is a Rust and Python helper for mapping one hot logical queue to several ordinary physical queue names. The storage engine does not add a separate group table for this; each physical queue keeps the normal lane, lease, DLQ, descriptor, and terminal-history contract.</li>
+<li>Queue striping and bounded claimers reduce contention on very hot logical queues. Per-queue <code>claimers</code> can add dispatcher/claimer loops inside one runtime, but those loops share the queue's worker permits and rate limiter; they do not own jobs. Recovery still follows the receipt/lease state in Postgres.</li>
+</ul>
+<p>Priority ordering is by effective priority first. Within one enqueue shard the lane sequence is FIFO; across enqueue shards, strict global lane order is not promised. With queue storage, priority aging is applied at claim time rather than by physically rewriting ready rows. The ready/done/lease partitions carry shard-aware lane indexes on <code>(queue, priority, enqueue_shard, lane_seq)</code> so deep backlog claim probes do not scan a non-shard-selective lane index and post-filter most rows.</p>
+<h2 id="completion-and-callbacks">Completion And Callbacks<a class="headerlink" href="#completion-and-callbacks" title="Permanent link">&para;</a></h2>
+<p>Handler results finalize through guarded storage transitions:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>handler result
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    ├── Completed      -&gt; close attempt, append receipt_completion_batches or done_entries
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    ├── RetryAfter     -&gt; close attempt, append deferred retry or terminal failure
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    ├── Snooze         -&gt; close attempt, append deferred_jobs without attempt bump
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    ├── Cancel         -&gt; close attempt, append done_entries(cancelled)
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    ├── Terminal error -&gt; close attempt, append done_entries(failed) or dlq_entries
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>    └── Retryable err  -&gt; close attempt, append deferred retry or terminal failure
+</span></code></pre></div>
+<p>Two callback modes share the same attempt guard:</p>
+<ul>
+<li><strong>Parked callback.</strong> The handler registers a callback token and returns <code>WaitForCallback</code>; the runtime frees the task slot and moves the attempt to <code>waiting_external</code> until a signed callback completes, fails, retries, or resumes it.</li>
+<li><strong>Sequential wait.</strong> The handler calls <code>wait_for_callback()</code> and stays suspended; <code>resume_external</code> writes the callback result and returns the same attempt to <code>running</code> so the handler can continue.</li>
+</ul>
+<p>Callback tokens are attempt-specific. Stale tokens and stale completions are rejected after a newer claim or terminal transition. The <code>awa-ui</code> HTTP callback receiver verifies <code>X-Awa-Signature</code> when <code>AWA_CALLBACK_HMAC_SECRET</code> is set; custom callback receivers must provide equivalent authentication. See <a href="../http-callbacks/">HTTP workers and callback signatures</a> for the concrete endpoint and signing contract.</p>
+<h2 id="recovery-model">Recovery Model<a class="headerlink" href="#recovery-model" title="Permanent link">&para;</a></h2>
+<p>Awa has three rescue paths:</p>
+<ul>
+<li><strong>Stale heartbeat rescue.</strong> Each worker heartbeats the attempts it owns. The maintenance leader rescues attempts whose heartbeat is older than <code>heartbeat_staleness</code> (default 90s).</li>
+<li><strong>Hard deadline rescue.</strong> Per-queue deadlines write <code>deadline_at</code> onto row-local receipt claims or lease rows. The maintenance leader closes expired attempts and routes them through the normal retry/fail/DLQ path.</li>
+<li><strong>Callback-timeout rescue.</strong> Waiting attempts with expired callback timeouts are moved back through the same guarded finalization machinery.</li>
+</ul>
+<p>Rescue closes the old attempt before making work available again. If the old handler later writes a completion, the <code>run_lease</code> guard rejects it as stale. When rescue happens in a process that still has the handler registered, the runtime also flips the in-memory cancellation flag.</p>
+<h2 id="partition-rotation-and-reclamation">Partition Rotation And Reclamation<a class="headerlink" href="#partition-rotation-and-reclamation" title="Permanent link">&para;</a></h2>
+<p>Queue storage has three independent rings, each advanced by the elected maintenance leader:</p>
+<table>
+<thead>
+<tr>
+<th>Ring</th>
+<th>Partitions</th>
+<th style="text-align: right;">Default cadence</th>
+<th>Rotate requires</th>
+<th>Prune requires</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Queue</td>
+<td><code>ready_entries_*</code>, <code>ready_claim_attempt_batches_*</code>, <code>ready_tombstones_*</code>, <code>ready_segments_*</code>, <code>done_entries_*</code>, <code>receipt_completion_batches_*</code>, <code>receipt_completion_tombstones_*</code>, <code>queue_terminal_count_deltas_*</code></td>
+<td style="text-align: right;"><code>1000ms</code></td>
+<td>incoming ready/attempt/terminal/tombstone/segment/delta slot is empty</td>
+<td>oldest non-current slot has no active leases, no retained ready rows at or ahead of their lane claim cursors, and no receipt claims without closure evidence; pending-ready, active-lease, and closure gates are checked before and after the bounded exclusive-lock path; terminal rows, compact completion batches, compact tombstones, emitted-attempt evidence, ready tombstones, ready-segment metadata, and pending <code>done_entries</code> count deltas in that ready segment are reclaimed with their retained ready bodies</td>
+</tr>
+<tr>
+<td>Lease</td>
+<td><code>leases_*</code></td>
+<td style="text-align: right;"><code>1000ms</code></td>
+<td>incoming lease slot is empty</td>
+<td>oldest initialized non-current lease slot is empty</td>
+</tr>
+<tr>
+<td>Claim</td>
+<td><code>lease_claims_*</code>, <code>lease_claim_batches_*</code>, <code>lease_claim_closures_*</code>, <code>lease_claim_closure_batches_*</code></td>
+<td style="text-align: right;">matches queue ring</td>
+<td>incoming claim-row/claim-batch/closure/closure-batch slot is empty</td>
+<td>every row claim or compact claim-batch item in the oldest non-current slot has durable closure evidence; count proofs use compact closure-batch ready-segment metadata and skip conservatively when counts do not prove closure, and the open-claim proof is repeated after the bounded exclusive-lock path; stale-rescue cursors are reset when the slot is truncated</td>
+</tr>
+</tbody>
+</table>
+<p>The maintenance tick for each ring is deliberately small: attempt one rotate, then attempt one prune. If a partition is busy, blocked by a lock, current, or still live, the tick records a skipped/blocked outcome and tries again on a future interval.</p>
+<p>Rotation is also gated on the ring having something to seal: if every child table of the <em>current</em> slot is empty, the tick reports <code>skipped_idle</code> and appends nothing, instead of advancing the cursor over nothing. An idle queue therefore stops rotating entirely — the cursor's slot and generation freeze until the next write lands — which keeps the ring bookkeeping free of dead-tuple churn under a pinned MVCC horizon. Once the oldest sealed generation has been pruned at that cursor, later idle ticks report <code>already_pruned</code> without repeating <code>TRUNCATE</code>; a new maintenance leader may conservatively repeat it once. A frozen generation on a quiet queue is expected and healthy; a frozen generation <strong>with</strong> rows accumulating (<code>skipped_busy</code> outcomes) is the pinned-ring condition to alert on.</p>
+<p><strong>Cursor representation — the rotation ledger (<a href="../adr/040-append-only-ring-rotation-ledger/">ADR-040</a>, #371).</strong> Each ring cursor lives in an append-only <code>{ring}_ring_rotations</code> ledger, one row per rotation <code>(generation, slot, rotated_at)</code>. The <strong>current cursor is the max-generation row</strong> — a backward primary-key scan, O(1) — and rotation <strong>appends</strong> one row rather than UPDATEing a mutable singleton, so even a busy ring under a pinned MVCC horizon adds no dead bookkeeping tuple per tick. The append is a compare-and-swap on the <code>generation</code> primary key: a rotator whose observed cursor was already consumed loses the race and skips instead of double-advancing. Per-slot generations are derived (<code>slot = generation mod slot_count</code>, genesis <code>(0, 0)</code>). The maintenance leader trims each ledger to one full ring wrap on a horizon-gated fold, so the ledger stays bounded once the MVCC horizon clears.</p>
+<p>This is the steady state in <strong>ledger authority</strong>. The rolling cutover uses a per-schema <code>ring_cursor_authority</code> row (<code>columns</code> | <code>ledger</code>), and <code>{schema}.ring_cursor(ring)</code> resolves the cursor accordingly. On upgrade a schema starts in <strong>compat authority</strong>, where the pre-0.7 <code>{ring}_ring_state.current_slot</code> / <code>generation</code> columns (and the per-slot <code>generation</code> column) remain authoritative and a 0.7 rotator serializes with any live 0.6.2 rotator on the singleton <code>FOR UPDATE</code>, CASes the columns, and shadows the ledger. Once the whole fleet is on 0.7 the authority flips one-way to <code>ledger</code> (<code>awa storage flip-ring-authority</code> or the maintenance auto-flip), reconciling the ledgers, poisoning the stale cursor/prune metadata, and database-enforcing rejection of later compat cursor updates. Fresh installs skip straight to ledger authority. The compat columns are dropped in 0.8.</p>
+<p>The common safety pattern is:</p>
+<ol>
+<li>Take the per-ring rotation advisory lock (<code>pg_try_advisory_xact_lock</code>) so a periodic tick skips under contention rather than queueing. This replaces the pre-ledger <code>FOR UPDATE</code> on the ring-state singleton for rotate ↔ prune ↔ delta-rollup serialization.</li>
+<li>Choose the incoming or oldest initialized slot (from the ledger cursor).</li>
+<li>Prove cheap skip gates before the exclusive-lock path. Queue prune checks active leases and pending ready lanes before receipt-closure proof; claim prune proves open-claim closure before child locks.</li>
+<li>Take child-table <code>ACCESS EXCLUSIVE</code> locks with a short transaction-local <code>lock_timeout</code> so maintenance gives up promptly under contention.</li>
+<li>Recheck the skip gates after acquiring the partition locks so rows that committed while the lock waited are visible before truncate.</li>
+<li><code>TRUNCATE</code> only partitions that are proven inactive; rotation appends the new cursor row to the ledger.</li>
+</ol>
+<p>This is why queue storage's hot-path reclamation is a rotation-and-prune discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the canonical compatibility path.</p>
+<h2 id="maintenance-leader">Maintenance Leader<a class="headerlink" href="#maintenance-leader" title="Permanent link">&para;</a></h2>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>flowchart TB
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    subgraph Workers["Worker processes"]
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>        W1["worker"]
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        W2["worker"]
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>        W3["worker"]
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    end
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    Lock["pg_try_advisory_lock(0x4157415f4d41494e)"]
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    W1 --&gt; Lock
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    W2 --&gt; Lock
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    W3 --&gt; Lock
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>    Lock -- "one session wins" --&gt; Leader["maintenance leader"]
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>    Lock -- "retry later" --&gt; Followers["followers"]
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>    Leader --&gt; Tasks["promotion&lt;br/&gt;heartbeat/deadline/callback rescue&lt;br/&gt;queue/lease/claim rotate + prune&lt;br/&gt;DLQ cleanup&lt;br/&gt;descriptor cleanup&lt;br/&gt;cron eval&lt;br/&gt;metadata refresh&lt;br/&gt;queue health"]
+</span></code></pre></div>
+<p>The advisory lock is session-scoped. If the leader process or database connection dies, Postgres releases the lock and another worker can win the next election. Heartbeat refresh is not leader-elected; only cluster-wide rescue and maintenance scans are.</p>
+<h2 id="operator-surfaces">Operator Surfaces<a class="headerlink" href="#operator-surfaces" title="Permanent link">&para;</a></h2>
+<h3 id="descriptors-and-runtime-liveness">Descriptors And Runtime Liveness<a class="headerlink" href="#descriptors-and-runtime-liveness" title="Permanent link">&para;</a></h3>
+<p>Awa keeps operator-facing descriptor catalogs separate from per-job metadata:</p>
+<ul>
+<li><code>awa.queue_descriptors</code> labels and documents queues.</li>
+<li><code>awa.job_kind_descriptors</code> labels and documents job kinds.</li>
+<li><code>awa.runtime_instances</code> reports live runtimes and descriptor hashes.</li>
+</ul>
+<p>Descriptors are code-declared by Rust <code>ClientBuilder</code> or Python <code>AsyncClient</code>. Workers upsert their declared descriptors at startup and on runtime snapshot ticks. Admin APIs derive:</p>
+<ul>
+<li><strong>stale</strong>: no live runtime has refreshed the descriptor recently.</li>
+<li><strong>drift</strong>: live runtimes report conflicting descriptor hashes.</li>
+</ul>
+<p>The maintenance leader deletes descriptor rows whose <code>last_seen_at</code> is older than <code>descriptor_retention</code> (default 30 days). Runtime liveness rows are garbage-collected on a shorter horizon.</p>
+<h3 id="dlq">DLQ<a class="headerlink" href="#dlq" title="Permanent link">&para;</a></h3>
+<p>The Dead Letter Queue is not a dispatchable <code>job_state</code>; it is a separate hold table for failed snapshots that need operator action.</p>
+<ul>
+<li>DLQ policy is per queue.</li>
+<li>Retry deletes the DLQ row and inserts a fresh ready/deferred entry with <code>attempt = 0</code> and <code>run_lease = 0</code>.</li>
+<li>Purge deletes the DLQ row permanently.</li>
+<li>DLQ retention is independent of ordinary terminal history.</li>
+</ul>
+<h3 id="cron">Cron<a class="headerlink" href="#cron" title="Permanent link">&para;</a></h3>
+<p>Periodic jobs are declared by worker code and synchronized to <code>cron_jobs</code>. Only the maintenance leader evaluates due schedules. Enqueue is atomic, so a crash between evaluation and insert cannot create half-visible work. Schedules carry a <code>paused_at</code> flag; the evaluator skips paused rows and the atomic enqueue CTE re-checks the flag inside the same UPDATE, so a pause asserted between the leader's read and its enqueue still takes effect.</p>
+<h2 id="observability-and-correctness">Observability And Correctness<a class="headerlink" href="#observability-and-correctness" title="Permanent link">&para;</a></h2>
+<p>Awa emits tracing spans and OpenTelemetry metrics for enqueue, claim, execution, completion, rescue, rotation, prune, DLQ, queue depth, runtime health, and callback flows. The Grafana dashboards in <a href="../grafana/"><code>docs/grafana</code></a> use those metrics plus SQL panels for storage-level inspection.</p>
+<p>Core safety invariants are modeled in TLA+:</p>
+<table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Focus</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/core/AwaCore.tla"><code>AwaCore</code></a></td>
+<td>job lifecycle, retry/fail/cancel transitions, callback states</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/core/AwaBatcher.tla"><code>AwaBatcher</code></a></td>
+<td>guarded completion batching and stale-result rejection</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/protocol/AwaExtended.tla"><code>AwaExtended</code></a></td>
+<td>multi-instance shutdown, rescue, permit, leadership, and bounded fairness protocol</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaSegmentedStorage.tla"><code>AwaSegmentedStorage</code></a></td>
+<td>queue-storage lifecycle, rotate/prune safety, DLQ round-trip, receipt rescue</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaSegmentedStorageRaces.tla"><code>AwaSegmentedStorageRaces</code></a></td>
+<td>claim-vs-rotate/prune interleavings</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaSegmentedStorageTrace.tla"><code>AwaSegmentedStorageTrace</code></a></td>
+<td>concrete runtime trace acceptance for representative queue-storage flows</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaShardedPrune.tla"><code>AwaShardedPrune</code></a></td>
+<td>cross-shard ready/terminal prune matching by <code>enqueue_shard</code></td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaStorageLockOrder.tla"><code>AwaStorageLockOrder</code></a></td>
+<td>Postgres lock ordering across claim, rotate, and prune</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaStorageTransition.tla"><code>AwaStorageTransition</code></a></td>
+<td>queue-storage transition prepare, mixed-entry, finalize, and abort gates</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/AwaDeadTupleContract.tla"><code>AwaDeadTupleContract</code></a></td>
+<td>hot-table reclaim-kind contract for partition truncate and bounded warm tables</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/races/AwaCbk.tla"><code>AwaCbk</code></a></td>
+<td>callback registration/resume/finalization races</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/races/AwaDispatchClaim.tla"><code>AwaDispatchClaim</code></a></td>
+<td>availability re-check at dispatch claim commit</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/races/AwaViewTrigger.tla"><code>AwaViewTrigger</code></a></td>
+<td><code>awa.jobs</code> view trigger concurrency and version checks</td>
+</tr>
+<tr>
+<td><a href="https://github.com/hardbyte/awa/blob/main/correctness/races/AwaCron.tla"><code>AwaCron</code></a></td>
+<td>cron double-fire prevention under leader failover</td>
+</tr>
+</tbody>
+</table>
+<p>The storage model-to-code correspondence is maintained in <a href="https://github.com/hardbyte/awa/blob/main/correctness/storage/MAPPING.md"><code>correctness/storage/MAPPING.md</code></a>. Runtime tests replay representative storage traces against these models, and the benchmark notes document long-horizon partition and dead-tuple validation for ADR-019 and ADR-023. Public SQL projections such as <code>awa.jobs</code> and admin counts are treated as refinements over the modeled storage state; they need code-level regression tests as well as TLA+ lifecycle coverage.</p>
+<h2 id="crate-structure">Crate Structure<a class="headerlink" href="#crate-structure" title="Permanent link">&para;</a></h2>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa (workspace)
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>├── awa-macros        proc macro: #[derive(JobArgs)]
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>├── awa-model         types, SQL, migrations, insert/admin/cron APIs
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>├── awa-worker        runtime: client, dispatcher, executor, heartbeat, maintenance
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>├── awa               facade crate re-exporting model + worker APIs
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>├── awa-testing       integration-test helpers
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>├── awa-ui            axum API + embedded React dashboard
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>├── awa-cli           migrations, admin, storage, and web UI CLI
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>└── awa-python        PyO3 Python bindings
+</span></code></pre></div>
+<p><code>awa-model</code> owns schema and storage APIs. <code>awa-worker</code> owns runtime behavior. <code>awa</code> is the normal Rust facade. <code>awa-python</code> embeds the same worker runtime behind Python bindings, so mixed Rust/Python fleets share storage semantics.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../concepts/transactional-enqueue/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Transactional enqueue">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Transactional enqueue
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../queue-storage-substrate/" class="md-footer__link md-footer__link--next" aria-label="Next: Queue storage">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Queue storage
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/language-switch.js"></script>
+      
+        <script src="../javascripts/agent-docs.js"></script>
+      
+    
+  </body>
+</html>
