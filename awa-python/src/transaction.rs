@@ -37,7 +37,7 @@ impl PyTransaction {
         let tx = self.tx.clone();
         let json_args = to_json_args(py, args)?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
             let result = bind_json_args(sqlx::query(&query), &json_args)
@@ -58,7 +58,7 @@ impl PyTransaction {
         let tx = self.tx.clone();
         let json_args = to_json_args(py, args)?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
             let row = bind_json_args(sqlx::query(&query), &json_args)
@@ -79,7 +79,7 @@ impl PyTransaction {
         let tx = self.tx.clone();
         let json_args = to_json_args(py, args)?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
             let row = bind_json_args(sqlx::query(&query), &json_args)
@@ -103,7 +103,7 @@ impl PyTransaction {
         let tx = self.tx.clone();
         let json_args = to_json_args(py, args)?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
             let rows = bind_json_args(sqlx::query(&query), &json_args)
@@ -153,7 +153,7 @@ impl PyTransaction {
                 .transpose()
         })?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
             let row = insert_raw_job(
@@ -214,7 +214,7 @@ impl PyTransaction {
                 .transpose()
         })?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx_ref = tx_ref(&mut guard)?;
             let mut inserted = Vec::with_capacity(prepared_jobs.len());
@@ -244,7 +244,7 @@ impl PyTransaction {
 
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx = guard
                 .take()
@@ -255,7 +255,7 @@ impl PyTransaction {
     }
 
     fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+        crate::async_bridge::future_into_py(py, async move { Ok(slf) })
     }
 
     #[pyo3(signature = (exc_type, _exc_val, _exc_tb))]
@@ -268,7 +268,7 @@ impl PyTransaction {
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         let has_exception = exc_type.is_some();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             if let Some(tx) = guard.take() {
                 if has_exception {
@@ -283,7 +283,7 @@ impl PyTransaction {
 
     fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let mut guard = tx.lock().await;
             let tx = guard
                 .take()

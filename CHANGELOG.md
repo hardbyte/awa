@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- Fence and join Rust-to-Python completion callbacks before interpreter
+  finalization, preventing the reproduced exit-time CPython 3.12 SIGSEGV after
+  `await client.close()`. Worker shutdown and pool close remain explicit.
+
 - Preserve canonical callback resolution during mixed storage transitions (#462),
   including lease fencing and transaction rollback.
 - Add `storage enter-mixed-transition --quiesced` for a stopped fleet, refusing
