@@ -1073,3 +1073,35 @@ async fn test_c19_cel_disabled_resolve_error() {
     let job = client.get_job(job_id).await.unwrap();
     assert_eq!(job.state, JobState::WaitingExternal);
 }
+
+#[sqlx::test(migrations = false)]
+async fn mixed_retry_notifies_only_after_commit(pool: sqlx::PgPool) {
+    let (id, callback) = mixed_callback(&pool).await;
+    let queue: String = sqlx::query_scalar("SELECT queue FROM awa.jobs_hot WHERE id=$1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .unwrap();
+    listener.listen(&format!("awa:{queue}")).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    admin::retry_external_in_tx(&mut tx, callback, Some(7))
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.recv())
+            .await
+            .is_err()
+    );
+    admin::retry_external(&pool, callback, Some(7))
+        .await
+        .unwrap();
+    let notification = tokio::time::timeout(Duration::from_secs(3), listener.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(notification.channel(), format!("awa:{queue}"));
+}

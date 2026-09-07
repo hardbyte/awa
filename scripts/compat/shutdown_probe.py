@@ -33,4 +33,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--delay-wakeup", action="store_true")
     asyncio.run(main(parser.parse_args().delay_wakeup))
-    print("CLOSE PASS", flush=True)
+    # Only the parent observing exit status zero can report process success.
+    print("CLOSE COMPLETE", flush=True)

@@ -3600,9 +3600,16 @@ pub async fn retry_external_in_tx(
     .fetch_optional(tx.as_mut())
     .await?;
 
-    row.ok_or(AwaError::CallbackNotFound {
+    let row = row.ok_or(AwaError::CallbackNotFound {
         callback_id: callback_id.to_string(),
-    })
+    })?;
+    // jobs_hot only notifies on INSERT. This direct UPDATE must wake the
+    // canonical dispatcher itself; PostgreSQL delivers it only on commit.
+    sqlx::query("SELECT pg_notify('awa:' || $1, '')")
+        .bind(&row.queue)
+        .execute(tx.as_mut())
+        .await?;
+    Ok(row)
 }
 
 /// Reset the callback timeout for a long-running external operation.

@@ -144,3 +144,39 @@ async fn quiesced_transition_preserves_backlog_and_finalize_gate(pool: PgPool) {
     );
     assert!(storage::finalize(&pool).await.is_err());
 }
+
+#[sqlx::test(migrations = false)]
+async fn quiesced_transition_rejects_partial_substrate(pool: PgPool) {
+    prepared(&pool).await;
+    sqlx::raw_sql("CREATE SCHEMA partial_substrate; CREATE TABLE partial_substrate.queue_ring_state(id int); CREATE TABLE partial_substrate.ready_entries(id int); CREATE TABLE partial_substrate.leases(id int)")
+        .execute(&pool).await.unwrap();
+    storage::prepare(
+        &pool,
+        "queue_storage",
+        json!({"schema":"partial_substrate"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, "partial_substrate")
+            .await
+            .unwrap()
+    );
+    let before = storage::status(&pool).await.unwrap();
+    assert!(storage::enter_mixed_transition_quiesced(&pool)
+        .await
+        .is_err());
+    assert_eq!(storage::status(&pool).await.unwrap(), before);
+}
+
+#[sqlx::test(migrations = false)]
+async fn quiesced_transition_preserves_snapshot_milliseconds(pool: PgPool) {
+    prepared(&pool).await;
+    // 91 seconds is stale with integer truncation (90s), but fresh at 92.997s.
+    sqlx::query("INSERT INTO awa.runtime_instances(instance_id,pid,version,started_at,last_seen_at,snapshot_interval_ms,healthy,postgres_connected,poll_loop_alive,heartbeat_alive,maintenance_alive,shutting_down,leader,storage_capability,transition_role) VALUES ($1,1,'0.6.6',now(),clock_timestamp()-interval '91 seconds',30999,true,true,true,true,true,false,false,'queue_storage','auto')")
+        .bind(uuid::Uuid::new_v4()).execute(&pool).await.unwrap();
+    assert!(storage::enter_mixed_transition_quiesced(&pool)
+        .await
+        .is_err());
+    assert_eq!(storage::status(&pool).await.unwrap().state, "prepared");
+}
