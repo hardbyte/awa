@@ -57,17 +57,22 @@ completion callback, so changing interpreters alone is not Awa's library fix.
 ## Library fix and durable check
 
 `awa-python/src/async_bridge.rs` adapts the upstream generic runtime, counting
-Python-facing completion callbacks **before** they enter Tokio's blocking
-queue. An atexit hook fences new completions and waits with the GIL released
-until every accepted callback returns. Async tasks finishing after the fence
-drop their owned handles without attaching to the finalizing interpreter.
+native async tasks and Python-facing completion callbacks **before** they enter
+Tokio. An atexit hook fences new work, cancels outstanding async tasks, and waits
+with the GIL released until every accepted task and callback is dropped. Task
+futures release their owned Python handles before reporting completion. This
+also covers argument conversion and result construction inside async bodies,
+which can acquire the GIL before the completion callback exists.
 All Awa Rust-to-Python futures use this adapter. Workers and pools still require
 their ordinary explicit shutdown/close lifecycle.
 
 `tests/test_interpreter_shutdown.py` holds the completion callback after it has
 woken asyncio, then checks atexit ordering. The released wheel prints
 `EARLY_EXIT`; the patched wheel passes on the same CPython 3.12.3 environment.
-A second subprocess checks the shutdown fence and idempotence. This exercises
+A second subprocess checks the shutdown fence and idempotence. A third holds
+argument conversion inside an abandoned native insert until atexit; it prints
+`EARLY_EXIT` with completion-only tracking, proving async bodies need joining
+too. These checks exercise
 the boundary directly without relying on a rare process crash. CI builds and
 installs an actual wheel on 3.12.3 for this regression, alongside the normal
 full Python 3.13/3.14 suites.

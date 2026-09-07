@@ -31,7 +31,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
-- Join native Python completion callbacks before interpreter finalization.
+- Cancel and join native Python async operations and join their completion
+  callbacks before interpreter finalization.
   Previously `await client.close()` could finish while its Rust completion
   thread still held Python objects, causing intermittent exit-time SIGSEGV on
   CPython 3.12. The bridge now fences and drains these callbacks at atexit;
