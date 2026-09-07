@@ -210,10 +210,22 @@ together — never by swapping which workers you run.
 ```bash
 awa storage status
 awa storage prepare --engine queue_storage
-awa storage enter-mixed-transition        # needs a live queue_storage runtime
+awa storage enter-mixed-transition        # needs a live queue_storage_target runtime
 awa storage finalize --check              # dry run: exit 0 ready, exit 2 blocked
 awa storage finalize --wait               # poll until gates stay clear
 ```
+
+On builds carrying #457, `storage enter-mixed-transition --quiesced` permits a
+stopped fleet to flip without a target runtime. Stop all workers and keep them
+stopped until it returns; any fresh heartbeat refuses the command. A stale
+heartbeat is not a fence against a paused worker returning. Canonical backlog
+is preserved and still blocks finalize: drain it before stopping for a role-free
+cutover, or retain explicit canonical drain workers afterward. Follow the
+[quiesced upgrade procedure](../../docs/upgrade-0.5-to-0.6.md#quiesced-alternative-to-the-witness-runtime).
+On builds carrying #462, callback resolution falls back to canonical jobs only
+during mixed transition, preserving lease fencing and transaction atomicity.
+Both fixes need a 0.6 backport for unfinalized clusters; installing 0.7 first is
+not a supported workaround.
 
 Dangerous operations:
 

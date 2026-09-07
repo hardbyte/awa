@@ -15,6 +15,194 @@ fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
 }
 
+async fn mixed_callback(pool: &sqlx::PgPool) -> (i64, uuid::Uuid) {
+    migrations::run(pool).await.unwrap();
+    let job = awa::insert_with(
+        pool,
+        &WebhookPayment { order_id: 462 },
+        awa::InsertOpts::default(),
+    )
+    .await
+    .unwrap();
+    let callback = uuid::Uuid::new_v4();
+    sqlx::query("UPDATE awa.jobs SET state='waiting_external', attempt=1, run_lease=7, callback_id=$2, callback_timeout_at=now()+interval '1 hour' WHERE id=$1")
+        .bind(job.id).bind(callback).execute(pool).await.unwrap();
+    awa::model::storage::prepare(pool, "queue_storage", serde_json::json!({"schema":"awa"}))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO awa.runtime_instances(instance_id,pid,version,started_at,last_seen_at,snapshot_interval_ms,healthy,postgres_connected,poll_loop_alive,heartbeat_alive,maintenance_alive,shutting_down,leader,storage_capability,transition_role) VALUES ($1,1,'0.7.0-alpha.1',now(),now(),1000,true,true,true,true,true,false,false,'queue_storage','queue_storage_target')")
+        .bind(uuid::Uuid::new_v4()).execute(pool).await.unwrap();
+    awa::model::storage::enter_mixed_transition(pool)
+        .await
+        .unwrap();
+    (job.id, callback)
+}
+
+macro_rules! mixed_callback_case {
+    ($name:ident, $action:literal, $state:literal) => {
+        #[sqlx::test]
+        async fn $name(pool: sqlx::PgPool) {
+            let (id, callback) = mixed_callback(&pool).await;
+            match $action {
+                "complete" => { admin::complete_external(&pool, callback, None, Some(7)).await.unwrap(); }
+                "resume" => { admin::resume_external(&pool, callback, Some(serde_json::json!({"answer":42})), Some(7)).await.unwrap(); }
+                "fail" => { admin::fail_external(&pool, callback, "declined", Some(7)).await.unwrap(); }
+                "retry" => { admin::retry_external(&pool, callback, Some(7)).await.unwrap(); }
+                "heartbeat" => { admin::heartbeat_callback(&pool, callback, Duration::from_secs(7200)).await.unwrap(); }
+                "resolve" => { admin::resolve_callback(&pool, callback, Some(serde_json::json!({"answer":42})), DefaultAction::Complete, Some(7)).await.unwrap(); }
+                _ => unreachable!(),
+            }
+            let (state, metadata): (String, serde_json::Value) = sqlx::query_as("SELECT state::text,metadata FROM awa.jobs_hot WHERE id=$1")
+                .bind(id).fetch_one(&pool).await.unwrap();
+            assert_eq!(state, $state);
+            if $action == "resume" { assert_eq!(metadata["_awa_callback_result"]["answer"], 42); }
+        }
+    };
+}
+mixed_callback_case!(
+    mixed_complete_preserves_canonical_callback,
+    "complete",
+    "completed"
+);
+mixed_callback_case!(
+    mixed_resume_preserves_canonical_callback,
+    "resume",
+    "running"
+);
+mixed_callback_case!(mixed_fail_preserves_canonical_callback, "fail", "failed");
+mixed_callback_case!(
+    mixed_retry_preserves_canonical_callback,
+    "retry",
+    "available"
+);
+mixed_callback_case!(
+    mixed_heartbeat_preserves_canonical_callback,
+    "heartbeat",
+    "waiting_external"
+);
+mixed_callback_case!(
+    mixed_resolve_preserves_canonical_callback,
+    "resolve",
+    "completed"
+);
+
+#[sqlx::test]
+async fn mixed_callback_preserves_lease_fence_and_rollback(pool: sqlx::PgPool) {
+    let (id, callback) = mixed_callback(&pool).await;
+    for action in ["complete", "resume", "fail", "retry"] {
+        let result = match action {
+            "complete" => admin::complete_external(&pool, callback, None, Some(6)).await,
+            "resume" => admin::resume_external(&pool, callback, None, Some(6)).await,
+            "fail" => admin::fail_external(&pool, callback, "declined", Some(6)).await,
+            "retry" => admin::retry_external(&pool, callback, Some(6)).await,
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(AwaError::CallbackNotFound { .. })),
+            "{result:?}"
+        );
+    }
+    assert!(matches!(
+        admin::resolve_callback(&pool, callback, None, DefaultAction::Complete, Some(6)).await,
+        Err(AwaError::CallbackNotFound { .. })
+    ));
+    let mut tx = pool.begin().await.unwrap();
+    admin::complete_external_in_tx(&mut tx, callback, None, Some(7))
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state::text FROM awa.jobs_hot WHERE id=$1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "waiting_external");
+    admin::complete_external(&pool, callback, None, Some(7))
+        .await
+        .unwrap();
+    assert!(matches!(
+        admin::complete_external(&pool, callback, None, Some(7)).await,
+        Err(AwaError::CallbackNotFound { .. })
+    ));
+}
+
+#[sqlx::test]
+async fn finalized_callback_does_not_fall_back_to_canonical(pool: sqlx::PgPool) {
+    let (_, callback) = mixed_callback(&pool).await;
+    // Simulate a stale canonical row surviving outside the supported transition
+    // window. Active routing must never make this row authoritative again.
+    sqlx::query("UPDATE awa.storage_transition_state SET state='active',current_engine='queue_storage',prepared_engine=NULL WHERE singleton")
+        .execute(&pool).await.unwrap();
+    assert!(matches!(
+        admin::complete_external(&pool, callback, None, Some(7)).await,
+        Err(AwaError::CallbackNotFound { .. })
+    ));
+}
+
+#[sqlx::test]
+async fn mixed_resume_delivers_payload_to_waiting_handler(pool: sqlx::PgPool) {
+    let (id, callback) = mixed_callback(&pool).await;
+    admin::resume_external(
+        &pool,
+        callback,
+        Some(serde_json::json!({"answer": 42})),
+        Some(7),
+    )
+    .await
+    .unwrap();
+    match admin::check_callback_state(&pool, id, callback)
+        .await
+        .unwrap()
+    {
+        admin::CallbackPollResult::Resolved(payload) => assert_eq!(payload["answer"], 42),
+        other => panic!("canonical handler lost its callback payload: {other:?}"),
+    }
+    let metadata: serde_json::Value =
+        sqlx::query_scalar("SELECT metadata FROM awa.jobs_hot WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(metadata.get("_awa_callback_result").is_none());
+}
+
+#[sqlx::test]
+async fn mixed_running_handler_can_register_wait_and_cancel(pool: sqlx::PgPool) {
+    let (id, _) = mixed_callback(&pool).await;
+    sqlx::query("UPDATE awa.jobs_hot SET state='running',callback_id=NULL WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let callback = admin::register_callback(&pool, id, 7, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(!admin::cancel_callback(&pool, id, 6).await.unwrap());
+    assert!(admin::enter_callback_wait(&pool, id, 7, callback)
+        .await
+        .unwrap());
+    assert!(matches!(
+        admin::check_callback_state(&pool, id, callback)
+            .await
+            .unwrap(),
+        admin::CallbackPollResult::Pending
+    ));
+    admin::resume_external(&pool, callback, None, Some(7))
+        .await
+        .unwrap();
+    let next = admin::register_callback_with_config(
+        &pool,
+        id,
+        7,
+        Duration::from_secs(60),
+        &CallbackConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(next, callback);
+    assert!(admin::cancel_callback(&pool, id, 7).await.unwrap());
+}
+
 async fn setup() -> TestClient {
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -884,4 +1072,36 @@ async fn test_c19_cel_disabled_resolve_error() {
     // Job should still be waiting_external (not mutated)
     let job = client.get_job(job_id).await.unwrap();
     assert_eq!(job.state, JobState::WaitingExternal);
+}
+
+#[sqlx::test(migrations = false)]
+async fn mixed_retry_notifies_only_after_commit(pool: sqlx::PgPool) {
+    let (id, callback) = mixed_callback(&pool).await;
+    let queue: String = sqlx::query_scalar("SELECT queue FROM awa.jobs_hot WHERE id=$1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+        .await
+        .unwrap();
+    listener.listen(&format!("awa:{queue}")).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    admin::retry_external_in_tx(&mut tx, callback, Some(7))
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.recv())
+            .await
+            .is_err()
+    );
+    admin::retry_external(&pool, callback, Some(7))
+        .await
+        .unwrap();
+    let notification = tokio::time::timeout(Duration::from_secs(3), listener.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(notification.channel(), format!("awa:{queue}"));
 }

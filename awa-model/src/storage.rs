@@ -95,6 +95,76 @@ where
         .map_err(AwaError::from)
 }
 
+/// Enter mixed transition after the operator has stopped the entire fleet.
+/// Unlike the live transition, this does not require a queue-storage target.
+/// Fresh runtime snapshots refuse the operation, including unhealthy or
+/// shutting-down runtimes. Stale snapshots are evidence of absence, not a
+/// process fence: the operator must keep workers stopped until this returns.
+/// Canonical backlog is preserved and still blocks finalization.
+///
+/// Implemented without DDL so this works on an unfinalized 0.6 schema (#457).
+pub async fn enter_mixed_transition_quiesced(pool: &PgPool) -> Result<StorageStatus, AwaError> {
+    let mut tx = pool.begin().await?;
+    // Serialize snapshot writes with the liveness check and routing flip. Do
+    // not take the snapshot protocol advisory lock after this table lock: a
+    // writer may already hold it while waiting to insert its snapshot.
+    sqlx::query("LOCK TABLE awa.runtime_instances IN SHARE MODE")
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query("SELECT singleton FROM awa.storage_transition_state WHERE singleton FOR UPDATE")
+        .fetch_one(tx.as_mut())
+        .await?;
+    let before = status(tx.as_mut()).await?;
+    if before.state != "prepared" || before.prepared_engine.as_deref() != Some("queue_storage") {
+        return Err(AwaError::Validation(
+            "quiesced transition requires prepared queue storage".into(),
+        ));
+    }
+    let schema = before
+        .details
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("awa");
+    let ready = queue_storage_schema_ready(tx.as_mut(), schema).await?;
+    if !ready {
+        return Err(AwaError::Validation(format!(
+            "queue storage schema {schema:?} is not prepared"
+        )));
+    }
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.runtime_instances
+         WHERE last_seen_at + GREATEST(
+             snapshot_interval_ms * INTERVAL '3 milliseconds', INTERVAL '30 seconds'
+         ) >= clock_timestamp()",
+    )
+    .fetch_one(tx.as_mut())
+    .await?;
+    if live != 0 {
+        return Err(AwaError::Validation(format!(
+            "cannot enter quiesced transition while {live} fresh runtime snapshot(s) exist; stop all workers and wait for their heartbeats to expire",
+        )));
+    }
+    sqlx::query(
+        "INSERT INTO awa.runtime_storage_backends(backend,schema_name,updated_at)
+         VALUES ('queue_storage',$1,now()) ON CONFLICT(backend)
+         DO UPDATE SET schema_name=EXCLUDED.schema_name,updated_at=EXCLUDED.updated_at",
+    )
+    .bind(schema)
+    .execute(tx.as_mut())
+    .await?;
+    sqlx::query(
+        "UPDATE awa.storage_transition_state SET state='mixed_transition',
+         transition_epoch=transition_epoch+1,entered_at=now(),updated_at=now(),finalized_at=NULL
+         WHERE singleton",
+    )
+    .execute(tx.as_mut())
+    .await?;
+    let after = status(tx.as_mut()).await?;
+    tx.commit().await?;
+    Ok(after)
+}
+
 pub async fn finalize<'e, E>(executor: E) -> Result<StorageStatus, AwaError>
 where
     E: PgExecutor<'e>,
@@ -219,7 +289,10 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
 /// for custom schemas. If you change a required substrate object or the
 /// `claim_ready_runtime` signature there, update this check at the same
 /// time.
-pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<bool, AwaError> {
+pub async fn queue_storage_schema_ready<'e, E>(executor: E, schema: &str) -> Result<bool, AwaError>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_scalar::<_, bool>(
         r#"
         SELECT
@@ -279,7 +352,7 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
         "#,
     )
     .bind(schema)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map_err(AwaError::from)
 }

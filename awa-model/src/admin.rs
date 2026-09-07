@@ -270,6 +270,60 @@ async fn active_queue_storage_in_tx(
         .transpose()
 }
 
+/// Callback ownership can remain canonical while new jobs route to queue storage.
+/// Lock transition state through the caller's transaction so finalize cannot
+/// change the fallback boundary halfway through a callback operation (#462).
+async fn callback_queue_storage_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+) -> Result<Option<QueueStorage>, AwaError> {
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM awa.storage_transition_state WHERE singleton FOR SHARE",
+    )
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(store) = active_queue_storage_in_tx(tx).await? else {
+        return Ok(None);
+    };
+    if state.as_deref() == Some("mixed_transition")
+        && store
+            .callback_job_in_tx(tx, callback_id, None, false)
+            .await?
+            .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(store))
+}
+
+/// A drain handler keeps its canonical job ID across the routing flip. Job
+/// IDs are global; migrated successors get fresh IDs, so an existing canonical
+/// row identifies this handler's store without searching the queue view.
+async fn callback_job_queue_storage_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: i64,
+) -> Result<Option<QueueStorage>, AwaError> {
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM awa.storage_transition_state WHERE singleton FOR SHARE",
+    )
+    .fetch_optional(tx.as_mut())
+    .await?;
+    let Some(store) = active_queue_storage_in_tx(tx).await? else {
+        return Ok(None);
+    };
+    if state.as_deref() == Some("mixed_transition") {
+        let canonical: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM awa.jobs_hot WHERE id=$1)")
+                .bind(job_id)
+                .fetch_one(tx.as_mut())
+                .await?;
+        if canonical {
+            return Ok(None);
+        }
+    }
+    Ok(Some(store))
+}
+
 fn queue_storage_current_jobs_cte(schema: &str) -> String {
     format!(
         r#"
@@ -3251,7 +3305,9 @@ pub async fn register_callback(
     run_lease: i64,
     timeout: std::time::Duration,
 ) -> Result<Uuid, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
+        tx.commit().await?;
         return store
             .register_callback(pool, job_id, run_lease, timeout)
             .await;
@@ -3260,7 +3316,7 @@ pub async fn register_callback(
     let callback_id = Uuid::new_v4();
     let timeout_secs = timeout.as_secs_f64();
     let result = sqlx::query(
-        r#"UPDATE awa.jobs
+        r#"UPDATE awa.jobs_hot
            SET callback_id = $2,
                callback_timeout_at = now() + make_interval(secs => $3),
                callback_filter = NULL,
@@ -3273,11 +3329,12 @@ pub async fn register_callback(
     .bind(callback_id)
     .bind(timeout_secs)
     .bind(run_lease)
-    .execute(pool)
+    .execute(tx.as_mut())
     .await?;
     if result.rows_affected() == 0 {
         return Err(AwaError::Validation("job is not in running state".into()));
     }
+    tx.commit().await?;
     Ok(callback_id)
 }
 
@@ -3357,7 +3414,7 @@ async fn complete_external_in_tx_inner(
     run_lease: Option<i64>,
     resume: bool,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         return store
             .complete_external_in_tx(tx, callback_id, payload, run_lease, resume)
             .await;
@@ -3369,7 +3426,7 @@ async fn complete_external_in_tx_inner(
         let payload_json = payload.unwrap_or(serde_json::Value::Null);
         sqlx::query_as::<_, JobRow>(
             r#"
-            UPDATE awa.jobs
+            UPDATE awa.jobs_hot
             SET state = 'running',
                 callback_id = NULL,
                 callback_timeout_at = NULL,
@@ -3393,7 +3450,7 @@ async fn complete_external_in_tx_inner(
         // Complete: terminal state, clear everything.
         sqlx::query_as::<_, JobRow>(
             r#"
-            UPDATE awa.jobs
+            UPDATE awa.jobs_hot
             SET state = 'completed',
                 finalized_at = now(),
                 callback_id = NULL,
@@ -3443,7 +3500,7 @@ pub async fn fail_external_in_tx(
     error: &str,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         return store
             .fail_external_with_error_entry_in_tx(
                 tx,
@@ -3456,7 +3513,7 @@ pub async fn fail_external_in_tx(
 
     let row = sqlx::query_as::<_, JobRow>(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET state = 'failed',
             finalized_at = now(),
             callback_id = NULL,
@@ -3514,13 +3571,13 @@ pub async fn retry_external_in_tx(
     callback_id: Uuid,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         return store.retry_external_in_tx(tx, callback_id, run_lease).await;
     }
 
     let row = sqlx::query_as::<_, JobRow>(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET state = 'available',
             attempt = 0,
             run_at = now(),
@@ -3543,9 +3600,16 @@ pub async fn retry_external_in_tx(
     .fetch_optional(tx.as_mut())
     .await?;
 
-    row.ok_or(AwaError::CallbackNotFound {
+    let row = row.ok_or(AwaError::CallbackNotFound {
         callback_id: callback_id.to_string(),
-    })
+    })?;
+    // jobs_hot only notifies on INSERT. This direct UPDATE must wake the
+    // canonical dispatcher itself; PostgreSQL delivers it only on commit.
+    sqlx::query("SELECT pg_notify('awa:' || $1, '')")
+        .bind(&row.queue)
+        .execute(tx.as_mut())
+        .await?;
+    Ok(row)
 }
 
 /// Reset the callback timeout for a long-running external operation.
@@ -3561,14 +3625,16 @@ pub async fn heartbeat_callback(
     callback_id: Uuid,
     timeout: std::time::Duration,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    if let Some(store) = callback_queue_storage_in_tx(&mut tx, callback_id).await? {
+        tx.commit().await?;
         return store.heartbeat_callback(pool, callback_id, timeout).await;
     }
 
     let timeout_secs = timeout.as_secs_f64();
     let row = sqlx::query_as::<_, JobRow>(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET callback_timeout_at = now() + make_interval(secs => $2)
         WHERE callback_id = $1 AND state = 'waiting_external'
         RETURNING *
@@ -3576,9 +3642,10 @@ pub async fn heartbeat_callback(
     )
     .bind(callback_id)
     .bind(timeout_secs)
-    .fetch_optional(pool)
+    .fetch_optional(tx.as_mut())
     .await?;
 
+    tx.commit().await?;
     row.ok_or(AwaError::CallbackNotFound {
         callback_id: callback_id.to_string(),
     })
@@ -3590,13 +3657,15 @@ pub async fn heartbeat_callback(
 /// `Ok(false)` if no match (already resolved, rescued, or wrong lease).
 /// Callers should not treat `false` as an error.
 pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Result<bool, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
+        tx.commit().await?;
         return store.cancel_callback(pool, job_id, run_lease).await;
     }
 
     let result = sqlx::query(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET callback_id = NULL,
             callback_timeout_at = NULL,
             callback_filter = NULL,
@@ -3608,9 +3677,10 @@ pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Resu
     )
     .bind(job_id)
     .bind(run_lease)
-    .execute(pool)
+    .execute(tx.as_mut())
     .await?;
 
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -3649,7 +3719,9 @@ pub async fn enter_callback_wait(
     run_lease: i64,
     callback_id: Uuid,
 ) -> Result<bool, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
+        tx.commit().await?;
         return store
             .enter_callback_wait(pool, job_id, run_lease, callback_id)
             .await;
@@ -3657,7 +3729,7 @@ pub async fn enter_callback_wait(
 
     let result = sqlx::query(
         r#"
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET state = 'waiting_external',
             heartbeat_at = NULL,
             deadline_at = NULL
@@ -3667,9 +3739,10 @@ pub async fn enter_callback_wait(
     .bind(job_id)
     .bind(run_lease)
     .bind(callback_id)
-    .execute(pool)
+    .execute(tx.as_mut())
     .await?;
 
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -3683,21 +3756,33 @@ pub async fn check_callback_state(
     job_id: i64,
     callback_id: Uuid,
 ) -> Result<CallbackPollResult, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
+        tx.commit().await?;
         return store.check_callback_state(pool, job_id, callback_id).await;
     }
 
-    let row: Option<(JobState, Option<Uuid>, serde_json::Value)> =
-        sqlx::query_as("SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(JobState, Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT state, callback_id, metadata FROM awa.jobs_hot WHERE id = $1 FOR UPDATE",
+    )
+    .bind(job_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
 
-    match row {
+    let result = match row {
         Some((JobState::Running, None, metadata))
             if metadata.get("_awa_callback_result").is_some() =>
         {
-            let payload = take_callback_payload(pool, job_id, metadata).await?;
+            let payload = metadata
+                .get("_awa_callback_result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            sqlx::query(
+                "UPDATE awa.jobs_hot SET metadata=metadata-'_awa_callback_result' WHERE id=$1",
+            )
+            .bind(job_id)
+            .execute(tx.as_mut())
+            .await?;
             Ok(CallbackPollResult::Resolved(payload))
         }
         Some((state, Some(current_callback_id), _)) if current_callback_id != callback_id => {
@@ -3715,7 +3800,9 @@ pub async fn check_callback_state(
             state,
         }),
         None => Ok(CallbackPollResult::NotFound),
-    }
+    };
+    tx.commit().await?;
+    result
 }
 
 /// Extract the `_awa_callback_result` key from metadata and clean it up.
@@ -3729,10 +3816,12 @@ pub async fn take_callback_payload(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    sqlx::query("UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1")
-        .bind(job_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE awa.jobs_hot SET metadata = metadata - '_awa_callback_result' WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
 
     Ok(payload)
 }
@@ -3859,7 +3948,9 @@ pub async fn register_callback_with_config(
         }
     }
 
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    if let Some(store) = callback_job_queue_storage_in_tx(&mut tx, job_id).await? {
+        tx.commit().await?;
         return store
             .register_callback_with_config(pool, job_id, run_lease, timeout, config)
             .await;
@@ -3869,7 +3960,7 @@ pub async fn register_callback_with_config(
     let timeout_secs = timeout.as_secs_f64();
 
     let result = sqlx::query(
-        r#"UPDATE awa.jobs
+        r#"UPDATE awa.jobs_hot
            SET callback_id = $2,
                callback_timeout_at = now() + make_interval(secs => $3),
                callback_filter = $4,
@@ -3886,12 +3977,13 @@ pub async fn register_callback_with_config(
     .bind(&config.on_fail)
     .bind(&config.transform)
     .bind(run_lease)
-    .execute(pool)
+    .execute(tx.as_mut())
     .await?;
 
     if result.rows_affected() == 0 {
         return Err(AwaError::Validation("job is not in running state".into()));
     }
+    tx.commit().await?;
     Ok(callback_id)
 }
 
@@ -3944,7 +4036,7 @@ pub async fn resolve_callback_in_tx(
     default_action: DefaultAction,
     run_lease: Option<i64>,
 ) -> Result<ResolveOutcome, AwaError> {
-    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
         let job = store
             .callback_job_in_tx(tx, callback_id, run_lease, true)
             .await?
@@ -4011,7 +4103,7 @@ pub async fn resolve_callback_in_tx(
         ResolveAction::Complete(transformed_payload) => {
             let completed_job = sqlx::query_as::<_, JobRow>(
                 r#"
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'completed',
                     finalized_at = now(),
                     callback_id = NULL,
@@ -4048,7 +4140,7 @@ pub async fn resolve_callback_in_tx(
 
             let failed_job = sqlx::query_as::<_, JobRow>(
                 r#"
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'failed',
                     finalized_at = now(),
                     callback_id = NULL,

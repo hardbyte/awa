@@ -1,0 +1,15 @@
+{
+  "python": "3.12.3 (main, Jul 15 2026, 23:46:41) [GCC 13.3.0]",
+  "executable": "/home/runner/work/awa/awa/.compat-venv-062/bin/python",
+  "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "wheel_version": "0.6.2",
+  "native_files": [
+    "/home/runner/work/awa/awa/.compat-venv-062/lib/python3.12/site-packages/awa/_awa.abi3.so"
+  ],
+  "native_sha256": {
+    "/home/runner/work/awa/awa/.compat-venv-062/lib/python3.12/site-packages/awa/_awa.abi3.so": "0cd3a67662b17cac58a485765bf88736dd9f632a7a3244795c0f20a1362697c3"
+  },
+  "pid": 3203,
+  "returncode": -11,
+  "host": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39"
+}

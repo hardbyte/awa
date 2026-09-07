@@ -22,6 +22,10 @@ on:
         description: "Released N-1 awa-pg version to rehearse against"
         required: false
         default: "0.6.3"
+      compat_repetitions:
+        description: "Diagnostic lifecycle repetitions per pinned wheel (fails on first error)"
+        required: false
+        default: "1"
   workflow_call:
     inputs:
       n_minus_one:
@@ -110,7 +114,7 @@ jobs:
   compat-matrix:
     name: Pinned release-artifact compat matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17-alpine
@@ -132,10 +136,23 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Build current awa CLI
         run: cargo build -p awa-cli
+      - name: Enable native crash evidence
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+          mkdir -p compat-crash-artifacts
+          sudo sysctl -w kernel.core_pattern="$PWD/compat-crash-artifacts/core.%p"
       - name: Run compat matrix (pinned release artifacts vs newest schema)
         run: ./scripts/compat-matrix.sh
         env:
+          COMPAT_REPETITIONS: ${{ inputs.compat_repetitions || '1' }}
           PGHOST: localhost
           PGPORT: "5432"
           PGUSER: postgres
           PGPASSWORD: postgres
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: compat-native-evidence-${{ github.run_id }}
+          path: compat-crash-artifacts/
+          retention-days: 30

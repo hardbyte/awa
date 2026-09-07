@@ -93,27 +93,37 @@ FROM (SELECT slot, generation FROM awa.claim_ring_rotations ORDER BY generation 
 WHERE state.singleton;
 SQL
 
-echo "── setup: pinned release artifacts (PyPI wheels)"
-uv venv --quiet --clear .compat-venv-060
+# Released wheels cannot acquire Awa's new native completion join. On older
+# CPython, interpreter finalization can force-unwind their Rust callback thread
+# (python/cpython#87135). Pin a fixed interpreter for binary/schema evidence;
+# current-wheel shutdown is separately regressed on Python 3.12 in CI.
+COMPAT_PYTHON=${COMPAT_PYTHON:-3.13.12}
+echo "── setup: pinned release artifacts (PyPI wheels, Python ${COMPAT_PYTHON})"
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-060
 uv pip install --quiet --python .compat-venv-060 "awa-pg==0.6.0"
-uv venv --quiet --clear .compat-venv-066
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-066
 uv pip install --quiet --python .compat-venv-066 "awa-pg==0.6.6"
-uv venv --quiet --clear .compat-venv-062
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-062
 uv pip install --quiet --python .compat-venv-062 "awa-pg==0.6.2"
-uv venv --quiet --clear .compat-venv-057
+uv venv --quiet --clear --python "$COMPAT_PYTHON" .compat-venv-057
 uv pip install --quiet --python .compat-venv-057 "awa-pg==0.5.7"
 
-echo "── leg: forward-0.6.6 (latest released 0.6.x lifecycle on newest schema)"
-DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.6 COMPAT_QUEUE=compat_forward_066 \
-  .compat-venv-066/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
-
-echo "── leg: forward-0.6.2 (supported N-1 lifecycle on newest schema)"
-DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.2 COMPAT_QUEUE=compat_forward_062 \
-  .compat-venv-062/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
-
-echo "── leg: forward-0.6.0 (full lifecycle on newest schema)"
-DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION=0.6.0 COMPAT_QUEUE=compat_forward_060 \
-  .compat-venv-060/bin/python "${SCRIPT_DIR}/compat/forward_060.py"
+# Repeat only on an explicitly requested diagnostic run. A failed process
+# immediately fails the matrix; repetitions never turn a failure into a pass.
+repetitions=${COMPAT_REPETITIONS:-1}
+if ! [[ "$repetitions" =~ ^[1-9][0-9]*$ ]] || [ "$repetitions" -gt 1000 ]; then
+  echo "COMPAT_REPETITIONS must be an integer from 1 to 1000" >&2
+  exit 2
+fi
+for ((iteration=1; iteration<=repetitions; iteration++)); do
+  for version in 0.6.6 0.6.2 0.6.0; do
+    suffix=${version//./}
+    echo "── leg: forward-${version}, repetition ${iteration}/${repetitions}"
+    DATABASE_URL="${BASE_URL}/${FWD_DB}" COMPAT_VERSION="$version" COMPAT_QUEUE="compat_forward_${suffix}" \
+      python3 "${SCRIPT_DIR}/compat/run_python.py" \
+        ".compat-venv-${suffix}/bin/python" "${SCRIPT_DIR}/compat/forward_060.py"
+  done
+done
 
 echo "── leg: post-flip 0.6.2 is fenced"
 "$AWA_BIN" --database-url "${BASE_URL}/${FWD_DB}" storage flip-ring-authority --force

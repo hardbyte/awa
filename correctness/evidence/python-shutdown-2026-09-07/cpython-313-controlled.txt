@@ -1,0 +1,45 @@
+
+warning: Loadable section ".dynstr" outside of ELF segments
+  in /home/brian/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/bin/python3.13
+Breakpoint 1 at 0x1761d84
+warning: Error disabling address space randomization: Operation not permitted
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7f7418dff6c0 (LWP 19)]
+[New Thread 0x7f7418bfe6c0 (LWP 20)]
+[New Thread 0x7f74189fd6c0 (LWP 21)]
+CLOSE PASS
+
+Thread 1 "python" hit Breakpoint 1, 0x0000000001761d84 in finalize_modules ()
+[Switching to thread 4 (Thread 0x7f74189fd6c0 (LWP 21))]
+#0  0x00007f741b5b2bdf in clock_nanosleep () from /lib/x86_64-linux-gnu/libc.so.6
+Breakpoint 2 at 0x4b92c4
+
+Thread 4 "tokio-rt-worker" hit Breakpoint 2, 0x00000000004b92c4 in PyThread_hang_thread ()
+#0  0x00000000004b92c4 in PyThread_hang_thread ()
+#1  0x00000000019d2093 in take_gil.llvm[cold] ()
+#2  0x000000000167b2ec in PyEval_RestoreThread ()
+#3  0x000000000175b615 in time_sleep ()
+#4  0x0000000001603e82 in cfunction_vectorcall_O.llvm.10452570196726818380 ()
+#5  0x0000000001619d5c in _PyEval_EvalFrameDefault ()
+#6  0x000000000161294e in method_vectorcall.llvm ()
+#7  0x0000000001699d4d in PyObject_Call ()
+#8  0x00007f741a1032d3 in <(pyo3_async_runtimes::generic::CheckedCompletor, &pyo3::instance::Bound<pyo3::types::any::PyAny>, pyo3::instance::Bound<pyo3::types::any::PyAny>, pyo3::instance::Bound<pyo3::types::any::PyAny>) as pyo3::call::PyCallArgs>::call () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#9  0x00007f741a102cb0 in pyo3_async_runtimes::generic::set_result () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#10 0x00007f741a0edfbc in <tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::job::PyJob>::flush_progress::{closure#2}, ()>::{closure#0}::{closure#0}::{closure#0}> as core::future::future::Future>::poll () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#11 0x00007f7419a37314 in <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::client::PyClient>::close::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#12 0x00007f74197fbb6f in <tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<pyo3_async_runtimes::generic::future_into_py_with_locals<pyo3_async_runtimes::tokio::TokioRuntime, <_awa::client::PyClient>::close::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#13 0x00007f741a73584b in <tokio::runtime::blocking::pool::Inner>::run () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#14 0x00007f741a748b23 in std::sys::backtrace::__rust_begin_short_backtrace::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()> () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#15 0x00007f741a749221 in <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0} () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#16 0x00007f741a7d71bf in <std::sys::thread::unix::Thread>::new::thread_start () from /tmp/awa-wheel-313/lib/python3.13/site-packages/awa/_awa.abi3.so
+#17 0x00007f741b562b84 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#18 0x00007f741b5efb64 in clone () from /lib/x86_64-linux-gnu/libc.so.6
+[Switching to thread 1 (Thread 0x7f741b4c3740 (LWP 16))]
+#0  0x0000000001761d84 in finalize_modules ()
+[Thread 0x7f7418bfe6c0 (LWP 20) exited]
+[Thread 0x7f7418dff6c0 (LWP 19) exited]
+[Thread 0x7f741b4c3740 (LWP 16) exited]
+[Thread 0x7f74189fd6c0 (LWP 21) exited]
+[New process 16]
+[Inferior 1 (process 16) exited normally]

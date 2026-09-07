@@ -4,7 +4,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
+  while retaining the join required for safe interpreter finalization.
+
 ### Added
+- Add `storage enter-mixed-transition --quiesced` for a stopped fleet, refusing
+  fresh runtime snapshots with millisecond precision, checking the complete target
+  substrate, and retaining canonical backlog/finalize gates (#457).
 - Opt-in owner-scoped periodic reconciliation (#481): complete Rust/Python
   declarations, durable grace/capability gates, explicit adoption/transfer and
   retirement/restoration, and CLI/API/UI dry-run/status. v045 preserves default
@@ -28,6 +34,19 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - **Upgraded to sea-orm 2.0.2 stable and sqlx 0.9 ([#443](https://github.com/hardbyte/awa/issues/443)).** sea-orm moves from the 2.0.0 release candidates (sqlx 0.8) to the stable line built on sqlx 0.9, which unifies the dependency for `awa-seaorm` consumers. For library users the visible change is sqlx 0.9's injection guard: query functions only accept `&'static str` or an explicit assertion, so dynamically assembled SQL must opt in via [`awa::audited_sql`](https://docs.rs/awa) (new re-export). Awa's own call sites interpolate only validated identifiers — schema names are checked against `[a-z_][a-z0-9_]*` both where they are configured (`QueueStorage::new`) and where they are read back out of the transition state (`QueueStorage::active_schema`, which now re-validates so no unchecked name can reach a `format!`) — and pass all external values as bind parameters; the helper documents that invariant at its definition. The deliberate raw-SQL passthrough APIs (Python `Transaction.execute` / `fetch_*`, where the caller supplies the statement) opt in through a separate `caller_provided_sql` instead, so `audited_sql` stays greppable as the set of sites awa vouches for. sqlx's combined runtime+TLS features were removed in 0.9, so builds now select `runtime-tokio` + `tls-rustls-ring` explicitly (the same ring provider with webpki roots `runtime-tokio-rustls` selected previously). The upgrade also drops 20 transitive crates, among them `rsa` and its `pkcs1`/`pkcs8`/`spki`/`der`/`num-bigint-dig` chain: `sqlx-mysql` 0.8 depended on `rsa` and `sqlx-macros-core` pulled that driver in unconditionally, so a Postgres-only build still carried it — and `rsa` 0.9.x has no released fix for the RUSTSEC-2023-0071 Marvin timing advisory. `sqlx-mysql` 0.9 no longer needs it. No schema, migration, or behavioural changes.
 
 ### Fixed
+
+- Rejected Python bridge operations leave install/start/shutdown lifecycle state
+  unchanged. Canonical callback retries retain commit-time dispatcher notifications.
+
+- Cancel and join native Python async operations and join their completion
+  callbacks before interpreter finalization.
+  Previously `await client.close()` could finish while its Rust completion
+  thread still held Python objects, causing intermittent exit-time SIGSEGV on
+  CPython 3.12. The bridge now fences and drains these callbacks at atexit;
+  applications should still shut down workers and close clients explicitly.
+
+- Preserve canonical callback resolution during mixed storage transitions (#462),
+  including lease fencing and transaction rollback.
 
 - **The ring-authority flip no longer surfaces a raw deadlock when it loses a race to live traffic ([#480](https://github.com/hardbyte/awa/pull/480)).** The flip runs while the current fleet keeps claiming — by design — so `awa.flip_ring_authority`'s `claim_ring_slots` writes can lose a PostgreSQL deadlock cycle (SQLSTATE `40P01`) against a concurrent `claim_ready_runtime` call; the release-gate rehearsal reproduced exactly this under 2-core contention. The server-side function is one atomic transaction, so the detected deadlock rolls it back whole and re-running re-evaluates the refusal gate from scratch. `storage::flip_ring_authority` (the wrapper behind `awa storage flip-ring-authority` and the maintenance auto-flip) now retries only that error, bounded with backoff — the same policy `migrations::run` applies at its own atomic boundary. Refusals and every other error still return immediately, and the rehearsal's stale-heartbeat flip helper applies the same retry around its freshness-window variant. The wrapper's signature narrows from a generic executor to `&PgPool` (every in-repo caller already passed a pool; the retry needs a re-executable connection source). `awa serve --help` and `awa callbacks serve --help` identify `AWA_CALLBACK_HMAC_SECRET` without rendering its current value. Root help already keeps the manually resolved `DATABASE_URL` out of Clap output; regression coverage now protects all three credential-bearing help surfaces.
 

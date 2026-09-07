@@ -1,4 +1,5 @@
 mod args;
+mod async_bridge;
 mod callback_contract;
 mod client;
 mod dlq;
@@ -47,7 +48,7 @@ fn migrate<'py>(py: Python<'py>, database_url: String) -> PyResult<Bound<'py, Py
 
         Ok::<(), PyErr>(())
     });
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    crate::async_bridge::future_into_py(py, async move {
         result?;
         Ok(())
     })
@@ -92,6 +93,7 @@ fn migration_lock_key() -> i64 {
 
 #[pymodule]
 fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    async_bridge::register_shutdown(m)?;
     // Classes
     m.add_class::<client::PyClient>()?;
     m.add_class::<job::PyJob>()?;
