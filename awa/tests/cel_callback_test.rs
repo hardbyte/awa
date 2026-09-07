@@ -139,6 +139,70 @@ async fn finalized_callback_does_not_fall_back_to_canonical(pool: sqlx::PgPool) 
     ));
 }
 
+#[sqlx::test]
+async fn mixed_resume_delivers_payload_to_waiting_handler(pool: sqlx::PgPool) {
+    let (id, callback) = mixed_callback(&pool).await;
+    admin::resume_external(
+        &pool,
+        callback,
+        Some(serde_json::json!({"answer": 42})),
+        Some(7),
+    )
+    .await
+    .unwrap();
+    match admin::check_callback_state(&pool, id, callback)
+        .await
+        .unwrap()
+    {
+        admin::CallbackPollResult::Resolved(payload) => assert_eq!(payload["answer"], 42),
+        other => panic!("canonical handler lost its callback payload: {other:?}"),
+    }
+    let metadata: serde_json::Value =
+        sqlx::query_scalar("SELECT metadata FROM awa.jobs_hot WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(metadata.get("_awa_callback_result").is_none());
+}
+
+#[sqlx::test]
+async fn mixed_running_handler_can_register_wait_and_cancel(pool: sqlx::PgPool) {
+    let (id, _) = mixed_callback(&pool).await;
+    sqlx::query("UPDATE awa.jobs_hot SET state='running',callback_id=NULL WHERE id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let callback = admin::register_callback(&pool, id, 7, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(!admin::cancel_callback(&pool, id, 6).await.unwrap());
+    assert!(admin::enter_callback_wait(&pool, id, 7, callback)
+        .await
+        .unwrap());
+    assert!(matches!(
+        admin::check_callback_state(&pool, id, callback)
+            .await
+            .unwrap(),
+        admin::CallbackPollResult::Pending
+    ));
+    admin::resume_external(&pool, callback, None, Some(7))
+        .await
+        .unwrap();
+    let next = admin::register_callback_with_config(
+        &pool,
+        id,
+        7,
+        Duration::from_secs(60),
+        &CallbackConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(next, callback);
+    assert!(admin::cancel_callback(&pool, id, 7).await.unwrap());
+}
+
 async fn setup() -> TestClient {
     let pool = PgPoolOptions::new()
         .max_connections(5)

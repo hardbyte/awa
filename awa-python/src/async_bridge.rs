@@ -1,32 +1,39 @@
-//! Join Python-facing completion callbacks before interpreter finalization.
+//! Join Python-facing native work before interpreter finalization.
 //!
 //! `future_into_py` schedules the asyncio result before its blocking callback
 //! releases all Python objects. An awaited result is therefore not a native
 //! join. CPython 3.12 can terminate that thread during GIL reacquisition and
 //! unwind Rust destructors without a thread state (the captured wheel SIGSEGV).
 //!
-//! Count callbacks before enqueueing them, fence new callbacks at atexit, and
-//! wait with the GIL released until every accepted callback has returned. This
-//! owns only the Rust -> Python completion boundary, not the Tokio runtime or
-//! worker shutdown. Applications must still shut down workers and close pools.
+//! Track async bodies as well as completion callbacks: argument conversion and
+//! result construction can acquire the GIL before completion. At atexit, fence
+//! new work, cancel async tasks, and join all accepted work with the GIL released.
+//! This does not own worker shutdown or the shared Tokio runtime. Applications
+//! must still shut down workers and close pools.
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::generic::{self, ContextExt, Runtime};
 use pyo3_async_runtimes::TaskLocals;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Condvar, Mutex};
+use std::task::{Context, Poll};
 
 #[derive(Default)]
 struct State {
     closing: bool,
     callbacks: usize,
+    next_task: u64,
+    tasks: BTreeMap<u64, tokio::task::AbortHandle>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     closing: false,
     callbacks: 0,
+    next_task: 0,
+    tasks: BTreeMap::new(),
 });
 static IDLE: Condvar = Condvar::new();
 
@@ -55,6 +62,31 @@ impl Drop for Completion {
 
 struct BridgeRuntime;
 
+struct TaskCompletion(u64);
+
+impl Drop for TaskCompletion {
+    fn drop(&mut self) {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.tasks.remove(&self.0);
+        IDLE.notify_all();
+    }
+}
+
+// Fields drop in declaration order, including cancellation and panic paths.
+// Release the future's Python handles before reporting that the task is joined.
+struct TrackedFuture<F> {
+    future: Pin<Box<F>>,
+    _completion: TaskCompletion,
+}
+
+impl<F: Future> Future for TrackedFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
+    }
+}
+
 tokio::task_local! {
     static LOCALS: TaskLocals;
 }
@@ -67,7 +99,22 @@ impl Runtime for BridgeRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        pyo3_async_runtimes::tokio::get_runtime().spawn(future)
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closing {
+            drop(state);
+            drop(future);
+            return pyo3_async_runtimes::tokio::get_runtime().spawn(async {});
+        }
+        let id = state.next_task;
+        state.next_task += 1;
+        // Hold the lock through registration so a fast task cannot remove its
+        // entry before it is inserted, or escape the shutdown snapshot.
+        let task = pyo3_async_runtimes::tokio::get_runtime().spawn(TrackedFuture {
+            future: Box::pin(future),
+            _completion: TaskCompletion(id),
+        });
+        state.tasks.insert(id, task.abort_handle());
+        task
     }
 
     fn spawn_blocking<F>(callback: F) -> Self::JoinHandle
@@ -125,7 +172,13 @@ pub(crate) fn _shutdown_async_bridge(py: Python<'_>) {
     py.detach(|| {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.closing = true;
-        while state.callbacks != 0 {
+        let tasks: Vec<_> = state.tasks.values().cloned().collect();
+        drop(state);
+        for task in tasks {
+            task.abort();
+        }
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        while state.callbacks != 0 || !state.tasks.is_empty() {
             state = IDLE.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     });
