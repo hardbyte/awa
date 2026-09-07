@@ -83,3 +83,20 @@ unchanged; every process must exit successfully. `COMPAT_PYTHON` can explicitly
 select 3.12.3 for diagnosis, and `COMPAT_REPETITIONS` controls stress repetitions.
 Do not remove the native completion regression or claim older published wheels
 contain this fix.
+
+## Stalled shutdown boundary
+
+Cancellation releases async socket/database waits; a regression holds a query
+behind a PostgreSQL advisory lock and retains the blocking transaction through
+atexit, proving the native waiter is cancelled rather than joined indefinitely.
+The migration helper uses an untracked Tokio blocking task containing Rust/SQLx
+work. Cancelling its tracked waiter detaches that task; it does not join it at
+interpreter exit or permit it to attach to Python later.
+
+Synchronous Python code inside a task or completion callback cannot be safely
+aborted. After five seconds the bridge writes a native stderr diagnostic with
+the outstanding task/callback counts and continues waiting. Returning from the
+hook on timeout would reintroduce access to a finalizing interpreter; forcibly
+exiting the process is not a library cleanup policy. A controlled regression
+holds a completion callback until the parent observes the warning, verifies the
+child remains alive, then releases it and verifies safe finalization.

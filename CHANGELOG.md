@@ -4,6 +4,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
+  while retaining the join required for safe interpreter finalization.
+
 ### Added
 - Add `storage enter-mixed-transition --quiesced` for a stopped fleet, refusing
   fresh runtime snapshots with millisecond precision, checking the complete target
