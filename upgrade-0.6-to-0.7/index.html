@@ -2392,6 +2392,11 @@ needs a canonical implementation, and gives operators one unambiguous instructio
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
 </span></code></pre></div>
+<p>For a stopped fleet, a CLI containing #457 can replace the middle command
+with <code>awa storage enter-mixed-transition --quiesced</code>; follow the
+<a href="../upgrade-0.5-to-0.6/#quiesced-alternative-to-the-witness-runtime">quiesced procedure</a>.
+If canonical callbacks are outstanding, deploy the 0.6 backport of #462 before
+flipping routing. Neither fix requires a new schema migration.</p>
 <p>Then upgrade binaries to 0.7 and run <code>awa migrate</code>.</p>
 <p>If <code>finalize --wait</code> sits at a non-zero backlog that never falls while jobs are visibly executing, your workload probably contains <strong>perpetually snoozing jobs</strong> — handlers that end every run in <code>JobResult::Snooze</code>. On builds before <a href="https://github.com/hardbyte/awa/issues/456">#456</a> those re-entered canonical <code>scheduled_jobs</code> after each post-flip run, replenishing the backlog forever. Roll to a build carrying that fix (or apply the <a href="../upgrade-0.5-to-0.6/#known-issues">manual backlog migration</a>) before waiting on finalize.</p>
 <p>Remember the transition is a one-way door once queue-storage work is accepted; the 0.5→0.6

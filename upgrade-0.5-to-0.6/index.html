@@ -1454,6 +1454,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#quiesced-alternative-to-the-witness-runtime" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quiesced alternative to the witness runtime
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#health-checks-per-step" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2215,6 +2226,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#quiesced-alternative-to-the-witness-runtime" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quiesced alternative to the witness runtime
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#health-checks-per-step" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2422,6 +2444,37 @@
 </span><span id="__span-1-84"><a id="__codelineno-1-84" name="__codelineno-1-84" href="#__codelineno-1-84"></a><span class="c1">#     redeploy it without --transition-role; behavior is identical</span>
 </span><span id="__span-1-85"><a id="__codelineno-1-85" name="__codelineno-1-85" href="#__codelineno-1-85"></a><span class="c1">#     post-flip.</span>
 </span></code></pre></div>
+<h2 id="quiesced-alternative-to-the-witness-runtime">Quiesced alternative to the witness runtime<a class="headerlink" href="#quiesced-alternative-to-the-witness-runtime" title="Permanent link">&para;</a></h2>
+<p>A CLI carrying <a href="https://github.com/hardbyte/awa/issues/457">#457</a> accepts
+<code>awa storage enter-mixed-transition --quiesced</code> after <code>storage prepare</code>.
+This path runs without a schema migration and replaces Phase 2 steps 6–7.
+It is intended for a stopped fleet, not a live rollout:</p>
+<ol>
+<li>Stop producers and drain canonical work before stopping workers if you want
+   a fully role-free cutover. Inspect <code>canonical_live_backlog</code>, including scheduled
+   work and jobs waiting for external callbacks.</li>
+<li>Stop every worker and keep them stopped. Wait for runtime heartbeats to expire
+   (at least 30 seconds, or three snapshot intervals when longer). The command
+   refuses <strong>any</strong> fresh runtime, including unhealthy or shutting-down ones.</li>
+<li>Run <code>awa storage enter-mixed-transition --quiesced</code>. The liveness check and
+   routing change serialize against runtime snapshot writes. Stale heartbeats
+   do not fence a paused process; preventing old workers from returning during
+   this window remains an operator responsibility.</li>
+<li>Run <code>awa storage finalize --check</code>, then <code>awa storage finalize</code> when ready.
+   Restart workers on 0.6 and resume producers; new auto-role workers resolve
+   queue storage at startup.</li>
+</ol>
+<p>The command preserves canonical jobs and does not bypass finalization gates.
+If canonical backlog remains, drain it with canonical drain workers before
+finalizing; restarting only auto-role workers after the flip will not execute
+canonical work. Use the live staged path above when a stop-and-drain window
+is impractical.</p>
+<p>Callback APIs carrying <a href="https://github.com/hardbyte/awa/issues/462">#462</a> resolve
+callbacks left on canonical jobs throughout <code>mixed_transition</code>, including
+completion, resume, failure, retry, heartbeat and CEL resolution. Lease checks
+and transaction rollback still apply. Run a 0.6 backport containing this fix
+before flipping a cluster with outstanding callbacks; a fix installed only in
+0.7 arrives too late for an unfinalized cluster.</p>
 <h2 id="health-checks-per-step">Health checks per step<a class="headerlink" href="#health-checks-per-step" title="Permanent link">&para;</a></h2>
 <table>
 <thead>

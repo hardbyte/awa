@@ -39,6 +39,12 @@ awa storage enter-mixed-transition
 awa storage finalize --wait
 ```
 
+For a stopped fleet, a CLI containing #457 can replace the middle command
+with `awa storage enter-mixed-transition --quiesced`; follow the
+[quiesced procedure](../upgrade-0.5-to-0.6/index.md#quiesced-alternative-to-the-witness-runtime).
+If canonical callbacks are outstanding, deploy the 0.6 backport of #462 before
+flipping routing. Neither fix requires a new schema migration.
+
 Then upgrade binaries to 0.7 and run `awa migrate`.
 
 If `finalize --wait` sits at a non-zero backlog that never falls while jobs are visibly executing, your workload probably contains **perpetually snoozing jobs** — handlers that end every run in `JobResult::Snooze`. On builds before [#456](https://github.com/hardbyte/awa/issues/456) those re-entered canonical `scheduled_jobs` after each post-flip run, replenishing the backlog forever. Roll to a build carrying that fix (or apply the [manual backlog migration](../upgrade-0.5-to-0.6/index.md#known-issues)) before waiting on finalize.
