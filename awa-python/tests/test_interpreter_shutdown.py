@@ -104,9 +104,9 @@ def test_rejected_bridge_operations_preserve_client_lifecycle():
             starting = awa.AsyncClient(os.environ["DATABASE_URL"])
             running = awa.AsyncClient(os.environ["DATABASE_URL"])
             await running.migrate()
-            tx = await running.transaction()
-            row = await tx.fetch_one("SELECT COALESCE((SELECT schema_name FROM awa.runtime_storage_backends WHERE backend='queue_storage'), 'awa') AS schema")
-            await tx.commit()
+            # Same normalisation as the other runtime suites: the shared database
+            # may carry a custom prepared schema left by an earlier test module.
+            await running.install_queue_storage(reset=True)
             from dataclasses import dataclass
             @dataclass
             class Payload:
@@ -115,7 +115,7 @@ def test_rejected_bridge_operations_preserve_client_lifecycle():
                 return None
             for client in (starting, running):
                 client.worker(Payload, queue="shutdown_lifecycle_probe")(handler)
-            await running.start([("shutdown_lifecycle_probe", 1)], queue_storage_schema=row["schema"])
+            await running.start([("shutdown_lifecycle_probe", 1)])
             _shutdown_async_bridge()
             for operation in (
                 lambda: installing._raw.install_queue_storage("awa", 8, 8, False),
