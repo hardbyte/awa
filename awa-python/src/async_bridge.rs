@@ -17,9 +17,11 @@ use pyo3_async_runtimes::generic::{self, ContextExt, Runtime};
 use pyo3_async_runtimes::TaskLocals;
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::{Condvar, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct State {
@@ -178,8 +180,33 @@ pub(crate) fn _shutdown_async_bridge(py: Python<'_>) {
             task.abort();
         }
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Instant::now();
+        let mut warned = false;
         while state.callbacks != 0 || !state.tasks.is_empty() {
-            state = IDLE.wait(state).unwrap_or_else(|e| e.into_inner());
+            if warned {
+                state = IDLE.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            let remaining = Duration::from_secs(5).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let tasks = state.tasks.len();
+                let callbacks = state.callbacks;
+                drop(state);
+                // Do not attach to Python for diagnostics, or let a closed
+                // stderr panic. A deadline cannot safely permit finalization:
+                // synchronous Python code may still be using the interpreter.
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "Awa shutdown is still waiting for {tasks} native task(s) and {callbacks} completion callback(s) after 5 seconds. Python code may be blocked; interpreter finalization remains paused to prevent unsafe access."
+                );
+                warned = true;
+                state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            } else {
+                state = IDLE
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
         }
     });
 }

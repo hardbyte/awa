@@ -141,3 +141,89 @@ def test_rejected_bridge_operations_preserve_client_lifecycle():
     result = subprocess.run([sys.executable, "-X", "faulthandler", "-c", code],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_stalled_shutdown_warns_without_finalizing_live_callback():
+    import os
+    from pathlib import Path
+    import tempfile
+    import time
+
+    code = textwrap.dedent('''
+        import atexit, asyncio, os, threading, time
+        from pathlib import Path
+        released = Path(os.environ["AWA_TEST_RELEASE_CALLBACK"])
+        finished = threading.Event()
+        atexit.register(lambda: print("SAFE_EXIT" if finished.is_set() else "EARLY_EXIT", flush=True))
+        import awa
+        async def main():
+            loop = asyncio.get_running_loop()
+            original = loop._write_to_self
+            def controlled_wakeup():
+                original()
+                if threading.current_thread() is not threading.main_thread():
+                    while not released.exists():
+                        time.sleep(0.01)
+                    finished.set()
+            loop._write_to_self = controlled_wakeup
+            client = awa.AsyncClient(os.environ["DATABASE_URL"])
+            await client.close()
+        asyncio.run(main())
+    ''')
+    with tempfile.TemporaryDirectory() as directory:
+        release = Path(directory) / "release"
+        stderr_path = Path(directory) / "stderr"
+        with stderr_path.open("w") as stderr:
+            child = subprocess.Popen(
+                [sys.executable, "-X", "faulthandler", "-c", code],
+                stdout=subprocess.PIPE, stderr=stderr, text=True,
+                env={**os.environ, "AWA_TEST_RELEASE_CALLBACK": str(release)},
+            )
+            try:
+                deadline = time.monotonic() + 12
+                while "Awa shutdown is still waiting" not in stderr_path.read_text():
+                    assert child.poll() is None, stderr_path.read_text()
+                    assert time.monotonic() < deadline, "stalled shutdown emitted no diagnostic"
+                    time.sleep(0.02)
+                assert child.poll() is None, "shutdown finalized a live callback"
+                release.touch()
+                stdout, _ = child.communicate(timeout=10)
+                assert child.returncode == 0, stdout + stderr_path.read_text()
+                assert "SAFE_EXIT" in stdout, stdout
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
+
+
+def test_shutdown_cancels_native_database_wait():
+    # A pending socket/lock wait is cancellable, unlike synchronous Python code.
+    code = textwrap.dedent('''
+        import atexit, asyncio, os
+        atexit.register(lambda: print("DATABASE_WAIT_EXIT", flush=True))
+        import awa
+        retained = []
+        async def main():
+            client = awa.AsyncClient(os.environ["DATABASE_URL"])
+            holder = await client._raw.transaction()
+            waiter = await client._raw.transaction()
+            inspector = await client._raw.transaction()
+            pid = (await waiter.fetch_one("SELECT pg_backend_pid() AS pid"))["pid"]
+            await holder.execute("SELECT pg_advisory_xact_lock(481, $1::int)", pid)
+            pending = waiter.execute("SELECT pg_advisory_xact_lock(481, $1::int)", pid)
+            deadline = asyncio.get_running_loop().time() + 5
+            while True:
+                row = await inspector.fetch_one("SELECT cardinality(pg_blocking_pids($1::int)) AS blockers", pid)
+                if row["blockers"]:
+                    break
+                assert asyncio.get_running_loop().time() < deadline, "query never blocked"
+                await asyncio.sleep(0.01)
+            # Keep the blocking transaction alive until interpreter finalization;
+            # only cancellation can release the bridge's pending task join.
+            retained.extend((client, holder, waiter, inspector, pending))
+        asyncio.run(main())
+    ''')
+    result = subprocess.run([sys.executable, "-X", "faulthandler", "-c", code],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "DATABASE_WAIT_EXIT" in result.stdout, result.stdout + result.stderr

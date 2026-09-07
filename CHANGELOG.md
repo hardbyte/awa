@@ -4,6 +4,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
+  while retaining the join required for safe interpreter finalization.
+
 - Rejected Python bridge operations preserve client lifecycle state; canonical
   callback retries notify dispatchers only when their transaction commits.
 
