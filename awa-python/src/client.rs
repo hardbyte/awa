@@ -628,10 +628,10 @@ impl PyClient {
         lease_slot_count: u32,
         reset: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        begin_queue_storage_install(&self.lifecycle)?;
         let pool = self.pool.clone();
         let lifecycle = self.lifecycle.clone();
         crate::async_bridge::future_into_py(py, async move {
+            begin_queue_storage_install(&lifecycle)?;
             let result = async {
                 let store = QueueStorage::new(QueueStorageConfig {
                     schema,
@@ -1917,22 +1917,21 @@ impl PyClient {
             builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
 
-        begin_runtime_start(&self.lifecycle)?;
-        let runtime = match builder.build() {
-            Ok(runtime) => Arc::new(runtime),
-            Err(err) => {
-                set_runtime_lifecycle(&self.lifecycle, RuntimeLifecycle::Idle);
-                return Err(state_error(err.to_string()));
-            }
-        };
-        let runtime_clone = runtime.clone();
         let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
-        // Store the runtime BEFORE starting so shutdown() can find it
-        // even if called concurrently. If start() fails, remove it.
-        *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime);
         crate::async_bridge::future_into_py(py, async move {
-            if let Err(e) = runtime_clone.start().await {
+            begin_runtime_start(&lifecycle)?;
+            let runtime = match builder.build() {
+                Ok(runtime) => Arc::new(runtime),
+                Err(err) => {
+                    set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+                    return Err(state_error(err.to_string()));
+                }
+            };
+            // Publish only after bridge acceptance, before starting so an
+            // accepted concurrent shutdown can find the runtime.
+            *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime.clone());
+            if let Err(e) = runtime.start().await {
                 runtime_store.lock().expect("runtime mutex poisoned").take();
                 set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
                 return Err(map_awa_error(e));
@@ -1943,9 +1942,10 @@ impl PyClient {
 
     #[pyo3(signature = (timeout_ms=2000))]
     fn shutdown<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
-        let runtime = self.runtime.lock().expect("runtime mutex poisoned").take();
+        let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
         crate::async_bridge::future_into_py(py, async move {
+            let runtime = runtime_store.lock().expect("runtime mutex poisoned").take();
             if let Some(runtime) = runtime {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }

@@ -93,3 +93,51 @@ def test_interpreter_exit_joins_pending_native_future():
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SAFE_EXIT" in result.stdout, result.stdout + result.stderr
+
+
+def test_rejected_bridge_operations_preserve_client_lifecycle():
+    code = textwrap.dedent('''
+        import asyncio, os, awa
+        from awa._awa import _shutdown_async_bridge
+        async def main():
+            installing = awa.AsyncClient(os.environ["DATABASE_URL"])
+            starting = awa.AsyncClient(os.environ["DATABASE_URL"])
+            running = awa.AsyncClient(os.environ["DATABASE_URL"])
+            await running.migrate()
+            tx = await running.transaction()
+            row = await tx.fetch_one("SELECT COALESCE((SELECT schema_name FROM awa.runtime_storage_backends WHERE backend='queue_storage'), 'awa') AS schema")
+            await tx.commit()
+            from dataclasses import dataclass
+            @dataclass
+            class Payload:
+                value: int
+            async def handler(job):
+                return None
+            for client in (starting, running):
+                client.worker(Payload, queue="shutdown_lifecycle_probe")(handler)
+            await running.start([("shutdown_lifecycle_probe", 1)], queue_storage_schema=row["schema"])
+            _shutdown_async_bridge()
+            for operation in (
+                lambda: installing._raw.install_queue_storage("awa", 8, 8, False),
+                lambda: starting.start([("shutdown_lifecycle_probe", 1)]),
+                lambda: running.shutdown(),
+            ):
+                try:
+                    await operation()
+                except RuntimeError as error:
+                    assert "shutting down" in str(error), str(error)
+                else:
+                    raise AssertionError("bridge accepted operation")
+            for client in (installing, starting):
+                try:
+                    client._raw.install_queue_storage_sync("invalid-schema", 8, 8, False)
+                except Exception as error:
+                    assert "schema" in str(error) and "runtime" not in str(error) and "progress" not in str(error), str(error)
+                else:
+                    raise AssertionError("invalid schema accepted")
+            assert running._raw.health_check_sync().poll_loop_alive, "rejected shutdown lost the runtime"
+        asyncio.run(main())
+    ''')
+    result = subprocess.run([sys.executable, "-X", "faulthandler", "-c", code],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr

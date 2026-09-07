@@ -126,13 +126,7 @@ pub async fn enter_mixed_transition_quiesced(pool: &PgPool) -> Result<StorageSta
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty())
         .unwrap_or("awa");
-    let ready: bool = sqlx::query_scalar(
-        "SELECT bool_and(to_regclass(format('%I.%I', $1::text, name)) IS NOT NULL)
-         FROM unnest(ARRAY['queue_ring_state','ready_entries','leases']) AS name",
-    )
-    .bind(schema)
-    .fetch_one(tx.as_mut())
-    .await?;
+    let ready = queue_storage_schema_ready(tx.as_mut(), schema).await?;
     if !ready {
         return Err(AwaError::Validation(format!(
             "queue storage schema {schema:?} is not prepared"
@@ -140,8 +134,8 @@ pub async fn enter_mixed_transition_quiesced(pool: &PgPool) -> Result<StorageSta
     }
     let live: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM awa.runtime_instances
-         WHERE last_seen_at + make_interval(secs =>
-             GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+         WHERE last_seen_at + GREATEST(
+             snapshot_interval_ms * INTERVAL '3 milliseconds', INTERVAL '30 seconds'
          ) >= clock_timestamp()",
     )
     .fetch_one(tx.as_mut())
@@ -209,7 +203,10 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
 /// for custom schemas. If you change a required substrate object or the
 /// `claim_ready_runtime` signature there, update this check at the same
 /// time.
-pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<bool, AwaError> {
+pub async fn queue_storage_schema_ready<'e, E>(executor: E, schema: &str) -> Result<bool, AwaError>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_scalar::<_, bool>(
         r#"
         SELECT
@@ -265,7 +262,7 @@ pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<b
         "#,
     )
     .bind(schema)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map_err(AwaError::from)
 }
