@@ -227,3 +227,40 @@ def test_shutdown_cancels_native_database_wait():
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "DATABASE_WAIT_EXIT" in result.stdout, result.stdout + result.stderr
+
+
+def test_abandoned_transactions_roll_back_on_the_runtime():
+    # Garbage collection may drop the last transaction handle on a thread with
+    # no Tokio context, including interpreter finalization. The pooled
+    # connection must still return without a native panic.
+    code = textwrap.dedent('''
+        import asyncio, os, sys, awa
+        async def main():
+            client = awa.AsyncClient(os.environ["DATABASE_URL"])
+            leaked = await client.transaction()
+            await leaked.execute("SELECT 1")
+            failing = await client.transaction()
+            try:
+                await failing.fetch_one("SELECT no_such_column FROM awa.schema_version")
+            except awa.DatabaseError:
+                pass
+            else:
+                raise AssertionError("invalid query succeeded")
+            sync_client = awa.Client(os.environ["DATABASE_URL"], max_connections=1)
+            sync_leaked = sync_client.transaction()
+            sync_leaked.execute("SELECT 1")
+            del sync_leaked
+            # A dropped handle releases its connection; a pool of one proves it.
+            sync_client.transaction().commit()
+            sync_client.close()
+            # Keep the async handles alive until finalization.
+            globals().update(client=client, leaked=leaked, failing=failing)
+            print("ABANDONED_OK", flush=True)
+        asyncio.run(main())
+    ''')
+    result = subprocess.run([sys.executable, "-X", "faulthandler", "-c", code],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ABANDONED_OK" in result.stdout, result.stdout
+    assert "PanicException" not in result.stderr, result.stderr
+    assert "Tokio context" not in result.stderr, result.stderr
