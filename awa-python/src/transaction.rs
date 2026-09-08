@@ -25,6 +25,39 @@ impl PyTransaction {
     }
 }
 
+/// Roll back a transaction handle that Python released without committing.
+///
+/// The last Python reference can be dropped by garbage collection on a thread
+/// with no Tokio context, including interpreter finalization. sqlx returns the
+/// pooled connection from a spawned task when the transaction drops, and that
+/// spawn panics outside a runtime. Move the transaction onto the shared runtime
+/// first so the rollback and pool return happen where they are allowed.
+fn release_abandoned(handle: &mut Arc<Mutex<Option<Transaction<'static, Postgres>>>>) {
+    let owned = std::mem::replace(handle, Arc::new(Mutex::new(None)));
+    // A clone held by an in-flight bridge future drops inside that Tokio task.
+    let Ok(mutex) = Arc::try_unwrap(owned) else {
+        return;
+    };
+    let Some(tx) = mutex.into_inner() else {
+        return;
+    };
+    pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        let _ = tx.rollback().await;
+    });
+}
+
+impl Drop for PyTransaction {
+    fn drop(&mut self) {
+        release_abandoned(&mut self.tx);
+    }
+}
+
+impl Drop for PySyncTransaction {
+    fn drop(&mut self) {
+        release_abandoned(&mut self.tx);
+    }
+}
+
 #[pymethods]
 impl PyTransaction {
     #[pyo3(signature = (query, *args))]

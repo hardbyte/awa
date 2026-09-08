@@ -4,6 +4,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- Python `Transaction`/`SyncTransaction` handles released without commit or
+  rollback now roll back on the shared Tokio runtime. Previously garbage
+  collection on a thread without a runtime, including interpreter exit,
+  panicked inside sqlx's pool return with "this functionality requires a
+  Tokio context".
+
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.
 
