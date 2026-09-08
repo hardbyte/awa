@@ -35,6 +35,12 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- Python `Transaction`/`SyncTransaction` handles released without commit or
+  rollback now roll back on the shared Tokio runtime. Previously garbage
+  collection on a thread without a runtime, including interpreter exit,
+  panicked inside sqlx's pool return with "this functionality requires a
+  Tokio context".
+
 - Rejected Python bridge operations leave install/start/shutdown lifecycle state
   unchanged. Canonical callback retries retain commit-time dispatcher notifications.
 
