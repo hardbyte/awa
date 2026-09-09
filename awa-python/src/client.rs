@@ -494,7 +494,7 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let (kind_str, args_json, metadata_json, run_at, unique, ordering_key) =
                 Python::attach(|py| {
                     let args_bound = args.bind(py);
@@ -562,7 +562,7 @@ impl PyClient {
     /// If workers are running, call `shutdown()` first.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             pool.close().await;
             Ok(())
         })
@@ -573,7 +573,7 @@ impl PyClient {
         // migrations::run() is !Send (holds PoolConnection across awaits).
         // We bridge it via spawn_blocking + a current_thread runtime so the
         // asyncio event loop stays free and asyncio.wait_for() can cancel.
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -607,7 +607,7 @@ impl PyClient {
         lease_slot_count: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let store = QueueStorage::new(QueueStorageConfig {
                 schema,
                 queue_slot_count: queue_slot_count as usize,
@@ -628,10 +628,10 @@ impl PyClient {
         lease_slot_count: u32,
         reset: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        begin_queue_storage_install(&self.lifecycle)?;
         let pool = self.pool.clone();
         let lifecycle = self.lifecycle.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
+            begin_queue_storage_install(&lifecycle)?;
             let result = async {
                 let store = QueueStorage::new(QueueStorageConfig {
                     schema,
@@ -691,7 +691,7 @@ impl PyClient {
 
     fn transaction<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let tx = pool.begin().await.map_err(map_sqlx_error)?;
             Ok(PyTransaction::new(tx))
         })
@@ -730,7 +730,7 @@ impl PyClient {
                     handler: handler_py.clone_ref(py),
                     args_type: args_type.clone_ref(py),
                     queue: queue.clone(),
-                    task_locals: pyo3_async_runtimes::tokio::get_current_locals(py)?,
+                    task_locals: crate::async_bridge::get_current_locals(py)?,
                 };
 
                 let workers = workers.clone();
@@ -895,7 +895,7 @@ impl PyClient {
 
     fn retry<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let row = awa_model::admin::retry(&pool, job_id)
                 .await
                 .map_err(map_awa_error)?;
@@ -905,7 +905,7 @@ impl PyClient {
 
     fn cancel<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let row = awa_model::admin::cancel(&pool, job_id)
                 .await
                 .map_err(map_awa_error)?;
@@ -934,7 +934,7 @@ impl PyClient {
                 pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize args: {e}"))
             })?;
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let row = awa_model::admin::cancel_by_unique_key(
                 &pool,
                 &kind,
@@ -964,7 +964,7 @@ impl PyClient {
             }
         }
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let outcome = match (kind, queue) {
                 (Some(kind), None) => awa_model::admin::retry_failed_by_kind(&pool, &kind).await,
                 (None, Some(queue)) => awa_model::admin::retry_failed_by_queue(&pool, &queue).await,
@@ -978,7 +978,7 @@ impl PyClient {
 
     fn discard_failed<'py>(&self, py: Python<'py>, kind: String) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let count = awa_model::admin::discard_failed(&pool, &kind)
                 .await
                 .map_err(map_awa_error)?;
@@ -994,7 +994,7 @@ impl PyClient {
         paused_by: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             awa_model::admin::pause_queue(&pool, &queue, paused_by.as_deref())
                 .await
                 .map_err(map_awa_error)?;
@@ -1004,7 +1004,7 @@ impl PyClient {
 
     fn resume_queue<'py>(&self, py: Python<'py>, queue: String) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             awa_model::admin::resume_queue(&pool, &queue)
                 .await
                 .map_err(map_awa_error)?;
@@ -1014,7 +1014,7 @@ impl PyClient {
 
     fn drain_queue<'py>(&self, py: Python<'py>, queue: String) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let count = awa_model::admin::drain_queue(&pool, &queue)
                 .await
                 .map_err(map_awa_error)?;
@@ -1027,7 +1027,7 @@ impl PyClient {
     /// maintenance leader to ensure the cache is fully fresh.
     fn flush_admin_metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             awa_model::admin::flush_dirty_admin_metadata(&pool)
                 .await
                 .map_err(map_awa_error)?;
@@ -1056,7 +1056,7 @@ impl PyClient {
 
     fn dump_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let dump = awa_model::admin::dump_job(&pool, job_id)
                 .await
                 .map_err(map_awa_error)?;
@@ -1090,7 +1090,7 @@ impl PyClient {
         attempt: Option<i16>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let dump = awa_model::admin::dump_run(&pool, job_id, attempt)
                 .await
                 .map_err(map_awa_error)?;
@@ -1121,7 +1121,7 @@ impl PyClient {
 
     fn storage_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let report = awa_model::storage::status_report(&pool)
                 .await
                 .map_err(map_awa_error)?;
@@ -1151,7 +1151,7 @@ impl PyClient {
 
     fn list_cron_jobs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let rows = awa_model::cron::list_cron_jobs(&pool)
                 .await
                 .map_err(map_awa_error)?;
@@ -1181,7 +1181,7 @@ impl PyClient {
 
     fn delete_cron_job<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             awa_model::cron::delete_cron_job(&pool, &name)
                 .await
                 .map_err(map_awa_error)
@@ -1201,7 +1201,7 @@ impl PyClient {
 
     fn queue_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let stats = awa_model::admin::queue_overviews(&pool)
                 .await
                 .map_err(map_awa_error)?;
@@ -1241,7 +1241,7 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let parsed_state = state.as_deref().map(parse_job_state).transpose()?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let filter = ListJobsFilter {
                 state: parsed_state,
                 kind,
@@ -1265,7 +1265,7 @@ impl PyClient {
     /// Get a single job by ID.
     fn get_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let job = awa_model::admin::get_job(&pool, job_id)
                 .await
                 .map_err(map_awa_error)?;
@@ -1289,7 +1289,7 @@ impl PyClient {
         limit: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let filter =
                 crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, Some(limit));
             let rows = awa_model::dlq::list_dlq(&pool, &filter)
@@ -1318,7 +1318,7 @@ impl PyClient {
         let spec = parse_batch_operation_spec(py, &op_kind, &spec)?;
         let filter = parse_batch_operation_filter(py, filter.as_ref())?;
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let preview = awa_model::batch_operations::preview_batch_operation(&pool, spec, filter)
                 .await
                 .map_err(map_awa_error)?;
@@ -1340,7 +1340,7 @@ impl PyClient {
         let spec = parse_batch_operation_spec(py, &op_kind, &spec)?;
         let filter = parse_batch_operation_filter(py, filter.as_ref())?;
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let operation = awa_model::batch_operations::submit_batch_operation(
                 &pool,
                 SubmitBatchOperation {
@@ -1369,7 +1369,7 @@ impl PyClient {
             .map(parse_batch_operation_state)
             .transpose()?;
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let operations = awa_model::batch_operations::list_batch_operations(
                 &pool,
                 &ListBatchOperationsFilter {
@@ -1389,7 +1389,7 @@ impl PyClient {
             pyo3::exceptions::PyValueError::new_err(format!("invalid batch operation id: {err}"))
         })?;
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let operation = awa_model::batch_operations::get_batch_operation(&pool, id)
                 .await
                 .map_err(map_awa_error)?;
@@ -1407,7 +1407,7 @@ impl PyClient {
             pyo3::exceptions::PyValueError::new_err(format!("invalid batch operation id: {err}"))
         })?;
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let operation =
                 awa_model::batch_operations::request_batch_operation_cancellation(&pool, id)
                     .await
@@ -1425,7 +1425,7 @@ impl PyClient {
         limit: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             awa_model::batch_operations::purge_batch_operations_before(&pool, before, limit)
                 .await
                 .map_err(map_awa_error)
@@ -1435,7 +1435,7 @@ impl PyClient {
     /// Fetch a single DLQ entry by id. Returns `None` if the row isn't in the DLQ.
     fn get_dlq_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let row = awa_model::dlq::get_dlq_job(&pool, job_id)
                 .await
                 .map_err(map_awa_error)?;
@@ -1459,7 +1459,7 @@ impl PyClient {
         queue: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let count = awa_model::dlq::dlq_depth(&pool, queue.as_deref())
                 .await
                 .map_err(map_awa_error)?;
@@ -1470,7 +1470,7 @@ impl PyClient {
     /// DLQ row counts grouped by queue (descending).
     fn dlq_depth_by_queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let rows = awa_model::dlq::dlq_depth_by_queue(&pool)
                 .await
                 .map_err(map_awa_error)?;
@@ -1492,7 +1492,7 @@ impl PyClient {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         let opts = crate::dlq::build_retry_opts(run_at, priority, queue);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let job = awa_model::dlq::retry_from_dlq(&pool, job_id, &opts)
                 .await
                 .map_err(map_awa_error)?;
@@ -1523,7 +1523,7 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
             let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
@@ -1546,7 +1546,7 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let row = awa_model::dlq::move_failed_to_dlq(&pool, job_id, &reason)
                 .await
                 .map_err(map_awa_error)?;
@@ -1579,7 +1579,7 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let kind_attr = kind.clone();
             let queue_attr = queue.clone();
             let count = awa_model::dlq::bulk_move_failed_to_dlq(
@@ -1607,7 +1607,7 @@ impl PyClient {
     fn purge_dlq_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let queue = awa_model::dlq::get_dlq_job(&pool, job_id)
                 .await
                 .map_err(map_awa_error)?
@@ -1640,7 +1640,7 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
             let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
@@ -1656,7 +1656,7 @@ impl PyClient {
     fn health_check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             if let Some(runtime) = runtime {
                 let health = runtime.health_check().await;
                 return Ok(map_health_check(health));
@@ -1917,22 +1917,21 @@ impl PyClient {
             builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
 
-        begin_runtime_start(&self.lifecycle)?;
-        let runtime = match builder.build() {
-            Ok(runtime) => Arc::new(runtime),
-            Err(err) => {
-                set_runtime_lifecycle(&self.lifecycle, RuntimeLifecycle::Idle);
-                return Err(state_error(err.to_string()));
-            }
-        };
-        let runtime_clone = runtime.clone();
         let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
-        // Store the runtime BEFORE starting so shutdown() can find it
-        // even if called concurrently. If start() fails, remove it.
-        *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Err(e) = runtime_clone.start().await {
+        crate::async_bridge::future_into_py(py, async move {
+            begin_runtime_start(&lifecycle)?;
+            let runtime = match builder.build() {
+                Ok(runtime) => Arc::new(runtime),
+                Err(err) => {
+                    set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+                    return Err(state_error(err.to_string()));
+                }
+            };
+            // Publish only after bridge acceptance, before starting so an
+            // accepted concurrent shutdown can find the runtime.
+            *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime.clone());
+            if let Err(e) = runtime.start().await {
                 runtime_store.lock().expect("runtime mutex poisoned").take();
                 set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
                 return Err(map_awa_error(e));
@@ -1943,9 +1942,10 @@ impl PyClient {
 
     #[pyo3(signature = (timeout_ms=2000))]
     fn shutdown<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
-        let runtime = self.runtime.lock().expect("runtime mutex poisoned").take();
+        let runtime_store = self.runtime.clone();
         let lifecycle = self.lifecycle.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
+            let runtime = runtime_store.lock().expect("runtime mutex poisoned").take();
             if let Some(runtime) = runtime {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }
@@ -1968,7 +1968,7 @@ impl PyClient {
             .as_ref()
             .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
             .transpose()?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
             let row = awa_model::admin::complete_external(&pool, uuid, payload_json, None)
@@ -1985,7 +1985,7 @@ impl PyClient {
         error: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
             let row = awa_model::admin::fail_external(&pool, uuid, &error, None)
@@ -2001,7 +2001,7 @@ impl PyClient {
         callback_id: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
             let row = awa_model::admin::retry_external(&pool, uuid, None)
@@ -2027,7 +2027,7 @@ impl PyClient {
             .as_ref()
             .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
             .transpose()?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
             let row = awa_model::admin::resume_external(&pool, uuid, payload_json, None)
@@ -2070,7 +2070,7 @@ impl PyClient {
         timeout_seconds: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
             let timeout = validate_timeout_seconds(timeout_seconds)?;
@@ -2174,7 +2174,7 @@ impl PyClient {
             .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
             .transpose()?;
         let action = parse_default_action(default_action)?;
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
             let outcome =
@@ -2247,7 +2247,7 @@ impl PyClient {
             opts.as_deref(),
         )?;
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let results = awa_model::insert_many_copy_from_pool(&pool, &insert_params)
                 .await
                 .map_err(map_awa_error)?;
@@ -2346,7 +2346,7 @@ impl PyClient {
         )?;
         let queue_counts = enqueue_batch_queue_counts(&insert_params);
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        crate::async_bridge::future_into_py(py, async move {
             let schema = QueueStorage::active_schema(&pool)
                 .await
                 .map_err(map_awa_error)?

@@ -4,6 +4,28 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- Python `Transaction`/`SyncTransaction` handles released without commit or
+  rollback now roll back on the shared Tokio runtime. Previously garbage
+  collection on a thread without a runtime, including interpreter exit,
+  panicked inside sqlx's pool return with "this functionality requires a
+  Tokio context".
+
+- Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
+  while retaining the join required for safe interpreter finalization.
+
+- Rejected Python bridge operations preserve client lifecycle state; canonical
+  callback retries notify dispatchers only when their transaction commits.
+
+- Cancel and join native Python async operations and join completion callbacks
+  before interpreter finalization, preventing the reproduced exit-time CPython 3.12 SIGSEGV after
+  `await client.close()`. Worker shutdown and pool close remain explicit.
+
+- Preserve canonical callback resolution during mixed storage transitions (#462),
+  including handler registration, polling, lease fencing, and transaction rollback.
+- Add `storage enter-mixed-transition --quiesced` for a stopped fleet, refusing
+  fresh runtime snapshots with millisecond precision, checking the complete target
+  substrate, and retaining canonical backlog/finalize gates (#457).
+
 ## [0.6.7] — 2026-08-31
 
 Patch release: CLI help credential redaction and dependency security updates. No migrations, schema changes, or public API changes.
