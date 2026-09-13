@@ -2740,7 +2740,7 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td><code>awa.completion.deadlock_retry</code></td>
 <td>Counter</td>
 <td>kind, queue</td>
-<td>Finalize transactions re-run after Postgres aborted them as deadlock victims (SQLSTATE 40P01); non-zero means job transitions are waiting on each other</td>
+<td>Re-runs of a finalize transaction after Postgres aborted it as a deadlock victim (SQLSTATE 40P01); one increment per retry, up to three per completion. Any sustained rate means job transitions are waiting on each other</td>
 </tr>
 <tr>
 <td><code>awa.job.cancelled</code></td>
