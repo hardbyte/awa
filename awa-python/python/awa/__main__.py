@@ -319,6 +319,12 @@ async def _migrate(args: argparse.Namespace) -> None:
 
     for version, description, sql_text in awa.migrations_range(range_from, range_to):
         print(f"-- Migration V{version}: {description}\n{sql_text}\n")
+    if range_to >= current_ver:
+        for name, description, sql_text in awa.schema_patches():
+            print(
+                f"-- Schema patch R__{name}: {description} "
+                f"(idempotent; apply after V{current_ver})\n{sql_text}\n"
+            )
 
 
 # ── job ─────────────────────────────────────────────────────────────────

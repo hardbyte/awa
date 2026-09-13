@@ -226,6 +226,69 @@ const V38_UP: &str = include_str!("../migrations/v038_compact_claim_batches.sql"
 const V39_UP: &str = include_str!("../migrations/v039_claim_head_cold_routing.sql");
 const V40_UP: &str = include_str!("../migrations/v040_finalize_with_drain_runtimes.sql");
 
+/// An idempotent schema repair shipped in a 0.6 patch release.
+///
+/// The 0.6 series cannot add migration versions — awa 0.7 owns v041 and
+/// above — so a fix that must reach canonical clusters travels as a patch:
+/// `awa migrate` applies it when the schema is exactly at [`CURRENT_VERSION`]
+/// and `applied_probe` reports it missing, and the 0.7 migration carrying the
+/// same SQL re-applies it cleanly over a patched cluster. A patch never writes
+/// `awa.schema_version` and is never applied to a schema newer than this
+/// binary, where a later migration may have superseded it.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaPatch {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub sql: &'static str,
+    /// Boolean SQL: TRUE when the patch is already present.
+    pub applied_probe: &'static str,
+}
+
+pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
+    name: "wait_free_dirty_marks",
+    description: "Wait-free admin dirty-key marks (awa 0.7 migration v046)",
+    sql: include_str!("../migrations/patches/wait_free_dirty_marks.sql"),
+    // Tables alone are not enough: a runner that applies the script statement by
+    // statement and stops early leaves the blocking trigger bodies in place.
+    applied_probe: "SELECT to_regclass('awa.admin_dirty_queue_marks') IS NOT NULL \
+                    AND to_regclass('awa.admin_dirty_kind_marks') IS NOT NULL \
+                    AND (SELECT count(*) FROM pg_proc \
+                         WHERE pronamespace = 'awa'::regnamespace \
+                           AND proname IN ('mark_dirty_keys_insert', 'mark_dirty_keys_delete', \
+                                           'mark_dirty_keys_update', 'recompute_dirty_admin_metadata') \
+                           AND prosrc LIKE '%admin_dirty_queue_marks%') = 4 \
+                    AND EXISTS (SELECT 1 FROM pg_proc \
+                                WHERE pronamespace = 'awa'::regnamespace \
+                                  AND proname = 'refresh_admin_metadata' \
+                                  AND prosrc LIKE '%admin_dirty_queue_marks%' \
+                                  AND prosrc NOT LIKE '%TRUNCATE%')",
+}];
+
+/// Schema patches not yet present on a database at [`CURRENT_VERSION`].
+/// Empty when the schema is at any other version.
+pub async fn pending_schema_patches(pool: &PgPool) -> Result<Vec<SchemaPatch>, AwaError> {
+    let mut conn = pool.acquire().await?;
+    if current_version_conn(&mut conn).await? != CURRENT_VERSION {
+        return Ok(Vec::new());
+    }
+    pending_schema_patches_conn(&mut conn).await
+}
+
+async fn pending_schema_patches_conn(
+    conn: &mut PgConnection,
+) -> Result<Vec<SchemaPatch>, AwaError> {
+    let mut pending = Vec::new();
+    for patch in SCHEMA_PATCHES {
+        let applied: bool = sqlx::query_scalar(patch.applied_probe)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !applied {
+            pending.push(*patch);
+        }
+    }
+    Ok(pending)
+}
+
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
 /// Maps old max version → equivalent new version.
@@ -297,6 +360,20 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         }
     } else {
         info!(version = current, "Schema is up to date");
+    }
+
+    // Patches ride on the schema this binary owns. A newer schema belongs
+    // to a newer binary whose migrations may have superseded them.
+    if current <= CURRENT_VERSION {
+        for patch in pending_schema_patches_conn(conn).await? {
+            info!(
+                patch = patch.name,
+                description = patch.description,
+                "Applying schema patch"
+            );
+            sqlx::raw_sql(patch.sql).execute(&mut *conn).await?;
+            info!(patch = patch.name, "Schema patch applied");
+        }
     }
 
     // Ensure the admin metadata cache is warm. Since v006 removed the
@@ -510,6 +587,10 @@ async fn forward_compatible_v043_columns(
 }
 
 /// Get the raw SQL for all migrations (for extraction / external tooling).
+///
+/// Versioned migrations only. The idempotent [`SCHEMA_PATCHES`] that `run`
+/// applies after the last migration are exported separately by
+/// [`schema_patch_sql`], because they have no version of their own.
 pub fn migration_sql() -> Vec<(i32, &'static str, String)> {
     MIGRATIONS
         .iter()
@@ -527,9 +608,41 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
         .collect()
 }
 
+/// Schema patches as `(name, description, sql)`, for external runners. Each
+/// patch is idempotent and versionless: apply it after the migrations that
+/// bring the schema to [`CURRENT_VERSION`], as a repeatable migration
+/// (`R__<name>.sql` in Flyway terms), never as another `V40` file.
+pub fn schema_patch_sql(patches: &[SchemaPatch]) -> Vec<(&'static str, &'static str, String)> {
+    patches
+        .iter()
+        .map(|patch| (patch.name, patch.description, patch.sql.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_patches_are_idempotent_and_versionless() {
+        for patch in SCHEMA_PATCHES {
+            let upper = patch.sql.to_uppercase();
+            assert!(
+                !upper.contains("INSERT INTO AWA.SCHEMA_VERSION"),
+                "patch {} must not record a schema version",
+                patch.name
+            );
+            assert!(
+                !upper.contains("CREATE TABLE AWA.")
+                    && !upper.contains("CREATE FUNCTION")
+                    && !upper.contains("DROP TABLE")
+                    && !upper.contains("ALTER TABLE"),
+                "patch {} must use IF NOT EXISTS / OR REPLACE forms only",
+                patch.name
+            );
+            assert!(!patch.applied_probe.is_empty());
+        }
+    }
 
     #[test]
     fn migration_sql_range_all() {
@@ -545,6 +658,19 @@ mod tests {
         assert!(subset.iter().all(|(v, _, _)| *v > 2));
         let expected = MIGRATIONS.iter().filter(|&&(v, _, _)| v > 2).count();
         assert_eq!(subset.len(), expected);
+    }
+
+    #[test]
+    fn schema_patch_sql_is_versionless_and_complete() {
+        let exported = schema_patch_sql(SCHEMA_PATCHES);
+        assert_eq!(exported.len(), SCHEMA_PATCHES.len());
+        for ((name, _, sql), patch) in exported.iter().zip(SCHEMA_PATCHES) {
+            assert_eq!(*name, patch.name);
+            assert_eq!(sql, patch.sql);
+        }
+        assert!(migration_sql().iter().all(|(_, description, _)| {
+            !SCHEMA_PATCHES.iter().any(|p| p.description == *description)
+        }));
     }
 
     #[test]

@@ -111,9 +111,8 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA awa TO awa_runtime;
 
 -- All tables: the runtime needs full DML because triggers run as the
 -- invoking role (SECURITY INVOKER), so inserting a job also writes to
--- the admin metadata cache tables via triggers. The maintenance leader
--- also calls refresh_admin_metadata(), which truncates dirty-key tables
--- after taking the metadata advisory lock.
+-- the admin metadata tables via triggers. TRUNCATE is used by queue-storage
+-- segment pruning.
 GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO awa_runtime;
 
 -- Functions (trigger functions execute with invoker privileges)
@@ -195,7 +194,9 @@ The runtime grants look broad (`SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL 
 
 Since these triggers run with the caller's privileges, the runtime role needs write access to these internal tables even though application code never touches them directly.
 
-The maintenance leader also calls `awa.refresh_admin_metadata()` as a full reconciliation safety net. That function runs with invoker privileges and uses `TRUNCATE` on `awa.admin_dirty_queues` and `awa.admin_dirty_kinds` after taking the metadata advisory lock, so `awa_runtime` needs the `TRUNCATE` table privilege too.
+The maintenance leader also calls `awa.refresh_admin_metadata()` as a full reconciliation safety net. It runs with invoker privileges and needs DML on the admin metadata tables. `TRUNCATE` in the grant is for queue-storage segment pruning, which truncates retired partitions.
+
+Schema patches (`awa migrate --sql` prints them after the versioned migrations) replace function bodies and create tables under the migrator role, like migrations do; they never change grants. Privileges managed with `GRANT ... ON ALL TABLES` plus the default privileges above cover patched tables without further action.
 
 The runtime also directly upserts into the descriptor catalogs on startup and on each runtime snapshot tick:
 

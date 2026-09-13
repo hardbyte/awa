@@ -238,10 +238,16 @@ If you manage SQL with Flyway, Liquibase, dbmate, or a homegrown process, extrac
 awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
 ```
 
-That writes one SQL file per migration. The same SQL is also available programmatically:
+That writes one `V<n>__<description>.sql` file per migration, plus one
+`R__<name>.sql` file per **schema patch**: an idempotent repair the 0.6 series
+ships without a version bump, applied by `awa migrate` after the last migration
+and recorded nowhere in `awa.schema_version`. Apply patches as repeatable
+scripts after `V40`, never as another versioned file. `awa migrate --pending
+--sql` prints only the migrations and patches the database lacks. The same SQL
+is also available programmatically:
 
-- Rust: `awa::migrations::migration_sql()`
-- Python: `awa.migrations()`
+- Rust: `awa::migrations::migration_sql()` and `awa::migrations::schema_patch_sql(SCHEMA_PATCHES)`
+- Python: `awa.migrations()` and `awa.schema_patches()`
 
 ## Checking Schema Version
 
