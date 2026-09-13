@@ -31,6 +31,19 @@ pub enum AwaError {
     TokioPg(#[source] tokio_postgres::Error),
 }
 
+impl AwaError {
+    /// Postgres aborted this transaction to break a lock cycle (SQLSTATE
+    /// `40P01`). Nothing the transaction did was applied, so a caller whose
+    /// statements are idempotent may simply run it again.
+    pub fn is_deadlock(&self) -> bool {
+        matches!(
+            self,
+            AwaError::Database(sqlx::Error::Database(database))
+                if database.code().as_deref() == Some("40P01")
+        )
+    }
+}
+
 impl From<sqlx::Error> for AwaError {
     fn from(err: sqlx::Error) -> Self {
         AwaError::Database(err)
