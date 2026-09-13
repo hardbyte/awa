@@ -888,8 +888,13 @@ async fn test_migrate_gate_refuses_recently_live_canonical_runtime() {
         .expect("stale runtimes should not hold the migrate gate closed");
 }
 
+/// v046 removed the only `TRUNCATE` from the canonical maintenance path:
+/// `refresh_admin_metadata()` now deletes visible dirty marks instead of
+/// truncating the mark tables. A runtime role with plain DML grants must be
+/// able to run the full refresh, and the trigger-maintained mark tables must
+/// be writable by the same role (triggers run as the invoker).
 #[tokio::test]
-async fn test_documented_runtime_grants_cover_admin_refresh_truncate() {
+async fn test_admin_refresh_needs_no_truncate_privilege() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
@@ -897,33 +902,25 @@ async fn test_documented_runtime_grants_cover_admin_refresh_truncate() {
 
     let suffix = Uuid::new_v4().simple().to_string();
     let runtime_without_truncate = format!("awa_runtime_no_truncate_{suffix}");
-    let runtime_with_truncate = format!("awa_runtime_with_truncate_{suffix}");
-
     create_login_role(&pool, &runtime_without_truncate).await;
-    create_login_role(&pool, &runtime_with_truncate).await;
-
     grant_runtime_privileges(&pool, &runtime_without_truncate, false).await;
-    grant_runtime_privileges(&pool, &runtime_with_truncate, true).await;
 
-    let old_doc_pool = runtime_pool_for_role(&runtime_without_truncate).await;
-    let err = awa::model::admin::refresh_admin_metadata(&old_doc_pool)
+    let runtime_pool = runtime_pool_for_role(&runtime_without_truncate).await;
+    sqlx::query(
+        "INSERT INTO awa.jobs (kind, queue, args) VALUES ('grants_probe', 'grants_probe_q', '{}'::jsonb)",
+    )
+    .execute(&runtime_pool)
+    .await
+    .expect("DML grants must cover the dirty-mark trigger inserts");
+    awa::model::admin::recompute_dirty_admin_metadata(&runtime_pool)
         .await
-        .expect_err("runtime grants without TRUNCATE should fail during metadata refresh");
-    assert_eq!(
-        sqlstate_from_awa_error(&err).as_deref(),
-        Some("42501"),
-        "missing TRUNCATE should surface as insufficient_privilege"
-    );
-    old_doc_pool.close().await;
-
-    let documented_pool = runtime_pool_for_role(&runtime_with_truncate).await;
-    awa::model::admin::refresh_admin_metadata(&documented_pool)
+        .expect("DML grants must cover the dirty-mark drain");
+    awa::model::admin::refresh_admin_metadata(&runtime_pool)
         .await
-        .expect("documented runtime grants should allow metadata refresh");
-    documented_pool.close().await;
+        .expect("full metadata refresh must not require TRUNCATE");
+    runtime_pool.close().await;
 
     drop_login_role(&pool, &runtime_without_truncate).await;
-    drop_login_role(&pool, &runtime_with_truncate).await;
 }
 
 #[tokio::test]

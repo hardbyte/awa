@@ -35,6 +35,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **Job transitions no longer wait on, or deadlock through, the admin dirty-key triggers ([#492](https://github.com/hardbyte/awa/issues/492), v046).** The v006 triggers marked touched queues and kinds with `INSERT ... ON CONFLICT DO NOTHING` into keyed tables, which blocks on another transaction whenever the keyed row is uncommitted; the 2 s drain and the `TRUNCATE`-based 60 s refresh made that routine, and two re-schedules in one queue could deadlock through it. v046 makes the marks append-only rows in unconstrained tables (`admin_dirty_queue_marks`, `admin_dirty_kind_marks`) so the trigger INSERT never waits, drains by deleting only the visible rows it recounts, and refreshes without `TRUNCATE`. The executor now re-runs a finalize transaction aborted as a deadlock victim (SQLSTATE `40P01`, three retries) instead of leaving the job to heartbeat rescue, counted in `awa.completion.deadlock_retry`. ADR-045 records the trigger lock contract and an executable test enforces it. No operator action; 0.6.x binaries operate unchanged on the migrated schema.
+
 - Python `Transaction`/`SyncTransaction` handles released without commit or
   rollback now roll back on the shared Tokio runtime. Previously garbage
   collection on a thread without a runtime, including interpreter exit,
