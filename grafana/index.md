@@ -164,6 +164,7 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.job.completed` | Counter | kind, queue | Jobs completed |
 | `awa.job.failed` | Counter | kind, queue, terminal | Jobs failed |
 | `awa.job.retried` | Counter | kind, queue | Jobs retried |
+| `awa.completion.deadlock_retry` | Counter | kind, queue | Re-runs of a finalize transaction after Postgres aborted it as a deadlock victim (SQLSTATE 40P01); one increment per retry, up to three per completion. Any sustained rate means job transitions are waiting on each other |
 | `awa.job.cancelled` | Counter | kind, queue | Jobs cancelled |
 | `awa.job.claimed` | Counter | queue | Jobs claimed from DB |
 | `awa.job.in_flight` | UpDownCounter | queue | Currently executing |

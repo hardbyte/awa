@@ -54,6 +54,7 @@ Each record preserves its status, context, decision, consequences, and alternati
 | 042 | [Caller-owned finalization transactions](042-caller-owned-finalization-transactions/index.md) | A distinct handler type commits application rows and exact-lease completion in one transaction through a least-privilege finalization function (#401). |  |
 | 043 | [PostgreSQL capability functions and least-privilege runtime roles](043-postgresql-capability-functions/index.md) | Replace blanket runtime table/function grants with allowlisted, role-specific capability entry points owned by a bounded execution role (#452); blanket definer conversion is rejected. | <span class="awa-status awa-status--proposed">Proposed</span> |
 | 044 | [Gate A — storage evolution for 0.7](044-storage-evolution-gate-a/index.md) | The #295 segment-engine RFC graduates to 0.8: the allocator ideas landed inside the engine as staged migrations and measured better; the remaining WAL headroom has no in-place delivery path (#295, #383). |  |
+| 045 | [Hot-path triggers never wait on another transaction](045-hot-path-trigger-lock-contract/index.md) | Triggers on the canonical hot tables may write only append-only, unconstrained mark tables or the job's own unique claim; the maintenance path never truncates; the contract is an executable test and a TLA+ witness (v046, 0.6 patch). |  |
 
 ## Correctness evidence
 

@@ -176,6 +176,23 @@ the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downg
 previous releases).
 
 
+## v046: wait-free admin dirty-key marks
+
+v046 replaces the keyed `admin_dirty_queues` / `admin_dirty_kinds` tables the
+canonical triggers wrote with `INSERT ... ON CONFLICT DO NOTHING` by append-only
+`admin_dirty_queue_marks` / `admin_dirty_kind_marks` tables with no index or
+constraint, and rewrites `mark_dirty_keys_*`, `recompute_dirty_admin_metadata()`
+and `refresh_admin_metadata()` around them. The trigger write inside every job
+transition becomes a plain heap insert that cannot wait on another transaction,
+and the full refresh no longer `TRUNCATE`s under `ACCESS EXCLUSIVE`.
+
+No operator action is required. The migration creates two small tables, copies
+pending marks, and replaces function bodies; it takes no lock that conflicts with
+job traffic. 0.6.x runtimes call the maintenance functions by name and keep
+working on the migrated schema in either order. External SQL runners apply the
+file like any other additive migration. The old tables are left in place and are
+dropped by a later contract migration.
+
 ## v045: opt-in periodic ownership
 
 v045 adds ownership, retirement, and normalized desired-declaration control

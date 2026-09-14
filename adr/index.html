@@ -2449,6 +2449,12 @@
 <td>The #295 segment-engine RFC graduates to 0.8: the allocator ideas landed inside the engine as staged migrations and measured better; the remaining WAL headroom has no in-place delivery path (#295, #383).</td>
 <td></td>
 </tr>
+<tr>
+<td style="text-align: right;">045</td>
+<td><a href="045-hot-path-trigger-lock-contract/">Hot-path triggers never wait on another transaction</a></td>
+<td>Triggers on the canonical hot tables may write only append-only, unconstrained mark tables or the job's own unique claim; the maintenance path never truncates; the contract is an executable test and a TLA+ witness (v046, 0.6 patch).</td>
+<td></td>
+</tr>
 </tbody>
 </table>
 <h2 id="correctness-evidence">Correctness evidence<a class="headerlink" href="#correctness-evidence" title="Permanent link">&para;</a></h2>

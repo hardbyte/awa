@@ -10,31 +10,27 @@
       
       
       
-        <link rel="canonical" href="https://hardbyte.github.io/awa/upgrade-0.6-to-0.7/">
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/045-hot-path-trigger-lock-contract/">
       
       
-        <link rel="prev" href="../upgrade-0.5-to-0.6/">
-      
-      
-        <link rel="next" href="../grafana/">
       
       
         
       
       
-      <link rel="icon" href="../assets/logo.svg">
+      <link rel="icon" href="../../assets/logo.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
-        <title>Upgrade 0.6 to 0.7 - AWA</title>
+        <title>ADR-045: Hot-path triggers never wait on another transaction - AWA</title>
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
       
       
 
@@ -53,15 +49,15 @@
       
     
     
-      <link rel="stylesheet" href="../stylesheets/extra.css">
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
     
-      <link rel="stylesheet" href="../stylesheets/reference.css">
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
     
-      <link rel="stylesheet" href="../stylesheets/language-switch.css">
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
     
-      <link rel="stylesheet" href="../stylesheets/agent-docs.css">
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
     
-    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -72,14 +68,14 @@
   
   
   <meta name="theme-color" content="#17633e">
-  <meta property="og:title" content="Upgrade 0.6 to 0.7 — AWA">
+  <meta property="og:title" content="ADR-045: Hot-path triggers never wait on another transaction — AWA">
   <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://hardbyte.github.io/awa/upgrade-0.6-to-0.7/">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/045-hot-path-trigger-lock-contract/">
   
     <link rel="alternate" type="text/markdown" href="index.md">
   
-  <link rel="help" type="text/plain" href="../llms.txt" title="AWA documentation index for AI agents">
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
 
   </head>
   
@@ -100,7 +96,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#upgrading-from-06-to-07" class="md-skip">
+        <a href="#adr-045-hot-path-triggers-never-wait-on-another-transaction" class="md-skip">
           Skip to content
         </a>
       
@@ -128,9 +124,9 @@
 
 <header class="md-header" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href=".." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
       
-  <img src="../assets/logo.svg" alt="logo">
+  <img src="../../assets/logo.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -147,7 +143,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Upgrade 0.6 to 0.7
+              ADR-045: Hot-path triggers never wait on another transaction
             
           </span>
         </div>
@@ -260,7 +256,7 @@
   
   
     <li class="md-tabs__item">
-      <a href=".." class="md-tabs__link">
+      <a href="../.." class="md-tabs__link">
         
   
   
@@ -281,7 +277,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../start/" class="md-tabs__link">
+        <a href="../../start/" class="md-tabs__link">
           
   
   
@@ -303,7 +299,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../concepts/" class="md-tabs__link">
+        <a href="../../concepts/" class="md-tabs__link">
           
   
   
@@ -325,7 +321,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../guides/" class="md-tabs__link">
+        <a href="../../guides/" class="md-tabs__link">
           
   
   
@@ -343,13 +339,11 @@
   
   
   
-    
-  
   
     
     
-      <li class="md-tabs__item md-tabs__item--active">
-        <a href="../operations/" class="md-tabs__link">
+      <li class="md-tabs__item">
+        <a href="../../operations/" class="md-tabs__link">
           
   
   
@@ -371,7 +365,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../security/" class="md-tabs__link">
+        <a href="../../security/" class="md-tabs__link">
           
   
   
@@ -393,7 +387,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../reference/" class="md-tabs__link">
+        <a href="../../reference/" class="md-tabs__link">
           
   
   
@@ -415,7 +409,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../contributing/" class="md-tabs__link">
+        <a href="../../contributing/" class="md-tabs__link">
           
   
   
@@ -451,9 +445,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href=".." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
       
-  <img src="../assets/logo.svg" alt="logo">
+  <img src="../../assets/logo.svg" alt="logo">
 
     </a>
     AWA
@@ -480,7 +474,7 @@
   
   
     <li class="md-nav__item">
-      <a href=".." class="md-nav__link">
+      <a href="../.." class="md-nav__link">
         
   
   
@@ -536,7 +530,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../start/" class="md-nav__link ">
+            <a href="../../start/" class="md-nav__link ">
               
   
   
@@ -580,7 +574,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../getting-started-rust/" class="md-nav__link">
+      <a href="../../getting-started-rust/" class="md-nav__link">
         
   
   
@@ -608,7 +602,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../getting-started-python/" class="md-nav__link">
+      <a href="../../getting-started-python/" class="md-nav__link">
         
   
   
@@ -636,7 +630,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../start/cli/" class="md-nav__link">
+      <a href="../../start/cli/" class="md-nav__link">
         
   
   
@@ -702,7 +696,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../concepts/" class="md-nav__link ">
+            <a href="../../concepts/" class="md-nav__link ">
               
   
   
@@ -746,7 +740,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../concepts/job-lifecycle/" class="md-nav__link">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
         
   
   
@@ -774,7 +768,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../concepts/transactional-enqueue/" class="md-nav__link">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
         
   
   
@@ -802,7 +796,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../architecture/" class="md-nav__link">
+      <a href="../../architecture/" class="md-nav__link">
         
   
   
@@ -830,7 +824,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../queue-storage-substrate/" class="md-nav__link">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
         
   
   
@@ -898,7 +892,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../guides/" class="md-nav__link ">
+            <a href="../../guides/" class="md-nav__link ">
               
   
   
@@ -942,7 +936,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../bridge-adapters/" class="md-nav__link">
+      <a href="../../bridge-adapters/" class="md-nav__link">
         
   
   
@@ -970,7 +964,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../lifecycle-hooks/" class="md-nav__link">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
         
   
   
@@ -998,7 +992,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../http-callbacks/" class="md-nav__link">
+      <a href="../../http-callbacks/" class="md-nav__link">
         
   
   
@@ -1026,7 +1020,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../callback-receivers/" class="md-nav__link">
+      <a href="../../callback-receivers/" class="md-nav__link">
         
   
   
@@ -1054,7 +1048,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../dead-letter-queue/" class="md-nav__link">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
         
   
   
@@ -1086,8 +1080,6 @@
       
   
   
-    
-  
   
   
     
@@ -1113,23 +1105,20 @@
     
     
       
-        
-        
-      
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../operations/" class="md-nav__link ">
+            <a href="../../operations/" class="md-nav__link ">
               
   
   
@@ -1147,13 +1136,13 @@
             </a>
             
               
-              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="">
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
                 <span class="md-nav__icon md-icon"></span>
               </label>
             
           </div>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1173,7 +1162,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../configuration/" class="md-nav__link">
+      <a href="../../configuration/" class="md-nav__link">
         
   
   
@@ -1201,7 +1190,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../deployment/" class="md-nav__link">
+      <a href="../../deployment/" class="md-nav__link">
         
   
   
@@ -1229,7 +1218,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../deploying-on-managed-postgres/" class="md-nav__link">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
         
   
   
@@ -1254,10 +1243,8 @@
                 
   
   
-    
   
   
-  
     
     
       
@@ -1272,21 +1259,18 @@
     
       
       
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" >
         
           
-          
-        
-      
-    
-    
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
-      
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" checked>
-        
-          
-          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="">
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
             
   
   
@@ -1304,7 +1288,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_5_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1322,7 +1306,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../migrations/" class="md-nav__link">
+      <a href="../../migrations/" class="md-nav__link">
         
   
   
@@ -1350,7 +1334,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../upgrade-0.5-to-0.6/" class="md-nav__link">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
         
   
   
@@ -1375,37 +1359,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Upgrade 0.6 to 0.7
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
         
   
   
@@ -1421,164 +1378,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#the-one-gate" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The one gate
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#if-you-are-on-06-finalized" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        If you are on 0.6, finalized
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#if-you-are-on-06-not-yet-finalized" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        If you are on 0.6, not yet finalized
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#if-you-are-on-05x" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        If you are on 0.5.x
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#the-v043-ring-rotation-ledger-migration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The v043 ring-rotation ledger migration
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="The v043 ring-rotation ledger migration">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#procedure-either-order-works-after-the-062-stepping-stone" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Procedure (either order works after the 0.6.2 stepping-stone)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#after-the-flip-do-not-roll-back-to-a-pre-flip-binary" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        After the flip — do not roll back to a pre-flip binary
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#contract-08" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Contract (0.8)
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#runtime-deprecation-warning" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Runtime deprecation warning
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#rollback" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Rollback
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#v046-wait-free-admin-dirty-key-marks" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        v046: wait-free admin dirty-key marks
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#v045-opt-in-periodic-ownership" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        v045: opt-in periodic ownership
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -1599,7 +1398,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../grafana/" class="md-nav__link">
+      <a href="../../grafana/" class="md-nav__link">
         
   
   
@@ -1627,7 +1426,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../troubleshooting/" class="md-nav__link">
+      <a href="../../troubleshooting/" class="md-nav__link">
         
   
   
@@ -1724,7 +1523,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/" class="md-nav__link">
+      <a href="../../security/" class="md-nav__link">
         
   
   
@@ -1752,7 +1551,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/database-roles/" class="md-nav__link">
+      <a href="../../security/database-roles/" class="md-nav__link">
         
   
   
@@ -1780,7 +1579,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/deployable-surfaces/" class="md-nav__link">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
         
   
   
@@ -1808,7 +1607,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../security/callback-security/" class="md-nav__link">
+      <a href="../../security/callback-security/" class="md-nav__link">
         
   
   
@@ -1876,7 +1675,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../reference/" class="md-nav__link ">
+            <a href="../../reference/" class="md-nav__link ">
               
   
   
@@ -1920,7 +1719,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../reference/cli/" class="md-nav__link">
+      <a href="../../reference/cli/" class="md-nav__link">
         
   
   
@@ -1948,7 +1747,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../reference/rust/" class="md-nav__link">
+      <a href="../../reference/rust/" class="md-nav__link">
         
   
   
@@ -1976,7 +1775,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../reference/python/" class="md-nav__link">
+      <a href="../../reference/python/" class="md-nav__link">
         
   
   
@@ -2004,7 +1803,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../stability/" class="md-nav__link">
+      <a href="../../stability/" class="md-nav__link">
         
   
   
@@ -2032,7 +1831,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../adr/" class="md-nav__link">
+      <a href="../" class="md-nav__link">
         
   
   
@@ -2094,7 +1893,7 @@
         
           
           <div class="md-nav__link md-nav__container">
-            <a href="../contributing/" class="md-nav__link ">
+            <a href="../../contributing/" class="md-nav__link ">
               
   
   
@@ -2138,7 +1937,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../development/" class="md-nav__link">
+      <a href="../../development/" class="md-nav__link">
         
   
   
@@ -2166,7 +1965,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../benchmarking/" class="md-nav__link">
+      <a href="../../benchmarking/" class="md-nav__link">
         
   
   
@@ -2221,10 +2020,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#the-one-gate" class="md-nav__link">
+  <a href="#status" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The one gate
+        Status
       
     </span>
   </a>
@@ -2232,10 +2031,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#if-you-are-on-06-finalized" class="md-nav__link">
+  <a href="#context" class="md-nav__link">
     <span class="md-ellipsis">
       
-        If you are on 0.6, finalized
+        Context
       
     </span>
   </a>
@@ -2243,10 +2042,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#if-you-are-on-06-not-yet-finalized" class="md-nav__link">
+  <a href="#decision" class="md-nav__link">
     <span class="md-ellipsis">
       
-        If you are on 0.6, not yet finalized
+        Decision
       
     </span>
   </a>
@@ -2254,10 +2053,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#if-you-are-on-05x" class="md-nav__link">
+  <a href="#consequences" class="md-nav__link">
     <span class="md-ellipsis">
       
-        If you are on 0.5.x
+        Consequences
       
     </span>
   </a>
@@ -2265,93 +2064,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-v043-ring-rotation-ledger-migration" class="md-nav__link">
+  <a href="#alternatives-considered" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The v043 ring-rotation ledger migration
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="The v043 ring-rotation ledger migration">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#procedure-either-order-works-after-the-062-stepping-stone" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Procedure (either order works after the 0.6.2 stepping-stone)
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#after-the-flip-do-not-roll-back-to-a-pre-flip-binary" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        After the flip — do not roll back to a pre-flip binary
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#contract-08" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Contract (0.8)
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#runtime-deprecation-warning" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Runtime deprecation warning
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#rollback" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Rollback
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#v046-wait-free-admin-dirty-key-marks" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        v046: wait-free admin dirty-key marks
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#v045-opt-in-periodic-ownership" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        v045: opt-in periodic ownership
+        Alternatives considered
       
     </span>
   </a>
@@ -2386,207 +2102,40 @@
   
 
 
-<h1 id="upgrading-from-06-to-07">Upgrading from 0.6 to 0.7<a class="headerlink" href="#upgrading-from-06-to-07" title="Permanent link">&para;</a></h1>
-<p>The 0.6 → 0.7 upgrade is short: <strong>the storage step is "be finalized."</strong> Everything else in
-0.7 is additive.</p>
-<h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
-<p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
-<ul>
-<li>the cluster's storage transition is <strong>finalized</strong> (<code>awa storage status</code> reports
-  <code>state = active</code>, <code>current_engine = queue_storage</code>), or</li>
-<li>the install is <strong>fresh</strong> — a brand-new database, or a schema with no jobs and no
-  recently-live runtimes (the same conditions that let a fresh install auto-finalize at
-  worker startup).</li>
-</ul>
-<p>Any other shape — canonical with work, <code>prepared</code>, <code>mixed_transition</code> — is refused with an
-error naming the steps below. Nothing is applied on refusal; re-run <code>awa migrate</code> after
-finalizing.</p>
-<p>This is the <a href="../adr/037-canonical-engine-deprecation/">ADR-037</a> deprecation gate: the
-canonical (row-mutating) engine is deprecated in 0.7 and its claim/execution/trigger paths
-are removed in 0.8. Requiring finalization at the 0.7 boundary means no 0.7 feature ever
-needs a canonical implementation, and gives operators one unambiguous instruction.</p>
-<h2 id="if-you-are-on-06-finalized">If you are on 0.6, finalized<a class="headerlink" href="#if-you-are-on-06-finalized" title="Permanent link">&para;</a></h2>
-<p>You are done with the storage step. Deploy 0.7 binaries and run <code>awa migrate</code> as usual.</p>
-<h2 id="if-you-are-on-06-not-yet-finalized">If you are on 0.6, not yet finalized<a class="headerlink" href="#if-you-are-on-06-not-yet-finalized" title="Permanent link">&para;</a></h2>
-<p>Complete the staged transition <strong>on your 0.6 binaries</strong> first
-(full procedure: <a href="../upgrade-0.5-to-0.6/">Upgrade 0.5 to 0.6</a>):</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
+<h1 id="adr-045-hot-path-triggers-never-wait-on-another-transaction">ADR-045: Hot-path triggers never wait on another transaction<a class="headerlink" href="#adr-045-hot-path-triggers-never-wait-on-another-transaction" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Accepted. Tracked in <a href="https://github.com/hardbyte/awa/issues/492">#492</a>. Implemented by migration v046 (<code>awa-model/migrations/v046_wait_free_dirty_marks.sql</code>), the 0.6 schema patch <code>wait_free_dirty_marks</code>, the <code>hot_path_triggers_cannot_wait_on_other_transactions</code> test in <code>awa/tests/dirty_marks_wait_free_test.rs</code>, and the <code>AwaCanonicalDirtyMarks</code> TLA+ model.</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p>Every INSERT, UPDATE, or DELETE on <code>awa.jobs_hot</code> and <code>awa.scheduled_jobs</code> fires triggers, so whatever a trigger does executes inside every job transition: enqueue, claim, heartbeat, completion, re-schedule, rescue, and every application transaction that enqueues through <code>awa.jobs</code>. Since v006 the admin-metadata triggers recorded "this queue / kind needs its cached counts recomputed" with</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">admin_dirty_queues</span><span class="w"> </span><span class="p">(</span><span class="n">queue</span><span class="p">)</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">CONFLICT</span><span class="w"> </span><span class="p">(</span><span class="n">queue</span><span class="p">)</span><span class="w"> </span><span class="k">DO</span><span class="w"> </span><span class="k">NOTHING</span>
 </span></code></pre></div>
-<p>For a stopped fleet, a CLI containing #457 can replace the middle command
-with <code>awa storage enter-mixed-transition --quiesced</code>; follow the
-<a href="../upgrade-0.5-to-0.6/#quiesced-alternative-to-the-witness-runtime">quiesced procedure</a>.
-If canonical callbacks are outstanding, deploy the 0.6 backport of #462 before
-flipping routing. Neither fix requires a new schema migration.</p>
-<p>Then upgrade binaries to 0.7 and run <code>awa migrate</code>.</p>
-<p>If <code>finalize --wait</code> sits at a non-zero backlog that never falls while jobs are visibly executing, your workload probably contains <strong>perpetually snoozing jobs</strong> — handlers that end every run in <code>JobResult::Snooze</code>. On builds before <a href="https://github.com/hardbyte/awa/issues/456">#456</a> those re-entered canonical <code>scheduled_jobs</code> after each post-flip run, replenishing the backlog forever. Roll to a build carrying that fix (or apply the <a href="../upgrade-0.5-to-0.6/#known-issues">manual backlog migration</a>) before waiting on finalize.</p>
-<p>Remember the transition is a one-way door once queue-storage work is accepted; the 0.5→0.6
-guide covers the abort boundaries.</p>
-<h2 id="if-you-are-on-05x">If you are on 0.5.x<a class="headerlink" href="#if-you-are-on-05x" title="Permanent link">&para;</a></h2>
-<p>Step through 0.6: upgrade to the latest 0.6.x, run <code>awa migrate</code>, walk the staged
-transition to <code>finalize</code>, then upgrade to 0.7. A 0.7 binary will not migrate a 0.5-era
-schema directly — stepping-stone upgrades are the supported path (the same pattern Oban,
-River, and Postgres itself use).</p>
-<h2 id="the-v043-ring-rotation-ledger-migration">The v043 ring-rotation ledger migration<a class="headerlink" href="#the-v043-ring-rotation-ledger-migration" title="Permanent link">&para;</a></h2>
-<p>Migration <strong>v043</strong> (<a href="https://github.com/hardbyte/awa/issues/371">#371</a>,
-<a href="../adr/040-append-only-ring-rotation-ledger/">ADR-040</a>) moves the queue/lease/claim ring
-cursors out of the mutable <code>{ring}_ring_state</code> singleton columns (<code>current_slot</code>,
-<code>generation</code>) into append-only <code>{ring}_ring_rotations</code> ledgers (dead-tuple-free rotation
-under a pinned MVCC horizon). It is delivered as a staged <strong>expand → flip → contract</strong>
-upgrade supporting a mixed 0.6.2/0.7 fleet.</p>
-<blockquote>
-<p><strong>Required stepping-stone:</strong> first roll the whole fleet to <strong>0.6.2 or later</strong>.
-0.6.2 is the first 0.6 build that recognizes v043 as forward-compatible only
-while ring authority is <code>columns</code>, refuses unknown newer schemas without
-modifying them, and refuses to restart after the authority flip. Do not run a
-0.7 migration while a 0.6.0 or 0.6.1 binary can invoke <code>awa migrate</code>; those
-releases contain the destructive newer-schema misclassification fixed by
-<a href="https://github.com/hardbyte/awa/issues/392">#392</a>.</p>
-</blockquote>
-<p><code>awa migrate</code> enforces this stepping-stone: v043 is refused while any runtime with a
-fresh heartbeat reports a version below 0.6.2 or an unparseable version. The
-<code>--allow-live-runtimes</code> override is available for operators who have independently verified
-the fleet; it should not be needed in the normal rollout.</p>
-<p><strong>v043 is additive (the expand phase).</strong> It creates and seeds the three ledgers and the
-rollup-delta landing table, and it <strong>keeps</strong> the compat <code>current_slot</code> / <code>generation</code>
-columns in place. Each queue-storage schema gets a <code>ring_cursor_authority</code> control row
-that selects which representation is authoritative:</p>
-<ul>
-<li><code>columns</code> (compat) — the pre-0.7 singleton columns are authoritative, exactly as 0.6
-  wrote them, so a live 0.6.2 binary keeps working. 0.7 rotators additionally shadow every
-  advance into the ledger, keeping it a ready-to-promote copy.</li>
-<li><code>ledger</code> — the append-only ledgers are authoritative (the #371 dead-tuple win).</li>
-</ul>
-<p>An <strong>upgrade</strong> starts in <code>columns</code>; a <strong>fresh install</strong> starts directly in <code>ledger</code> (no
-old binary can exist). The flip is one-way.</p>
-<h3 id="procedure-either-order-works-after-the-062-stepping-stone">Procedure (either order works after the 0.6.2 stepping-stone)<a class="headerlink" href="#procedure-either-order-works-after-the-062-stepping-stone" title="Permanent link">&para;</a></h3>
-<p>First roll 0.6.2 across the fleet as a normal patch release. After that, both
-orders are supported:</p>
+<p>into tables keyed by queue and kind. <code>ON CONFLICT DO NOTHING</code> is free only when the keyed row is committed. Against a row another transaction has inserted or deleted and not yet committed, Postgres waits for that transaction. Two maintenance paths made that wait common: the 2 s drain deleted the keyed rows inside its recompute transaction, and the 60 s full refresh <code>TRUNCATE</code>d both tables under <code>ACCESS EXCLUSIVE</code> for its whole run.</p>
+<p>A production cluster showed the consequence on 2026-09-12. The refresh held every job transition for about three seconds each minute; when it committed the tables were empty and the queued transitions stampeded onto them. A re-schedule CTE fires two statement triggers (the <code>jobs_hot</code> DELETE trigger, then the <code>scheduled_jobs</code> INSERT trigger), each marking queue then kind, while a claim UPDATE marks only the queue. With a drain landing between one re-schedule's two triggers, two re-schedules in the same queue acquired the queue row and the kind row in opposite orders and deadlocked. The victim's completion was only logged, and its job sat <code>running</code> until heartbeat rescue two minutes later. The cluster recorded 37 such deadlocks in a week and roughly 3,000 transitions a day waiting more than a second behind the refresh.</p>
+<p>The v006 mitigation (sorted inserts, <code>ON CONFLICT DO NOTHING</code>) addressed lock <em>ordering</em> within one statement. The defect is that the trigger could <em>wait</em> at all: a hot-path transaction that waits on another while holding its own locks is a deadlock edge, and this edge joined transactions that shared nothing but a queue name. No amount of ordering removes an edge whose direction depends on what a concurrent drain deleted a millisecond earlier.</p>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p>A trigger on a canonical hot table may not perform any operation that can wait on another transaction, except for the one case where waiting expresses the feature itself.</p>
 <ol>
-<li><strong>Roll binaries, then migrate</strong>, or <strong>migrate, then roll binaries</strong> — either way the
-   fleet runs mixed 0.6.2/0.7 against one database once v043 is applied. In
-   compat mode a 0.6.2 rotator and a 0.7 rotator serialize on the same
-   <code>{ring}_ring_state</code> row lock, so the cursor stays correct. A 0.6.2 restart also
-   recognizes v043 while authority remains <code>columns</code>; it refuses rather than mutating the
-   schema once authority is <code>ledger</code>.</li>
+<li><strong>Shared bookkeeping written from triggers is append-only and unconstrained.</strong> The dirty marks live in <code>awa.admin_dirty_queue_marks</code> and <code>awa.admin_dirty_kind_marks</code>, which carry no index and no constraint. The trigger <code>INSERT</code> is a plain heap insert. Nothing on the hot path updates or deletes a mark. Duplicate marks are collapsed by <code>DISTINCT</code> on read.</li>
+<li><strong>The maintenance reader never takes a lock that conflicts with the hot path.</strong> The drain selects the distinct keys it can see, deletes exactly those visible rows, then recounts under READ COMMITTED statement snapshots; a mark from a transaction that commits later stays for the next drain, so the cached counts remain exact. The full refresh deletes visible marks instead of truncating. <code>TRUNCATE</code> is not used on any table a hot-path trigger writes.</li>
+<li><strong>The one permitted wait is the unique claim.</strong> <code>awa.sync_job_unique_claims</code> inserts into <code>awa.job_unique_claims</code>, whose unique index is the uniqueness feature. A wait there is a genuine duplicate racing a transition, and the transaction that loses gets the documented unique-violation outcome. It writes only the transitioning job's own claim rows.</li>
+<li><strong>The contract is executable.</strong> <code>hot_path_triggers_cannot_wait_on_other_transactions</code> enumerates every non-internal trigger on <code>jobs_hot</code> and <code>scheduled_jobs</code>, extracts each body's write targets, and fails on any target outside the allowlist, on <code>ON CONFLICT</code>, <code>TRUNCATE</code>, <code>LOCK</code>, or any row lock (<code>FOR UPDATE</code>, <code>FOR NO KEY UPDATE</code>, <code>FOR SHARE</code>, <code>FOR KEY SHARE</code>) in a trigger body, on <code>UPDATE</code>/<code>DELETE</code> outside the claim trigger, on any index or constraint on a mark table, and on <code>TRUNCATE</code> in the maintenance functions. <code>AwaCanonicalDirtyMarks</code> keeps the v006 cycle, including the production interleaving, as an expected counterexample and proves the wait-free plans never block.</li>
+<li><strong>A deadlock abort is retried, not surfaced.</strong> Every finalize path is one lease-guarded transaction, so the executor re-runs a transaction Postgres aborted with SQLSTATE <code>40P01</code> (up to three retries after the initial attempt, 10/20/40 ms backoff) and counts it in <code>awa.completion.deadlock_retry</code>. A non-zero rate of that metric means a new wait has entered the hot path.</li>
 </ol>
-<p>If you roll binaries first, a 0.7 worker <strong>refuses to start</strong> on the
-   pre-migration v040 schema — it fails closed at startup naming <code>awa migrate</code>
-   as the fix, and completes no work. Under a rolling deployment the new pods
-   crash-loop harmlessly while the remaining 0.6.2 workers keep draining
-   traffic, and come up unaided the moment the migration commits. Plan
-   capacity for that window, or migrate first to avoid it.
-2. Once <strong>every</strong> worker is on 0.7, promote to ledger authority to unlock the full #371
-   dead-tuple benefits — either:
-   - manually: <code>awa storage flip-ring-authority</code> (add <code>--schema &lt;name&gt;</code> for a custom
-     schema; <code>--check</code> prints the fleet flip-readiness and exits without changing
-     anything), or
-   - automatically: the maintenance leader auto-flips once every fresh-heartbeat runtime
-     has reported a 0.7+ <code>binary_version</code> continuously for a stable period (default 10
-     minutes; a builder knob). It logs the flip loudly.</p>
-<p>If you migrate first, roll 0.7 workers promptly. An all-0.6.2 fleet on v043 remains safe:
-crash and heartbeat rescue are batch-aware, but 0.6.2's deadline-rescue sweep does not read
-the v042 compact claim batches used for newly claimed deadline jobs. Deadline-based rescue
-for those jobs resumes when a 0.7 runtime takes maintenance leadership. Roll the
-0.6 maintenance leader promptly after migrating. Awa's built-in
-migrator applies v041-v043 in one transaction, so other sessions see v040 or v043, never an
-intermediate version. An external migration runner that commits each version separately can
-expose v041/v042; a restarting 0.6.2 worker refuses those transient schemas and connects
-normally once v043 is committed.</p>
-<p>The manual flip <strong>refuses</strong> (without <code>--force</code>) while any fresh-heartbeat runtime is not
-known to be flip-aware — i.e. a 0.6 (or pre-flip 0.7) binary might still be reading the
-compat columns. Roll the whole fleet first, or pass <code>--force</code> only once you have confirmed
-no pre-flip binary is live.</p>
-<h3 id="after-the-flip-do-not-roll-back-to-a-pre-flip-binary">After the flip — do not roll back to a pre-flip binary<a class="headerlink" href="#after-the-flip-do-not-roll-back-to-a-pre-flip-binary" title="Permanent link">&para;</a></h3>
-<p>The flip <strong>fences returning pre-flip binaries</strong>: under the three cursor locks it first
-reconciles and verifies every shadow ledger, then poisons both compat cursor fields and
-the legacy prune metadata. A database trigger rejects any later old-style cursor advance,
-including the <code>-1 -&gt; 0</code> rotation a pre-ledger binary would otherwise compute. A 0.6.2 (or
-pre-flip 0.7) binary that reconnects therefore fails loudly instead of misrouting writes
-or pruning an authoritative ledger slot.
-Rolling a binary back <strong>across the flip</strong> is therefore not supported; roll back only to
-another 0.7 build (which reads the ledger). <strong>Before</strong> the flip, the normal one-minor
-skew guarantee holds and rollback to the 0.6.2 stepping-stone is safe.</p>
-<h3 id="contract-08">Contract (0.8)<a class="headerlink" href="#contract-08" title="Permanent link">&para;</a></h3>
-<p>Dropping the compat columns for good is deferred to <strong>0.8</strong> (the contract phase), after
-ledger authority is universal and the release's capability gate excludes pre-flip binaries.
-Until then the columns remain as a cheap, cold safety net.</p>
-<p>Fresh installs are unaffected — they get ledger authority directly and never touch the
-compat path.</p>
-<h2 id="runtime-deprecation-warning">Runtime deprecation warning<a class="headerlink" href="#runtime-deprecation-warning" title="Permanent link">&para;</a></h2>
-<p>Any 0.7 worker whose effective storage resolves to the canonical engine — an unfinalized
-cluster, an explicit <code>canonical_drain</code> role, or a builder configured for canonical storage —
-logs a startup warning naming this guide. Treat it as a to-do, not an emergency: canonical
-still works in 0.7, and is gone in 0.8.</p>
-<h2 id="rollback">Rollback<a class="headerlink" href="#rollback" title="Permanent link">&para;</a></h2>
-<p>0.7's migrate <em>gate</em> itself changes nothing in the database. Migration <strong>v043</strong> is
-additive (it keeps the compat cursor columns), so applying it does <strong>not</strong> break the
-one-minor-version skew window: a 0.6.2 binary keeps working against a v043 schema in compat
-authority. The skew window only ends at the <strong>ring-authority flip</strong> (see above): after the
-flip the stale compat columns are poisoned, so a pre-flip binary fails loudly and rolling
-back across the flip is <strong>not</strong> supported — roll back only to another 0.7 build. Before
-the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downgrade path (unchanged from
-previous releases).</p>
-<h2 id="v046-wait-free-admin-dirty-key-marks">v046: wait-free admin dirty-key marks<a class="headerlink" href="#v046-wait-free-admin-dirty-key-marks" title="Permanent link">&para;</a></h2>
-<p>v046 replaces the keyed <code>admin_dirty_queues</code> / <code>admin_dirty_kinds</code> tables the
-canonical triggers wrote with <code>INSERT ... ON CONFLICT DO NOTHING</code> by append-only
-<code>admin_dirty_queue_marks</code> / <code>admin_dirty_kind_marks</code> tables with no index or
-constraint, and rewrites <code>mark_dirty_keys_*</code>, <code>recompute_dirty_admin_metadata()</code>
-and <code>refresh_admin_metadata()</code> around them. The trigger write inside every job
-transition becomes a plain heap insert that cannot wait on another transaction,
-and the full refresh no longer <code>TRUNCATE</code>s under <code>ACCESS EXCLUSIVE</code>.</p>
-<p>No operator action is required. The migration creates two small tables, copies
-pending marks, and replaces function bodies; it takes no lock that conflicts with
-job traffic. 0.6.x runtimes call the maintenance functions by name and keep
-working on the migrated schema in either order. External SQL runners apply the
-file like any other additive migration. The old tables are left in place and are
-dropped by a later contract migration.</p>
-<h2 id="v045-opt-in-periodic-ownership">v045: opt-in periodic ownership<a class="headerlink" href="#v045-opt-in-periodic-ownership" title="Permanent link">&para;</a></h2>
-<p>v045 adds ownership, retirement, and normalized desired-declaration control
-state. Existing unowned additive schedules retain their behavior. Apply the
-migration before starting an authoritative runtime; a binary-first authoritative
-startup refuses until the schema is present. No existing schedule is adopted or
-retired by migration.</p>
-<p>Roll every runtime to a cron-protocol-capable build before expecting automatic
-retirement. Fresh older instances conservatively block it even if their cron
-configuration is unrelated. Then explicitly adopt the owner's existing schedule
-names and enable complete-set registration. Inspect <code>awa cron plan OWNER</code> before
-removing declarations. A stopped fleet is an outage, never a delete signal;
-use explicit <code>cron retire-owner OWNER --apply</code> for decommissioning.</p>
-<p>Use current operator clients for owned schedules. The released 0.6.7 automatic
-enqueue and additive UPSERT paths are fenced on retired rows; old manual trigger
-uses a separate read/insert path and is outside the owned-schedule operator
-contract. Old physical deletion is rejected. Existing jobs and retries are not
-cancelled. Restore uses current database time, without replaying retired time.</p>
-<p>The Rust migrator drains cron enqueues before applying the pending range, holding
-<code>cron_jobs</code> in <code>ACCESS EXCLUSIVE</code> mode through commit. This prevents a lock-order
-cycle between released cron enqueue and earlier storage DDL. Cron evaluation
-pauses for the whole range (several seconds when upgrading from v040), then
-resumes under its missed-fire policy. Ordinary workers may still encounter the
-existing storage-DDL contention handled by the migration retry policy.</p>
-<p>External SQL runners crossing v045 in a transaction with earlier migrations must
-likewise acquire <code>LOCK TABLE awa.cron_jobs IN ACCESS EXCLUSIVE MODE</code> before the
-<strong>first</strong> pending migration, when the table already exists. Acquiring it only at
-v045 is too late. A fresh install has no old cron enqueues to drain.</p>
-<p>External SQL runners must apply the complete migration transactionally under
-the migration lock and retain the runtime-snapshot statement trigger: it makes
-old and new evidence writers share the same retirement serializer. Do not disable
-it or write declaration state independently of the snapshot transaction. The
-lock protects control-plane decisions only, not ordinary job/lease heartbeats.</p>
-<p>Reproduce the released-artifact proof with
-<code>scripts/rehearse-cron-ownership.sh</code> (disposable DATABASE_URL required); the cron
-model suite is <code>scripts/check-cron-models.sh</code>. Existing ring-authority rollback
-restrictions still apply independently of cron ownership.</p>
-<p>Reintroducing a retired desired name in a later deploy does not fail startup.
-It remains inert and visible as an ownership/retirement blocker until an operator
-restores it. Use <code>awa cron restore NAME</code> or <code>awa cron restore-owner OWNER</code> to
-preview, then add <code>--apply</code>. Restore-owner affects only that owner's retired
-schedules, preserves pause state, and starts evaluation from current database
-time. Foreign ownership still fails startup and requires explicit transfer.
-During mixed-manifest rollouts, existing definitions retain their last agreed
-value; new names can be inserted immediately. Definition updates wait for fresh
-capable fleet agreement, while removals additionally wait through grace.</p>
+<p>Adding a trigger that writes anywhere else, adding a constraint to a mark table, or re-introducing a keyed upsert on the hot path requires a new ADR that explains why the wait cannot form a cycle.</p>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<ul>
+<li>One small heap insert per DML statement on the canonical tables replaces a keyed upsert that was a read in the steady state and a wait after every drain. Marks accumulate between drains and are removed by every drain and refresh; while a maintenance leader is alive the tables stay a few rows long.</li>
+<li>The runtime role no longer needs <code>TRUNCATE</code> for the canonical maintenance path; queue-storage segment pruning still uses it on partitions.</li>
+<li>The old <code>admin_dirty_queues</code> / <code>admin_dirty_kinds</code> tables remain, unread, until a later contract migration removes them under ADR-041.</li>
+<li>The 0.6 series cannot add migration versions, so the same SQL ships there as an idempotent, versionless schema patch applied at v040 and included in the SQL export for external runners.</li>
+</ul>
+<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Sorted acquisition or a per-queue advisory lock in the trigger.</strong> Ordering does not remove the edge; a drain between two triggers of one statement still reverses it. An advisory lock per queue would serialise every transition in a queue behind the slowest one and still leave the refresh's <code>TRUNCATE</code> stall.</li>
+<li><strong>Drain in a separate short transaction, keep <code>ON CONFLICT</code>.</strong> Shortens one window but keeps the first-inserter-after-drain wait and the stampede after every refresh.</li>
+<li><strong><code>pg_notify</code> instead of mark rows.</strong> Wait-free and durable enough given the reconciliation backstop, but <code>NOTIFY</code> serialises briefly at commit under the async queue lock, and a leader that is not listening loses the signal for up to a full refresh interval. Append-only rows give the same wait-freedom with exact counts.</li>
+<li><strong>Drop the cached counts and compute on demand.</strong> Exactness without maintenance, but the admin UI and the queue-health metrics read those counts on every tick.</li>
+</ul>
 
 
 
@@ -2620,44 +2169,6 @@ capable fleet agreement, while removals additionally wait through grace.</p>
       
         <footer class="md-footer">
   
-    
-      
-      <nav class="md-footer__inner md-grid" aria-label="Footer" >
-        
-          
-          <a href="../upgrade-0.5-to-0.6/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Upgrade 0.5 to 0.6">
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-            </div>
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Previous
-              </span>
-              <div class="md-ellipsis">
-                Upgrade 0.5 to 0.6
-              </div>
-            </div>
-          </a>
-        
-        
-          
-          <a href="../grafana/" class="md-footer__link md-footer__link--next" aria-label="Next: Observability">
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Next
-              </span>
-              <div class="md-ellipsis">
-                Observability
-              </div>
-            </div>
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
-            </div>
-          </a>
-        
-      </nav>
     
   
   <div class="md-footer-meta md-typeset">
@@ -2702,14 +2213,14 @@ capable fleet agreement, while removals additionally wait through grace.</p>
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
       
-        <script src="../javascripts/language-switch.js"></script>
+        <script src="../../javascripts/language-switch.js"></script>
       
-        <script src="../javascripts/agent-docs.js"></script>
+        <script src="../../javascripts/agent-docs.js"></script>
       
     
   </body>
