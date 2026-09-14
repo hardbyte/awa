@@ -250,6 +250,32 @@ jobs:
     needs: [version-check, candidate-ci]
     runs-on: ubuntu-latest
     steps:
+      # The release body is the tag's `## [x.y.z]` section of CHANGELOG.md when
+      # one exists; otherwise GitHub's generated pull-request list.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ -z "$(tr -d '[:space:]' < release-notes.md)" ]; then
+            echo "No CHANGELOG.md section for ${version}; using generated notes."
+            rm -f release-notes.md
+            exit 0
+          fi
+          git fetch --tags --quiet
+          previous=$(git tag --sort=-v:refname | grep -vx "$tag" | grep "^v${version%.*}\." | head -1 || true)
+          if [ -n "$previous" ]; then
+            printf '\n**Full changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$previous" "$tag" >> release-notes.md
+          fi
+          echo "Release notes taken from CHANGELOG.md section [${version}]:"
+          cat release-notes.md
+
       - name: Create or verify draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -264,7 +290,12 @@ jobs:
             fi
             echo "Draft release ${tag} already exists."
           else
-            release_args=(--verify-tag --title "$tag" --generate-notes --draft)
+            release_args=(--verify-tag --title "$tag" --draft)
+            if [ -f release-notes.md ]; then
+              release_args+=(--notes-file release-notes.md)
+            else
+              release_args+=(--generate-notes)
+            fi
             if [[ "$tag" =~ (alpha|beta|rc) ]]; then
               release_args+=(--prerelease)
             fi
