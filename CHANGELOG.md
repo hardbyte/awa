@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-09-14
+
+Patch release: removes a deadlock class in the canonical engine's admin dirty-key triggers, retries finalize transactions aborted as deadlock victims, and carries the Python shutdown and storage-upgrade fixes merged since 0.6.7. No new migration version and no public API changes. The fix arrives as the idempotent schema patch `wait_free_dirty_marks`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__wait_free_dirty_marks.sql` (from `awa migrate --sql`, `--extract-to`, or `awa.schema_patches()`) after `V40`.
+
 - **Job transitions no longer wait on, or deadlock through, the admin
   dirty-key triggers ([#492](https://github.com/hardbyte/awa/issues/492)).**
   The v006 triggers marked touched queues and kinds with `INSERT ... ON
