@@ -106,6 +106,7 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
 - [ ] Safe under live load: no long `ACCESS EXCLUSIVE` holds on hot tables; note the expected wall time on realistic data volumes.
 - [ ] The current binary remains operable before migration, or startup applies the migration before any changed path runs. Test binary-first as well as migrate-first ordering.
 - [ ] Document requirements for external runners, which do not execute Rust preflights.
+- [ ] If it adds or changes a trigger on `awa.jobs_hot` / `awa.scheduled_jobs`, or a table such a trigger writes, keep [ADR-045](docs/adr/045-hot-path-trigger-lock-contract.md): no `ON CONFLICT`, `TRUNCATE`, `LOCK`, row locks (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), or writes outside the allowlist; `hot_path_triggers_cannot_wait_on_other_transactions` enforces it.
 
 **If compatibility first ships in an earlier-release patch**
 

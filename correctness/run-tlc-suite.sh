@@ -43,6 +43,10 @@ AwaMigratedRescheduleUnique.tla ;; -                                      ;; pas
 AwaMigratedRescheduleUnique.tla ;; AwaMigratedRescheduleUniqueBroken.cfg  ;; NoUnclaimedExecutable is violated ;; old lost-claim successor witness
 AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; per-row rescue fallback converges
 AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueBatchOnly.cfg   ;; Temporal property Convergence was violated ;; batch-only rescue starvation witness
+AwaCanonicalDirtyMarks.tla     ;; -                                       ;; pass ;; wait-free dirty marks: no hot-path wait, no cycle
+AwaCanonicalDirtyMarks.tla     ;; AwaCanonicalDirtyMarksOnConflict.cfg     ;; NoDeadlock is violated ;; v006 ON CONFLICT dirty-row deadlock witness
+AwaCanonicalDirtyMarks.tla     ;; AwaCanonicalDirtyMarksIncident.cfg       ;; NoDeadlock is violated ;; 2026-09-12 production re-schedule deadlock witness
+AwaCanonicalDirtyMarks.tla     ;; AwaCanonicalDirtyMarksIncidentWaitFree.cfg ;; pass ;; production interleavings under wait-free marks
 '
 
 failures=0
