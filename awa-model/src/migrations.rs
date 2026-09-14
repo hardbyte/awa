@@ -264,11 +264,19 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
                                   AND prosrc NOT LIKE '%TRUNCATE%')",
 }];
 
-/// Schema patches not yet present on a database at [`CURRENT_VERSION`].
-/// Empty when the schema is at any other version.
+/// Schema patches a database still needs to reach this binary's schema shape.
+///
+/// Below [`CURRENT_VERSION`] every patch is pending, because the migrations
+/// that export alongside it leave the pre-patch function bodies in place; at
+/// [`CURRENT_VERSION`] each patch is probed; on a newer schema nothing is
+/// pending, since a later migration may have superseded the patch.
 pub async fn pending_schema_patches(pool: &PgPool) -> Result<Vec<SchemaPatch>, AwaError> {
     let mut conn = pool.acquire().await?;
-    if current_version_conn(&mut conn).await? != CURRENT_VERSION {
+    let current = current_version_conn(&mut conn).await?;
+    if current < CURRENT_VERSION {
+        return Ok(SCHEMA_PATCHES.to_vec());
+    }
+    if current > CURRENT_VERSION {
         return Ok(Vec::new());
     }
     pending_schema_patches_conn(&mut conn).await

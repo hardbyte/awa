@@ -243,7 +243,8 @@ That writes one `V<n>__<description>.sql` file per migration, plus one
 ships without a version bump, applied by `awa migrate` after the last migration
 and recorded nowhere in `awa.schema_version`. Apply patches as repeatable
 scripts after `V40`, never as another versioned file. `awa migrate --pending
---sql` prints only the migrations and patches the database lacks. The same SQL
+--sql` prints the migrations the database lacks, plus every patch when the
+database is below `V40` and only the missing patches when it is at `V40`. The same SQL
 is also available programmatically:
 
 - Rust: `awa::migrations::migration_sql()` and `awa::migrations::schema_patch_sql(SCHEMA_PATCHES)`

@@ -491,7 +491,8 @@ async fn concurrent_reschedules_with_drain_and_refresh_never_deadlock() {
 }
 
 /// The patch is applied by `migrations::run` on a v040 schema, reported as
-/// pending beforehand and absent afterwards, and re-running is a no-op.
+/// pending on any schema below v040 and on a v040 schema that lacks it,
+/// absent afterwards, and re-running is a no-op.
 ///
 /// Runs on its own database: it drops the mark tables to simulate a cluster
 /// that took v040 before the patch existed, which would break every trigger
@@ -507,6 +508,16 @@ async fn schema_patch_is_applied_once_by_migrate() {
         .execute(&pool)
         .await
         .unwrap();
+    // Below v040 every patch is pending: an exported migration range that
+    // reaches v040 must carry the patches too, or the runner ends on the
+    // pre-patch function bodies.
+    assert_eq!(
+        awa_model::migrations::pending_schema_patches(&pool)
+            .await
+            .unwrap()
+            .len(),
+        awa_model::migrations::SCHEMA_PATCHES.len()
+    );
     awa_model::migrations::run(&pool).await.unwrap();
     assert_eq!(
         awa_model::migrations::current_version(&pool).await.unwrap(),
