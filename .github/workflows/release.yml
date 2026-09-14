@@ -475,6 +475,32 @@ jobs:
           pattern: "{binary-*,wheels-*,cli-wheels-*}"
           merge-multiple: true
 
+      # The release body is the tag's `## [x.y.z]` section of CHANGELOG.md when
+      # one exists; otherwise GitHub's generated pull-request list.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ -z "$(tr -d '[:space:]' < release-notes.md)" ]; then
+            echo "No CHANGELOG.md section for ${version}; using generated notes."
+            rm -f release-notes.md
+            exit 0
+          fi
+          git fetch --tags --quiet
+          previous=$(git tag --sort=-v:refname | grep -vx "$tag" | grep "^v${version%.*}\." | head -1 || true)
+          if [ -n "$previous" ]; then
+            printf '\n**Full changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$previous" "$tag" >> release-notes.md
+          fi
+          echo "Release notes taken from CHANGELOG.md section [${version}]:"
+          cat release-notes.md
+
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -485,7 +511,11 @@ jobs:
             if echo "$tag" | grep -qE 'alpha|beta|rc'; then
               prerelease_flag="--prerelease"
             fi
-            gh release create "$tag" --title "$tag" --generate-notes --draft $prerelease_flag
+            notes_args=(--generate-notes)
+            if [ -f release-notes.md ]; then
+              notes_args=(--notes-file release-notes.md)
+            fi
+            gh release create "$tag" --title "$tag" "${notes_args[@]}" --draft $prerelease_flag
           fi
 
       - name: Upload assets
