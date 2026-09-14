@@ -4,6 +4,23 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-09-14
+
+Patch release: widens the OpenTelemetry dependency range so `awa-metrics` unifies with a consumer's existing provider. No schema change, no migration, and no public API change.
+
+- **`awa-metrics` no longer forces a second `opentelemetry` crate into the dep
+  tree ([#489](https://github.com/hardbyte/awa/pull/489)).** The workspace
+  pinned `opentelemetry` and `opentelemetry_sdk` at `0.31`, so a consumer held
+  on 0.30 — for example through `tower-otel-http-metrics` 0.16, which has no
+  0.31+ release — ended up with both versions linked. Each carries its own
+  static global meter provider, so `AwaMetrics::from_global()` bound to a no-op
+  provider and the queue depth and lag gauges recorded into a void. The range is
+  now `>=0.30, <0.33` for both, letting Cargo unify on whatever the consumer
+  already has; the metric API surface used by `awa-metrics` (`Meter`, `Counter`,
+  `Gauge`, `Histogram`, `UpDownCounter`, `KeyValue`, `global::meter`) is
+  identical across 0.30–0.32. Backported from main; thanks to
+  [@sean-nzl](https://github.com/sean-nzl).
+
 ## [0.6.8] — 2026-09-14
 
 Patch release: removes a deadlock class in the canonical engine's admin dirty-key triggers, retries finalize transactions aborted as deadlock victims, and carries the Python shutdown and storage-upgrade fixes merged since 0.6.7. No new migration version and no public API changes. The fix arrives as the idempotent schema patch `wait_free_dirty_marks`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__wait_free_dirty_marks.sql` (from `awa migrate --sql`, `--extract-to`, or `awa.schema_patches()`) after `V40`.
