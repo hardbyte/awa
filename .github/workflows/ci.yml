@@ -165,12 +165,13 @@ jobs:
     needs: [rust-build]
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     runs-on: ubuntu-latest
-    # Sharded per #335: the migration replay suite alone took ~22 minutes as
-    # one binary, so it is partitioned per-test across four shards with
-    # cargo-nextest, the other slow binaries form `heavy`, and everything
-    # else (including new test files, automatically) lands in `rest`.
-    # Shard membership lives in scripts/ci-test-shard.sh; the lint job runs
-    # its `check` mode so renames can't silently drop coverage.
+    # Sharded per #335: the migration replay suite is partitioned per-test
+    # across four shards with cargo-nextest, the other slow awa binaries form
+    # `heavy`, every other awa test binary (including new test files,
+    # automatically) lands in `rest`, and the remaining workspace crates plus
+    # doctests run as `workspace`. Shard membership lives in
+    # scripts/ci-test-shard.sh; the lint job runs its `check` mode so renames
+    # can't silently drop coverage.
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -187,6 +188,7 @@ jobs:
           - migrations-4
           - heavy
           - rest
+          - workspace
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine
