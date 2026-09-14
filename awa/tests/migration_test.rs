@@ -10,6 +10,7 @@
 use awa::audited_sql;
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage, QueueStorage};
 use awa::{InsertOpts, InsertParams, JobArgs, UniqueOpts};
+use awa_testing::setup::TestDatabase;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
@@ -472,9 +473,8 @@ fn assert_snapshots_match(before: &[String], after: &[String], context: &str) {
 #[tokio::test]
 async fn test_full_migration_replay_converges_to_identical_schema() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("initial migrate");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let before = schema_snapshot(&pool).await;
 
@@ -648,9 +648,8 @@ async fn test_failed_fresh_install_rolls_back_every_step() {
 #[tokio::test]
 async fn test_failed_upgrade_leaves_prior_schema_untouched() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("initial migrate");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let before = schema_snapshot(&pool).await;
     let before_version = migrations::current_version(&pool).await.unwrap();
@@ -926,9 +925,8 @@ async fn test_admin_refresh_needs_no_truncate_privilege() {
 #[tokio::test]
 async fn test_install_queue_storage_substrate_is_not_public_executable() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let public_can_execute: bool = sqlx::query_scalar(
         "SELECT has_function_privilege('public', 'awa.install_queue_storage_substrate(text,integer,integer,integer,boolean)', 'EXECUTE')",
@@ -1092,10 +1090,8 @@ async fn test_step_through_upgrade_preserves_data() {
 #[tokio::test]
 async fn test_migration_sql_matches_run() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     let tables_from_run: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'awa' ORDER BY table_name",
@@ -3580,11 +3576,8 @@ async fn delete_storage_transition_singleton(pool: &PgPool) {
 
 #[tokio::test]
 async fn test_active_storage_engine_defaults_to_canonical_when_singleton_missing() {
-    let _guard = test_mutex().lock().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     delete_storage_transition_singleton(&pool).await;
 
     let active: String = sqlx::query_scalar("SELECT awa.active_storage_engine()")
@@ -3602,11 +3595,8 @@ async fn test_active_storage_engine_defaults_to_canonical_when_singleton_missing
 
 #[tokio::test]
 async fn test_inserts_succeed_when_singleton_missing() {
-    let _guard = test_mutex().lock().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     delete_storage_transition_singleton(&pool).await;
 
     // Single insert path goes through awa.insert_job_compat, which calls
@@ -3667,11 +3657,8 @@ async fn test_inserts_succeed_when_singleton_missing() {
 
 #[tokio::test]
 async fn test_v011_reseeds_singleton_when_upgrading_from_v010() {
-    let _guard = test_mutex().lock().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-
-    migrations::run(&pool).await.unwrap();
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     // Simulate a database that received v010 but lost its singleton row
     // and is being re-migrated from v10 → current. Roll the recorded
@@ -4187,9 +4174,8 @@ async fn test_newer_schema_guard_leaves_normal_paths_untouched() {
 #[tokio::test]
 async fn test_exclusive_window_preflight_refuses_with_live_runtime() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("migrate to head");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     // A heartbeat inside the window — healthy is TRUE, matching a still-running
     // worker (also what a kill -9 leaves behind).
@@ -4222,9 +4208,8 @@ async fn test_exclusive_window_preflight_refuses_with_live_runtime() {
 #[tokio::test]
 async fn test_exclusive_window_preflight_passes_with_stale_runtime() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("migrate to head");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
 
     insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
     sqlx::raw_sql("UPDATE awa.runtime_instances SET last_seen_at = now() - interval '10 minutes'")
@@ -4244,9 +4229,8 @@ async fn test_exclusive_window_preflight_passes_with_stale_runtime() {
 #[tokio::test]
 async fn test_runtime_version_floor_override_allows_old_live_runtime() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("migrate to head");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     // Finalize (so the ADR-037 gate passes), add a live worker, then rewind so
     // a real pending range crosses v043 with the worker heartbeating.
     simulate_non_canonical_compat_routing(&pool).await;
@@ -4274,9 +4258,8 @@ async fn test_runtime_version_floor_override_allows_old_live_runtime() {
 #[tokio::test]
 async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("migrate to head");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
 
@@ -4317,9 +4300,8 @@ async fn test_runtime_version_floor_refuses_old_or_unparseable_live_runtime() {
 #[tokio::test]
 async fn test_runtime_version_floor_ignores_stale_old_runtime() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("migrate to head");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
     sqlx::raw_sql(
@@ -4346,9 +4328,8 @@ async fn test_runtime_version_floor_ignores_stale_old_runtime() {
 #[tokio::test]
 async fn test_live_migration_retries_hot_table_deadlock() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("migrate to head");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     simulate_non_canonical_compat_routing(&pool).await;
     insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
     rewind_schema_version(&pool, 43).await;
@@ -4359,7 +4340,7 @@ async fn test_live_migration_retries_hot_table_deadlock() {
     .await
     .expect("read initial deadlock counter");
 
-    let mut blocker = PgConnection::connect(&migration_database_url())
+    let mut blocker = PgConnection::connect(&db.url())
         .await
         .expect("connect deadlock blocker");
     sqlx::raw_sql("BEGIN; LOCK TABLE awa.deferred_jobs IN ROW EXCLUSIVE MODE")
@@ -4439,9 +4420,8 @@ async fn test_live_migration_retries_hot_table_deadlock() {
 #[tokio::test]
 async fn test_exclusive_window_skipped_for_noncrossing_range() {
     let _guard = acquire_migration_guard().await;
-    let pool = pool().await;
-    reset_schema(&pool).await;
-    migrations::run(&pool).await.expect("migrate to head");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     assert_eq!(
         migrations::current_version(&pool).await.unwrap(),
         migrations::CURRENT_VERSION
