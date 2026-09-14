@@ -370,22 +370,48 @@ impl JobExecutor {
 
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
             tokio::spawn(async move {
-                let outcome = complete_job(
-                    &pool,
-                    &job,
-                    queue_storage_claim.as_ref(),
-                    queue_storage_unique_states.as_deref(),
-                    &result,
-                    &completion_batcher,
-                    progress_snapshot,
-                    duration,
-                    has_lifecycle_handlers,
-                    &enqueue_specs,
-                    &storage,
-                    dlq_enabled,
-                    &metrics,
-                )
-                .await;
+                // Every finalize path is one lease-guarded transaction, and a
+                // deadlock abort rolls the whole transaction back, so running
+                // it again is safe. Without the retry the job would sit
+                // `running` until heartbeat rescue re-ran the handler.
+                let mut deadlock_retries = 0u32;
+                let outcome = loop {
+                    let outcome = complete_job(
+                        &pool,
+                        &job,
+                        queue_storage_claim.as_ref(),
+                        queue_storage_unique_states.as_deref(),
+                        &result,
+                        &completion_batcher,
+                        progress_snapshot.clone(),
+                        duration,
+                        has_lifecycle_handlers,
+                        &enqueue_specs,
+                        &storage,
+                        dlq_enabled,
+                        &metrics,
+                    )
+                    .await;
+                    match outcome {
+                        Err(err)
+                            if err.is_deadlock()
+                                && deadlock_retries < COMPLETION_DEADLOCK_RETRIES =>
+                        {
+                            deadlock_retries += 1;
+                            metrics.record_completion_deadlock_retry(&job_kind, &job_queue);
+                            let delay = completion_deadlock_backoff(deadlock_retries);
+                            warn!(
+                                job_id,
+                                retry = deadlock_retries,
+                                max_retries = COMPLETION_DEADLOCK_RETRIES,
+                                delay_ms = delay.as_millis() as u64,
+                                "Completion transaction aborted by the deadlock detector; retrying"
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                        outcome => break outcome,
+                    }
+                };
 
                 match &outcome {
                     Ok(CompletionOutcome::Applied { terminal, .. }) => {
@@ -462,6 +488,17 @@ impl JobExecutor {
         }
         .instrument(span)
     }
+}
+
+/// How many times a finalize transaction is re-run after Postgres aborts it
+/// to break a lock cycle before the failure is surfaced.
+const COMPLETION_DEADLOCK_RETRIES: u32 = 3;
+
+/// Short exponential backoff between deadlock retries (10ms, 20ms, 40ms, ...).
+/// Postgres aborts only one party of a cycle, so the survivor has usually
+/// committed by the time the retry runs.
+fn completion_deadlock_backoff(retry: u32) -> Duration {
+    Duration::from_millis(10u64 << retry.saturating_sub(1).min(4))
 }
 
 /// Update job state in the database based on handler result.

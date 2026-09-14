@@ -511,7 +511,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (from.unwrap_or(0), to.unwrap_or(current_version))
             };
 
-            if range_from >= range_to {
+            // Schema patches are idempotent repairs the 0.6 series ships without a
+            // version bump. They accompany any range that reaches the current
+            // version and are emitted as repeatable scripts, never as a second
+            // V40. With --pending only the patches the database lacks are listed.
+            let patches: Vec<(&str, &str, String)> = if pending {
+                let db_url = require_pool(&cli.database_url)?;
+                let pool = PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&db_url)
+                    .await?;
+                let missing = awa_model::migrations::pending_schema_patches(&pool).await?;
+                awa_model::migrations::schema_patch_sql(&missing)
+            } else if range_to >= current_version {
+                awa_model::migrations::schema_patch_sql(awa_model::migrations::SCHEMA_PATCHES)
+            } else {
+                Vec::new()
+            };
+
+            if range_from >= range_to && patches.is_empty() {
                 if pending {
                     println!("Schema is up to date (version {range_from}).");
                 } else {
@@ -520,9 +538,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            let selected = awa_model::migrations::migration_sql_range(range_from, range_to);
+            let selected = if range_from >= range_to {
+                Vec::new()
+            } else {
+                awa_model::migrations::migration_sql_range(range_from, range_to)
+            };
 
-            if selected.is_empty() {
+            if selected.is_empty() && patches.is_empty() {
                 println!("No migrations matched the selected range.");
                 return Ok(());
             }
@@ -532,11 +554,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for (v, description, sql_text) in &selected {
                     println!("-- Migration V{v}: {description}\n{sql_text}\n");
                 }
+                for (name, description, sql_text) in &patches {
+                    println!(
+                        "-- Schema patch R__{name}: {description} (idempotent; apply after V{current_version})\n{sql_text}\n"
+                    );
+                }
             } else if let Some(dir) = extract_to {
                 std::fs::create_dir_all(&dir)?;
                 for (v, description, sql_text) in &selected {
-                    let filename = format!("{dir}/V{v}__{description}.sql");
-                    let filename = filename.replace(' ', "_");
+                    // Descriptions are prose; keep only filename-safe characters so
+                    // a '/' or ':' cannot turn into a path component.
+                    let slug: String = description
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                                c
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect();
+                    let filename = format!("{dir}/V{v}__{slug}.sql");
+                    std::fs::write(&filename, sql_text)?;
+                    println!("Extracted: {filename}");
+                }
+                for (name, _, sql_text) in &patches {
+                    let filename = format!("{dir}/R__{name}.sql");
                     std::fs::write(&filename, sql_text)?;
                     println!("Extracted: {filename}");
                 }
