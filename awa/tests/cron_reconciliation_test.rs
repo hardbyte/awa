@@ -4,6 +4,7 @@ mod ci_timing;
 
 use awa::model::{cron, cron_reconciliation as reconcile, migrations};
 use awa::{PeriodicJob, PeriodicReconciliation};
+use awa_testing::setup::TestDatabase;
 use chrono::{Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -37,15 +38,10 @@ async fn get(pool: &PgPool, name: &str) -> cron::CronJobRow {
         .find(|r| r.name == name)
         .unwrap()
 }
-async fn init(pool: &PgPool) {
-    static MIGRATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _guard = MIGRATE.lock().await;
-    migrations::run(pool).await.unwrap();
-}
-
-#[sqlx::test]
-async fn migration_drains_cron_before_locking_job_relations(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn migration_drains_cron_before_locking_job_relations() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     // Replay the released 0.6.7 pending range on an empty, rerunnable schema.
     sqlx::query("DELETE FROM awa.schema_version WHERE version > 40")
         .execute(&pool)
@@ -105,9 +101,10 @@ fn explicit_authority_and_canonical_manifest() {
     );
 }
 
-#[sqlx::test]
-async fn explicit_empty_retires_only_its_owner(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn explicit_empty_retires_only_its_owner() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     publish(&pool, a, &config("billing", 0), &[job("invoice")]).await;
@@ -129,9 +126,10 @@ async fn explicit_empty_retires_only_its_owner(pool: PgPool) {
     assert!(get(&pool, "unowned").await.retired_at.is_none());
 }
 
-#[sqlx::test]
-async fn ownership_and_retirement_require_explicit_actions(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn ownership_and_retirement_require_explicit_actions() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     cron::upsert_cron_job(&pool, &job("invoice")).await.unwrap();
     let id = Uuid::new_v4();
     publish(&pool, id, &config("billing", 0), &[job("invoice")]).await;
@@ -202,9 +200,10 @@ async fn ownership_and_retirement_require_explicit_actions(pool: PgPool) {
     assert!(row.last_enqueued_at.unwrap() >= before);
 }
 
-#[sqlx::test]
-async fn transient_conflict_resets_grace_between_leader_passes(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn transient_conflict_resets_grace_between_leader_passes() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = config("billing", 150);
@@ -236,9 +235,10 @@ async fn transient_conflict_resets_grace_between_leader_passes(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
-async fn unknown_runtime_and_outage_never_authorize_retirement(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn unknown_runtime_and_outage_never_authorize_retirement() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let id = Uuid::new_v4();
     let old = Uuid::new_v4();
     publish(&pool, id, &config("billing", 0), &[job("invoice")]).await;
@@ -269,9 +269,10 @@ async fn unknown_runtime_and_outage_never_authorize_retirement(pool: PgPool) {
     assert!(get(&pool, "invoice").await.retired_at.is_some());
 }
 
-#[sqlx::test]
-async fn conflicting_publication_serializes_before_reconciliation(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn conflicting_publication_serializes_before_reconciliation() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     publish(&pool, a, &config("billing", 0), &[job("invoice")]).await;
@@ -298,9 +299,10 @@ async fn conflicting_publication_serializes_before_reconciliation(pool: PgPool) 
     assert!(get(&pool, "invoice").await.retired_at.is_none());
 }
 
-#[sqlx::test]
-async fn snapshot_trigger_fences_legacy_publication(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn snapshot_trigger_fences_legacy_publication() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let mut tx = pool.begin().await.unwrap();
     reconcile::lock(&mut tx).await.unwrap();
     let other = pool.clone();
@@ -313,9 +315,10 @@ async fn snapshot_trigger_fences_legacy_publication(pool: PgPool) {
     task.await.unwrap();
 }
 
-#[sqlx::test]
-async fn migration_and_grace_survive_restarts_but_not_evidence_gaps(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn migration_and_grace_survive_restarts_but_not_evidence_gaps() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let id = Uuid::new_v4();
     let c = config("billing", 100);
     publish(&pool, id, &c, &[job("invoice")]).await;
@@ -347,9 +350,10 @@ async fn migration_and_grace_survive_restarts_but_not_evidence_gaps(pool: PgPool
     );
 }
 
-#[sqlx::test]
-async fn proposed_manifest_is_read_only_and_explains_all_changes(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn proposed_manifest_is_read_only_and_explains_all_changes() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let id = Uuid::new_v4();
     publish(
         &pool,
@@ -382,9 +386,10 @@ async fn proposed_manifest_is_read_only_and_explains_all_changes(pool: PgPool) {
     assert_eq!(cron::list_cron_jobs(&pool).await.unwrap().len(), 3);
 }
 
-#[sqlx::test]
-async fn failed_start_does_not_publish_authority(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn failed_start_does_not_publish_authority() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = awa::Client::builder(pool.clone())
         .queue("test", awa::QueueConfig::default())
@@ -411,9 +416,11 @@ async fn failed_start_does_not_publish_authority(pool: PgPool) {
 
 /// Released executable built by scripts/rehearse-cron-ownership.sh. Exercises
 /// released functions and a real old maintenance leader, not copied SQL.
-#[sqlx::test]
+#[tokio::test]
 #[ignore = "requires the released 0.6.7 probe; scripts/rehearse-cron-ownership.sh"]
-async fn released_old_leader_cannot_fire_retired_schedule(pool: PgPool) {
+async fn released_old_leader_cannot_fire_retired_schedule() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     use sqlx::ConnectOptions;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -573,9 +580,10 @@ async fn released_old_leader_cannot_fire_retired_schedule(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
-async fn review_mixed_manifests_do_not_flip_definitions(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn review_mixed_manifests_do_not_flip_definitions() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let c = config("billing", 0);
@@ -598,9 +606,10 @@ async fn review_mixed_manifests_do_not_flip_definitions(pool: PgPool) {
     assert_eq!(get(&pool, "invoice").await.cron_expr, new.cron_expr);
 }
 
-#[sqlx::test]
-async fn review_operator_action_preserves_unrelated_owner_and_row_locks(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn review_operator_action_preserves_unrelated_owner_and_row_locks() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     publish(
         &pool,
         Uuid::new_v4(),
@@ -663,9 +672,10 @@ async fn review_operator_action_preserves_unrelated_owner_and_row_locks(pool: Pg
     row_lock.rollback().await.unwrap();
 }
 
-#[sqlx::test]
-async fn review_retired_additive_registration_is_quiet(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn review_retired_additive_registration_is_quiet() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     cron::upsert_cron_job(&pool, &job("unowned")).await.unwrap();
     reconcile::operate(
         &pool,
@@ -691,9 +701,10 @@ async fn review_retired_additive_registration_is_quiet(pool: PgPool) {
     assert!(!error.contains("durable ownership"), "{error}");
 }
 
-#[sqlx::test]
-async fn review_read_only_plans_do_not_wait_for_evidence_writer(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn review_read_only_plans_do_not_wait_for_evidence_writer() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let mut writer = pool.begin().await.unwrap();
     reconcile::lock(&mut writer).await.unwrap();
     tokio::time::timeout(
@@ -710,9 +721,10 @@ async fn review_read_only_plans_do_not_wait_for_evidence_writer(pool: PgPool) {
     writer.rollback().await.unwrap();
 }
 
-#[sqlx::test]
-async fn review_conflicts_never_persist_agreement_on_heartbeat(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn review_conflicts_never_persist_agreement_on_heartbeat() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     cron::upsert_cron_job(&pool, &job("unowned")).await.unwrap();
     let id = Uuid::new_v4();
     for _ in 0..2 {
@@ -730,9 +742,10 @@ async fn review_conflicts_never_persist_agreement_on_heartbeat(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
-async fn retired_desired_names_allow_startup_and_owner_restore(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn retired_desired_names_allow_startup_and_owner_restore() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let c = config("billing", 0);
     publish(
         &pool,
@@ -794,9 +807,10 @@ async fn retired_desired_names_allow_startup_and_owner_restore(pool: PgPool) {
     assert!(get(&pool, "invoice").await.paused_at.is_some());
 }
 
-#[sqlx::test]
-async fn protocol_capability_matches_schema_and_legacy_reset_is_idempotent(pool: PgPool) {
-    init(&pool).await;
+#[tokio::test]
+async fn protocol_capability_matches_schema_and_legacy_reset_is_idempotent() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let schema_version: i32 = sqlx::query_scalar("SELECT awa.cron_protocol_version()")
         .fetch_one(&pool)
         .await
