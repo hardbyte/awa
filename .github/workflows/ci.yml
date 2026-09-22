@@ -15,11 +15,46 @@ env:
   SQLX_OFFLINE: "true"
   DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
-# PRs default to a low-minute gate so AWA does not monopolize shared Actions
-# capacity across repositories. Add the `full-ci` label, dispatch CI manually,
-# or merge to main or a release branch to run the expensive DB/Python/E2E/smoke matrix.
-
 jobs:
+  changes:
+    name: Select PR checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      full: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+      rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      skills: ${{ steps.filter.outputs.skills }}
+    steps:
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'full-ci')
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '**/.cargo/**'
+              - '**/rust-toolchain*'
+              - '**/*rustfmt.toml'
+              - '**/*.sql'
+              - '**/.sqlx/**'
+              - 'scripts/ci-test-shard.sh'
+              - '.github/workflows/ci.yml'
+            python:
+              - 'awa-python/**'
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'awa-ui/frontend/**'
+              - '.github/workflows/ci.yml'
+            skills:
+              - 'skills/**'
+              - '.github/workflows/ci.yml'
+
   # The release workflow requires a successful branch-push CI run on the exact
   # tagged SHA. Keep the storage models here so that gate covers the executable
   # tests and their formal concurrency model together.
@@ -40,6 +75,8 @@ jobs:
   # ─── Rust ───────────────────────────────────────────────
   rust-lint:
     name: Rust lint (fmt + clippy)
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -49,8 +86,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           workspaces: |
             . -> target
+            awa-python -> target
             examples/rust-app-demo -> target
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -80,6 +119,8 @@ jobs:
 
   agent-skills:
     name: Agent Skills validate
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.skills == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -329,7 +370,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "awa-python -> awa-python/target"
+          prefix-key: v1-rust
+          workspaces: "awa-python -> target"
           key: "py${{ matrix.python }}"
       - uses: actions/setup-python@v6
         with:
@@ -361,6 +403,8 @@ jobs:
   # A targeted old-interpreter regression supplements the newest-two full suite.
   python-shutdown:
     name: Python 3.12 wheel shutdown
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -380,7 +424,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "awa-python -> awa-python/target"
+          prefix-key: v1-rust
+          workspaces: "awa-python -> target"
           key: py-shutdown-312
       - uses: actions/setup-python@v6
         with:
@@ -400,6 +445,8 @@ jobs:
   # ─── Frontend ──────────────────────────────────────────
   frontend-lint:
     name: Frontend lint + typecheck
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -606,7 +653,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          prefix-key: v1-rust
+          workspaces: |
+            . -> target
+            awa-python -> target
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -666,9 +716,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           workspaces: |
             . -> target
-            awa-python -> awa-python/target
+            awa-python -> target
       - uses: astral-sh/setup-uv@v7
       - name: Wait for Postgres
         run: until pg_isready -h localhost -p 5432; do sleep 1; done

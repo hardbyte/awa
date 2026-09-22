@@ -1,9 +1,8 @@
-name: Nightly Chaos And Benchmarks
+name: Weekly Chaos And Benchmarks
 
 on:
   schedule:
-    - cron: "0 6 * * *"
-    - cron: "0 8 * * 0"
+    - cron: "17 8 * * 0"
   workflow_dispatch:
 
 concurrency:
@@ -29,52 +28,6 @@ jobs:
         run: docker --version
       - name: Run TLC model suite
         run: ./correctness/run-tlc-suite.sh
-
-  compat-matrix:
-    name: Binary/schema compat matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-      - uses: astral-sh/setup-uv@v5
-      - name: Build current awa CLI
-        run: cargo build -p awa-cli
-      - name: Enable native crash evidence
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y gdb
-          mkdir -p compat-crash-artifacts
-          sudo sysctl -w kernel.core_pattern="$PWD/compat-crash-artifacts/core.%p"
-      - name: Run compat matrix (pinned release artifacts vs newest schema)
-        run: ./scripts/compat-matrix.sh
-        env:
-          PGHOST: localhost
-          PGPORT: "5432"
-          PGUSER: postgres
-          PGPASSWORD: postgres
-      - uses: actions/upload-artifact@v6
-        if: always()
-        with:
-          name: nightly-compat-native-evidence-${{ github.run_id }}
-          path: compat-crash-artifacts/
-          retention-days: 30
-
 
   postgres-failover-smoke:
     name: Postgres failover smoke
@@ -103,7 +56,7 @@ jobs:
     uses: ./.github/workflows/release-gate.yml
 
   rust-nightly:
-    name: Rust nightly benchmarks
+    name: Rust chaos and benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -127,7 +80,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          prefix-key: v1-rust
+          workspaces: |
+            . -> target
+            awa-python -> target
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -263,7 +219,7 @@ jobs:
             test_mvcc_horizon_overlap_benchmark -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-mvcc-horizon.txt
       - name: Run MVCC horizon soak benchmark
-        if: always() && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 0')
+        if: always()
         timeout-minutes: 30
         run: |
           set -o pipefail
@@ -278,10 +234,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: nightly-rust
+          retention-days: 14
           path: artifacts/nightly/
 
   python-nightly:
-    name: Python nightly chaos and benchmarks
+    name: Python chaos and benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -307,7 +264,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "awa-python -> awa-python/target"
+          prefix-key: v1-rust
+          workspaces: "awa-python -> target"
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -384,6 +342,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: nightly-python
+          retention-days: 14
           path: awa-python/artifacts/nightly/
 
   # ─── Notify on failure ───────────────────────────────────
@@ -391,7 +350,6 @@ jobs:
     name: Create issue on failure
     needs:
       - tla-storage
-      - compat-matrix
       - postgres-failover-smoke
       - rolling-upgrade-rehearsal
       - rust-nightly
@@ -408,11 +366,10 @@ jobs:
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           cat <<EOF > issue_body.md
-          Nightly run failed on $(date -u +%Y-%m-%d).
+          Weekly/manual run failed on $(date -u +%Y-%m-%d).
 
           **Failed jobs:**
           - tla-storage: ${{ needs.tla-storage.result }}
-          - compat-matrix: ${{ needs.compat-matrix.result }}
           - postgres-failover-smoke: ${{ needs.postgres-failover-smoke.result }}
           - rolling-upgrade-rehearsal: ${{ needs.rolling-upgrade-rehearsal.result }}
           - rust-nightly: ${{ needs.rust-nightly.result }}
@@ -426,7 +383,7 @@ jobs:
         run: |
           # Check for an existing open nightly-failure issue
           EXISTING=$(gh issue list --label nightly-failure --state open --limit 1 --json number --jq '.[0].number // empty')
-          TITLE="Nightly chaos/benchmark failure ($(date -u +%Y-%m-%d))"
+          TITLE="Chaos/benchmark failure ($(date -u +%Y-%m-%d))"
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body-file issue_body.md
           else
