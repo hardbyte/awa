@@ -2416,6 +2416,9 @@
 queue-storage schemas without changing function signatures or cursor semantics.
 Existing provisioned lanes run without schema CREATE; single-role owners retain
 lazy creation. The migration adds no runtime version gate or authority flip.</p>
+<p>A <a href="https://github.com/hardbyte/awa/pull/501#compatibility-evidence">migrate-first rehearsal with released <code>awa-pg==0.6.7</code></a>
+verified a restricted worker completing jobs on the upgraded schema. That
+rehearsal does not cover concurrent mixed-version rollouts.</p>
 <p>For a runtime without DDL privileges, apply v047 as the migrator, run
 <code>awa storage prepare-queue --queue &lt;name&gt;</code> for every physical queue, and grant
 sequence <code>USAGE, SELECT, UPDATE</code> before starting producers or workers. Match
