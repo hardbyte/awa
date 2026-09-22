@@ -299,8 +299,8 @@ pub async fn wait_for_counts(
 /// is dropped when the value goes out of scope.
 ///
 /// The template name carries a fingerprint of the migration SQL, so a changed
-/// migration invalidates it; templates with other fingerprints and clones
-/// left behind by killed processes are pruned when a template is built.
+/// migration selects a new template. Other templates and abandoned clones
+/// are retained; each instance only drops its own clone.
 pub struct TestDatabase {
     name: String,
     admin_url: String,
@@ -310,7 +310,6 @@ pub struct TestDatabase {
 const TEMPLATE_PREFIX: &str = "awa_tpl_";
 const CLONE_PREFIX: &str = "awa_t_";
 const TEMPLATE_BUILD_LOCK_KEY: i64 = 0x6177615f7470;
-const STALE_CLONE_AGE: Duration = Duration::from_secs(30 * 60);
 
 static CANONICAL_TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 static CLONE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -409,7 +408,10 @@ impl Drop for TestDatabase {
 }
 
 async fn ensure_canonical_template() -> String {
-    let name = format!("{TEMPLATE_PREFIX}{:016x}", schema_fingerprint());
+    ensure_template(format!("{TEMPLATE_PREFIX}{:016x}", schema_fingerprint())).await
+}
+
+async fn ensure_template(name: String) -> String {
     let admin_url = admin_database_url();
     let mut admin = connect(&admin_url).await;
     sqlx::query("SELECT pg_advisory_lock($1)")
@@ -418,7 +420,6 @@ async fn ensure_canonical_template() -> String {
         .await
         .expect("template build lock");
     if !database_exists(&mut admin, &name).await {
-        prune_stale_databases(&mut admin, &name).await;
         let build_name = format!("{name}_build_{}", std::process::id());
         sqlx::raw_sql(audited_sql(format!(
             "DROP DATABASE IF EXISTS {build_name} WITH (FORCE)"
@@ -470,40 +471,6 @@ async fn database_exists(admin: &mut sqlx::postgres::PgConnection, name: &str) -
         .expect("pg_database lookup")
 }
 
-/// Drop templates built from other migration fingerprints and clones whose
-/// owning process is long gone (the clone name carries its creation time).
-async fn prune_stale_databases(admin: &mut sqlx::postgres::PgConnection, keep_template: &str) {
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT datname FROM pg_database \
-         WHERE starts_with(datname, $1) OR starts_with(datname, $2)",
-    )
-    .bind(TEMPLATE_PREFIX)
-    .bind(CLONE_PREFIX)
-    .fetch_all(&mut *admin)
-    .await
-    .expect("listing test databases");
-    let cutoff = unix_time_secs().saturating_sub(STALE_CLONE_AGE.as_secs());
-    for name in names {
-        let stale = if let Some(rest) = name.strip_prefix(CLONE_PREFIX) {
-            rest.split('_')
-                .next()
-                .and_then(|secs| secs.parse::<u64>().ok())
-                .is_some_and(|created| created < cutoff)
-        } else if name.strip_prefix(TEMPLATE_PREFIX).is_some() {
-            name != keep_template && !name.starts_with(&format!("{keep_template}_build_"))
-        } else {
-            false
-        };
-        if stale {
-            let _ = sqlx::raw_sql(audited_sql(format!(
-                "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-            )))
-            .execute(&mut *admin)
-            .await;
-        }
-    }
-}
-
 async fn connect(url: &str) -> sqlx::postgres::PgConnection {
     sqlx::postgres::PgConnection::connect(url)
         .await
@@ -533,4 +500,69 @@ fn unix_time_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database_guard(name: String) -> TestDatabase {
+        let admin_url = admin_database_url();
+        let pool = PgPoolOptions::new()
+            .connect_lazy(&replace_database_name(&admin_url, &name))
+            .expect("test database URL");
+        TestDatabase {
+            name,
+            admin_url,
+            pool,
+        }
+    }
+
+    #[tokio::test]
+    async fn building_a_template_preserves_other_templates_and_live_clones() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let old_template = database_guard(format!("{TEMPLATE_PREFIX}{suffix}_old"));
+        let active_clone = database_guard(format!("{CLONE_PREFIX}0_{suffix}"));
+        let new_template = database_guard(format!("{TEMPLATE_PREFIX}{suffix}_new"));
+        let next_clone = database_guard(format!("{CLONE_PREFIX}1_{suffix}"));
+        let mut admin = connect(&admin_database_url()).await;
+        sqlx::raw_sql(audited_sql(format!(
+            "CREATE DATABASE {}",
+            old_template.name()
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        sqlx::raw_sql(audited_sql(format!(
+            "CREATE DATABASE {} TEMPLATE {}",
+            active_clone.name(),
+            old_template.name()
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        let mut active_connection = active_clone.pool().acquire().await.unwrap();
+
+        ensure_template(new_template.name().to_owned()).await;
+
+        let old_template_exists = database_exists(&mut admin, old_template.name()).await;
+        let active_clone_exists = database_exists(&mut admin, active_clone.name()).await;
+        assert!(
+            old_template_exists && active_clone_exists,
+            "template preserved: {old_template_exists}, live clone preserved: {active_clone_exists}"
+        );
+        let value: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut *active_connection)
+            .await
+            .unwrap();
+        assert_eq!(value, 1);
+        sqlx::raw_sql(audited_sql(format!(
+            "CREATE DATABASE {} TEMPLATE {}",
+            next_clone.name(),
+            old_template.name()
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    }
 }

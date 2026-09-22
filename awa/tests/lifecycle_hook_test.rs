@@ -85,6 +85,11 @@ async fn test_typed_completed_event_handler_runs() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = Client::builder(pool.clone())
+        .queue_storage(
+            Default::default(),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+        )
         .queue(
             queue,
             QueueConfig {
