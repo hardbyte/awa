@@ -1,6 +1,7 @@
 -- Refresh the invoker helpers in every installed queue-storage schema.
 -- N-1 binaries keep the same functions, arguments, tables, and cursor semantics.
 -- Provisioned lanes require no DDL; schema owners retain lazy lane creation.
+-- Compatibility evidence: https://github.com/hardbyte/awa/pull/501#compatibility-evidence
 
 DO $$
 DECLARE
