@@ -96,9 +96,9 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   test_mvcc_horizon_overlap_benchmark -- --ignored --exact --nocapture
 ```
 
-This scenario is also wired into `.github/workflows/nightly-chaos.yml` and runs on PostgreSQL 18 in the Rust nightly benchmark lane.
+This scenario is also wired into `.github/workflows/nightly-chaos.yml` and runs on PostgreSQL 18 in the Rust benchmark job, scheduled weekly and available manually.
 
-The nightly lane uses a shorter CI profile so the benchmark stays cheap on shared runners while still exercising overlap readers and cleanup pressure:
+The scheduled job uses a shorter CI profile so the benchmark stays cheap on shared runners while still exercising overlap readers and cleanup pressure:
 
 - `AWA_MVCC_JOB_RATE=400`
 - `AWA_MVCC_BASELINE_SECS=5`
@@ -110,9 +110,9 @@ The nightly lane uses a shorter CI profile so the benchmark stays cheap on share
 - `AWA_MVCC_READER_MODE=active_scan`
 - `AWA_MVCC_ANALYTICS_TICK_MS=500`
 
-Nightly regression checks use per-run ratios (`overlap_handler_per_s` and `cooldown_handler_per_s` relative to the same run's baseline window) plus guardrails on `dead_tup_delta` and `max_available`.
+CI regression checks use per-run ratios (`overlap_handler_per_s` and `cooldown_handler_per_s` relative to the same run's baseline window) plus guardrails on `dead_tup_delta` and `max_available`.
 
-That nightly profile is intentionally short. It checks that Awa still behaves reasonably under overlapping analytical readers, but it is not the same thing as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a closer reproduction, increase duration and reader hold times and keep the readers in `active_scan` mode so queries overlap continuously rather than simulating only `idle in transaction`.
+That CI profile is intentionally short. It checks that Awa still behaves reasonably under overlapping analytical readers, but it is not the same thing as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a closer reproduction, increase duration and reader hold times and keep the readers in `active_scan` mode so queries overlap continuously rather than simulating only `idle in transaction`.
 
 A second ignored benchmark target now exists for that longer profile: `test_mvcc_horizon_planetscale_soak`. Its default shape is closer to the blog's mixed-workload setup:
 
@@ -122,7 +122,7 @@ A second ignored benchmark target now exists for that longer profile: `test_mvcc
 - `20s` stagger between readers
 - `15m` overlap window with `active_scan`
 
-That soak benchmark is wired into CI as a weekly/manual run, while the shorter `test_mvcc_horizon_overlap_benchmark` remains the daily nightly smoke.
+Both the soak benchmark and the shorter `test_mvcc_horizon_overlap_benchmark` run weekly and on manual dispatch.
 
 ### MVCC bench knobs
 

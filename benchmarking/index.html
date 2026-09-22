@@ -2911,8 +2911,8 @@
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--release<span class="w"> </span>--package<span class="w"> </span>awa<span class="w"> </span>--test<span class="w"> </span>scheduling_benchmark_test<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>test_mvcc_horizon_overlap_benchmark<span class="w"> </span>--<span class="w"> </span>--ignored<span class="w"> </span>--exact<span class="w"> </span>--nocapture
 </span></code></pre></div>
-<p>This scenario is also wired into <code>.github/workflows/nightly-chaos.yml</code> and runs on PostgreSQL 18 in the Rust nightly benchmark lane.</p>
-<p>The nightly lane uses a shorter CI profile so the benchmark stays cheap on shared runners while still exercising overlap readers and cleanup pressure:</p>
+<p>This scenario is also wired into <code>.github/workflows/nightly-chaos.yml</code> and runs on PostgreSQL 18 in the Rust benchmark job, scheduled weekly and available manually.</p>
+<p>The scheduled job uses a shorter CI profile so the benchmark stays cheap on shared runners while still exercising overlap readers and cleanup pressure:</p>
 <ul>
 <li><code>AWA_MVCC_JOB_RATE=400</code></li>
 <li><code>AWA_MVCC_BASELINE_SECS=5</code></li>
@@ -2924,8 +2924,8 @@
 <li><code>AWA_MVCC_READER_MODE=active_scan</code></li>
 <li><code>AWA_MVCC_ANALYTICS_TICK_MS=500</code></li>
 </ul>
-<p>Nightly regression checks use per-run ratios (<code>overlap_handler_per_s</code> and <code>cooldown_handler_per_s</code> relative to the same run's baseline window) plus guardrails on <code>dead_tup_delta</code> and <code>max_available</code>.</p>
-<p>That nightly profile is intentionally short. It checks that Awa still behaves reasonably under overlapping analytical readers, but it is not the same thing as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a closer reproduction, increase duration and reader hold times and keep the readers in <code>active_scan</code> mode so queries overlap continuously rather than simulating only <code>idle in transaction</code>.</p>
+<p>CI regression checks use per-run ratios (<code>overlap_handler_per_s</code> and <code>cooldown_handler_per_s</code> relative to the same run's baseline window) plus guardrails on <code>dead_tup_delta</code> and <code>max_available</code>.</p>
+<p>That CI profile is intentionally short. It checks that Awa still behaves reasonably under overlapping analytical readers, but it is not the same thing as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a closer reproduction, increase duration and reader hold times and keep the readers in <code>active_scan</code> mode so queries overlap continuously rather than simulating only <code>idle in transaction</code>.</p>
 <p>A second ignored benchmark target now exists for that longer profile: <code>test_mvcc_horizon_planetscale_soak</code>. Its default shape is closer to the blog's mixed-workload setup:</p>
 <ul>
 <li><code>800</code> jobs/sec producer rate</li>
@@ -2934,7 +2934,7 @@
 <li><code>20s</code> stagger between readers</li>
 <li><code>15m</code> overlap window with <code>active_scan</code></li>
 </ul>
-<p>That soak benchmark is wired into CI as a weekly/manual run, while the shorter <code>test_mvcc_horizon_overlap_benchmark</code> remains the daily nightly smoke.</p>
+<p>Both the soak benchmark and the shorter <code>test_mvcc_horizon_overlap_benchmark</code> run weekly and on manual dispatch.</p>
 <h3 id="mvcc-bench-knobs">MVCC bench knobs<a class="headerlink" href="#mvcc-bench-knobs" title="Permanent link">&para;</a></h3>
 <ul>
 <li><code>AWA_MVCC_JOB_RATE</code> — steady producer rate in jobs/sec</li>
