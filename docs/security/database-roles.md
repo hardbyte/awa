@@ -40,7 +40,7 @@ The 0.6 runtime and current 0.7 development runtime use `SECURITY INVOKER` trigg
 GRANT USAGE ON SCHEMA awa TO awa_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE
   ON ALL TABLES IN SCHEMA awa TO awa_runtime;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA awa TO awa_runtime;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO awa_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO awa_runtime;
 
 REVOKE EXECUTE ON FUNCTION
@@ -56,12 +56,39 @@ Set matching default privileges for every role that creates objects during migra
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
-  GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
 If an existing installation created objects as `awa_migrator` without first setting the owner role, transfer every existing schema object to `awa_owner` before relying on owner-scoped defaults. New migrations should use the effective-role command above.
+
+## Provision queues before starting restricted runtimes
+
+From schema v047, runtime calls use existing lane sequences without issuing
+`CREATE SEQUENCE`. Run provisioning as the migrator for every queue before
+starting its producers or workers:
+
+```bash
+PGOPTIONS='-c role=awa_owner' \
+  awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
+  --queue email --enqueue-shards 1
+```
+
+The command provisions all four priorities in one transaction and is safe to
+repeat on a live queue: existing sequence cursors keep their positions. It does
+not change routing or the queue's configured shard count. Prepare additional
+shards before increasing `enqueue_shards`; match `--queue-stripe-count` to the
+runtime's queue-storage configuration. With `PartitionedQueue`, provision each
+physical queue. Use `--schema` for a custom storage schema.
+
+Apply the sequence grants above after provisioning, or set the owner's default
+privileges first. Lane cursors need `UPDATE` for `setval`, in addition to `USAGE`
+and `SELECT`. `CREATE SEQUENCE IF NOT EXISTS` requires schema CREATE even when
+the sequence already exists, so provisioning alone does not repair pre-v047
+helpers: apply the migration first. Schema owners retain lazy creation for
+single-role installations; a restricted runtime encountering an unprepared
+lane fails with a provisioning hint.
 
 ## Custom queue-storage schemas
 

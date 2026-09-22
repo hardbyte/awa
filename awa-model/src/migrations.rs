@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 46;
+pub const CURRENT_VERSION: i32 = 47;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -263,6 +263,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     ),
     (45, "Owner-scoped periodic reconciliation (#481)", &[V45_UP]),
     (46, "Wait-free admin dirty-key marks", &[V46_UP]),
+    (
+        47,
+        "Use provisioned lane sequences without runtime DDL",
+        &[V23_UP, V47_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -310,6 +315,7 @@ const V43_UP: &str = include_str!("../migrations/v043_ring_rotation_ledger.sql")
 const V44_UP: &str = include_str!("../migrations/v044_jobs_compat_receipt_running.sql");
 const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
 const V46_UP: &str = include_str!("../migrations/v046_wait_free_dirty_marks.sql");
+const V47_UP: &str = include_str!("../migrations/v047_prepared_lane_sequences.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

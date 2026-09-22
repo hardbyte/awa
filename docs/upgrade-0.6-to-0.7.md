@@ -3,6 +3,19 @@
 The 0.6 → 0.7 upgrade is short: **the storage step is "be finalized."** Everything else in
 0.7 is additive.
 
+## Restricted runtime roles and v047
+
+v047 refreshes lane-sequence helpers in the default and existing custom
+queue-storage schemas without changing function signatures or cursor semantics.
+Existing provisioned lanes run without schema CREATE; single-role owners retain
+lazy creation. The migration adds no runtime version gate or authority flip.
+
+For a runtime without DDL privileges, apply v047 as the migrator, run
+`awa storage prepare-queue --queue <name>` for every physical queue, and grant
+sequence `USAGE, SELECT, UPDATE` before starting producers or workers. Match
+shard and stripe counts and provision extra lanes before increasing them.
+See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

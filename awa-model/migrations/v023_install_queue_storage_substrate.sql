@@ -1082,16 +1082,30 @@ BEGIN
                 p_enqueue_shard
             );
         BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_enqueue_seq
-            );
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_claim_seq
-            );
+            IF to_regclass(format('%%I.%%I', %1$L, v_enqueue_seq)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_enqueue_seq
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_enqueue_seq
+                );
+            END IF;
+            IF to_regclass(format('%%I.%%I', %1$L, v_claim_seq)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_claim_seq
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_claim_seq
+                );
+            END IF;
 
             UPDATE %1$I.queue_enqueue_heads
             SET seq_name = v_enqueue_seq
@@ -1203,11 +1217,18 @@ BEGIN
             v_count BIGINT;
             v_start BIGINT;
         BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_seq_name
-            );
+            IF to_regclass(format('%%I.%%I', %1$L, v_seq_name)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_seq_name
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_seq_name
+                );
+            END IF;
             NEW.seq_name := v_seq_name;
 
             IF TG_OP = 'UPDATE'
@@ -1262,11 +1283,18 @@ BEGIN
                 NEW.enqueue_shard
             );
         BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_seq_name
-            );
+            IF to_regclass(format('%%I.%%I', %1$L, v_seq_name)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_seq_name
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_seq_name
+                );
+            END IF;
             NEW.seq_name := v_seq_name;
 
             IF TG_OP = 'INSERT' THEN
