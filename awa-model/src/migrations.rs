@@ -244,7 +244,29 @@ pub struct SchemaPatch {
     pub applied_probe: &'static str,
 }
 
-pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
+pub const SCHEMA_PATCHES: &[SchemaPatch] = &[WAIT_FREE_DIRTY_MARKS, PREPARED_LANE_SEQUENCES];
+
+pub(crate) const PREPARED_LANE_SEQUENCES: SchemaPatch = SchemaPatch {
+    name: "prepared_lane_sequences",
+    description: "Lane helpers use provisioned sequences without DDL (awa 0.7 migration v047)",
+    sql: include_str!("../migrations/patches/prepared_lane_sequences.sql"),
+    applied_probe: "WITH helpers AS ( \
+                        SELECT p.pronamespace, p.prosrc FROM pg_catalog.pg_proc AS p \
+                        WHERE (p.proname = 'ensure_lane_sequences' \
+                               AND pg_catalog.oidvectortypes(p.proargtypes) = 'text, smallint, smallint') \
+                           OR (p.proname IN ('queue_enqueue_head_sequence_sync', 'queue_claim_head_sequence_sync') \
+                               AND p.pronargs = 0) \
+                    ), substrates AS ( \
+                        SELECT pronamespace FROM helpers GROUP BY pronamespace HAVING count(*) = 3 \
+                    ) \
+                    SELECT NOT EXISTS ( \
+                        SELECT 1 FROM helpers \
+                        WHERE pronamespace IN (SELECT pronamespace FROM substrates) \
+                          AND prosrc NOT LIKE '%has not been provisioned%' \
+                    )",
+};
+
+const WAIT_FREE_DIRTY_MARKS: SchemaPatch = SchemaPatch {
     name: "wait_free_dirty_marks",
     description: "Wait-free admin dirty-key marks (awa 0.7 migration v046)",
     sql: include_str!("../migrations/patches/wait_free_dirty_marks.sql"),
@@ -262,7 +284,7 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
                                   AND proname = 'refresh_admin_metadata' \
                                   AND prosrc LIKE '%admin_dirty_queue_marks%' \
                                   AND prosrc NOT LIKE '%TRUNCATE%')",
-}];
+};
 
 /// Schema patches a database still needs to reach this binary's schema shape.
 ///

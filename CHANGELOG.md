@@ -4,6 +4,28 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- **Runtimes without schema `CREATE` can use provisioned queue-storage lanes
+  ([#501](https://github.com/hardbyte/awa/pull/501)).** The lane helpers ran
+  `CREATE SEQUENCE IF NOT EXISTS` on every call, and PostgreSQL requires
+  `CREATE` on the schema for that statement even when the sequence exists, so a
+  migrator/runtime role split failed every enqueue with `permission denied for
+  schema`. The helpers now skip the DDL for an existing sequence, and a caller
+  that cannot create a missing lane gets SQLSTATE `42501` with a provisioning
+  hint; schema owners keep lazy creation. The fix ships as the idempotent schema
+  patch `prepared_lane_sequences`, which replaces the three lane helpers in
+  every queue-storage schema and leaves `claim_ready_runtime` and every other
+  substrate function unchanged. `awa migrate` applies it on a v040 database and
+  `storage prepare-queue-storage-schema` applies it to the schema it installs;
+  external runners apply the exported `R__prepared_lane_sequences.sql` after
+  `V40` and again after installing a custom queue-storage schema. No new
+  migration version.
+- **`awa storage prepare-queue` and `QueueStorage::prepare_queue`** provision
+  every priority and enqueue shard of a queue as the migrator, in one
+  transaction, without changing routing. Repeating it keeps existing cursors.
+- **The role guide grants `UPDATE` on queue-storage sequences**, which lane
+  cursors need for `setval`. `docs/security.md` covers provisioning, including a
+  SQL equivalent for external runners.
+
 ## [0.6.9] — 2026-09-14
 
 Patch release: widens the OpenTelemetry dependency range so `awa-metrics` unifies with a consumer's existing provider. No schema change, no migration, and no public API change.

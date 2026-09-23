@@ -2869,6 +2869,20 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
+            sqlx::query("SELECT set_config('awa.prepared_lane_sequences_schema', $1, true)")
+                .bind(schema)
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            sqlx::query(crate::migrations::PREPARED_LANE_SEQUENCES.sql)
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            sqlx::query("SELECT set_config('awa.prepared_lane_sequences_schema', '', true)")
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
             // Post-helper legacy fixups: copy any renamed-aside rows into the
             // newly partitioned parents created by the helper, then drop the
             // legacy table. ON CONFLICT DO NOTHING so a re-run after a
@@ -3288,6 +3302,30 @@ impl QueueStorage {
 
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
             .await
+    }
+
+    pub async fn prepare_queue(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        enqueue_shards: i16,
+    ) -> Result<(), AwaError> {
+        if queue.is_empty() || !(1..=64).contains(&enqueue_shards) {
+            return Err(AwaError::Validation(
+                "prepare_queue requires a nonempty queue and 1..=64 enqueue shards".into(),
+            ));
+        }
+        let mut transaction = pool.begin().await.map_err(map_sqlx_error)?;
+        for physical_queue in self.physical_queues_for_logical(queue) {
+            for priority in 1..=4 {
+                for shard in 0..enqueue_shards {
+                    self.ensure_lane_inserts(&mut transaction, &physical_queue, priority, shard)
+                        .await?;
+                }
+            }
+        }
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        Ok(())
     }
 
     /// Run the three lane-row inserts unconditionally and mark the
