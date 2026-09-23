@@ -327,6 +327,7 @@ fn access_for(command: &Commands) -> context::Access {
             StorageCommands::FlipRingAuthority { check: true, .. } => ReadOnly,
             StorageCommands::Prepare { .. }
             | StorageCommands::PrepareQueueStorageSchema { .. }
+            | StorageCommands::PrepareQueue { .. }
             | StorageCommands::Abort
             | StorageCommands::EnterMixedTransition { .. }
             | StorageCommands::Finalize { .. }
@@ -804,6 +805,21 @@ enum StorageCommands {
         /// Drop and recreate the target schema before preparing it
         #[arg(long)]
         reset: bool,
+    },
+    /// Provision lane sequences as the migrator, before starting a runtime without DDL
+    PrepareQueue {
+        /// Queue-storage schema to provision
+        #[arg(long, default_value = "awa")]
+        schema: String,
+        /// Logical queue name, before queue striping
+        #[arg(long)]
+        queue: String,
+        /// Enqueue shards to provision for every priority (1..=64)
+        #[arg(long, default_value_t = 1)]
+        enqueue_shards: i16,
+        /// Match the runtime's queue-storage stripe count
+        #[arg(long, default_value_t = 1)]
+        queue_stripe_count: usize,
     },
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
@@ -1887,6 +1903,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }))?
                         );
                     }
+                    StorageCommands::PrepareQueue {
+                        schema,
+                        queue,
+                        enqueue_shards,
+                        queue_stripe_count,
+                    } => {
+                        let store = awa_model::QueueStorage::new(awa_model::QueueStorageConfig {
+                            schema: schema.clone(),
+                            queue_stripe_count,
+                            ..Default::default()
+                        })?;
+                        store.prepare_queue(&pool, &queue, enqueue_shards).await?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "schema": schema, "queue": queue, "enqueue_shards": enqueue_shards,
+                                "queue_stripe_count": queue_stripe_count, "routing_changed": false,
+                            }))?
+                        );
+                    }
                     StorageCommands::Abort => {
                         awa_model::storage::abort(&pool).await?;
                         let report = awa_model::storage::status_report(&pool).await?;
@@ -2276,6 +2312,10 @@ mod tests {
         assert_eq!(access(&["migrate", "--pending"]), Mutating);
         assert_eq!(access(&["storage", "enter-mixed-transition"]), Mutating);
         assert_eq!(access(&["storage", "finalize"]), Mutating);
+        assert_eq!(
+            access(&["storage", "prepare-queue", "--queue", "email"]),
+            Mutating
+        );
         assert_eq!(access(&["storage", "flip-ring-authority"]), Mutating);
         assert_eq!(access(&["dlq", "retry", "1"]), Mutating);
         assert_eq!(access(&["dlq", "purge", "--all"]), Mutating);
