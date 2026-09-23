@@ -66,6 +66,15 @@ async fn wait_for_job_state(pool: &sqlx::PgPool, job_id: i64, state: JobState) -
     }
 }
 
+// Queue rotation can prune terminal rows while lifecycle assertions still read them.
+fn lifecycle_client_builder(pool: sqlx::PgPool) -> awa::ClientBuilder {
+    Client::builder(pool).queue_storage(
+        Default::default(),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct HookJob {
     action: String,
@@ -84,12 +93,7 @@ async fn test_typed_completed_event_handler_runs() {
     let queue = "lifecycle_completed";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
-        .queue_storage(
-            Default::default(),
-            Duration::from_secs(60),
-            Duration::from_secs(1),
-        )
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -142,7 +146,7 @@ async fn test_typed_started_event_handler_runs() {
     let queue = "lifecycle_started";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -192,7 +196,7 @@ async fn test_typed_retried_event_handler_runs() {
     let queue = "lifecycle_retried";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -274,7 +278,7 @@ async fn test_typed_exhausted_event_handler_runs() {
     let queue = "lifecycle_exhausted";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -343,7 +347,7 @@ async fn test_retry_after_on_final_attempt_exhausts() {
     let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handler_executions = executions.clone();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -423,7 +427,7 @@ async fn test_retry_after_exhaustion_lands_in_dlq() {
     let queue = "lifecycle_retry_after_dlq";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -482,7 +486,7 @@ async fn test_retry_after_below_bound_still_retries() {
     let queue = "lifecycle_retry_after_retries";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -548,7 +552,7 @@ async fn test_typed_cancelled_event_handler_runs() {
     let queue = "lifecycle_cancelled";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -616,7 +620,7 @@ async fn test_untyped_event_handlers_stack_for_raw_workers() {
     let queue = "lifecycle_raw_stack";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -683,7 +687,7 @@ async fn test_handler_panic_does_not_crash_executor() {
     let queue = "lifecycle_panic";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -741,7 +745,7 @@ async fn test_no_handlers_registered_still_completes() {
     let queue = "lifecycle_no_handlers";
 
     // No on_event registered — should work without any lifecycle overhead
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -783,7 +787,7 @@ async fn test_stale_completion_does_not_fire_event() {
     let queue = "lifecycle_stale";
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -877,7 +881,7 @@ async fn test_terminal_error_emits_exhausted() {
     let queue = "lifecycle_terminal";
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -938,7 +942,7 @@ async fn test_snooze_only_emits_started_event() {
     let queue = "lifecycle_snooze";
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -1035,7 +1039,7 @@ fn parking_client(
     canonical: bool,
     tx: mpsc::UnboundedSender<CbEvent>,
 ) -> Client {
-    let mut builder = Client::builder(pool.clone())
+    let mut builder = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
