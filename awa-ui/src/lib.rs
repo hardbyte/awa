@@ -10,7 +10,7 @@ pub use callback_router::{
 
 use std::time::Duration;
 
-use axum::http::header;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
@@ -190,13 +190,36 @@ async fn static_handler(uri: axum::http::Uri) -> Response {
         return ([(header::CONTENT_TYPE, mime.as_ref())], file.data.to_vec()).into_response();
     }
 
+    // A missing asset 404s rather than falling through. Serving the shell here
+    // hands a CDN that keys cacheability off the extension a cacheable copy of
+    // it, which it will then serve to anyone, including past an auth proxy.
+    if is_asset_request(path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // SPA fallback: serve index.html for non-API routes
     if let Some(index) = StaticAssets::get("index.html") {
-        return Html(index.data.to_vec()).into_response();
+        return (
+            [(header::CACHE_CONTROL, "no-store")],
+            Html(index.data.to_vec()),
+        )
+            .into_response();
     }
 
     // No frontend built — serve placeholder
-    Html(PLACEHOLDER_HTML).into_response()
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(PLACEHOLDER_HTML),
+    )
+        .into_response()
+}
+
+/// A request the SPA router will never own: anything under the embedded
+/// `assets/` directory, or a dotted filename at the root such as `favicon.ico`.
+/// A client-side route can carry a dot in a path parameter (`/queues/orders.v2`),
+/// so nested paths are deliberately left to the SPA fallback.
+fn is_asset_request(path: &str) -> bool {
+    path.starts_with("assets/") || (!path.contains('/') && path.contains('.'))
 }
 
 const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
@@ -208,3 +231,28 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
   <p>Frontend not built. Run <code>cd awa-ui/frontend && npm install && npm run build</code> to build the UI.</p>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::is_asset_request;
+
+    #[test]
+    fn asset_paths_do_not_fall_through_to_the_shell() {
+        assert!(is_asset_request("assets/index-a1b2c3d4.js"));
+        assert!(is_asset_request("assets/index-e5f6a7b8.css"));
+        assert!(is_asset_request("favicon.ico"));
+        assert!(is_asset_request("robots.txt"));
+        assert!(is_asset_request("manifest.json"));
+    }
+
+    #[test]
+    fn client_side_routes_still_reach_the_shell() {
+        assert!(!is_asset_request(""));
+        assert!(!is_asset_request("jobs"));
+        assert!(!is_asset_request("batch-ops"));
+        assert!(!is_asset_request("runtime/01J8Z3"));
+        // A dot in a path parameter must not read as a file extension.
+        assert!(!is_asset_request("queues/orders.v2"));
+        assert!(!is_asset_request("queues/com.example.emails"));
+    }
+}
