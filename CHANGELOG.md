@@ -4,6 +4,22 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.10] — 2026-11-02
+
+Patch release: the admin UI's queue and dashboard reads on queue storage no longer scan retained history, and restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`. No new migration version and no public API change. The lane fix ships as the idempotent schema patch `prepared_lane_sequences`: `awa migrate` applies it on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. The admin fix needs no migration; only the process serving the admin UI has to run 0.6.10 to get it. Operators deploying a runtime role without schema `CREATE` must run `awa storage prepare-queue` per queue and grant sequence `USAGE, SELECT, UPDATE` before starting workers; see `docs/security.md`.
+
+- **Admin queue and dashboard reads on queue storage follow live work, not
+  retained history** (backport of
+  [#580](https://github.com/hardbyte/awa/pull/580) and
+  [#581](https://github.com/hardbyte/awa/pull/581)). `admin::queue_overviews`
+  (the queues and dashboard pages, `awa queue stats`, the Python queue
+  stats), `admin::state_counts` and `admin::state_timeseries` built every
+  current job through `terminal_jobs`, expanding each completion batch and
+  joining it back to `ready_entries`. One production deployment saw the queue
+  overview take 22 s, re-run by an open dashboard. They now read the
+  live-work tables the worker queue gauges read, count completions from
+  batch sizes, and bound the timeseries to rows finalised within its window.
+  Counts are unchanged; `running` keeps 0.6's leases-only definition.
 - Restricted runtimes can use pre-provisioned queue lanes without schema
   `CREATE` ([#501](https://github.com/hardbyte/awa/pull/501)). The lane helpers
   skip `CREATE SEQUENCE` when the sequence exists and raise SQLSTATE `42501`
