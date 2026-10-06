@@ -53,6 +53,7 @@ Each record preserves its status, context, decision, consequences, and alternati
 | 043 | [PostgreSQL capability functions and least-privilege runtime roles](043-postgresql-capability-functions.md) | Replace blanket runtime table/function grants with allowlisted, role-specific capability entry points owned by a bounded execution role (#452); blanket definer conversion is rejected. | <span class="awa-status awa-status--proposed">Proposed</span> |
 | 044 | [Gate A — storage evolution for 0.7](044-storage-evolution-gate-a.md) | The #295 segment-engine RFC graduates to 0.8: the allocator ideas landed inside the engine as staged migrations and measured better; the remaining WAL headroom has no in-place delivery path (#295, #383). |  |
 | 045 | [Hot-path triggers never wait on another transaction](045-hot-path-trigger-lock-contract.md) | Triggers on the canonical hot tables may write only append-only, unconstrained mark tables or the job's own unique claim; the maintenance path never truncates; the contract is an executable test and a TLA+ witness (v046, 0.6 patch). |  |
+| 046 | [Maintenance-line schema patches](046-maintenance-line-schema-patches.md) | A maintenance line never adds migration versions past its last release; changes ship as named idempotent patches recorded in `awa.schema_patches`, exported as repeatable `R__` scripts, and carried onto the development line as ordinary migrations that record the same ledger row (v048). |  |
 
 ## Correctness evidence
 

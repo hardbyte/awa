@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 46;
+pub const CURRENT_VERSION: i32 = 48;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -263,6 +263,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     ),
     (45, "Owner-scoped periodic reconciliation (#481)", &[V45_UP]),
     (46, "Wait-free admin dirty-key marks", &[V46_UP]),
+    (48, "Schema patch ledger (#492)", &[V48_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -310,6 +311,176 @@ const V43_UP: &str = include_str!("../migrations/v043_ring_rotation_ledger.sql")
 const V44_UP: &str = include_str!("../migrations/v044_jobs_compat_receipt_running.sql");
 const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
 const V46_UP: &str = include_str!("../migrations/v046_wait_free_dirty_marks.sql");
+const V48_UP: &str = include_str!("../migrations/v048_schema_patch_ledger.sql");
+
+/// Ledger of applied schema patches. Created by migration v048 and, on a
+/// maintenance line that cannot add migration versions, by the patch runner
+/// itself the first time it applies a patch. The text is also embedded in the
+/// exported patch scripts, so every path that can apply a patch can record it.
+pub const SCHEMA_PATCH_LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS awa.schema_patches (\n    \
+    name        TEXT        PRIMARY KEY,\n    \
+    description TEXT        NOT NULL,\n    \
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),\n    \
+    applied_by  TEXT        NOT NULL\n)";
+
+/// An idempotent schema change that a maintenance line ships without a new
+/// migration version (ADR-046).
+///
+/// Migration numbers past a maintenance line's last release belong to the
+/// next minor: released binaries of the maintenance line interpret specific
+/// higher numbers through their forward-compatibility guards. A fix that must
+/// reach such a line therefore travels as a named patch: idempotent SQL,
+/// recorded in `awa.schema_patches` by name, applied after the last migration
+/// when the schema is exactly at that line's [`CURRENT_VERSION`], and carried
+/// onto the next minor as an ordinary numbered migration that records the same
+/// ledger row. `applied_probe`, when set, is boolean SQL that recognises a patch
+/// applied before the ledger existed; a true probe back-fills the ledger row
+/// instead of re-running the SQL.
+#[derive(Debug, Clone, Copy)]
+pub struct SchemaPatch {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub sql: &'static str,
+    pub applied_probe: Option<&'static str>,
+}
+
+/// Patches this line still ships outside the numbered sequence. Empty on a
+/// development line: a change that lands here as a numbered migration also
+/// records the patch name it supersedes (see v048 for `wait_free_dirty_marks`).
+pub const SCHEMA_PATCHES: &[SchemaPatch] = &[];
+
+/// The statement that records a patch in the ledger.
+pub fn schema_patch_ledger_insert(patch: &SchemaPatch, applied_by: &str) -> String {
+    format!(
+        "INSERT INTO awa.schema_patches (name, description, applied_by)\nVALUES ('{}', '{}', '{}')\nON CONFLICT (name) DO NOTHING;",
+        patch.name.replace('\'', "''"),
+        patch.description.replace('\'', "''"),
+        applied_by.replace('\'', "''"),
+    )
+}
+
+/// The complete script an external runner applies for one patch: the patch
+/// SQL, the ledger table, and the ledger row.
+pub fn schema_patch_script(patch: &SchemaPatch, applied_by: &str) -> String {
+    format!(
+        "{}\n\n{};\n\n{}\n",
+        patch.sql.trim_end(),
+        SCHEMA_PATCH_LEDGER_DDL,
+        schema_patch_ledger_insert(patch, applied_by)
+    )
+}
+
+/// Schema patches as `(name, description, script)`, for external runners.
+/// Apply each as a repeatable migration (`R__<name>.sql` in Flyway terms)
+/// after the migrations that reach [`CURRENT_VERSION`], never as another
+/// versioned file.
+pub fn schema_patch_sql(patches: &[SchemaPatch]) -> Vec<(&'static str, &'static str, String)> {
+    patches
+        .iter()
+        .map(|patch| {
+            (
+                patch.name,
+                patch.description,
+                schema_patch_script(patch, "sql export"),
+            )
+        })
+        .collect()
+}
+
+/// Schema patches a database still needs to reach this binary's schema shape.
+///
+/// Below [`CURRENT_VERSION`] every registered patch is pending, because the
+/// migrations exported alongside it leave the pre-patch objects in place; at
+/// [`CURRENT_VERSION`] the ledger (or a patch's probe) decides; on a newer
+/// schema nothing is pending, since a later migration may have superseded the
+/// patch.
+pub async fn pending_schema_patches(pool: &PgPool) -> Result<Vec<SchemaPatch>, AwaError> {
+    let mut conn = pool.acquire().await?;
+    let current = current_version_conn(&mut conn).await?;
+    if current < CURRENT_VERSION {
+        return Ok(SCHEMA_PATCHES.to_vec());
+    }
+    if current > CURRENT_VERSION {
+        return Ok(Vec::new());
+    }
+    pending_schema_patches_conn(&mut conn, SCHEMA_PATCHES).await
+}
+
+async fn ledger_exists(conn: &mut PgConnection) -> Result<bool, AwaError> {
+    Ok(
+        sqlx::query_scalar("SELECT to_regclass('awa.schema_patches') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
+/// Patches from `patches` that the ledger does not record. A patch whose probe
+/// reports it present is recorded as back-filled and not returned.
+pub async fn pending_schema_patches_conn(
+    conn: &mut PgConnection,
+    patches: &[SchemaPatch],
+) -> Result<Vec<SchemaPatch>, AwaError> {
+    let recorded: Vec<String> = if ledger_exists(conn).await? {
+        sqlx::query_scalar("SELECT name FROM awa.schema_patches")
+            .fetch_all(&mut *conn)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let mut pending = Vec::new();
+    for patch in patches {
+        if recorded.iter().any(|name| name == patch.name) {
+            continue;
+        }
+        if let Some(probe) = patch.applied_probe {
+            let applied: bool = sqlx::query_scalar(probe).fetch_one(&mut *conn).await?;
+            if applied {
+                record_schema_patch(conn, patch, "probe back-fill").await?;
+                continue;
+            }
+        }
+        pending.push(*patch);
+    }
+    Ok(pending)
+}
+
+async fn record_schema_patch(
+    conn: &mut PgConnection,
+    patch: &SchemaPatch,
+    applied_by: &str,
+) -> Result<(), AwaError> {
+    sqlx::raw_sql(SCHEMA_PATCH_LEDGER_DDL)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::raw_sql(crate::audited_sql(schema_patch_ledger_insert(
+        patch, applied_by,
+    )))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Apply every pending patch from `patches` and record each in the ledger.
+/// Returns the names applied, in order.
+pub async fn apply_schema_patches_conn(
+    conn: &mut PgConnection,
+    patches: &[SchemaPatch],
+) -> Result<Vec<&'static str>, AwaError> {
+    let applied_by = format!("awa {}", env!("CARGO_PKG_VERSION"));
+    let mut applied = Vec::new();
+    for patch in pending_schema_patches_conn(conn, patches).await? {
+        info!(
+            patch = patch.name,
+            description = patch.description,
+            "Applying schema patch"
+        );
+        sqlx::raw_sql(patch.sql).execute(&mut *conn).await?;
+        record_schema_patch(conn, &patch, &applied_by).await?;
+        info!(patch = patch.name, "Schema patch applied");
+        applied.push(patch.name);
+    }
+    Ok(applied)
+}
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
@@ -514,6 +685,12 @@ async fn apply_migrations(
         }
     } else {
         info!(version = current, "Schema is up to date");
+    }
+
+    // Patches ride on the schema this binary owns. A newer schema belongs to a
+    // newer binary whose migrations may have superseded them.
+    if current <= CURRENT_VERSION {
+        apply_schema_patches_conn(conn, SCHEMA_PATCHES).await?;
     }
 
     Ok(())
@@ -1673,6 +1850,53 @@ mod tests {
             previous, CURRENT_VERSION,
             "CURRENT_VERSION must match the highest listed migration"
         );
+    }
+
+    #[test]
+    fn schema_patches_are_idempotent_and_versionless() {
+        for patch in SCHEMA_PATCHES {
+            let upper = patch.sql.to_uppercase();
+            assert!(
+                !upper.contains("INSERT INTO AWA.SCHEMA_VERSION"),
+                "patch {} must not record a schema version",
+                patch.name
+            );
+            assert!(
+                !upper.contains("CREATE TABLE AWA.")
+                    && !upper.contains("CREATE FUNCTION")
+                    && !upper.contains("DROP TABLE")
+                    && !upper.contains("ALTER TABLE"),
+                "patch {} must use IF NOT EXISTS / OR REPLACE forms only",
+                patch.name
+            );
+        }
+    }
+
+    #[test]
+    fn schema_patch_script_records_the_ledger_row() {
+        let patch = SchemaPatch {
+            name: "example_patch",
+            description: "It's an example",
+            sql: "SELECT 1;",
+            applied_probe: None,
+        };
+        let script = schema_patch_script(&patch, "sql export");
+        assert!(script.starts_with("SELECT 1;"));
+        assert!(script.contains(SCHEMA_PATCH_LEDGER_DDL));
+        assert!(script.contains("VALUES ('example_patch', 'It''s an example', 'sql export')"));
+        assert!(script
+            .trim_end()
+            .ends_with("ON CONFLICT (name) DO NOTHING;"));
+    }
+
+    #[test]
+    fn v048_creates_the_same_ledger_the_runner_creates() {
+        assert!(
+            V48_UP.contains(SCHEMA_PATCH_LEDGER_DDL),
+            "v048 must create awa.schema_patches with exactly SCHEMA_PATCH_LEDGER_DDL"
+        );
+        assert!(V48_UP.contains("'wait_free_dirty_marks'"));
+        assert!(V48_UP.contains("'prepared_lane_sequences'"));
     }
 
     #[test]

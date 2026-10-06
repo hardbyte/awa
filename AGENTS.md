@@ -124,7 +124,12 @@ Checklist for any new `awa-model/migrations/vNNN_*.sql`:
 - [ ] Model mixed-version interleavings in TLA+ when a state machine or lock order changes.
 - [ ] Rehearse migrate-first, binary-first, and overlapping rollouts with a released N−1 artifact. Include concurrent old/new workers, failures and retries, scheduled work, in-flight work, hard-kill and deadline rescue, flip/fence behavior, and exact job accounting; record the evidence. CI automation is [#427](https://github.com/hardbyte/awa/issues/427).
 
-**If no rolling-compatible design is practical**
+**If the change must reach a maintenance line (0.6.x) too**
+
+- [ ] Do not add a migration version on the maintenance line. Ship the change there as a named schema patch per [ADR-046](docs/adr/046-maintenance-line-schema-patches.md): idempotent SQL in `awa-model/migrations/patches/`, registered in `SCHEMA_PATCHES`, recorded in `awa.schema_patches`, exported as `R__<name>.sql`.
+- [ ] On `main`, land the same SQL as an ordinary numbered migration that is idempotent over a patched database and records the patch name in `awa.schema_patches` (`schema_patch_ledger_insert` shows the statement).
+- [ ] Never let a patch change what a version number means to a released binary; if it would, it needs a new minor.
+
 
 - [ ] Explain in an ADR why expand/flip/contract and a version floor are insufficient, then add the migration to `EXCLUSIVE_WINDOW_MIGRATIONS` with refusal, override, and stale-heartbeat tests plus explicit operator documentation.
 

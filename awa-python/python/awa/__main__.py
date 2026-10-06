@@ -323,7 +323,10 @@ async def _migrate(args: argparse.Namespace) -> None:
         range_from = args.from_version if args.from_version is not None else 0
         range_to = args.to if args.to is not None else current_ver
 
-    if range_from >= range_to:
+    # Schema patches are versionless and accompany any range that reaches the
+    # current version, including an empty one such as --from N on a current schema.
+    patches = awa.schema_patches() if range_to >= current_ver else []
+    if range_from >= range_to and not patches:
         print(f"No migrations in range ({range_from}, {range_to}].", file=sys.stderr)
         return
 
@@ -342,8 +345,14 @@ async def _migrate(args: argparse.Namespace) -> None:
             "-- Pass --no-transaction if your migration runner opens its own transaction.\n"
             f"BEGIN;\nSELECT pg_advisory_xact_lock({awa.migration_lock_key()});\n"
         )
-    for version, description, sql_text in awa.migrations_range(range_from, range_to):
-        print(f"-- Migration V{version}: {description}\n{sql_text}\n")
+    if range_from < range_to:
+        for version, description, sql_text in awa.migrations_range(range_from, range_to):
+            print(f"-- Migration V{version}: {description}\n{sql_text}\n")
+    for name, description, sql_text in patches:
+        print(
+            f"-- Schema patch R__{name}: {description} "
+            f"(idempotent; apply after V{current_ver})\n{sql_text}\n"
+        )
     if wrap:
         print("COMMIT;")
 

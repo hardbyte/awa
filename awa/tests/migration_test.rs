@@ -1103,6 +1103,12 @@ async fn test_migration_sql_matches_run() {
             .await
             .unwrap();
     }
+    for (_name, _desc, sql) in migrations::schema_patch_sql(migrations::SCHEMA_PATCHES) {
+        sqlx::raw_sql(audited_sql(sql))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
     let tables_from_sql: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'awa' ORDER BY table_name",

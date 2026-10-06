@@ -174,7 +174,15 @@ the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downg
 previous releases).
 
 
-## v046: wait-free admin dirty-key marks
+## v048: schema patch ledger
+
+v048 adds `awa.schema_patches`, the ledger of named schema patches a database
+has received ([ADR-046](adr/046-maintenance-line-schema-patches.md)), and
+records `wait_free_dirty_marks` and `prepared_lane_sequences` in it, so a
+database upgraded from 0.6.x (patches applied) and a fresh 0.7 install carry
+the same rows. No operator action;
+additive; 0.6.x runtimes never read the table.
+
 
 v046 replaces the keyed `admin_dirty_queues` / `admin_dirty_kinds` tables the
 canonical triggers wrote with `INSERT ... ON CONFLICT DO NOTHING` by append-only

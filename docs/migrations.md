@@ -79,6 +79,16 @@ To manage Awa SQL with Flyway, Liquibase, dbmate, or another runner, extract the
 awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
 ```
 
+That writes one `V<n>__<description>.sql` file per migration, plus one
+`R__<name>.sql` file per **schema patch** when the line ships any. A patch is an
+idempotent repair a maintenance line ships without a version bump
+([ADR-046](adr/046-maintenance-line-schema-patches.md)); its script records
+itself in `awa.schema_patches`, so apply it as a repeatable migration after the
+last versioned file, never as another versioned one. `awa migrate --pending
+--sql` prints the migrations the database lacks plus the patches not yet in its
+ledger; programmatically the patches are `awa::migrations::schema_patch_sql(SCHEMA_PATCHES)`
+in Rust and `awa.schema_patches()` in Python.
+
 Use `awa migrate --sql` to print the same migration set to standard output. That output is wrapped in a single transaction that takes the runner's advisory lock, so piping it into `psql` is atomic and serialized exactly like `awa migrate`:
 
 ```bash

@@ -1067,7 +1067,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (from.unwrap_or(0), to.unwrap_or(current_version))
             };
 
-            if range_from >= range_to {
+            // Schema patches (ADR-046) accompany any range that reaches the
+            // current version and are rendered as repeatable scripts, never as
+            // another versioned file. With --pending only the patches the
+            // database's ledger lacks are rendered.
+            let patches: Vec<(&str, &str, String)> = if pending {
+                let db_url = resolve_db()?;
+                let pool = PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&db_url)
+                    .await?;
+                let missing = awa_model::migrations::pending_schema_patches(&pool).await?;
+                awa_model::migrations::schema_patch_sql(&missing)
+            } else if range_to >= current_version {
+                awa_model::migrations::schema_patch_sql(awa_model::migrations::SCHEMA_PATCHES)
+            } else {
+                Vec::new()
+            };
+
+            if range_from >= range_to && patches.is_empty() {
                 if pending {
                     println!("Schema is up to date (version {range_from}).");
                 } else {
@@ -1076,9 +1094,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            let selected = awa_model::migrations::migration_sql_range(range_from, range_to);
+            let selected = if range_from >= range_to {
+                Vec::new()
+            } else {
+                awa_model::migrations::migration_sql_range(range_from, range_to)
+            };
 
-            if selected.is_empty() {
+            if selected.is_empty() && patches.is_empty() {
                 println!("No migrations matched the selected range.");
                 return Ok(());
             }
@@ -1116,6 +1138,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for (v, description, sql_text) in &selected {
                     println!("-- Migration V{v}: {description}\n{sql_text}\n");
                 }
+                for (name, description, sql_text) in &patches {
+                    println!(
+                        "-- Schema patch R__{name}: {description} (idempotent; apply after V{current_version})\n{sql_text}\n"
+                    );
+                }
                 if !no_transaction {
                     println!("COMMIT;");
                 }
@@ -1133,6 +1160,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             sql_text,
                         )
                     })
+                    .chain(
+                        patches
+                            .iter()
+                            .map(|(name, _, sql_text)| (format!("{dir}/R__{name}.sql"), sql_text)),
+                    )
                     .collect();
                 let mut seen = std::collections::HashSet::new();
                 for (path, _) in &planned {

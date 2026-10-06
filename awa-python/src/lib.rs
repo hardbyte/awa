@@ -76,6 +76,17 @@ fn migrations_range(from_version: i32, to_version: i32) -> Vec<(i32, String, Str
         .collect()
 }
 
+/// Idempotent schema patches as (name, description, script) tuples. Apply
+/// each after the migrations that reach `current_migration_version()`, as a
+/// repeatable script; the script records itself in `awa.schema_patches`.
+#[pyfunction]
+fn schema_patches() -> Vec<(String, String, String)> {
+    awa_model::migrations::schema_patch_sql(awa_model::migrations::SCHEMA_PATCHES)
+        .into_iter()
+        .map(|(n, d, s)| (n.to_string(), d.to_string(), s))
+        .collect()
+}
+
 /// Return the latest migration version known to this build.
 #[pyfunction]
 fn current_migration_version() -> i32 {
@@ -118,6 +129,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migrate, m)?)?;
     m.add_function(wrap_pyfunction!(migrations, m)?)?;
     m.add_function(wrap_pyfunction!(migrations_range, m)?)?;
+    m.add_function(wrap_pyfunction!(schema_patches, m)?)?;
     m.add_function(wrap_pyfunction!(current_migration_version, m)?)?;
     m.add_function(wrap_pyfunction!(migration_lock_key, m)?)?;
     m.add_function(wrap_pyfunction!(telemetry::init_telemetry, m)?)?;
