@@ -4,6 +4,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+## [0.6.10] — 2026-10-06
+
+Patch release: restricted runtime roles can run against pre-provisioned queue lanes without schema `CREATE`, and schema patches are now recorded in an `awa.schema_patches` ledger. No new migration version. Both changes ship as idempotent schema patches: `awa migrate` applies them on any v040 database; external runners apply the exported `R__prepared_lane_sequences.sql` (and `R__wait_free_dirty_marks.sql` if not yet applied) after `V40`. Operators deploying a runtime role without schema `CREATE` must run `awa storage prepare-queue` per queue and grant sequence `USAGE, SELECT, UPDATE` before starting workers; see `docs/security.md`.
+
 - Restricted runtimes can use pre-provisioned queue lanes without schema
   `CREATE` ([#501](https://github.com/hardbyte/awa/pull/501)). The lane helpers
   skip `CREATE SEQUENCE` when the sequence exists and raise SQLSTATE `42501`
