@@ -1,7 +1,14 @@
+-- v047: Use provisioned lane sequences without runtime DDL (#501)
+--
 -- Refresh the invoker helpers in every installed queue-storage schema.
 -- N-1 binaries keep the same functions, arguments, tables, and cursor semantics.
 -- Provisioned lanes require no DDL; schema owners retain lazy lane creation.
 -- Compatibility evidence: https://github.com/hardbyte/awa/pull/501#compatibility-evidence
+--
+-- Live load: one install_queue_storage_substrate() call per queue-storage
+-- schema, which replaces functions and re-asserts partition DDL with IF NOT
+-- EXISTS guards; about 8 s per schema on a cluster with the default slot
+-- counts, independent of row volume. It takes no lock on job rows.
 
 DO $$
 DECLARE
@@ -58,8 +65,11 @@ BEGIN
             v_schema
         ));
         v_claim_runtime_def := pg_get_functiondef(v_claim_runtime::oid);
+        -- Receipt mode writes lease_claims (v023..v041) or lease_claim_batches
+        -- (v042+ compact path); legacy mode writes leases only.
         v_lease_claim_receipts := v_schema = 'awa'
-            OR position(format('INSERT INTO %I.lease_claims', v_schema) IN v_claim_runtime_def) > 0;
+            OR position(format('INSERT INTO %I.lease_claims', v_schema) IN v_claim_runtime_def) > 0
+            OR position(format('INSERT INTO %I.lease_claim_batches', v_schema) IN v_claim_runtime_def) > 0;
 
         PERFORM awa.install_queue_storage_substrate(
             v_schema,
