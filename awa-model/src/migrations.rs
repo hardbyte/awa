@@ -230,22 +230,33 @@ const V38_UP: &str = include_str!("../migrations/v038_compact_claim_batches.sql"
 const V39_UP: &str = include_str!("../migrations/v039_claim_head_cold_routing.sql");
 const V40_UP: &str = include_str!("../migrations/v040_finalize_with_drain_runtimes.sql");
 
+/// Ledger of applied schema patches (ADR-046 on `main`). Created by the patch
+/// runner the first time it applies or back-fills a patch, and by migration
+/// v047 on the 0.7 line; the exported patch scripts embed the same text.
+pub const SCHEMA_PATCH_LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS awa.schema_patches (\n    \
+    name        TEXT        PRIMARY KEY,\n    \
+    description TEXT        NOT NULL,\n    \
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),\n    \
+    applied_by  TEXT        NOT NULL\n)";
+
 /// An idempotent schema repair shipped in a 0.6 patch release.
 ///
 /// The 0.6 series cannot add migration versions — awa 0.7 owns v041 and
 /// above — so a fix that must reach canonical clusters travels as a patch:
 /// `awa migrate` applies it when the schema is exactly at [`CURRENT_VERSION`]
-/// and `applied_probe` reports it missing, and the 0.7 migration carrying the
-/// same SQL re-applies it cleanly over a patched cluster. A patch never writes
-/// `awa.schema_version` and is never applied to a schema newer than this
-/// binary, where a later migration may have superseded it.
+/// and the `awa.schema_patches` ledger does not record it, and the 0.7
+/// migration carrying the same SQL records the same ledger row. A patch never
+/// writes `awa.schema_version` and is never applied to a schema newer than
+/// this binary, where a later migration may have superseded it.
+/// `applied_probe`, when set, recognises a database patched before the
+/// ledger existed (0.6.8): a true probe back-fills the ledger row instead of
+/// re-running the SQL.
 #[derive(Debug, Clone, Copy)]
 pub struct SchemaPatch {
     pub name: &'static str,
     pub description: &'static str,
     pub sql: &'static str,
-    /// Boolean SQL: TRUE when the patch is already present.
-    pub applied_probe: &'static str,
+    pub applied_probe: Option<&'static str>,
 }
 
 pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
@@ -253,9 +264,10 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
     name: "wait_free_dirty_marks",
     description: "Wait-free admin dirty-key marks (awa 0.7 migration v046)",
     sql: include_str!("../migrations/patches/wait_free_dirty_marks.sql"),
-    // Tables alone are not enough: a runner that applies the script statement by
-    // statement and stops early leaves the blocking trigger bodies in place.
-    applied_probe: "SELECT to_regclass('awa.admin_dirty_queue_marks') IS NOT NULL \
+    // 0.6.8 applied this patch without a ledger. Tables alone are not enough:
+    // a runner that applied the script statement by statement and stopped
+    // early leaves the blocking trigger bodies in place.
+    applied_probe: Some("SELECT to_regclass('awa.admin_dirty_queue_marks') IS NOT NULL \
                     AND to_regclass('awa.admin_dirty_kind_marks') IS NOT NULL \
                     AND (SELECT count(*) FROM pg_proc \
                          WHERE pronamespace = 'awa'::regnamespace \
@@ -266,7 +278,7 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
                                 WHERE pronamespace = 'awa'::regnamespace \
                                   AND proname = 'refresh_admin_metadata' \
                                   AND prosrc LIKE '%admin_dirty_queue_marks%' \
-                                  AND prosrc NOT LIKE '%TRUNCATE%')",
+                                  AND prosrc NOT LIKE '%TRUNCATE%')"),
     },
     SchemaPatch {
         name: "prepared_lane_sequences",
@@ -278,12 +290,33 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
             "\n",
             include_str!("../migrations/patches/prepared_lane_sequences.sql"),
         ),
-        applied_probe: "SELECT EXISTS (SELECT 1 FROM pg_proc \
+        applied_probe: Some("SELECT EXISTS (SELECT 1 FROM pg_proc \
                                 WHERE pronamespace = 'awa'::regnamespace \
                                   AND proname = 'ensure_lane_sequences' \
-                                  AND pg_get_functiondef(oid) LIKE '%has not been provisioned%')",
+                                  AND pg_get_functiondef(oid) LIKE '%has not been provisioned%')"),
     },
 ];
+
+/// The statement that records a patch in the ledger.
+pub fn schema_patch_ledger_insert(patch: &SchemaPatch, applied_by: &str) -> String {
+    format!(
+        "INSERT INTO awa.schema_patches (name, description, applied_by)\nVALUES ('{}', '{}', '{}')\nON CONFLICT (name) DO NOTHING;",
+        patch.name.replace('\'', "''"),
+        patch.description.replace('\'', "''"),
+        applied_by.replace('\'', "''"),
+    )
+}
+
+/// The complete script an external runner applies for one patch: the patch
+/// SQL, the ledger table, and the ledger row.
+pub fn schema_patch_script(patch: &SchemaPatch, applied_by: &str) -> String {
+    format!(
+        "{}\n\n{};\n\n{}\n",
+        patch.sql.trim_end(),
+        SCHEMA_PATCH_LEDGER_DDL,
+        schema_patch_ledger_insert(patch, applied_by)
+    )
+}
 
 /// Schema patches a database still needs to reach this binary's schema shape.
 ///
@@ -303,17 +336,53 @@ pub async fn pending_schema_patches(pool: &PgPool) -> Result<Vec<SchemaPatch>, A
     pending_schema_patches_conn(&mut conn).await
 }
 
+async fn ledger_exists(conn: &mut PgConnection) -> Result<bool, AwaError> {
+    Ok(
+        sqlx::query_scalar("SELECT to_regclass('awa.schema_patches') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
+async fn record_schema_patch(
+    conn: &mut PgConnection,
+    patch: &SchemaPatch,
+    applied_by: &str,
+) -> Result<(), AwaError> {
+    sqlx::raw_sql(SCHEMA_PATCH_LEDGER_DDL)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::raw_sql(&schema_patch_ledger_insert(patch, applied_by))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Patches the ledger does not record. A patch whose probe reports it present
+/// is recorded as back-filled and not returned.
 async fn pending_schema_patches_conn(
     conn: &mut PgConnection,
 ) -> Result<Vec<SchemaPatch>, AwaError> {
+    let recorded: Vec<String> = if ledger_exists(conn).await? {
+        sqlx::query_scalar("SELECT name FROM awa.schema_patches")
+            .fetch_all(&mut *conn)
+            .await?
+    } else {
+        Vec::new()
+    };
     let mut pending = Vec::new();
     for patch in SCHEMA_PATCHES {
-        let applied: bool = sqlx::query_scalar(patch.applied_probe)
-            .fetch_one(&mut *conn)
-            .await?;
-        if !applied {
-            pending.push(*patch);
+        if recorded.iter().any(|name| name == patch.name) {
+            continue;
         }
+        if let Some(probe) = patch.applied_probe {
+            let applied: bool = sqlx::query_scalar(probe).fetch_one(&mut *conn).await?;
+            if applied {
+                record_schema_patch(conn, patch, "probe back-fill").await?;
+                continue;
+            }
+        }
+        pending.push(*patch);
     }
     Ok(pending)
 }
@@ -401,6 +470,8 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
                 "Applying schema patch"
             );
             sqlx::raw_sql(patch.sql).execute(&mut *conn).await?;
+            record_schema_patch(conn, &patch, &format!("awa {}", env!("CARGO_PKG_VERSION")))
+                .await?;
             info!(patch = patch.name, "Schema patch applied");
         }
     }
@@ -637,14 +708,20 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
         .collect()
 }
 
-/// Schema patches as `(name, description, sql)`, for external runners. Each
-/// patch is idempotent and versionless: apply it after the migrations that
+/// Schema patches as `(name, description, script)`, for external runners. Each
+/// script is idempotent and self-recording: apply it after the migrations that
 /// bring the schema to [`CURRENT_VERSION`], as a repeatable migration
 /// (`R__<name>.sql` in Flyway terms), never as another `V40` file.
 pub fn schema_patch_sql(patches: &[SchemaPatch]) -> Vec<(&'static str, &'static str, String)> {
     patches
         .iter()
-        .map(|patch| (patch.name, patch.description, patch.sql.to_string()))
+        .map(|patch| {
+            (
+                patch.name,
+                patch.description,
+                schema_patch_script(patch, "sql export"),
+            )
+        })
         .collect()
 }
 
@@ -675,7 +752,10 @@ mod tests {
                 "patch {} must use IF NOT EXISTS / OR REPLACE forms only",
                 patch.name
             );
-            assert!(!patch.applied_probe.is_empty());
+            assert!(
+                patch.applied_probe.is_some(),
+                "0.6 patches predate the ledger and need a probe"
+            );
         }
     }
 
@@ -699,9 +779,14 @@ mod tests {
     fn schema_patch_sql_is_versionless_and_complete() {
         let exported = schema_patch_sql(SCHEMA_PATCHES);
         assert_eq!(exported.len(), SCHEMA_PATCHES.len());
-        for ((name, _, sql), patch) in exported.iter().zip(SCHEMA_PATCHES) {
+        for ((name, _, script), patch) in exported.iter().zip(SCHEMA_PATCHES) {
             assert_eq!(*name, patch.name);
-            assert_eq!(sql, patch.sql);
+            assert!(script.starts_with(patch.sql.trim_end()));
+            assert!(script.contains(SCHEMA_PATCH_LEDGER_DDL));
+            assert!(script.contains(&format!("VALUES ('{}',", patch.name)));
+            assert!(!script
+                .to_uppercase()
+                .contains("INSERT INTO AWA.SCHEMA_VERSION"));
         }
         assert!(migration_sql().iter().all(|(_, description, _)| {
             !SCHEMA_PATCHES.iter().any(|p| p.description == *description)

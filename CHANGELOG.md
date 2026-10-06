@@ -12,6 +12,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `R__prepared_lane_sequences.sql`). New `awa storage prepare-queue` and
   `QueueStorage::prepare_queue` provision lanes as the migrator; runtime roles
   need `USAGE, SELECT, UPDATE` on the lane sequences.
+- Schema patches are recorded in `awa.schema_patches` ([#492](https://github.com/hardbyte/awa/issues/492), ADR-046 on `main`). `awa migrate` creates the ledger when it applies a patch, back-fills the `wait_free_dirty_marks` row on a 0.6.8 database from the existing probe, and the exported `R__wait_free_dirty_marks.sql` script records itself, so `awa migrate --pending` and operators read applied state from the ledger rather than from object shapes. awa 0.7 migration v048 creates the same table.
 
 ## [0.6.9] — 2026-09-14
 

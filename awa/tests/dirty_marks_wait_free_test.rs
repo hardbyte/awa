@@ -528,11 +528,13 @@ async fn schema_patch_is_applied_once_by_migrate() {
         .unwrap()
         .is_empty());
 
-    // Simulate a cluster that took v040 before the patch existed.
-    sqlx::query("DROP TABLE awa.admin_dirty_queue_marks, awa.admin_dirty_kind_marks")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Simulate a cluster that took v040 before the patch or the ledger existed.
+    sqlx::query(
+        "DROP TABLE awa.admin_dirty_queue_marks, awa.admin_dirty_kind_marks, awa.schema_patches",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let pending = awa_model::migrations::pending_schema_patches(&pool)
         .await
         .unwrap();
@@ -549,9 +551,38 @@ async fn schema_patch_is_applied_once_by_migrate() {
         .await
         .unwrap();
     assert_eq!(version, awa_model::migrations::CURRENT_VERSION);
+    let ledger: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, applied_by FROM awa.schema_patches ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger.len(), awa_model::migrations::SCHEMA_PATCHES.len());
+    let (_, applied_by) = ledger
+        .iter()
+        .find(|(name, _)| name == "wait_free_dirty_marks")
+        .expect("wait_free_dirty_marks is recorded");
+    assert!(applied_by.starts_with("awa "));
 
     // Idempotent re-run.
     awa_model::migrations::run(&pool).await.unwrap();
+
+    // A 0.6.8 database: patch applied, no ledger. The probe back-fills the
+    // row and the SQL is not re-run.
+    sqlx::query("DROP TABLE awa.schema_patches")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(awa_model::migrations::pending_schema_patches(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    let backfilled: String = sqlx::query_scalar(
+        "SELECT applied_by FROM awa.schema_patches WHERE name = 'wait_free_dirty_marks'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(backfilled, "probe back-fill");
     pool.close().await;
 }
 

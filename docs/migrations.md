@@ -241,8 +241,9 @@ awa --database-url "$DATABASE_URL" migrate --extract-to ./sql/awa
 That writes one `V<n>__<description>.sql` file per migration, plus one
 `R__<name>.sql` file per **schema patch**: an idempotent repair the 0.6 series
 ships without a version bump, applied by `awa migrate` after the last migration
-and recorded nowhere in `awa.schema_version`. Apply patches as repeatable
-scripts after `V40`, never as another versioned file. `awa migrate --pending
+and recorded by name in `awa.schema_patches` (never in `awa.schema_version`);
+the exported script records itself. Apply patches as repeatable scripts after
+`V40`, never as another versioned file. `awa migrate --pending
 --sql` prints the migrations the database lacks, plus every patch when the
 database is below `V40` and only the missing patches when it is at `V40`. The same SQL
 is also available programmatically:
