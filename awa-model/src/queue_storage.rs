@@ -3666,6 +3666,33 @@ impl QueueStorage {
             .await
     }
 
+    /// Provision every priority and shard of a queue before deploying a runtime
+    /// role without schema CREATE. Run as the schema owner/migrator. This does
+    /// not change enqueue routing or the configured shard count.
+    pub async fn prepare_queue(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        enqueue_shards: i16,
+    ) -> Result<(), AwaError> {
+        if queue.is_empty() || !(1..=64).contains(&enqueue_shards) {
+            return Err(AwaError::Validation(
+                "prepare_queue requires a nonempty queue and 1..=64 enqueue shards".into(),
+            ));
+        }
+        let mut transaction = pool.begin().await.map_err(map_sqlx_error)?;
+        for physical_queue in self.physical_queues_for_logical(queue) {
+            for priority in 1..=4 {
+                for shard in 0..enqueue_shards {
+                    self.ensure_lane_inserts(&mut transaction, &physical_queue, priority, shard)
+                        .await?;
+                }
+            }
+        }
+        transaction.commit().await.map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
     /// Run the three lane-row inserts unconditionally and mark the
     /// `(queue, priority)` pair as cached on success. Skips the cache
     /// fast path so callers in the rollback-recovery path can force a

@@ -76,6 +76,14 @@ earlier storage DDL. See the 0.6→0.7 upgrade guide for the rollout boundary.
 
 Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
 
+## Restricted Database Roles
+
+When deploying a runtime without schema CREATE, apply v047 and provision every
+queue with `awa storage prepare-queue` as the migrator before starting producers
+or workers. Match shard/stripe counts; provision additional lanes before changing
+routing. Use the sequence grants and owner defaults in
+[Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+
 ## Rolling Upgrades
 
 Awa runs mixed-version fleets during a rollout; the constraints are version

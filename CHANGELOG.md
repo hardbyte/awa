@@ -4,6 +4,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+- v047 allows restricted runtimes to use provisioned lane sequences without
+  schema CREATE, including existing custom storage schemas. Add
+  `awa storage prepare-queue` / `QueueStorage::prepare_queue` for migrator-owned
+  provisioning; prepare each queue before deployment and grant sequence
+  `USAGE, SELECT, UPDATE`. Existing owners retain lazy creation and existing
+  cursors survive repeated provisioning.
+
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.
 
