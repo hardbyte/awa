@@ -207,7 +207,11 @@ const V19_UP: &str = include_str!("../migrations/v019_queue_storage_jobs_compat_
 const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schema_fallback.sql");
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
-const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
+const V23_UP: &str = concat!(
+    include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+    "\n",
+    include_str!("../migrations/v023_install_default_queue_storage_substrate.sql"),
+);
 const V24_UP: &str = include_str!("../migrations/v024_receipt_plane_fillfactor.sql");
 const V25_UP: &str = include_str!("../migrations/v025_drop_leases_state_hb_index.sql");
 const V26_UP: &str = include_str!("../migrations/v026_cron_jobs_pause.sql");
@@ -244,7 +248,8 @@ pub struct SchemaPatch {
     pub applied_probe: &'static str,
 }
 
-pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
+pub const SCHEMA_PATCHES: &[SchemaPatch] = &[
+    SchemaPatch {
     name: "wait_free_dirty_marks",
     description: "Wait-free admin dirty-key marks (awa 0.7 migration v046)",
     sql: include_str!("../migrations/patches/wait_free_dirty_marks.sql"),
@@ -262,7 +267,23 @@ pub const SCHEMA_PATCHES: &[SchemaPatch] = &[SchemaPatch {
                                   AND proname = 'refresh_admin_metadata' \
                                   AND prosrc LIKE '%admin_dirty_queue_marks%' \
                                   AND prosrc NOT LIKE '%TRUNCATE%')",
-}];
+    },
+    SchemaPatch {
+        name: "prepared_lane_sequences",
+        description: "Use provisioned lane sequences without runtime DDL (awa 0.7 migration v047)",
+        // The installer definition first, so the refresh re-runs the updated
+        // helper text for every installed queue-storage schema.
+        sql: concat!(
+            include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+            "\n",
+            include_str!("../migrations/patches/prepared_lane_sequences.sql"),
+        ),
+        applied_probe: "SELECT EXISTS (SELECT 1 FROM pg_proc \
+                                WHERE pronamespace = 'awa'::regnamespace \
+                                  AND proname = 'ensure_lane_sequences' \
+                                  AND pg_get_functiondef(oid) LIKE '%has not been provisioned%')",
+    },
+];
 
 /// Schema patches a database still needs to reach this binary's schema shape.
 ///
@@ -634,7 +655,13 @@ mod tests {
     #[test]
     fn schema_patches_are_idempotent_and_versionless() {
         for patch in SCHEMA_PATCHES {
-            let upper = patch.sql.to_uppercase();
+            // The installer body carries guarded DDL that only runs when the
+            // function is called; lint the statements the patch runs itself.
+            let top_level = match patch.sql.split("$install$").collect::<Vec<_>>().as_slice() {
+                [before, _body, after] => format!("{before}{after}"),
+                _ => patch.sql.to_string(),
+            };
+            let upper = top_level.to_uppercase();
             assert!(
                 !upper.contains("INSERT INTO AWA.SCHEMA_VERSION"),
                 "patch {} must not record a schema version",
