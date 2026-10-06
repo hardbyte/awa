@@ -5,19 +5,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ## [Unreleased]
 
 - Restricted runtimes can use pre-provisioned queue lanes without schema
-  `CREATE` ([#501](https://github.com/hardbyte/awa/pull/501), backported from
-  awa 0.7 migration v047). The lane helpers and head-sync triggers now skip
-  `CREATE SEQUENCE` when the lane sequence exists and raise SQLSTATE `42501`
-  with a provisioning hint when it does not and the role lacks schema `CREATE`.
-  It ships as the idempotent schema patch `prepared_lane_sequences`, with no new
-  migration version: `awa migrate` applies it on any v040 database, and external
-  runners apply the exported `R__prepared_lane_sequences.sql` (from `awa migrate
-  --sql`, `--extract-to`, or `awa.schema_patches()`) after `V40`. The patch
-  refreshes every installed queue-storage schema, keeping slot counts and receipt
-  mode. Add `awa storage prepare-queue` / `QueueStorage::prepare_queue` for
-  migrator-owned provisioning of all priorities, shards, and stripes before
-  deployment, and grant sequence `USAGE, SELECT, UPDATE`. Schema owners retain
-  lazy creation and existing cursors survive repeated provisioning.
+  `CREATE` ([#501](https://github.com/hardbyte/awa/pull/501)). The lane helpers
+  skip `CREATE SEQUENCE` when the sequence exists and raise SQLSTATE `42501`
+  with a provisioning hint when it does not. Ships as the schema patch
+  `prepared_lane_sequences` (applied by `awa migrate`, exported as
+  `R__prepared_lane_sequences.sql`). New `awa storage prepare-queue` and
+  `QueueStorage::prepare_queue` provision lanes as the migrator; runtime roles
+  need `USAGE, SELECT, UPDATE` on the lane sequences.
 
 ## [0.6.9] — 2026-09-14
 
