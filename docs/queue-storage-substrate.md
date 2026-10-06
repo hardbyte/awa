@@ -118,7 +118,7 @@ The split between migration-owned default substrate and helper-installed custom 
 - **Migrations that depend on queue-storage tables can write unconditional DDL.** Operations like the `done_entries` terminal-count delta append inside `awa.delete_job_compat()` need the delta table to exist. Migration ordering guarantees it.
 - **The default schema cannot be accidentally destroyed.** The reset guard above protects operators from a `DROP SCHEMA awa CASCADE` that would take the canonical migration tables with it.
 
-The helper is `SECURITY INVOKER` so callers need their own DDL privileges on the target schema; the runtime role does not gain DDL through the helper, which keeps the principle-of-least-privilege role model intact.
+The helper is `SECURITY INVOKER` so callers need their own DDL privileges on the target schema; the runtime role does not gain DDL through the helper, which keeps the principle-of-least-privilege role model intact. Once each queue is provisioned with `awa storage prepare-queue` and the `prepared_lane_sequences` schema patch is applied, a runtime role with DML, sequence `USAGE`/`SELECT`/`UPDATE`, function `EXECUTE` and `TRUNCATE` needs no schema `CREATE`; see [Provision queues before starting restricted runtimes](security.md#provision-queues-before-starting-restricted-runtimes).
 
 ## See also
 
