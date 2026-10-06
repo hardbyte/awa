@@ -107,7 +107,7 @@ GRANT USAGE ON SCHEMA awa TO awa_runtime;
 
 -- Sequences: canonical `jobs_id_seq`, and queue-storage `job_id_seq`
 -- once prepare_schema has materialized it.
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA awa TO awa_runtime;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA awa TO awa_runtime;
 
 -- All tables: the runtime needs full DML because triggers run as the
 -- invoking role (SECURITY INVOKER), so inserting a job also writes to
@@ -125,7 +125,7 @@ REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, I
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
-  GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 
@@ -134,7 +134,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
-  GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
@@ -156,23 +156,39 @@ If you override the schema name (Rust: `QueueStorageConfig.schema`; Python: `que
 ```sql
 GRANT USAGE ON SCHEMA my_qs_schema TO awa_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA my_qs_schema TO awa_runtime;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA my_qs_schema TO awa_runtime;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA my_qs_schema TO awa_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA my_qs_schema TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
-  GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
-  GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
 The default `awa` queue-storage substrate is migrated by `awa migrate`. Custom queue-storage schemas are migrated by `awa storage prepare-queue-storage-schema`, which should also run as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role needs read/write/execute privileges plus `TRUNCATE` for ring-partition rotation; it never needs DDL.
+
+### Provision queues before starting restricted runtimes
+
+Lane sequences are created lazily by the first producer or worker that touches a queue, which needs schema `CREATE`. A runtime role without it needs each queue provisioned in advance, and needs the `prepared_lane_sequences` schema patch: before it, the lane helpers issue `CREATE SEQUENCE IF NOT EXISTS` even for sequences that already exist, which requires schema `CREATE` regardless. Apply the patch with `awa migrate` (it applies on any v040 database), or run the exported `R__prepared_lane_sequences.sql` from `awa migrate --sql` / `--extract-to` / `awa.schema_patches()` after `V40`.
+
+Then provision every queue as the migrator before starting its producers or workers:
+
+```bash
+PGOPTIONS='-c role=awa_owner' \
+  awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
+  --queue email --enqueue-shards 1
+```
+
+The command provisions all four priorities in one transaction and is safe to repeat on a live queue: existing sequence cursors keep their positions. It does not change routing or the queue's configured shard count. Prepare additional shards before increasing `enqueue_shards`, and match `--queue-stripe-count` to the runtime's queue-storage configuration. With `PartitionedQueue`, provision each physical queue. Use `--schema` for a custom queue-storage schema. The Rust equivalent is `QueueStorage::prepare_queue`.
+
+Lane cursors need `UPDATE` on their sequences for `setval`, in addition to `USAGE` and `SELECT`; use the sequence grants above. A restricted runtime that reaches an unprovisioned lane fails with SQLSTATE `42501` and a provisioning hint. Schema owners keep lazy creation, so single-role installations need no extra step.
 
 ### 5. Configure your processes
 
