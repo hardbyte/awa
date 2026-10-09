@@ -27,6 +27,10 @@ const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 /// Batches smaller than this are written with a single `unnest` INSERT even on
 /// the COPY entry points; below it the INSERT is the faster path.
 pub(crate) const COPY_MIN_ROWS: usize = 2048;
+/// Claim and claim-cursor transactions commit without waiting for the WAL
+/// flush. A claim lost to a server crash leaves its job claimable again, and
+/// any later synchronous commit flushes every earlier claim first.
+const CLAIM_TRANSACTION_BEGIN: &str = "BEGIN; SET LOCAL synchronous_commit = off";
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
@@ -4330,7 +4334,10 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         for advance in advances {
             sqlx::query(audited_sql(format!(
                 r#"
@@ -5880,7 +5887,10 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut claimed_rows = Vec::new();
         let stripe_queues = self.physical_queues_for_logical(queue);
         let start = self.stripe_probe_start(stripe_queues.len());
@@ -6004,7 +6014,10 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut tx = pool
+            .begin_with(CLAIM_TRANSACTION_BEGIN)
+            .await
+            .map_err(map_sqlx_error)?;
         let mut claimed = Vec::new();
         claimed.extend(
             self.claim_ready_rows_tx(&mut tx, queue, max_batch, deadline_duration, aging_interval)
