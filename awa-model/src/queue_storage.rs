@@ -191,6 +191,16 @@ pub struct QueueClaimerLease {
     pub lease_epoch: i64,
 }
 
+/// How long a claim may reuse this instance's cached claimer lease before
+/// re-reading the lease row and the queue's claimer target.
+const CLAIMER_GATE_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy)]
+struct CachedClaimerGate {
+    checked_at: Instant,
+    lease: QueueClaimerLeaseRow,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 struct QueueClaimerLeaseRow {
     claimer_slot: i16,
@@ -2689,6 +2699,9 @@ pub struct QueueStorage {
     /// `reset()`. With the default `enqueue_shards = 1`, the cache holds 1
     /// and `pick_shard` returns 0 unconditionally.
     enqueue_shards_cache: Mutex<HashMap<String, i16>>,
+    /// This instance's claimer lease per queue, as last read or written, so a
+    /// claim does not re-read the lease and claimer target on every call.
+    claimer_gates: Mutex<HashMap<(String, Uuid), CachedClaimerGate>>,
     /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
     /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
     /// queue_claim_heads) we have previously inserted. Skips the three
@@ -2740,6 +2753,7 @@ impl QueueStorage {
             next_stripe_probe: AtomicUsize::new(0),
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
+            claimer_gates: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
@@ -3635,14 +3649,18 @@ impl QueueStorage {
 
         tx.commit().await.map_err(map_sqlx_error)?;
 
-        // queue_lanes was TRUNCATEd above and queue_meta may have a new
-        // shard configuration for the next round. Clear both caches so
-        // the next ensure_lane / shard_for_enqueue calls re-observe DB
-        // state.
+        // queue_lanes and queue_claimer_leases were TRUNCATEd above and
+        // queue_meta may have a new shard configuration for the next round.
+        // Clear the caches so the next ensure_lane / shard_for_enqueue /
+        // claim calls re-observe DB state.
         self.clear_lane_cache();
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
+            .clear();
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
             .clear();
         Ok(())
     }
@@ -6282,6 +6300,27 @@ impl QueueStorage {
         Ok(None)
     }
 
+    #[doc(hidden)]
+    pub fn cached_claimer_lease_count(&self) -> usize {
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .len()
+    }
+
+    fn cache_claimer_gate(&self, key: (String, Uuid), lease: QueueClaimerLeaseRow) {
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .insert(
+                key,
+                CachedClaimerGate {
+                    checked_at: Instant::now(),
+                    lease,
+                },
+            );
+    }
+
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, messaging.destination.name = %queue, instance_id = %instance_id, claimer_slot = lease.claimer_slot), name = "queue_storage.mark_queue_claimer_active")]
     pub async fn mark_queue_claimer_active(
         &self,
@@ -6504,22 +6543,43 @@ impl QueueStorage {
         lease_ttl: Duration,
         idle_threshold: Duration,
     ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
-        let target_claimers = self
-            .queue_claimer_target(pool, queue, max_claimers, Duration::from_millis(500))
-            .await?;
-
-        let Some(lease) = self
-            .acquire_queue_claimer_row(
-                pool,
-                queue,
-                instance_id,
-                target_claimers,
-                lease_ttl,
-                idle_threshold,
-            )
-            .await?
-        else {
-            return Ok(Vec::new());
+        let gate_key = (queue.to_string(), instance_id);
+        let cached_lease = self
+            .claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .get(&gate_key)
+            .filter(|gate| {
+                gate.checked_at.elapsed() < CLAIMER_GATE_CACHE_TTL
+                    && gate.lease.expires_at > Utc::now() + TimeDelta::seconds(1)
+            })
+            .map(|gate| gate.lease);
+        let lease = match cached_lease {
+            Some(lease) => lease,
+            None => {
+                let target_claimers = self
+                    .queue_claimer_target(pool, queue, max_claimers, Duration::from_millis(500))
+                    .await?;
+                let Some(lease) = self
+                    .acquire_queue_claimer_row(
+                        pool,
+                        queue,
+                        instance_id,
+                        target_claimers,
+                        lease_ttl,
+                        idle_threshold,
+                    )
+                    .await?
+                else {
+                    self.claimer_gates
+                        .lock()
+                        .expect("claimer gate cache poisoned")
+                        .remove(&gate_key);
+                    return Ok(Vec::new());
+                };
+                self.cache_claimer_gate(gate_key.clone(), lease);
+                lease
+            }
         };
 
         let claimed = self
@@ -6532,10 +6592,27 @@ impl QueueStorage {
             )
             .await?;
 
-        if !claimed.is_empty() && lease.needs_refresh(Utc::now(), lease_ttl, idle_threshold) {
-            let _ = self
+        let now = Utc::now();
+        if !claimed.is_empty() && lease.needs_refresh(now, lease_ttl, idle_threshold) {
+            let still_owned = self
                 .mark_queue_claimer_active(pool, queue, instance_id, lease.lease(), lease_ttl)
                 .await?;
+            if still_owned {
+                let refreshed = QueueClaimerLeaseRow {
+                    last_claimed_at: now,
+                    expires_at: now
+                        + TimeDelta::from_std(lease_ttl).map_err(|err| {
+                            AwaError::Validation(format!("invalid claimer lease ttl: {err}"))
+                        })?,
+                    ..lease
+                };
+                self.cache_claimer_gate(gate_key, refreshed);
+            } else {
+                self.claimer_gates
+                    .lock()
+                    .expect("claimer gate cache poisoned")
+                    .remove(&gate_key);
+            }
         }
 
         Ok(claimed)
