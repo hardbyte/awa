@@ -13047,6 +13047,8 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
     .execute(&pool)
     .await
     .expect("failed to age claimer lease heartbeat");
+    // Claims reuse this instance's cached claimer lease for a short TTL.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     store
         .enqueue_batch(&pool, queue, 1, 1)
