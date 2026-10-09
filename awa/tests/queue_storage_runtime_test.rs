@@ -15103,3 +15103,74 @@ async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
         "the job whose claim was lost stays claimable"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_reset_forgets_cached_claimer_lease() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_reset_claimer_cache";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_reset_claimer_cache";
+    let instance = Uuid::new_v4();
+    let ttl = Duration::from_secs(300);
+    let idle_threshold = Duration::from_secs(120);
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("failed to enqueue job");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            instance,
+            1,
+            ttl,
+            idle_threshold,
+        )
+        .await
+        .expect("claim should succeed");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(store.cached_claimer_lease_count(), 1);
+
+    store.reset(&pool).await.expect("failed to reset store");
+    assert_eq!(
+        store.cached_claimer_lease_count(),
+        0,
+        "reset truncates queue_claimer_leases, so cached leases must go too"
+    );
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("failed to enqueue job after reset");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            instance,
+            1,
+            ttl,
+            idle_threshold,
+        )
+        .await
+        .expect("claim after reset should succeed");
+    assert_eq!(claimed.len(), 1);
+
+    let owned: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {schema}.queue_claimer_leases WHERE queue = $1 AND owner_instance_id = $2"
+    )))
+    .bind(queue)
+    .bind(instance)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to count claimer leases");
+    assert_eq!(
+        owned, 1,
+        "a claim right after reset must take a real claimer lease, not a cached one"
+    );
+}

@@ -3649,14 +3649,18 @@ impl QueueStorage {
 
         tx.commit().await.map_err(map_sqlx_error)?;
 
-        // queue_lanes was TRUNCATEd above and queue_meta may have a new
-        // shard configuration for the next round. Clear both caches so
-        // the next ensure_lane / shard_for_enqueue calls re-observe DB
-        // state.
+        // queue_lanes and queue_claimer_leases were TRUNCATEd above and
+        // queue_meta may have a new shard configuration for the next round.
+        // Clear the caches so the next ensure_lane / shard_for_enqueue /
+        // claim calls re-observe DB state.
         self.clear_lane_cache();
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
+            .clear();
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
             .clear();
         Ok(())
     }
@@ -6294,6 +6298,14 @@ impl QueueStorage {
         }
 
         Ok(None)
+    }
+
+    #[doc(hidden)]
+    pub fn cached_claimer_lease_count(&self) -> usize {
+        self.claimer_gates
+            .lock()
+            .expect("claimer gate cache poisoned")
+            .len()
     }
 
     fn cache_claimer_gate(&self, key: (String, Uuid), lease: QueueClaimerLeaseRow) {
