@@ -1322,6 +1322,7 @@ mod claim_cursor_advance_tests {
             enqueue_shard: 0,
             next_seq,
             only_if_current,
+            evidence: None,
         }
     }
 
@@ -1838,12 +1839,28 @@ struct ClaimCursorAdvance {
     enqueue_shard: i16,
     next_seq: i64,
     only_if_current: Option<i64>,
+    /// Claim batch row that must exist for the advance to apply: the cursor
+    /// only moves past a lane position whose claim is visible on the server
+    /// the advance runs against.
+    evidence: Option<ClaimEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimEvidence {
+    ready_slot: i32,
+    ready_generation: i64,
+    lane_seq: i64,
 }
 
 type ClaimCursorLaneKey = (String, i16, i16);
 type ConditionalClaimCursorAdvances = BTreeMap<i64, i64>;
-type GroupedClaimCursorAdvances =
-    BTreeMap<ClaimCursorLaneKey, (Option<i64>, ConditionalClaimCursorAdvances)>;
+type GroupedClaimCursorAdvances = BTreeMap<
+    ClaimCursorLaneKey,
+    (
+        Option<(i64, Option<ClaimEvidence>)>,
+        ConditionalClaimCursorAdvances,
+    ),
+>;
 type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 
 struct CancelJobTxResult {
@@ -4219,25 +4236,33 @@ impl QueueStorage {
     }
 
     fn claim_cursor_advances(rows: &[ReadyJobLeaseRow]) -> Vec<ClaimCursorAdvance> {
-        let mut next_by_lane: BTreeMap<ClaimCursorLaneKey, i64> = BTreeMap::new();
+        let mut last_by_lane: BTreeMap<ClaimCursorLaneKey, &ReadyJobLeaseRow> = BTreeMap::new();
         for row in rows {
             let key = (row.queue.clone(), row.lane_priority, row.enqueue_shard);
-            let next = row.lane_seq + 1;
-            next_by_lane
+            last_by_lane
                 .entry(key)
-                .and_modify(|current| *current = (*current).max(next))
-                .or_insert(next);
+                .and_modify(|current| {
+                    if row.lane_seq > current.lane_seq {
+                        *current = row;
+                    }
+                })
+                .or_insert(row);
         }
 
-        next_by_lane
+        last_by_lane
             .into_iter()
             .map(
-                |((queue, priority, enqueue_shard), next_seq)| ClaimCursorAdvance {
+                |((queue, priority, enqueue_shard), last)| ClaimCursorAdvance {
                     queue,
                     priority,
                     enqueue_shard,
-                    next_seq,
+                    next_seq: last.lane_seq + 1,
                     only_if_current: None,
+                    evidence: last.claim_batch_id.map(|_| ClaimEvidence {
+                        ready_slot: last.ready_slot,
+                        ready_generation: last.ready_generation,
+                        lane_seq: last.lane_seq,
+                    }),
                 },
             )
             .collect()
@@ -4258,24 +4283,21 @@ impl QueueStorage {
                     .entry(only_if_current)
                     .and_modify(|next| *next = (*next).max(advance.next_seq))
                     .or_insert(advance.next_seq);
-            } else {
-                *unconditional = Some(
-                    unconditional
-                        .map(|next| next.max(advance.next_seq))
-                        .unwrap_or(advance.next_seq),
-                );
+            } else if unconditional.is_none_or(|(next, _)| advance.next_seq > next) {
+                *unconditional = Some((advance.next_seq, advance.evidence));
             }
         }
 
         let mut normalized = Vec::with_capacity(advances.len());
         for ((queue, priority, enqueue_shard), (unconditional, conditional)) in grouped {
-            if let Some(next_seq) = unconditional {
+            if let Some((next_seq, evidence)) = unconditional {
                 normalized.push(ClaimCursorAdvance {
                     queue,
                     priority,
                     enqueue_shard,
                     next_seq,
                     only_if_current: None,
+                    evidence,
                 });
                 continue;
             }
@@ -4287,11 +4309,45 @@ impl QueueStorage {
                     enqueue_shard,
                     next_seq,
                     only_if_current: Some(only_if_current),
+                    evidence: None,
                 });
             }
         }
 
         normalized
+    }
+
+    /// Re-run the cursor advance a claim of `lane_seq` would issue, as if the
+    /// claim had been recorded in `(ready_slot, ready_generation)`. Lets tests
+    /// exercise the evidence guard after removing a claim's batch row.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replay_claim_cursor_advance(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+        ready_slot: i32,
+        ready_generation: i64,
+        lane_seq: i64,
+    ) -> Result<(), AwaError> {
+        self.advance_claim_cursors_strict(
+            pool,
+            &[ClaimCursorAdvance {
+                queue: queue.to_string(),
+                priority,
+                enqueue_shard,
+                next_seq: lane_seq + 1,
+                only_if_current: None,
+                evidence: Some(ClaimEvidence {
+                    ready_slot,
+                    ready_generation,
+                    lane_seq,
+                }),
+            }],
+        )
+        .await
     }
 
     async fn advance_claim_cursors(&self, pool: &PgPool, advances: &[ClaimCursorAdvance]) {
@@ -4351,8 +4407,22 @@ impl QueueStorage {
                 )
                 SELECT {schema}.set_sequence_next(seq_name, $4)
                 FROM head
-                WHERE $5::bigint IS NULL
-                   OR {schema}.sequence_next_value(seq_name) = $5
+                WHERE ($5::bigint IS NULL OR {schema}.sequence_next_value(seq_name) = $5)
+                  AND (
+                      $6::int IS NULL
+                      OR EXISTS (
+                          SELECT 1
+                          FROM {schema}.ready_claim_attempt_batches AS attempts
+                          WHERE attempts.ready_slot = $6
+                            AND attempts.ready_generation = $7
+                            AND attempts.queue = $1
+                            AND attempts.priority = $2
+                            AND attempts.enqueue_shard = $3
+                            AND attempts.first_lane_seq <= $8
+                            AND attempts.next_lane_seq > $8
+                            AND attempts.lane_ranges @> int8range($8, $8 + 1, '[)')
+                      )
+                  )
                 "#
             )))
             .bind(&advance.queue)
@@ -4360,6 +4430,9 @@ impl QueueStorage {
             .bind(advance.enqueue_shard)
             .bind(advance.next_seq)
             .bind(advance.only_if_current)
+            .bind(advance.evidence.map(|evidence| evidence.ready_slot))
+            .bind(advance.evidence.map(|evidence| evidence.ready_generation))
+            .bind(advance.evidence.map(|evidence| evidence.lane_seq))
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
@@ -8453,6 +8526,7 @@ impl QueueStorage {
                 enqueue_shard: ready.enqueue_shard,
                 next_seq: ready.lane_seq + 1,
                 only_if_current: Some(ready.lane_seq),
+                evidence: None,
             };
             return Ok(Some(CancelJobTxResult {
                 row: done.into_job_row()?,

@@ -15019,3 +15019,85 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_cursor_claim_evidence";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_cursor_claim_evidence";
+
+    store
+        .enqueue_batch(&pool, queue, 2, 1)
+        .await
+        .expect("failed to enqueue job");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("failed to claim job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    let claim = claimed.claim.clone();
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
+        claim.lane_seq + 1,
+        "a recorded claim advances the cursor past its row"
+    );
+
+    // A server that never received the claim (e.g. a standby promoted before
+    // the asynchronously committed claim replicated): no claim rows, and the
+    // cursor still at the claimed row.
+    for table in [
+        "ready_claim_attempt_batches",
+        "lease_claim_batches",
+        "leases",
+    ] {
+        sqlx::query(audited_sql(format!(
+            "DELETE FROM {schema}.{table} WHERE queue = $1"
+        )))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("failed to remove claim evidence");
+    }
+    sqlx::query(audited_sql(format!(
+        "SELECT setval(format('%I.%I', $1::text, seq_name)::regclass, $3, false)
+         FROM {schema}.queue_claim_heads
+         WHERE queue = $2"
+    )))
+    .bind(schema)
+    .bind(queue)
+    .bind(claim.lane_seq)
+    .execute(&pool)
+    .await
+    .expect("failed to rewind claim cursor");
+
+    store
+        .replay_claim_cursor_advance(
+            &pool,
+            queue,
+            claim.priority,
+            claim.enqueue_shard,
+            claim.ready_slot,
+            claim.ready_generation,
+            claim.lane_seq,
+        )
+        .await
+        .expect("cursor advance should not fail");
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
+        claim.lane_seq,
+        "the cursor must not move past a row whose claim is not recorded"
+    );
+
+    let reclaimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("failed to reclaim job");
+    assert_eq!(
+        reclaimed.iter().map(|job| job.job.id).collect::<Vec<_>>(),
+        vec![claimed.job.id],
+        "the job whose claim was lost stays claimable"
+    );
+}
