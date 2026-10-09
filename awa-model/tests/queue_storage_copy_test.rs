@@ -134,6 +134,101 @@ async fn lane_available_count(pool: &PgPool, schema: &str, queues: Vec<String>) 
     .expect("count lane availability")
 }
 
+// Batches below the COPY threshold are written with an `unnest` INSERT; this
+// one is large enough that both the ready and deferred writers take COPY.
+#[tokio::test]
+async fn queue_storage_copy_large_batch_takes_copy_path() {
+    let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
+    let (pool, store) = setup_store("awa_qs_copy_large").await;
+    let queue = "qs_copy_large";
+    let rows_per_state: i64 = 2048;
+    let special_args = serde_json::json!({
+        "quotes": "he said \"hello\"",
+        "newlines": "line1\nline2",
+        "commas": "a,b,c",
+        "sentinel": "__AWA_NULL__",
+    });
+
+    let mut jobs: Vec<InsertParams> = (0..rows_per_state)
+        .map(|seq| InsertParams {
+            kind: "copy_large_ready".to_string(),
+            args: if seq == 0 {
+                special_args.clone()
+            } else {
+                serde_json::json!({"seq": seq})
+            },
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                tags: if seq == 0 {
+                    vec!["with,comma".to_string(), "with\"quote".to_string()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+        })
+        .collect();
+    jobs.extend((0..rows_per_state).map(|seq| InsertParams {
+        kind: "copy_large_scheduled".to_string(),
+        args: serde_json::json!({"seq": seq}),
+        opts: InsertOpts {
+            queue: queue.to_string(),
+            run_at: Some(Utc::now() + TimeDelta::minutes(10)),
+            ..Default::default()
+        },
+    }));
+
+    let inserted = store
+        .enqueue_params_copy(&pool, &jobs)
+        .await
+        .expect("copy enqueue");
+    assert_eq!(inserted as i64, rows_per_state * 2);
+
+    let (ready_count, min_seq, max_seq): (i64, i64, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT count(*)::bigint, min(lane_seq), max(lane_seq) FROM {}.ready_entries WHERE queue = $1",
+        store.schema()
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count ready rows");
+    assert_eq!(ready_count, rows_per_state);
+    assert_eq!(
+        max_seq - min_seq + 1,
+        rows_per_state,
+        "lane sequence is contiguous"
+    );
+
+    let (args, payload): (serde_json::Value, Option<serde_json::Value>) =
+        sqlx::query_as(audited_sql(format!(
+            "SELECT args, payload FROM {}.ready_entries WHERE queue = $1 AND args ? 'quotes'",
+            store.schema()
+        )))
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .expect("read special row");
+    assert_eq!(args, special_args);
+    assert_eq!(
+        payload.expect("tagged payload")["tags"],
+        serde_json::json!(["with,comma", "with\"quote"])
+    );
+
+    let deferred_count: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1 AND state = 'scheduled'",
+        store.schema()
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count deferred rows");
+    assert_eq!(deferred_count, rows_per_state);
+
+    let available_count =
+        lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
+    assert_eq!(available_count, rows_per_state);
+}
+
 #[tokio::test]
 async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
     let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
