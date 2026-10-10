@@ -372,7 +372,9 @@ Prototypes on this branch, each its own commit with tests:
 | --- | --- |
 | `3c0f813` | P1: shared listener, idle poll back-off |
 | `780c9b2` | P2: close compact receipt claims by batch identity |
-| (next) | P1b: bounded claim concurrency; P2b: slow completion by batch identity; P3: truncate only non-empty children |
+| `ba4dba8` | P1b: bounded claim concurrency (`max_concurrent_claims`) |
+| `59181a6` | P3: truncate only ring children that hold rows |
+| `feb1cab` | P2b: slow completion addresses claim batches by identity |
 
 ### 3.1 First pass: baseline vs P1+P2 (runs hours apart, same conditions)
 
@@ -402,14 +404,79 @@ back-to-back table below separates the two.
 
 ### 3.2 Back-to-back comparison (same hour, variants alternated)
 
-{{BACK_TO_BACK}}
+Variants: `base` = #508 head (`59b244f`); `p12` = P1+P2; `p123` = P1+P1b+P2+P2b+P3
+(branch head). Every row is a fresh Postgres; `fan200` was run for all
+three variants in sequence, the other cells alternated base/p123.
+
+| Cell | Metric | base | p12 | p123 |
+| --- | --- | ---: | ---: | ---: |
+| `fan200` | done/s (200 offered) | 200 | 123 | **200** |
+| `fan200` | claim p50 / p99 | 462 / 1,837 ms | 1,215 / 3,526 ms | **27 / 1,283 ms** |
+| `fan200` | producer p99 | 1,341 ms | 2,381 ms | **236 ms** |
+| `fan200` | queue depth | 30 | 97 | **2** |
+| `fan200` | claim calls/s, mean | 1,633, 10.8 ms | 677, 79 ms | 1,100, **5.2 ms** |
+| `fan200` | LWLock:LockManager samples | 755 | 4,734 | **173** |
+| `fan200` | xacts/s | 3,758 | 2,243 | 4,053 |
+| `retry` | done/s (400 offered) | **88** | – | **402** |
+| `retry` | claim p50 / p99 | 53.5 s / 66.7 s | – | 35 ms / 2.7 s |
+| `retry` | producer p99 | 283 ms | – | **23 ms** |
+| `retry` | queue depth | 27,016 | – | 6 |
+| `retry` | WAL B/job | 4,647 | – | 3,046 |
+| `idle` | xacts/s | 157 | – | **70** |
+| `idle` | WAL KB/s | 17.1 | – | 16.0 |
+| `idle` | tuples updated/s | 6.5 | – | 4.7 |
+| `2x200` | done/s, claim p50 / p99 | 397, 10 / 60 ms | – | 385, 12 / 73 ms |
+| `2x200` | xacts/job, WAL B/job | 1.80, 1,795 | – | 1.77, 1,769 |
+| `2x200` | relfilenode swaps/s | 32.8 | – | **20.1** |
+| `w64` | done/s, claim p50 / p99 | 5,754, 495 / 734 ms | – | 5,957, 447 / 637 ms |
+| `w64` | xacts/job, WAL B/job | 0.09, 924 | – | 0.09, 922 |
+| `w64` | relfilenode swaps/s | 25.1 | – | **11.4** |
+| `w4` | done/s | 454 | – | 435 |
+| `w4` | xacts/job, WAL B/job | 1.40, 1,994 | – | 1.39, 1,917 |
+| `w4` | relfilenode swaps/s | 22.8 | – | **10.6** |
+| `long` | xacts/s, WAL KB/s | 183, 24.0 | – | **131, 17.1** |
+| `long` | tuples updated/s | 21.7 | – | 14.2 |
+| `long` | catalog dead-tuple delta (97 s) | +594 | – | +324 |
+| `long` | relfilenode swaps/s | 10.6 | – | 5.9 |
+
+Reading the table:
+
+- The two degenerate shapes are gone. `retry` goes from 88/s with a 27k
+  backlog and a 53 s claim p50 to full throughput at 400/s with a 6-row
+  depth and a 23 ms producer p99 (the coordinator's "producer insert p99
+  rising to ~100 ms while retries re-enqueue" was this lookup holding batch
+  rows and lane locks). `fan200` goes from a 462 ms claim p50 and 1.3 s
+  producer p99 to 27 ms and 236 ms at the same throughput, with the lock
+  manager out of the wait profile.
+- `p12` alone makes `fan200` worse (section 3.1 explained why): removing
+  the per-queue listeners frees the pool, and without the claim gate the
+  freed connections all become concurrent claims. P1 and P1b ship together.
+- P3 halves relfilenode churn everywhere (`w64` 25 → 11/s, `w4` 23 → 11/s,
+  `2x200` 33 → 20/s) and the catalog dead-tuple growth in the long-job cell,
+  with no throughput cost; the remaining swaps are children that really hold
+  rows, which only P4 (cadence) can reduce further.
+- Idle transactions halve (157 → 70/s). The remainder is maintenance: the
+  ring serialisers take a WAL-logged `FOR UPDATE` on each `*_ring_state`
+  singleton on every rotate *and* prune tick before the idle gate is
+  checked (8/s for the lease ring at the bench's 250 ms cadence, 54 B of WAL
+  each), `promote_due` runs twice every 250 ms, and the claimer-gate cache
+  re-acquires its lease row every 250 ms. Checking the idle gate before the
+  serialiser lock and lengthening the gate TTL while idle (P9) would bring
+  idle close to river's 25/s.
+- Throughput-bound cells (`w64`, `w4`, `2x200`) are unchanged within noise:
+  these prototypes remove degenerate cost, they do not shorten the claim
+  itself. That is P5/P6/P7.
+- `fan200`'s claim p99 (1.28 s) is now queueing on the claim gate (200
+  queues sharing 64 slots on a 4-CPU server); p50 is 27 ms. Raising the
+  gate trades p99 for lock-manager contention, so the right fix for the
+  tail is a cheaper claim (P5) rather than a wider gate.
 
 ### 3.3 Tests
 
-`cargo test -p awa-model` and `cargo test -p awa --test
-queue_storage_runtime_test` pass on PostgreSQL 17 (subsets re-run after each
-prototype: dispatcher/claimer, receipt/retry/snooze/cancel/DLQ, rotation/
-prune/idle). New tests: `idle_poll_sleep_doubles_up_to_the_idle_cap`
+`cargo test -p awa-model` and the full `cargo test -p awa --test
+queue_storage_runtime_test` (136 tests) pass on PostgreSQL 17 at the branch
+head; `cargo fmt` and `cargo clippy --all-targets --all-features -D warnings`
+are clean. New tests: `idle_poll_sleep_doubles_up_to_the_idle_cap`
 (worker), `test_queue_storage_receipt_claim_hint_closes_compact_claim_once`,
 and the idle-prune test now asserts that an empty child's relfilenode is
 left alone.
