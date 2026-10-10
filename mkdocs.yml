@@ -151,6 +151,7 @@ exclude_docs: |
 
 not_in_nav: |
   /0.7-roadmap.md
+  /design/**
   /adr/[0-9]*.md
   /adr/bench/**
   /grafana/alerts/**
