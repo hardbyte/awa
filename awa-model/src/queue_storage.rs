@@ -6716,7 +6716,9 @@ impl QueueStorage {
         self.close_receipt_pairs_tx(&mut tx, &completed_pairs, "completed")
             .await?;
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = self
+            .hydrate_deleted_leases_tx(&mut tx, deleted, true)
+            .await?;
 
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
@@ -7727,7 +7729,7 @@ impl QueueStorage {
         self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
             .await?;
 
-        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
 
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
@@ -8145,7 +8147,7 @@ impl QueueStorage {
 
         if !deleted_waiting.is_empty() {
             let waiting = self
-                .hydrate_deleted_leases_tx(tx, deleted_waiting)
+                .hydrate_deleted_leases_tx(tx, deleted_waiting, true)
                 .await?
                 .into_iter()
                 .next()
@@ -8642,7 +8644,7 @@ impl QueueStorage {
 
         if !deleted_lease.is_empty() {
             let lease = self
-                .hydrate_deleted_leases_tx(tx, deleted_lease)
+                .hydrate_deleted_leases_tx(tx, deleted_lease, true)
                 .await?
                 .into_iter()
                 .next()
@@ -10175,10 +10177,13 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
+    /// `write_receipt_closures` is false when the caller has already closed
+    /// the receipt for every row in `deleted` in this transaction.
     async fn hydrate_deleted_leases_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         deleted: Vec<DeletedLeaseRow>,
+        write_receipt_closures: bool,
     ) -> Result<Vec<LeaseTransitionRow>, AwaError> {
         if deleted.is_empty() {
             return Ok(Vec::new());
@@ -10272,7 +10277,8 @@ impl QueueStorage {
         // retryable / failed / completed. Write the closure here so
         // the receipt plane mirrors the lease plane: when the lease
         // is gone, the receipt is gone too.
-        sqlx::query(audited_sql(format!(
+        if write_receipt_closures {
+            sqlx::query(audited_sql(format!(
             r#"
             WITH refs(job_id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
@@ -10375,6 +10381,7 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        }
 
         let ready_map: BTreeMap<(i32, i64, String, i16, i64, i64), ReadySnapshotRow> = ready_rows
             .into_iter()
@@ -10444,12 +10451,141 @@ impl QueueStorage {
         Ok(hydrated)
     }
 
+    /// Close one compact receipt claim by its batch identity. The claim
+    /// batch row is addressed by primary key and the item by index, and the
+    /// closure evidence probes are all index lookups, so the cost does not
+    /// grow with the number of open claim batches. The per-attempt advisory
+    /// lock taken by the caller serialises closers; the batch row itself is
+    /// not locked, matching the compact completion path.
+    #[allow(clippy::too_many_arguments)]
+    async fn close_compact_receipt_claim_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        outcome: &str,
+        claim_slot: i32,
+        batch_id: i64,
+        batch_index: i32,
+        receipt_id: i64,
+    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        let schema = self.schema();
+        let slot = usize::try_from(claim_slot)
+            .map_err(|_| AwaError::Validation(format!("invalid claim slot {claim_slot}")))?;
+        let claim_batch_rel = claim_batch_child_name(schema, slot);
+        let closure_rel = closure_child_name(schema, slot);
+        let closure_batch_rel = claim_closure_batch_child_name(schema, slot);
+        sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH target AS (
+                SELECT
+                    claim_batches.claim_slot,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    claim_batches.job_ids[$3] AS job_id,
+                    claim_batches.queue,
+                    'running'::awa.job_state AS state,
+                    claim_batches.priority,
+                    claim_batches.attempts[$3] AS attempt,
+                    claim_batches.run_leases[$3] AS run_lease,
+                    claim_batches.max_attempts[$3] AS max_attempts,
+                    claim_batches.lane_seqs[$3] AS lane_seq,
+                    claim_batches.enqueue_shard,
+                    claim_batches.claimed_at AS attempted_at
+                FROM {claim_batch_rel} AS claim_batches
+                WHERE claim_batches.claim_slot = $1
+                  AND claim_batches.batch_id = $2
+                  AND $3 BETWEEN 1 AND claim_batches.claimed_count
+                  AND claim_batches.job_ids[$3] = $4
+                  AND claim_batches.run_leases[$3] = $5
+                  AND claim_batches.receipt_ids[$3] = $6
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {closure_rel} AS closures
+                      WHERE closures.claim_slot = $1
+                        AND closures.job_id = $4
+                        AND closures.run_lease = $5
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {closure_batch_rel} AS closure_batches
+                      WHERE closure_batches.claim_slot = $1
+                        AND closure_batches.receipt_ranges @> $6::bigint
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = $4 AND done.run_lease = $5
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = $4 AND deferred.run_lease = $5
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = $4 AND dlq.run_lease = $5
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
+                      WHERE lease.job_id = $4 AND lease.run_lease = $5
+                  )
+            ),
+            inserted_batches AS (
+                INSERT INTO {schema}.lease_claim_closure_batches (
+                    claim_slot,
+                    ready_slot,
+                    ready_generation,
+                    outcome,
+                    closed_count,
+                    receipt_ids,
+                    receipt_ranges,
+                    closed_at
+                )
+                SELECT
+                    target.claim_slot,
+                    target.ready_slot,
+                    target.ready_generation,
+                    $7,
+                    1,
+                    ARRAY[$6::bigint],
+                    int8multirange(int8range($6::bigint, $6::bigint + 1, '[)')),
+                    clock_timestamp()
+                FROM target
+                RETURNING claim_slot
+            )
+            SELECT
+                target.ready_slot,
+                target.ready_generation,
+                target.job_id,
+                target.queue,
+                target.state,
+                target.priority,
+                target.attempt,
+                target.run_lease,
+                target.max_attempts,
+                target.lane_seq,
+                target.enqueue_shard,
+                target.attempted_at
+            FROM target
+            WHERE EXISTS (SELECT 1 FROM inserted_batches)
+            "#
+        )))
+        .bind(claim_slot)
+        .bind(batch_id)
+        .bind(batch_index)
+        .bind(job_id)
+        .bind(run_lease)
+        .bind(receipt_id)
+        .bind(outcome)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     async fn close_open_receipt_claim_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
         run_lease: i64,
         outcome: &str,
+        claim: Option<&ClaimedEntry>,
     ) -> Result<Option<LeaseTransitionRow>, AwaError> {
         if !self.lease_claim_receipts() {
             return Ok(None);
@@ -10457,6 +10593,32 @@ impl QueueStorage {
 
         self.lock_receipt_attempts_tx(tx, &[(job_id, run_lease)])
             .await?;
+
+        if let Some(claim) = claim.filter(|claim| claim.lease_claim_receipt) {
+            if let (Some(batch_id), Some(batch_index), Some(receipt_id)) = (
+                claim.claim_batch_id,
+                claim.claim_batch_index,
+                claim.receipt_id,
+            ) {
+                let deleted = self
+                    .close_compact_receipt_claim_tx(
+                        tx,
+                        job_id,
+                        run_lease,
+                        outcome,
+                        claim.claim_slot,
+                        batch_id,
+                        batch_index,
+                        receipt_id,
+                    )
+                    .await?;
+                if deleted.is_empty() {
+                    return Ok(None);
+                }
+                let moved = self.hydrate_deleted_leases_tx(tx, deleted, false).await?;
+                return Ok(moved.into_iter().next());
+            }
+        }
 
         let schema = self.schema();
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
@@ -10678,7 +10840,7 @@ impl QueueStorage {
             return Ok(None);
         }
 
-        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
         Ok(moved.into_iter().next())
     }
 
@@ -10688,9 +10850,10 @@ impl QueueStorage {
         job_id: i64,
         run_lease: i64,
         receipt_outcome: &str,
+        claim: Option<&ClaimedEntry>,
     ) -> Result<Option<LeaseTransitionRow>, AwaError> {
         if let Some(moved) = self
-            .close_open_receipt_claim_tx(tx, job_id, run_lease, receipt_outcome)
+            .close_open_receipt_claim_tx(tx, job_id, run_lease, receipt_outcome, claim)
             .await?
         {
             return Ok(Some(moved));
@@ -10732,7 +10895,7 @@ impl QueueStorage {
             return Ok(None);
         }
 
-        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
         Ok(moved.into_iter().next())
     }
 
@@ -12911,7 +13074,7 @@ impl QueueStorage {
         self.close_receipt_pairs_tx(tx, &completed_pairs, "completed")
             .await?;
 
-        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
@@ -13013,7 +13176,7 @@ impl QueueStorage {
         self.close_receipt_pairs_tx(tx, &failed_pairs, "failed")
             .await?;
 
-        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
@@ -13112,7 +13275,7 @@ impl QueueStorage {
         self.close_receipt_pairs_tx(tx, &retryable_pairs, "retryable")
             .await?;
 
-        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted, true).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let ready_payload =
@@ -13354,9 +13517,22 @@ impl QueueStorage {
         retry_after: Duration,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.retry_after_with_claim(pool, job_id, run_lease, retry_after, progress, None)
+            .await
+    }
+
+    pub async fn retry_after_with_claim(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        run_lease: i64,
+        retry_after: Duration,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let result = self
-            .retry_after_in_tx(&mut tx, job_id, run_lease, retry_after, progress)
+            .retry_after_in_tx_with_claim(&mut tx, job_id, run_lease, retry_after, progress, claim)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result)
@@ -13373,8 +13549,21 @@ impl QueueStorage {
         retry_after: Duration,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.retry_after_in_tx_with_claim(tx, job_id, run_lease, retry_after, progress, None)
+            .await
+    }
+
+    pub async fn retry_after_in_tx_with_claim(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        retry_after: Duration,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(tx, job_id, run_lease, "retryable")
+            .take_running_attempt_tx(tx, job_id, run_lease, "retryable", claim)
             .await?
         else {
             return Ok(None);
@@ -13404,9 +13593,22 @@ impl QueueStorage {
         snooze_for: Duration,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.snooze_with_claim(pool, job_id, run_lease, snooze_for, progress, None)
+            .await
+    }
+
+    pub async fn snooze_with_claim(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        run_lease: i64,
+        snooze_for: Duration,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let Some(moved) = self
-            .take_running_attempt_tx(&mut tx, job_id, run_lease, "scheduled")
+            .take_running_attempt_tx(&mut tx, job_id, run_lease, "scheduled", claim)
             .await?
         else {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -13670,8 +13872,21 @@ impl QueueStorage {
         reason: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.cancel_running_in_tx_with_claim(tx, job_id, run_lease, reason, progress, None)
+            .await
+    }
+
+    pub async fn cancel_running_in_tx_with_claim(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        reason: &str,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(tx, job_id, run_lease, "cancelled")
+            .take_running_attempt_tx(tx, job_id, run_lease, "cancelled", claim)
             .await?
         else {
             return Ok(None);
@@ -13720,8 +13935,21 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.fail_terminal_in_tx_with_claim(tx, job_id, run_lease, error, progress, None)
+            .await
+    }
+
+    pub async fn fail_terminal_in_tx_with_claim(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        error: &str,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(tx, job_id, run_lease, "failed")
+            .take_running_attempt_tx(tx, job_id, run_lease, "failed", claim)
             .await?
         else {
             return Ok(None);
@@ -13767,8 +13995,23 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.fail_to_dlq_in_tx_with_claim(tx, job_id, run_lease, dlq_reason, error, progress, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fail_to_dlq_in_tx_with_claim(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        dlq_reason: &str,
+        error: &str,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(tx, job_id, run_lease, "dlq")
+            .take_running_attempt_tx(tx, job_id, run_lease, "dlq", claim)
             .await?
         else {
             return Ok(None);
@@ -14184,9 +14427,22 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.fail_retryable_with_claim(pool, job_id, run_lease, error, progress, None)
+            .await
+    }
+
+    pub async fn fail_retryable_with_claim(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        run_lease: i64,
+        error: &str,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let result = self
-            .fail_retryable_in_tx(&mut tx, job_id, run_lease, error, progress)
+            .fail_retryable_in_tx_with_claim(&mut tx, job_id, run_lease, error, progress, claim)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result)
@@ -14201,8 +14457,21 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.fail_retryable_in_tx_with_claim(tx, job_id, run_lease, error, progress, None)
+            .await
+    }
+
+    pub async fn fail_retryable_in_tx_with_claim(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        error: &str,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(tx, job_id, run_lease, "retryable")
+            .take_running_attempt_tx(tx, job_id, run_lease, "retryable", claim)
             .await?
         else {
             return Ok(None);
@@ -14323,9 +14592,11 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let moved_leases = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved_leases = self
+            .hydrate_deleted_leases_tx(&mut tx, deleted, true)
+            .await?;
         let moved_receipts = self
-            .hydrate_deleted_leases_tx(&mut tx, rescued_receipts)
+            .hydrate_deleted_leases_tx(&mut tx, rescued_receipts, true)
             .await?;
 
         let mut rescued = Vec::with_capacity(moved_leases.len() + moved_receipts.len());
@@ -14444,9 +14715,11 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let mut moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let mut moved = self
+            .hydrate_deleted_leases_tx(&mut tx, deleted, true)
+            .await?;
         moved.extend(
-            self.hydrate_deleted_leases_tx(&mut tx, receipt_deleted)
+            self.hydrate_deleted_leases_tx(&mut tx, receipt_deleted, true)
                 .await?,
         );
 
@@ -14527,7 +14800,9 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = self
+            .hydrate_deleted_leases_tx(&mut tx, deleted, true)
+            .await?;
 
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
