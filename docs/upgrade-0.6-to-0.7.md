@@ -174,6 +174,34 @@ the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downg
 previous releases).
 
 
+## v047: replica identity for every table
+
+v047 gives the tables that had no primary key a replica identity, so awa keeps
+working when its schema is in a logical-replication publication (Debezium's
+default `FOR ALL TABLES`, or `FOR TABLES IN SCHEMA awa`). Without one PostgreSQL
+rejects every UPDATE and DELETE on a published table, which stopped the
+maintenance leader on each tick. `awa.job_unique_claims` identifies rows by its
+existing uniqueness index; `awa.admin_dirty_queue_marks`,
+`awa.admin_dirty_kind_marks`, `queue_terminal_rollup_deltas` and
+`queue_terminal_count_deltas` with its partitions use `REPLICA IDENTITY FULL`
+(ADR-045 forbids an index on the mark tables; the delta tables are append-only,
+so FULL costs nothing on their hot path).
+
+No operator action is required and 0.7.x runtimes operate unchanged on the
+migrated schema in either order; replica identity only changes what the WAL
+records for UPDATE and DELETE. Each `ALTER TABLE ... REPLICA IDENTITY` is a
+catalog-only change under a momentary `ACCESS EXCLUSIVE` lock; the mark tables
+are written by every job transition, so transitions queue behind the lock until
+the migration transaction commits. On its own v047 commits in milliseconds; if
+you are applying a long pending range under load, apply the earlier range
+first and v047 on its own (`awa migrate --sql --from 46 --to 47` renders just
+that file for an external runner). The migration also re-runs
+`awa.install_queue_storage_substrate` and sets the identity on every custom
+queue-storage schema it can see, so external SQL runners need nothing beyond the
+exported file. See [Logical replication and
+CDC](deploying-on-managed-postgres.md#logical-replication-and-cdc) for the
+recommended publication shape.
+
 ## v046: wait-free admin dirty-key marks
 
 v046 replaces the keyed `admin_dirty_queues` / `admin_dirty_kinds` tables the

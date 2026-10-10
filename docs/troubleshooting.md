@@ -447,6 +447,26 @@ Fix:
   SELECT awa.active_queue_storage_schema();
   ```
 
+### `cannot delete from table ... because it does not have a replica identity`
+
+```text
+cannot delete from table "queue_terminal_rollup_deltas" because it does not
+have a replica identity and publishes deletes
+```
+
+The awa schema is in a logical-replication publication (`CREATE PUBLICATION
+... FOR ALL TABLES`, which Debezium creates by default, or `FOR TABLES IN
+SCHEMA awa`) and the database is on a schema older than v047, where some
+tables had no primary key or replica identity. PostgreSQL then rejects every
+UPDATE and DELETE on those tables, so maintenance fails on each tick and
+dirty-mark drains, rollup folds and unique-claim releases stop.
+
+Fix: run `awa migrate` to v047 or later, which gives every awa table a replica
+identity. Independently, prefer keeping the awa schema out of the publication;
+see [Logical replication and
+CDC](deploying-on-managed-postgres.md#logical-replication-and-cdc) for the
+recommended publication shape and what to expect if the queue is published.
+
 ### `register at least one worker before starting the runtime`
 
 Cause:
