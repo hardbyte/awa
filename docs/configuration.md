@@ -113,6 +113,8 @@ The key `QueueConfig` fields:
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
+A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
+
 ### Partitioned Queues
 
 A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.

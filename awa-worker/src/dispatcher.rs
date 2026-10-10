@@ -371,6 +371,8 @@ pub struct Dispatcher {
     /// Shared per-queue wake signalled by the runtime's notify hub.
     /// `None` means notifications are unavailable and the loop polls only.
     notify_wake: Option<Arc<Notify>>,
+    /// Runtime-wide bound on concurrent claim round-trips.
+    claim_gate: Arc<Semaphore>,
     claimer_owner_id: Uuid,
 }
 
@@ -392,6 +394,7 @@ impl Dispatcher {
         rate_limiter: Option<Arc<StdMutex<TokenBucket>>>,
         capacity_wake: Arc<Notify>,
         notify_wake: Option<Arc<Notify>>,
+        claim_gate: Arc<Semaphore>,
         claimer_owner_id: Uuid,
         storage: RuntimeStorage,
     ) -> Self {
@@ -417,6 +420,7 @@ impl Dispatcher {
             storage,
             capacity_wake,
             notify_wake,
+            claim_gate,
             claimer_owner_id,
         }
     }
@@ -769,40 +773,46 @@ impl Dispatcher {
                     return false;
                 }
             },
-            RuntimeStorage::QueueStorage(runtime) => match runtime
-                .store
-                .claim_runtime_batch_with_aging_for_instance(
-                    &self.pool,
-                    &self.queue,
-                    batch_size as i64,
-                    self.config.deadline_duration,
-                    self.config.priority_aging_interval,
-                    self.claimer_owner_id,
-                    max_claimers_per_queue().max(self.config.claimers as i16),
-                    CLAIMER_LEASE_TTL,
-                    CLAIMER_IDLE_THRESHOLD,
-                )
-                .await
-            {
-                Ok(jobs) => jobs
-                    .into_iter()
-                    .map(|claimed| DispatchedJob {
-                        job: claimed.job,
-                        queue_storage_claim: Some(claimed.claim),
-                        queue_storage_unique_states: claimed.unique_states,
-                    })
-                    .collect(),
-                Err(err) => {
-                    warn!(
-                        queue = %self.queue,
-                        messaging.destination.name = %self.queue,
-                        error = %err,
-                        "Failed to claim queue storage jobs"
-                    );
-                    self.refund_rate_limit(batch_size);
+            RuntimeStorage::QueueStorage(runtime) => {
+                let Ok(claim_slot) = self.claim_gate.acquire().await else {
                     return false;
+                };
+                let claimed = runtime
+                    .store
+                    .claim_runtime_batch_with_aging_for_instance(
+                        &self.pool,
+                        &self.queue,
+                        batch_size as i64,
+                        self.config.deadline_duration,
+                        self.config.priority_aging_interval,
+                        self.claimer_owner_id,
+                        max_claimers_per_queue().max(self.config.claimers as i16),
+                        CLAIMER_LEASE_TTL,
+                        CLAIMER_IDLE_THRESHOLD,
+                    )
+                    .await;
+                drop(claim_slot);
+                match claimed {
+                    Ok(jobs) => jobs
+                        .into_iter()
+                        .map(|claimed| DispatchedJob {
+                            job: claimed.job,
+                            queue_storage_claim: Some(claimed.claim),
+                            queue_storage_unique_states: claimed.unique_states,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        warn!(
+                            queue = %self.queue,
+                            messaging.destination.name = %self.queue,
+                            error = %err,
+                            "Failed to claim queue storage jobs"
+                        );
+                        self.refund_rate_limit(batch_size);
+                        return false;
+                    }
                 }
-            },
+            }
         };
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
