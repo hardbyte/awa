@@ -269,6 +269,14 @@ lock. Size for steady-state completion rate, not burst.
 - **Role model.** `awa_owner` owns the schema (NOLOGIN); `awa_migrator` runs
   `awa migrate`; `awa_runtime` (least privilege, cannot alter schema) runs
   workers, producers, `awa serve`, and CLI admin.
+- **CDC / logical replication.** Keep the awa schema (and any custom
+  queue-storage schema) out of publications: list application tables, or with
+  Debezium use `publication.autocreate.mode=filtered` plus
+  `schema.exclude.list=awa`. If it is published anyway, schema v047+ works
+  (every table has a replica identity); older schemas fail maintenance with
+  `cannot delete from table ... does not have a replica identity`. Ring prune
+  is a `TRUNCATE`, which publications publish by default, and slot lag pins WAL
+  and the MVCC horizon like a long transaction.
 
 ## Web Admin UI
 
