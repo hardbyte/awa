@@ -10,6 +10,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
   connection and a `LISTEN` backend per queue. Empty polls back off from
   `poll_interval` up to the new `QueueConfig::idle_poll_interval` (default
   2s) while notifications are available.
+- Retryable failures, terminal failures, DLQ routing, `retry_after` and
+  `snooze` of a compact receipt claim now close the claim by its batch
+  identity (`*_with_claim` store entry points, used by the worker) instead of
+  unnesting every open claim batch under `FOR UPDATE`, so the cost of a
+  failure no longer grows with the number of in-flight claims.
 
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.

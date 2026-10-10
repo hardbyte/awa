@@ -8409,6 +8409,105 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claim_hint_closes_compact_claim_once() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_lease_claim_hint";
+    let schema = "awa_qs_runtime_lease_claim_hint";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 72 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("Failed to claim receipt-backed job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    assert!(
+        claimed.claim.claim_batch_id.is_some() && claimed.claim.claim_batch_index.is_some(),
+        "compact claims carry their batch identity"
+    );
+
+    let retried = store
+        .fail_retryable_with_claim(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "synthetic error",
+            None,
+            Some(&claimed.claim),
+        )
+        .await
+        .expect("Failed to fail retryable receipt-backed job")
+        .expect("Expected the claim hint to close the compact claim");
+    assert_eq!(retried.state, JobState::Retryable);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+
+    let again = store
+        .fail_retryable_with_claim(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "synthetic error",
+            None,
+            Some(&claimed.claim),
+        )
+        .await
+        .expect("Second failure must not error");
+    assert!(
+        again.is_none(),
+        "a closed claim is stale for the hinted path"
+    );
+    let without_hint = store
+        .fail_retryable(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "synthetic error",
+            None,
+        )
+        .await
+        .expect("Unhinted failure must not error");
+    assert!(
+        without_hint.is_none(),
+        "a closed claim is stale for the generic path"
+    );
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+    let deferred: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
+        store.schema()
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count deferred rows");
+    assert_eq!(deferred, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heartbeat() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_attempt_rescue";
