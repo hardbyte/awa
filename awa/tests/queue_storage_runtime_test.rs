@@ -2249,16 +2249,16 @@ async fn test_successful_prunes_report_database_phase_timings() {
         assert!(durations.commit > Duration::ZERO, "{ring} commit timing");
     }
     let after_first = filenodes().await;
-    assert_ne!(
+    assert_eq!(
         after_first, before,
-        "the first destructive prunes must replace child relfilenodes"
+        "pruning empty slots must not swap child relfilenodes"
     );
 }
 
 /// The maintenance leader should call destructive prune once for an idle
 /// cursor, then suppress repeat DDL while the cursor generation is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_maintenance_idle_prune_replaces_child_filenode_once() {
+async fn test_maintenance_idle_prune_leaves_empty_child_filenode_alone() {
     let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_idle_prune_once";
     let queue = "idle_prune_once";
@@ -2311,23 +2311,27 @@ async fn test_maintenance_idle_prune_replaces_child_filenode_once() {
     client.start().await.expect("start idle-prune client");
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    let after_first = loop {
-        let current = child_filenode().await;
-        if current != before {
-            break current;
+    loop {
+        let pruned: bool = sqlx::query_scalar(audited_sql(format!(
+            "SELECT EXISTS (SELECT 1 FROM {schema}.queue_ring_rotations WHERE generation = 1)"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("read queue ring ledger");
+        assert!(pruned, "the seeded ledger row must stay the ring cursor");
+        if Instant::now()
+            >= deadline
+                .checked_sub(Duration::from_secs(8))
+                .expect("deadline")
+        {
+            break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "maintenance did not issue the first queue prune"
-        );
         tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    }
     assert_eq!(
         child_filenode().await,
-        after_first,
-        "idle maintenance ticks must not repeat TRUNCATE at the same cursor generation"
+        before,
+        "idle maintenance must not TRUNCATE an empty ring child: the swap would only churn the catalogs"
     );
     client.shutdown(Duration::from_secs(5)).await;
 }

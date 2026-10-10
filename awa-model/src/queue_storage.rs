@@ -10191,6 +10191,38 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
+    /// Truncate only the ring children that hold rows. Callers hold
+    /// ACCESS EXCLUSIVE on every child, so the emptiness probe is stable;
+    /// truncating an empty child would only swap its relfilenode, churn the
+    /// catalogs and invalidate cached plans.
+    async fn truncate_nonempty_children_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        children: &[&str],
+    ) -> Result<usize, sqlx::Error> {
+        let mut targets: Vec<&str> = Vec::with_capacity(children.len());
+        for child in children {
+            let has_rows: bool = sqlx::query_scalar(audited_sql(format!(
+                "SELECT EXISTS (SELECT 1 FROM {child} LIMIT 1)"
+            )))
+            .fetch_one(tx.as_mut())
+            .await?;
+            if has_rows {
+                targets.push(child);
+            }
+        }
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query(audited_sql(format!(
+            "TRUNCATE TABLE {}",
+            targets.join(", ")
+        )))
+        .execute(tx.as_mut())
+        .await?;
+        Ok(targets.len())
+    }
+
     /// `write_receipt_closures` is false when the caller has already closed
     /// the receipt for every row in `deleted` in this transaction.
     async fn hydrate_deleted_leases_tx<'a>(
@@ -16312,11 +16344,21 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         let truncate_started = Instant::now();
-        let truncate = sqlx::query(audited_sql(format!(
-            "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
-        )))
-        .execute(tx.as_mut())
-        .await;
+        let truncate = self
+            .truncate_nonempty_children_tx(
+                &mut tx,
+                &[
+                    &ready_child,
+                    &claim_attempt_child,
+                    &done_child,
+                    &tomb_child,
+                    &segment_child,
+                    &receipt_batch_child,
+                    &receipt_tomb_child,
+                    &delta_child,
+                ],
+            )
+            .await;
         let truncate_duration = truncate_started.elapsed();
 
         match truncate {
@@ -16502,8 +16544,8 @@ impl QueueStorage {
         }
 
         let truncate_started = Instant::now();
-        let truncate = sqlx::query(audited_sql(format!("TRUNCATE TABLE {lease_child}")))
-            .execute(tx.as_mut())
+        let truncate = self
+            .truncate_nonempty_children_tx(&mut tx, &[&lease_child])
             .await;
         let truncate_duration = truncate_started.elapsed();
 
@@ -16854,11 +16896,17 @@ impl QueueStorage {
         }
 
         let truncate_started = Instant::now();
-        let truncate = sqlx::query(audited_sql(format!(
-            "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
-        )))
-        .execute(tx.as_mut())
-        .await;
+        let truncate = self
+            .truncate_nonempty_children_tx(
+                &mut tx,
+                &[
+                    &claim_child,
+                    &claim_batch_child,
+                    &closure_child,
+                    &closure_batch_child,
+                ],
+            )
+            .await;
         let truncate_duration = truncate_started.elapsed();
 
         match truncate {
