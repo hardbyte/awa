@@ -4,6 +4,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Changed
+- Queue-storage dispatchers share one `LISTEN` connection per runtime instead
+  of holding one each, so a runtime with many queues no longer pins a pool
+  connection and a `LISTEN` backend per queue. Empty polls back off from
+  `poll_interval` up to the new `QueueConfig::idle_poll_interval` (default
+  2s) while notifications are available.
+
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.
 
@@ -31,6 +38,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- **One LISTEN connection per runtime, idle poll back-off and a claim concurrency bound.** Each queue dispatcher held its own LISTEN connection from the client pool, so ~200 queues exhausted the default pool and no jobs completed; a runtime now shares one listener across queues and fans notifications out per queue. Empty polls back off from 200 ms to `QueueConfig::idle_poll_interval` (default 2 s) until a notification or claim resets them, and `ClientBuilder::max_concurrent_claims` (default pool size / 4, clamped to 4..=64) bounds concurrent claim round trips across queues. At 200 queues × 1 job/s, claim p50 drops from 462 ms to 27 ms and producer p99 from 1.3 s to 236 ms; idle transactions fall from ~157/s to ~70/s.
 - **Claims reuse the instance's claimer lease.** A queue-storage claim no longer re-reads the queue's claimer target and its own claimer lease on every call; the last read or refreshed lease is reused for up to 250 ms (never within a second of expiry), removing two round trips and two transactions from each claim. At W=4 this cuts transactions per completed job from 2.35 to 1.39.
 - **Claim transactions commit asynchronously.** Claims and claim-cursor advances run with `synchronous_commit = off`, so a lane's claim head is no longer locked across a WAL fsync. A claim lost to a server crash leaves the job claimable again, consistent with at-least-once delivery; enqueues and completions stay synchronous. At 400 jobs/s on a ~7 ms-fsync disk, claim p99 drops from ~9.8 s (backlog growing) to 67 ms.
 - **Enqueue batches are written with one `unnest` INSERT.** The queue-storage INSERT writers send each column as an array through fixed SQL text instead of a per-batch-size multi-row `VALUES` statement, and the COPY entry points (`QueueStorage::enqueue_params_copy`, `insert_many_copy`, the Python `*_copy` methods) use that INSERT for batches under 2,048 rows. Below that size the INSERT is faster, and it avoids a ~40 ms per-COPY stall with sqlx-core 0.9.0, which does not set `TCP_NODELAY`. Larger batches still use COPY.

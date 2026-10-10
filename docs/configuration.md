@@ -106,11 +106,14 @@ The key `QueueConfig` fields:
 | `rate_limit` | `None` | External API rate limits, backpressure |
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims. |
 | `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
+| `idle_poll_interval` | `2s` | Cap for the poll sleep while a queue stays empty: consecutive empty polls double the sleep from `poll_interval` up to this value, and any notification or claimed job resets it. Only applies when `LISTEN`/`NOTIFY` is available; a poll-only runtime (transaction-mode pooler) keeps `poll_interval`. Lower it if notifications are unreliable in your deployment. |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
 | `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
+
+A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
 
 ### Partitioned Queues
 

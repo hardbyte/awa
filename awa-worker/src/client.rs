@@ -164,6 +164,7 @@ pub struct ClientBuilder {
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     runtime_snapshot_interval: Duration,
     queue_stats_interval: Option<Duration>,
+    max_concurrent_claims: Option<usize>,
     dlq_enabled_by_default: bool,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
@@ -223,6 +224,7 @@ impl ClientBuilder {
             queue_retention_overrides: HashMap::new(),
             runtime_snapshot_interval: Duration::from_secs(10),
             queue_stats_interval: None,
+            max_concurrent_claims: None,
             dlq_enabled_by_default: false,
             dlq_retention: None,
             dlq_cleanup_batch_size: None,
@@ -863,6 +865,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound the number of claim round-trips this runtime runs concurrently
+    /// across all queues and claimers. Defaults to a quarter of the pool,
+    /// clamped to `4..=64`.
+    pub fn max_concurrent_claims(mut self, limit: usize) -> Self {
+        self.max_concurrent_claims = Some(limit.max(1));
+        self
+    }
+
     /// Enable or disable DLQ routing by default.
     pub fn dlq_enabled_by_default(mut self, enabled: bool) -> Self {
         self.dlq_enabled_by_default = enabled;
@@ -1147,6 +1157,7 @@ impl ClientBuilder {
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
             queue_stats_interval: self.queue_stats_interval,
+            max_concurrent_claims: self.max_concurrent_claims,
             dlq_policy,
             dlq_retention: self.dlq_retention,
             dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
@@ -1251,6 +1262,7 @@ pub struct Client {
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Option<Duration>,
+    max_concurrent_claims: Option<usize>,
     dlq_policy: DlqPolicy,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
@@ -1845,7 +1857,34 @@ impl Client {
 
         // Start dispatcher/claimer loops per queue (uses dispatch_cancel — stops claiming first).
         let mut dispatcher_handles = self.dispatcher_handles.write().await;
+        // One LISTEN connection for every queue; dispatchers wait on their
+        // queue's shared wake instead of holding a listener each.
+        let notify_wakes: HashMap<String, Arc<tokio::sync::Notify>> = self
+            .queues
+            .iter()
+            .map(|(queue, _)| (queue.clone(), Arc::new(tokio::sync::Notify::new())))
+            .collect();
+        let notify_hub = crate::notify_hub::QueueNotifyHub::new(
+            self.pool.clone(),
+            notify_wakes.clone(),
+            self.dispatch_cancel.clone(),
+        );
+        let claim_gate = Arc::new(tokio::sync::Semaphore::new(
+            self.max_concurrent_claims.unwrap_or_else(|| {
+                (self.pool.options().get_max_connections() as usize / 4).clamp(4, 64)
+            }),
+        ));
+        let notify_available = match notify_hub.spawn().await {
+            Some(handle) => {
+                dispatcher_handles.push(handle);
+                true
+            }
+            None => false,
+        };
         for (queue_name, config) in &self.queues {
+            let notify_wake = notify_available
+                .then(|| notify_wakes.get(queue_name).cloned())
+                .flatten();
             let alive = self
                 .dispatcher_alive
                 .get(queue_name)
@@ -1904,6 +1943,8 @@ impl Client {
                     concurrency,
                     rate_limiter.clone(),
                     capacity_wake.clone(),
+                    notify_wake.clone(),
+                    claim_gate.clone(),
                     claimer_owner_id,
                     effective_storage.clone(),
                 );
