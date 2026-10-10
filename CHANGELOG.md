@@ -10,6 +10,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
   connection and a `LISTEN` backend per queue. Empty polls back off from
   `poll_interval` up to the new `QueueConfig::idle_poll_interval` (default
   2s) while notifications are available.
+- Retryable failures, terminal failures, DLQ routing, `retry_after` and
+  `snooze` of a compact receipt claim now close the claim by its batch
+  identity (`*_with_claim` store entry points, used by the worker) instead of
+  unnesting every open claim batch under `FOR UPDATE`, so the cost of a
+  failure no longer grows with the number of in-flight claims.
+- Ring prune truncates only the children that hold rows. An empty child's
+  TRUNCATE swapped its relfilenode, churned `pg_class`/`pg_attribute` and
+  invalidated cached plans for no space gain; idle runtimes now swap nothing.
+- `ClientBuilder::max_concurrent_claims` bounds the claim round-trips one
+  runtime runs concurrently across all queues (default: a quarter of the pool,
+  clamped to 4..=64), so many-queue runtimes stop driving Postgres into lock
+  manager contention when the pool is large.
 
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.
@@ -38,6 +50,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- **Failed, retried and snoozed jobs close their claim by batch identity.** Closing a compact receipt claim on failure (fail/retry/snooze/DLQ and the slow completion path) located the attempt by unnesting every `lease_claim_batches` row and locked the whole batch row: ~250 ms and ~950 buffers per call, so a retry storm (30% transient failures at 400 jobs/s) fell to 88 completions/s with a 27k backlog. The worker now passes the claim it holds and the close addresses the batch by primary key and index; the same storm completes ~400/s with claim p50 35 ms.
 - **One LISTEN connection per runtime, idle poll back-off and a claim concurrency bound.** Each queue dispatcher held its own LISTEN connection from the client pool, so ~200 queues exhausted the default pool and no jobs completed; a runtime now shares one listener across queues and fans notifications out per queue. Empty polls back off from 200 ms to `QueueConfig::idle_poll_interval` (default 2 s) until a notification or claim resets them, and `ClientBuilder::max_concurrent_claims` (default pool size / 4, clamped to 4..=64) bounds concurrent claim round trips across queues. At 200 queues × 1 job/s, claim p50 drops from 462 ms to 27 ms and producer p99 from 1.3 s to 236 ms; idle transactions fall from ~157/s to ~70/s.
 - **Claims reuse the instance's claimer lease.** A queue-storage claim no longer re-reads the queue's claimer target and its own claimer lease on every call; the last read or refreshed lease is reused for up to 250 ms (never within a second of expiry), removing two round trips and two transactions from each claim. At W=4 this cuts transactions per completed job from 2.35 to 1.39.
 - **Claim transactions commit asynchronously.** Claims and claim-cursor advances run with `synchronous_commit = off`, so a lane's claim head is no longer locked across a WAL fsync. A claim lost to a server crash leaves the job claimable again, consistent with at-least-once delivery; enqueues and completions stay synchronous. At 400 jobs/s on a ~7 ms-fsync disk, claim p99 drops from ~9.8 s (backlog growing) to 67 ms.
