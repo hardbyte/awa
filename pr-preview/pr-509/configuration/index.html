@@ -3337,6 +3337,11 @@
 <td>Tune if NOTIFY latency matters (rare)</td>
 </tr>
 <tr>
+<td><code>idle_poll_interval</code></td>
+<td><code>2s</code></td>
+<td>Cap for the poll sleep while a queue stays empty: consecutive empty polls double the sleep from <code>poll_interval</code> up to this value, and any notification or claimed job resets it. Only applies when <code>LISTEN</code>/<code>NOTIFY</code> is available; a poll-only runtime (transaction-mode pooler) keeps <code>poll_interval</code>. Lower it if notifications are unreliable in your deployment.</td>
+</tr>
+<tr>
 <td><code>min_workers</code> / <code>weight</code></td>
 <td><code>0</code> / <code>1</code></td>
 <td>Only in weighted mode</td>
@@ -3354,6 +3359,7 @@
 </tbody>
 </table>
 <p>Defaults intentionally favor the smallest blast radius: <code>enqueue_shards = 1</code>, <code>claimers = 1</code>, and <code>claim_batch_size = 512</code>. Raise <code>enqueue_shards</code> only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark <code>claimers = 2</code> or <code>4</code> only when a single claimer cannot keep worker permits full.</p>
+<p>A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: <code>ClientBuilder::max_concurrent_claims</code> (default: a quarter of the pool, clamped to <code>4..=64</code>). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.</p>
 <h3 id="partitioned-queues">Partitioned Queues<a class="headerlink" href="#partitioned-queues" title="Permanent link">&para;</a></h3>
 <p>A logical queue is the application concept: for example <code>email</code> or <code>customer-updates</code>. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.</p>
 <p>Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.</p>
