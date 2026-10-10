@@ -4,6 +4,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Changed
+- Queue-storage dispatchers share one `LISTEN` connection per runtime instead
+  of holding one each, so a runtime with many queues no longer pins a pool
+  connection and a `LISTEN` backend per queue. Empty polls back off from
+  `poll_interval` up to the new `QueueConfig::idle_poll_interval` (default
+  2s) while notifications are available.
+
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.
 

@@ -13,6 +13,7 @@ pub mod heartbeat;
 pub mod http_worker;
 pub mod maintenance;
 pub mod metrics;
+mod notify_hub;
 mod runtime;
 mod storage;
 

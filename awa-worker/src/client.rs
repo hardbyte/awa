@@ -1845,7 +1845,29 @@ impl Client {
 
         // Start dispatcher/claimer loops per queue (uses dispatch_cancel — stops claiming first).
         let mut dispatcher_handles = self.dispatcher_handles.write().await;
+        // One LISTEN connection for every queue; dispatchers wait on their
+        // queue's shared wake instead of holding a listener each.
+        let notify_wakes: HashMap<String, Arc<tokio::sync::Notify>> = self
+            .queues
+            .iter()
+            .map(|(queue, _)| (queue.clone(), Arc::new(tokio::sync::Notify::new())))
+            .collect();
+        let notify_hub = crate::notify_hub::QueueNotifyHub::new(
+            self.pool.clone(),
+            notify_wakes.clone(),
+            self.dispatch_cancel.clone(),
+        );
+        let notify_available = match notify_hub.spawn().await {
+            Some(handle) => {
+                dispatcher_handles.push(handle);
+                true
+            }
+            None => false,
+        };
         for (queue_name, config) in &self.queues {
+            let notify_wake = notify_available
+                .then(|| notify_wakes.get(queue_name).cloned())
+                .flatten();
             let alive = self
                 .dispatcher_alive
                 .get(queue_name)
@@ -1904,6 +1926,7 @@ impl Client {
                     concurrency,
                     rate_limiter.clone(),
                     capacity_wake.clone(),
+                    notify_wake.clone(),
                     claimer_owner_id,
                     effective_storage.clone(),
                 );
