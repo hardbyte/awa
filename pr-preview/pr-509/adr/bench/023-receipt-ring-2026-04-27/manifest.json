@@ -1,0 +1,193 @@
+{
+  "run_id": "custom-20260427T081444Z-2471c6",
+  "scenario": null,
+  "started_at": "2026-04-27T19:51:07+00:00",
+  "cli": [
+    "long_horizon.py",
+    "--systems",
+    "awa",
+    "--replicas",
+    "4",
+    "--worker-count",
+    "8",
+    "--producer-rate",
+    "200",
+    "--phase",
+    "warmup=warmup:5m",
+    "--phase",
+    "clean_1=clean:4h",
+    "--phase",
+    "idle_1=idle-in-tx:30m",
+    "--phase",
+    "recovery_1=recovery:30m",
+    "--phase",
+    "clean_2=clean:4h",
+    "--phase",
+    "idle_2=idle-in-tx:30m",
+    "--phase",
+    "recovery_2=recovery:30m",
+    "--phase",
+    "clean_3=clean:90m"
+  ],
+  "systems": [
+    "awa"
+  ],
+  "phases": [
+    {
+      "label": "warmup",
+      "type": "warmup",
+      "duration_s": 300
+    },
+    {
+      "label": "clean_1",
+      "type": "clean",
+      "duration_s": 14400
+    },
+    {
+      "label": "idle_1",
+      "type": "idle-in-tx",
+      "duration_s": 1800
+    },
+    {
+      "label": "recovery_1",
+      "type": "recovery",
+      "duration_s": 1800
+    },
+    {
+      "label": "clean_2",
+      "type": "clean",
+      "duration_s": 14400
+    },
+    {
+      "label": "idle_2",
+      "type": "idle-in-tx",
+      "duration_s": 1800
+    },
+    {
+      "label": "recovery_2",
+      "type": "recovery",
+      "duration_s": 1800
+    },
+    {
+      "label": "clean_3",
+      "type": "clean",
+      "duration_s": 5400
+    }
+  ],
+  "pg_image": "postgres:17.2-alpine",
+  "postgres": {
+    "version": "PostgreSQL 17.2 on x86_64-pc-linux-musl, compiled by gcc (Alpine 14.2.0) 14.2.0, 64-bit",
+    "settings": {
+      "shared_buffers": "256MB",
+      "work_mem": "8MB",
+      "maintenance_work_mem": "128MB",
+      "autovacuum": "on",
+      "autovacuum_naptime": "1min",
+      "autovacuum_vacuum_cost_delay": "2ms",
+      "autovacuum_vacuum_cost_limit": "200",
+      "autovacuum_vacuum_scale_factor": "0.2",
+      "autovacuum_analyze_scale_factor": "0.1",
+      "max_connections": "400",
+      "synchronous_commit": "on",
+      "wal_level": "replica"
+    }
+  },
+  "host": {
+    "os": "Linux-6.18.21-x86_64-with-glibc2.42",
+    "kernel": "6.18.21",
+    "cpu": "x86_64",
+    "cpu_count": 24,
+    "memory_bytes": 98688577536,
+    "python": "3.14.3",
+    "docker": "Docker version 29.3.1, build v29.3.1",
+    "docker_compose": "Docker Compose version 5.0.2"
+  },
+  "adapters": {
+    "awa": {
+      "db_name": "awa_bench",
+      "event_indexes": [],
+      "event_tables": [
+        "awa_exp.queue_ring_state",
+        "awa_exp.queue_ring_slots",
+        "awa_exp.lease_ring_state",
+        "awa_exp.lease_ring_slots",
+        "awa_exp.claim_ring_state",
+        "awa_exp.claim_ring_slots",
+        "awa_exp.queue_lanes",
+        "awa_exp.attempt_state",
+        "awa_exp.deferred_jobs",
+        "awa_exp.dlq_entries",
+        "awa_exp.ready_entries_0",
+        "awa_exp.done_entries_0",
+        "awa_exp.ready_entries_1",
+        "awa_exp.done_entries_1",
+        "awa_exp.ready_entries_2",
+        "awa_exp.done_entries_2",
+        "awa_exp.ready_entries_3",
+        "awa_exp.done_entries_3",
+        "awa_exp.ready_entries_4",
+        "awa_exp.done_entries_4",
+        "awa_exp.ready_entries_5",
+        "awa_exp.done_entries_5",
+        "awa_exp.ready_entries_6",
+        "awa_exp.done_entries_6",
+        "awa_exp.ready_entries_7",
+        "awa_exp.done_entries_7",
+        "awa_exp.ready_entries_8",
+        "awa_exp.done_entries_8",
+        "awa_exp.ready_entries_9",
+        "awa_exp.done_entries_9",
+        "awa_exp.ready_entries_10",
+        "awa_exp.done_entries_10",
+        "awa_exp.ready_entries_11",
+        "awa_exp.done_entries_11",
+        "awa_exp.ready_entries_12",
+        "awa_exp.done_entries_12",
+        "awa_exp.ready_entries_13",
+        "awa_exp.done_entries_13",
+        "awa_exp.ready_entries_14",
+        "awa_exp.done_entries_14",
+        "awa_exp.ready_entries_15",
+        "awa_exp.done_entries_15",
+        "awa_exp.leases_0",
+        "awa_exp.leases_1",
+        "awa_exp.leases_2",
+        "awa_exp.leases_3",
+        "awa_exp.leases_4",
+        "awa_exp.leases_5",
+        "awa_exp.leases_6",
+        "awa_exp.leases_7",
+        "awa_exp.lease_claims_0",
+        "awa_exp.lease_claim_closures_0",
+        "awa_exp.lease_claims_1",
+        "awa_exp.lease_claim_closures_1",
+        "awa_exp.lease_claims_2",
+        "awa_exp.lease_claim_closures_2",
+        "awa_exp.lease_claims_3",
+        "awa_exp.lease_claim_closures_3",
+        "awa_exp.lease_claims_4",
+        "awa_exp.lease_claim_closures_4",
+        "awa_exp.lease_claims_5",
+        "awa_exp.lease_claim_closures_5",
+        "awa_exp.lease_claims_6",
+        "awa_exp.lease_claim_closures_6",
+        "awa_exp.lease_claims_7",
+        "awa_exp.lease_claim_closures_7"
+      ],
+      "extensions": [],
+      "instance_id": 0,
+      "kind": "descriptor",
+      "schema_version": "current",
+      "started_at": "2026-04-27T08:14:55.905Z",
+      "system": "awa",
+      "version": "0.1.0",
+      "revision": {
+        "source": "awa repo",
+        "git_sha": "a45dca61d4270e87b4ed51b870f2c51eff3907a6",
+        "git_short": "a45dca6",
+        "git_branch": "feature/vacuum-aware-storage-redesign",
+        "dirty": true
+      }
+    }
+  }
+}

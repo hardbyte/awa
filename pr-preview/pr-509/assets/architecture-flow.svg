@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 560" role="img" aria-labelledby="title desc">
+  <title id="title">AWA architecture</title>
+  <desc id="desc">Applications atomically commit business data and jobs to PostgreSQL. Workers claim jobs from PostgreSQL and write durable outcomes back. Operators inspect the same system of record.</desc>
+  <defs>
+    <linearGradient id="db" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17633e"/><stop offset="1" stop-color="#0d4d2e"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 10 5 0 10z" fill="context-stroke"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#10341f" flood-opacity=".14"/>
+    </filter>
+    <style>
+      .surface{fill:#fff;stroke:#b9d6c4}.heading{fill:#173324}.copy{fill:#52675a}.line{fill:none;stroke:#287a51;stroke-width:4;stroke-linecap:round;stroke-linejoin:round}.label{fill:#17633e}.canvas{fill:#eef8f1}.tooling{fill:#d8ebe0}.tooling-text{fill:#345845}
+      @media (prefers-color-scheme:dark){.canvas{fill:#101713}.surface{fill:#17221b;stroke:#3f6b50}.heading{fill:#eff8f2}.copy{fill:#b9c9bf}.line{stroke:#55c58a}.label{fill:#8de2b1}.tooling{fill:#20392b}.tooling-text{fill:#c8ded0}}
+    </style>
+  </defs>
+  <rect class="canvas" width="1000" height="560" rx="28"/>
+  <g font-family="Inter,system-ui,sans-serif">
+    <text class="label" x="500" y="42" text-anchor="middle" font-size="19" font-weight="750">ONE POSTGRESQL SYSTEM OF RECORD</text>
+
+    <g filter="url(#shadow)">
+      <rect class="surface" x="45" y="105" width="260" height="126" rx="20" stroke-width="2"/>
+      <circle cx="87" cy="148" r="18" fill="#d4eee0"/>
+      <path d="M78 148h18m-8-9 9 9-9 9" fill="none" stroke="#17633e" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text class="heading" x="119" y="151" font-size="23" font-weight="760">Applications</text>
+      <text class="copy" x="73" y="190" font-size="15">Rust · Python · SQL bridges</text>
+      <text class="copy" x="73" y="214" font-size="14">Own the application transaction</text>
+
+      <rect x="363" y="208" width="274" height="196" rx="24" fill="url(#db)"/>
+      <ellipse cx="500" cy="253" rx="96" ry="25" fill="#55c58a" opacity=".35"/>
+      <path d="M404 253v90c0 16 43 29 96 29s96-13 96-29v-90" fill="none" stroke="#c4eed5" stroke-width="3"/>
+      <path d="M404 299c0 16 43 29 96 29s96-13 96-29" fill="none" stroke="#c4eed5" stroke-width="2" opacity=".78"/>
+      <text x="500" y="292" text-anchor="middle" font-size="25" font-weight="760" fill="#fff">PostgreSQL</text>
+      <text x="500" y="322" text-anchor="middle" font-size="15" fill="#e1f6e9">application data + AWA jobs</text>
+
+      <rect class="surface" x="695" y="105" width="260" height="126" rx="20" stroke-width="2"/>
+      <circle cx="737" cy="148" r="18" fill="#d4eee0"/>
+      <path d="M729 148l5 5 11-13" fill="none" stroke="#17633e" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text class="heading" x="769" y="151" font-size="23" font-weight="760">Workers</text>
+      <text class="copy" x="723" y="190" font-size="15">Claim · heartbeat · execute</text>
+      <text class="copy" x="723" y="214" font-size="14">Complete · retry · wait</text>
+    </g>
+
+    <!-- Each path ends on the edge of its target, so arrowheads remain connected. -->
+    <path class="line" d="M245 231 C270 290 312 315 363 315" marker-end="url(#arrow)"/>
+    <text class="label" x="270" y="276" font-size="14" font-weight="700">ATOMIC COMMIT</text>
+
+    <path class="line" d="M637 280 C680 266 710 247 734 231" marker-end="url(#arrow)"/>
+    <text class="label" x="655" y="253" font-size="14" font-weight="700">CLAIM</text>
+
+    <path class="line" d="M785 231 C758 307 704 348 637 351" stroke-dasharray="9 8" marker-end="url(#arrow)"/>
+    <text class="label" x="717" y="335" font-size="14" font-weight="700">DURABLE OUTCOME</text>
+
+    <g>
+      <rect class="tooling" x="100" y="455" width="800" height="52" rx="26"/>
+      <text class="tooling-text" x="500" y="487" text-anchor="middle" font-size="15" font-weight="700">OPERATE · CLI · WEB UI · METRICS · TRACES · SQL</text>
+      <path class="line" d="M500 455V404" stroke-width="3" marker-end="url(#arrow)"/>
+    </g>
+  </g>
+</svg>
