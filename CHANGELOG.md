@@ -15,6 +15,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   identity (`*_with_claim` store entry points, used by the worker) instead of
   unnesting every open claim batch under `FOR UPDATE`, so the cost of a
   failure no longer grows with the number of in-flight claims.
+- Ring prune truncates only the children that hold rows. An empty child's
+  TRUNCATE swapped its relfilenode, churned `pg_class`/`pg_attribute` and
+  invalidated cached plans for no space gain; idle runtimes now swap nothing.
+- `ClientBuilder::max_concurrent_claims` bounds the claim round-trips one
+  runtime runs concurrently across all queues (default: a quarter of the pool,
+  clamped to 4..=64), so many-queue runtimes stop driving Postgres into lock
+  manager contention when the pool is large.
 
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.
