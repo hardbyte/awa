@@ -18,6 +18,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - Syncing a periodic job declaration that matches the stored schedule no longer rewrites its `awa.cron_jobs` row or moves `updated_at`, so runtimes that sync on a timer stop generating a row version per schedule per interval.
 - **Claim transactions commit asynchronously (0.6 port of #507).** Claims and the claim-cursor advance that follows them run with `synchronous_commit = off`, so a lane's claim head is no longer locked across a WAL fsync. A claim lost to a server crash leaves the job claimable again, consistent with at-least-once delivery; enqueues, completions and every other transaction stay synchronous. The setting is `SET LOCAL` in those transactions only. A post-claim cursor advance now applies only while the claim it follows is visible on the server it runs against, so a retry that lands on a promoted standby cannot move the cursor past a claim that never reached it. No schema or configuration change.
 
+- **Claims reuse the instance's claimer lease (0.6 port of #508).** A queue-storage claim no longer re-reads the queue's claimer target and its own claimer lease on every call; the last read or refreshed lease is reused for up to 250 ms (never within a second of expiry), removing two round trips and two transactions from each claim. On `main` at 4 workers this cut transactions per completed job from 2.35 to 1.39.
+
 ### Fixed
 
 - The embedded admin UI now works when its axum router is nested under a path such as `/awa` (#502). Assets, API requests, navigation and direct deep links automatically use the mount path, including outer nested routers, without rebuilding the frontend or changing existing router calls.
