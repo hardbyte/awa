@@ -1850,6 +1850,7 @@ struct ClaimEvidence {
     ready_slot: i32,
     ready_generation: i64,
     lane_seq: i64,
+    legacy_attempt: Option<(i64, i64)>,
 }
 
 type ClaimCursorLaneKey = (String, i16, i16);
@@ -4258,10 +4259,14 @@ impl QueueStorage {
                     enqueue_shard,
                     next_seq: last.lane_seq + 1,
                     only_if_current: None,
-                    evidence: last.claim_batch_id.map(|_| ClaimEvidence {
+                    evidence: Some(ClaimEvidence {
                         ready_slot: last.ready_slot,
                         ready_generation: last.ready_generation,
                         lane_seq: last.lane_seq,
+                        legacy_attempt: last
+                            .claim_batch_id
+                            .is_none()
+                            .then_some((last.job_id, last.run_lease)),
                     }),
                 },
             )
@@ -4317,33 +4322,30 @@ impl QueueStorage {
         normalized
     }
 
-    /// Re-run the cursor advance a claim of `lane_seq` would issue, as if the
-    /// claim had been recorded in `(ready_slot, ready_generation)`. Lets tests
-    /// exercise the evidence guard after removing a claim's batch row.
+    /// Replay the post-commit advance for an actual claim on the current server.
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn replay_claim_cursor_advance(
         &self,
         pool: &PgPool,
-        queue: &str,
-        priority: i16,
-        enqueue_shard: i16,
-        ready_slot: i32,
-        ready_generation: i64,
-        lane_seq: i64,
+        claimed: &ClaimedRuntimeJob,
     ) -> Result<(), AwaError> {
+        let claim = &claimed.claim;
         self.advance_claim_cursors_strict(
             pool,
             &[ClaimCursorAdvance {
-                queue: queue.to_string(),
-                priority,
-                enqueue_shard,
-                next_seq: lane_seq + 1,
+                queue: claim.queue.clone(),
+                priority: claim.priority,
+                enqueue_shard: claim.enqueue_shard,
+                next_seq: claim.lane_seq + 1,
                 only_if_current: None,
                 evidence: Some(ClaimEvidence {
-                    ready_slot,
-                    ready_generation,
-                    lane_seq,
+                    ready_slot: claim.ready_slot,
+                    ready_generation: claim.ready_generation,
+                    lane_seq: claim.lane_seq,
+                    legacy_attempt: claim
+                        .claim_batch_id
+                        .is_none()
+                        .then_some((claimed.job.id, claimed.job.run_lease)),
                 }),
             }],
         )
@@ -4410,7 +4412,7 @@ impl QueueStorage {
                 WHERE ($5::bigint IS NULL OR {schema}.sequence_next_value(seq_name) = $5)
                   AND (
                       $6::int IS NULL
-                      OR EXISTS (
+                      OR ($9::bigint IS NULL AND EXISTS (
                           SELECT 1
                           FROM {schema}.ready_claim_attempt_batches AS attempts
                           WHERE attempts.ready_slot = $6
@@ -4421,6 +4423,14 @@ impl QueueStorage {
                             AND attempts.first_lane_seq <= $8
                             AND attempts.next_lane_seq > $8
                             AND attempts.lane_ranges @> int8range($8, $8 + 1, '[)')
+                      ))
+                      OR EXISTS (
+                          SELECT 1 FROM {schema}.leases AS leases
+                          WHERE $9::bigint IS NOT NULL
+                            AND leases.job_id = $9 AND leases.run_lease = $10
+                            AND leases.ready_slot = $6 AND leases.ready_generation = $7
+                            AND leases.queue = $1 AND leases.enqueue_shard = $3
+                            AND leases.lane_seq = $8
                       )
                   )
                 "#
@@ -4433,6 +4443,16 @@ impl QueueStorage {
             .bind(advance.evidence.map(|evidence| evidence.ready_slot))
             .bind(advance.evidence.map(|evidence| evidence.ready_generation))
             .bind(advance.evidence.map(|evidence| evidence.lane_seq))
+            .bind(
+                advance
+                    .evidence
+                    .and_then(|evidence| evidence.legacy_attempt.map(|attempt| attempt.0)),
+            )
+            .bind(
+                advance
+                    .evidence
+                    .and_then(|evidence| evidence.legacy_attempt.map(|attempt| attempt.1)),
+            )
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
