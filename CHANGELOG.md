@@ -5,23 +5,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ## [Unreleased]
 
 ### Changed
-- Queue-storage dispatchers share one `LISTEN` connection per runtime instead
-  of holding one each, so a runtime with many queues no longer pins a pool
-  connection and a `LISTEN` backend per queue. Empty polls back off from
-  `poll_interval` up to the new `QueueConfig::idle_poll_interval` (default
-  2s) while notifications are available.
-- Retryable failures, terminal failures, DLQ routing, `retry_after` and
-  `snooze` of a compact receipt claim now close the claim by its batch
-  identity (`*_with_claim` store entry points, used by the worker) instead of
-  unnesting every open claim batch under `FOR UPDATE`, so the cost of a
-  failure no longer grows with the number of in-flight claims.
-- Ring prune truncates only the children that hold rows. An empty child's
-  TRUNCATE swapped its relfilenode, churned `pg_class`/`pg_attribute` and
-  invalidated cached plans for no space gain; idle runtimes now swap nothing.
-- `ClientBuilder::max_concurrent_claims` bounds the claim round-trips one
-  runtime runs concurrently across all queues (default: a quarter of the pool,
-  clamped to 4..=64), so many-queue runtimes stop driving Postgres into lock
-  manager contention when the pool is large.
+
+- Compact receipt failure, exhaustion, DLQ, retry and snooze paths carry immutable batch identity and validate the exact receipt under the per-attempt advisory lock. Independent jobs in one batch no longer require a shared batch-row lock.
+
+- **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore. Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
 
 - Emit a stderr diagnostic after five seconds of stalled native Python shutdown,
   while retaining the join required for safe interpreter finalization.
@@ -50,12 +37,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
-- **Failed, retried and snoozed jobs close their claim by batch identity.** Closing a compact receipt claim on failure (fail/retry/snooze/DLQ and the slow completion path) located the attempt by unnesting every `lease_claim_batches` row and locked the whole batch row: ~250 ms and ~950 buffers per call, so a retry storm (30% transient failures at 400 jobs/s) fell to 88 completions/s with a 27k backlog. The worker now passes the claim it holds and the close addresses the batch by primary key and index; the same storm completes ~400/s with claim p50 35 ms.
-- **One LISTEN connection per runtime, idle poll back-off and a claim concurrency bound.** Each queue dispatcher held its own LISTEN connection from the client pool, so ~200 queues exhausted the default pool and no jobs completed; a runtime now shares one listener across queues and fans notifications out per queue. Empty polls back off from 200 ms to `QueueConfig::idle_poll_interval` (default 2 s) until a notification or claim resets them, and `ClientBuilder::max_concurrent_claims` (default pool size / 4, clamped to 4..=64) bounds concurrent claim round trips across queues. At 200 queues × 1 job/s, claim p50 drops from 462 ms to 27 ms and producer p99 from 1.3 s to 236 ms; idle transactions fall from ~157/s to ~70/s.
-- **Claims reuse the instance's claimer lease.** A queue-storage claim no longer re-reads the queue's claimer target and its own claimer lease on every call; the last read or refreshed lease is reused for up to 250 ms (never within a second of expiry), removing two round trips and two transactions from each claim. At W=4 this cuts transactions per completed job from 2.35 to 1.39.
+- Post-claim cursor replays require current-server claim evidence for both receipt and legacy leases, preventing a retry on a promoted standby from skipping a lost claim. A focused async-commit model and receipt/legacy regressions cover the split transaction boundary.
+
 - **Claim transactions commit asynchronously.** Claims and claim-cursor advances run with `synchronous_commit = off`, so a lane's claim head is no longer locked across a WAL fsync. A claim lost to a server crash leaves the job claimable again, consistent with at-least-once delivery; enqueues and completions stay synchronous. At 400 jobs/s on a ~7 ms-fsync disk, claim p99 drops from ~9.8 s (backlog growing) to 67 ms.
-- **Enqueue batches are written with one `unnest` INSERT.** The queue-storage INSERT writers send each column as an array through fixed SQL text instead of a per-batch-size multi-row `VALUES` statement, and the COPY entry points (`QueueStorage::enqueue_params_copy`, `insert_many_copy`, the Python `*_copy` methods) use that INSERT for batches under 2,048 rows. Below that size the INSERT is faster, and it avoids a ~40 ms per-COPY stall with sqlx-core 0.9.0, which does not set `TCP_NODELAY`. Larger batches still use COPY.
+- **Enqueue batches are written with one `unnest` INSERT.** The queue-storage INSERT writers send each column as an array through fixed SQL text instead of a per-batch-size multi-row `VALUES` statement, and the COPY entry points (`QueueStorage::enqueue_params_copy`, `insert_many_copy`, the Python `*_copy` methods) use that INSERT for batches under 2,048 rows. Below that size the INSERT is faster, and it avoids a ~40 ms per-COPY stall with sqlx-core 0.9.0, which does not set `TCP_NODELAY`. Larger batches still use COPY. This reduces COPY round trips; it does not restore `TCP_NODELAY` for other SQLx traffic. The 0.7 release remains gated on a SQLx release containing transact-rs/sqlx#4336 and a rerun of the performance gate ([#505](https://github.com/hardbyte/awa/issues/505)).
 - **Upgraded to sea-orm 2.0.2 stable and sqlx 0.9 ([#443](https://github.com/hardbyte/awa/issues/443)).** sea-orm moves from the 2.0.0 release candidates (sqlx 0.8) to the stable line built on sqlx 0.9, which unifies the dependency for `awa-seaorm` consumers. For library users the visible change is sqlx 0.9's injection guard: query functions only accept `&'static str` or an explicit assertion, so dynamically assembled SQL must opt in via [`awa::audited_sql`](https://docs.rs/awa) (new re-export). Awa's own call sites interpolate only validated identifiers — schema names are checked against `[a-z_][a-z0-9_]*` both where they are configured (`QueueStorage::new`) and where they are read back out of the transition state (`QueueStorage::active_schema`, which now re-validates so no unchecked name can reach a `format!`) — and pass all external values as bind parameters; the helper documents that invariant at its definition. The deliberate raw-SQL passthrough APIs (Python `Transaction.execute` / `fetch_*`, where the caller supplies the statement) opt in through a separate `caller_provided_sql` instead, so `audited_sql` stays greppable as the set of sites awa vouches for. sqlx's combined runtime+TLS features were removed in 0.9, so builds now select `runtime-tokio` + `tls-rustls-ring` explicitly (the same ring provider with webpki roots `runtime-tokio-rustls` selected previously). The upgrade also drops 20 transitive crates, among them `rsa` and its `pkcs1`/`pkcs8`/`spki`/`der`/`num-bigint-dig` chain: `sqlx-mysql` 0.8 depended on `rsa` and `sqlx-macros-core` pulled that driver in unconditionally, so a Postgres-only build still carried it — and `rsa` 0.9.x has no released fix for the RUSTSEC-2023-0071 Marvin timing advisory. `sqlx-mysql` 0.9 no longer needs it. No schema, migration, or behavioural changes.
+
+- **Claims reuse the instance's claimer lease.** A queue-storage claim no longer re-reads the queue's claimer target and its own claimer lease on every call; the last read or refreshed lease is reused for up to 250 ms (never within a second of expiry), removing two round trips and two transactions from each claim. At W=4 this cuts transactions per completed job from 2.35 to 1.39.
 
 ### Fixed
 

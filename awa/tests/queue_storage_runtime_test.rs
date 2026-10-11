@@ -12703,14 +12703,19 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
     };
     let store = Arc::new(create_store_with_config(&pool, config).await);
 
+    let (first_enqueue_tx, first_enqueue_rx) = tokio::sync::oneshot::channel();
     let producer_pool = pool.clone();
     let producer_store = Arc::clone(&store);
     let producer = tokio::spawn(async move {
+        let mut first_enqueue_tx = Some(first_enqueue_tx);
         for _ in 0..64 {
             producer_store
                 .enqueue_batch(&producer_pool, queue, 1, 16)
                 .await
                 .expect("striped enqueue should not deadlock");
+            if let Some(start) = first_enqueue_tx.take() {
+                start.send(()).expect("claimer start receiver dropped");
+            }
             tokio::task::yield_now().await;
         }
     });
@@ -12718,6 +12723,9 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
     let claimer_pool = pool.clone();
     let claimer_store = Arc::clone(&store);
     let claimer = tokio::spawn(async move {
+        // Otherwise fast empty claims can finish before the first producer
+        // commit, making the progress assertion a scheduler race.
+        first_enqueue_rx.await.expect("producer did not enqueue");
         let mut claimed_total = 0usize;
         for _ in 0..128 {
             let claimed = claimer_store
@@ -13005,6 +13013,170 @@ async fn test_queue_storage_aged_completion_stays_compact_and_keeps_lane_priorit
     .await
     .expect("Failed to read aged terminal entry");
     assert_eq!(stored_priority, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_reset_forgets_cached_claimer_lease() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_reset_claimer_cache";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_reset_claimer_cache";
+    let instance = Uuid::new_v4();
+    let ttl = Duration::from_secs(300);
+    let idle_threshold = Duration::from_secs(120);
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("failed to enqueue job");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            instance,
+            1,
+            ttl,
+            idle_threshold,
+        )
+        .await
+        .expect("claim should succeed");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(store.cached_claimer_lease_count(), 1);
+
+    store.reset(&pool).await.expect("failed to reset store");
+    assert_eq!(
+        store.cached_claimer_lease_count(),
+        0,
+        "reset truncates queue_claimer_leases, so cached leases must go too"
+    );
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("failed to enqueue job after reset");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            instance,
+            1,
+            ttl,
+            idle_threshold,
+        )
+        .await
+        .expect("claim after reset should succeed");
+    assert_eq!(claimed.len(), 1);
+
+    let owned: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {schema}.queue_claimer_leases WHERE queue = $1 AND owner_instance_id = $2"
+    )))
+    .bind(queue)
+    .bind(instance)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to count claimer leases");
+    assert_eq!(
+        owned, 1,
+        "a claim right after reset must take a real claimer lease, not a cached one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_cache_rechecks_reduced_target_after_lease_loss() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_cache_target";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_cache_target";
+    let instance = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let ttl = Duration::from_secs(300);
+    let idle = Duration::from_secs(120);
+    store.enqueue_batch(&pool, queue, 1, 3).await.unwrap();
+    // Own slot 1 while another active instance occupies slot 0.
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 2, now() + interval '1 hour');
+         "
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (slot, owner) in [(0_i16, other), (1_i16, instance)] {
+        sqlx::query(audited_sql(format!(
+            "INSERT INTO {schema}.queue_claimer_leases
+             (queue, claimer_slot, owner_instance_id, lease_epoch, leased_at, last_claimed_at, expires_at)
+             VALUES ($1, $2, $3, 0, now(), now(), now() + interval '1 hour')"
+        )))
+        .bind(queue).bind(slot).bind(owner).execute(&pool).await.unwrap();
+    }
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            ttl,
+            Duration::ZERO,
+            instance,
+            2,
+            ttl,
+            idle,
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(store.cached_claimer_lease_count(), 1);
+    // An external coordination change is allowed to lag until the cache TTL.
+    // After it expires, the old owner must not acquire the now-disallowed
+    // second slot or bypass the active owner in slot 0.
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_claimer_state SET target_claimers = 1 WHERE queue = $1"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!(
+        "DELETE FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = 1"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let denied = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            ttl,
+            Duration::ZERO,
+            instance,
+            2,
+            ttl,
+            idle,
+        )
+        .await
+        .unwrap();
+    assert!(
+        denied.is_empty(),
+        "expired cache must recheck target and ownership"
+    );
+    assert_eq!(store.cached_claimer_lease_count(), 0);
+    assert_eq!(
+        store
+            .claim_runtime_batch(&pool, queue, 2, ttl)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "coordination denial must leave the remaining work claimable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -15123,9 +15295,28 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
+    cursor_advance_requires_claim_evidence(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_legacy_cursor_advance_requires_claim_evidence() {
+    cursor_advance_requires_claim_evidence(false).await;
+}
+
+async fn cursor_advance_requires_claim_evidence(receipts: bool) {
     let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_cursor_claim_evidence";
-    let store = create_store(&pool, schema).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
     let queue = "qs_cursor_claim_evidence";
 
     store
@@ -15140,10 +15331,33 @@ async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
         .next()
         .expect("missing claimed job");
     let claim = claimed.claim.clone();
+    assert_eq!(claim.claim_batch_id.is_some(), receipts);
     assert_eq!(
         claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
         claim.lane_seq + 1,
         "a recorded claim advances the cursor past its row"
+    );
+
+    // A committed claim with a lost cursor advance remains spent. Replaying
+    // the real production advance repairs its cursor without emitting twice.
+    sqlx::query(audited_sql(format!(
+        "SELECT setval(format('%I.%I', $1::text, seq_name)::regclass, $3, false)
+         FROM {schema}.queue_claim_heads WHERE queue = $2"
+    )))
+    .bind(schema)
+    .bind(queue)
+    .bind(claim.lane_seq)
+    .execute(&pool)
+    .await
+    .unwrap();
+    store
+        .replay_claim_cursor_advance(&pool, &claimed)
+        .await
+        .unwrap();
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
+        claim.lane_seq + 1,
+        "committed evidence permits the replay"
     );
 
     // A server that never received the claim (e.g. a standby promoted before
@@ -15175,15 +15389,7 @@ async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
     .expect("failed to rewind claim cursor");
 
     store
-        .replay_claim_cursor_advance(
-            &pool,
-            queue,
-            claim.priority,
-            claim.enqueue_shard,
-            claim.ready_slot,
-            claim.ready_generation,
-            claim.lane_seq,
-        )
+        .replay_claim_cursor_advance(&pool, &claimed)
         .await
         .expect("cursor advance should not fail");
     assert_eq!(
@@ -15204,72 +15410,205 @@ async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_queue_storage_reset_forgets_cached_claimer_lease() {
-    let (_db_guard, pool) = setup_pool(10).await;
-    let schema = "awa_qs_reset_claimer_cache";
-    let store = create_store(&pool, schema).await;
-    let queue = "qs_reset_claimer_cache";
-    let instance = Uuid::new_v4();
-    let ttl = Duration::from_secs(300);
-    let idle_threshold = Duration::from_secs(120);
-
-    store
-        .enqueue_batch(&pool, queue, 1, 1)
-        .await
-        .expect("failed to enqueue job");
-    let claimed = store
-        .claim_runtime_batch_with_aging_for_instance(
-            &pool,
-            queue,
-            1,
-            Duration::from_secs(300),
-            Duration::from_secs(60),
-            instance,
-            1,
-            ttl,
-            idle_threshold,
+async fn test_shared_listener_disconnect_still_drains_both_queues() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let config = QueueStorageConfig {
+        schema: "awa_qs_lost_notify".into(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, config.clone()).await;
+    let client = Client::builder(pool.clone())
+        .queue(
+            "lost_notify_a",
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
         )
-        .await
-        .expect("claim should succeed");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(store.cached_claimer_lease_count(), 1);
-
-    store.reset(&pool).await.expect("failed to reset store");
-    assert_eq!(
-        store.cached_claimer_lease_count(),
-        0,
-        "reset truncates queue_claimer_leases, so cached leases must go too"
-    );
-    store
-        .enqueue_batch(&pool, queue, 1, 1)
-        .await
-        .expect("failed to enqueue job after reset");
-    let claimed = store
-        .claim_runtime_batch_with_aging_for_instance(
-            &pool,
-            queue,
-            1,
-            Duration::from_secs(300),
-            Duration::from_secs(60),
-            instance,
-            1,
-            ttl,
-            idle_threshold,
+        .queue(
+            "lost_notify_b",
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
         )
-        .await
-        .expect("claim after reset should succeed");
-    assert_eq!(claimed.len(), 1);
-
-    let owned: i64 = sqlx::query_scalar(audited_sql(format!(
-        "SELECT count(*)::bigint FROM {schema}.queue_claimer_leases WHERE queue = $1 AND owner_instance_id = $2"
-    )))
-    .bind(queue)
-    .bind(instance)
-    .fetch_one(&pool)
+        .queue_storage(config, Duration::from_secs(60), Duration::from_secs(60))
+        .claim_rotate_interval(Duration::from_secs(60))
+        .max_concurrent_claims(1)
+        .register_worker(CompleteWorker)
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    let listener_pids: Vec<i32> = sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity WHERE datname = current_database()
+         AND query LIKE 'LISTEN %lost_notify%'",
+    )
+    .fetch_all(&pool)
     .await
-    .expect("failed to count claimer leases");
+    .unwrap();
+    assert_eq!(listener_pids.len(), 1, "queues share a listener");
+    // Notifications emitted while the listener reconnects are lossy. Polling
+    // must drain every queue independently of a delivered wake-up.
+    for pid in listener_pids {
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+                .bind(pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        );
+    }
+    let mut ids = Vec::new();
+    for queue in ["lost_notify_a", "lost_notify_b"] {
+        ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: 1 },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for id in ids {
+        wait_for_job_state(
+            &store,
+            &pool,
+            id,
+            &[JobState::Completed],
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let schema = "awa_qs_identity_races";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    store
+        .enqueue_batch(&pool, "identity_races", 1, 2)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "identity_races", 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
     assert_eq!(
-        owned, 1,
-        "a claim right after reset must take a real claimer lease, not a cached one"
+        claimed[0].claim.claim_batch_id,
+        claimed[1].claim.claim_batch_id
     );
+    let first = &claimed[0];
+    let second = &claimed[1];
+    let mut invalid = first.claim.clone();
+    invalid.claim_batch_index = second.claim.claim_batch_index;
+    assert!(store
+        .fail_terminal_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "bad index",
+            None,
+            Some(&invalid)
+        )
+        .await
+        .unwrap()
+        .is_none());
+    invalid = first.claim.clone();
+    invalid.receipt_id = second.claim.receipt_id;
+    assert!(store
+        .fail_to_dlq_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "bad hint",
+            "bad receipt",
+            None,
+            Some(&invalid)
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 2);
+    // Another transaction can lock the immutable batch without blocking
+    // unrelated item closure. This fails if FOR UPDATE is reintroduced.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!("SELECT batch_id FROM {schema}.lease_claim_batches WHERE claim_slot=$1 AND batch_id=$2 FOR UPDATE")))
+        .bind(first.claim.claim_slot).bind(first.claim.claim_batch_id.unwrap()).execute(blocker.as_mut()).await.unwrap();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.fail_terminal_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "terminal",
+            None,
+            Some(&first.claim),
+        ),
+    )
+    .await
+    .expect("identity close must not wait on batch row")
+    .unwrap();
+    assert!(closed.is_some());
+    blocker.rollback().await.unwrap();
+    sqlx::query(audited_sql(format!("UPDATE {schema}.lease_claim_batches SET claimed_at = clock_timestamp() - interval '10 minutes'")))
+        .execute(&pool).await.unwrap();
+    let (completed, failed, rescued) = tokio::join!(
+        store.complete_runtime_batch(&pool, std::slice::from_ref(second)),
+        store.fail_to_dlq_with_claim(
+            &pool,
+            second.job.id,
+            second.job.run_lease,
+            "race",
+            "race",
+            None,
+            Some(&second.claim)
+        ),
+        store.rescue_stale_heartbeats(&pool, Duration::from_secs(1)),
+    );
+    let applied = completed.unwrap().len()
+        + usize::from(failed.unwrap().is_some())
+        + rescued
+            .unwrap()
+            .iter()
+            .filter(|j| j.id == second.job.id)
+            .count();
+    assert_eq!(applied, 1, "exactly one lifecycle transition wins");
+    for job in &claimed {
+        let count: i64 = sqlx::query_scalar(audited_sql(format!("SELECT count(*) FROM {schema}.lease_claim_closure_batches WHERE claim_slot=$1 AND receipt_ranges @> $2::bigint")))
+            .bind(job.claim.claim_slot).bind(job.claim.receipt_id.unwrap()).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "one durable closure per exact receipt");
+    }
+    assert!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .is_empty(),
+        "stale completion cannot create another disposition"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    pool.close().await;
 }

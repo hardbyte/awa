@@ -160,13 +160,6 @@ pub struct QueueConfig {
     pub claimers: u16,
     /// Maximum jobs a dispatcher attempts to claim in one DB round-trip.
     pub claim_batch_size: usize,
-    /// Upper bound for the poll sleep while the queue stays empty.
-    ///
-    /// Consecutive empty polls double the sleep from `poll_interval` up to
-    /// this value; a notification or a non-empty claim resets it. Only
-    /// applied when `LISTEN`/`NOTIFY` is available, so a poll-only runtime
-    /// keeps polling at `poll_interval`.
-    pub idle_poll_interval: Duration,
 }
 
 impl Default for QueueConfig {
@@ -181,7 +174,6 @@ impl Default for QueueConfig {
             weight: 1,
             claimers: 1,
             claim_batch_size: DEFAULT_CLAIM_BATCH_LIMIT,
-            idle_poll_interval: Duration::from_secs(2),
         }
     }
 }
@@ -442,7 +434,7 @@ impl Dispatcher {
         loop {
             let sleep_for = idle_poll_sleep(
                 self.config.poll_interval,
-                self.config.idle_poll_interval,
+                Duration::from_secs(2),
                 idle_polls,
             )
             .min(override_refresh_interval());
@@ -774,8 +766,19 @@ impl Dispatcher {
                 }
             },
             RuntimeStorage::QueueStorage(runtime) => {
-                let Ok(claim_slot) = self.claim_gate.acquire().await else {
-                    return false;
+                let claim_slot = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        self.refund_rate_limit(batch_size);
+                        return false;
+                    }
+                    permit = self.claim_gate.acquire() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            self.refund_rate_limit(batch_size);
+                            return false;
+                        }
+                    }
                 };
                 let claimed = runtime
                     .store
@@ -904,10 +907,11 @@ impl Dispatcher {
         while set.try_join_next().is_some() {}
         for (job, permit) in jobs.into_iter().zip(permits) {
             let cancel_flag = Arc::new(AtomicBool::new(false));
-            let task = self.executor.execute_task(job, cancel_flag);
+            let task = self.executor.execute_task(job, cancel_flag.clone());
+            let dispatch_cancel = self.cancel.clone();
             let capacity_wake = self.capacity_wake.clone();
             set.spawn(async move {
-                task.await;
+                run_with_dispatch_cancellation(task, cancel_flag, dispatch_cancel).await;
                 drop(permit);
                 capacity_wake.notify_one();
             });
@@ -917,9 +921,184 @@ impl Dispatcher {
     }
 }
 
+// A claim can finish while shutdown signals the current in-flight map.
+// Carry cancellation into execution even before the task registers itself.
+async fn run_with_dispatch_cancellation(
+    task: impl std::future::Future<Output = ()>,
+    cancel_flag: Arc<AtomicBool>,
+    dispatch_cancel: CancellationToken,
+) {
+    tokio::pin!(task);
+    tokio::select! {
+        biased;
+        _ = dispatch_cancel.cancelled() => {
+            cancel_flag.store(true, Ordering::SeqCst);
+            task.await;
+        }
+        _ = &mut task => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blocked_dispatcher() -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:test@localhost/awa_test")
+            .unwrap();
+        let metrics =
+            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
+        let storage = RuntimeStorage::QueueStorage(
+            crate::storage::QueueStorageRuntime::new(
+                awa_model::QueueStorageConfig::default(),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let (_, completion) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let executor = Arc::new(JobExecutor::new(
+            pool.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            metrics.clone(),
+            completion,
+            storage.clone(),
+            crate::executor::DlqPolicy::default(),
+        ));
+        let config = QueueConfig {
+            max_workers: 1,
+            rate_limit: Some(RateLimit {
+                max_rate: 0.0,
+                burst: 1,
+            }),
+            ..Default::default()
+        };
+        let rate_limiter = shared_rate_limiter(&config);
+        let capacity = Arc::new(Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        let dispatcher = Dispatcher::with_concurrency(
+            "blocked".into(),
+            Uuid::new_v4(),
+            config,
+            pool,
+            executor,
+            metrics,
+            in_flight,
+            Arc::new(AtomicBool::new(false)),
+            cancel.clone(),
+            Arc::new(Mutex::new(JoinSet::new())),
+            ConcurrencyMode::HardReserved {
+                semaphore: capacity.clone(),
+            },
+            rate_limiter,
+            Arc::new(Notify::new()),
+            None,
+            Arc::new(Semaphore::new(0)),
+            Uuid::new_v4(),
+            storage,
+        );
+        (dispatcher, capacity, cancel)
+    }
+
+    #[tokio::test]
+    async fn saturated_claim_gate_cancellation_releases_capacity_and_rate_tokens() {
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher();
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block before SQL"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert_eq!(capacity.available_permits(), 0);
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
+        assert!(dispatcher.job_set.lock().await.is_empty());
+        // Cancellation wins even if a gate permit becomes available concurrently.
+        dispatcher.claim_gate.add_permits(1);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), dispatcher.poll_once(None))
+                .await
+                .unwrap()
+        );
+        assert_eq!(dispatcher.claim_gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn claim_finishing_during_shutdown_starts_with_cancelled_context() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let observed = flag.clone();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        run_with_dispatch_cancellation(
+            async move {
+                assert!(
+                    observed.load(Ordering::SeqCst),
+                    "late registration must see shutdown"
+                );
+            },
+            flag,
+            shutdown,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_task_that_has_not_registered_in_flight() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let observed = flag.clone();
+        let shutdown = CancellationToken::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_with_dispatch_cancellation(
+            async move {
+                entered_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                assert!(observed.load(Ordering::SeqCst));
+            },
+            flag.clone(),
+            shutdown.clone(),
+        ));
+        entered_rx.await.unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        finish_tx.send(()).unwrap();
+        task.await.unwrap();
+    }
 
     #[test]
     fn idle_poll_sleep_doubles_up_to_the_idle_cap() {

@@ -1986,13 +1986,33 @@ impl Client {
             flag.store(true, Ordering::SeqCst);
         }
 
+        // Claim queries can still be blocked in PostgreSQL after cancellation.
+        // Dispatcher exit and worker drain share the caller's time budget.
+        let drain_deadline = tokio::time::Instant::now() + timeout;
         // Phase 3: Wait for dispatchers to exit their poll loops
-        let dispatcher_handles: Vec<_> = {
+        let mut dispatcher_handles: Vec<_> = {
             let mut guard = self.dispatcher_handles.write().await;
             std::mem::take(&mut *guard)
         };
-        for handle in dispatcher_handles {
-            let _ = handle.await;
+        let stop_dispatchers = async {
+            for handle in &mut dispatcher_handles {
+                let _ = handle.await;
+            }
+        };
+        if tokio::time::timeout_at(drain_deadline, stop_dispatchers)
+            .await
+            .is_err()
+        {
+            warn!("Shutdown timeout waiting for dispatchers; aborting pending claims");
+            for handle in &dispatcher_handles {
+                handle.abort();
+            }
+            for handle in dispatcher_handles {
+                let _ = handle.await;
+            }
+        }
+        for flag in self.in_flight.flags() {
+            flag.store(true, Ordering::SeqCst);
         }
 
         // Phase 4: Drain in-flight jobs (heartbeat + maintenance still alive)
@@ -2000,7 +2020,10 @@ impl Client {
             let mut set = self.job_set.lock().await;
             while set.join_next().await.is_some() {}
         };
-        if tokio::time::timeout(timeout, drain).await.is_err() {
+        if tokio::time::timeout_at(drain_deadline, drain)
+            .await
+            .is_err()
+        {
             warn!(
                 timeout_secs = timeout.as_secs(),
                 "Shutdown drain timeout exceeded, some jobs may not have completed"
@@ -3027,6 +3050,33 @@ mod tests {
         builder.storage = RuntimeStorage::Canonical;
         builder.storage_error = None;
         builder
+    }
+
+    #[tokio::test]
+    async fn shutdown_bounds_blocked_dispatcher_exit() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.unwrap();
+        let client = force_canonical(
+            Client::builder(pool.clone()).queue("shutdown_bound", QueueConfig::default()),
+        )
+        .build()
+        .unwrap();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let abort = handle.abort_handle();
+        client.dispatcher_handles.write().await.push(handle);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.shutdown(Duration::from_millis(25)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            abort.is_finished(),
+            "blocked dispatcher must be aborted at the deadline"
+        );
+        pool.close().await;
     }
 
     #[tokio::test]
