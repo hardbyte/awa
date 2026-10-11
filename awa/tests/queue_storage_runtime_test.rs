@@ -12604,14 +12604,19 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
     };
     let store = Arc::new(create_store_with_config(&pool, config).await);
 
+    let (first_enqueue_tx, first_enqueue_rx) = tokio::sync::oneshot::channel();
     let producer_pool = pool.clone();
     let producer_store = Arc::clone(&store);
     let producer = tokio::spawn(async move {
+        let mut first_enqueue_tx = Some(first_enqueue_tx);
         for _ in 0..64 {
             producer_store
                 .enqueue_batch(&producer_pool, queue, 1, 16)
                 .await
                 .expect("striped enqueue should not deadlock");
+            if let Some(start) = first_enqueue_tx.take() {
+                start.send(()).expect("claimer start receiver dropped");
+            }
             tokio::task::yield_now().await;
         }
     });
@@ -12619,6 +12624,9 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
     let claimer_pool = pool.clone();
     let claimer_store = Arc::clone(&store);
     let claimer = tokio::spawn(async move {
+        // Otherwise fast empty claims can finish before the first producer
+        // commit, making the progress assertion a scheduler race.
+        first_enqueue_rx.await.expect("producer did not enqueue");
         let mut claimed_total = 0usize;
         for _ in 0..128 {
             let claimed = claimer_store
@@ -15024,9 +15032,28 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
+    cursor_advance_requires_claim_evidence(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_legacy_cursor_advance_requires_claim_evidence() {
+    cursor_advance_requires_claim_evidence(false).await;
+}
+
+async fn cursor_advance_requires_claim_evidence(receipts: bool) {
     let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_cursor_claim_evidence";
-    let store = create_store(&pool, schema).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
     let queue = "qs_cursor_claim_evidence";
 
     store
@@ -15041,10 +15068,33 @@ async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
         .next()
         .expect("missing claimed job");
     let claim = claimed.claim.clone();
+    assert_eq!(claim.claim_batch_id.is_some(), receipts);
     assert_eq!(
         claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
         claim.lane_seq + 1,
         "a recorded claim advances the cursor past its row"
+    );
+
+    // A committed claim with a lost cursor advance remains spent. Replaying
+    // the real production advance repairs its cursor without emitting twice.
+    sqlx::query(audited_sql(format!(
+        "SELECT setval(format('%I.%I', $1::text, seq_name)::regclass, $3, false)
+         FROM {schema}.queue_claim_heads WHERE queue = $2"
+    )))
+    .bind(schema)
+    .bind(queue)
+    .bind(claim.lane_seq)
+    .execute(&pool)
+    .await
+    .unwrap();
+    store
+        .replay_claim_cursor_advance(&pool, &claimed)
+        .await
+        .unwrap();
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
+        claim.lane_seq + 1,
+        "committed evidence permits the replay"
     );
 
     // A server that never received the claim (e.g. a standby promoted before
@@ -15076,15 +15126,7 @@ async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
     .expect("failed to rewind claim cursor");
 
     store
-        .replay_claim_cursor_advance(
-            &pool,
-            queue,
-            claim.priority,
-            claim.enqueue_shard,
-            claim.ready_slot,
-            claim.ready_generation,
-            claim.lane_seq,
-        )
+        .replay_claim_cursor_advance(&pool, &claimed)
         .await
         .expect("cursor advance should not fail");
     assert_eq!(
@@ -15172,5 +15214,98 @@ async fn test_queue_storage_reset_forgets_cached_claimer_lease() {
     assert_eq!(
         owned, 1,
         "a claim right after reset must take a real claimer lease, not a cached one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_claimer_cache_rechecks_reduced_target_after_lease_loss() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_claimer_cache_target";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_claimer_cache_target";
+    let instance = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let ttl = Duration::from_secs(300);
+    let idle = Duration::from_secs(120);
+    store.enqueue_batch(&pool, queue, 1, 3).await.unwrap();
+    // Own slot 1 while another active instance occupies slot 0.
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+         VALUES ($1, 2, now() + interval '1 hour');
+         "
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (slot, owner) in [(0_i16, other), (1_i16, instance)] {
+        sqlx::query(audited_sql(format!(
+            "INSERT INTO {schema}.queue_claimer_leases
+             (queue, claimer_slot, owner_instance_id, lease_epoch, leased_at, last_claimed_at, expires_at)
+             VALUES ($1, $2, $3, 0, now(), now(), now() + interval '1 hour')"
+        )))
+        .bind(queue).bind(slot).bind(owner).execute(&pool).await.unwrap();
+    }
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            ttl,
+            Duration::ZERO,
+            instance,
+            2,
+            ttl,
+            idle,
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(store.cached_claimer_lease_count(), 1);
+    // An external coordination change is allowed to lag until the cache TTL.
+    // After it expires, the old owner must not acquire the now-disallowed
+    // second slot or bypass the active owner in slot 0.
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_claimer_state SET target_claimers = 1 WHERE queue = $1"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!(
+        "DELETE FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = 1"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let denied = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            ttl,
+            Duration::ZERO,
+            instance,
+            2,
+            ttl,
+            idle,
+        )
+        .await
+        .unwrap();
+    assert!(
+        denied.is_empty(),
+        "expired cache must recheck target and ownership"
+    );
+    assert_eq!(store.cached_claimer_lease_count(), 0);
+    assert_eq!(
+        store
+            .claim_runtime_batch(&pool, queue, 2, ttl)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "coordination denial must leave the remaining work claimable"
     );
 }
