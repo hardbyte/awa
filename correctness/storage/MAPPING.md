@@ -141,6 +141,10 @@ The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate property, 
 
 The TLA+ storage model does not represent local worker-capacity accounting. Rust now releases local queue capacity immediately after handler execution and progress snapshotting, while durable completion continues asynchronously through the completion batcher. That changes throughput and scheduling behavior, but it does not change the modeled storage safety boundary because the `run_lease`-guarded finalization and rescue semantics are unchanged.
 
+## Claimer coordination cache (#508)
+
+The per-instance 250 ms claimer cache is a throughput gate, not job ownership evidence. A stale target/lease may allow another claim during that window, but the same database claim transaction and attempt fences still govern each job. Existing owned slots were already retained across target reductions; the target bounds new acquisition. Cache expiry rechecks acquisition, near-expiry leases bypass the cache, lost refresh/acquisition evicts it, and reset clears it after truncating leases. Rust tests cover reset/reacquisition and a reduced target combined with loss of a cached slot. The storage lifecycle model needs no new ownership transition for this hint cache. Concurrent reset and active claims are outside the reset API's test-isolation use; clearing this cache does not establish a fleet reset barrier.
+
 ## Producer batching note
 
 The TLA+ storage model treats `EnqueueReady` and `EnqueueDeferred` as logical per-job state transitions. Rust may batch the SQL implementation of producer side effects: allocating a contiguous lane sequence range, syncing enqueue-time `job_unique_claims` with one array-backed statement, and inserting rows with multi-row `INSERT` or COPY. Those batching choices refine the same logical actions as long as they commit in the same transaction as the ready/deferred append.
