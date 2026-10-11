@@ -87,6 +87,8 @@ own fixed `max_workers`. **Weighted** shares one pool: call `.global_max_workers
 (Rust) or pass `global_max_workers=N` with dict-form queues (Python), then use
 `min_workers` as a floor and `weight` to split overflow. Per-queue rate limiting
 is a token bucket (`RateLimit { max_rate, burst }` / `rate_limit=(rate, burst)`).
+A runtime shares one LISTEN connection across queues. Empty notification-backed queues poll with backoff up to 2s; poll-only runtimes retain `poll_interval`. `ClientBuilder::max_concurrent_claims` bounds concurrent queue-storage claim round trips across queues (default pool size / 4, clamped to 4..=64). This controls database pressure separately from worker capacity; increase it only with measured pool headroom. Extra `claimers` share each queue's worker permits.
+
 Enabling a rate limit live is not supported — you can only retune a queue that
 was built with one.
 

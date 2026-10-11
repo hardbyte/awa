@@ -102,7 +102,10 @@ impl QueueNotifyHub {
                         Err(err) => {
                             warn!(error = %err, "PG listener error, will retry");
                             self.wake_all();
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::select! {
+                                _ = self.cancel.cancelled() => return,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            }
                         }
                     }
                 }
