@@ -12604,14 +12604,19 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
     };
     let store = Arc::new(create_store_with_config(&pool, config).await);
 
+    let (first_enqueue_tx, first_enqueue_rx) = tokio::sync::oneshot::channel();
     let producer_pool = pool.clone();
     let producer_store = Arc::clone(&store);
     let producer = tokio::spawn(async move {
+        let mut first_enqueue_tx = Some(first_enqueue_tx);
         for _ in 0..64 {
             producer_store
                 .enqueue_batch(&producer_pool, queue, 1, 16)
                 .await
                 .expect("striped enqueue should not deadlock");
+            if let Some(start) = first_enqueue_tx.take() {
+                start.send(()).expect("claimer start receiver dropped");
+            }
             tokio::task::yield_now().await;
         }
     });
@@ -12619,6 +12624,9 @@ async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues
     let claimer_pool = pool.clone();
     let claimer_store = Arc::clone(&store);
     let claimer = tokio::spawn(async move {
+        // Otherwise fast empty claims can finish before the first producer
+        // commit, making the progress assertion a scheduler race.
+        first_enqueue_rx.await.expect("producer did not enqueue");
         let mut claimed_total = 0usize;
         for _ in 0..128 {
             let claimed = claimer_store
@@ -15018,4 +15026,120 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
             "deadline_at must be the claim time plus the claim deadline"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
+    cursor_advance_requires_claim_evidence(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_legacy_cursor_advance_requires_claim_evidence() {
+    cursor_advance_requires_claim_evidence(false).await;
+}
+
+async fn cursor_advance_requires_claim_evidence(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_cursor_claim_evidence";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: receipts,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "qs_cursor_claim_evidence";
+
+    store
+        .enqueue_batch(&pool, queue, 2, 1)
+        .await
+        .expect("failed to enqueue job");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("failed to claim job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    let claim = claimed.claim.clone();
+    assert_eq!(claim.claim_batch_id.is_some(), receipts);
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
+        claim.lane_seq + 1,
+        "a recorded claim advances the cursor past its row"
+    );
+
+    // A committed claim with a lost cursor advance remains spent. Replaying
+    // the real production advance repairs its cursor without emitting twice.
+    sqlx::query(audited_sql(format!(
+        "SELECT setval(format('%I.%I', $1::text, seq_name)::regclass, $3, false)
+         FROM {schema}.queue_claim_heads WHERE queue = $2"
+    )))
+    .bind(schema)
+    .bind(queue)
+    .bind(claim.lane_seq)
+    .execute(&pool)
+    .await
+    .unwrap();
+    store
+        .replay_claim_cursor_advance(&pool, &claimed)
+        .await
+        .unwrap();
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
+        claim.lane_seq + 1,
+        "committed evidence permits the replay"
+    );
+
+    // A server that never received the claim (e.g. a standby promoted before
+    // the asynchronously committed claim replicated): no claim rows, and the
+    // cursor still at the claimed row.
+    for table in [
+        "ready_claim_attempt_batches",
+        "lease_claim_batches",
+        "leases",
+    ] {
+        sqlx::query(audited_sql(format!(
+            "DELETE FROM {schema}.{table} WHERE queue = $1"
+        )))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("failed to remove claim evidence");
+    }
+    sqlx::query(audited_sql(format!(
+        "SELECT setval(format('%I.%I', $1::text, seq_name)::regclass, $3, false)
+         FROM {schema}.queue_claim_heads
+         WHERE queue = $2"
+    )))
+    .bind(schema)
+    .bind(queue)
+    .bind(claim.lane_seq)
+    .execute(&pool)
+    .await
+    .expect("failed to rewind claim cursor");
+
+    store
+        .replay_claim_cursor_advance(&pool, &claimed)
+        .await
+        .expect("cursor advance should not fail");
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, claim.priority, claim.enqueue_shard).await,
+        claim.lane_seq,
+        "the cursor must not move past a row whose claim is not recorded"
+    );
+
+    let reclaimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("failed to reclaim job");
+    assert_eq!(
+        reclaimed.iter().map(|job| job.job.id).collect::<Vec<_>>(),
+        vec![claimed.job.id],
+        "the job whose claim was lost stays claimable"
+    );
 }
