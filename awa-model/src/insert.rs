@@ -495,19 +495,24 @@ pub async fn insert_many_copy(
     .execute(&mut *conn)
     .await?;
 
-    // 2. COPY data into staging table via CSV
-    let mut csv_buf = Vec::with_capacity(rows.len() * 256);
-    for row in &rows {
-        write_csv_row(&mut csv_buf, row);
-    }
+    // 2. Fill the staging table: one `unnest` INSERT for small batches,
+    // COPY via CSV for large ones.
+    if rows.len() < crate::queue_storage::COPY_MIN_ROWS {
+        stage_rows_with_insert(conn, &rows).await?;
+    } else {
+        let mut csv_buf = Vec::with_capacity(rows.len() * 256);
+        for row in &rows {
+            write_csv_row(&mut csv_buf, row);
+        }
 
-    let mut copy_in = conn
-        .copy_in_raw(
-            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key) FROM STDIN WITH (FORMAT csv, NULL '__AWA_NULL__')",
-        )
-        .await?;
-    copy_in.send(csv_buf).await?;
-    copy_in.finish().await?;
+        let mut copy_in = conn
+            .copy_in_raw(
+                "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key) FROM STDIN WITH (FORMAT csv, NULL '__AWA_NULL__')",
+            )
+            .await?;
+        copy_in.send(csv_buf).await?;
+        copy_in.finish().await?;
+    }
 
     // 3. INSERT...SELECT from staging into real table
     let has_unique = rows.iter().any(|r| r.unique_key.is_some());
@@ -688,6 +693,57 @@ pub async fn insert_many_copy_from_pool(
     tx.commit().await?;
 
     Ok(results)
+}
+
+async fn stage_rows_with_insert(
+    conn: &mut PgConnection,
+    rows: &[PreparedRow],
+) -> Result<(), AwaError> {
+    sqlx::query(
+        r#"
+        INSERT INTO pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key)
+        SELECT
+            kind,
+            queue,
+            args,
+            state::awa.job_state,
+            priority,
+            max_attempts,
+            run_at,
+            metadata,
+            ARRAY(
+                SELECT tag
+                FROM jsonb_array_elements_text(tags) WITH ORDINALITY AS elements (tag, position)
+                ORDER BY position
+            ),
+            unique_key,
+            unique_states::bit(8),
+            ordering_key
+        FROM unnest(
+            $1::text[], $2::text[], $3::jsonb[], $4::text[], $5::smallint[], $6::smallint[],
+            $7::timestamptz[], $8::jsonb[], $9::jsonb[], $10::bytea[], $11::text[], $12::bytea[]
+        ) AS rows (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key)
+        "#,
+    )
+    .bind(rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.queue.as_str()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| &row.args).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.state.as_str()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.priority).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.max_attempts).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.run_at).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| &row.metadata).collect::<Vec<_>>())
+    .bind(
+        rows.iter()
+            .map(|row| serde_json::json!(row.tags))
+            .collect::<Vec<_>>(),
+    )
+    .bind(rows.iter().map(|row| row.unique_key.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.unique_states.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.ordering_key.as_deref()).collect::<Vec<_>>())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 // ── CSV serialization helpers ────────────────────────────────────────

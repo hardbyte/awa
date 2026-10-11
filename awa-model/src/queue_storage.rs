@@ -24,6 +24,9 @@ const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
+/// Batches smaller than this are written with a single `unnest` INSERT even on
+/// the COPY entry points; below it the INSERT is the faster path.
+pub(crate) const COPY_MIN_ROWS: usize = 2048;
 const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 const RECEIPT_RESCUE_BATCH_LIMIT: i64 = 500;
 const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
@@ -4370,34 +4373,39 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) "
-        ));
-        builder.push_values(rows.iter(), |mut b, row| {
-            b.push_bind(ring.0)
-                .push_bind(ring.1)
-                .push_bind(row.job_id)
-                .push_bind(&row.kind)
-                .push_bind(&row.queue)
-                .push_bind(&row.args)
-                .push_bind(row.priority)
-                .push_bind(row.attempt)
-                .push_bind(row.run_lease)
-                .push_bind(row.max_attempts)
-                .push_bind(row.lane_seq)
-                .push_bind(row.enqueue_shard)
-                .push_bind(row.run_at)
-                .push_bind(row.attempted_at)
-                .push_bind(row.created_at)
-                .push_bind(&row.unique_key)
-                .push_bind(&row.unique_states)
-                .push_bind(storage_payload(&row.payload));
-        });
-        builder
-            .build()
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload)
+            SELECT $1, $2, rows.*
+            FROM unnest(
+                $3::bigint[], $4::text[], $5::text[], $6::jsonb[], $7::smallint[],
+                $8::smallint[], $9::bigint[], $10::smallint[], $11::bigint[], $12::smallint[],
+                $13::timestamptz[], $14::timestamptz[], $15::timestamptz[], $16::bytea[],
+                $17::text[], $18::jsonb[]
+            ) AS rows
+            "#
+        )))
+        .bind(ring.0)
+        .bind(ring.1)
+        .bind(rows.iter().map(|row| row.job_id).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.queue.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| &row.args).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.priority).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.attempt).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.run_lease).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.max_attempts).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.lane_seq).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.enqueue_shard).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.run_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.attempted_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.created_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.unique_key.as_deref()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.unique_states.as_deref()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| storage_payload(&row.payload)).collect::<Vec<_>>())
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         Ok(rows.len())
     }
@@ -4453,27 +4461,25 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.ready_segments (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq, next_lane_seq, first_run_at) "
-        ));
-        builder.push_values(segments.iter(), |mut b, segment| {
-            b.push_bind(ring.0)
-                .push_bind(ring.1)
-                .push_bind(&segment.queue)
-                .push_bind(segment.priority)
-                .push_bind(segment.enqueue_shard)
-                .push_bind(segment.first_lane_seq)
-                .push_bind(segment.next_lane_seq)
-                .push_bind(segment.first_run_at);
-        });
-        builder.push(
-            " ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING",
-        );
-        builder
-            .build()
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.ready_segments (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq, next_lane_seq, first_run_at)
+            SELECT $1, $2, segments.*
+            FROM unnest($3::text[], $4::smallint[], $5::smallint[], $6::bigint[], $7::bigint[], $8::timestamptz[]) AS segments
+            ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq) DO NOTHING
+            "#
+        )))
+        .bind(ring.0)
+        .bind(ring.1)
+        .bind(segments.iter().map(|segment| segment.queue.as_str()).collect::<Vec<_>>())
+        .bind(segments.iter().map(|segment| segment.priority).collect::<Vec<_>>())
+        .bind(segments.iter().map(|segment| segment.enqueue_shard).collect::<Vec<_>>())
+        .bind(segments.iter().map(|segment| segment.first_lane_seq).collect::<Vec<_>>())
+        .bind(segments.iter().map(|segment| segment.next_lane_seq).collect::<Vec<_>>())
+        .bind(segments.iter().map(|segment| segment.first_run_at).collect::<Vec<_>>())
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         Ok(segments.len())
     }
@@ -4486,6 +4492,9 @@ impl QueueStorage {
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
+        }
+        if rows.len() < COPY_MIN_ROWS {
+            return self.execute_ready_inserts_tx(tx, ring, rows).await;
         }
 
         let schema = self.schema();
@@ -4838,33 +4847,49 @@ impl QueueStorage {
             }
         }
 
+        self.execute_deferred_inserts_tx(tx, &rows).await
+    }
+
+    async fn execute_deferred_inserts_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DeferredJobRow],
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
         let schema = self.schema();
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) "
-        ));
-        builder.push_values(rows.iter(), |mut b, row| {
-            b.push_bind(row.job_id)
-                .push_bind(&row.kind)
-                .push_bind(&row.queue)
-                .push_bind(&row.args)
-                .push_bind(row.state)
-                .push_bind(row.priority)
-                .push_bind(row.attempt)
-                .push_bind(row.run_lease)
-                .push_bind(row.max_attempts)
-                .push_bind(row.run_at)
-                .push_bind(row.attempted_at)
-                .push_bind(row.finalized_at)
-                .push_bind(row.created_at)
-                .push_bind(&row.unique_key)
-                .push_bind(&row.unique_states)
-                .push_bind(storage_payload(&row.payload));
-        });
-        builder
-            .build()
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        sqlx::query(audited_sql(format!(
+            r#"
+            INSERT INTO {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload)
+            SELECT job_id, kind, queue, args, state::awa.job_state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload
+            FROM unnest(
+                $1::bigint[], $2::text[], $3::text[], $4::jsonb[], $5::text[], $6::smallint[],
+                $7::smallint[], $8::bigint[], $9::smallint[], $10::timestamptz[], $11::timestamptz[],
+                $12::timestamptz[], $13::timestamptz[], $14::bytea[], $15::text[], $16::jsonb[]
+            ) AS rows (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload)
+            "#
+        )))
+        .bind(rows.iter().map(|row| row.job_id).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.kind.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.queue.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| &row.args).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.state.as_str()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.priority).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.attempt).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.run_lease).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.max_attempts).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.run_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.attempted_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.finalized_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.created_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.unique_key.as_deref()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| row.unique_states.as_deref()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|row| storage_payload(&row.payload)).collect::<Vec<_>>())
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         Ok(rows.len())
     }
@@ -4879,6 +4904,9 @@ impl QueueStorage {
         }
 
         self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
+        if rows.len() < COPY_MIN_ROWS {
+            return self.execute_deferred_inserts_tx(tx, &rows).await;
+        }
 
         let schema = self.schema();
         // `copy_in_raw` is outside sqlx 0.9's `SqlSafeStr` guard, so this
