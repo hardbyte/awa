@@ -320,8 +320,16 @@ async fn migration_and_grace_survive_restarts_but_not_evidence_gaps() {
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
     let id = Uuid::new_v4();
-    let c = config("billing", 100);
+    let c = config("billing", 60_000);
     publish(&pool, id, &c, &[job("invoice")]).await;
+    // Advance protocol evidence directly rather than requiring database calls
+    // to fit inside a 100 ms grace window on a shared CI runner.
+    let agreed_since: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE awa.cron_owners SET agreed_since=clock_timestamp()-interval '2 minutes' WHERE owner_id='billing' RETURNING agreed_since",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     migrations::run(&pool).await.unwrap();
     sqlx::raw_sql(include_str!(
         "../../awa-model/migrations/v045_cron_reconciliation.sql"
@@ -329,7 +337,12 @@ async fn migration_and_grace_survive_restarts_but_not_evidence_gaps() {
     .execute(&pool)
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    let preserved: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT agreed_since FROM awa.cron_owners WHERE owner_id='billing'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(preserved, agreed_since);
     assert!(reconcile::plan(&pool, "billing")
         .await
         .unwrap()
@@ -340,14 +353,11 @@ async fn migration_and_grace_survive_restarts_but_not_evidence_gaps() {
         .execute(&pool)
         .await
         .unwrap();
-    publish(&pool, id, &c, &[]).await;
-    assert!(
-        reconcile::plan(&pool, "billing")
-            .await
-            .unwrap()
-            .grace_remaining_ms
-            > 0
-    );
+    // Keep the manifest unchanged: only the evidence gap may reset grace.
+    publish(&pool, id, &c, &[job("invoice")]).await;
+    let reset = reconcile::plan(&pool, "billing").await.unwrap();
+    assert!(reset.agreed_since.unwrap() > agreed_since);
+    assert!(reset.grace_remaining_ms > 0);
 }
 
 #[tokio::test]
