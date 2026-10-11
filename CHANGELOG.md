@@ -16,6 +16,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Changed
 
 - Syncing a periodic job declaration that matches the stored schedule no longer rewrites its `awa.cron_jobs` row or moves `updated_at`, so runtimes that sync on a timer stop generating a row version per schedule per interval.
+- **Claim transactions commit asynchronously (0.6 port of #507).** Claims and the claim-cursor advance that follows them run with `synchronous_commit = off`, so a lane's claim head is no longer locked across a WAL fsync. A claim lost to a server crash leaves the job claimable again, consistent with at-least-once delivery; enqueues, completions and every other transaction stay synchronous. The setting is `SET LOCAL` in those transactions only. A post-claim cursor advance now applies only while the claim it follows is visible on the server it runs against, so a retry that lands on a promoted standby cannot move the cursor past a claim that never reached it. No schema or configuration change.
 
 ### Fixed
 
