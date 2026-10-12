@@ -5,6 +5,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ## [Unreleased]
 
 ### Changed
+- The claim CTE runs in per-queue-slot functions (`claim_ready_slot_N`, v049)
+  that address the slot's ring children directly, so claim statements plan
+  against one child, keep a generic plan, and are only invalidated when that
+  child is truncated instead of on every ring rotation.
 
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run

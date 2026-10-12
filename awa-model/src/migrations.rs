@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 49;
+pub const CURRENT_VERSION: i32 = 51;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -278,6 +278,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Use provisioned lane sequences without runtime DDL",
         &[V23_UP, V49_UP],
     ),
+    (51, "Per-slot claim functions", &[V23_UP, V51_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -330,6 +331,7 @@ const V46_UP: &str = include_str!("../migrations/v046_wait_free_dirty_marks.sql"
 const V47_UP: &str = include_str!("../migrations/v047_replica_identity.sql");
 const V48_UP: &str = include_str!("../migrations/v048_claim_cursor_catch_up.sql");
 const V49_UP: &str = include_str!("../migrations/v049_prepared_lane_sequences.sql");
+const V51_UP: &str = include_str!("../migrations/v051_claim_slot_functions.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
