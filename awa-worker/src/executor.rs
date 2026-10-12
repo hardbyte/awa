@@ -730,6 +730,7 @@ async fn exhaust_queue_storage(
     runtime: &QueueStorageRuntime,
     pool: &PgPool,
     job: &JobRow,
+    queue_storage_claim: Option<&ClaimedEntry>,
     error_msg: String,
     enqueue_specs: &EnqueueSpecsByOutcome,
     progress_snapshot: Option<serde_json::Value>,
@@ -757,6 +758,7 @@ async fn exhaust_queue_storage(
             runtime,
             pool,
             job,
+            queue_storage_claim,
             "max_attempts_exhausted",
             &error_msg,
             progress_snapshot.clone(),
@@ -794,13 +796,14 @@ async fn exhaust_queue_storage(
     let updated_job = if dlq_enabled {
         let moved = runtime
             .store
-            .fail_to_dlq(
+            .fail_to_dlq_with_claim(
                 pool,
                 job.id,
                 job.run_lease,
                 "max_attempts_exhausted",
                 &error_msg,
                 progress_snapshot.clone(),
+                queue_storage_claim,
             )
             .await?;
         if moved.is_some() {
@@ -810,12 +813,13 @@ async fn exhaust_queue_storage(
     } else {
         runtime
             .store
-            .fail_terminal(
+            .fail_terminal_with_claim(
                 pool,
                 job.id,
                 job.run_lease,
                 &error_msg,
                 progress_snapshot.clone(),
+                queue_storage_claim,
             )
             .await?
     };
@@ -1736,6 +1740,7 @@ async fn complete_job_queue_storage(
                     runtime,
                     pool,
                     job,
+                    queue_storage_claim,
                     error_msg,
                     enqueue_specs,
                     progress_snapshot.clone(),
@@ -1763,6 +1768,7 @@ async fn complete_job_queue_storage(
                     runtime,
                     pool,
                     job,
+                    queue_storage_claim,
                     *retry_duration,
                     progress_snapshot.clone(),
                     &specs,
@@ -1797,12 +1803,13 @@ async fn complete_job_queue_storage(
 
             let Some(updated_job) = runtime
                 .store
-                .retry_after(
+                .retry_after_with_claim(
                     pool,
                     job.id,
                     job.run_lease,
                     *retry_duration,
                     progress_snapshot.clone(),
+                    queue_storage_claim,
                 )
                 .await?
             else {
@@ -1839,12 +1846,13 @@ async fn complete_job_queue_storage(
             );
             let updated = runtime
                 .store
-                .snooze(
+                .snooze_with_claim(
                     pool,
                     job.id,
                     job.run_lease,
                     *snooze_duration,
                     progress_snapshot.clone(),
+                    queue_storage_claim,
                 )
                 .await?;
             if updated.is_none() {
@@ -1998,38 +2006,37 @@ async fn complete_job_queue_storage(
                             job_id = job.id,
                             "WaitForCallback returned without calling register_callback"
                         );
-                        let failed = if dlq_enabled {
-                            let failed = runtime
+                        let failed =
+                            if dlq_enabled {
+                                let failed = runtime
                                 .store
-                                .fail_to_dlq(
+                                .fail_to_dlq_with_claim(
                                     pool,
                                     job.id,
                                     job.run_lease,
                                     "wait_for_callback_contract_violation",
                                     "WaitForCallback returned without calling register_callback",
-                                    progress_snapshot.clone(),
-                                )
+                                    progress_snapshot.clone(), queue_storage_claim)
                                 .await?;
-                            if failed.is_some() {
-                                metrics.record_dlq_moved(
-                                    &job.kind,
-                                    &job.queue,
-                                    "wait_for_callback_contract_violation",
-                                );
-                            }
-                            failed
-                        } else {
-                            runtime
+                                if failed.is_some() {
+                                    metrics.record_dlq_moved(
+                                        &job.kind,
+                                        &job.queue,
+                                        "wait_for_callback_contract_violation",
+                                    );
+                                }
+                                failed
+                            } else {
+                                runtime
                                 .store
-                                .fail_terminal(
+                                .fail_terminal_with_claim(
                                     pool,
                                     job.id,
                                     job.run_lease,
                                     "WaitForCallback returned without calling register_callback",
-                                    progress_snapshot.clone(),
-                                )
+                                    progress_snapshot.clone(), queue_storage_claim)
                                 .await?
-                        };
+                            };
                         if failed.is_none() {
                             return Ok(CompletionOutcome::IgnoredStale);
                         }
@@ -2086,6 +2093,7 @@ async fn complete_job_queue_storage(
                     runtime,
                     pool,
                     job,
+                    queue_storage_claim,
                     "terminal_error",
                     msg,
                     progress_snapshot.clone(),
@@ -2123,13 +2131,14 @@ async fn complete_job_queue_storage(
             let updated_job = if dlq_enabled {
                 let moved = runtime
                     .store
-                    .fail_to_dlq(
+                    .fail_to_dlq_with_claim(
                         pool,
                         job.id,
                         job.run_lease,
                         "terminal_error",
                         msg,
                         progress_snapshot.clone(),
+                        queue_storage_claim,
                     )
                     .await?;
                 if moved.is_some() {
@@ -2139,7 +2148,14 @@ async fn complete_job_queue_storage(
             } else {
                 runtime
                     .store
-                    .fail_terminal(pool, job.id, job.run_lease, msg, progress_snapshot.clone())
+                    .fail_terminal_with_claim(
+                        pool,
+                        job.id,
+                        job.run_lease,
+                        msg,
+                        progress_snapshot.clone(),
+                        queue_storage_claim,
+                    )
                     .await?
             };
             let Some(updated_job) = updated_job else {
@@ -2173,6 +2189,7 @@ async fn complete_job_queue_storage(
                     runtime,
                     pool,
                     job,
+                    queue_storage_claim,
                     error_msg,
                     enqueue_specs,
                     progress_snapshot.clone(),
@@ -2200,6 +2217,7 @@ async fn complete_job_queue_storage(
                         runtime,
                         pool,
                         job,
+                        queue_storage_claim,
                         &error_msg,
                         progress_snapshot.clone(),
                         &specs,
@@ -2234,12 +2252,13 @@ async fn complete_job_queue_storage(
 
                 let Some(updated_job) = runtime
                     .store
-                    .fail_retryable(
+                    .fail_retryable_with_claim(
                         pool,
                         job.id,
                         job.run_lease,
                         &error_msg,
                         progress_snapshot.clone(),
+                        queue_storage_claim,
                     )
                     .await?
                 else {
@@ -2377,6 +2396,7 @@ async fn retry_after_queue_storage_with_followups(
     runtime: &QueueStorageRuntime,
     pool: &PgPool,
     job: &JobRow,
+    queue_storage_claim: Option<&ClaimedEntry>,
     retry_duration: Duration,
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
@@ -2384,12 +2404,13 @@ async fn retry_after_queue_storage_with_followups(
     let mut tx = pool.begin().await?;
     let Some(updated_job) = runtime
         .store
-        .retry_after_in_tx(
+        .retry_after_in_tx_with_claim(
             &mut tx,
             job.id,
             job.run_lease,
             retry_duration,
             progress_snapshot,
+            queue_storage_claim,
         )
         .await?
     else {
@@ -2414,6 +2435,7 @@ async fn retry_backoff_queue_storage_with_followups(
     runtime: &QueueStorageRuntime,
     pool: &PgPool,
     job: &JobRow,
+    queue_storage_claim: Option<&ClaimedEntry>,
     error_msg: &str,
     progress_snapshot: Option<serde_json::Value>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
@@ -2421,7 +2443,14 @@ async fn retry_backoff_queue_storage_with_followups(
     let mut tx = pool.begin().await?;
     let Some(updated_job) = runtime
         .store
-        .fail_retryable_in_tx(&mut tx, job.id, job.run_lease, error_msg, progress_snapshot)
+        .fail_retryable_in_tx_with_claim(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            error_msg,
+            progress_snapshot,
+            queue_storage_claim,
+        )
         .await?
     else {
         tx.rollback().await?;
@@ -2445,6 +2474,7 @@ async fn fail_queue_storage_with_followups(
     runtime: &QueueStorageRuntime,
     pool: &PgPool,
     job: &JobRow,
+    queue_storage_claim: Option<&ClaimedEntry>,
     dlq_reason: &str,
     error_msg: &str,
     progress_snapshot: Option<serde_json::Value>,
@@ -2460,13 +2490,14 @@ async fn fail_queue_storage_with_followups(
     let (updated_job, routed_to_dlq) = if dlq_enabled {
         let moved = runtime
             .store
-            .fail_to_dlq_in_tx(
+            .fail_to_dlq_in_tx_with_claim(
                 &mut tx,
                 job.id,
                 job.run_lease,
                 dlq_reason,
                 error_msg,
                 progress_snapshot,
+                queue_storage_claim,
             )
             .await?;
         let routed = moved.is_some();
@@ -2474,7 +2505,14 @@ async fn fail_queue_storage_with_followups(
     } else {
         let moved = runtime
             .store
-            .fail_terminal_in_tx(&mut tx, job.id, job.run_lease, error_msg, progress_snapshot)
+            .fail_terminal_in_tx_with_claim(
+                &mut tx,
+                job.id,
+                job.run_lease,
+                error_msg,
+                progress_snapshot,
+                queue_storage_claim,
+            )
             .await?;
         (moved, false)
     };

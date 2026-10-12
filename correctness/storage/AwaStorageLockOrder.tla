@@ -322,7 +322,7 @@ CompletePlan(claimSlot, readySlot) ==
 \* close_receipt_tx (called from cancel_job_tx)
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first
 \*   WITH locked_claim AS (SELECT ... FROM lease_claims /
-\*     lease_claim_batches FOR UPDATE)
+\*     lease_claim_batches by immutable batch/index identity; no batch row lock)
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
 CloseReceiptPlan(claimSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
