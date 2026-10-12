@@ -18570,6 +18570,22 @@ async fn binary_first_claim_shape_and_cursor_interoperation(receipts: bool) {
             .unwrap();
     old.replace_range(start..end, "");
     old = old.replace("selected.payload,\n                (v_lane_claim_seq + v_claim_limit >= v_lane_next_seq) AS lane_drained", "selected.payload");
+    // v051 moved the claim CTE into per-slot functions; the old shape then
+    // projects every result column but lane_drained out of the slot call.
+    let result_start = current.find("RETURNS TABLE(").unwrap() + "RETURNS TABLE(".len();
+    let result_end = result_start + current[result_start..].find(")\n").unwrap();
+    let old_columns: Vec<&str> = current[result_start..result_end]
+        .split(',')
+        .map(|column| column.split_whitespace().next().unwrap())
+        .filter(|column| *column != "lane_drained")
+        .collect();
+    old = old.replace(
+        "'SELECT * FROM %I.claim_ready_slot_%s(",
+        &format!(
+            "'SELECT {} FROM %I.claim_ready_slot_%s(",
+            old_columns.join(", ")
+        ),
+    );
     assert!(!old.contains("AS lane_drained"));
     sqlx::query(audited_sql(format!(
         "DROP FUNCTION {schema}.claim_ready_runtime(text,bigint,double precision,double precision)"

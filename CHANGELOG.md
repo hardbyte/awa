@@ -76,6 +76,11 @@ for each step.
 
 ### Changed
 
+- The claim CTE runs in per-queue-slot functions (`claim_ready_slot_N`, v051)
+  that address the slot's ring children directly, so claim statements plan
+  against one child, keep a generic plan, and are only invalidated when that
+  child is truncated instead of on every ring rotation.
+
 - **Claims commit asynchronously.** Claims and claim-cursor advances run with
   `synchronous_commit = off`, so a lane's claim head is no longer held across
   a WAL flush. At 400 jobs/s on a disk with ~7 ms fsync, claim p99 fell from
