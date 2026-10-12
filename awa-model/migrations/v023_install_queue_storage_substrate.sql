@@ -4007,6 +4007,139 @@ BEGIN
                 RETURN;
             END IF;
 
+            -- The slot functions carry the claim CTE; the mode marker below
+            -- keeps the substrate reinstall loops' receipts detection working.
+            %2$s
+            RETURN QUERY EXECUTE format(
+                'SELECT * FROM %%I.claim_ready_slot_%%s($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
+                %1$L,
+                v_target_slot
+            )
+            USING
+                p_queue,
+                v_target_slot,
+                v_target_generation,
+                v_lane_priority,
+                v_lane_shard,
+                v_lane_claim_seq,
+                v_claim_limit,
+                p_aging_secs,
+                v_claimed_at,
+                v_deadline_at,
+                p_deadline_secs,
+                v_lane_next_seq;
+
+            GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
+
+            -- If a target ready row existed but the claim CTE produced no
+            -- rows, the spent-attempt pre-pass may still have moved the
+            -- sequence cursor over committed spent attempts. It deliberately
+            -- does not advance over unspent rows: newly emitted claims still
+            -- move the sequence only after the surrounding transaction
+            -- commits, because sequence movement is non-transactional and
+            -- cannot be recovered by rollback.
+            IF v_claimed_count = 0 THEN
+                RETURN;
+            END IF;
+        END;
+        $func$
+        $create_runtime$,
+        p_schema,
+        CASE
+            WHEN p_lease_claim_receipts THEN format('-- receipts mode: claim_ready_slot_N runs INSERT INTO %I.lease_claim_batches', p_schema)
+            ELSE format('-- legacy mode: claim_ready_slot_N runs INSERT INTO %I.leases', p_schema)
+        END,
+        p_lease_claim_receipts
+    );
+
+    EXECUTE format(
+        'COMMENT ON FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION) IS %L',
+        p_schema,
+        'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
+    );
+
+    --------------------------------------------------------------------
+    -- Replica identity for the append-only delta tables, which have no
+    -- primary key. PostgreSQL refuses UPDATE and DELETE on a published
+    -- table without a replica identity, so a `FOR ALL TABLES` or
+    -- `FOR TABLES IN SCHEMA` publication would break the rollup fold and
+    -- prune. FULL costs nothing on INSERT or TRUNCATE, which is all the
+    -- hot path does to these tables. Partitions never inherit the
+    -- parent's setting, so each child is set here as well; the parent is
+    -- set for `publish_via_partition_root` publications.
+    --------------------------------------------------------------------
+
+    FOR v_identity_rel IN
+        SELECT c.oid::regclass
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = p_schema
+          AND c.relkind IN ('r', 'p')
+          AND c.relreplident <> 'f'
+          AND c.relname ~ '^queue_terminal_(count_deltas(_[0-9]+)?|rollup_deltas)$'
+        ORDER BY c.relname
+    LOOP
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', v_identity_rel);
+    END LOOP;
+
+
+    --------------------------------------------------------------------
+    -- Per-queue-slot claim bodies. Each addresses its own ring children
+    -- directly, so the statement plans against one child (no Append over
+    -- the partitioned parents), goes generic after a few executions, and
+    -- is invalidated only when that child is truncated.
+    --------------------------------------------------------------------
+
+    FOR v_slot IN 0..(p_queue_slot_count - 1) LOOP
+        EXECUTE format(
+            $create_slot$
+            CREATE OR REPLACE FUNCTION %1$I.claim_ready_slot_%4$s(
+                p_queue TEXT,
+                p_target_slot INT,
+                p_target_generation BIGINT,
+                p_lane_priority SMALLINT,
+                p_lane_shard SMALLINT,
+                p_lane_claim_seq BIGINT,
+                p_claim_limit BIGINT,
+                p_aging_secs DOUBLE PRECISION,
+                p_claimed_at TIMESTAMPTZ,
+                p_deadline_at TIMESTAMPTZ,
+                p_deadline_secs DOUBLE PRECISION,
+                p_lane_next_seq BIGINT
+            )
+        RETURNS TABLE(
+            ready_slot INT,
+            ready_generation BIGINT,
+            lane_seq BIGINT,
+            enqueue_shard SMALLINT,
+            lease_slot INT,
+            lease_generation BIGINT,
+            claim_slot INT,
+            receipt_id BIGINT,
+            claim_batch_id BIGINT,
+            claim_batch_index INT,
+            job_id BIGINT,
+            kind TEXT,
+            queue TEXT,
+            args JSONB,
+            lane_priority SMALLINT,
+            priority SMALLINT,
+            attempt SMALLINT,
+            run_lease BIGINT,
+            max_attempts SMALLINT,
+            run_at TIMESTAMPTZ,
+            heartbeat_at TIMESTAMPTZ,
+            deadline_at TIMESTAMPTZ,
+            attempted_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ,
+            unique_key BYTEA,
+            unique_states TEXT,
+            payload JSONB,
+            lane_drained BOOLEAN)
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, awa, public
+        AS $func$
+        BEGIN
             RETURN QUERY
             WITH lease_ring AS MATERIALIZED (
                 -- #371: current lease cursor via the authority resolver
@@ -4048,23 +4181,23 @@ BEGIN
                     ready.unique_states,
                     COALESCE(ready.payload, '{}'::jsonb) AS payload,
                     EXISTS (
-                        SELECT 1 FROM %1$I.ready_tombstones AS tomb
-                        WHERE tomb.ready_slot = v_target_slot
-                          AND tomb.ready_generation = v_target_generation
+                        SELECT 1 FROM %1$I.ready_tombstones_%4$s AS tomb
+                        WHERE tomb.ready_slot = p_target_slot
+                          AND tomb.ready_generation = p_target_generation
                           AND tomb.queue = ready.queue
                           AND tomb.priority = ready.priority
                           AND tomb.enqueue_shard = ready.enqueue_shard
                           AND tomb.lane_seq = ready.lane_seq
                     ) AS is_tombstone
-                FROM %1$I.ready_entries AS ready
+                FROM %1$I.ready_entries_%4$s AS ready
                 WHERE ready.queue = p_queue
-                  AND ready.priority = v_lane_priority
-                  AND ready.enqueue_shard = v_lane_shard
-                  AND ready.ready_slot = v_target_slot
-                  AND ready.ready_generation = v_target_generation
-                  AND ready.lane_seq >= v_lane_claim_seq
+                  AND ready.priority = p_lane_priority
+                  AND ready.enqueue_shard = p_lane_shard
+                  AND ready.ready_slot = p_target_slot
+                  AND ready.ready_generation = p_target_generation
+                  AND ready.lane_seq >= p_lane_claim_seq
                 ORDER BY ready.lane_seq ASC
-                LIMIT v_claim_limit
+                LIMIT p_claim_limit
             ),
             selected_with_spent AS (
                 SELECT
@@ -4077,7 +4210,7 @@ BEGIN
                 claimed.ready_slot,
                 claimed.ready_generation,
                 claimed.lane_seq,
-                v_lane_shard AS enqueue_shard,
+                p_lane_shard AS enqueue_shard,
                 lease_ring.lease_slot,
                 lease_ring.lease_generation,
                 claimed.claim_slot,
@@ -4095,19 +4228,19 @@ BEGIN
                 claimed.max_attempts,
                 selected.run_at,
                 CASE
-                    WHEN p_deadline_secs > 0 THEN v_claimed_at
+                    WHEN p_deadline_secs > 0 THEN p_claimed_at
                     ELSE NULL::timestamptz
                 END AS heartbeat_at,
-                v_deadline_at AS deadline_at,
+                p_deadline_at AS deadline_at,
                 CASE
-                    WHEN p_deadline_secs > 0 THEN v_claimed_at
+                    WHEN p_deadline_secs > 0 THEN p_claimed_at
                     ELSE NULL::timestamptz
                 END AS attempted_at,
                 selected.created_at,
                 selected.unique_key,
                 selected.unique_states,
                 selected.payload,
-                (v_lane_claim_seq + v_claim_limit >= v_lane_next_seq) AS lane_drained
+                (p_lane_claim_seq + p_claim_limit >= p_lane_next_seq) AS lane_drained
             FROM claimed
             CROSS JOIN lease_ring
             JOIN selected
@@ -4118,52 +4251,30 @@ BEGIN
              AND selected.lane_seq = claimed.lane_seq
             ORDER BY selected.lane_seq ASC;
 
-            GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
-
-            -- If a target ready row existed but the claim CTE produced no
-            -- rows, the spent-attempt pre-pass may still have moved the
-            -- sequence cursor over committed spent attempts. It deliberately
-            -- does not advance over unspent rows: newly emitted claims still
-            -- move the sequence only after the surrounding transaction
-            -- commits, because sequence movement is non-transactional and
-            -- cannot be recovered by rollback.
-            IF v_claimed_count = 0 THEN
-                RETURN;
-            END IF;
         END;
         $func$
-        $create_runtime$,
-        p_schema, v_claimed_cte, p_lease_claim_receipts
-    );
-
-    EXECUTE format(
-        'COMMENT ON FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION) IS %L',
-        p_schema,
-        'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
-    );
-
-    --------------------------------------------------------------------
-    -- Replica identity for the append-only delta tables, which have no
-    -- primary key. PostgreSQL refuses UPDATE and DELETE on a published
-    -- table without a replica identity, so a `FOR ALL TABLES` or
-    -- `FOR TABLES IN SCHEMA` publication would break the rollup fold and
-    -- prune. FULL costs nothing on INSERT or TRUNCATE, which is all the
-    -- hot path does to these tables. Partitions never inherit the
-    -- parent's setting, so each child is set here as well; the parent is
-    -- set for `publish_via_partition_root` publications.
-    --------------------------------------------------------------------
-
-    FOR v_identity_rel IN
-        SELECT c.oid::regclass
-        FROM pg_class AS c
-        JOIN pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE n.nspname = p_schema
-          AND c.relkind IN ('r', 'p')
-          AND c.relreplident <> 'f'
-          AND c.relname ~ '^queue_terminal_(count_deltas(_[0-9]+)?|rollup_deltas)$'
-        ORDER BY c.relname
-    LOOP
-        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', v_identity_rel);
+            $create_slot$,
+            p_schema,
+            replace(
+                replace(
+                    replace(
+                        replace(
+                            v_claimed_cte,
+                            format('%I.ready_claim_attempt_batches', p_schema),
+                            format('%I.ready_claim_attempt_batches_%s', p_schema, v_slot)
+                        ),
+                        'v_lane_shard',
+                        'p_lane_shard'
+                    ),
+                    'v_claimed_at',
+                    'p_claimed_at'
+                ),
+                'v_deadline_at',
+                'p_deadline_at'
+            ),
+            p_lease_claim_receipts,
+            v_slot
+        );
     END LOOP;
 
     --------------------------------------------------------------------

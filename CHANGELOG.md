@@ -5,6 +5,10 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ## [Unreleased]
 
 ### Changed
+- The claim CTE runs in per-queue-slot functions (`claim_ready_slot_N`, v049)
+  that address the slot's ring children directly, so claim statements plan
+  against one child, keep a generic plan, and are only invalidated when that
+  child is truncated instead of on every ring rotation.
 
 - v048 catches claim cursors up from committed same-lane, same-generation attempt evidence. Current binaries retain guarded post-commit advances against pre-v048 schemas and use the old result shape until migration. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 
