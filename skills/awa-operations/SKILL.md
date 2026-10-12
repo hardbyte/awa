@@ -269,6 +269,11 @@ lock. Size for steady-state completion rate, not burst.
 - **Role model.** `awa_owner` owns the schema (NOLOGIN); `awa_migrator` runs
   `awa migrate`; `awa_runtime` (least privilege, cannot alter schema) runs
   workers, producers, `awa serve`, and CLI admin.
+- **v047+ migration bundles.** Use `awa migrate` or its generated `--sql`
+  bundle rather than an isolated migration tail. Installer replay replaces
+  triggers on ring state and queue heads and takes table locks through commit;
+  schedule a quiet window, bound `lock_timeout`, and retry the whole transaction
+  after a timeout. DDL credentials need ownership of all installed substrates.
 - **CDC / logical replication.** Keep the awa schema (and any custom
   queue-storage schema) out of publications: list application tables, or with
   Debezium use `publication.autocreate.mode=filtered` plus

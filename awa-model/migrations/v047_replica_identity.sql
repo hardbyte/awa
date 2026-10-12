@@ -21,12 +21,21 @@
 --
 -- N-1 (0.7.x) binaries are unaffected: replica identity only changes what
 -- the WAL records for UPDATE/DELETE and no query, trigger, or function body
--- depends on it. Every ALTER TABLE ... REPLICA IDENTITY is a catalog-only
--- change that takes a momentary ACCESS EXCLUSIVE lock on its table and is
--- guarded so a re-run takes no lock at all. Expected wall time: milliseconds
--- on any data volume; the lock on the mark tables queues job transitions
--- until the migration transaction commits, so apply v047 on its own rather
--- than at the end of a long pending range if that window matters.
+-- depends on it. The guarded identity ALTERs take ACCESS EXCLUSIVE locks;
+-- the full version bundle also replays V23_UP, reinstalls the canonical
+-- substrate and drops/recreates triggers on ring state and queue heads.
+-- These locks can wait behind live transactions and are held until the
+-- entire pending migration transaction commits. There is no fixed wall-time
+-- guarantee. Use a bounded lock_timeout and an operational quiet window;
+-- after a timeout, retry the complete generated bundle transaction.
+-- External runners must use `awa migrate --sql --from 46 --to 47`, which
+-- includes the current installer before this tail, and preserve the generated
+-- cron preflight before replay; SQL export does not run Rust preflights.
+-- Raw v047 alone omits installer refresh/replay.
+-- The DDL role must own (or inherit ownership of) all installed substrates.
+-- Tracking: https://github.com/hardbyte/awa/pull/509
+-- Review: https://github.com/hardbyte/awa/pull/509#discussion_r4236544554
+-- Released-artifact rehearsal tracking: https://github.com/hardbyte/awa/issues/427
 
 DO $$
 BEGIN
@@ -65,6 +74,8 @@ BEGIN
               SELECT 1 FROM pg_proc AS p
               WHERE p.pronamespace = n.oid
                 AND p.proname = 'claim_ready_runtime'
+                AND oidvectortypes(p.proargtypes)
+                    = 'text, bigint, double precision, double precision'
           )
           AND c.relkind IN ('r', 'p')
           AND c.relreplident <> 'f'

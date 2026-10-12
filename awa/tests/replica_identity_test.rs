@@ -465,3 +465,65 @@ async fn queue_storage_paths_work_with_an_all_tables_publication() {
     exercise_cron_and_admin_paths(pool).await;
     assert_every_table_accepts_update_and_delete(pool, &["awa", CUSTOM_SCHEMA]).await;
 }
+
+#[tokio::test]
+async fn v047_skips_unrelated_schema_without_table_ownership() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool();
+    install_custom_schema(pool).await;
+    sqlx::raw_sql("CREATE SCHEMA unrelated_ri; CREATE TABLE unrelated_ri.queue_terminal_rollup_deltas(n bigint); CREATE FUNCTION unrelated_ri.claim_ready_runtime() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; GRANT USAGE ON SCHEMA awa, unrelated_ri, awa_ri_custom TO pg_monitor; GRANT INSERT, SELECT ON awa.schema_version TO pg_monitor")
+        .execute(pool).await.unwrap();
+    // USAGE is not ownership. The wrong-signature sentinel must not cause an
+    // ALTER of this unrelated table by a role that cannot own/alter it.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE pg_monitor")
+        .execute(tx.as_mut())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../awa-model/migrations/v047_replica_identity.sql"
+    ))
+    .execute(tx.as_mut())
+    .await
+    .expect("unrelated schema must be skipped");
+    tx.commit().await.unwrap();
+    let identity: String = sqlx::query_scalar("SELECT relreplident::text FROM pg_class WHERE oid='unrelated_ri.queue_terminal_rollup_deltas'::regclass")
+        .fetch_one(pool).await.unwrap();
+    assert_eq!(identity, "d");
+    // The full awa signature still identifies an installed custom substrate.
+    sqlx::query("ALTER TABLE awa_ri_custom.queue_terminal_rollup_deltas REPLICA IDENTITY DEFAULT")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../awa-model/migrations/v047_replica_identity.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    let identity: String = sqlx::query_scalar("SELECT relreplident::text FROM pg_class WHERE oid='awa_ri_custom.queue_terminal_rollup_deltas'::regclass")
+        .fetch_one(pool).await.unwrap();
+    assert_eq!(identity, "f");
+}
+
+#[tokio::test]
+async fn v047_generated_bundle_replaces_triggers_and_holds_table_locks() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool();
+    let mut tx = pool.begin().await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT oid::bigint FROM pg_trigger WHERE tgrelid='awa.queue_claim_heads'::regclass AND tgname='queue_claim_heads_sequence_sync'")
+        .fetch_one(tx.as_mut()).await.unwrap();
+    let bundle = awa::model::migrations::migration_sql_range(46, 47);
+    assert_eq!(bundle.len(), 1);
+    sqlx::raw_sql(audited_sql(bundle[0].2.clone()))
+        .execute(tx.as_mut())
+        .await
+        .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT oid::bigint FROM pg_trigger WHERE tgrelid='awa.queue_claim_heads'::regclass AND tgname='queue_claim_heads_sequence_sync'")
+        .fetch_one(tx.as_mut()).await.unwrap();
+    assert_ne!(before, after, "replay drops/recreates the trigger");
+    let locked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation='awa.queue_claim_heads'::regclass AND mode='AccessExclusiveLock' AND granted)")
+        .fetch_one(tx.as_mut()).await.unwrap();
+    assert!(locked, "installer DDL locks remain until transaction end");
+    tx.rollback().await.unwrap();
+}
