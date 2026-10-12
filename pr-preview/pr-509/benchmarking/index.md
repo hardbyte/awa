@@ -504,3 +504,7 @@ PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_tes
 Cross-system comparison (awa vs pgque / procrastinate / pg-boss / river / oban / pgmq) lives in [hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking). That repo is the source of truth for fair-comparison numbers, chaos results across systems, and the long-horizon harness itself.
 
 The reasoning for the split: cross-system benches need to evolve at the pace of the systems being compared (each gets new releases, new public APIs, new adapter caveats), and the awa-only regression track in this file needs to evolve at awa's pace. Keeping them in one repo coupled their schedules and conflated "did awa regress?" with "is awa still faster than X?". They're separate questions; they're now in separate places.
+
+### Small-batch COPY entry points
+
+COPY entry points use array-backed INSERT below 2,048 rows in each ready or deferred write group. To measure the CSV COPY implementation, use at least 2,048 rows per group; mixed-state batches may split below the cutoff. Small-batch results measure the INSERT fallback. This workaround reduces round trips but does not fix SQLx 0.9.0 TCP_NODELAY; issue [#505](https://github.com/hardbyte/awa/issues/505) still requires the upstream fix in a released dependency and a fresh performance gate before 0.7 ships.
