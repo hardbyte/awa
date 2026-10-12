@@ -37,6 +37,43 @@ const RECEIPT_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
+// Physical bytes above empty-index overhead on PostgreSQL 17/18. Installed
+// btree/GiST main forks retain one page; BRIN retains three main
+// and three FSM pages when empty. Unknown
+// access methods conservatively count any allocation as reclaimable. Include
+// heap/TOAST/index forks: VACUUM can leave an empty heap with expanded indexes.
+// Accept one child or a partitioned parent (the lease-ring idle probe).
+const RECLAIMABLE_CHILD_STORAGE_SQL: &str = r#"
+WITH heaps AS (
+    SELECT oid, reltoastrelid FROM pg_class
+    WHERE oid = $1::regclass AND relkind = 'r'
+    UNION ALL
+    SELECT c.oid, c.reltoastrelid FROM pg_inherits i
+    JOIN pg_class c ON c.oid = i.inhrelid
+    WHERE i.inhparent = $1::regclass AND c.relkind = 'r'
+), heap_relations AS (
+    SELECT oid FROM heaps
+    UNION ALL
+    SELECT reltoastrelid FROM heaps WHERE reltoastrelid <> 0
+), storage_relations AS (
+    SELECT oid, NULL::name AS amname FROM heap_relations
+    UNION ALL
+    SELECT i.indexrelid, am.amname FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_am am ON am.oid = c.relam
+    WHERE i.indrelid IN (SELECT oid FROM heap_relations)
+)
+SELECT EXISTS (
+    SELECT 1 FROM storage_relations
+    WHERE pg_relation_size(oid, 'fsm') > current_setting('block_size')::bigint *
+          CASE amname WHEN 'brin' THEN 3 ELSE 0 END
+       OR pg_relation_size(oid, 'vm') > 0
+       OR pg_relation_size(oid) > current_setting('block_size')::bigint *
+          CASE amname WHEN 'btree' THEN 1 WHEN 'gist' THEN 1
+                      WHEN 'brin' THEN 3 ELSE 0 END
+)
+"#;
+
 /// Minimum age of another backend's active snapshot before the horizon-gated
 /// folds (ledger trim, terminal-delta fold, delta rollup) treat it as pinning
 /// the MVCC horizon and stand down (#371, ADR-040).
@@ -10211,10 +10248,10 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
-    /// Skip children whose heap has never been written (or already reclaimed).
-    /// Callers hold ACCESS EXCLUSIVE, so both logical and physical probes are
-    /// stable. A DELETE-emptied lease child still owns dead heap pages and must
-    /// be truncated to preserve partition reclamation without row vacuum.
+    /// Skip children with only bounded empty-index metadata. Callers already
+    /// hold ACCESS EXCLUSIVE and have proved closure. DELETE/VACUUM can leave
+    /// expanded indexes or TOAST storage even after the main heap reaches zero;
+    /// these children must truncate to preserve physical reclamation.
     async fn truncate_used_children_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -10222,12 +10259,11 @@ impl QueueStorage {
     ) -> Result<usize, sqlx::Error> {
         let mut targets: Vec<&str> = Vec::with_capacity(children.len());
         for child in children {
-            let has_heap_pages: bool =
-                sqlx::query_scalar("SELECT pg_relation_size($1::regclass) > 0")
-                    .bind(child)
-                    .fetch_one(tx.as_mut())
-                    .await?;
-            if has_heap_pages {
+            let has_reclaimable_storage: bool = sqlx::query_scalar(RECLAIMABLE_CHILD_STORAGE_SQL)
+                .bind(child)
+                .fetch_one(tx.as_mut())
+                .await?;
+            if has_reclaimable_storage {
                 targets.push(child);
             }
         }
@@ -15297,17 +15333,15 @@ impl QueueStorage {
         // analysis and why the whole-ring scope is load-bearing (prune
         // never advances slot generations; freezing rotation with sealed
         // rows behind would strand them until traffic resumed).
-        // Completed materialized leases are DELETEd. An empty visible set
-        // can still own heap pages that must be sealed and pruned.
-        let has_heap_pages: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_inherits
-             WHERE inhparent = $1::regclass AND pg_relation_size(inhrelid) > 0)",
-        )
-        .bind(format!("{schema}.leases"))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-        if !has_heap_pages {
+        // Completion and VACUUM can empty heaps while retaining indexes/TOAST.
+        // Seal these children so prune can reclaim physical storage, while
+        // genuinely idle rings with only empty-index overhead remain frozen.
+        let has_reclaimable_storage: bool = sqlx::query_scalar(RECLAIMABLE_CHILD_STORAGE_SQL)
+            .bind(format!("{schema}.leases"))
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        if !has_reclaimable_storage {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedIdle {
                 slot: state.0,
