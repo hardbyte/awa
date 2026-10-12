@@ -15702,3 +15702,109 @@ async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
     assert_eq!(physical().await, reclaimed, "idle repeat does no DDL");
     pool.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_vacuumed_materialized_lease_reclaims_indexes_and_toast_once() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_vacuumed_lease_prune";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    // A nullable fixture column exercises TOAST independently of indexed
+    // queue-name limits. Real claim/completion/rotation/prune paths still run.
+    sqlx::raw_sql(audited_sql(format!("ALTER TABLE {schema}.leases ADD COLUMN reclamation_fixture text; ALTER TABLE {schema}.leases ALTER COLUMN reclamation_fixture SET STORAGE EXTERNAL")))
+        .execute(&pool).await.unwrap();
+    let physical = || async {
+        sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(audited_sql(format!(
+            "SELECT pg_relation_filenode('{schema}.leases_0'::regclass)::bigint,
+             pg_relation_size('{schema}.leases_0'::regclass),
+             pg_indexes_size('{schema}.leases_0'::regclass),
+             pg_total_relation_size('{schema}.leases_0'::regclass),
+             (SELECT pg_total_relation_size(reltoastrelid) FROM pg_class WHERE oid='{schema}.leases_0'::regclass)"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let unused = physical().await;
+    assert_eq!(unused.1, 0);
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::SkippedIdle { .. }
+    ));
+    store
+        .enqueue_batch(&pool, "vacuum_reclaim", 1, 512)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "vacuum_reclaim", 512, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 512);
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.leases SET reclamation_fixture=repeat(md5(job_id::text),256)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        512
+    );
+    sqlx::query(audited_sql(format!(
+        "VACUUM (TRUNCATE TRUE) {schema}.leases_0"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let vacuumed = physical().await;
+    assert_eq!(vacuumed.1, 0, "VACUUM returns all main heap pages");
+    assert!(
+        vacuumed.2 > unused.2,
+        "vacuum retains expanded index storage"
+    );
+    assert!(
+        vacuumed.3 > unused.3,
+        "physical storage remains above empty overhead"
+    );
+    assert!(
+        vacuumed.4 > unused.4,
+        "TOAST storage remains above its empty baseline"
+    );
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+    assert!(matches!(
+        store.prune_oldest_leases(&pool).await.unwrap(),
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
+    let reclaimed = physical().await;
+    assert_ne!(reclaimed.0, vacuumed.0);
+    assert_eq!(
+        (reclaimed.1, reclaimed.2, reclaimed.3, reclaimed.4),
+        (unused.1, unused.2, unused.3, unused.4)
+    );
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::SkippedIdle { .. }
+    ));
+    store.prune_oldest_leases(&pool).await.unwrap();
+    assert_eq!(
+        physical().await,
+        reclaimed,
+        "empty overhead does not cause repeated DDL"
+    );
+    pool.close().await;
+}
