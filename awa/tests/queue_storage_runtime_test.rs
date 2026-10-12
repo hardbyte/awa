@@ -15630,6 +15630,91 @@ async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_reclaims_lease_child_vacuumed_to_an_empty_heap() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_vacuumed_lease_prune";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let physical = |child: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, i64, i64)>(audited_sql(format!(
+                "SELECT pg_relation_filenode('{schema}.{child}'::regclass)::bigint,
+                        pg_relation_size('{schema}.{child}'::regclass),
+                        pg_total_relation_size('{schema}.{child}'::regclass)"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let pristine_total = physical("leases_1").await.2;
+
+    store
+        .enqueue_batch(&pool, "lease_vacuum_reclaim", 1, 64)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "lease_vacuum_reclaim", 64, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 64);
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        64
+    );
+    sqlx::query(audited_sql(format!("VACUUM {schema}.leases_0")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let vacuumed = physical("leases_0").await;
+    assert_eq!(
+        vacuumed.1, 0,
+        "VACUUM truncates the emptied heap to zero pages"
+    );
+    assert!(
+        vacuumed.2 > pristine_total,
+        "indexes keep their pages after VACUUM: {} vs pristine {}",
+        vacuumed.2,
+        pristine_total
+    );
+
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+    assert!(matches!(
+        store.prune_oldest_leases(&pool).await.unwrap(),
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
+    let reclaimed = physical("leases_0").await;
+    assert_ne!(
+        reclaimed.0, vacuumed.0,
+        "prune must still swap the relfilenode"
+    );
+    assert_eq!(reclaimed.2, pristine_total, "index pages are returned");
+    store.prune_oldest_leases(&pool).await.unwrap();
+    assert_eq!(
+        physical("leases_0").await,
+        reclaimed,
+        "idle repeat does no DDL"
+    );
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
     let (_db_guard, pool) = setup_pool(8).await;
     let schema = "awa_qs_deleted_lease_prune";

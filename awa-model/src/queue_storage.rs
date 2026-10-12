@@ -10211,10 +10211,49 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
-    /// Skip children whose heap has never been written (or already reclaimed).
-    /// Callers hold ACCESS EXCLUSIVE, so both logical and physical probes are
-    /// stable. A DELETE-emptied lease child still owns dead heap pages and must
-    /// be truncated to preserve partition reclamation without row vacuum.
+    /// True when the relation, its TOAST table, or any of their indexes holds
+    /// more pages than a freshly created one. VACUUM can truncate an emptied
+    /// heap back to zero pages while its indexes keep every page they ever
+    /// allocated, so the heap alone is not evidence that nothing is left to
+    /// reclaim. Index baselines are the empty sizes of the access methods the
+    /// ring uses; any other access method counts as holding storage.
+    async fn relation_holds_storage_tx<'a>(
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        relation: &str,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM pg_class AS rel
+                 LEFT JOIN pg_am AS am ON am.oid = rel.relam
+                 WHERE rel.oid IN (
+                     SELECT $1::regclass
+                     UNION ALL
+                     SELECT heap.reltoastrelid FROM pg_class AS heap
+                     WHERE heap.oid = $1::regclass AND heap.reltoastrelid <> 0
+                     UNION ALL
+                     SELECT idx.indexrelid FROM pg_index AS idx
+                     WHERE idx.indrelid = $1::regclass
+                     UNION ALL
+                     SELECT toast_idx.indexrelid FROM pg_class AS heap
+                     JOIN pg_index AS toast_idx ON toast_idx.indrelid = heap.reltoastrelid
+                     WHERE heap.oid = $1::regclass
+                 )
+                 AND pg_relation_size(rel.oid) > CASE
+                     WHEN rel.relkind <> 'i' THEN 0
+                     WHEN am.amname IN ('btree', 'gist') THEN 8192
+                     WHEN am.amname = 'brin' THEN 24576
+                     ELSE 0
+                 END
+             )",
+        )
+        .bind(relation)
+        .fetch_one(tx.as_mut())
+        .await
+    }
+
+    /// Skip children that hold no storage beyond a freshly created child.
+    /// Callers hold ACCESS EXCLUSIVE, so the probe is stable.
     async fn truncate_used_children_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -10222,12 +10261,7 @@ impl QueueStorage {
     ) -> Result<usize, sqlx::Error> {
         let mut targets: Vec<&str> = Vec::with_capacity(children.len());
         for child in children {
-            let has_heap_pages: bool =
-                sqlx::query_scalar("SELECT pg_relation_size($1::regclass) > 0")
-                    .bind(child)
-                    .fetch_one(tx.as_mut())
-                    .await?;
-            if has_heap_pages {
+            if Self::relation_holds_storage_tx(tx, child).await? {
                 targets.push(child);
             }
         }
@@ -15298,16 +15332,26 @@ impl QueueStorage {
         // never advances slot generations; freezing rotation with sealed
         // rows behind would strand them until traffic resumed).
         // Completed materialized leases are DELETEd. An empty visible set
-        // can still own heap pages that must be sealed and pruned.
-        let has_heap_pages: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_inherits
-             WHERE inhparent = $1::regclass AND pg_relation_size(inhrelid) > 0)",
+        // can still own heap or index pages that must be sealed and pruned.
+        let lease_children: Vec<String> = sqlx::query_scalar(
+            "SELECT inhrelid::regclass::text FROM pg_inherits
+             WHERE inhparent = $1::regclass ORDER BY inhrelid",
         )
         .bind(format!("{schema}.leases"))
-        .fetch_one(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        if !has_heap_pages {
+        let mut holds_storage = false;
+        for child in &lease_children {
+            if Self::relation_holds_storage_tx(&mut tx, child)
+                .await
+                .map_err(map_sqlx_error)?
+            {
+                holds_storage = true;
+                break;
+            }
+        }
+        if !holds_storage {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedIdle {
                 slot: state.0,

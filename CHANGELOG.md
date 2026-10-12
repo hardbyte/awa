@@ -6,6 +6,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- Ring prune and lease rotation treat a child as reclaimable when its indexes or TOAST relations hold pages beyond their empty size, not only when the heap does. A child emptied by DELETE and then VACUUM keeps its index pages until truncated; it is now pruned instead of read as unused.
+
 - Ring prune skips physically unused child heaps while still reclaiming DELETE-emptied materialized lease partitions. Child locks and lifecycle prune proofs remain unchanged.
 
 - Compact receipt failure, exhaustion, DLQ, retry and snooze paths carry immutable batch identity and validate the exact receipt under the per-attempt advisory lock. Independent jobs in one batch no longer require a shared batch-row lock.
