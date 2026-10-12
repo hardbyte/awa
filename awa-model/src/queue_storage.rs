@@ -1968,6 +1968,9 @@ struct ReadyJobLeaseRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+    /// Whether the claim examined the lane's last reserved position, so no
+    /// further claim on this lane is expected to catch the cursor up.
+    lane_drained: bool,
 }
 
 impl ReadyJobLeaseRow {
@@ -2703,6 +2706,10 @@ pub struct QueueStorage {
     /// This instance's claimer lease per queue, as last read or written, so a
     /// claim does not re-read the lease and claimer target on every call.
     claimer_gates: Mutex<HashMap<(String, Uuid), CachedClaimerGate>>,
+    /// Whether the installed claim function catches the lane cursor up from
+    /// committed evidence itself (schema v048+), making the post-commit
+    /// cursor advance redundant. Read once per store.
+    claim_cursor_folded: tokio::sync::OnceCell<bool>,
     /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
     /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
     /// queue_claim_heads) we have previously inserted. Skips the three
@@ -2755,6 +2762,7 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             claimer_gates: Mutex::new(HashMap::new()),
+            claim_cursor_folded: tokio::sync::OnceCell::new(),
             ensured_lanes: Mutex::new(HashSet::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
@@ -4211,6 +4219,24 @@ impl QueueStorage {
         deadline_duration: Duration,
         aging_interval: Duration,
     ) -> Result<Vec<ReadyJobLeaseRow>, AwaError> {
+        let folded = *self
+            .claim_cursor_folded
+            .get_or_try_init(|| async {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM awa.schema_version WHERE version >= 48)",
+                )
+                .fetch_one(tx.as_mut())
+                .await
+            })
+            .await
+            .map_err(map_sqlx_error)?;
+        // N-1 result shapes have no lane_drained column. They require the
+        // post-commit advance, so conservatively treat every batch as drained.
+        let drained_projection = if folded {
+            "lane_drained"
+        } else {
+            "TRUE AS lane_drained"
+        };
         let schema = self.schema();
         sqlx::query_as(audited_sql(format!(
             r#"
@@ -4241,7 +4267,8 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                COALESCE(payload, '{{}}'::jsonb) AS payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload,
+                {drained_projection}
             FROM {schema}.claim_ready_runtime($1, $2, $3, $4)
             "#
         )))
@@ -4368,6 +4395,39 @@ impl QueueStorage {
             }],
         )
         .await
+    }
+
+    async fn claim_cursor_folded(&self, pool: &PgPool) -> bool {
+        *self
+            .claim_cursor_folded
+            .get_or_init(|| async {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM awa.schema_version WHERE version >= 48)",
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap_or(false)
+            })
+            .await
+    }
+
+    /// Post-claim cursor advance. With a v048+ schema in receipts mode the
+    /// next claim on the lane catches the cursor up from the committed
+    /// attempt-batch evidence itself, so the advance is only sent when the
+    /// lane looks drained and no such claim is expected; the cursor
+    /// otherwise lags for at most one poll. Legacy materialised-lease claims
+    /// write no attempt batches, so they always advance.
+    async fn advance_claim_cursors_after_claim(
+        &self,
+        pool: &PgPool,
+        claimed: &[ReadyJobLeaseRow],
+        advances: &[ClaimCursorAdvance],
+    ) {
+        let lane_drained = claimed.iter().any(|row| row.lane_drained);
+        if !lane_drained && self.lease_claim_receipts() && self.claim_cursor_folded(pool).await {
+            return;
+        }
+        self.advance_claim_cursors(pool, advances).await;
     }
 
     async fn advance_claim_cursors(&self, pool: &PgPool, advances: &[ClaimCursorAdvance]) {
@@ -6023,14 +6083,17 @@ impl QueueStorage {
             );
         }
         let claim_cursor_advances = Self::claim_cursor_advances(&claimed_rows);
+        let lane_drained = claimed_rows.iter().any(|row| row.lane_drained);
         let claimed = claimed_rows
             .into_iter()
             .map(|row| row.claim_ref(self.lease_claim_receipts()))
             .collect();
 
         tx.commit().await.map_err(map_sqlx_error)?;
-        self.advance_claim_cursors(pool, &claim_cursor_advances)
-            .await;
+        if lane_drained || !self.lease_claim_receipts() || !self.claim_cursor_folded(pool).await {
+            self.advance_claim_cursors(pool, &claim_cursor_advances)
+                .await;
+        }
         Ok(claimed)
     }
 
@@ -6160,7 +6223,7 @@ impl QueueStorage {
                 .collect::<Result<Vec<_>, _>>()?;
             let claim_cursor_advances = Self::claim_cursor_advances(&claimed);
             tx.commit().await.map_err(map_sqlx_error)?;
-            self.advance_claim_cursors(pool, &claim_cursor_advances)
+            self.advance_claim_cursors_after_claim(pool, &claimed, &claim_cursor_advances)
                 .await;
             return Ok(converted);
         }
@@ -6170,7 +6233,7 @@ impl QueueStorage {
         // Release claim locks before doing Rust-side payload conversion; this
         // keeps the hot claim transaction focused on database state changes.
         tx.commit().await.map_err(map_sqlx_error)?;
-        self.advance_claim_cursors(pool, &claim_cursor_advances)
+        self.advance_claim_cursors_after_claim(pool, &claimed, &claim_cursor_advances)
             .await;
 
         claimed

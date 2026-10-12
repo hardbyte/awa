@@ -4434,3 +4434,42 @@ async fn test_exclusive_window_skipped_for_noncrossing_range() {
 
     pool.close().await;
 }
+
+#[tokio::test]
+async fn v048_generated_bundle_refreshes_a_stale_installer() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool();
+    // A stale-installer sentinel makes the missing dependency observable. It
+    // is not a released-binary rehearsal; existing runtime tests cover shapes.
+    sqlx::raw_sql("CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(p_schema text, p_queue_slot_count int DEFAULT 16, p_lease_slot_count int DEFAULT 8, p_claim_slot_count int DEFAULT 8, p_lease_claim_receipts boolean DEFAULT TRUE) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'stale_installer_fixture'; END $$; DELETE FROM awa.schema_version WHERE version=48")
+        .execute(pool).await.unwrap();
+    let mut raw = pool.begin().await.unwrap();
+    let error = sqlx::raw_sql(include_str!(
+        "../../awa-model/migrations/v048_claim_cursor_catch_up.sql"
+    ))
+    .execute(raw.as_mut())
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("stale_installer_fixture"));
+    raw.rollback().await.unwrap();
+
+    let bundle = migrations::migration_sql_range(47, 48);
+    assert_eq!(bundle.len(), 1);
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::raw_sql(audited_sql(bundle[0].2.clone()))
+        .execute(tx.as_mut())
+        .await
+        .unwrap();
+    let current_shape: bool = sqlx::query_scalar("SELECT 'lane_drained'=ANY(proargnames) FROM pg_proc WHERE oid='awa.claim_ready_runtime(text,bigint,double precision,double precision)'::regprocedure")
+        .fetch_one(tx.as_mut()).await.unwrap();
+    assert!(current_shape);
+    let locked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation='awa.queue_claim_heads'::regclass AND mode='AccessExclusiveLock' AND granted)")
+        .fetch_one(tx.as_mut()).await.unwrap();
+    assert!(locked, "installer replay holds DDL locks until commit");
+    tx.commit().await.unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 48);
+}

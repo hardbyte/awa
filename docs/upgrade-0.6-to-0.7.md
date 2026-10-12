@@ -286,3 +286,19 @@ time. Foreign ownership still fails startup and requires explicit transfer.
 During mixed-manifest rollouts, existing definitions retain their last agreed
 value; new names can be inserted immediately. Definition updates wait for fresh
 capable fleet agreement, while removals additionally wait through grace.
+
+### v048 claim cursor compatibility
+
+Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds `lane_drained` and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.
+
+For v048 use `awa migrate` or the complete generated
+`awa migrate --sql --from 47 --to 48` bundle. It includes V23_UP to replace the
+installer definition and replay the canonical substrate before the v048 tail
+reinstalls custom substrates. Raw `v048_claim_cursor_catch_up.sql` alone calls
+whatever installer is already stored in the database; it does not supply the
+new function definition. The generated bundle path supplies that dependency.
+The same table-lock, ownership, external preflight and timeout/retry requirements
+[documented for v047](#v047-replica-identity-for-every-table) apply. Trigger replay
+is DDL and can block claim/enqueue/rotation activity until commit; there is no
+fixed completion-time guarantee. See [tracking PR #513](https://github.com/hardbyte/awa/pull/513)
+and [released-artifact rehearsal tracking #427](https://github.com/hardbyte/awa/issues/427).
