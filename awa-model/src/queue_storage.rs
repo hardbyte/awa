@@ -10211,6 +10211,38 @@ impl QueueStorage {
         Ok(updated as usize)
     }
 
+    /// Skip children whose heap has never been written (or already reclaimed).
+    /// Callers hold ACCESS EXCLUSIVE, so both logical and physical probes are
+    /// stable. A DELETE-emptied lease child still owns dead heap pages and must
+    /// be truncated to preserve partition reclamation without row vacuum.
+    async fn truncate_used_children_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        children: &[&str],
+    ) -> Result<usize, sqlx::Error> {
+        let mut targets: Vec<&str> = Vec::with_capacity(children.len());
+        for child in children {
+            let has_heap_pages: bool =
+                sqlx::query_scalar("SELECT pg_relation_size($1::regclass) > 0")
+                    .bind(child)
+                    .fetch_one(tx.as_mut())
+                    .await?;
+            if has_heap_pages {
+                targets.push(child);
+            }
+        }
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query(audited_sql(format!(
+            "TRUNCATE TABLE {}",
+            targets.join(", ")
+        )))
+        .execute(tx.as_mut())
+        .await?;
+        Ok(targets.len())
+    }
+
     /// `write_receipt_closures` is false when the caller has already closed
     /// the receipt for every row in `deleted` in this transaction.
     async fn hydrate_deleted_leases_tx<'a>(
@@ -15265,8 +15297,17 @@ impl QueueStorage {
         // analysis and why the whole-ring scope is load-bearing (prune
         // never advances slot generations; freezing rotation with sealed
         // rows behind would strand them until traffic resumed).
-        let ring_parents = [format!("{schema}.leases")];
-        if Self::relations_all_empty_tx(&mut tx, &ring_parents).await? {
+        // Completed materialized leases are DELETEd. An empty visible set
+        // can still own heap pages that must be sealed and pruned.
+        let has_heap_pages: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_inherits
+             WHERE inhparent = $1::regclass AND pg_relation_size(inhrelid) > 0)",
+        )
+        .bind(format!("{schema}.leases"))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if !has_heap_pages {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedIdle {
                 slot: state.0,
@@ -16362,11 +16403,21 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         let truncate_started = Instant::now();
-        let truncate = sqlx::query(audited_sql(format!(
-            "TRUNCATE TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child}"
-        )))
-        .execute(tx.as_mut())
-        .await;
+        let truncate = self
+            .truncate_used_children_tx(
+                &mut tx,
+                &[
+                    &ready_child,
+                    &claim_attempt_child,
+                    &done_child,
+                    &tomb_child,
+                    &segment_child,
+                    &receipt_batch_child,
+                    &receipt_tomb_child,
+                    &delta_child,
+                ],
+            )
+            .await;
         let truncate_duration = truncate_started.elapsed();
 
         match truncate {
@@ -16552,8 +16603,8 @@ impl QueueStorage {
         }
 
         let truncate_started = Instant::now();
-        let truncate = sqlx::query(audited_sql(format!("TRUNCATE TABLE {lease_child}")))
-            .execute(tx.as_mut())
+        let truncate = self
+            .truncate_used_children_tx(&mut tx, &[&lease_child])
             .await;
         let truncate_duration = truncate_started.elapsed();
 
@@ -16904,11 +16955,17 @@ impl QueueStorage {
         }
 
         let truncate_started = Instant::now();
-        let truncate = sqlx::query(audited_sql(format!(
-            "TRUNCATE TABLE {claim_child}, {claim_batch_child}, {closure_child}, {closure_batch_child}"
-        )))
-        .execute(tx.as_mut())
-        .await;
+        let truncate = self
+            .truncate_used_children_tx(
+                &mut tx,
+                &[
+                    &claim_child,
+                    &claim_batch_child,
+                    &closure_child,
+                    &closure_batch_child,
+                ],
+            )
+            .await;
         let truncate_duration = truncate_started.elapsed();
 
         match truncate {

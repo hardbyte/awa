@@ -2249,16 +2249,16 @@ async fn test_successful_prunes_report_database_phase_timings() {
         assert!(durations.commit > Duration::ZERO, "{ring} commit timing");
     }
     let after_first = filenodes().await;
-    assert_ne!(
+    assert_eq!(
         after_first, before,
-        "the first destructive prunes must replace child relfilenodes"
+        "pruning empty slots must not swap child relfilenodes"
     );
 }
 
 /// The maintenance leader should call destructive prune once for an idle
 /// cursor, then suppress repeat DDL while the cursor generation is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_maintenance_idle_prune_replaces_child_filenode_once() {
+async fn test_maintenance_idle_prune_leaves_empty_child_filenode_alone() {
     let (_db_guard, pool) = setup_pool(10).await;
     let schema = "awa_qs_idle_prune_once";
     let queue = "idle_prune_once";
@@ -2308,26 +2308,42 @@ async fn test_maintenance_idle_prune_replaces_child_filenode_once() {
         .register_worker(CompleteWorker)
         .build()
         .expect("build idle-prune client");
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT slot FROM {schema}.queue_ring_slots WHERE slot = 0 FOR UPDATE"
+    )))
+    .execute(blocker.as_mut())
+    .await
+    .unwrap();
     client.start().await.expect("start idle-prune client");
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    let after_first = loop {
-        let current = child_filenode().await;
-        if current != before {
-            break current;
+    loop {
+        let maintenance_is_pruning: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+             WHERE datname = current_database() AND pid <> pg_backend_pid()
+               AND query LIKE $1 AND wait_event_type = 'Lock')",
+        )
+        .bind(format!("%FROM {schema}.queue_ring_slots%"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if maintenance_is_pruning {
+            break;
         }
         assert!(
             Instant::now() < deadline,
-            "maintenance did not issue the first queue prune"
+            "maintenance must reach prune, not merely observe a seeded ledger"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    }
+    blocker.commit().await.unwrap();
+    // Let the observed prune finish and idle suppression run more than once.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
         child_filenode().await,
-        after_first,
-        "idle maintenance ticks must not repeat TRUNCATE at the same cursor generation"
+        before,
+        "idle maintenance must not TRUNCATE an empty ring child: the swap would only churn the catalogs"
     );
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -15610,5 +15626,79 @@ async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() 
         "stale completion cannot create another disposition"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_deleted_lease_prune";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let physical = || async {
+        sqlx::query_as::<_, (i64, i64)>(audited_sql(format!(
+            "SELECT pg_relation_filenode('{schema}.leases_0'::regclass)::bigint,
+                    pg_relation_size('{schema}.leases_0'::regclass)"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let unused = physical().await;
+    assert_eq!(unused.1, 0, "fresh heap has no pages");
+    store
+        .enqueue_batch(&pool, "lease_reclaim", 1, 1)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "lease_reclaim", 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let live: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.leases_0"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "claim creates a materialized lease");
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let live: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.leases_0"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 0);
+    let deleted = physical().await;
+    assert!(deleted.1 > 0, "DELETE leaves physical pages to reclaim");
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+    assert!(matches!(
+        store.prune_oldest_leases(&pool).await.unwrap(),
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
+    let reclaimed = physical().await;
+    assert_ne!(reclaimed.0, deleted.0);
+    assert_eq!(reclaimed.1, 0);
+    store.prune_oldest_leases(&pool).await.unwrap();
+    assert_eq!(physical().await, reclaimed, "idle repeat does no DDL");
     pool.close().await;
 }

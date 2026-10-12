@@ -810,15 +810,8 @@ async fn test_queue_storage_round_trip_smoke() {
         .expect("Failed to prune smoke queue slot");
     assert!(matches!(pruned_queue, PruneOutcome::Pruned { slot: 0, .. }));
 
-    // With every lease completed the lease ring is idle and rotation
-    // deliberately skips (#371). Hold one live lease across the rotate so
-    // the rotate/prune mechanics are exercised, then complete it.
-    let idle_leases = store
-        .rotate_leases(&pool)
-        .await
-        .expect("Failed to probe idle smoke lease slot");
-    assert!(matches!(idle_leases, RotateOutcome::SkippedIdle { .. }));
-
+    // Completed leases leave physical pages until pruning. Keep a live lease
+    // across rotation to verify that reclamation still waits for its closure.
     store
         .enqueue_batch(&pool, "smoke", 2, 1)
         .await

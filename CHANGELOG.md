@@ -6,6 +6,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- Ring prune skips physically unused child heaps while still reclaiming DELETE-emptied materialized lease partitions. Child locks and lifecycle prune proofs remain unchanged.
+
 - Compact receipt failure, exhaustion, DLQ, retry and snooze paths carry immutable batch identity and validate the exact receipt under the per-attempt advisory lock. Independent jobs in one batch no longer require a shared batch-row lock.
 
 - **One LISTEN connection per runtime, idle polling backoff and bounded claims.** Queue dispatchers share a listener and a runtime-wide claim semaphore. Empty queues back off from `poll_interval` to a 2 s cap when notifications are available; poll-only runtimes retain `poll_interval`. Saturated claim waits observe shutdown, and late-starting tasks receive cancellation. Dispatcher exit and worker drain share the timeout. The idle cap stays internal to preserve `QueueConfig` struct literals.
