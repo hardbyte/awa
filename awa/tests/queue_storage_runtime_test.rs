@@ -14489,3 +14489,182 @@ async fn test_queue_storage_receipt_deadline_rescue_after_a_heartbeat_recheck() 
     rescued_ids.sort_unstable();
     assert_eq!(rescued_ids, job_ids);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shared_listener_disconnect_still_drains_both_queues() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let config = QueueStorageConfig {
+        schema: "awa_qs_lost_notify".into(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, config.clone()).await;
+    let client = Client::builder(pool.clone())
+        .queue(
+            "lost_notify_a",
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .queue(
+            "lost_notify_b",
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .queue_storage(config, Duration::from_secs(60), Duration::from_secs(60))
+        .claim_rotate_interval(Duration::from_secs(60))
+        .max_concurrent_claims(1)
+        .register_worker(CompleteWorker)
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    let listener_pids: Vec<i32> = sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity WHERE datname = current_database()
+         AND query LIKE 'LISTEN %lost_notify%'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(listener_pids.len(), 1, "queues share a listener");
+    // Notifications emitted while the listener reconnects are lossy. Polling
+    // must drain every queue independently of a delivered wake-up.
+    for pid in listener_pids {
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+                .bind(pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        );
+    }
+    let mut ids = Vec::new();
+    for queue in ["lost_notify_a", "lost_notify_b"] {
+        ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: 1 },
+                InsertOpts {
+                    queue: queue.into(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for id in ids {
+        wait_for_job_state(
+            &store,
+            &pool,
+            id,
+            &[JobState::Completed],
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_many_queues_share_one_listener_and_notify_wakes_the_right_queue() {
+    const QUEUE_COUNT: usize = 50;
+    let (_db_guard, pool) = setup_pool(12).await;
+    let config = QueueStorageConfig {
+        schema: "awa_qs_many_queues".into(),
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, config.clone()).await;
+    let queues: Vec<String> = (0..QUEUE_COUNT)
+        .map(|index| format!("many_queues_{index:02}"))
+        .collect();
+    let mut builder = Client::builder(pool.clone());
+    for queue in &queues {
+        // A poll interval far beyond the test timeout means only a NOTIFY
+        // can wake a queue in time.
+        builder = builder.queue(
+            queue.clone(),
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+    }
+    let client = builder
+        .queue_storage(config, Duration::from_secs(60), Duration::from_secs(60))
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(CompleteWorker)
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+
+    let listener_backends: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND query LIKE 'LISTEN %many_queues_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        listener_backends, 1,
+        "{QUEUE_COUNT} queues must share one LISTEN connection"
+    );
+
+    let target_queue = &queues[QUEUE_COUNT / 2];
+    let other_queue = &queues[QUEUE_COUNT - 1];
+    let target_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: target_queue.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    wait_for_job_state(
+        &store,
+        &pool,
+        target_id,
+        &[JobState::Completed],
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let other_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: other_queue.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    wait_for_job_state(
+        &store,
+        &pool,
+        other_id,
+        &[JobState::Completed],
+        Duration::from_secs(5),
+    )
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    pool.close().await;
+}
