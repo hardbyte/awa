@@ -5,6 +5,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use awa_model::ClaimHeartbeatRef;
+
 const IN_FLIGHT_SHARDS: usize = 64;
 
 pub(crate) type RunLease = i64;
@@ -17,6 +19,10 @@ type InFlightShard = RwLock<HashMap<InFlightKey, InFlightState>>;
 pub(crate) struct InFlightState {
     pub cancel: CancelFlag,
     pub progress: Arc<std::sync::Mutex<ProgressState>>,
+    /// Compact receipt claim identity, when the attempt was dispatched from
+    /// queue storage with one; lets the heartbeat address the claim batch
+    /// directly.
+    pub claim: Option<ClaimHeartbeatRef>,
 }
 
 /// Mutable progress buffer shared between handler and heartbeat service.
@@ -157,13 +163,14 @@ impl InFlightRegistry {
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
-    pub fn keys(&self) -> Vec<InFlightKey> {
-        let mut keys = Vec::new();
+    /// Every in-flight attempt with its compact claim identity, if any.
+    pub fn claim_refs(&self) -> Vec<(InFlightKey, Option<ClaimHeartbeatRef>)> {
+        let mut refs = Vec::new();
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
-            keys.extend(guard.keys().copied());
+            refs.extend(guard.iter().map(|(key, state)| (*key, state.claim)));
         }
-        keys
+        refs
     }
 
     pub fn flags(&self) -> Vec<CancelFlag> {
@@ -270,6 +277,7 @@ mod tests {
             InFlightState {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: progress.clone(),
+                claim: None,
             },
         );
 

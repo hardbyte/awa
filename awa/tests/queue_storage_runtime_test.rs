@@ -8551,6 +8551,81 @@ async fn test_queue_storage_receipt_claim_hint_closes_compact_claim_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_heartbeat_by_claim_identity_touches_only_open_claims() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_heartbeat_claim_identity";
+    let schema = "awa_qs_runtime_heartbeat_claim_identity";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    for id in 0..2 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim two receipt-backed jobs");
+    assert_eq!(claimed.len(), 2);
+    let refs: Vec<awa_model::ClaimHeartbeatRef> = claimed
+        .iter()
+        .map(|entry| {
+            awa_model::ClaimHeartbeatRef::from_claim(
+                entry.job.id,
+                entry.job.run_lease,
+                &entry.claim,
+            )
+            .expect("compact claims carry a heartbeat identity")
+        })
+        .collect();
+
+    let updated = store
+        .heartbeat_claims_batch(&pool, &refs)
+        .await
+        .expect("heartbeat by claim identity");
+    assert_eq!(updated, 2, "both open claims are heartbeated");
+    assert_eq!(attempt_state_count(&pool, &store).await, 2);
+
+    let first = claimed[0].clone();
+    store
+        .fail_retryable_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "synthetic error",
+            None,
+            Some(&first.claim),
+        )
+        .await
+        .expect("fail one claim")
+        .expect("the claim is open");
+
+    let updated = store
+        .heartbeat_claims_batch(&pool, &refs)
+        .await
+        .expect("heartbeat after one closure");
+    assert_eq!(updated, 1, "a closed claim is not heartbeated");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heartbeat() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_attempt_rescue";

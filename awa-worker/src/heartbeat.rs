@@ -77,8 +77,9 @@ impl HeartbeatService {
         fields(interval_ms = self.interval.as_millis() as u64)
     )]
     async fn heartbeat_once(&self) {
-        let mut all_keys: Vec<(i64, RunLease)> = self.in_flight.keys();
-        all_keys.sort_unstable();
+        let mut in_flight = self.in_flight.claim_refs();
+        in_flight.sort_unstable_by_key(|(key, _)| *key);
+        let all_keys: Vec<(i64, RunLease)> = in_flight.iter().map(|(key, _)| *key).collect();
 
         if all_keys.is_empty() {
             return;
@@ -105,7 +106,14 @@ impl HeartbeatService {
                     .await;
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                self.heartbeat_once_queue_storage(runtime, &heartbeat_only, &pending_progress)
+                let (claimed, plain): (Vec<_>, Vec<_>) = in_flight
+                    .iter()
+                    .filter(|(key, _)| !progress_keys.contains(key))
+                    .partition(|(_, claim)| claim.is_some());
+                let claimed: Vec<awa_model::ClaimHeartbeatRef> =
+                    claimed.into_iter().filter_map(|(_, claim)| claim).collect();
+                let plain: Vec<(i64, RunLease)> = plain.into_iter().map(|(key, _)| key).collect();
+                self.heartbeat_once_queue_storage(runtime, &claimed, &plain, &pending_progress)
                     .await;
             }
         }
@@ -223,9 +231,26 @@ impl HeartbeatService {
     async fn heartbeat_once_queue_storage(
         &self,
         runtime: &QueueStorageRuntime,
+        claimed: &[awa_model::ClaimHeartbeatRef],
         heartbeat_only: &[(i64, RunLease)],
         pending_progress: &[(i64, i64, u64, serde_json::Value)],
     ) {
+        for chunk in claimed.chunks(self.batch_size) {
+            match runtime
+                .store
+                .heartbeat_claims_batch(&self.pool, chunk)
+                .await
+            {
+                Ok(updated) => {
+                    self.metrics.heartbeat_batches.add(1, &[]);
+                    debug!(count = chunk.len(), updated, "Heartbeat claim batch sent");
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed to send heartbeat claim batch");
+                }
+            }
+        }
+
         for chunk in heartbeat_only.chunks(self.batch_size) {
             match runtime.store.heartbeat_batch(&self.pool, chunk).await {
                 Ok(updated) => {
