@@ -8409,6 +8409,105 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claim_hint_closes_compact_claim_once() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_lease_claim_hint";
+    let schema = "awa_qs_runtime_lease_claim_hint";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 72 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("Failed to claim receipt-backed job")
+        .into_iter()
+        .next()
+        .expect("missing claimed job");
+    assert!(
+        claimed.claim.claim_batch_id.is_some() && claimed.claim.claim_batch_index.is_some(),
+        "compact claims carry their batch identity"
+    );
+
+    let retried = store
+        .fail_retryable_with_claim(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "synthetic error",
+            None,
+            Some(&claimed.claim),
+        )
+        .await
+        .expect("Failed to fail retryable receipt-backed job")
+        .expect("Expected the claim hint to close the compact claim");
+    assert_eq!(retried.state, JobState::Retryable);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+
+    let again = store
+        .fail_retryable_with_claim(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "synthetic error",
+            None,
+            Some(&claimed.claim),
+        )
+        .await
+        .expect("Second failure must not error");
+    assert!(
+        again.is_none(),
+        "a closed claim is stale for the hinted path"
+    );
+    let without_hint = store
+        .fail_retryable(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "synthetic error",
+            None,
+        )
+        .await
+        .expect("Unhinted failure must not error");
+    assert!(
+        without_hint.is_none(),
+        "a closed claim is stale for the generic path"
+    );
+    assert_eq!(lease_claim_closure_batch_count(&pool, &store).await, 1);
+    let deferred: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
+        store.schema()
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count deferred rows");
+    assert_eq!(deferred, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heartbeat() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_attempt_rescue";
@@ -15392,5 +15491,124 @@ async fn test_shared_listener_disconnect_still_drains_both_queues() {
     )
     .await
     .unwrap();
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() {
+    let (_db_guard, pool) = setup_pool(12).await;
+    let schema = "awa_qs_identity_races";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    store
+        .enqueue_batch(&pool, "identity_races", 1, 2)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "identity_races", 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(
+        claimed[0].claim.claim_batch_id,
+        claimed[1].claim.claim_batch_id
+    );
+    let first = &claimed[0];
+    let second = &claimed[1];
+    let mut invalid = first.claim.clone();
+    invalid.claim_batch_index = second.claim.claim_batch_index;
+    assert!(store
+        .fail_terminal_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "bad index",
+            None,
+            Some(&invalid)
+        )
+        .await
+        .unwrap()
+        .is_none());
+    invalid = first.claim.clone();
+    invalid.receipt_id = second.claim.receipt_id;
+    assert!(store
+        .fail_to_dlq_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "bad hint",
+            "bad receipt",
+            None,
+            Some(&invalid)
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 2);
+    // Another transaction can lock the immutable batch without blocking
+    // unrelated item closure. This fails if FOR UPDATE is reintroduced.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!("SELECT batch_id FROM {schema}.lease_claim_batches WHERE claim_slot=$1 AND batch_id=$2 FOR UPDATE")))
+        .bind(first.claim.claim_slot).bind(first.claim.claim_batch_id.unwrap()).execute(blocker.as_mut()).await.unwrap();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.fail_terminal_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "terminal",
+            None,
+            Some(&first.claim),
+        ),
+    )
+    .await
+    .expect("identity close must not wait on batch row")
+    .unwrap();
+    assert!(closed.is_some());
+    blocker.rollback().await.unwrap();
+    sqlx::query(audited_sql(format!("UPDATE {schema}.lease_claim_batches SET claimed_at = clock_timestamp() - interval '10 minutes'")))
+        .execute(&pool).await.unwrap();
+    let (completed, failed, rescued) = tokio::join!(
+        store.complete_runtime_batch(&pool, std::slice::from_ref(second)),
+        store.fail_to_dlq_with_claim(
+            &pool,
+            second.job.id,
+            second.job.run_lease,
+            "race",
+            "race",
+            None,
+            Some(&second.claim)
+        ),
+        store.rescue_stale_heartbeats(&pool, Duration::from_secs(1)),
+    );
+    let applied = completed.unwrap().len()
+        + usize::from(failed.unwrap().is_some())
+        + rescued
+            .unwrap()
+            .iter()
+            .filter(|j| j.id == second.job.id)
+            .count();
+    assert_eq!(applied, 1, "exactly one lifecycle transition wins");
+    for job in &claimed {
+        let count: i64 = sqlx::query_scalar(audited_sql(format!("SELECT count(*) FROM {schema}.lease_claim_closure_batches WHERE claim_slot=$1 AND receipt_ranges @> $2::bigint")))
+            .bind(job.claim.claim_slot).bind(job.claim.receipt_id.unwrap()).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "one durable closure per exact receipt");
+    }
+    assert!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .is_empty(),
+        "stale completion cannot create another disposition"
+    );
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     pool.close().await;
 }
