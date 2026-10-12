@@ -116,6 +116,8 @@ Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `c
 
 A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
 
+With LISTEN available, consecutive empty polls back off to a 2 s cap (or `poll_interval` when larger). Notifications reset the backoff; periodic polling still recovers lost notifications. Poll-only runtimes retain `poll_interval`. The cap is internal, preserving existing `QueueConfig` struct literals. Shutdown bounds dispatcher exit and worker drain by the same timeout; a claim interrupted at expiry is recovered through the normal lease-rescue path.
+
 ### Partitioned Queues
 
 A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
@@ -940,5 +942,3 @@ and structured logs, not unbounded metric labels.
 Authoritative clients prepare the canonical manifest once when built and share it
 across snapshot reports. Repeated publication sends the stored hash; unchanged
 manifest bodies are neither re-encoded under the protocol lock nor rewritten.
-
-With LISTEN available, consecutive empty polls back off to a 2 s cap (or `poll_interval` when larger). Notifications reset the backoff; periodic polling still recovers lost notifications. Poll-only runtimes retain `poll_interval`. The cap is internal, preserving existing `QueueConfig` struct literals. Shutdown bounds dispatcher exit and worker drain by the same timeout; a claim interrupted at expiry is recovered through the normal lease-rescue path.
