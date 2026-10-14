@@ -176,6 +176,48 @@ the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downg
 previous releases).
 
 
+## v047: replica identity for every table
+
+v047 gives the tables that had no primary key a replica identity, so awa keeps
+working when its schema is in a logical-replication publication (Debezium's
+default `FOR ALL TABLES`, or `FOR TABLES IN SCHEMA awa`). Without one PostgreSQL
+rejects every UPDATE and DELETE on a published table, which stopped the
+maintenance leader on each tick. `awa.job_unique_claims` identifies rows by its
+existing uniqueness index; `awa.admin_dirty_queue_marks`,
+`awa.admin_dirty_kind_marks`, `queue_terminal_rollup_deltas` and
+`queue_terminal_count_deltas` with its partitions use `REPLICA IDENTITY FULL`
+(ADR-045 forbids an index on the mark tables; the delta tables are append-only,
+so FULL costs nothing on their hot path).
+
+0.7.x runtimes retain the same query behavior after migration; replica identity
+changes WAL images for UPDATE and DELETE. Apply the migration with DDL credentials
+that own, or inherit ownership of, the canonical and installed custom substrates.
+Schema USAGE alone does not permit ALTER TABLE. Discovery uses the full
+`claim_ready_runtime(text,bigint,double precision,double precision)` signature
+and skips unrelated same-named functions.
+
+Use `awa migrate` or the generated version bundle. For an external runner,
+`awa migrate --sql --from 46 --to 47` emits V23_UP followed by the v047 tail,
+including installer refresh and canonical substrate replay. Raw v047 is only
+that tail. The default SQL export wraps a transaction and migration advisory lock,
+but does not run Rust runtime/cron preflights. External runners must perform the
+documented cron preflight below before installer replay:
+when `awa.cron_jobs` exists, acquire its ACCESS EXCLUSIVE lock before the first
+pending statement. Use `--no-transaction` when the external runner owns the
+transaction and migration lock. Apply the full bundle transactionally; see
+[migration policy](../adr/041-rolling-upgrade-policy/index.md).
+
+The identity ALTERs and installer trigger replacement acquire table locks,
+including ACCESS EXCLUSIVE locks on ring state and queue heads. Locks can wait
+behind live transactions and remain held until the entire pending range commits.
+Neither first application nor replay has a millisecond or lock-free guarantee.
+Use an operational quiet window and a bounded `lock_timeout`; on timeout roll
+back and retry the complete bundle. Applying earlier pending versions separately
+can shorten the final lock-holding transaction, but the v047 bundle still includes
+installer DDL. See [tracking PR #509](https://github.com/hardbyte/awa/pull/509),
+[released-artifact rehearsal tracking #427](https://github.com/hardbyte/awa/issues/427),
+and [Logical replication and CDC](../deploying-on-managed-postgres/index.md#logical-replication-and-cdc).
+
 ## v046: wait-free admin dirty-key marks
 
 v046 replaces the keyed `admin_dirty_queues` / `admin_dirty_kinds` tables the

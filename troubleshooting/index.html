@@ -1861,6 +1861,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#cannot-delete-from-table-because-it-does-not-have-a-replica-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        cannot delete from table ... because it does not have a replica identity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#register-at-least-one-worker-before-starting-the-runtime" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2863,6 +2874,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#cannot-delete-from-table-because-it-does-not-have-a-replica-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        cannot delete from table ... because it does not have a replica identity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#register-at-least-one-worker-before-starting-the-runtime" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3315,6 +3337,21 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
   <div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">active_queue_storage_schema</span><span class="p">();</span>
 </span></code></pre></div></li>
 </ul>
+<h3 id="cannot-delete-from-table-because-it-does-not-have-a-replica-identity"><code>cannot delete from table ... because it does not have a replica identity</code><a class="headerlink" href="#cannot-delete-from-table-because-it-does-not-have-a-replica-identity" title="Permanent link">&para;</a></h3>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>cannot delete from table "queue_terminal_rollup_deltas" because it does not
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>have a replica identity and publishes deletes
+</span></code></pre></div>
+<p>The awa schema is in a logical-replication publication (<code>CREATE PUBLICATION
+... FOR ALL TABLES</code>, which Debezium creates by default, or <code>FOR TABLES IN
+SCHEMA awa</code>) and the database is on a schema older than v047, where some
+tables had no primary key or replica identity. PostgreSQL then rejects every
+UPDATE and DELETE on those tables, so maintenance fails on each tick and
+dirty-mark drains, rollup folds and unique-claim releases stop.</p>
+<p>Fix: run <code>awa migrate</code> to v047 or later, which gives every awa table a replica
+identity. Independently, prefer keeping the awa schema out of the publication;
+see <a href="../deploying-on-managed-postgres/#logical-replication-and-cdc">Logical replication and
+CDC</a> for the
+recommended publication shape and what to expect if the queue is published.</p>
 <h3 id="register-at-least-one-worker-before-starting-the-runtime"><code>register at least one worker before starting the runtime</code><a class="headerlink" href="#register-at-least-one-worker-before-starting-the-runtime" title="Permanent link">&para;</a></h3>
 <p>Cause:</p>
 <ul>
@@ -3331,17 +3368,17 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <li>Python <code>client.start(global_max_workers=...)</code> was used without explicit queue config dicts</li>
 </ul>
 <p>Fix:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">start</span><span class="p">(</span>
-</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>    <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"email"</span><span class="p">,</span> <span class="s2">"min_workers"</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span> <span class="s2">"weight"</span><span class="p">:</span> <span class="mi">2</span><span class="p">}],</span>
-</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>    <span class="n">global_max_workers</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
-</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="k">await</span> <span class="n">client</span><span class="o">.</span><span class="n">start</span><span class="p">(</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>    <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"email"</span><span class="p">,</span> <span class="s2">"min_workers"</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span> <span class="s2">"weight"</span><span class="p">:</span> <span class="mi">2</span><span class="p">}],</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a>    <span class="n">global_max_workers</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="p">)</span>
 </span></code></pre></div>
 <h3 id="queue-or-job-kind-shows-stale-descriptor-in-the-ui">Queue or job-kind shows "stale descriptor" in the UI<a class="headerlink" href="#queue-or-job-kind-shows-stale-descriptor-in-the-ui" title="Permanent link">&para;</a></h3>
 <p>The descriptor catalog is refreshed by live workers on every runtime snapshot tick. A descriptor is flagged <strong>stale</strong> when no live runtime has touched <code>last_seen_at</code> within the snapshot window — typically because the code that declared it has been retired or no workers are currently running.</p>
 <ul>
 <li>If the queue/kind is genuinely retired, delete the row:
-  <div class="language-sql highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">queue_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">queue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired-queue'</span><span class="p">;</span>
-</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">job_kind_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">kind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired_kind'</span><span class="p">;</span>
+  <div class="language-sql highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">queue_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">queue</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired-queue'</span><span class="p">;</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa</span><span class="p">.</span><span class="n">job_kind_descriptors</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">kind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'retired_kind'</span><span class="p">;</span>
 </span></code></pre></div></li>
 <li>If workers <em>should</em> be running, check <code>/runtime</code> for missing instances.</li>
 <li>If the declaration moved to a different worker role that isn't deployed yet, the stale status will clear once that rollout completes.</li>

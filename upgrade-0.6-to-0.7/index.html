@@ -1554,6 +1554,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v047-replica-identity-for-every-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v047: replica identity for every table
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v046-wait-free-admin-dirty-key-marks" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2337,6 +2348,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v047-replica-identity-for-every-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v047: replica identity for every table
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v046-wait-free-admin-dirty-key-marks" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2528,6 +2550,43 @@ flip the stale compat columns are poisoned, so a pre-flip binary fails loudly an
 back across the flip is <strong>not</strong> supported — roll back only to another 0.7 build. Before
 the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downgrade path (unchanged from
 previous releases).</p>
+<h2 id="v047-replica-identity-for-every-table">v047: replica identity for every table<a class="headerlink" href="#v047-replica-identity-for-every-table" title="Permanent link">&para;</a></h2>
+<p>v047 gives the tables that had no primary key a replica identity, so awa keeps
+working when its schema is in a logical-replication publication (Debezium's
+default <code>FOR ALL TABLES</code>, or <code>FOR TABLES IN SCHEMA awa</code>). Without one PostgreSQL
+rejects every UPDATE and DELETE on a published table, which stopped the
+maintenance leader on each tick. <code>awa.job_unique_claims</code> identifies rows by its
+existing uniqueness index; <code>awa.admin_dirty_queue_marks</code>,
+<code>awa.admin_dirty_kind_marks</code>, <code>queue_terminal_rollup_deltas</code> and
+<code>queue_terminal_count_deltas</code> with its partitions use <code>REPLICA IDENTITY FULL</code>
+(ADR-045 forbids an index on the mark tables; the delta tables are append-only,
+so FULL costs nothing on their hot path).</p>
+<p>0.7.x runtimes retain the same query behavior after migration; replica identity
+changes WAL images for UPDATE and DELETE. Apply the migration with DDL credentials
+that own, or inherit ownership of, the canonical and installed custom substrates.
+Schema USAGE alone does not permit ALTER TABLE. Discovery uses the full
+<code>claim_ready_runtime(text,bigint,double precision,double precision)</code> signature
+and skips unrelated same-named functions.</p>
+<p>Use <code>awa migrate</code> or the generated version bundle. For an external runner,
+<code>awa migrate --sql --from 46 --to 47</code> emits V23_UP followed by the v047 tail,
+including installer refresh and canonical substrate replay. Raw v047 is only
+that tail. The default SQL export wraps a transaction and migration advisory lock,
+but does not run Rust runtime/cron preflights. External runners must perform the
+documented cron preflight below before installer replay:
+when <code>awa.cron_jobs</code> exists, acquire its ACCESS EXCLUSIVE lock before the first
+pending statement. Use <code>--no-transaction</code> when the external runner owns the
+transaction and migration lock. Apply the full bundle transactionally; see
+<a href="../adr/041-rolling-upgrade-policy/">migration policy</a>.</p>
+<p>The identity ALTERs and installer trigger replacement acquire table locks,
+including ACCESS EXCLUSIVE locks on ring state and queue heads. Locks can wait
+behind live transactions and remain held until the entire pending range commits.
+Neither first application nor replay has a millisecond or lock-free guarantee.
+Use an operational quiet window and a bounded <code>lock_timeout</code>; on timeout roll
+back and retry the complete bundle. Applying earlier pending versions separately
+can shorten the final lock-holding transaction, but the v047 bundle still includes
+installer DDL. See <a href="https://github.com/hardbyte/awa/pull/509">tracking PR #509</a>,
+<a href="https://github.com/hardbyte/awa/issues/427">released-artifact rehearsal tracking #427</a>,
+and <a href="../deploying-on-managed-postgres/#logical-replication-and-cdc">Logical replication and CDC</a>.</p>
 <h2 id="v046-wait-free-admin-dirty-key-marks">v046: wait-free admin dirty-key marks<a class="headerlink" href="#v046-wait-free-admin-dirty-key-marks" title="Permanent link">&para;</a></h2>
 <p>v046 replaces the keyed <code>admin_dirty_queues</code> / <code>admin_dirty_kinds</code> tables the
 canonical triggers wrote with <code>INSERT ... ON CONFLICT DO NOTHING</code> by append-only
