@@ -3,6 +3,7 @@ use crate::audited_sql;
 use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
+use crate::storage_footprint_sql::brin_fsm_empty_pages_sql;
 use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
@@ -39,11 +40,12 @@ const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
 // Physical bytes above empty-index overhead on PostgreSQL 17/18. Installed
 // btree/GiST main forks retain one page; BRIN retains three main
-// and three FSM pages when empty. Unknown
+// and three FSM pages (four below 4 KiB block size) when empty. Unknown
 // access methods conservatively count any allocation as reclaimable. Include
 // heap/TOAST/index forks: VACUUM can leave an empty heap with expanded indexes.
 // Accept one child or a partitioned parent (the lease-ring idle probe).
-const RECLAIMABLE_CHILD_STORAGE_SQL: &str = r#"
+const RECLAIMABLE_CHILD_STORAGE_SQL: &str = concat!(
+    r#"
 WITH heaps AS (
     SELECT oid, reltoastrelid FROM pg_class
     WHERE oid = $1::regclass AND relkind = 'r'
@@ -65,14 +67,18 @@ WITH heaps AS (
 )
 SELECT EXISTS (
     SELECT 1 FROM storage_relations
+    CROSS JOIN (SELECT current_setting('block_size')::bigint AS block_size) settings
     WHERE pg_relation_size(oid, 'fsm') > current_setting('block_size')::bigint *
-          CASE amname WHEN 'brin' THEN 3 ELSE 0 END
+          CASE amname WHEN 'brin' THEN "#,
+    brin_fsm_empty_pages_sql!(),
+    r#" ELSE 0 END
        OR pg_relation_size(oid, 'vm') > 0
        OR pg_relation_size(oid) > current_setting('block_size')::bigint *
           CASE amname WHEN 'btree' THEN 1 WHEN 'gist' THEN 1
                       WHEN 'brin' THEN 3 ELSE 0 END
 )
-"#;
+"#
+);
 
 /// Minimum age of another backend's active snapshot before the horizon-gated
 /// folds (ledger trim, terminal-delta fold, delta rollup) treat it as pinning

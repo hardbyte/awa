@@ -9,6 +9,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - v048 catches claim cursors up from committed same-lane, same-generation attempt evidence. Current binaries retain guarded post-commit advances against pre-v048 schemas and use the old result shape until migration. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 
 - Ring prune and lease rotation distinguish bounded empty-index overhead from reclaimable heap, index and TOAST storage, including VACUUM-emptied materialized lease partitions. Child locks and lifecycle prune proofs remain unchanged.
+- BRIN empty-FSM allowances follow server block size, including four-level FSM trees on 1/2 KiB PostgreSQL builds.
 
 - Compact receipt failure, exhaustion, DLQ, retry and snooze paths carry immutable batch identity and validate the exact receipt under the per-attempt advisory lock. Independent jobs in one batch no longer require a shared batch-row lock.
 
