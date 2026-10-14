@@ -28,11 +28,16 @@ async fn pool() -> PgPool {
         .expect("connect")
 }
 
+// Retention cleanup operates on the whole catalog, so name prefixes cannot
+// isolate concurrent fixtures. Keep setup, assertions and cleanup in one guard.
+static CATALOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn with_clean_catalog<F, Fut, T>(prefix: &str, f: F) -> T
 where
     F: FnOnce(PgPool) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    let _guard = CATALOG_TEST_LOCK.lock().await;
     let p = pool().await;
     awa_model::migrations::run(&p).await.unwrap();
     sqlx::query("DELETE FROM awa.queue_descriptors WHERE queue LIKE $1")
@@ -253,14 +258,6 @@ async fn kind_exists(pool: &PgPool, kind: &str) -> bool {
 
 #[tokio::test]
 async fn cleanup_stale_descriptors_deletes_beyond_window() {
-    // Distinct prefix from `cleanup_stale_descriptors_preserves_fresh_rows`
-    // — `with_clean_catalog` issues `DELETE … WHERE queue LIKE
-    // 'retention_%'` at both ends of the closure, and `tokio::test`
-    // runs siblings in parallel, so a shared prefix made the two
-    // tests race: the second test's pre-clean wiped the first
-    // test's freshly-synced row before the first reached its
-    // `queue_exists` assertion. Locally tests are usually fast enough
-    // to dodge this; CI saw it.
     with_clean_catalog("retention_old_", |p| async move {
         sync_queue_descriptors(
             &p,

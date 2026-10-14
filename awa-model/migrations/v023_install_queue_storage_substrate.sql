@@ -53,6 +53,7 @@ DECLARE
     v_ring           TEXT;
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
+    v_identity_rel   REGCLASS;
     -- #371 staged rolling upgrade: was this a FRESH install (the ring
     -- state did not exist before this call) or an UPGRADE of an existing
     -- schema? A fresh install has no old binaries that could still read
@@ -4067,6 +4068,30 @@ BEGIN
         p_schema,
         'Queue-storage claim allocator. Claims committed ready lanes, skips spent/tombstoned lanes, and leaves claim-cursor advancement safe under transaction rollback.'
     );
+
+    --------------------------------------------------------------------
+    -- Replica identity for the append-only delta tables, which have no
+    -- primary key. PostgreSQL refuses UPDATE and DELETE on a published
+    -- table without a replica identity, so a `FOR ALL TABLES` or
+    -- `FOR TABLES IN SCHEMA` publication would break the rollup fold and
+    -- prune. FULL costs nothing on INSERT or TRUNCATE, which is all the
+    -- hot path does to these tables. Partitions never inherit the
+    -- parent's setting, so each child is set here as well; the parent is
+    -- set for `publish_via_partition_root` publications.
+    --------------------------------------------------------------------
+
+    FOR v_identity_rel IN
+        SELECT c.oid::regclass
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = p_schema
+          AND c.relkind IN ('r', 'p')
+          AND c.relreplident <> 'f'
+          AND c.relname ~ '^queue_terminal_(count_deltas(_[0-9]+)?|rollup_deltas)$'
+        ORDER BY c.relname
+    LOOP
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', v_identity_rel);
+    END LOOP;
 
     --------------------------------------------------------------------
     -- Seed ring-slot rows. These are row-lock targets (and, for the

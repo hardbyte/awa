@@ -355,3 +355,7 @@ Skipping TRUNCATE remains an implementation refinement after the sealed-slot pro
 
 
 The shared BRIN FSM SQL fragment follows `FSM_TREE_DEPTH` in PostgreSQL 17/18 source. The SQL configuration model supplies 1/2/4/8/16/32 KiB block sizes and checks empty metadata is skipped while one extra page is reclaimed. It executes on both supported majors; physical small-block server builds are not rehearsed. Existing physical vacuum/index/TOAST and idle-filenode regressions execute on standard 8 KiB servers. No new abstract lifecycle state is introduced.
+
+## Publication compatibility (#509)
+
+Replica identity controls old-row WAL images; it adds no lifecycle transition. `replica_identity_test` checks every regular/partitioned relation in canonical and custom queue-storage schemas, then runs real unique enqueue/completion, failure/DLQ retry/purge, cron and maintenance UPDATE/DELETE paths under an all-tables publication. It covers default and custom schemas and partition routing. PostgreSQL 17/18 execute these tests as the database owner/superuser in full CI; a catalog-only test is insufficient. This is publication/executor compatibility evidence, not an end-to-end Debezium or logical subscriber delivery rehearsal. Managed service role restrictions and CDC configuration remain documented in `deploying-on-managed-postgres.md`.

@@ -269,6 +269,28 @@ lock. Size for steady-state completion rate, not burst.
 - **Role model.** `awa_owner` owns the schema (NOLOGIN); `awa_migrator` runs
   `awa migrate`; `awa_runtime` (least privilege, cannot alter schema) runs
   workers, producers, `awa serve`, and CLI admin.
+- **v047+ migration bundles.** Use `awa migrate` or its generated `--sql`
+  bundle rather than an isolated migration tail. Installer replay replaces
+  triggers on ring state and queue heads and takes table locks through commit;
+  schedule a quiet window, bound `lock_timeout`, and retry the whole transaction
+  after a timeout. DDL credentials need ownership of all installed substrates.
+- **CDC / logical replication.** Keep the awa schema (and any custom
+  queue-storage schema) out of publications: list application tables, or with
+  Debezium use `publication.autocreate.mode=filtered` plus
+  `schema.exclude.list=awa,custom_queue_schema`, adding every installed custom
+  queue-storage schema (replace the example name). Debezium matches each schema
+  regex against the complete name; escape regex metacharacters in literal names.
+  Alternatively, use `schema.include.list` for application schemas instead of an
+  exclusion list; do not set both. See the [Debezium PostgreSQL filter reference](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-schema-exclude-list).
+  If Awa is published anyway, schema v047+ works (every table has a replica
+  identity); older schemas fail maintenance with
+  `cannot delete from table ... does not have a replica identity`. Ring prune
+  is a `TRUNCATE`, which publications publish by default. Slot lag can retain
+  required WAL; lag alone does not establish an ordinary-table MVCC horizon pin.
+  Inspect [`pg_replication_slots`](https://www.postgresql.org/docs/17/view-pg-replication-slots.html):
+  `xmin` prevents vacuum from removing affected ordinary-table tuples, while
+  `catalog_xmin` protects catalog tuples. Diagnose those horizons separately
+  from WAL retention (`restart_lsn`) and consumer progress (`confirmed_flush_lsn`).
 
 ## Web Admin UI
 
