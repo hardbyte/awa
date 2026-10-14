@@ -3,6 +3,9 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
+#[path = "../../awa-model/src/storage_footprint_sql.rs"]
+mod storage_footprint_sql;
+
 use awa::audited_sql;
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
@@ -15806,5 +15809,35 @@ async fn test_prune_vacuumed_materialized_lease_reclaims_indexes_and_toast_once(
         reclaimed,
         "empty overhead does not cause repeated DDL"
     );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_brin_fsm_baseline_block_size_model() {
+    let (_db_guard, pool) = setup_pool(2).await;
+    // Physical 1/2 KiB servers are not emulated here. These source-backed
+    // byte counts exercise the production SQL fragment on both PG versions.
+    // Equality is empty metadata; one additional FSM page is reclaimable.
+    let rows: Vec<(i64, bool, bool)> = sqlx::query_as(audited_sql(format!(
+        "WITH samples(block_size, empty_pages) AS (
+          VALUES (1024::bigint,4), (2048,4), (4096,3), (8192,3),
+                 (16384,3), (32768,3)
+         ) SELECT block_size,
+           empty_pages*block_size > block_size*({depth}) AS empty_is_used,
+           (empty_pages+1)*block_size > block_size*({depth}) AS extra_is_used
+         FROM samples ORDER BY block_size",
+        depth = storage_footprint_sql::brin_fsm_empty_pages_sql!(),
+    )))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 6);
+    for (block_size, empty_is_used, extra_is_used) in rows {
+        assert!(
+            !empty_is_used,
+            "empty BRIN metadata at block_size={block_size}"
+        );
+        assert!(extra_is_used, "extra FSM page at block_size={block_size}");
+    }
     pool.close().await;
 }
