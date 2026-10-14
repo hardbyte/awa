@@ -16,6 +16,7 @@ pub mod partitioned_queue;
 pub mod queue_storage;
 pub mod reschedule;
 pub mod storage;
+mod storage_footprint_sql;
 pub mod trace;
 pub mod unique;
 
