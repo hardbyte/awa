@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 47;
+pub const CURRENT_VERSION: i32 = 48;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -268,6 +268,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Replica identity for tables without a primary key",
         &[V23_UP, V47_UP],
     ),
+    (
+        48,
+        "Claim cursor catch-up inside the claim",
+        &[V23_UP, V48_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -316,6 +321,7 @@ const V44_UP: &str = include_str!("../migrations/v044_jobs_compat_receipt_runnin
 const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
 const V46_UP: &str = include_str!("../migrations/v046_wait_free_dirty_marks.sql");
 const V47_UP: &str = include_str!("../migrations/v047_replica_identity.sql");
+const V48_UP: &str = include_str!("../migrations/v048_claim_cursor_catch_up.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

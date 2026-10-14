@@ -689,6 +689,30 @@ async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) ->
         .expect("Failed to count lease_claim_closures")
 }
 
+/// Moves every lane cursor of `queue` over its committed attempt-batch
+/// evidence, as the next claim on each lane would (v048). After a partial
+/// receipt-mode claim the runtime leaves that catch-up to the next claim, so
+/// count comparisons that expect an exact cursor settle it first.
+async fn settle_claim_cursor(pool: &sqlx::PgPool, schema: &str, queue: &str) {
+    sqlx::query(audited_sql(format!(
+        "SELECT {schema}.set_sequence_next(claims.seq_name, evidence.next_seq)
+         FROM {schema}.queue_claim_heads AS claims
+         JOIN LATERAL (
+             SELECT max(attempts.next_lane_seq) AS next_seq
+             FROM {schema}.ready_claim_attempt_batches AS attempts
+             WHERE attempts.queue = claims.queue
+               AND attempts.priority = claims.priority
+               AND attempts.enqueue_shard = claims.enqueue_shard
+               AND attempts.next_lane_seq > {schema}.sequence_next_value(claims.seq_name)
+         ) AS evidence ON evidence.next_seq IS NOT NULL
+         WHERE claims.queue = $1"
+    )))
+    .bind(queue)
+    .execute(pool)
+    .await
+    .expect("settle claim cursors");
+}
+
 async fn lease_claim_closure_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     let sql = format!(
         "SELECT count(*)::bigint FROM {}.lease_claim_closure_batches",
@@ -8933,6 +8957,97 @@ async fn test_queue_storage_enqueue_reservation_orders_ready_visibility() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_claim_catches_cursor_up_and_claims_in_one_call() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_claim_cursor_fold";
+    let schema = "awa_qs_claim_cursor_fold";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let mut job_ids = Vec::new();
+    for id in 0..3 {
+        job_ids.push(
+            enqueue_job(
+                &pool,
+                &store,
+                &HeartbeatRescueJob { id },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+
+    let claim_cursor = || async {
+        sqlx::query_scalar::<_, i64>(audited_sql(format!(
+            "SELECT {schema}.sequence_next_value(seq_name)
+             FROM {schema}.queue_claim_heads
+             WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
+        )))
+        .bind(queue)
+        .bind(2_i16)
+        .bind(0_i16)
+        .fetch_one(&pool)
+        .await
+        .expect("claim cursor")
+    };
+    let raw_claim = |max_batch: i64| {
+        let pool = &pool;
+        async move {
+            sqlx::query_as::<_, RawReceiptClaimRow>(audited_sql(format!(
+            "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+             FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+        )))
+        .bind(queue)
+        .bind(max_batch)
+        .bind(0.0_f64)
+        .bind(0.0_f64)
+        .fetch_all(pool)
+        .await
+        .expect("raw receipt claim")
+        }
+    };
+
+    let first = raw_claim(1).await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].job_id, job_ids[0]);
+    assert_eq!(
+        claim_cursor().await,
+        1,
+        "a raw claim leaves the cursor where the claiming runtime's post-commit advance would have moved it"
+    );
+
+    let second = raw_claim(1).await;
+    assert_eq!(
+        second.iter().map(|row| row.job_id).collect::<Vec<_>>(),
+        vec![job_ids[1]],
+        "the next claim must catch the cursor up over the recorded attempt and claim the following row in the same call"
+    );
+    assert_eq!(claim_cursor().await, 2);
+
+    let third = raw_claim(8).await;
+    assert_eq!(
+        third.iter().map(|row| row.job_id).collect::<Vec<_>>(),
+        vec![job_ids[2]]
+    );
+    assert_eq!(claim_cursor().await, 3);
+    assert!(raw_claim(8).await.is_empty(), "nothing is claimed twice");
+    assert_eq!(claim_cursor().await, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advance_is_lost() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_claim_lost_cursor_advance";
@@ -15275,6 +15390,7 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
         .await
         .expect("claim two jobs into the receipt plane");
     assert_eq!(claimed.len(), 2, "two jobs must be claimed");
+    settle_claim_cursor(&pool, schema, queue).await;
 
     let after = read_state_counts(&pool, queue).await;
     let mut states: Vec<(String, i64)> = after;
@@ -15703,6 +15819,249 @@ async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
     assert_eq!(reclaimed.1, 0);
     store.prune_oldest_leases(&pool).await.unwrap();
     assert_eq!(physical().await, reclaimed, "idle repeat does no DDL");
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v048_binary_first_receipt_shape_and_old_new_cursor_interoperation() {
+    binary_first_claim_shape_and_cursor_interoperation(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v048_binary_first_legacy_shape_and_cursor_interoperation() {
+    binary_first_claim_shape_and_cursor_interoperation(false).await;
+}
+
+async fn binary_first_claim_shape_and_cursor_interoperation(receipts: bool) {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_v047_shape";
+    let config = QueueStorageConfig {
+        schema: schema.into(),
+        lease_claim_receipts: receipts,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, config.clone()).await;
+    let queue = "v047_shape";
+    store.enqueue_batch(&pool, queue, 1, 4).await.unwrap();
+    let current: String = sqlx::query_scalar("SELECT pg_get_functiondef(to_regprocedure($1)::oid)")
+        .bind(format!(
+            "{schema}.claim_ready_runtime(text,bigint,double precision,double precision)"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Reconstruct the v047 result shape and post-commit cursor protocol.
+    // The claim CTE is unchanged by v048; remove only its added catch-up
+    // block and result column. This is SQL compatibility, not a binary rollout.
+    let mut old = current.replace(", lane_drained boolean)", ")");
+    assert_ne!(old, current, "fixture must remove the v048 return field");
+    let start = old
+        .find("-- Catch the lane cursor up over committed claim evidence.")
+        .unwrap();
+    let end = start
+        + old[start..]
+            .find("            SELECT\n                ready.job_id,")
+            .unwrap();
+    old.replace_range(start..end, "");
+    old = old.replace("selected.payload,\n                (v_lane_claim_seq + v_claim_limit >= v_lane_next_seq) AS lane_drained", "selected.payload");
+    assert!(!old.contains("AS lane_drained"));
+    sqlx::query(audited_sql(format!(
+        "DROP FUNCTION {schema}.claim_ready_runtime(text,bigint,double precision,double precision)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(audited_sql(old))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.schema_version WHERE version >= 48")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.len(),
+        1,
+        "current binary works against actual old result shape"
+    );
+    assert_eq!(
+        claim_cursor_for(&pool, &store, queue, 1, 0).await,
+        first[0].claim.lane_seq + 1
+    );
+    migrations::run(&pool).await.unwrap();
+    let new_store = QueueStorage::new(config).unwrap();
+    let second = new_store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    let cursor = claim_cursor_for(&pool, &new_store, queue, 1, 0).await;
+    assert_eq!(
+        cursor,
+        if receipts {
+            second[0].claim.lane_seq
+        } else {
+            second[0].claim.lane_seq + 1
+        }
+    );
+    let third = new_store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        third.len(),
+        1,
+        "new in-claim fold catches the preceding committed claim"
+    );
+    let last = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        last.len(),
+        1,
+        "cached pre-v048 runtime remains safe after migration"
+    );
+    let ids: HashSet<_> = first
+        .iter()
+        .chain(&second)
+        .chain(&third)
+        .chain(&last)
+        .map(|j| j.job.id)
+        .collect();
+    assert_eq!(ids.len(), 4);
+    assert!(new_store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        claim_cursor_for(&pool, &new_store, queue, 1, 0).await,
+        last[0].claim.lane_seq + 1
+    );
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v048_fold_preserves_live_tail_across_tombstone_gap_and_rotation() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_fold_range";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "fold_range";
+    let first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    // A rolled-back sequence reservation leaves a permanent lane gap.
+    let mut producer = pool.begin().await.unwrap();
+    let reserved: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2::smallint, $3::smallint, $4)"
+    )))
+    .bind(queue)
+    .bind(1i16)
+    .bind(0i16)
+    .bind(1i64)
+    .fetch_one(producer.as_mut())
+    .await
+    .unwrap();
+    assert!(reserved > 1);
+    producer.rollback().await.unwrap();
+    let cancelled = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    store.cancel_job(&pool, cancelled).await.unwrap().unwrap();
+    let a = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(a[0].job.id, first);
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+    let tail = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 3 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    // Reconstruct a lost old post-commit advance. Catch-up must stay inside
+    // its segment proof, pass the tombstone/gap, then discover the live tail.
+    sqlx::query(audited_sql(format!("SELECT setval(format('%I.%I', $1::text, seq_name)::regclass, $3, false) FROM {schema}.queue_claim_heads WHERE queue=$2")))
+        .bind(schema).bind(queue).bind(a[0].claim.lane_seq).execute(&pool).await.unwrap();
+    let mut b = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    if b.is_empty() {
+        // The existing spent-prefix pass can consume a tombstone-only
+        // remainder and return empty. Its cursor must stop at the next
+        // segment, and the next poll must expose that live tail.
+        let tail_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT lane_seq FROM {schema}.ready_entries WHERE job_id=$1"
+        )))
+        .bind(tail)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cursor = claim_cursor_for(&pool, &store, queue, 1, 0).await;
+        assert!(cursor > a[0].claim.lane_seq && cursor <= tail_seq);
+        b = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+            .await
+            .unwrap();
+    }
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        b[0].job.id, tail,
+        "earlier evidence must never consume the new generation's live tail"
+    );
+    assert!(b[0].claim.ready_generation > a[0].claim.ready_generation);
+    assert_eq!(
+        store.complete_runtime_batch(&pool, &a).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store.complete_runtime_batch(&pool, &b).await.unwrap().len(),
+        1
+    );
+    assert!(store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .is_empty());
     pool.close().await;
 }
 

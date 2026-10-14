@@ -3403,6 +3403,7 @@ BEGIN
            position('receipt_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0
            OR position('claim_batch_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0
            OR position('claim_batch_index' IN pg_get_function_result(v_claim_runtime::oid)) = 0
+           OR position('lane_drained' IN pg_get_function_result(v_claim_runtime::oid)) = 0
        ) THEN
         EXECUTE format(
             'DROP FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION)',
@@ -3445,8 +3446,8 @@ BEGIN
             created_at TIMESTAMPTZ,
             unique_key BYTEA,
             unique_states TEXT,
-            payload JSONB
-        )
+            payload JSONB,
+            lane_drained BOOLEAN)
         LANGUAGE plpgsql
         SET search_path = pg_catalog, awa, public
         AS $func$
@@ -3468,6 +3469,7 @@ BEGIN
             v_deadline_at TIMESTAMPTZ;
             v_head_attempt_spent BOOLEAN;
             v_spent_next_seq BIGINT;
+            v_evidence_next_seq BIGINT;
         BEGIN
             SELECT
                 claims.priority,
@@ -3616,6 +3618,65 @@ BEGIN
                 RETURN;
             END IF;
 
+            -- Catch the lane cursor up over committed claim evidence. Every
+            -- attempt batch was emitted by a claim that started at a cursor
+            -- already covered by evidence and recorded the contiguous rows
+            -- it took, so the largest recorded next_lane_seq is a safe
+            -- cursor position whether or not the claiming runtime's
+            -- post-commit advance ever ran. Reading only committed rows
+            -- keeps an abort of this transaction from stranding live work.
+            SELECT max(attempts.next_lane_seq)
+            INTO v_evidence_next_seq
+            FROM %1$I.ready_claim_attempt_batches AS attempts
+            WHERE attempts.ready_slot = v_target_slot
+              AND attempts.ready_generation = v_target_generation
+              AND attempts.queue = p_queue
+              AND attempts.priority = v_lane_priority
+              AND attempts.enqueue_shard = v_lane_shard
+              AND attempts.next_lane_seq > v_lane_claim_seq;
+
+            IF v_evidence_next_seq IS NOT NULL THEN
+                PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_evidence_next_seq);
+                v_lane_claim_seq := v_evidence_next_seq;
+                v_target_slot := NULL;
+                SELECT
+                    segment.ready_slot,
+                    segment.ready_generation,
+                    slot_bound.next_lane_seq
+                INTO
+                    v_target_slot,
+                    v_target_generation,
+                    v_target_next_lane_seq
+                FROM (
+                    SELECT
+                        segment.ready_slot,
+                        segment.ready_generation,
+                        segment.first_lane_seq
+                    FROM %1$I.ready_segments AS segment
+                    WHERE segment.queue = p_queue
+                      AND segment.priority = v_lane_priority
+                      AND segment.enqueue_shard = v_lane_shard
+                      AND segment.next_lane_seq > v_lane_claim_seq
+                    -- Order by next_lane_seq (non-overlapping segments, so this
+                    -- is the next segment covering or after the cursor) for the
+                    -- index short-circuit; see the inline routing probe above.
+                    ORDER BY segment.next_lane_seq ASC
+                    LIMIT 1
+                ) AS segment
+                CROSS JOIN LATERAL (
+                    SELECT max(later_segment.next_lane_seq)::bigint AS next_lane_seq
+                    FROM %1$I.ready_segments AS later_segment
+                    WHERE later_segment.ready_slot = segment.ready_slot
+                      AND later_segment.ready_generation = segment.ready_generation
+                      AND later_segment.queue = p_queue
+                      AND later_segment.priority = v_lane_priority
+                      AND later_segment.enqueue_shard = v_lane_shard
+                ) AS slot_bound;
+                IF v_target_slot IS NULL THEN
+                    RETURN;
+                END IF;
+            END IF;
+
             SELECT
                 ready.job_id,
                 ready.run_lease,
@@ -3640,6 +3701,17 @@ BEGIN
                 -- upgrade or after manual catalog damage. Keep the claim
                 -- cursor conservative rather than advancing over unseen work.
                 RETURN;
+            END IF;
+
+            -- A later committed ready row proves earlier reservations are
+            -- permanently absent: reserve_enqueue_seq holds the per-lane
+            -- transaction advisory lock until commit/abort. Move TO the first
+            -- visible row, never past it, so this sequence change is safe even
+            -- if the claim aborts. Otherwise a gap before a tombstone can keep
+            -- the bounded spent-prefix window empty on every future poll.
+            IF v_head_lane_seq > v_lane_claim_seq THEN
+                PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_head_lane_seq);
+                v_lane_claim_seq := v_head_lane_seq;
             END IF;
 
             -- The claim head stays a cold lane registry: the ready
@@ -4034,7 +4106,8 @@ BEGIN
                 selected.created_at,
                 selected.unique_key,
                 selected.unique_states,
-                selected.payload
+                selected.payload,
+                (v_lane_claim_seq + v_claim_limit >= v_lane_next_seq) AS lane_drained
             FROM claimed
             CROSS JOIN lease_ring
             JOIN selected

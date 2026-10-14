@@ -17,6 +17,8 @@ set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 SUITE='
+AwaClaimCursorFold.tla         ;; -                                      ;; pass ;; mixed-version cursor folding and prefix ranges
+AwaClaimCursorFold.tla         ;; AwaClaimCursorFoldNonPrefix.cfg         ;; NoSkippedLive is violated ;; non-prefix evidence cannot justify max cursor
 AwaAsyncClaimCursor.tla        ;; -                                      ;; pass ;; evidence-guarded async claim replay
 AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; NoSkippedJob is violated ;; lost claim on promoted standby witness
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker

@@ -275,3 +275,5 @@ See [`../README.md`](../README.md) for the full Known Divergences list. Specific
 - **Unique-claim conflicts on `retry_from_dlq`.** The Rust contract says retry-from-dlq returns `UniqueConflict` and leaves the DLQ row intact when a replacement owns the unique slot. The model doesn't have unique keys, so TLC simply explores `RetryFromDlq(j)` whenever the precondition holds. Preserving-the-DLQ-row-on-conflict is enforced in SQL (`awa-model/src/queue_storage.rs::sync_unique_claim`).
 
 `AwaAsyncClaimCursor.tla` refines async claim acknowledgment, WAL durability, standby promotion and post-commit sequence replay. Its safe config checks no skipped jobs; `AwaAsyncClaimCursorUnguarded.cfg` preserves the lost-claim cursor-skip counterexample.
+
+`AwaClaimCursorFold` covers v048's prefix/range proof and old post-commit versus new in-claim cursor movement, including gaps, tombstones, legacy leases and segment changes. Its non-prefix config is an expected counterexample. See `MAPPING.md` for SQL premises and the separate asynchronous durability boundary.
