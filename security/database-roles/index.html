@@ -1644,6 +1644,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#provision-queues-before-starting-restricted-runtimes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provision queues before starting restricted runtimes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#custom-queue-storage-schemas" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2155,6 +2166,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#provision-queues-before-starting-restricted-runtimes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provision queues before starting restricted runtimes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#custom-queue-storage-schemas" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2242,7 +2264,7 @@
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">USAGE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">SELECT</span><span class="p">,</span><span class="w"> </span><span class="k">INSERT</span><span class="p">,</span><span class="w"> </span><span class="k">UPDATE</span><span class="p">,</span><span class="w"> </span><span class="k">DELETE</span><span class="p">,</span><span class="w"> </span><span class="k">TRUNCATE</span>
 </span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="k">ON</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">USAGE</span><span class="p">,</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="n">SEQUENCES</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">USAGE</span><span class="p">,</span><span class="w"> </span><span class="k">SELECT</span><span class="p">,</span><span class="w"> </span><span class="k">UPDATE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="n">SEQUENCES</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="k">GRANT</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="n">FUNCTIONS</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
 </span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="k">REVOKE</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">FUNCTION</span>
@@ -2254,11 +2276,32 @@
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">DEFAULT</span><span class="w"> </span><span class="k">PRIVILEGES</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="n">awa_owner</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span>
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="k">GRANT</span><span class="w"> </span><span class="k">SELECT</span><span class="p">,</span><span class="w"> </span><span class="k">INSERT</span><span class="p">,</span><span class="w"> </span><span class="k">UPDATE</span><span class="p">,</span><span class="w"> </span><span class="k">DELETE</span><span class="p">,</span><span class="w"> </span><span class="k">TRUNCATE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">DEFAULT</span><span class="w"> </span><span class="k">PRIVILEGES</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="n">awa_owner</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span>
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span><span class="k">GRANT</span><span class="w"> </span><span class="k">USAGE</span><span class="p">,</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">SEQUENCES</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span><span class="k">GRANT</span><span class="w"> </span><span class="k">USAGE</span><span class="p">,</span><span class="w"> </span><span class="k">SELECT</span><span class="p">,</span><span class="w"> </span><span class="k">UPDATE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">SEQUENCES</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">DEFAULT</span><span class="w"> </span><span class="k">PRIVILEGES</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="n">awa_owner</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span>
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span><span class="k">GRANT</span><span class="w"> </span><span class="k">EXECUTE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">FUNCTIONS</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span></code></pre></div>
 <p>If an existing installation created objects as <code>awa_migrator</code> without first setting the owner role, transfer every existing schema object to <code>awa_owner</code> before relying on owner-scoped defaults. New migrations should use the effective-role command above.</p>
+<h2 id="provision-queues-before-starting-restricted-runtimes">Provision queues before starting restricted runtimes<a class="headerlink" href="#provision-queues-before-starting-restricted-runtimes" title="Permanent link">&para;</a></h2>
+<p>From schema v049, runtime calls use existing lane sequences without issuing
+<code>CREATE SEQUENCE</code>. Run provisioning as the migrator for every queue before
+starting its producers or workers:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">PGOPTIONS</span><span class="o">=</span><span class="s1">'-c role=awa_owner'</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_MIGRATOR_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>prepare-queue<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span>--queue<span class="w"> </span>email<span class="w"> </span>--enqueue-shards<span class="w"> </span><span class="m">1</span>
+</span></code></pre></div>
+<p>The command provisions all four priorities in one transaction and is safe to
+repeat on a live queue: existing sequence cursors keep their positions. It does
+not change routing or the queue's configured shard count. Prepare additional
+shards before increasing <code>enqueue_shards</code>; match <code>--queue-stripe-count</code> to the
+runtime's queue-storage configuration. With <code>PartitionedQueue</code>, provision each
+physical queue. Use <code>--schema</code> for a custom storage schema.</p>
+<p>Apply the sequence grants above after provisioning, or set the owner's default
+privileges first. Lane cursors need <code>UPDATE</code> for <code>setval</code>, in addition to <code>USAGE</code>
+and <code>SELECT</code>. <code>CREATE SEQUENCE IF NOT EXISTS</code> requires schema CREATE even when
+the sequence already exists, so provisioning alone does not repair pre-v049
+helpers: apply the migration first. Schema owners retain lazy creation for
+single-role installations; a restricted runtime encountering an unprepared
+lane fails with a provisioning hint.</p>
 <h2 id="custom-queue-storage-schemas">Custom queue-storage schemas<a class="headerlink" href="#custom-queue-storage-schemas" title="Permanent link">&para;</a></h2>
 <p>Repeat the schema, table, sequence, function, and default-privilege grants for a custom queue-storage schema. Prepare custom schemas as the migrator; the runtime needs DML, sequence access, function execution, and <code>TRUNCATE</code>, but never DDL. See <a href="../../queue-storage-substrate/">Queue storage</a>.</p>
 <h2 id="why-the-grants-are-broad">Why the grants are broad<a class="headerlink" href="#why-the-grants-are-broad" title="Permanent link">&para;</a></h2>

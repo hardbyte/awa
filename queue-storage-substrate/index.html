@@ -2274,7 +2274,7 @@
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span>--lease-slot-count<span class="w"> </span><span class="m">16</span>
 </span></code></pre></div>
 <p>The command invokes the idempotent <code>awa.install_queue_storage_substrate(...)</code> helper under a per-schema advisory transaction lock. The helper is activation-neutral: preparing a schema does not route work to it. Activation is a separate staged transition described in <a href="../upgrade-0.5-to-0.6/">Upgrading from 0.5 to 0.6</a>.</p>
-<p>The installer is <code>SECURITY INVOKER</code>; its caller needs DDL privileges on the target schema. Workers need runtime DML privileges and <code>TRUNCATE</code> for guarded ring reclamation, but do not need DDL. See <a href="../security/database-roles/">Database roles</a>.</p>
+<p>The installer is <code>SECURITY INVOKER</code>; its caller needs DDL privileges on the target schema. After the migrator provisions each queue with <code>awa storage prepare-queue</code>, workers need runtime DML, sequence <code>USAGE</code>/<code>SELECT</code>/<code>UPDATE</code>, and <code>TRUNCATE</code> for guarded ring reclamation. They do not need schema CREATE. See <a href="../security/database-roles/">Database roles</a>.</p>
 <h2 id="operator-rules">Operator rules<a class="headerlink" href="#operator-rules" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Treat physical queue-storage tables and helper functions as internal unless a page explicitly names a public surface.</li>
