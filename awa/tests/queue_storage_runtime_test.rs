@@ -12602,10 +12602,15 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
         .expect("rollup terminal deltas");
     assert_eq!(outcome.rolled_slots, 1);
     assert_eq!(outcome.delta_rows, 6);
-    assert_eq!(outcome.grouped_keys, 6);
+    assert_eq!(outcome.grouped_keys, 1);
     assert_eq!(outcome.skipped_active_slots, 0);
     assert_eq!(outcome.blocked_slots, 0);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the fold writes one live-count row per lane, not one per job-id bucket"
+    );
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
     assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
     assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
@@ -12683,7 +12688,7 @@ async fn test_queue_terminal_count_delta_rollup_skips_pinned_mvcc_horizon() {
         .expect("rollup terminal deltas after pin release");
     assert_eq!(outcome.rolled_slots, 1);
     assert_eq!(outcome.delta_rows, 6);
-    assert_eq!(outcome.grouped_keys, 6);
+    assert_eq!(outcome.grouped_keys, 1);
     assert!(!outcome.skipped_mvcc_pinned);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
@@ -13186,6 +13191,17 @@ async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
     .fetch_one(pool)
     .await
     .expect("sum live_terminal_count")
+}
+
+async fn live_count_rows(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
+        "SELECT count(*)::bigint \
+         FROM {schema}.queue_terminal_live_counts WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count live-count rows")
 }
 
 async fn terminal_delta_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {

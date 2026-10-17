@@ -15877,14 +15877,10 @@ impl QueueStorage {
                     queue,
                     priority,
                     enqueue_shard,
-                    mod(
-                        mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                            + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                        {TERMINAL_COUNTER_BUCKETS}::bigint
-                    )::smallint AS counter_bucket,
+                    0::smallint AS counter_bucket,
                     count(*)::bigint
                 FROM {schema}.done_entries
-                GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                GROUP BY ready_slot, queue, priority, enqueue_shard
                 RETURNING 1
             )
             SELECT COALESCE(count(*), 0)::bigint FROM inserted
@@ -16269,11 +16265,11 @@ impl QueueStorage {
                     queue,
                     priority,
                     enqueue_shard,
-                    counter_bucket,
+                    0::smallint AS counter_bucket,
                     SUM(terminal_delta)::bigint AS delta
                 FROM {delta_child}
                 WHERE ready_generation = $1
-                GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                GROUP BY ready_slot, queue, priority, enqueue_shard
                 HAVING SUM(terminal_delta) <> 0
             ),
             updated AS (
