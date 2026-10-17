@@ -963,6 +963,9 @@ impl MaintenanceService {
 
             debug!("Elected as maintenance leader");
             self.leader.store(true, Ordering::SeqCst);
+            if let Some(runtime) = self.storage.queue_storage() {
+                runtime.store.reset_rotation_observations();
+            }
 
             // Run maintenance tasks as leader
             let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);

@@ -2489,7 +2489,7 @@ async fn test_idle_gate_holds_rotation_open_until_sealed_slots_reclaimed() {
 }
 
 /// A maintenance tick seals a slot that holds rows only once it is at
-/// least `min_slot_age` old or `max_slot_bytes` large. An empty current
+/// least `min_slot_age` old or `target_slot_bytes` large. An empty current
 /// slot is never held back (rotating it is ledger-only and its prune
 /// truncates nothing), so a draining ring still cycles at tick cadence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2533,7 +2533,7 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
     };
     let patient = RingRotationCadence {
         min_slot_age: Duration::from_secs(3600),
-        max_slot_bytes: 1 << 30,
+        target_slot_bytes: 1 << 30,
     };
 
     // Slot 0 (genesis) holds one row and is seconds old: a patient cadence
@@ -2555,15 +2555,15 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
     );
     assert_eq!(ring_cursor(&pool, schema, "queue").await, (0, 0));
 
-    // The byte cap seals regardless of age.
+    // The byte target seals regardless of age.
     let by_size = RingRotationCadence {
-        max_slot_bytes: 1,
+        target_slot_bytes: 1,
         ..patient
     };
     let outcome = store
         .rotate_with_cadence(&pool, by_size)
         .await
-        .expect("rotate over byte cap");
+        .expect("rotate over byte target");
     assert!(
         matches!(
             outcome,
@@ -2572,7 +2572,7 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
                 generation: 1
             }
         ),
-        "slot over the byte cap must seal, got {outcome:?}"
+        "slot over the byte target must seal, got {outcome:?}"
     );
 
     // The new current slot is empty while slot 0 still holds rows: the
@@ -2629,6 +2629,353 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
         matches!(outcome, RotateOutcome::SkippedBusy { slot: 0, .. }),
         "eager rotate reaches the busy gate (slot 0 still holds rows), got {outcome:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_change() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_observed_age";
+    let store = create_store(&pool, schema).await;
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_ring_rotations SET rotated_at = now() - interval '1 day'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    store
+        .enqueue_batch(&pool, "observed_age", 1, 1)
+        .await
+        .unwrap();
+    let cadence = RingRotationCadence {
+        min_slot_age: Duration::from_millis(50),
+        target_slot_bytes: 0,
+    };
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::SkippedFilling { slot: 0, .. }
+    ));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    store.reset_rotation_observations();
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::SkippedFilling { slot: 0, .. }
+    ));
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    store
+        .enqueue_batch(&pool, "observed_age", 1, 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::SkippedFilling { slot: 1, .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_empty_observation_resets_age_on_same_cursor() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let store = create_store(&pool, "awa_qs_cadence_refill").await;
+    store.enqueue_batch(&pool, "refill", 1, 3).await.unwrap();
+    let first = store
+        .claim_runtime_batch(&pool, "refill", 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(matches!(
+        store.rotate_leases(&pool).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    let second = store
+        .claim_runtime_batch(&pool, "refill", 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    let cadence = RingRotationCadence {
+        min_slot_age: Duration::from_millis(50),
+        target_slot_bytes: 0,
+    };
+    assert!(matches!(
+        store
+            .rotate_leases_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::SkippedFilling { slot: 1, .. }
+    ));
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &second)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(matches!(
+        store
+            .rotate_leases_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::SkippedBusy { .. }
+    ));
+    let third = store
+        .claim_runtime_batch(&pool, "refill", 1, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(third.len(), 1);
+    assert!(matches!(
+        store
+            .rotate_leases_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::SkippedFilling { slot: 1, .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_empty_used_leases_reclaim_without_age_delay() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_empty_leases";
+    let store = create_store(&pool, schema).await;
+    let fresh_bytes: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT pg_total_relation_size('{schema}.leases_0')"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    store
+        .enqueue_batch(&pool, "empty_leases", 1, 4)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "empty_leases", 4, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 4);
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    sqlx::query(audited_sql(format!(
+        "VACUUM (TRUNCATE FALSE) {schema}.leases_0"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (rows, heap_bytes): (i64, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT (SELECT count(*) FROM {schema}.leases_0), pg_relation_size('{schema}.leases_0')"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+    assert!(heap_bytes > 0);
+    let cadence = RingRotationCadence {
+        min_slot_age: Duration::from_secs(3600),
+        target_slot_bytes: 1 << 30,
+    };
+    assert!(matches!(
+        store
+            .rotate_leases_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    assert!(matches!(
+        store.prune_oldest_leases(&pool).await.unwrap(),
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
+    let reclaimed_bytes: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT pg_total_relation_size('{schema}.leases_0')"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reclaimed_bytes, fresh_bytes);
+    assert!(matches!(
+        store
+            .rotate_leases_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::SkippedIdle { .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_size_trigger_includes_indexes() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_total_bytes";
+    let store = create_store(&pool, schema).await;
+    store
+        .enqueue_batch(&pool, "total_bytes", 1, 4)
+        .await
+        .unwrap();
+    let (main_bytes, total_bytes): (i64, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT SUM(pg_relation_size(child.oid) + CASE WHEN child.reltoastrelid <> 0 \
+                    THEN pg_relation_size(child.reltoastrelid) ELSE 0 END)::bigint, \
+                SUM(pg_total_relation_size(child.oid))::bigint \
+         FROM pg_inherits inheritance JOIN pg_class child ON child.oid = inheritance.inhrelid \
+         WHERE inheritance.inhparent = ANY(ARRAY[\
+             '{schema}.ready_entries'::regclass, '{schema}.ready_claim_attempt_batches'::regclass, \
+             '{schema}.done_entries'::regclass, '{schema}.ready_tombstones'::regclass, \
+             '{schema}.ready_segments'::regclass, '{schema}.receipt_completion_batches'::regclass, \
+             '{schema}.receipt_completion_tombstones'::regclass, '{schema}.queue_terminal_count_deltas'::regclass\
+         ]) AND child.relname LIKE '%_0'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(total_bytes > main_bytes);
+    let cadence = RingRotationCadence {
+        min_slot_age: Duration::from_secs(3600),
+        target_slot_bytes: (main_bytes + 1) as u64,
+    };
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_burst_can_exceed_target_without_reusing_busy_slot() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_burst";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "burst", 1, 1).await.unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            store.rotate(&pool).await.unwrap(),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+    let cadence = RingRotationCadence {
+        min_slot_age: Duration::from_secs(3600),
+        target_slot_bytes: 64 * 1024,
+    };
+    store.enqueue_batch(&pool, "burst", 1, 4096).await.unwrap();
+    let current_bytes: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT pg_total_relation_size('{schema}.ready_entries_3')"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(current_bytes as u64 > 4 * cadence.target_slot_bytes);
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::SkippedBusy { slot: 0, .. }
+    ));
+    let mut claimed = Vec::new();
+    while claimed.len() < 4097 {
+        let mut batch = store
+            .claim_runtime_batch(&pool, "burst", 4097, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(
+            !batch.is_empty(),
+            "every enqueued job must remain claimable"
+        );
+        claimed.append(&mut batch);
+    }
+    assert_eq!(claimed.len(), 4097);
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        4097
+    );
+    assert!(matches!(
+        store.prune_oldest(&pool, Duration::ZERO).await.unwrap(),
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::Rotated { slot: 0, .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_claim_ring_drains_empty_current_slots() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: "awa_qs_cadence_claim_drain".into(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    store
+        .enqueue_batch(&pool, "claim_drain", 1, 4)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "claim_drain", 4, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 4);
+    let cadence = RingRotationCadence {
+        min_slot_age: Duration::from_secs(3600),
+        target_slot_bytes: 1 << 30,
+    };
+    assert!(matches!(
+        store
+            .rotate_claims_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::SkippedFilling { slot: 0, .. }
+    ));
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(matches!(
+        store
+            .rotate_claims_with_cadence(
+                &pool,
+                RingRotationCadence {
+                    target_slot_bytes: 1,
+                    ..cadence
+                }
+            )
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated { slot: 1, .. }
+    ));
+    assert!(matches!(
+        store
+            .rotate_claims_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated { slot: 2, .. }
+    ));
+    assert!(matches!(
+        store.prune_oldest_claims(&pool).await.unwrap(),
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
+    assert!(matches!(
+        store
+            .rotate_claims_with_cadence(&pool, cadence)
+            .await
+            .unwrap(),
+        RotateOutcome::SkippedIdle { .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

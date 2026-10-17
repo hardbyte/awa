@@ -675,7 +675,10 @@ async def test_queue_storage_target_role_executes_after_mixed_transition(client)
 
 
 @pytest.mark.asyncio
-async def test_install_queue_storage_rejected_while_runtime_is_running(client):
+@pytest.mark.parametrize("min_age_ms, target_bytes", [(0, 0), (5000, 2 * 1024 * 1024)])
+async def test_install_queue_storage_rejected_while_runtime_is_running(
+    client, min_age_ms, target_bytes
+):
     """install_queue_storage() is blocked once the worker runtime has started."""
     queue = "cfg_install_queue_storage_guard"
     schema = "awa_py_cfg_runtime_guard"
@@ -690,7 +693,13 @@ async def test_install_queue_storage_rejected_while_runtime_is_running(client):
         return None
 
     try:
-        await client.start([(queue, 1)], poll_interval_ms=25, queue_storage_schema=schema)
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_schema=schema,
+            queue_storage_rotate_min_slot_age_ms=min_age_ms,
+            queue_storage_rotate_target_slot_bytes=target_bytes,
+        )
         with pytest.raises(awa.AwaError, match="cannot install queue storage while the worker runtime is running"):
             await client.install_queue_storage(schema=f"{schema}_other")
     finally:

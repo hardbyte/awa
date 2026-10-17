@@ -938,7 +938,8 @@ impl ClientBuilder {
 
     /// Override when a maintenance tick may seal the current slot of the
     /// queue, lease and claim rings (default
-    /// [`RingRotationCadence::DEFAULT`]: five seconds or 8 MiB). The rotate
+    /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling or
+    /// a 2 MiB physical-size target). The rotate
     /// intervals set how often the decision is made; the cadence decides
     /// whether a slot that holds rows is sealed on that tick. Use
     /// [`RingRotationCadence::EAGER`] to seal on every tick. Only takes

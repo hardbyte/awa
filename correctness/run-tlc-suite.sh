@@ -35,6 +35,10 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqRetry.cfg    ;; Dlq
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqPurge.cfg    ;; DlqPurgeTraceIncomplete is violated ;; DLQ purge trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Deadlock reached ;; broken trace rejected
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
+AwaRotationCadence.tla        ;; AwaRotationCadence.cfg                 ;; pass ;; observed fill age and eventual drain under stable leadership
+AwaRotationCadence.tla        ;; AwaRotationCadencePhysicalEmpty.cfg    ;; EmptyNeverWaits is violated ;; allocated empty lease heap witness
+AwaRotationCadence.tla        ;; AwaRotationCadenceOldClock.cfg         ;; YoungSmallSlotStaysOpen is violated ;; old slot timestamp witness
+AwaRotationCadence.tla        ;; AwaRotationCadenceHardCap.cfg          ;; TargetIsHardCap is violated ;; sampled size target permits batch overshoot
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueue.cfg     ;; pass ;; prepared lanes and producer lock order
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueueNumeric.cfg ;; NoDeadlock is violated ;; numeric stripe order inversion witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness

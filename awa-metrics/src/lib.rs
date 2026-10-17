@@ -1071,7 +1071,7 @@ impl AwaMetrics {
             }
             awa_model::RotateOutcome::SkippedFilling { slot, generation } => {
                 // The current slot holds rows but is below the cadence's
-                // age floor and byte cap, so it stays open. Expected on
+                // age floor and byte target, so it stays open. Expected on
                 // most ticks under steady moderate load.
                 let attrs = [
                     opentelemetry::KeyValue::new("awa.ring", ring),

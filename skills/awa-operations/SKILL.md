@@ -256,6 +256,19 @@ Rings rotate only when active — a frozen generation on an idle queue is health
 The condition to alert on is a frozen generation *with* accumulating rows
 (`skipped_busy`): a pinned ring, almost always caused by a long-held snapshot.
 
+## Ring Rotation Cadence
+
+For queue storage, `ClientBuilder::ring_rotation_cadence` sets a five-second
+observed fill window and a 2 MiB total physical-size target by default. Python
+exposes `queue_storage_rotate_min_slot_age_ms` and
+`queue_storage_rotate_target_slot_bytes`. A zero byte target disables the size
+trigger; zero age or Rust `RingRotationCadence::EAGER` permits sealing each tick.
+Empty slots bypass the fill window so reclamation can continue after drain.
+Leader changes reset the local monotonic fill timers. The size is sampled and
+can be exceeded by bursts or blocked reuse; use actual retained storage and
+blocked-prune metrics for capacity planning. It is not a retention policy or
+storage limit. See `docs/configuration.md` for the scheduling contract.
+
 ## Managed Postgres
 
 Prefer PostgreSQL 18 where available; PG17 on some managed platforms caps
