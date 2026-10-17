@@ -226,6 +226,62 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
+-- Queue-storage schemas that migration loops may refresh. Beyond the
+-- `claim_ready_runtime` signature, a schema must be owned by a role the
+-- current user can act as, its `claim_ready_runtime` and ring-state tables
+-- likewise, and the ring-state relations must be ordinary tables. `public`
+-- and `pg_*` qualify only when their `claim_ready_runtime` is owned by the
+-- owner of the `awa` schema. Every migration loop over custom schemas uses
+-- this function.
+CREATE OR REPLACE FUNCTION awa.queue_storage_schemas()
+RETURNS TABLE (schema_name TEXT)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $discover$
+    SELECT n.nspname::text
+    FROM pg_namespace AS n
+    JOIN pg_proc AS claim_fn
+      ON claim_fn.pronamespace = n.oid
+     AND claim_fn.proname = 'claim_ready_runtime'
+     AND oidvectortypes(claim_fn.proargtypes)
+         = 'text, bigint, double precision, double precision'
+    WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
+      AND (
+          n.nspname = 'awa'
+          OR (
+              pg_has_role(current_user, n.nspowner, 'USAGE')
+              AND pg_has_role(current_user, claim_fn.proowner, 'USAGE')
+              AND (
+                  (n.nspname <> 'public' AND n.nspname !~ '^pg_')
+                  OR claim_fn.proowner = (
+                      SELECT awa_ns.nspowner
+                      FROM pg_namespace AS awa_ns
+                      WHERE awa_ns.nspname = 'awa'
+                  )
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM pg_class AS ring
+                  WHERE ring.relnamespace = n.oid
+                    AND ring.relname = 'queue_ring_state'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_class AS ring
+                  WHERE ring.relnamespace = n.oid
+                    AND ring.relname IN ('queue_ring_state', 'lease_ring_state', 'claim_ring_state')
+                    AND (
+                        ring.relkind <> 'r'
+                        OR NOT pg_has_role(current_user, ring.relowner, 'USAGE')
+                    )
+              )
+          )
+      )
+    ORDER BY n.nspname
+$discover$;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,

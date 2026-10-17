@@ -69,14 +69,7 @@ BEGIN
         SELECT c.oid::regclass
         FROM pg_class AS c
         JOIN pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS p
-              WHERE p.pronamespace = n.oid
-                AND p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
-          )
+        WHERE n.nspname IN (SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered)
           AND c.relkind IN ('r', 'p')
           AND c.relreplident <> 'f'
           AND c.relname ~ '^queue_terminal_(count_deltas(_[0-9]+)?|rollup_deltas)$'

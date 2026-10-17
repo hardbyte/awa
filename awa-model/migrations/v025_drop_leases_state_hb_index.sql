@@ -35,16 +35,7 @@ DECLARE
     v_slot TEXT;
 BEGIN
     FOR v_schema IN
-        SELECT n.nspname
-        FROM pg_namespace AS n
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS awa_p
-              WHERE awa_p.pronamespace = n.oid
-                AND awa_p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(awa_p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
-          )
+        SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered
     LOOP
         IF to_regclass(format('%I.leases', v_schema)) IS NULL THEN
             CONTINUE;

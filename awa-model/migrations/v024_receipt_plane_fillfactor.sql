@@ -124,16 +124,7 @@ BEGIN
     -- schema only during an in-flight transition), but stays inside
     -- AWA's ownership boundary.
     FOR v_schema IN
-        SELECT n.nspname
-        FROM pg_namespace AS n
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS awa_p
-              WHERE awa_p.pronamespace = n.oid
-                AND awa_p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(awa_p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
-          )
+        SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered
     LOOP
         -- The helper itself re-checks the sentinel and verifies the
         -- partitioned `leases` / `lease_claims` exist before doing

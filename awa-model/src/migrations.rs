@@ -66,6 +66,10 @@ pub struct MigrateOptions {
 /// Representation changes require a release-specific compatibility and
 /// authority-transition procedure.
 ///
+/// A step that loops over queue-storage schemas selects them with
+/// `awa.queue_storage_schemas()` and lists `V23_UP` first, so the helper
+/// exists even when upgrading from a schema installed by an older binary.
+///
 /// **v043 (#371) stays additive.** The ring cursors move to append-only
 /// `{ring}_ring_rotations` ledgers, but v043 is the *expand* phase of a
 /// staged rolling upgrade: it seeds the ledgers and **keeps** the compat
@@ -167,12 +171,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         24,
         "Lower fillfactor to 50 on leases and lease_claims partitions",
-        &[V24_UP],
+        &[V23_UP, V24_UP],
     ),
     (
         25,
         "Drop idx_<schema>_leases_<slot>_state_hb on all AWA substrates",
-        &[V25_UP],
+        &[V23_UP, V25_UP],
     ),
     (
         26,
@@ -198,12 +202,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         31,
         "Backfill failed done-entry metric indexes for queue storage",
-        &[V31_UP],
+        &[V23_UP, V31_UP],
     ),
     (
         32,
         "Add pruned_failed_count to queue_terminal_rollups for the failed terminal retention floor",
-        &[V32_UP],
+        &[V23_UP, V32_UP],
     ),
     (
         33,
@@ -218,7 +222,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         35,
         "Add per-slot receipt deadline-rescue cursors for queue storage",
-        &[V35_UP],
+        &[V23_UP, V35_UP],
     ),
     (
         36,

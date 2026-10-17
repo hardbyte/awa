@@ -23,6 +23,25 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
+## Custom-schema discovery during migration
+
+Migrations that refresh custom queue-storage schemas select them through
+`awa.queue_storage_schemas()`. A schema qualifies when it has the
+`claim_ready_runtime(text, bigint, double precision, double precision)`
+function and the migrating role holds `USAGE` membership in the owners of the
+schema, that function and the `queue_ring_state`, `lease_ring_state` and
+`claim_ring_state` tables, which must be ordinary tables. `public` and `pg_*`
+qualify only when their `claim_ready_runtime` is owned by the owner of the
+`awa` schema. The default `awa` schema always qualifies. Schemas prepared by
+the migrator, or by a role the migrator is a member of, through
+`awa storage prepare-queue-storage-schema` or `QueueStorage::prepare_schema`
+are unaffected. A custom schema prepared by an unrelated role is now skipped.
+To have it refreshed, grant that role to the migrator, or prepare the schema
+again as its owner after migrating.
+PostgreSQL superusers pass every role-membership test, so for a superuser
+migrator only the `public`/`pg_*` and table-kind checks apply. Run migrations
+as a dedicated owner role.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:
