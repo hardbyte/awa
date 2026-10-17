@@ -138,6 +138,8 @@ Run the broken correlated-hash witness with:
 
 ## Lock-order companion spec
 
+[`AwaUniqueClaimLockOrder.tla`](./AwaUniqueClaimLockOrder.tla) checks three row-level lock orders omitted by the partition-level model below. Its passing configurations cover a producer and DLQ retry acquiring a unique claim before the enqueue lane, two batches acquiring unique claims in key order, and pruning versus counter rebuild or reset acquiring the queue-ring singleton before the done child. The corresponding `*Broken.cfg` configurations reproduce a waits-for cycle for each old inverse order. Each scenario has two transactions and two exclusive resources; it checks ordering, while PostgreSQL integration tests cover the actual SQL paths.
+
 [`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models storage transactions, including queue preparation, enqueue, claim, rotate, and prune, as ordered Postgres lock acquisitions with a simplified shared/exclusive compatibility matrix. Invariants:
 
 - `NoDeadlock`: the waits-for graph is acyclic

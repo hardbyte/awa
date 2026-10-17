@@ -14109,6 +14109,385 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
     );
 }
 
+async fn wait_for_lock_wait(pool: &sqlx::PgPool, wait_event: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                SELECT 1 FROM pg_stat_activity \
+                WHERE datname = current_database() \
+                  AND pid <> pg_backend_pid() \
+                  AND wait_event_type = 'Lock' \
+                  AND wait_event = $1\
+            )",
+        )
+        .bind(wait_event)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to inspect transaction lock wait");
+        if waiting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "Expected {wait_event} lock wait");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn check_mixed_enqueue_unique_claim_order(use_copy: bool) {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = if use_copy {
+        "qs_mixed_claim_copy"
+    } else {
+        "qs_mixed_claim_batch"
+    };
+    let schema = if use_copy {
+        "awa_qs_mixed_claim_copy"
+    } else {
+        "awa_qs_mixed_claim_batch"
+    };
+    let store = Arc::new(create_store(&pool, schema).await);
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare enqueue lane");
+
+    let unique = UniqueOpts {
+        by_args: true,
+        states: (1 << JobState::Available.bit_position())
+            | (1 << JobState::Scheduled.bit_position()),
+        ..Default::default()
+    };
+    let ready_opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(unique.clone()),
+        ..Default::default()
+    };
+    let scheduled_opts = InsertOpts {
+        run_at: Some(Utc::now() + chrono::TimeDelta::days(1)),
+        ..ready_opts.clone()
+    };
+    let scheduled_key = insert::prepare_job_insert(&DlqJob { id: 22 }, scheduled_opts.clone())
+        .expect("Failed to prepare scheduled job")
+        .unique_key()
+        .expect("Expected scheduled unique key")
+        .to_vec();
+    let jobs = vec![
+        insert::params_with(&DlqJob { id: 11 }, ready_opts).expect("Failed to prepare ready job"),
+        insert::params_with(&DlqJob { id: 22 }, scheduled_opts)
+            .expect("Failed to prepare scheduled job"),
+    ];
+
+    let mut blocker = pool.begin().await.expect("Failed to start blocker");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(scheduled_key)
+        .bind(-1_i64)
+        .execute(blocker.as_mut())
+        .await
+        .expect("Failed to hold scheduled unique claim");
+
+    let enqueue_pool = pool.clone();
+    let enqueue_store = Arc::clone(&store);
+    let enqueue = tokio::spawn(async move {
+        if use_copy {
+            enqueue_store
+                .enqueue_params_copy(&enqueue_pool, &jobs)
+                .await
+        } else {
+            enqueue_store
+                .enqueue_params_batch(&enqueue_pool, &jobs)
+                .await
+        }
+    });
+    wait_for_lock_wait(&pool, "transactionid").await;
+
+    let lane_available: bool = sqlx::query_scalar(audited_sql(format!(
+        "SELECT pg_try_advisory_xact_lock(\
+            hashtextextended(format('%I.%I', $1::text, seq_name), 0)\
+        ) FROM {schema}.queue_enqueue_heads \
+        WHERE queue = $2 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(schema)
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to probe enqueue lane reservation");
+    assert!(
+        lane_available,
+        "Enqueue lane was reserved before all unique claims"
+    );
+
+    blocker.rollback().await.expect("Failed to release blocker");
+    let inserted = tokio::time::timeout(Duration::from_secs(5), enqueue)
+        .await
+        .expect("Enqueue remained blocked")
+        .expect("Enqueue task panicked")
+        .expect("Enqueue failed");
+    assert_eq!(inserted, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_mixed_batch_claims_unique_before_lane() {
+    check_mixed_enqueue_unique_claim_order(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_mixed_copy_claims_unique_before_lane() {
+    check_mixed_enqueue_unique_claim_order(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_dlq_retry_claims_unique_before_lane() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_dlq_retry_claim_order";
+    let schema = "awa_qs_dlq_retry_claim_order";
+    let store = create_store(&pool, schema).await;
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare retry lane");
+    let original_id = enqueue_job(
+        &pool,
+        &store,
+        &DlqJob { id: 23 },
+        available_unique_insert_opts(queue),
+    )
+    .await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        },
+        TerminalFailureWorker,
+    );
+    client
+        .start()
+        .await
+        .expect("Failed to start failure worker");
+    wait_for_job_state(
+        &store,
+        &pool,
+        original_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    client.shutdown(Duration::from_secs(5)).await;
+    awa::model::dlq::move_failed_to_dlq(&pool, original_id, "claim_order")
+        .await
+        .expect("Failed to move row to DLQ")
+        .expect("Expected DLQ row");
+
+    let unique_key: Vec<u8> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT unique_key FROM {schema}.dlq_entries WHERE job_id = $1"
+    )))
+    .bind(original_id)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read DLQ unique key");
+    let mut blocker = pool.begin().await.expect("Failed to start blocker");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(unique_key)
+        .bind(-1_i64)
+        .execute(blocker.as_mut())
+        .await
+        .expect("Failed to hold DLQ unique claim");
+
+    let retry_pool = pool.clone();
+    let retry = tokio::spawn(async move {
+        awa::model::dlq::retry_from_dlq(
+            &retry_pool,
+            original_id,
+            &awa::model::RetryFromDlqOpts::default(),
+        )
+        .await
+    });
+    wait_for_lock_wait(&pool, "transactionid").await;
+
+    let lane_available: bool = sqlx::query_scalar(audited_sql(format!(
+        "SELECT pg_try_advisory_xact_lock(\
+            hashtextextended(format('%I.%I', $1::text, seq_name), 0)\
+        ) FROM {schema}.queue_enqueue_heads \
+        WHERE queue = $2 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(schema)
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to probe retry lane reservation");
+    assert!(
+        lane_available,
+        "Retry reserved the lane before its unique claim"
+    );
+
+    blocker.rollback().await.expect("Failed to release blocker");
+    let retried = tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .expect("DLQ retry remained blocked")
+        .expect("DLQ retry task panicked")
+        .expect("DLQ retry failed");
+    assert!(retried.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_batch_claims_unique_keys_in_key_order() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let store = Arc::new(create_store(&pool, "awa_qs_batch_claim_key_order").await);
+    let opts = InsertOpts {
+        queue: "qs_batch_claim_key_order".to_string(),
+        unique: Some(UniqueOpts {
+            by_args: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let first = DlqJob { id: 31 };
+    let second = DlqJob { id: 32 };
+    let first_key = insert::prepare_job_insert(&first, opts.clone())
+        .expect("Failed to prepare first job")
+        .unique_key()
+        .expect("Expected first unique key")
+        .to_vec();
+    let second_key = insert::prepare_job_insert(&second, opts.clone())
+        .expect("Failed to prepare second job")
+        .unique_key()
+        .expect("Expected second unique key")
+        .to_vec();
+    let (low_job, low_key, high_job, high_key) = if first_key < second_key {
+        (first, first_key, second, second_key)
+    } else {
+        (second, second_key, first, first_key)
+    };
+    let jobs = vec![
+        insert::params_with(&high_job, opts.clone()).expect("Failed to prepare high-key job"),
+        insert::params_with(&low_job, opts).expect("Failed to prepare low-key job"),
+    ];
+
+    let mut blocker = pool.begin().await.expect("Failed to start blocker");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(low_key)
+        .bind(-1_i64)
+        .execute(blocker.as_mut())
+        .await
+        .expect("Failed to hold low unique key");
+    let enqueue_pool = pool.clone();
+    let enqueue_store = Arc::clone(&store);
+    let enqueue = tokio::spawn(async move {
+        enqueue_store
+            .enqueue_params_batch(&enqueue_pool, &jobs)
+            .await
+    });
+    wait_for_lock_wait(&pool, "transactionid").await;
+
+    let mut probe = pool.begin().await.expect("Failed to start high-key probe");
+    sqlx::query("SET LOCAL lock_timeout = '100ms'")
+        .execute(probe.as_mut())
+        .await
+        .expect("Failed to set probe lock timeout");
+    sqlx::query("INSERT INTO awa.job_unique_claims (unique_key, job_id) VALUES ($1, $2)")
+        .bind(high_key)
+        .bind(-2_i64)
+        .execute(probe.as_mut())
+        .await
+        .expect("High unique key was claimed before low key");
+    probe
+        .rollback()
+        .await
+        .expect("Failed to close high-key probe");
+
+    blocker.rollback().await.expect("Failed to release blocker");
+    let inserted = tokio::time::timeout(Duration::from_secs(5), enqueue)
+        .await
+        .expect("Batch enqueue remained blocked")
+        .expect("Batch enqueue task panicked")
+        .expect("Batch enqueue failed");
+    assert_eq!(inserted, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_counter_rebuild_locks_ring_before_done_table() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_rebuild_lock_order";
+    let store = Arc::new(create_store(&pool, schema).await);
+
+    let mut blocker = pool.begin().await.expect("Failed to start blocker");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries IN ACCESS SHARE MODE"
+    )))
+    .execute(blocker.as_mut())
+    .await
+    .expect("Failed to hold done table lock");
+
+    let rebuild_pool = pool.clone();
+    let rebuild_store = Arc::clone(&store);
+    let rebuild =
+        tokio::spawn(async move { rebuild_store.rebuild_terminal_counters(&rebuild_pool).await });
+    wait_for_lock_wait(&pool, "relation").await;
+
+    let mut probe = pool.begin().await.expect("Failed to start probe");
+    let lock_result = sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE NOWAIT"
+    )))
+    .execute(probe.as_mut())
+    .await;
+    assert!(
+        matches!(lock_result, Err(sqlx::Error::Database(ref error)) if error.code().as_deref() == Some("55P03")),
+        "Counter rebuild should hold the ring singleton before waiting on done_entries: {lock_result:?}"
+    );
+    probe.rollback().await.expect("Failed to close probe");
+
+    blocker.rollback().await.expect("Failed to release blocker");
+    tokio::time::timeout(Duration::from_secs(5), rebuild)
+        .await
+        .expect("Counter rebuild remained blocked")
+        .expect("Counter rebuild task panicked")
+        .expect("Counter rebuild failed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_reset_locks_ring_before_done_table() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_reset_lock_order";
+    let store = Arc::new(create_store(&pool, schema).await);
+
+    let mut blocker = pool.begin().await.expect("Failed to start blocker");
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries IN ACCESS SHARE MODE"
+    )))
+    .execute(blocker.as_mut())
+    .await
+    .expect("Failed to hold done table lock");
+
+    let reset_pool = pool.clone();
+    let reset_store = Arc::clone(&store);
+    let reset = tokio::spawn(async move { reset_store.reset(&reset_pool).await });
+    wait_for_lock_wait(&pool, "relation").await;
+
+    let mut probe = pool.begin().await.expect("Failed to start probe");
+    let lock_result = sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE NOWAIT"
+    )))
+    .execute(probe.as_mut())
+    .await;
+    assert!(
+        matches!(lock_result, Err(sqlx::Error::Database(ref error)) if error.code().as_deref() == Some("55P03")),
+        "Reset should hold the ring singleton before waiting on done_entries: {lock_result:?}"
+    );
+    probe.rollback().await.expect("Failed to close probe");
+
+    blocker.rollback().await.expect("Failed to release blocker");
+    tokio::time::timeout(Duration::from_secs(5), reset)
+        .await
+        .expect("Reset remained blocked")
+        .expect("Reset task panicked")
+        .expect("Reset failed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
     let (_db_guard, pool) = setup_pool(10).await;

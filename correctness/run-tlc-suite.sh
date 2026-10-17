@@ -38,6 +38,12 @@ AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pas
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueue.cfg     ;; pass ;; prepared lanes and producer lock order
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueueNumeric.cfg ;; NoDeadlock is violated ;; numeric stripe order inversion witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrder.cfg            ;; pass ;; unique claim before enqueue lane
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrderBroken.cfg      ;; NoDeadlock is violated ;; old retry lane-before-claim witness
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKey.cfg             ;; pass ;; unique claims in key order
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKeyBroken.cfg       ;; NoDeadlock is violated ;; reversed batch key-order witness
+AwaUniqueClaimLockOrder.tla    ;; AwaCounterRebuildLockOrder.cfg         ;; pass ;; ring singleton before terminal table
+AwaUniqueClaimLockOrder.tla    ;; AwaCounterRebuildLockOrderBroken.cfg   ;; NoDeadlock is violated ;; old rebuild order witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + 0.7 migrate gate
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence

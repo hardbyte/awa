@@ -2096,6 +2096,7 @@ impl ReadyJobLeaseRow {
 
 #[derive(Debug, Clone)]
 struct RuntimeReadyRow {
+    job_id: Option<i64>,
     kind: String,
     queue: String,
     args: serde_json::Value,
@@ -3109,7 +3110,7 @@ impl QueueStorage {
             ),
             inserted AS (
                 INSERT INTO awa.job_unique_claims (unique_key, job_id)
-                SELECT unique_key, job_id FROM input
+                SELECT unique_key, job_id FROM input ORDER BY unique_key
                 ON CONFLICT (unique_key)
                 DO UPDATE SET job_id = EXCLUDED.job_id
                 WHERE awa.job_unique_claims.job_id = EXCLUDED.job_id
@@ -3162,6 +3163,28 @@ impl QueueStorage {
             .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id)))
             .collect();
         self.sync_enqueue_unique_claims(tx, claims).await
+    }
+
+    fn batch_enqueue_unique_claims(
+        ready_rows: &[RuntimeReadyRow],
+        deferred_rows: &[DeferredJobRow],
+    ) -> Vec<(Vec<u8>, i64)> {
+        let ready_claims = ready_rows
+            .iter()
+            .filter(|row| unique_state_claims(row.unique_states.as_deref(), JobState::Available))
+            .filter_map(|row| {
+                row.unique_key.as_ref().map(|key| {
+                    (
+                        key.clone(),
+                        row.job_id.expect("batch ready job id is assigned"),
+                    )
+                })
+            });
+        let deferred_claims = deferred_rows
+            .iter()
+            .filter(|row| unique_state_claims(row.unique_states.as_deref(), row.state))
+            .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id)));
+        ready_claims.chain(deferred_claims).collect()
     }
 
     /// Idempotently install the queue-storage substrate (schema, tables,
@@ -3573,7 +3596,24 @@ impl QueueStorage {
 
     pub async fn reset(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
+        let install_lock_name = format!("awa.queue_storage.install:{schema}");
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&install_lock_name)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        for family in [RingFamily::Queue, RingFamily::Lease, RingFamily::Claim] {
+            let state = family.state_relname();
+            sqlx::query(audited_sql(format!(
+                "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
+            )))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
 
         // Drop any partial-migration leftover tables before the main
         // TRUNCATE. If `prepare_schema` crashed mid-migration, the
@@ -4784,6 +4824,7 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<RuntimeReadyRow>,
+        unique_claims_synced: bool,
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
@@ -4791,7 +4832,12 @@ impl QueueStorage {
 
         let grouped = self.group_ready_rows_by_shard(tx, rows).await?;
         let total_rows: usize = grouped.values().map(Vec::len).sum();
-        let job_ids = self.next_job_ids(tx, total_rows).await?;
+        let missing_job_ids = grouped
+            .values()
+            .flatten()
+            .filter(|row| row.job_id.is_none())
+            .count();
+        let job_ids = self.next_job_ids(tx, missing_job_ids).await?;
         let mut job_id_iter = job_ids.into_iter();
 
         let mut ready_rows = Vec::with_capacity(total_rows);
@@ -4801,9 +4847,14 @@ impl QueueStorage {
             let range_start = ready_rows.len();
 
             for row in lane_rows {
-                let job_id = job_id_iter.next().ok_or_else(|| {
-                    AwaError::Validation("queue storage job id allocation underflow".to_string())
-                })?;
+                let job_id = match row.job_id {
+                    Some(job_id) => job_id,
+                    None => job_id_iter.next().ok_or_else(|| {
+                        AwaError::Validation(
+                            "queue storage job id allocation underflow".to_string(),
+                        )
+                    })?,
+                };
                 ready_rows.push(RuntimeReadyInsert {
                     job_id,
                     kind: row.kind,
@@ -4832,8 +4883,10 @@ impl QueueStorage {
             ));
         }
 
-        self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
-            .await?;
+        if !unique_claims_synced {
+            self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
+                .await?;
+        }
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
                 .await?;
@@ -4920,7 +4973,7 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<RuntimeReadyRow>,
-        job_ids: Vec<i64>,
+        unique_claims_synced: bool,
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
@@ -4929,11 +4982,12 @@ impl QueueStorage {
         let grouped = self.group_ready_rows_by_shard(tx, rows).await?;
 
         let total_rows: usize = grouped.values().map(Vec::len).sum();
-        if job_ids.len() != total_rows {
-            return Err(AwaError::Validation(
-                "queue storage job id allocation count mismatch".to_string(),
-            ));
-        }
+        let missing_job_ids = grouped
+            .values()
+            .flatten()
+            .filter(|row| row.job_id.is_none())
+            .count();
+        let job_ids = self.next_job_ids(tx, missing_job_ids).await?;
         let mut job_id_iter = job_ids.into_iter();
 
         let mut ready_rows = Vec::with_capacity(total_rows);
@@ -4943,9 +4997,14 @@ impl QueueStorage {
             let range_start = ready_rows.len();
 
             for row in lane_rows {
-                let job_id = job_id_iter.next().ok_or_else(|| {
-                    AwaError::Validation("queue storage job id allocation underflow".to_string())
-                })?;
+                let job_id = match row.job_id {
+                    Some(job_id) => job_id,
+                    None => job_id_iter.next().ok_or_else(|| {
+                        AwaError::Validation(
+                            "queue storage job id allocation underflow".to_string(),
+                        )
+                    })?,
+                };
                 ready_rows.push(RuntimeReadyInsert {
                     job_id,
                     kind: row.kind,
@@ -4974,8 +5033,10 @@ impl QueueStorage {
             ));
         }
 
-        self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
-            .await?;
+        if !unique_claims_synced {
+            self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
+                .await?;
+        }
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
                 .await?;
@@ -5003,6 +5064,24 @@ impl QueueStorage {
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
+        }
+
+        let mut unique_rows: Vec<&ExistingReadyRow> = rows.iter().collect();
+        unique_rows.sort_unstable_by(|left, right| {
+            left.unique_key
+                .cmp(&right.unique_key)
+                .then(left.job_id.cmp(&right.job_id))
+        });
+        for row in unique_rows {
+            self.sync_unique_claim(
+                tx,
+                row.job_id,
+                &row.unique_key,
+                row.unique_states.as_deref(),
+                old_state,
+                Some(JobState::Available),
+            )
+            .await?;
         }
 
         let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
@@ -5035,15 +5114,6 @@ impl QueueStorage {
                 .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
-                self.sync_unique_claim(
-                    tx,
-                    row.job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    old_state,
-                    Some(JobState::Available),
-                )
-                .await?;
                 ready_rows.push(RuntimeReadyInsert {
                     job_id: row.job_id,
                     kind: row.kind,
@@ -5084,7 +5154,13 @@ impl QueueStorage {
         if old_state.is_none() {
             self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
         } else {
-            for row in &rows {
+            let mut unique_rows: Vec<&DeferredJobRow> = rows.iter().collect();
+            unique_rows.sort_unstable_by(|left, right| {
+                left.unique_key
+                    .cmp(&right.unique_key)
+                    .then(left.job_id.cmp(&right.job_id))
+            });
+            for row in unique_rows {
                 self.sync_unique_claim(
                     tx,
                     row.job_id,
@@ -5148,12 +5224,15 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<DeferredJobRow>,
+        unique_claims_synced: bool,
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
         }
 
-        self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
+        if !unique_claims_synced {
+            self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
+        }
         if rows.len() < COPY_MIN_ROWS {
             return self.execute_deferred_inserts_tx(tx, &rows).await;
         }
@@ -5201,7 +5280,13 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        for row in rows {
+        let mut unique_rows: Vec<&DoneJobRow> = rows.iter().collect();
+        unique_rows.sort_unstable_by(|left, right| {
+            left.unique_key
+                .cmp(&right.unique_key)
+                .then(left.job_id.cmp(&right.job_id))
+        });
+        for row in unique_rows {
             self.sync_unique_claim(
                 tx,
                 row.job_id,
@@ -5665,7 +5750,13 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        for row in rows {
+        let mut unique_rows: Vec<&DlqJobRow> = rows.iter().collect();
+        unique_rows.sort_unstable_by(|left, right| {
+            left.unique_key
+                .cmp(&right.unique_key)
+                .then(left.job_id.cmp(&right.job_id))
+        });
+        for row in unique_rows {
             self.sync_unique_claim(
                 tx,
                 row.job_id,
@@ -5875,7 +5966,9 @@ impl QueueStorage {
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let total_rows = self.insert_ready_rows_tx(&mut tx, rows.clone()).await?;
+        let total_rows = self
+            .insert_ready_rows_tx(&mut tx, rows.clone(), false)
+            .await?;
 
         let queues_to_notify: Vec<String> = rows.iter().map(|row| row.queue.clone()).collect();
         self.notify_queues_tx(&mut tx, queues_to_notify).await?;
@@ -5897,6 +5990,7 @@ impl QueueStorage {
 
         let rows: Vec<_> = (0..count)
             .map(|seq| RuntimeReadyRow {
+                job_id: None,
                 kind: "bench_job".to_string(),
                 queue: if self.uses_queue_striping() && !self.is_physical_stripe_queue(queue) {
                     self.physical_queue_for_stripe(
@@ -5945,6 +6039,7 @@ impl QueueStorage {
                 self.queue_stripe_for_enqueue(&prepared.queue, &prepared.unique_key, idx as i64);
 
             let ready_row = RuntimeReadyRow {
+                job_id: None,
                 kind: prepared.kind,
                 queue: queue.clone(),
                 args: prepared.args,
@@ -5993,21 +6088,31 @@ impl QueueStorage {
             ready_rows.iter().map(|row| row.queue.clone()).collect();
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let job_ids = self
+            .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
+            .await?;
+        let (ready_job_ids, deferred_job_ids) = job_ids.split_at(ready_rows.len());
+        for (row, job_id) in ready_rows.iter_mut().zip(ready_job_ids) {
+            row.job_id = Some(*job_id);
+        }
+        let deferred_rows: Vec<_> = deferred_rows
+            .into_iter()
+            .zip(deferred_job_ids.iter().copied())
+            .map(|(row, job_id)| DeferredJobRow { job_id, ..row })
+            .collect();
+        let unique_claims = Self::batch_enqueue_unique_claims(&ready_rows, &deferred_rows);
+        self.sync_enqueue_unique_claims(&mut tx, unique_claims)
+            .await?;
+
         let mut total = 0usize;
         if !ready_rows.is_empty() {
             total += self
-                .insert_ready_rows_tx(&mut tx, ready_rows.clone())
+                .insert_ready_rows_tx(&mut tx, ready_rows.clone(), true)
                 .await?;
         }
         if !deferred_rows.is_empty() {
-            let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
-            let deferred_rows: Vec<_> = deferred_rows
-                .into_iter()
-                .zip(ids)
-                .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
-                .collect();
             total += self
-                .insert_deferred_rows_tx(&mut tx, deferred_rows, None)
+                .execute_deferred_inserts_tx(&mut tx, &deferred_rows)
                 .await?;
         }
 
@@ -6044,6 +6149,7 @@ impl QueueStorage {
                 self.queue_stripe_for_enqueue(&prepared.queue, &prepared.unique_key, idx as i64);
 
             let ready_row = RuntimeReadyRow {
+                job_id: None,
                 kind: prepared.kind,
                 queue: queue.clone(),
                 args: prepared.args,
@@ -6097,19 +6203,26 @@ impl QueueStorage {
             .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
             .await?;
         let (ready_job_ids, deferred_job_ids) = job_ids.split_at(ready_rows.len());
+        for (row, job_id) in ready_rows.iter_mut().zip(ready_job_ids) {
+            row.job_id = Some(*job_id);
+        }
+        let deferred_rows: Vec<_> = deferred_rows
+            .into_iter()
+            .zip(deferred_job_ids.iter().copied())
+            .map(|(row, job_id)| DeferredJobRow { job_id, ..row })
+            .collect();
+        let unique_claims = Self::batch_enqueue_unique_claims(&ready_rows, &deferred_rows);
+        self.sync_enqueue_unique_claims(&mut tx, unique_claims)
+            .await?;
+
         if !ready_rows.is_empty() {
             total += self
-                .insert_ready_rows_copy_tx(&mut tx, ready_rows, ready_job_ids.to_vec())
+                .insert_ready_rows_copy_tx(&mut tx, ready_rows, true)
                 .await?;
         }
         if !deferred_rows.is_empty() {
-            let deferred_rows: Vec<_> = deferred_rows
-                .into_iter()
-                .zip(deferred_job_ids.iter().copied())
-                .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
-                .collect();
             total += self
-                .insert_deferred_rows_copy_tx(&mut tx, deferred_rows)
+                .insert_deferred_rows_copy_tx(&mut tx, deferred_rows, true)
                 .await?;
         }
 
@@ -6270,7 +6383,13 @@ impl QueueStorage {
                 .await?,
         );
 
-        for row in &claimed {
+        let mut unique_claimed: Vec<&ReadyJobLeaseRow> = claimed.iter().collect();
+        unique_claimed.sort_unstable_by(|left, right| {
+            left.unique_key
+                .cmp(&right.unique_key)
+                .then(left.job_id.cmp(&right.job_id))
+        });
+        for row in unique_claimed {
             self.sync_unique_claim(
                 &mut tx,
                 row.job_id,
@@ -14621,25 +14740,34 @@ impl QueueStorage {
         )
         .await?;
 
-        for row in &deleted_done {
+        let mut unique_releases: Vec<_> = deleted_done
+            .iter()
+            .map(|row| {
+                (
+                    row.job_id,
+                    &row.unique_key,
+                    row.unique_states.as_deref(),
+                    row.state,
+                )
+            })
+            .chain(deleted_dlq.iter().map(|row| {
+                (
+                    row.job_id,
+                    &row.unique_key,
+                    row.unique_states.as_deref(),
+                    row.state,
+                )
+            }))
+            .collect();
+        unique_releases
+            .sort_unstable_by(|left, right| left.1.cmp(right.1).then(left.0.cmp(&right.0)));
+        for (job_id, unique_key, unique_states, state) in unique_releases {
             self.sync_unique_claim(
                 &mut tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                Some(row.state),
-                None,
-            )
-            .await?;
-        }
-
-        for row in &deleted_dlq {
-            self.sync_unique_claim(
-                &mut tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                Some(row.state),
+                job_id,
+                unique_key,
+                unique_states,
+                Some(state),
                 None,
             )
             .await?;
@@ -15504,14 +15632,28 @@ impl QueueStorage {
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rebuild_terminal_counters")]
     pub async fn rebuild_terminal_counters(&self, pool: &PgPool) -> Result<i64, AwaError> {
         let schema = self.schema();
+        let install_lock_name = format!("awa.queue_storage.install:{schema}");
         let rebuild_lock_name = format!("awa.queue_storage.rebuild_terminal_counters:{schema}");
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&install_lock_name)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&rebuild_lock_name)
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+
+        sqlx::query(audited_sql(format!(
+            "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"
+        )))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         sqlx::query(audited_sql(format!(
             "LOCK TABLE {schema}.done_entries, \
