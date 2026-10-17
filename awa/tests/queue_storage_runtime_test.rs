@@ -16991,7 +16991,11 @@ async fn binary_first_claim_shape_and_cursor_interoperation(receipts: bool) {
         .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
         .await
         .unwrap();
-    assert_eq!(third.len(), 1);
+    assert_eq!(
+        third.len(),
+        1,
+        "the claim after a post-commit advance returns the next ready row"
+    );
     let last = store
         .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
         .await

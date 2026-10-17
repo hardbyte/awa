@@ -6,7 +6,6 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
-- Runtimes advance the lane claim cursor after every committed claim again. Omitting the advance for a non-drained lane left the cursor behind whenever an enqueue reservation was open; the lane's claimed segment then ranked first on the next claim, the catch-up found nothing and the claim returned empty while another lane held ready rows. The v048 in-claim catch-up remains the recovery path for advances that never ran.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
@@ -14,7 +13,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - Ring rotation uses a five-second observed fill window or a 2 MiB total physical-size target before sealing a non-empty slot. Empty slots can advance immediately to reclaim sealed history. `RingRotationCadence::EAGER` restores rotation on every tick; the size target is sampled and does not impose a storage limit. See [#518](https://github.com/hardbyte/awa/issues/518).
 - Finished attempts retry lease-guarded finalization after connection loss or pool-acquire timeouts within a 120 s deadline, reducing avoidable heartbeat rescue and handler re-execution after outages. Pending finalizers have a bounded budget sized for workers and completion batching, and drain during shutdown; a newer lease fences stale retries. Counted by `awa.completion.reconnect_retry`.
 
-- v048 catches claim cursors up from committed same-lane, same-generation attempt evidence. Current binaries retain guarded post-commit advances against pre-v048 schemas and use the old result shape until migration. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
+- v048 catches claim cursors up from committed same-lane, same-generation attempt evidence inside the claim, so a post-commit advance that never ran (for example because the claimer stopped between commit and advance) no longer leaves the lane behind. Runtimes still advance the cursor after every committed claim, on pre-v048 and v048 schemas alike. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 
 - Ring prune and lease rotation distinguish bounded empty-index overhead from reclaimable heap, index and TOAST storage, including VACUUM-emptied materialized lease partitions. Child locks and lifecycle prune proofs remain unchanged.
 - BRIN empty-FSM allowances follow server block size, including four-level FSM trees on 1/2 KiB PostgreSQL builds.
