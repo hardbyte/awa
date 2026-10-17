@@ -30,16 +30,6 @@ impl QueueStorageRuntime {
             rotation_cadence: RingRotationCadence::default(),
         })
     }
-
-    pub fn with_claim_rotate_interval(mut self, claim_rotate_interval: Duration) -> Self {
-        self.claim_rotate_interval = claim_rotate_interval;
-        self
-    }
-
-    pub fn with_rotation_cadence(mut self, rotation_cadence: RingRotationCadence) -> Self {
-        self.rotation_cadence = rotation_cadence;
-        self
-    }
 }
 
 #[derive(Debug, Clone, Default)]

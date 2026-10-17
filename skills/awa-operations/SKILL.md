@@ -263,6 +263,7 @@ observed fill window and a 2 MiB total physical-size target by default. Python
 exposes `queue_storage_rotate_min_slot_age_ms` and
 `queue_storage_rotate_target_slot_bytes`. A zero byte target disables the size
 trigger; zero age or Rust `RingRotationCadence::EAGER` permits sealing each tick.
+Rust cadence and claim-interval overrides survive `queue_storage` calls in either order.
 Empty slots bypass the fill window so reclamation can continue after drain.
 Leader changes reset the local monotonic fill timers. The size is sampled and
 can be exceeded by bursts or blocked reuse; use actual retained storage and
