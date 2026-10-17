@@ -4,6 +4,7 @@ use sqlx::{Executor, PgPool};
 use std::str::FromStr;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+const SCHEMAS: [&str; 3] = ["awa", "custom_lanes", "custom_legacy"];
 
 #[tokio::test]
 async fn runtime_uses_prepared_lane_sequences_without_schema_create() -> TestResult {
@@ -45,20 +46,26 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
         .max_connections(2)
         .connect_with(options.clone().username(owner))
         .await?;
-    for (_, _, statement) in migrations::migration_sql_range(0, 46) {
+    for (_, _, statement) in migrations::migration_sql_range(0, 48) {
         owner_pool
             .execute(sqlx::raw_sql(awa_model::audited_sql(statement)))
             .await?;
     }
-    for schema in ["awa", "custom_lanes"] {
+    let mut schema_shapes_before = Vec::new();
+    for schema in SCHEMAS {
         if schema != "awa" {
             QueueStorage::new(QueueStorageConfig {
                 schema: schema.into(),
+                queue_slot_count: 6,
+                lease_slot_count: 4,
+                claim_slot_count: 3,
+                lease_claim_receipts: schema != "custom_legacy",
                 ..Default::default()
             })?
             .prepare_schema(&owner_pool)
             .await?;
         }
+        schema_shapes_before.push(schema_snapshot(&owner_pool, schema).await?);
         let legacy_helper =
             include_str!("fixtures/v046_ensure_lane_sequences.sql").replace("__schema__", schema);
         owner_pool
@@ -73,7 +80,7 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
             SELECT {schema}.ensure_lane_sequences('prepared_queue', 2::smallint, 0::smallint);
         "#)))).await?;
     }
-    for schema in ["awa", "custom_lanes"] {
+    for schema in SCHEMAS {
         let store = QueueStorage::new(QueueStorageConfig {
             schema: schema.into(),
             queue_stripe_count: 2,
@@ -100,7 +107,7 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
         .max_connections(2)
         .connect_with(options.username(runtime))
         .await?;
-    for schema in ["awa", "custom_lanes"] {
+    for schema in SCHEMAS {
         let error = runtime_pool
             .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
                 "SELECT {schema}.ensure_lane_sequences('prepared_queue', 2::smallint, 0::smallint)"
@@ -113,7 +120,8 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
         );
     }
     migrations::run(&owner_pool).await?;
-    for schema in ["awa", "custom_lanes"] {
+    for (schema, shape_before) in SCHEMAS.into_iter().zip(schema_shapes_before) {
+        assert_eq!(schema_snapshot(&owner_pool, schema).await?, shape_before);
         check_runtime(&runtime_pool, schema).await?;
         let cursor_sql = format!("SELECT {schema}.sequence_next_value(seq_name) FROM {schema}.queue_enqueue_heads WHERE queue='prepared_queue' AND priority=2 AND enqueue_shard=0");
         let before: i64 = sqlx::query_scalar(awa_model::audited_sql(cursor_sql.clone()))
@@ -130,8 +138,47 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
             .await?;
         assert_eq!(before, after);
     }
+    assert_no_head_table_ddl_locks(&owner_pool).await?;
     runtime_pool.close().await;
     owner_pool.close().await;
+    Ok(())
+}
+
+async fn schema_snapshot(
+    pool: &PgPool,
+    schema: &str,
+) -> Result<(i32, i32, i32, String), sqlx::Error> {
+    sqlx::query_as(awa_model::audited_sql(format!(
+        "SELECT \
+            (SELECT slot_count FROM {schema}.queue_ring_state WHERE singleton), \
+            (SELECT slot_count FROM {schema}.lease_ring_state WHERE singleton), \
+            (SELECT slot_count FROM {schema}.claim_ring_state WHERE singleton), \
+            pg_get_functiondef('{schema}.claim_ready_runtime(text,bigint,double precision,double precision)'::regprocedure)"
+    )))
+    .fetch_one(pool)
+    .await
+}
+
+async fn assert_no_head_table_ddl_locks(pool: &PgPool) -> TestResult {
+    let mut transaction = pool.begin().await?;
+    for (_, _, statement) in migrations::migration_sql_range(48, 49) {
+        transaction
+            .execute(sqlx::raw_sql(awa_model::audited_sql(statement)))
+            .await?;
+    }
+    let exclusive_locks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks \
+         WHERE pid = pg_backend_pid() AND mode = 'AccessExclusiveLock' \
+           AND relation IN ( \
+             'awa.queue_enqueue_heads'::regclass, 'awa.queue_claim_heads'::regclass, \
+             'custom_lanes.queue_enqueue_heads'::regclass, 'custom_lanes.queue_claim_heads'::regclass, \
+             'custom_legacy.queue_enqueue_heads'::regclass, 'custom_legacy.queue_claim_heads'::regclass \
+           )",
+    )
+    .fetch_one(transaction.as_mut())
+    .await?;
+    assert_eq!(exclusive_locks, 0);
+    transaction.rollback().await?;
     Ok(())
 }
 

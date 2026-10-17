@@ -65,7 +65,7 @@ If an existing installation created objects as `awa_migrator` without first sett
 
 ## Provision queues before starting restricted runtimes
 
-From schema v047, runtime calls use existing lane sequences without issuing
+From schema v049, runtime calls use existing lane sequences without issuing
 `CREATE SEQUENCE`. Run provisioning as the migrator for every queue before
 starting its producers or workers:
 
@@ -85,7 +85,7 @@ physical queue. Use `--schema` for a custom storage schema.
 Apply the sequence grants above after provisioning, or set the owner's default
 privileges first. Lane cursors need `UPDATE` for `setval`, in addition to `USAGE`
 and `SELECT`. `CREATE SEQUENCE IF NOT EXISTS` requires schema CREATE even when
-the sequence already exists, so provisioning alone does not repair pre-v047
+the sequence already exists, so provisioning alone does not repair pre-v049
 helpers: apply the migration first. Schema owners retain lazy creation for
 single-role installations; a restricted runtime encountering an unprepared
 lane fails with a provisioning hint.

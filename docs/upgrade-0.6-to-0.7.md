@@ -3,9 +3,9 @@
 The 0.6 → 0.7 upgrade is short: **the storage step is "be finalized."** Everything else in
 0.7 is additive.
 
-## Restricted runtime roles and v047
+## Restricted runtime roles and v049
 
-v047 refreshes lane-sequence helpers in the default and existing custom
+v049 refreshes lane-sequence helpers in the default and existing custom
 queue-storage schemas without changing function signatures or cursor semantics.
 Existing provisioned lanes run without schema CREATE; single-role owners retain
 lazy creation. The migration adds no runtime version gate or authority flip.
@@ -14,10 +14,13 @@ A [migrate-first rehearsal with released `awa-pg==0.6.7`](https://github.com/har
 verified a restricted worker completing jobs on the upgraded schema. That
 rehearsal does not cover concurrent mixed-version rollouts.
 
-For a runtime without DDL privileges, apply v047 as the migrator, run
+For a runtime without DDL privileges, apply v049 as the migrator, run
 `awa storage prepare-queue --queue <name>` for every physical queue, and grant
 sequence `USAGE, SELECT, UPDATE` before starting producers or workers. Match
 shard and stripe counts and provision extra lanes before increasing them.
+External migration runners must apply the complete generated
+`awa migrate --sql --from 48 --to 49` bundle: it refreshes the installer
+definition before replacing lane helpers in the installed schemas.
 See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
 ## The one gate
@@ -212,8 +215,8 @@ Schema USAGE alone does not permit ALTER TABLE. Discovery uses the full
 and skips unrelated same-named functions.
 
 Use `awa migrate` or the generated version bundle. For an external runner,
-`awa migrate --sql --from 46 --to 47` emits V23_UP followed by the v047 tail,
-including installer refresh and canonical substrate replay. Raw v047 is only
+`awa migrate --sql --from 46 --to 47` emits the installer definition and
+default-substrate replay followed by the v047 tail. Raw v047 is only
 that tail. The default SQL export wraps a transaction and migration advisory lock,
 but does not run Rust runtime/cron preflights. External runners must perform the
 documented cron preflight below before installer replay:
@@ -309,9 +312,9 @@ capable fleet agreement, while removals additionally wait through grace.
 Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds `lane_drained` and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.
 
 For v048 use `awa migrate` or the complete generated
-`awa migrate --sql --from 47 --to 48` bundle. It includes V23_UP to replace the
-installer definition and replay the canonical substrate before the v048 tail
-reinstalls custom substrates. Raw `v048_claim_cursor_catch_up.sql` alone calls
+`awa migrate --sql --from 47 --to 48` bundle. It includes the installer
+definition and default-substrate replay before the v048 tail reinstalls custom
+substrates. Raw `v048_claim_cursor_catch_up.sql` alone calls
 whatever installer is already stored in the database; it does not supply the
 new function definition. The generated bundle path supplies that dependency.
 The same table-lock, ownership, external preflight and timeout/retry requirements
