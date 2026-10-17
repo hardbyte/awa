@@ -76,14 +76,16 @@ for each step.
 
 ### Changed
 
-- Heartbeats for compact receipt claims address `lease_claim_batches` by the
-  claim's batch identity (`ClaimHeartbeatRef`) instead of unnesting every open
-  batch under `FOR UPDATE`, so a heartbeat tick costs O(in-flight attempts)
-  and no longer blocks failures on the batches it touches.
-- The claim CTE runs in per-queue-slot functions (`claim_ready_slot_N`, v051)
-  that address the slot's ring children directly, so claim statements plan
-  against one child, keep a generic plan, and are only invalidated when that
-  child is truncated instead of on every ring rotation.
+- Heartbeats no longer scan or lock every open claim batch. Each tick looks up
+  only the attempts the worker is running, so its cost follows in-flight work
+  rather than open claims, and failures, retries and slow completions no
+  longer wait for a heartbeat tick to release their claim batch.
+- v051 moves the claim query into one function per queue-ring slot, so
+  PostgreSQL keeps a cached plan across ring rotations instead of re-planning
+  most claims. Like other installer-replay migrations it holds table locks
+  until commit: apply it in a quiet window with a bounded `lock_timeout` (see
+  the 0.6 to 0.7 upgrade guide). Binaries before v051 run unchanged on the
+  migrated schema.
 
 - **Claims commit asynchronously.** Claims and claim-cursor advances run with
   `synchronous_commit = off`, so a lane's claim head is no longer held across
