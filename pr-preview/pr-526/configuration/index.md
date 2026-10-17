@@ -449,7 +449,7 @@ A running job updates a heartbeat row periodically while its handler is alive. I
 Pick them in this order:
 
 1. **Decide your detection target.** "Crashes should be noticed within X seconds." That target is roughly `heartbeat_staleness + heartbeat_rescue_interval` in the worst case.
-2. **Set `heartbeat_staleness` to at least `3× heartbeat_interval`.** The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it.
+2. **Set `heartbeat_staleness` to at least `3× heartbeat_interval`.** The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it. At 3× or more a new attempt's first heartbeat is deferred by half an interval (step 4), so a fresh attempt has 1.5 intervals of margin before the cutoff rather than 2; use 4× if your handlers or database see pauses longer than an interval.
 3. **`heartbeat_rescue_interval`** can match `heartbeat_interval` for low-latency rescue, or be higher to reduce maintenance load on big fleets.
 4. **Use the same three values on every runtime that shares a queue-storage schema.** Rescue runs on whichever runtime holds the maintenance election and applies that runtime's `heartbeat_staleness`. Each runtime decides when to send heartbeats from its own settings: when its `heartbeat_staleness` is at least `3× heartbeat_interval`, it skips an attempt's first heartbeat until the attempt is half an interval old, because the claim time counts as the first heartbeat. A runtime whose interval is long relative to the leader's staleness can see its live attempts rescued.
 
