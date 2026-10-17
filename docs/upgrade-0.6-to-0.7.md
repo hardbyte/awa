@@ -23,6 +23,18 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
+## v050: one lane index per ready partition
+
+v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every `ready_entries`
+partition in the default and discovered custom schemas. The partition primary
+key `(ready_slot, queue, priority, enqueue_shard, lane_seq)` serves the same
+lane scans because every claim pins `ready_slot`. Each `DROP INDEX` holds an
+ACCESS EXCLUSIVE lock on its partition until the migration transaction
+commits, so run it with a bounded `lock_timeout`; no rows are scanned or
+rewritten. External runners apply the complete generated
+`awa migrate --sql --from 49 --to 50` bundle, which refreshes the installer
+before the tail drops the existing indexes.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:
