@@ -207,8 +207,9 @@ Resources ==
     ClosureChildResources \cup
     ClosureBatchChildResources
 
-\* A plan step is [res, mode].
-Step(res, mode) == [res |-> res, mode |-> mode]
+\* A plan step names a resource, mode, and whether contention waits.
+Step(res, mode) == [res |-> res, mode |-> mode, wait |-> TRUE]
+TryStep(res, mode) == [res |-> res, mode |-> mode, wait |-> FALSE]
 
 \* A small, explicit two-stripe shape for the hot logical queue case.
 \* `StripeA` / `StripeB` are physical queue names such as `queue#0`
@@ -256,7 +257,8 @@ PrepareNumericStripePlan(p) ==
 \*     serialisation against rotate is via the rotator's ledger-insert
 \*     CAS on the generation PK, not a row lock here, so these reads
 \*     are NOT modelled as plan steps.
-\*   plain SELECT of ready_entries_<slot> (implicit AccessShare on child)
+\*   read ready_segments, then attempt evidence and ready entries
+\*     (implicit AccessShare on child partitions)
 \*   INSERT INTO ready_claim_attempt_batches_<ready_slot> (receipts mode)
 \*   INSERT INTO lease_claim_batches_<claim_slot> or
 \*     lease_claims_<claim_slot> (receipts mode) OR
@@ -272,13 +274,16 @@ PrepareNumericStripePlan(p) ==
 \* queue_claim_heads` on the same lane row really does serialise.
 ClaimReceiptsPlan(q, p, readySlot, claimSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
-       Step(ReadyChildResource(readySlot), ModeShared),
+       Step(ReadySegmentChildResource(readySlot), ModeShared),
        Step(ReadyClaimAttemptBatchChildResource(readySlot), ModeShared),
+       Step(ReadyChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClaimBatchChildResource(claimSlot), ModeShared) >>
 
 ClaimLegacyPlan(q, p, readySlot, leaseSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
+       Step(ReadySegmentChildResource(readySlot), ModeShared),
+       Step(ReadyClaimAttemptBatchChildResource(readySlot), ModeShared),
        Step(ReadyChildResource(readySlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
@@ -489,10 +494,35 @@ RotateReadyPlan(nextSlot) ==
 \*     active leases (leases parent), unclosed receipt claims
 \*     (claim/closure proof resources), and pending retained ready rows
 \*     at or beyond the lane cursor
-\*   LOCK TABLE ready/claim-attempt/done/tombstone/segment/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
+\*   bounded ACCESS EXCLUSIVE wait on the routing segment child
+\*   NOWAIT ACCESS EXCLUSIVE on every other child; rollback on contention
 \*   repeat the active/pending/unclosed proofs after the exclusive child
 \*     locks before TRUNCATE
 PruneReadyPlan(slot) ==
+    << Step(QueueRingStateResource, ModeExclusive),
+       Step(QueueRingRotationLockResource, ModeExclusive),
+       Step(QueueRingSlotResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared),
+       Step(ReadySegmentChildResource(slot), ModeExclusive),
+       TryStep(ReadyChildResource(slot), ModeExclusive),
+       TryStep(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
+       TryStep(DoneChildResource(slot), ModeExclusive),
+       TryStep(ReadyTombstoneChildResource(slot), ModeExclusive),
+       TryStep(ReceiptBatchChildResource(slot), ModeExclusive),
+       TryStep(ReceiptTombstoneChildResource(slot), ModeExclusive),
+       TryStep(TerminalDeltaChildResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared) >>
+
+\* Historical body-first blocking tail, retained as a negative witness.
+PruneReadyBlockingPlan(slot) ==
     << Step(QueueRingStateResource, ModeExclusive),
        Step(QueueRingRotationLockResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
@@ -622,21 +652,8 @@ CompatRotateClaimsPlan(nextSlot) ==
        Step(ClaimRingSlotResource(nextSlot), ModeExclusive) >>
 
 CompatPruneReadyPlan(slot) ==
-    << Step(QueueRingStateResource, ModeExclusive),
-       Step(QueueRingSlotResource(slot), ModeExclusive),
-       Step(LeasesParentResource, ModeShared),
-       Step(ClaimProofResource, ModeShared),
-       Step(ClosureProofResource, ModeShared),
-       Step(ClosureBatchProofResource, ModeShared),
-       Step(ReadyChildResource(slot), ModeShared),
-       Step(ReadyChildResource(slot), ModeExclusive),
-       Step(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
-       Step(DoneChildResource(slot), ModeExclusive),
-       Step(ReadyTombstoneChildResource(slot), ModeExclusive),
-       Step(ReadySegmentChildResource(slot), ModeExclusive),
-       Step(ReceiptBatchChildResource(slot), ModeExclusive),
-       Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
-       Step(TerminalDeltaChildResource(slot), ModeExclusive) >>
+    << Step(QueueRingStateResource, ModeExclusive) >>
+    \o SubSeq(PruneReadyPlan(slot), 3, Len(PruneReadyPlan(slot)))
 
 CompatPruneLeasesPlan(slot) ==
     << Step(LeaseRingStateResource, ModeExclusive),
@@ -966,6 +983,22 @@ AcquireNext(t) ==
        /\ txNextStep' = [txNextStep EXCEPT ![t] = txNextStep[t] + 1]
     /\ UNCHANGED <<txState, txPlan, authority, txMode>>
 
+\* NOWAIT failure rolls the entire prune transaction back, including
+\* its segment lock and all previously acquired tail locks.
+AbortUnavailable(t) ==
+    /\ txState[t] = "running"
+    /\ txNextStep[t] > 0
+    /\ txNextStep[t] <= Len(txPlan[t])
+    /\ LET step == txPlan[t][txNextStep[t]]
+       IN /\ ~step.wait
+          /\ Blocked(t, step.res, step.mode)
+    /\ heldLocks' = [r \in Resources |-> {<<u, m>> \in heldLocks[r] : u # t}]
+    /\ txState' = [txState EXCEPT ![t] = "committed"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = EmptyPlan]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 0]
+    /\ txMode' = [txMode EXCEPT ![t] = "none"]
+    /\ UNCHANGED authority
+
 \* Commit once all plan steps have been acquired. Release everything. The
 \* flip tx (see FlipAuthority) promotes the authority as it commits; every
 \* other tx leaves it unchanged.
@@ -1026,6 +1059,7 @@ Next ==
          srcP \in Priorities, dstP \in Priorities, rs \in ReadySlots :
           StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)
     \/ \E t \in TxIds : StartFlipAuthority(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -1036,6 +1070,7 @@ Spec == ConfigOK /\ Init /\ [][Next]_vars
 NextPrepareQueue ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
     \/ \E t \in TxIds, p \in Priorities : StartPrepareTwoStripe(t, p)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -1046,6 +1081,7 @@ SpecPrepareQueue == ConfigOK /\ Init /\ [][NextPrepareQueue]_vars
 NextPrepareQueueNumeric ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
     \/ \E t \in TxIds, p \in Priorities : StartPrepareNumericStripe(t, p)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -1086,6 +1122,7 @@ StartCycleB(t) ==
 NextDeadlockDemo ==
     \/ \E t \in TxIds : StartCycleA(t)
     \/ \E t \in TxIds : StartCycleB(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -1118,6 +1155,7 @@ NextOldStripedClaimDeadlockDemo ==
     \/ \E t \in TxIds, p \in Priorities, rs \in ReadySlots,
          cs \in ClaimSlots :
           StartOldClaimTwoStripeReceipts(t, p, rs, cs)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -1171,7 +1209,7 @@ IsBlocked(t) ==
     /\ txNextStep[t] > 0
     /\ txNextStep[t] <= Len(txPlan[t])
     /\ LET step == txPlan[t][txNextStep[t]]
-       IN Blocked(t, step.res, step.mode)
+       IN step.wait /\ Blocked(t, step.res, step.mode)
 
 \* Direct waits-for: tx t waits for tx u.
 WaitsFor(t, u) ==
@@ -1200,6 +1238,39 @@ NoDeadlock ==
 NoGlobalStall ==
     \/ \A t \in TxIds : txState[t] # "running"
     \/ \E t \in TxIds : txState[t] = "running" /\ ~ IsBlocked(t)
+
+\* A producer writes entries before routing segments, the inverse of
+\* the claimer. The focused configs include both reader shapes.
+StartQueueChildWriter(t, slot) ==
+    /\ txState[t] = "idle"
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] =
+        <<Step(ReadyChildResource(slot), ModeShared),
+          Step(ReadySegmentChildResource(slot), ModeShared)>>]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+StartPruneReadyBlocking(t, slot) ==
+    BeginRingTx(t, QueueRingStateResource,
+        IF authority = "ledger" THEN PruneReadyBlockingPlan(slot)
+        ELSE <<Step(QueueRingStateResource, ModeExclusive)>>
+             \o SubSeq(PruneReadyBlockingPlan(slot), 3, Len(PruneReadyBlockingPlan(slot))))
+
+NextQueuePrune(blocking) ==
+    \/ \E t \in TxIds : StartFlipAuthority(t)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities,
+         rs \in ReadySlots, cs \in ClaimSlots : StartClaimReceipts(t, q, p, rs, cs)
+    \/ \E t \in TxIds, rs \in ReadySlots : StartQueueChildWriter(t, rs)
+    \/ \E t \in TxIds, rs \in ReadySlots :
+         IF blocking THEN StartPruneReadyBlocking(t, rs) ELSE StartPruneReady(t, rs)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecQueuePrune == ConfigOK /\ Init /\ [][NextQueuePrune(FALSE)]_vars
+SpecQueuePruneBlocking == ConfigOK /\ Init /\ [][NextQueuePrune(TRUE)]_vars
 
 \* #371 MixedFleet safety. A single ring must never be advanced under BOTH
 \* disciplines at once: no state where one ring maintenance tx holds its

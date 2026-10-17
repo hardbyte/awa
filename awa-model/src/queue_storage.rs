@@ -16607,10 +16607,21 @@ impl QueueStorage {
         set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_started = Instant::now();
-        let lock_tables = sqlx::query(audited_sql(format!(
-            "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
-        )))
-        .execute(tx.as_mut())
+        // Claims read segments before ready rows, while producers write in
+        // the opposite order. Queue behind segment readers, then abandon
+        // the transaction rather than wait with an exclusive child held.
+        let lock_tables = async {
+            sqlx::query(audited_sql(format!(
+                "LOCK TABLE {segment_child} IN ACCESS EXCLUSIVE MODE"
+            )))
+            .execute(tx.as_mut())
+            .await?;
+            sqlx::query(audited_sql(format!(
+                "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            )))
+            .execute(tx.as_mut())
+            .await
+        }
         .await;
         let lock_duration = lock_started.elapsed();
 

@@ -35,6 +35,8 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqRetry.cfg    ;; Dlq
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqPurge.cfg    ;; DlqPurgeTraceIncomplete is violated ;; DLQ purge trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Deadlock reached ;; broken trace rejected
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
+AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrder.cfg              ;; pass ;; segment-first queue prune with NOWAIT tail
+AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrderBlocking.cfg      ;; NoDeadlock is violated ;; old queue prune versus segment-first claim witness
 AwaRotationCadence.tla        ;; AwaRotationCadence.cfg                 ;; pass ;; observed fill age and eventual drain under stable leadership
 AwaRotationCadence.tla        ;; AwaRotationCadencePhysicalEmpty.cfg    ;; EmptyNeverWaits is violated ;; allocated empty lease heap witness
 AwaRotationCadence.tla        ;; AwaRotationCadenceOldClock.cfg         ;; YoungSmallSlotStaysOpen is violated ;; old slot timestamp witness

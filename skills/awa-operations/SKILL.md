@@ -267,7 +267,9 @@ Empty slots bypass the fill window so reclamation can continue after drain.
 Leader changes reset the local monotonic fill timers. The size is sampled and
 can be exceeded by bursts or blocked reuse; use actual retained storage and
 blocked-prune metrics for capacity planning. It is not a retention policy or
-storage limit. See `docs/configuration.md` for the scheduling contract.
+storage limit. Queue prune lock contention retries on the next decision tick;
+active-data gates retain exponential backoff. Persistent contention can still
+stall reclamation. See `docs/configuration.md` for the scheduling contract.
 
 ## Managed Postgres
 

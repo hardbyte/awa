@@ -49,6 +49,7 @@ def prepare(harness: Path, destination: Path, awa: Path, cpus: str) -> None:
     (destination / "docker-compose.override.yml").write_text(
         f'services:\n  postgres:\n    cpuset: "{cpus}"\n'
     )
+    (destination / "awa-bench/.cargo").mkdir(exist_ok=True)
     (destination / "awa-bench/.cargo/config.toml").write_text(
         '[patch."https://github.com/hardbyte/awa"]\n'
         + "".join(
@@ -114,6 +115,7 @@ def run_cell(
 ) -> dict:
     directory = root / policy
     log = directory / f"{cell}.log"
+    runner_digest = digest(Path(__file__).resolve())
     expected_digest = json.loads((root / "provenance.json").read_text())[
         "binary_sha256"
     ]
@@ -135,6 +137,7 @@ def run_cell(
         "LEASE_CLAIM_RECEIPTS": "true",
         "QUEUE_ROTATE_MS": "1000",
         "LEASE_ROTATE_MS": "250",
+        "AWA_CLAIM_BATCH_SIZE": "512",
     }
     argv = [
         "taskset",
@@ -171,6 +174,8 @@ def run_cell(
         "cpus": cpus,
         "port": port,
         "binary_sha256": expected_digest,
+        "claim_batch_size": int(env["AWA_CLAIM_BATCH_SIZE"]),
+        "runner_sha256": runner_digest,
     }
     rows = list(csv.DictReader((run_dir / "raw.csv").open()))
     if cell != "idle":

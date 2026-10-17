@@ -59,11 +59,14 @@ def main() -> None:
     parser.add_argument("destination", type=Path)
     args = parser.parse_args()
     args.destination.mkdir(parents=True, exist_ok=True)
+    provenance = json.loads((args.source / "provenance.json").read_text())
     results = []
     selected = []
     for policy in ("eager", "cadence"):
         for record_path in sorted((args.source / policy).glob("*.json")):
             record = json.loads(record_path.read_text())
+            if record["binary_sha256"] != provenance["binary_sha256"]:
+                raise ValueError(f"Mixed benchmark executables: {record_path}")
             run = Path(record["run_dir"])
             raw_path = run / "raw.csv"
             record["raw_sha256"] = hashlib.sha256(raw_path.read_bytes()).hexdigest()

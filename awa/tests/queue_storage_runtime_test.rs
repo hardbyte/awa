@@ -3745,7 +3745,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
     let prune_task =
         tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
 
-    let needle = format!("{schema}.ready_entries_0");
+    let needle = format!("{schema}.ready_segments_0");
     let wait_deadline = Instant::now() + Duration::from_secs(1);
     let mut saw_lock_wait = false;
     while Instant::now() < wait_deadline {
@@ -3773,7 +3773,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
     }
     assert!(
         saw_lock_wait,
-        "queue prune should wait on the ready child before the writer commits"
+        "queue prune should wait on the segment child before the writer commits"
     );
 
     writer_tx.commit().await.expect("commit pending ready row");
@@ -14039,6 +14039,131 @@ async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
         matches!(pruned, PruneOutcome::Pruned { slot: 0, .. }),
         "unexpected prune outcome after reader lock release: {pruned:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_claim_lock_order";
+    let store = Arc::new(
+        create_store(&pool, schema)
+            .await
+            .with_prune_lock_timeout(Duration::from_secs(5))
+            .expect("prune lock timeout"),
+    );
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let claims = store.claim_batch(&pool, "q", 1).await.unwrap();
+    assert_eq!(store.complete_batch(&pool, &claims).await.unwrap(), 1);
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+
+    let mut reader = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.ready_segments_0 IN ACCESS SHARE MODE"
+    )))
+    .execute(reader.as_mut())
+    .await
+    .unwrap();
+    let prune_store = Arc::clone(&store);
+    let prune_pool = pool.clone();
+    let prune =
+        tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = $1::regclass AND mode = 'AccessExclusiveLock' AND NOT granted)",
+        )
+        .bind(format!("{schema}.ready_segments_0"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "prune never queued behind segment reader"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.ready_claim_attempt_batches_0, {schema}.ready_entries_0 IN ACCESS SHARE MODE NOWAIT"
+    )))
+    .execute(reader.as_mut())
+    .await
+    .expect("a segment reader must finish acquiring the claim relations while prune waits");
+    reader.commit().await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), prune)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(outcome, PruneOutcome::Pruned { slot: 0, .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(store.queue_counts(&pool, "q").await.unwrap().terminal, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_prune_releases_segment_lock_on_every_tail_conflict() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_prune_tail_nowait";
+    let store = create_store(&pool, schema)
+        .await
+        .with_prune_lock_timeout(Duration::from_secs(5))
+        .unwrap();
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let claims = store.claim_batch(&pool, "q", 1).await.unwrap();
+    assert_eq!(store.complete_batch(&pool, &claims).await.unwrap(), 1);
+    assert!(matches!(
+        store.rotate(&pool).await.unwrap(),
+        RotateOutcome::Rotated { .. }
+    ));
+
+    for child in [
+        "ready_entries",
+        "ready_claim_attempt_batches",
+        "done_entries",
+        "ready_tombstones",
+        "receipt_completion_batches",
+        "receipt_completion_tombstones",
+        "queue_terminal_count_deltas",
+    ] {
+        let mut writer = pool.begin().await.unwrap();
+        sqlx::query(audited_sql(format!(
+            "LOCK TABLE {schema}.{child}_0 IN ROW EXCLUSIVE MODE"
+        )))
+        .execute(writer.as_mut())
+        .await
+        .unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.prune_oldest(&pool, Duration::ZERO),
+        )
+        .await
+        .expect("prune must abandon a tail conflict without its five-second wait")
+        .unwrap();
+        assert!(
+            matches!(outcome, PruneOutcome::Blocked { slot: 0 }),
+            "{child}: {outcome:?}"
+        );
+        sqlx::query(audited_sql(format!(
+            "LOCK TABLE {schema}.ready_segments_0 IN ROW EXCLUSIVE MODE NOWAIT"
+        )))
+        .execute(writer.as_mut())
+        .await
+        .expect("prune must release its segment lock so an entry-first producer can finish");
+        writer.commit().await.unwrap();
+    }
+    assert!(matches!(
+        store.prune_oldest(&pool, Duration::ZERO).await.unwrap(),
+        PruneOutcome::Pruned { slot: 0, .. }
+    ));
+    assert_eq!(store.queue_counts(&pool, "q").await.unwrap().terminal, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
