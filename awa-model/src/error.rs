@@ -89,11 +89,9 @@ impl AwaError {
         )
     }
 
-    /// The statement never reached a healthy server: the socket dropped, the
-    /// pool could not hand out a connection in time, the server rejected or
-    /// closed the session (SQLSTATE class `08`), or it was shutting down or
-    /// still starting up (`57P01`..`57P03`). A lease-guarded statement can be
-    /// run again once the server is back.
+    /// A transport/pool/server-availability failure that may recover after
+    /// reconnecting. The transaction may already have committed: callers must
+    /// establish replay safety independently before retrying it.
     pub fn is_connection_lost(&self) -> bool {
         match self {
             AwaError::Database(sqlx::Error::Io(_))

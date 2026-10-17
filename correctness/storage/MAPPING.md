@@ -139,7 +139,7 @@ The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate property, 
 
 ## Local runtime note
 
-The TLA+ storage model does not represent local worker-capacity accounting. Rust now releases local queue capacity immediately after handler execution and progress snapshotting, while durable completion continues asynchronously through the completion batcher. That changes throughput and scheduling behavior, but it does not change the modeled storage safety boundary because the `run_lease`-guarded finalization and rescue semantics are unchanged.
+The TLA+ storage model does not represent local worker-capacity accounting. Rust releases local queue capacity after handler execution and progress snapshotting when a bounded finalizer slot is available; otherwise the finished handler retains worker and heartbeat ownership until capacity is available or shutdown cancels the wait. Durable completion continues asynchronously through the completion batcher. Outcome hooks do not hold finalizer capacity. These scheduling choices do not change the modeled storage safety boundary because the `run_lease`-guarded finalization and rescue semantics are unchanged.
 
 ## Claimer coordination cache (#508)
 
@@ -332,6 +332,12 @@ Model checking results:
 `queue_storage_runtime_test` (103 tests) covers the lifecycle: partition routing, rotation isolation, partition migration on schema upgrade, the rotate / prune busy-and-safety predicates, admin cancel of running attempts, the open-receipt-claims absence invariant, the full short-job lifecycle, and the rescue paths for heartbeat / deadline / receipt-only attempts.
 
 `receipt_plane_chaos_test` (4 `#[ignore]`-d nightly tests) covers flood / concurrency / lock-order scenarios: rescue throughput under overload, prune-skips-active under concurrent traffic, the bounded `ACCESS EXCLUSIVE` barrier between TRUNCATE and concurrent inserts, and admin-cancel-during-materialize orphan-lease cleanup.
+
+## Finalize replay after reconnect (#521)
+
+`AwaFinalizeReconnect` refines a completed handler result into `Send`, `CommitFinalize`, `LoseResponse` and `Acknowledge`. `AbortRequest` represents a transport failure before the transaction commits; `LoseResponse` represents a successful commit whose acknowledgement never reaches the executor. The saved outcome remains unchanged across replay. The abstract state/lease guard corresponds to canonical `state = 'running' AND run_lease = ...` transitions and queue-storage lease/receipt disposition guards in `JobExecutor::complete_job` and the called model methods. `Rescue` followed by `ClaimNewLease` represents stale-heartbeat, deadline or callback-timeout recovery before an old finalize retry reaches the server.
+
+`TransactionalFollowup` corresponds to ADR-029's guarded transition and registered follow-up inserts sharing one transaction. Snooze has no outcome registry entry and therefore no follow-up in the model. A committed request replay becomes stale and must not dispatch the durable follow-up again. The separate-follow-up negative configuration reaches a committed finalize, a lost reply and a stale acknowledgement with no follow-up. Lifecycle hooks, best-effort metrics and rescue's separate best-effort follow-ups are outside this invariant. The unfenced negative configuration mutates a newer running lease. The model assumes committed state survives reconnect, abstracts each database transaction atomically and checks safety only; real time, cancellation, finalizer capacity, callback token handling and failover durability remain separate obligations.
 
 ## Asynchronous claim commits (#507)
 

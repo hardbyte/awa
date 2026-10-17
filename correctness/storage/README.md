@@ -279,6 +279,14 @@ Expected outcomes:
 
 See [`MAPPING.md`](./MAPPING.md#trace-validation) for the full description of how to transcribe and add a new trace.
 
+## Finalize replay after reconnect
+
+[`AwaFinalizeReconnect.tla`](./AwaFinalizeReconnect.tla) separates committing a saved handler outcome from receiving its acknowledgement. A connection failure may occur before commit or after the database committed. The same saved request can then be replayed while rescue and a new claim advance the job's lease. Completion, retry, snooze, cancellation, terminal failure and callback parking abstract to their resulting database states; the handler is never re-executed by a replay.
+
+The model includes one registered follow-up for each eventful outcome and none for snooze, matching the public outcome registry. The passing configuration checks at most one accepted finalize and its transactional follow-up, rejection of an old request against a newer lease, and acknowledgement consistency. `AwaFinalizeReconnectUnfenced.cfg` demonstrates the stale-worker mutation when only the running state is checked. `AwaFinalizeReconnectSeparateFollowup.cfg` demonstrates why a follow-up cannot depend on receiving the finalize acknowledgement: a committed finalize with a lost response is stale on replay, leaving the separate follow-up absent.
+
+This is a safety model with two lease identities and one saved handler result. It assumes committed transactions persist across reconnects; it does not model failover data loss, callback payload/token protocols, lifecycle-event delivery, resource capacity, shutdown, elapsed time or eventual database recovery. Rescue's separate best-effort follow-ups are outside the model. SQL and runtime regressions remain necessary for the concrete implementation; the model makes no liveness or retry-window guarantee.
+
 ## Known modelling gaps
 
 See [`../README.md`](../README.md) for the full Known Divergences list. Specific to this spec:
