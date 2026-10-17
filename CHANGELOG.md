@@ -6,6 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- Terminal-count folds and rebuilds write one `queue_terminal_live_counts` row per `(ready_slot, queue, priority, enqueue_shard)` instead of one per job-id bucket. Queue prune deletes one row per lane rather than up to 256, which removes the live-count table from the dead-tuple peak under retry churn. Existing bucketed rows stay valid; readers sum every bucket.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
