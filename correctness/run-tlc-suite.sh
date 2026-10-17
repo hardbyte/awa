@@ -19,6 +19,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SUITE='
 AwaClaimCursorFold.tla         ;; -                                      ;; pass ;; mixed-version cursor folding and prefix ranges
 AwaClaimCursorFold.tla         ;; AwaClaimCursorFoldNonPrefix.cfg         ;; NoSkippedLive is violated ;; non-prefix evidence cannot justify max cursor
+AwaClaimLaneScheduling.tla     ;; -                                      ;; pass ;; committed claim advances before next lane selection
+AwaClaimLaneScheduling.tla     ;; AwaClaimLaneSchedulingSkip.cfg          ;; NoEmptyWithEligibleLow is violated ;; skipped advance shadows another ready lane
 AwaAsyncClaimCursor.tla        ;; -                                      ;; pass ;; evidence-guarded async claim replay
 AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; NoSkippedJob is violated ;; lost claim on promoted standby witness
 AwaFinalizeReconnect.tla      ;; -                                      ;; pass ;; saved finalize replay after unknown commit acknowledgement

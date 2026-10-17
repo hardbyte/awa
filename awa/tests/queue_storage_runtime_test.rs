@@ -9513,7 +9513,21 @@ async fn test_queue_storage_claim_catches_cursor_up_and_claims_in_one_call() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_partial_claim_does_not_shadow_another_lane() {
+async fn test_queue_storage_receipt_runtime_claim_reaches_other_lane() {
+    assert_partial_claim_reaches_other_lane(true, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_legacy_runtime_claim_reaches_other_lane() {
+    assert_partial_claim_reaches_other_lane(false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_raw_claim_reaches_other_lane() {
+    assert_partial_claim_reaches_other_lane(true, true, false).await;
+}
+
+async fn assert_partial_claim_reaches_other_lane(receipts: bool, raw_claim: bool, unique: bool) {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_partial_claim_other_lane";
     let schema = "awa_qs_partial_claim_other_lane";
@@ -9524,7 +9538,7 @@ async fn test_queue_storage_partial_claim_does_not_shadow_another_lane() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            lease_claim_receipts: true,
+            lease_claim_receipts: receipts,
             claim_slot_count: 2,
         },
     )
@@ -9538,14 +9552,18 @@ async fn test_queue_storage_partial_claim_does_not_shadow_another_lane() {
             InsertOpts {
                 queue: queue.to_string(),
                 priority: 1,
+                unique: unique.then_some(UniqueOpts {
+                    by_args: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
         .await;
     }
 
-    // An open enqueue reservation inflates the priority-1 lane's next
-    // sequence, so claiming both committed rows does not drain the lane.
+    // The open reservation raises next_seq without adding a visible ready row.
+    // The high-priority claim is therefore partial even after taking both jobs.
     let mut reservation_tx = pool.begin().await.expect("begin enqueue reservation");
     sqlx::query_scalar::<_, i64>(audited_sql(format!(
         "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
@@ -9558,11 +9576,21 @@ async fn test_queue_storage_partial_claim_does_not_shadow_another_lane() {
     .await
     .expect("reserve enqueue sequence");
 
-    let urgent = store
-        .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
-        .await
-        .expect("claim priority-1 rows");
-    assert_eq!(urgent.len(), 2);
+    let urgent_count = if raw_claim {
+        store
+            .claim_batch(&pool, queue, 2)
+            .await
+            .expect("claim priority-1 rows")
+            .len()
+    } else {
+        store
+            .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+            .await
+            .expect("claim priority-1 rows")
+            .len()
+    };
+    assert_eq!(urgent_count, 2);
+    assert_eq!(claim_cursor_for(&pool, &store, queue, 1, 0).await, 3);
 
     let low_id = enqueue_job(
         &pool,
@@ -9575,15 +9603,24 @@ async fn test_queue_storage_partial_claim_does_not_shadow_another_lane() {
         },
     )
     .await;
-    let low = store
-        .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
-        .await
-        .expect("claim priority-4 row");
-    assert_eq!(
-        low.iter().map(|claimed| claimed.job.id).collect::<Vec<_>>(),
-        vec![low_id],
-        "a lane whose cursor lags its committed claims must not shadow another lane's ready rows"
-    );
+    if raw_claim {
+        let low = store
+            .claim_batch(&pool, queue, 2)
+            .await
+            .expect("claim priority-4 row");
+        assert_eq!(low.len(), 1);
+        assert_eq!(low[0].priority, 4);
+    } else {
+        let low = store
+            .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+            .await
+            .expect("claim priority-4 row");
+        assert_eq!(
+            low.iter().map(|claimed| claimed.job.id).collect::<Vec<_>>(),
+            vec![low_id],
+            "a lagging high-priority claim cursor must not shadow a lower-priority ready lane"
+        );
+    }
     reservation_tx
         .rollback()
         .await
