@@ -9,8 +9,8 @@ mod storage_footprint_sql;
 use awa::audited_sql;
 use awa::model::{
     admin, batch_operations, insert, migrations, storage, AwaError, BatchOperationFilter,
-    BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome, SkipReason,
-    SubmitBatchOperation,
+    BatchOperationSpec, PruneOutcome, QueueStorage, QueueStorageConfig, RingRotationCadence,
+    RotateOutcome, SkipReason, SubmitBatchOperation,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -2485,6 +2485,149 @@ async fn test_idle_gate_holds_rotation_open_until_sealed_slots_reclaimed() {
         (frozen_slot, frozen_gen),
         (still_slot, still_gen),
         "idle rotations must not move the cursor"
+    );
+}
+
+/// A maintenance tick seals a slot that holds rows only once it is at
+/// least `min_slot_age` old or `max_slot_bytes` large. An empty current
+/// slot is never held back (rotating it is ledger-only and its prune
+/// truncates nothing), so a draining ring still cycles at tick cadence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_holds_filling_slot_open() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "cadence_q";
+    let seed_done_row = |slot: i32, generation: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(audited_sql(format!(
+                "INSERT INTO {schema}.done_entries (
+                    ready_slot, ready_generation, job_id, kind, queue, state,
+                    priority, attempt, run_lease, lane_seq, enqueue_shard,
+                    attempted_at, finalized_at, payload
+                ) VALUES ($1, $2, $3, 'cadence_job', $4,
+                          'completed'::awa.job_state, 2::smallint, 1::smallint,
+                          1::bigint, $5::bigint, 0::smallint, now(), now(),
+                          '{{}}'::jsonb)"
+            )))
+            .bind(slot)
+            .bind(generation)
+            .bind(9_000_000_i64 + generation)
+            .bind(queue)
+            .bind(100_i64 + generation)
+            .execute(&pool)
+            .await
+            .expect("seed done row in the current slot");
+        }
+    };
+    let patient = RingRotationCadence {
+        min_slot_age: Duration::from_secs(3600),
+        max_slot_bytes: 1 << 30,
+    };
+
+    // Slot 0 (genesis) holds one row and is seconds old: a patient cadence
+    // leaves it open and the cursor does not move.
+    seed_done_row(0, 0).await;
+    let outcome = store
+        .rotate_with_cadence(&pool, patient)
+        .await
+        .expect("rotate young slot");
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::SkippedFilling {
+                slot: 0,
+                generation: 0
+            }
+        ),
+        "young, small slot must stay open, got {outcome:?}"
+    );
+    assert_eq!(ring_cursor(&pool, schema, "queue").await, (0, 0));
+
+    // The byte cap seals regardless of age.
+    let by_size = RingRotationCadence {
+        max_slot_bytes: 1,
+        ..patient
+    };
+    let outcome = store
+        .rotate_with_cadence(&pool, by_size)
+        .await
+        .expect("rotate over byte cap");
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 1,
+                generation: 1
+            }
+        ),
+        "slot over the byte cap must seal, got {outcome:?}"
+    );
+
+    // The new current slot is empty while slot 0 still holds rows: the
+    // cadence never holds an empty slot back.
+    let outcome = store
+        .rotate_with_cadence(&pool, patient)
+        .await
+        .expect("rotate empty current slot");
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 2,
+                generation: 2
+            }
+        ),
+        "empty current slot must rotate freely, got {outcome:?}"
+    );
+
+    // The age floor seals once the slot is old enough.
+    seed_done_row(2, 2).await;
+    let outcome = store
+        .rotate_with_cadence(&pool, patient)
+        .await
+        .expect("rotate young slot 2");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedFilling { slot: 2, .. }),
+        "got {outcome:?}"
+    );
+    let by_age = RingRotationCadence {
+        min_slot_age: Duration::from_millis(1),
+        ..patient
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let outcome = store
+        .rotate_with_cadence(&pool, by_age)
+        .await
+        .expect("rotate old slot 2");
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 3,
+                generation: 3
+            }
+        ),
+        "slot past the age floor must seal, got {outcome:?}"
+    );
+
+    // The eager form seals a filling slot on every call.
+    seed_done_row(3, 3).await;
+    let outcome = store.rotate(&pool).await.expect("eager rotate");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedBusy { slot: 0, .. }),
+        "eager rotate reaches the busy gate (slot 0 still holds rows), got {outcome:?}"
     );
 }
 

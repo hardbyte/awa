@@ -566,6 +566,7 @@ await client.start(
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `1000ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions. |
+| `ring_rotation_cadence` | 5 s / 2 MiB | Whether a rotate tick seals the current slot. A slot that holds rows seals once it is `min_slot_age` old or its children hold `max_slot_bytes` (heap plus TOAST), whichever comes first; an empty slot always rotates. Set with `ClientBuilder::ring_rotation_cadence` (Rust) or `queue_storage_rotate_min_slot_age_ms` / `queue_storage_rotate_max_slot_bytes` (Python); `RingRotationCadence::EAGER` (or `0` / `0`) seals on every tick. Each seal costs a `TRUNCATE` per filled child, so the floor removes most rotations at low load while the cap bounds what the ring retains beyond one-tick slots to `queue_slot_count × max_slot_bytes`. |
 
 The benchmark harness in [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking) reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.
 

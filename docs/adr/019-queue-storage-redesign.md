@@ -166,6 +166,7 @@ That order is deliberate. The TLA+ storage race / lock-order models cross-check 
 Rotation and prune policy is also part of this decision:
 
 - lease and claim-ring segments rotate quickly because their churn is the remaining hot-path source
+- amended: rotation is decided on the ring's tick but a current slot that holds rows is sealed only once it is `min_slot_age` old or `max_slot_bytes` large (`RingRotationCadence`, default 5 s / 2 MiB), because every seal costs a `TRUNCATE` per filled child and the catalog row versions that go with it; an empty current slot still rotates on every tick
 - ready / terminal segments rotate more slowly than the lease and claim rings; deferred and DLQ rows are plain backlog/hold tables with their own promotion, retry, purge, and retention cleanup paths
 - prune walks sealed segments oldest-first
 - prune returns gracefully when a reader or writer still holds the segment beyond the short lock-timeout window, but it may queue briefly to avoid starvation under continuous parent-partition readers

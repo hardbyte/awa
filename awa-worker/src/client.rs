@@ -17,6 +17,7 @@ use awa_model::admin::{
 use awa_model::audited_sql;
 use awa_model::{
     storage as transition, JobArgs, PartitionedQueue, PeriodicJob, QueueStorageConfig,
+    RingRotationCadence,
 };
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -931,6 +932,20 @@ impl ClientBuilder {
             self.storage = RuntimeStorage::QueueStorage(
                 runtime.with_claim_rotate_interval(claim_rotate_interval),
             );
+        }
+        self
+    }
+
+    /// Override when a maintenance tick may seal the current slot of the
+    /// queue, lease and claim rings (default
+    /// [`RingRotationCadence::DEFAULT`]: five seconds or 8 MiB). The rotate
+    /// intervals set how often the decision is made; the cadence decides
+    /// whether a slot that holds rows is sealed on that tick. Use
+    /// [`RingRotationCadence::EAGER`] to seal on every tick. Only takes
+    /// effect when queue storage is active; no-op on the canonical engine.
+    pub fn ring_rotation_cadence(mut self, cadence: RingRotationCadence) -> Self {
+        if let RuntimeStorage::QueueStorage(runtime) = self.storage {
+            self.storage = RuntimeStorage::QueueStorage(runtime.with_rotation_cadence(cadence));
         }
         self
     }

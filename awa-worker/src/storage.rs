@@ -1,4 +1,4 @@
-use awa_model::{QueueStorage, QueueStorageConfig};
+use awa_model::{QueueStorage, QueueStorageConfig, RingRotationCadence};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +8,7 @@ pub(crate) struct QueueStorageRuntime {
     pub queue_rotate_interval: Duration,
     pub lease_rotate_interval: Duration,
     pub claim_rotate_interval: Duration,
+    pub rotation_cadence: RingRotationCadence,
 }
 
 impl QueueStorageRuntime {
@@ -26,11 +27,17 @@ impl QueueStorageRuntime {
             queue_rotate_interval,
             lease_rotate_interval,
             claim_rotate_interval,
+            rotation_cadence: RingRotationCadence::default(),
         })
     }
 
     pub fn with_claim_rotate_interval(mut self, claim_rotate_interval: Duration) -> Self {
         self.claim_rotate_interval = claim_rotate_interval;
+        self
+    }
+
+    pub fn with_rotation_cadence(mut self, rotation_cadence: RingRotationCadence) -> Self {
+        self.rotation_cadence = rotation_cadence;
         self
     }
 }

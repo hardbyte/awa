@@ -1069,6 +1069,20 @@ impl AwaMetrics {
                 self.ring_current_slot.record(*slot as i64, &slot_attrs);
                 self.ring_generation.record(*generation, &slot_attrs);
             }
+            awa_model::RotateOutcome::SkippedFilling { slot, generation } => {
+                // The current slot holds rows but is below the cadence's
+                // age floor and byte cap, so it stays open. Expected on
+                // most ticks under steady moderate load.
+                let attrs = [
+                    opentelemetry::KeyValue::new("awa.ring", ring),
+                    opentelemetry::KeyValue::new("awa.ring.outcome", "skipped_filling"),
+                    opentelemetry::KeyValue::new("awa.ring.blocker", "none"),
+                ];
+                self.maintenance_rotate_attempts.add(1, &attrs);
+                let slot_attrs = [opentelemetry::KeyValue::new("awa.ring", ring)];
+                self.ring_current_slot.record(*slot as i64, &slot_attrs);
+                self.ring_generation.record(*generation, &slot_attrs);
+            }
         }
     }
 

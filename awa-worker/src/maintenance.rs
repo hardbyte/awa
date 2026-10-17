@@ -2653,7 +2653,11 @@ impl MaintenanceService {
             return;
         };
 
-        let idle_cursor = match runtime.store.rotate(&self.pool).await {
+        let idle_cursor = match runtime
+            .store
+            .rotate_with_cadence(&self.pool, runtime.rotation_cadence)
+            .await
+        {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("queue", &outcome);
                 let idle_cursor = match &outcome {
@@ -2679,6 +2683,12 @@ impl MaintenanceService {
                     }
                     RotateOutcome::SkippedIdle { slot, generation } => {
                         debug!(slot, generation, "Skipped idle queue storage queue segment");
+                    }
+                    RotateOutcome::SkippedFilling { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage queue segment still filling"
+                        );
                     }
                 }
                 idle_cursor
@@ -2764,7 +2774,11 @@ impl MaintenanceService {
             return;
         };
 
-        let idle_cursor = match runtime.store.rotate_leases(&self.pool).await {
+        let idle_cursor = match runtime
+            .store
+            .rotate_leases_with_cadence(&self.pool, runtime.rotation_cadence)
+            .await
+        {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("lease", &outcome);
                 let idle_cursor = match &outcome {
@@ -2784,6 +2798,12 @@ impl MaintenanceService {
                     }
                     RotateOutcome::SkippedIdle { slot, generation } => {
                         debug!(slot, generation, "Skipped idle queue storage lease segment");
+                    }
+                    RotateOutcome::SkippedFilling { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage lease segment still filling"
+                        );
                     }
                 }
                 idle_cursor
@@ -2855,7 +2875,11 @@ impl MaintenanceService {
             return;
         };
 
-        let idle_cursor = match runtime.store.rotate_claims(&self.pool).await {
+        let idle_cursor = match runtime
+            .store
+            .rotate_claims_with_cadence(&self.pool, runtime.rotation_cadence)
+            .await
+        {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("claim", &outcome);
                 let idle_cursor = match &outcome {
@@ -2877,6 +2901,12 @@ impl MaintenanceService {
                     }
                     RotateOutcome::SkippedIdle { slot, generation } => {
                         debug!(slot, generation, "Skipped idle queue storage claim segment");
+                    }
+                    RotateOutcome::SkippedFilling { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage claim segment still filling"
+                        );
                     }
                 }
                 idle_cursor
