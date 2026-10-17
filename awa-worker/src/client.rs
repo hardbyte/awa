@@ -1788,7 +1788,11 @@ impl Client {
             self.pool.clone(),
             self.storage.clone(),
             self.in_flight.clone(),
-            self.heartbeat_interval,
+            crate::heartbeat::HeartbeatCadence::new(
+                self.heartbeat_interval,
+                self.heartbeat_staleness
+                    .unwrap_or(crate::maintenance::DEFAULT_HEARTBEAT_STALENESS),
+            ),
             self.heartbeat_alive.clone(),
             self.service_cancel.clone(),
             self.metrics.clone(),

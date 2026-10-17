@@ -618,6 +618,9 @@ const PRUNE_BRANCH_LEASE: &str = "lease";
 const PRUNE_BRANCH_CLAIM: &str = "claim";
 const PRUNE_BRANCH_QUEUE: &str = "queue";
 
+/// Default window after which an attempt without a heartbeat is rescued.
+pub(crate) const DEFAULT_HEARTBEAT_STALENESS: Duration = Duration::from_secs(90);
+
 /// Maintenance service: runs leader-elected background tasks.
 ///
 /// Tasks: heartbeat rescue, deadline rescue, scheduled promotion, cleanup,
@@ -740,7 +743,7 @@ impl MaintenanceService {
             cron_eval_interval: Duration::from_secs(1),
             leader_check_interval: Duration::from_secs(30),
             leader_election_interval: Duration::from_secs(10),
-            heartbeat_staleness: Duration::from_secs(90),
+            heartbeat_staleness: DEFAULT_HEARTBEAT_STALENESS,
             completed_retention: Duration::from_secs(86400), // 24h
             failed_retention: Duration::from_secs(259200),   // 72h
             cleanup_batch_size: 1000,
