@@ -12713,6 +12713,107 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
     assert_eq!(counts.terminal, 6);
 }
 
+/// A negative delta folds exactly even when the lane's live count still sits
+/// in per-job-id buckets, as written by pre-collapse folds, the installer
+/// backfill and older rebuilds: the fold collapses the lane to one bucket-0
+/// row holding the bucket total plus the signed delta.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_collapses_bucketed_rows() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_bucketed";
+    let schema = "awa_qs_terminal_delta_rollup_bucketed";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 6)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 6, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 6);
+    let (completed, failed) = claimed.split_at(5);
+    let completed_claims: Vec<_> = completed.iter().map(|job| job.claim.clone()).collect();
+    store
+        .complete_batch(&pool, &completed_claims)
+        .await
+        .expect("complete");
+    let failed_job = &failed[0].job;
+    store
+        .fail_terminal(&pool, failed_job.id, failed_job.run_lease, "boom", None)
+        .await
+        .expect("fail terminally")
+        .expect("running job fails");
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
+
+    match store.rotate(&pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("first rollup");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+
+    // Rewrite the folded lane into the per-job-id bucket shape older folds
+    // and rebuilds left behind.
+    sqlx::query(audited_sql(format!(
+        "WITH removed AS (
+             DELETE FROM {schema}.queue_terminal_live_counts WHERE queue = $1
+         )
+         INSERT INTO {schema}.queue_terminal_live_counts
+             (ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count)
+         SELECT ready_slot, queue, priority, enqueue_shard,
+                mod(mod(job_id, 256::bigint) + 256::bigint, 256::bigint)::smallint,
+                count(*)::bigint
+         FROM {schema}.done_entries
+         WHERE queue = $1
+         GROUP BY 1, 2, 3, 4, 5"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("rewrite live counts into job-id buckets");
+    assert_eq!(live_count_rows(&pool, schema, queue).await, 6);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+
+    // Retrying the failed job removes its done row from the sealed slot and
+    // appends a -1 delta in the failed job's bucket.
+    store
+        .retry_job(&pool, failed_job.id)
+        .await
+        .expect("retry failed job")
+        .expect("failed job is retryable");
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, -1);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("second rollup");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(outcome.grouped_keys, 1);
+    assert_eq!(
+        live_count_sum(&pool, schema, queue).await,
+        5,
+        "the negative delta must not be dropped when its bucket holds no bucket-0 row"
+    );
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the fold collapses the lane's bucketed rows into one row"
+    );
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(counts.terminal, 5);
+}
+
 /// Terminal-count rollup mutates `queue_terminal_live_counts`, so it should
 /// stand down while another backend is pinning the MVCC horizon. Exact reads
 /// remain correct because they include pending delta rows.

@@ -16194,6 +16194,12 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::Empty);
         }
 
+        // Each touched lane collapses to one bucket-0 row holding its old
+        // total (summed over every bucket) plus the signed delta. Applying
+        // the delta to the lane total rather than to one bucket keeps a
+        // negative delta exact when the matching positive count was folded
+        // into a different bucket (pre-collapse folds, the installer
+        // backfill and older rebuilds wrote one row per job-id bucket).
         let grouped_keys: i64 = sqlx::query_scalar(audited_sql(format!(
             r#"
             WITH grouped AS MATERIALIZED (
@@ -16202,31 +16208,49 @@ impl QueueStorage {
                     queue,
                     priority,
                     enqueue_shard,
-                    0::smallint AS counter_bucket,
                     SUM(terminal_delta)::bigint AS delta
                 FROM {delta_child}
                 WHERE ready_generation = $1
                 GROUP BY ready_slot, queue, priority, enqueue_shard
                 HAVING SUM(terminal_delta) <> 0
             ),
-            updated AS (
-                UPDATE {schema}.queue_terminal_live_counts AS counts
-                SET live_terminal_count = GREATEST(0, counts.live_terminal_count + grouped.delta)
-                FROM grouped
+            collapsed AS (
+                DELETE FROM {schema}.queue_terminal_live_counts AS counts
+                USING grouped
                 WHERE counts.ready_slot = grouped.ready_slot
                   AND counts.queue = grouped.queue
                   AND counts.priority = grouped.priority
                   AND counts.enqueue_shard = grouped.enqueue_shard
-                  AND counts.counter_bucket = grouped.counter_bucket
                 RETURNING
                     counts.ready_slot,
                     counts.queue,
                     counts.priority,
                     counts.enqueue_shard,
-                    counts.counter_bucket
+                    counts.live_terminal_count
+            ),
+            folded AS (
+                SELECT
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    (grouped.delta + COALESCE(SUM(collapsed.live_terminal_count), 0))::bigint
+                        AS live_terminal_count
+                FROM grouped
+                LEFT JOIN collapsed
+                  ON collapsed.ready_slot = grouped.ready_slot
+                 AND collapsed.queue = grouped.queue
+                 AND collapsed.priority = grouped.priority
+                 AND collapsed.enqueue_shard = grouped.enqueue_shard
+                GROUP BY
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    grouped.delta
             ),
             inserted AS (
-                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                INSERT INTO {schema}.queue_terminal_live_counts (
                     ready_slot,
                     queue,
                     priority,
@@ -16235,27 +16259,15 @@ impl QueueStorage {
                     live_terminal_count
                 )
                 SELECT
-                    grouped.ready_slot,
-                    grouped.queue,
-                    grouped.priority,
-                    grouped.enqueue_shard,
-                    grouped.counter_bucket,
-                    grouped.delta
-                FROM grouped
-                WHERE grouped.delta > 0
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM updated
-                      WHERE updated.ready_slot = grouped.ready_slot
-                        AND updated.queue = grouped.queue
-                        AND updated.priority = grouped.priority
-                        AND updated.enqueue_shard = grouped.enqueue_shard
-                        AND updated.counter_bucket = grouped.counter_bucket
-                  )
-                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
-                ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
-                SET live_terminal_count =
-                    GREATEST(0, counts.live_terminal_count + EXCLUDED.live_terminal_count)
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    0::smallint,
+                    live_terminal_count
+                FROM folded
+                WHERE live_terminal_count <> 0
+                ORDER BY ready_slot, queue, priority, enqueue_shard
                 RETURNING 1
             )
             SELECT count(*)::bigint FROM grouped
