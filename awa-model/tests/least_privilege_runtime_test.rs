@@ -2,6 +2,7 @@ use awa_model::{migrations, QueueStorage, QueueStorageConfig};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, PgPool};
 use std::str::FromStr;
+use std::time::Duration;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 const SCHEMAS: [&str; 3] = ["awa", "custom_lanes", "custom_legacy"];
@@ -43,7 +44,7 @@ async fn runtime_uses_prepared_lane_sequences_without_schema_create() -> TestRes
 
 async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> TestResult {
     let owner_pool = PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(3)
         .connect_with(options.clone().username(owner))
         .await?;
     for (_, _, statement) in migrations::migration_sql_range(0, 48) {
@@ -103,6 +104,13 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
             .await
             .is_err());
     }
+    assert_preparation_lock_order(&owner_pool).await?;
+    let wide_lane_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.queue_enqueue_heads WHERE queue LIKE 'wide_queue#%'",
+    )
+    .fetch_one(&owner_pool)
+    .await?;
+    assert_eq!(wide_lane_count, 96);
     let runtime_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect_with(options.username(runtime))
@@ -141,6 +149,52 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
     assert_no_head_table_ddl_locks(&owner_pool).await?;
     runtime_pool.close().await;
     owner_pool.close().await;
+    Ok(())
+}
+
+async fn assert_preparation_lock_order(pool: &PgPool) -> TestResult {
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind("awa:wide_queue#10:1:0")
+        .execute(blocker.as_mut())
+        .await?;
+
+    let prepare_pool = pool.clone();
+    let preparation = tokio::spawn(async move {
+        QueueStorage::new(QueueStorageConfig {
+            queue_stripe_count: 12,
+            ..Default::default()
+        })?
+        .prepare_queue(&prepare_pool, "wide_queue", 2)
+        .await
+    });
+
+    let mut waiting_on_stripe_ten = false;
+    for _ in 0..100 {
+        waiting_on_stripe_ten = sqlx::query_scalar(
+            r#"SELECT EXISTS (
+                SELECT 1 FROM pg_locks
+                WHERE locktype = 'advisory' AND NOT granted
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+            )"#,
+        )
+        .fetch_one(pool)
+        .await?;
+        if waiting_on_stripe_ten {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let stripe_two_is_unlocked: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind("awa:wide_queue#2:1:0")
+            .fetch_one(pool)
+            .await?;
+    blocker.rollback().await?;
+    preparation.await??;
+    assert!(waiting_on_stripe_ten);
+    assert!(stripe_two_is_unlocked);
     Ok(())
 }
 

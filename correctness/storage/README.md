@@ -138,7 +138,7 @@ Run the broken correlated-hash witness with:
 
 ## Lock-order companion spec
 
-[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each storage-engine transaction (claim, rotate-leases, prune-leases, rotate-ready, prune-ready) as an ordered sequence of Postgres lock acquisitions, with a simplified shared/exclusive compatibility matrix that captures the cases relevant to deadlock analysis. Invariants:
+[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models storage transactions, including queue preparation, enqueue, claim, rotate, and prune, as ordered Postgres lock acquisitions with a simplified shared/exclusive compatibility matrix. Invariants:
 
 - `NoDeadlock`: the waits-for graph is acyclic
 - `LockCompatibility`: no two incompatible locks on the same resource
@@ -148,12 +148,16 @@ Run the broken correlated-hash witness with:
 Configs:
 
 - [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrderPrepareQueue.cfg`](./AwaStorageLockOrderPrepareQueue.cfg): producer and preparer both lock `q#10` before `q#2`, matching the string order of the batched Rust producer path.
+- [`AwaStorageLockOrderPrepareQueueNumeric.cfg`](./AwaStorageLockOrderPrepareQueueNumeric.cfg): numeric preparation order locks `q#2` before `q#10`; TLC finds a waits-for cycle against a producer.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
 
 Run:
 
 ```bash
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderPrepareQueue.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderPrepareQueueNumeric.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ```
 

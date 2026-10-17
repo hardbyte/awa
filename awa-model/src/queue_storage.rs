@@ -3775,7 +3775,9 @@ impl QueueStorage {
             ));
         }
         let mut transaction = pool.begin().await.map_err(map_sqlx_error)?;
-        for physical_queue in self.physical_queues_for_logical(queue) {
+        let mut physical_queues = self.physical_queues_for_logical(queue);
+        physical_queues.sort_unstable();
+        for physical_queue in physical_queues {
             for priority in 1..=4 {
                 for shard in 0..enqueue_shards {
                     self.ensure_lane_inserts(&mut transaction, &physical_queue, priority, shard)
