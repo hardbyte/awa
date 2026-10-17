@@ -3898,9 +3898,17 @@
 <td>matches <code>queue_rotate_interval</code></td>
 <td>How often the ADR-023 claim-ring rotates. Set with <code>ClientBuilder::claim_rotate_interval</code> (Rust) or <code>queue_storage_claim_rotate_interval_ms</code> (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions.</td>
 </tr>
+<tr>
+<td><code>ring_rotation_cadence</code></td>
+<td>5 s / 2 MiB target</td>
+<td>A non-empty slot becomes eligible after <code>min_slot_age</code> since the first non-empty observation, or when <code>target_slot_bytes</code> is reached. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. Age uses a monotonic clock and resets on an empty observation or leader change. Configure with <code>ClientBuilder::ring_rotation_cadence</code> (Rust) or <code>queue_storage_rotate_min_slot_age_ms</code> / <code>queue_storage_rotate_target_slot_bytes</code> (Python). A zero byte target disables the size trigger; zero age or <code>RingRotationCadence::EAGER</code> permits sealing on every tick. The target is sampled and does not bound retained storage.</td>
+</tr>
 </tbody>
 </table>
 <p>The benchmark harness in <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking">postgresql-job-queue-benchmarking</a> reads <code>QUEUE_SLOT_COUNT</code>, <code>LEASE_SLOT_COUNT</code>, <code>CLAIM_SLOT_COUNT</code>, <code>QUEUE_STRIPE_COUNT</code>, and <code>LEASE_CLAIM_RECEIPTS</code> from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.</p>
+<p>Rust builder overrides for cadence and claim rotation interval may be set before
+or after <code>queue_storage</code>; reconfiguring storage preserves those overrides. With
+no claim interval override, the claim ring uses the queue decision interval.</p>
 <p>Use the defaults unless you have a reason not to:</p>
 <ul>
 <li>Increase <code>queue_slot_count</code> if queue partitions stay unprunable for too long because readers, active leases, or pending ready rows keep old segments live.</li>

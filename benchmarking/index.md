@@ -8,7 +8,7 @@ This document captures the benchmark harnesses used in the repo and a few refere
 
 - **Developer laptop reference**: Apple M5 MacBook Air (16 GB), PostgreSQL 17 in Docker (OrbStack). Several awa-only regression examples below come from this environment.
 - **Dedicated enqueue reference**: PostgreSQL 17 on a separate Linux host. These runs are useful for producer-path shape comparisons and are not published throughput claims.
-- **Cross-system comparison reference**: [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking). That repo owns fair-comparison hardware, adapter configuration, raw output, and result summaries. Its default Postgres image is 17.2; `--pg-image postgres:18-alpine` selects PG18.
+- **Cross-system comparison reference**: [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking). That repo owns adapter configuration, raw output, and result summaries. Pin an exact Postgres image with `--pg-image` and record the harness revision for each comparison.
 - Example commands assume a developer database URL: `postgres://postgres:test@localhost:15432/awa_test`
 - Benchmarks live in: `awa/tests/benchmark_test.rs` `awa/tests/scheduling_benchmark_test.rs` `awa/tests/failure_benchmark_test.rs`
 - Python worker benchmarks live in: `awa-python/scripts/benchmark_runtime.py`
@@ -71,6 +71,33 @@ Two benchmark shapes are used:
 - **Steady/sustained benchmarks**: warm up, then measure a fixed time window
 
 Steady numbers are the better indicator of sustained runtime behavior.
+
+## Ring Rotation Cadence
+
+`scripts/benchmark-ring-cadence.py` compares eager maintenance rotation with
+`RingRotationCadence::DEFAULT` using one prebuilt adapter executable and fresh
+PostgreSQL data for each workload. The runner verifies the executable digest,
+pins the adapter dependency lockfile, and checks actual queue and claim ring
+wraps during warmup. Review its CPU sets and ports before using it on another
+machine.
+
+A five-second fill window with 16 queue slots needs substantially more than a
+60-second fresh-database sample to reach steady reclamation. Allow at least
+two complete wraps before measuring turnover, and measure several more wraps.
+Record catalog update counters and retained storage alongside throughput and
+latency. The byte target is sampled, so bursts and blocked reuse can exceed it.
+
+The comparison's method, selected samples, manifests and provenance live under
+`correctness/evidence/ring-cadence-2026-10-17/` in the repository. The external
+adapter reports successful handler returns and latency through handler return;
+those metrics do not measure durable completion acknowledgement.
+
+In the recorded PostgreSQL 18.6 comparison, cadence reduced measured `pg_class`
+updates by 61–81% under load, with similar handler throughput and higher
+retained ring storage. True idle produced no catalog updates under either
+policy. These are single paired runs with fixed CPU assignments; they do not
+establish a capacity or latency improvement. See the evidence report for the
+full matrix, retry recovery and logical-consumer pause/catchup results.
 
 ## MVCC Horizon Benchmark
 
