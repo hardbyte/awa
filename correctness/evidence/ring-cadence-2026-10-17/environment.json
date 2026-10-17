@@ -1,0 +1,160 @@
+{
+  "recorded_at": "2026-10-17T05:41:09.894698+00:00",
+  "resource_validation_cell": "idle",
+  "kernel": "6.8.0-139-generic",
+  "cpu": {
+    "Architecture": "x86_64",
+    "CPU(s)": "24",
+    "Model name": "AMD Ryzen 9 5900X 12-Core Processor",
+    "Thread(s) per core": "2",
+    "Core(s) per socket": "12",
+    "Socket(s)": "1",
+    "L3 cache": "64 MiB (2 instances)"
+  },
+  "policies": [
+    {
+      "policy": "eager",
+      "image_id": "sha256:c293117fcecda7344b5480222e813b9f673d7abd69b1dd95eff239b768b04f59",
+      "image_repo_digests": [
+        "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+      ],
+      "postgres_version": "postgres (PostgreSQL) 18.6",
+      "nano_cpus": 4000000000,
+      "memory_bytes": 8589934592,
+      "cpuset": "0-3,12-15"
+    },
+    {
+      "policy": "cadence",
+      "image_id": "sha256:c293117fcecda7344b5480222e813b9f673d7abd69b1dd95eff239b768b04f59",
+      "image_repo_digests": [
+        "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+      ],
+      "postgres_version": "postgres (PostgreSQL) 18.6",
+      "nano_cpus": 4000000000,
+      "memory_bytes": 8589934592,
+      "cpuset": "6-9,18-21"
+    }
+  ],
+  "cpu_topology": [
+    {
+      "cpu": 0,
+      "core": 0,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 1,
+      "core": 1,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 2,
+      "core": 2,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 3,
+      "core": 3,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 4,
+      "core": 4,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 5,
+      "core": 5,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 6,
+      "core": 8,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 7,
+      "core": 9,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 8,
+      "core": 10,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 9,
+      "core": 11,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 10,
+      "core": 12,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 11,
+      "core": 13,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 12,
+      "core": 0,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 13,
+      "core": 1,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 14,
+      "core": 2,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 15,
+      "core": 3,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 16,
+      "core": 4,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 17,
+      "core": 5,
+      "l3_shared_cpu_list": "0-5,12-17"
+    },
+    {
+      "cpu": 18,
+      "core": 8,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 19,
+      "core": 9,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 20,
+      "core": 10,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 21,
+      "core": 11,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 22,
+      "core": 12,
+      "l3_shared_cpu_list": "6-11,18-23"
+    },
+    {
+      "cpu": 23,
+      "core": 13,
+      "l3_shared_cpu_list": "6-11,18-23"
+    }
+  ]
+}
