@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 const IN_FLIGHT_SHARDS: usize = 64;
 
@@ -17,6 +18,8 @@ type InFlightShard = RwLock<HashMap<InFlightKey, InFlightState>>;
 pub(crate) struct InFlightState {
     pub cancel: CancelFlag,
     pub progress: Arc<std::sync::Mutex<ProgressState>>,
+    /// When the attempt was registered, just after its claim returned.
+    pub registered_at: Instant,
 }
 
 /// Mutable progress buffer shared between handler and heartbeat service.
@@ -157,11 +160,18 @@ impl InFlightRegistry {
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
-    pub fn keys(&self) -> Vec<InFlightKey> {
+    /// Keys of attempts registered at least `min_age` ago.
+    pub fn keys_older_than(&self, min_age: Duration) -> Vec<InFlightKey> {
+        let now = Instant::now();
         let mut keys = Vec::new();
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
-            keys.extend(guard.keys().copied());
+            keys.extend(
+                guard
+                    .iter()
+                    .filter(|(_, state)| now.duration_since(state.registered_at) >= min_age)
+                    .map(|(key, _)| *key),
+            );
         }
         keys
     }
@@ -270,6 +280,7 @@ mod tests {
             InFlightState {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: progress.clone(),
+                registered_at: Instant::now(),
             },
         );
 
@@ -278,5 +289,37 @@ mod tests {
         let state = progress.lock().expect("progress lock poisoned");
         assert_eq!(state.acked_generation, 2);
         assert!(state.in_flight.is_none());
+    }
+
+    #[test]
+    fn keys_older_than_filters_young_attempts() {
+        let registry = InFlightRegistry::default();
+        let fresh_progress = || Arc::new(std::sync::Mutex::new(ProgressState::new(None)));
+        let old_key = (1, 1);
+        let young_key = (2, 1);
+        registry.insert(
+            old_key,
+            InFlightState {
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: fresh_progress(),
+                registered_at: Instant::now() - Duration::from_secs(60),
+            },
+        );
+        registry.insert(
+            young_key,
+            InFlightState {
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: fresh_progress(),
+                registered_at: Instant::now(),
+            },
+        );
+
+        assert_eq!(
+            registry.keys_older_than(Duration::from_secs(30)),
+            vec![old_key]
+        );
+        let mut all = registry.keys_older_than(Duration::ZERO);
+        all.sort_unstable();
+        assert_eq!(all, vec![old_key, young_key]);
     }
 }
