@@ -6,6 +6,11 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every ready_entries
+  partition; the partition primary key already covers every lane lookup.
+  Each enqueued job writes two index entries instead of three and each
+  rotation initialises one fewer index. The drop takes a brief ACCESS
+  EXCLUSIVE lock per partition.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
