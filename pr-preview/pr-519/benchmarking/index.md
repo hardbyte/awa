@@ -92,6 +92,13 @@ The comparison's method, selected samples, manifests and provenance live under
 adapter reports successful handler returns and latency through handler return;
 those metrics do not measure durable completion acknowledgement.
 
+In the recorded PostgreSQL 18.6 comparison, cadence reduced measured `pg_class`
+updates by 61–81% under load, with similar handler throughput and higher
+retained ring storage. True idle produced no catalog updates under either
+policy. These are single paired runs with fixed CPU assignments; they do not
+establish a capacity or latency improvement. See the evidence report for the
+full matrix, retry recovery and logical-consumer pause/catchup results.
+
 ## MVCC Horizon Benchmark
 
 `awa/tests/scheduling_benchmark_test.rs` also includes an ignored `test_mvcc_horizon_overlap_benchmark` scenario for the failure mode described in PlanetScale's "Keeping a Postgres queue healthy" post: overlapping long-lived transactions pin the MVCC horizon while queue churn continues.
