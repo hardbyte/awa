@@ -18,14 +18,22 @@ pub(crate) struct HeartbeatCadence {
 impl HeartbeatCadence {
     /// A claim stamps the attempt's start time, and the stale-heartbeat rescue
     /// treats that stamp as the heartbeat until one is written, so an attempt
-    /// is covered for a full staleness window from its claim. When `staleness`
-    /// honours the documented floor of three intervals, the first heartbeat
-    /// can wait one interval and still land at least one interval before the
-    /// cutoff; attempts that finish within an interval then write no heartbeat
-    /// at all. Below the floor every tick heartbeats every attempt, as before.
+    /// is covered for a full staleness window from its claim. Ticks run at an
+    /// arbitrary phase relative to registration, so an attempt first becomes
+    /// due on the first tick at least `first_heartbeat_after` after it was
+    /// registered: with half an interval, that is at most 1.5 intervals after
+    /// registration. When `staleness` honours the documented floor of three
+    /// intervals this leaves 1.5 intervals before the cutoff, so one failed or
+    /// stalled tick is still followed by another before the attempt goes
+    /// stale. Attempts that finish within half an interval write no heartbeat.
+    /// Below the floor every tick heartbeats every attempt.
+    ///
+    /// `staleness` is this runtime's setting; the rescue sweep applies the
+    /// elected leader's. Fleets should use the same heartbeat settings on
+    /// every runtime.
     pub fn new(interval: Duration, staleness: Duration) -> Self {
         let first_heartbeat_after = if staleness >= interval * 3 {
-            interval
+            interval / 2
         } else {
             Duration::ZERO
         };
@@ -312,12 +320,12 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn first_heartbeat_waits_one_interval_when_staleness_meets_the_floor() {
+    fn first_heartbeat_waits_half_an_interval_when_staleness_meets_the_floor() {
         let interval = Duration::from_secs(30);
         for staleness in [Duration::from_secs(90), Duration::from_secs(600)] {
             assert_eq!(
                 HeartbeatCadence::new(interval, staleness).first_heartbeat_after,
-                interval
+                Duration::from_secs(15)
             );
         }
     }
