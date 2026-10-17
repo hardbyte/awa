@@ -3,8 +3,38 @@ use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+
+/// Heartbeat timing: the tick interval and how old an attempt must be before
+/// its first heartbeat is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeartbeatCadence {
+    pub interval: Duration,
+    pub first_heartbeat_after: Duration,
+}
+
+impl HeartbeatCadence {
+    /// A claim stamps the attempt's start time, and the stale-heartbeat rescue
+    /// treats that stamp as the heartbeat until one is written, so an attempt
+    /// is covered for a full staleness window from its claim. When `staleness`
+    /// honours the documented floor of three intervals, the first heartbeat
+    /// can wait one interval and still land at least one interval before the
+    /// cutoff; attempts that finish within an interval then write no heartbeat
+    /// at all. Below the floor every tick heartbeats every attempt, as before.
+    pub fn new(interval: Duration, staleness: Duration) -> Self {
+        let first_heartbeat_after = if staleness >= interval * 3 {
+            interval
+        } else {
+            Duration::ZERO
+        };
+        Self {
+            interval,
+            first_heartbeat_after,
+        }
+    }
+}
 
 /// Background heartbeat service that periodically updates heartbeat_at
 /// for all in-flight jobs, and flushes pending progress updates.
@@ -12,7 +42,7 @@ pub struct HeartbeatService {
     pool: PgPool,
     storage: RuntimeStorage,
     in_flight: InFlightMap,
-    interval: std::time::Duration,
+    cadence: HeartbeatCadence,
     batch_size: usize,
     alive: Arc<AtomicBool>,
     cancel: CancellationToken,
@@ -24,7 +54,7 @@ impl HeartbeatService {
         pool: PgPool,
         storage: RuntimeStorage,
         in_flight: InFlightMap,
-        interval: std::time::Duration,
+        cadence: HeartbeatCadence,
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
         metrics: crate::metrics::AwaMetrics,
@@ -33,7 +63,7 @@ impl HeartbeatService {
             pool,
             storage,
             in_flight,
-            interval,
+            cadence,
             batch_size: 500,
             alive,
             cancel,
@@ -45,7 +75,7 @@ impl HeartbeatService {
     pub async fn run(&self) {
         self.alive.store(true, Ordering::SeqCst);
         debug!(
-            interval_ms = self.interval.as_millis(),
+            interval_ms = self.cadence.interval.as_millis(),
             "Heartbeat service started"
         );
 
@@ -57,7 +87,7 @@ impl HeartbeatService {
                     self.heartbeat_once().await;
                     break;
                 }
-                _ = tokio::time::sleep(self.interval) => {
+                _ = tokio::time::sleep(self.cadence.interval) => {
                     self.heartbeat_once().await;
                 }
             }
@@ -66,27 +96,28 @@ impl HeartbeatService {
         self.alive.store(false, Ordering::SeqCst);
     }
 
-    /// One heartbeat pass: refresh leases for in-flight jobs and flush any
-    /// pending progress. No-op when nothing is in flight.
+    /// One heartbeat pass: refresh leases for in-flight jobs that are due a
+    /// heartbeat and flush any pending progress. No-op when neither applies.
     // Debug-level root span, as for the dispatcher's poll (#449, #455).
     #[tracing::instrument(
         level = "debug",
         parent = None,
         name = "heartbeat.tick",
         skip(self),
-        fields(interval_ms = self.interval.as_millis() as u64)
+        fields(interval_ms = self.cadence.interval.as_millis() as u64)
     )]
     async fn heartbeat_once(&self) {
-        let mut all_keys: Vec<(i64, RunLease)> = self.in_flight.keys();
+        let mut all_keys: Vec<(i64, RunLease)> = self
+            .in_flight
+            .keys_older_than(self.cadence.first_heartbeat_after);
         all_keys.sort_unstable();
-
-        if all_keys.is_empty() {
-            return;
-        }
 
         // Snapshot pending progress updates from the in-flight registry.
         // This locks each ProgressState briefly and sets in_flight snapshots.
         let mut pending_progress = self.in_flight.snapshot_pending_progress();
+        if all_keys.is_empty() && pending_progress.is_empty() {
+            return;
+        }
         pending_progress.sort_unstable_by_key(|(job_id, run_lease, _, _)| (*job_id, *run_lease));
         let progress_keys: std::collections::HashSet<(i64, i64)> = pending_progress
             .iter()
@@ -271,6 +302,34 @@ impl HeartbeatService {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HeartbeatCadence;
+    use std::time::Duration;
+
+    #[test]
+    fn first_heartbeat_waits_one_interval_when_staleness_meets_the_floor() {
+        let interval = Duration::from_secs(30);
+        for staleness in [Duration::from_secs(90), Duration::from_secs(600)] {
+            assert_eq!(
+                HeartbeatCadence::new(interval, staleness).first_heartbeat_after,
+                interval
+            );
+        }
+    }
+
+    #[test]
+    fn first_heartbeat_is_immediate_below_the_floor() {
+        let interval = Duration::from_secs(30);
+        for staleness in [Duration::from_secs(89), Duration::ZERO] {
+            assert_eq!(
+                HeartbeatCadence::new(interval, staleness).first_heartbeat_after,
+                Duration::ZERO
+            );
         }
     }
 }

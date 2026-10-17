@@ -6,6 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- The first heartbeat for an attempt waits one `heartbeat_interval` when `heartbeat_staleness` is at least three intervals, as the claim stamp already covers the attempt for a full staleness window. Attempts that finish within one interval no longer write or delete an `attempt_state` row, and heartbeat ticks with nothing due issue no statement. Rescue timing is unchanged.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
