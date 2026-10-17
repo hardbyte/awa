@@ -1,4 +1,10 @@
 -- v049: Use provisioned lane sequences without runtime DDL.
+-- Tracking: https://github.com/hardbyte/awa/pull/501
+-- N-1 binaries use unchanged helper signatures and cursor semantics. Owners
+-- retain lazy sequence creation; restricted roles use provisioned lanes.
+-- Live load: function replacement only, with no table DDL or row scans.
+-- Three schemas took 54 ms on disposable PostgreSQL 17. Row volume does not
+-- change the work; function lock waits and schema count determine wall time.
 
 DO $$
 DECLARE
