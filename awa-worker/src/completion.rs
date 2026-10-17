@@ -105,9 +105,16 @@ fn completion_sort_key(request: &CompletionRequest) -> (i32, i64, RunLease) {
 #[derive(Clone)]
 pub(crate) struct CompletionBatcherHandle {
     shards: Vec<mpsc::Sender<CompletionRequest>>,
+    pipeline_capacity: usize,
 }
 
 impl CompletionBatcherHandle {
+    pub fn finalizer_capacity(&self, runtime_worker_capacity: u32) -> usize {
+        self.pipeline_capacity
+            .max(runtime_worker_capacity.max(1) as usize)
+            .min(tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
     pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
         self.complete_inner(job_id, run_lease, None, None).await
     }
@@ -166,6 +173,26 @@ impl CompletionBatcher {
         let shard_count = completion_shards(&storage, runtime_worker_capacity);
         let batch_size = completion_batch_size();
         let flush_interval = completion_flush_interval();
+        Self::with_batching(
+            pool,
+            cancel,
+            metrics,
+            storage,
+            shard_count,
+            batch_size,
+            flush_interval,
+        )
+    }
+
+    pub(crate) fn with_batching(
+        pool: PgPool,
+        cancel: CancellationToken,
+        metrics: crate::metrics::AwaMetrics,
+        storage: RuntimeStorage,
+        shard_count: usize,
+        batch_size: usize,
+        flush_interval: Duration,
+    ) -> (Self, CompletionBatcherHandle) {
         let mut shards = Vec::with_capacity(shard_count);
         let mut workers = Vec::with_capacity(shard_count);
 
@@ -185,7 +212,14 @@ impl CompletionBatcher {
             });
         }
 
-        (Self { workers }, CompletionBatcherHandle { shards })
+        (
+            Self { workers },
+            CompletionBatcherHandle {
+                shards,
+                // Each shard needs an in-flight batch and a queued batch.
+                pipeline_capacity: batch_size.saturating_mul(shard_count).saturating_mul(2),
+            },
+        )
     }
 
     pub fn spawn(self) -> Vec<tokio::task::JoinHandle<()>> {

@@ -258,6 +258,9 @@ impl JobExecutor {
         finalize_cancel: CancellationToken,
         runtime_worker_capacity: u32,
     ) -> Self {
+        let finalize_capacity = Arc::new(Semaphore::new(
+            completion_batcher.finalizer_capacity(runtime_worker_capacity),
+        ));
         Self {
             pool,
             workers,
@@ -272,7 +275,7 @@ impl JobExecutor {
             dlq_policy,
             finalizers,
             finalize_cancel,
-            finalize_capacity: Arc::new(Semaphore::new(runtime_worker_capacity.max(1) as usize)),
+            finalize_capacity,
         }
     }
 
@@ -3478,7 +3481,7 @@ mod tests {
             "reconnect_parent".into(),
             Box::new(ReconnectWorker(Arc::new(AtomicU32::new(0)))) as BoxedWorker,
         )]);
-        let executor = JobExecutor::new(
+        let mut executor = JobExecutor::new(
             pool.clone(),
             Arc::new(workers),
             Arc::new(HashMap::from([("reconnect_parent".into(), vec![hook])])),
@@ -3494,6 +3497,7 @@ mod tests {
             cancel,
             1,
         );
+        executor.finalize_capacity = Arc::new(Semaphore::new(1));
         let dispatched = |job| DispatchedJob {
             job,
             queue_storage_claim: None,
@@ -3554,7 +3558,7 @@ mod tests {
             "reconnect_parent".into(),
             Box::new(ReconnectWorker(runs.clone())) as BoxedWorker,
         )]);
-        let executor = JobExecutor::new(
+        let mut executor = JobExecutor::new(
             pool,
             Arc::new(workers),
             Arc::new(HashMap::new()),
@@ -3570,6 +3574,7 @@ mod tests {
             cancel.clone(),
             1,
         );
+        executor.finalize_capacity = Arc::new(Semaphore::new(1));
         let dispatched = |job| DispatchedJob {
             job,
             queue_storage_claim: None,
@@ -3607,6 +3612,151 @@ mod tests {
             .unwrap();
         assert!(in_flight.get_cancel(second_key).is_none());
         assert!(finalizers.is_empty());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn finalizers_fill_completion_pipeline_then_backpressure_handlers(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let mut jobs = Vec::new();
+        for _ in 0..12 {
+            jobs.push(running_reconnect_job(&pool).await);
+        }
+        let job_ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+        let mut blocking_tx = pool.begin().await.unwrap();
+        let blocking_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocking_tx)
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM awa.jobs_hot WHERE id = ANY($1) FOR UPDATE")
+            .bind(&job_ids[..4])
+            .fetch_all(&mut *blocking_tx)
+            .await
+            .unwrap();
+
+        let metrics = test_metrics();
+        let finalizers = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let runs = Arc::new(AtomicU32::new(0));
+        let (batcher, handle) = crate::completion::CompletionBatcher::with_batching(
+            pool.clone(),
+            cancel.clone(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+            4,
+            Duration::from_secs(3600),
+        );
+        let workers: HashMap<String, BoxedWorker> = HashMap::from([(
+            "reconnect_parent".into(),
+            Box::new(ReconnectWorker(runs.clone())) as BoxedWorker,
+        )]);
+        let executor = JobExecutor::new(
+            pool.clone(),
+            Arc::new(workers),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            metrics,
+            handle,
+            RuntimeStorage::Canonical,
+            DlqPolicy::default(),
+            finalizers.clone(),
+            cancel.clone(),
+            1,
+        );
+        let dispatched = |job| DispatchedJob {
+            job,
+            queue_storage_claim: None,
+            queue_storage_unique_states: None,
+        };
+        let mut jobs = jobs.into_iter();
+        for job in jobs.by_ref().take(4) {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                executor.execute_task(dispatched(job), Arc::new(AtomicBool::new(false))),
+            )
+            .await
+            .expect("short handlers must fill a complete batch even with one worker");
+        }
+        let batcher_handles = batcher.spawn();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(blocking_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the full first batch must reach its blocked SQL flush");
+        for job in jobs.by_ref().take(4) {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                executor.execute_task(dispatched(job), Arc::new(AtomicBool::new(false))),
+            )
+            .await
+            .expect("another complete batch must queue while the first flush is blocked");
+        }
+        let waiting_job = jobs.next().unwrap();
+        let waiting_key = (waiting_job.id, waiting_job.run_lease);
+        let waiting_task = tokio::spawn(
+            executor.execute_task(dispatched(waiting_job), Arc::new(AtomicBool::new(false))),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs.load(Ordering::SeqCst) != 9 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!waiting_task.is_finished());
+        assert!(in_flight.get_cancel(waiting_key).is_some());
+        assert_eq!(finalizers.len(), 8);
+
+        blocking_tx.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiting_task)
+            .await
+            .unwrap()
+            .unwrap();
+        for job in jobs {
+            executor
+                .execute_task(dispatched(job), Arc::new(AtomicBool::new(false)))
+                .await;
+        }
+        finalizers.close();
+        tokio::time::timeout(Duration::from_secs(5), finalizers.wait())
+            .await
+            .expect("three full batches must persist and drain without the flush timer");
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.jobs_hot WHERE id = ANY($1) AND state = 'completed'",
+        )
+        .bind(&job_ids)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(completed, job_ids.len() as i64);
+        assert_eq!(runs.load(Ordering::SeqCst), 12);
+        assert!(in_flight.get_cancel(waiting_key).is_none());
+        cancel.cancel();
+        for handle in batcher_handles {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]
