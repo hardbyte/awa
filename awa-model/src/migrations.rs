@@ -281,7 +281,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         50,
         "Drop the redundant lane index on ready_entries partitions",
-        &[V23_UP, V23_DEFAULT_UP, V50_UP],
+        &[V23_UP, V50_UP],
     ),
 ];
 

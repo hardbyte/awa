@@ -27,13 +27,31 @@ See [Database roles](security/database-roles.md#provision-queues-before-starting
 
 v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every `ready_entries`
 partition in the default and discovered custom schemas. The partition primary
-key `(ready_slot, queue, priority, enqueue_shard, lane_seq)` serves the same
-lane scans because every claim pins `ready_slot`. Each `DROP INDEX` holds an
-ACCESS EXCLUSIVE lock on its partition until the migration transaction
-commits, so run it with a bounded `lock_timeout`; no rows are scanned or
-rewritten. External runners apply the complete generated
-`awa migrate --sql --from 49 --to 50` bundle, which refreshes the installer
-before the tail drops the existing indexes.
+key `(ready_slot, queue, priority, enqueue_shard, lane_seq)` serves every
+per-lane lookup because current binaries pin `ready_slot` in claims, in the
+queue prune and terminal-count fold gates, and in the maintenance lag gauge
+(through `ready_segments`).
+
+What the migration locks: it redefines `awa.install_queue_storage_substrate`
+(no schema is reinstalled) and then drops the indexes in slot order. Each
+`DROP INDEX` takes ACCESS EXCLUSIVE on its `ready_entries` partition and holds
+it until the migration transaction commits, so enqueues and claims touching
+that partition wait for the commit. No rows are scanned or rewritten; on a
+scratch PostgreSQL 17 database with 409,600 ready rows the whole 49 → 50 step
+took 27 ms. When the session has no `lock_timeout`, the migration waits at
+most 2 s for each partition. If it times out (SQLSTATE `55P03`, typically
+behind a long-running read of `awa.jobs` or a backup) the whole migration
+rolls back and can simply be re-run. External runners apply the complete
+generated `awa migrate --sql --from 49 --to 50` bundle.
+
+Rollout order: roll the binaries first, then migrate. Current binaries work
+with or without the index. Pre-v050 binaries keep working against a v050
+schema, but on PostgreSQL 17 and earlier their maintenance lag gauge,
+queue prune gate and terminal-count fold gate fall back to sequential scans of every ready partition
+(PostgreSQL 18 can skip-scan the primary key). Rolling back a binary is
+therefore safe for correctness; to restore the old binary's query plans,
+recreate the index per partition with
+`CREATE INDEX CONCURRENTLY idx_<schema>_ready_<slot>_lane_shard ON <schema>.ready_entries_<slot> (queue, priority, enqueue_shard, lane_seq)`.
 
 ## The one gate
 

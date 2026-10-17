@@ -2,30 +2,36 @@
 --
 -- Every ready partition carries `idx_<schema>_ready_<slot>_lane_shard` on
 -- (queue, priority, enqueue_shard, lane_seq) next to its primary key on
--- (ready_slot, queue, priority, enqueue_shard, lane_seq). A partition holds
--- one ready_slot value and every lane lookup in `claim_ready_runtime`
--- pins ready_slot, so the primary key serves the same scans. The extra
--- index costs one btree insert per enqueued job and one metapage image per
--- rotation.
+-- (ready_slot, queue, priority, enqueue_shard, lane_seq). Every per-lane
+-- lookup on ready_entries pins ready_slot (claims, prune and fold gates,
+-- the maintenance lag gauge via ready_segments), so the primary key serves
+-- the same scans. The extra index costs one btree insert per enqueued job
+-- and one metapage image per rotation.
 --
 -- This file is the migration tail. `awa migrate` and
--- `awa migrate --sql --from 49 --to 50` run V23_UP first so the installer no
--- longer recreates the index on the next `prepare_schema`; this tail drops
--- the existing copies in every discovered queue-storage schema.
+-- `awa migrate --sql --from 49 --to 50` run V23_UP first, which only
+-- redefines the installer function so later installs omit the index; the
+-- default substrate is not replayed. This tail drops the existing copies in
+-- every discovered queue-storage schema, in slot order.
 --
--- `DROP INDEX` takes an ACCESS EXCLUSIVE lock on each ready partition until
--- the transaction commits, so in-flight enqueues and claims on that
--- partition wait for the drop and the drop waits for them. No rows are
--- scanned or rewritten. Use a bounded lock_timeout and a quiet window.
+-- Locks: each `DROP INDEX` takes ACCESS EXCLUSIVE on its ready partition and
+-- holds it until the migration transaction commits. No rows are scanned or
+-- rewritten. When no lock_timeout is set, the tail waits at most 2 s for each
+-- partition; a timeout (SQLSTATE 55P03) rolls the whole migration back and it
+-- can be re-run.
 -- Tracking: https://github.com/hardbyte/awa/issues/522
 
 DO $$
 DECLARE
     v_schema TEXT;
     v_parent_oid OID;
-    v_child_name TEXT;
-    v_slot TEXT;
+    v_slot INT;
+    v_previous_lock_timeout TEXT := current_setting('lock_timeout');
 BEGIN
+    IF v_previous_lock_timeout = '0' THEN
+        PERFORM set_config('lock_timeout', '2s', true);
+    END IF;
+
     FOR v_schema IN
         SELECT n.nspname
         FROM pg_namespace AS n
@@ -37,19 +43,21 @@ BEGIN
                 AND oidvectortypes(awa_p.proargtypes)
                     = 'text, bigint, double precision, double precision'
           )
+        ORDER BY n.nspname
     LOOP
         v_parent_oid := to_regclass(format('%I.ready_entries', v_schema));
         IF v_parent_oid IS NULL THEN
             CONTINUE;
         END IF;
 
-        FOR v_child_name IN
-            SELECT c.relname
+        FOR v_slot IN
+            SELECT substring(c.relname FROM '^ready_entries_([0-9]+)$')::int AS slot
             FROM pg_inherits AS i
             JOIN pg_class AS c ON c.oid = i.inhrelid
             WHERE i.inhparent = v_parent_oid
+              AND c.relname ~ '^ready_entries_[0-9]+$'
+            ORDER BY 1
         LOOP
-            v_slot := substring(v_child_name FROM length('ready_entries') + 2);
             EXECUTE format(
                 'DROP INDEX IF EXISTS %I.%I',
                 v_schema,
@@ -57,6 +65,8 @@ BEGIN
             );
         END LOOP;
     END LOOP;
+
+    PERFORM set_config('lock_timeout', v_previous_lock_timeout, true);
 END;
 $$;
 
