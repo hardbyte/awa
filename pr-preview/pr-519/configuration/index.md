@@ -572,6 +572,10 @@ await client.start(
 
 The benchmark harness in [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking) reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.
 
+Rust builder overrides for cadence and claim rotation interval may be set before
+or after `queue_storage`; reconfiguring storage preserves those overrides. With
+no claim interval override, the claim ring uses the queue decision interval.
+
 Use the defaults unless you have a reason not to:
 
 - Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers, active leases, or pending ready rows keep old segments live.
