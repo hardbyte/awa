@@ -114,11 +114,15 @@ The key `QueueConfig` fields:
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
+A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
+
+With LISTEN available, consecutive empty polls back off to a 2 s cap (or `poll_interval` when larger). Notifications reset the backoff; periodic polling still recovers lost notifications. Poll-only runtimes retain `poll_interval`. The cap is internal, preserving existing `QueueConfig` struct literals. Shutdown bounds dispatcher exit and worker drain by the same timeout; a claim interrupted at expiry is recovered through the normal lease-rescue path.
+
 ### Partitioned Queues
 
 A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
 
-Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
+Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
 
 Rust producers and workers can share `PartitionedQueue`:
 
@@ -500,7 +504,7 @@ Queue storage is the runtime engine in `0.6`, and most deployments can keep the 
 
 ### Producer path choice
 
-For bulk producers on queue storage, prefer direct queue-storage COPY: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Those paths stream rows straight into `ready_entries` / `deferred_jobs` and use the queue-storage enqueue heads directly.
+For bulk producers on queue storage, prefer direct queue-storage COPY: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Those paths write straight into `ready_entries` / `deferred_jobs` and use the queue-storage enqueue heads directly. In 0.7, each ready or deferred write group uses array-backed INSERT below 2,048 rows and CSV COPY at or above that cutoff; the API and transactional enqueue semantics are unchanged.
 
 Direct-copy producers must use the same queue-storage routing config as the worker fleet. This matters most for `queue_stripe_count` / `queue_storage_queue_stripe_count`: a producer using the default unstriped config can write to `queue` while striped workers claim from `queue#0`, `queue#1`, etc. Rust producers should construct `QueueStorage` with the same `QueueStorageConfig` used by workers. Python producers should pass the same `queue_storage_queue_stripe_count` to `enqueue_many_copy()` when the fleet uses non-default striping.
 
@@ -600,7 +604,7 @@ Lowering the value is safe at any time. See [ADR-025](../adr/025-sharded-enqueue
 
 ### Hot-Queue Claim Control
 
-Queue storage also uses a bounded-claimer control plane (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a hot queue's claim path at once. For a single hot queue, raising `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's `max_workers` / `min_workers` permits.
+Queue storage also uses a bounded-claimer control plane (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a hot queue's claim path at once. In 0.7, each instance may reuse its claimer lease and target check for up to 250 ms, bypassing the cache within one second of lease expiry. Target reductions constrain new acquisition; existing owned slots remain valid. These are coordination hints: job ownership still comes from the database claim transaction. Reset clears the local cache after truncating the coordination leases. For a single hot queue, raising `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's `max_workers` / `min_workers` permits.
 
 Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4` is the change that turns overload into bounded end-to-end throughput; raising `claimers` to `4` increases transaction pressure and worsens tail latency in that shape. For extreme single-queue workloads, raise `enqueue_shards` first when the ordering contract allows partitioned FIFO. Benchmark `claimers = 2` or `4` only for a workload-specific reason, and judge the result by durable completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed job, transaction commits per completed job, and dead tuples. Lower `claim_batch_size` from `512` for small or latency-sensitive queues; raise claimers only with workload-specific evidence.
 

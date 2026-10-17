@@ -5,9 +5,9 @@
 The 0.6 → 0.7 upgrade is short: **the storage step is "be finalized."** Everything else in
 0.7 is additive.
 
-## Restricted runtime roles and v047
+## Restricted runtime roles and v049
 
-v047 refreshes lane-sequence helpers in the default and existing custom
+v049 refreshes lane-sequence helpers in the default and existing custom
 queue-storage schemas without changing function signatures or cursor semantics.
 Existing provisioned lanes run without schema CREATE; single-role owners retain
 lazy creation. The migration adds no runtime version gate or authority flip.
@@ -16,10 +16,13 @@ A [migrate-first rehearsal with released `awa-pg==0.6.7`](https://github.com/har
 verified a restricted worker completing jobs on the upgraded schema. That
 rehearsal does not cover concurrent mixed-version rollouts.
 
-For a runtime without DDL privileges, apply v047 as the migrator, run
+For a runtime without DDL privileges, apply v049 as the migrator, run
 `awa storage prepare-queue --queue <name>` for every physical queue, and grant
 sequence `USAGE, SELECT, UPDATE` before starting producers or workers. Match
 shard and stripe counts and provision extra lanes before increasing them.
+External migration runners must apply the complete generated
+`awa migrate --sql --from 48 --to 49` bundle: it refreshes the installer
+definition before replacing lane helpers in the installed schemas.
 See [Database roles](../security/database-roles/index.md#provision-queues-before-starting-restricted-runtimes).
 
 ## The one gate
@@ -193,6 +196,48 @@ the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downg
 previous releases).
 
 
+## v047: replica identity for every table
+
+v047 gives the tables that had no primary key a replica identity, so awa keeps
+working when its schema is in a logical-replication publication (Debezium's
+default `FOR ALL TABLES`, or `FOR TABLES IN SCHEMA awa`). Without one PostgreSQL
+rejects every UPDATE and DELETE on a published table, which stopped the
+maintenance leader on each tick. `awa.job_unique_claims` identifies rows by its
+existing uniqueness index; `awa.admin_dirty_queue_marks`,
+`awa.admin_dirty_kind_marks`, `queue_terminal_rollup_deltas` and
+`queue_terminal_count_deltas` with its partitions use `REPLICA IDENTITY FULL`
+(ADR-045 forbids an index on the mark tables; the delta tables are append-only,
+so FULL costs nothing on their hot path).
+
+0.7.x runtimes retain the same query behavior after migration; replica identity
+changes WAL images for UPDATE and DELETE. Apply the migration with DDL credentials
+that own, or inherit ownership of, the canonical and installed custom substrates.
+Schema USAGE alone does not permit ALTER TABLE. Discovery uses the full
+`claim_ready_runtime(text,bigint,double precision,double precision)` signature
+and skips unrelated same-named functions.
+
+Use `awa migrate` or the generated version bundle. For an external runner,
+`awa migrate --sql --from 46 --to 47` emits the installer definition and
+default-substrate replay followed by the v047 tail. Raw v047 is only
+that tail. The default SQL export wraps a transaction and migration advisory lock,
+but does not run Rust runtime/cron preflights. External runners must perform the
+documented cron preflight below before installer replay:
+when `awa.cron_jobs` exists, acquire its ACCESS EXCLUSIVE lock before the first
+pending statement. Use `--no-transaction` when the external runner owns the
+transaction and migration lock. Apply the full bundle transactionally; see
+[migration policy](../adr/041-rolling-upgrade-policy/index.md).
+
+The identity ALTERs and installer trigger replacement acquire table locks,
+including ACCESS EXCLUSIVE locks on ring state and queue heads. Locks can wait
+behind live transactions and remain held until the entire pending range commits.
+Neither first application nor replay has a millisecond or lock-free guarantee.
+Use an operational quiet window and a bounded `lock_timeout`; on timeout roll
+back and retry the complete bundle. Applying earlier pending versions separately
+can shorten the final lock-holding transaction, but the v047 bundle still includes
+installer DDL. See [tracking PR #509](https://github.com/hardbyte/awa/pull/509),
+[released-artifact rehearsal tracking #427](https://github.com/hardbyte/awa/issues/427),
+and [Logical replication and CDC](../deploying-on-managed-postgres/index.md#logical-replication-and-cdc).
+
 ## v046: wait-free admin dirty-key marks
 
 v046 replaces the keyed `admin_dirty_queues` / `admin_dirty_kinds` tables the
@@ -263,3 +308,19 @@ time. Foreign ownership still fails startup and requires explicit transfer.
 During mixed-manifest rollouts, existing definitions retain their last agreed
 value; new names can be inserted immediately. Definition updates wait for fresh
 capable fleet agreement, while removals additionally wait through grace.
+
+### v048 claim cursor compatibility
+
+Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds `lane_drained` and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.
+
+For v048 use `awa migrate` or the complete generated
+`awa migrate --sql --from 47 --to 48` bundle. It includes the installer
+definition and default-substrate replay before the v048 tail reinstalls custom
+substrates. Raw `v048_claim_cursor_catch_up.sql` alone calls
+whatever installer is already stored in the database; it does not supply the
+new function definition. The generated bundle path supplies that dependency.
+The same table-lock, ownership, external preflight and timeout/retry requirements
+[documented for v047](#v047-replica-identity-for-every-table) apply. Trigger replay
+is DDL and can block claim/enqueue/rotation activity until commit; there is no
+fixed completion-time guarantee. See [tracking PR #513](https://github.com/hardbyte/awa/pull/513)
+and [released-artifact rehearsal tracking #427](https://github.com/hardbyte/awa/issues/427).

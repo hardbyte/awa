@@ -2282,7 +2282,7 @@
 </span></code></pre></div>
 <p>If an existing installation created objects as <code>awa_migrator</code> without first setting the owner role, transfer every existing schema object to <code>awa_owner</code> before relying on owner-scoped defaults. New migrations should use the effective-role command above.</p>
 <h2 id="provision-queues-before-starting-restricted-runtimes">Provision queues before starting restricted runtimes<a class="headerlink" href="#provision-queues-before-starting-restricted-runtimes" title="Permanent link">&para;</a></h2>
-<p>From schema v047, runtime calls use existing lane sequences without issuing
+<p>From schema v049, runtime calls use existing lane sequences without issuing
 <code>CREATE SEQUENCE</code>. Run provisioning as the migrator for every queue before
 starting its producers or workers:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">PGOPTIONS</span><span class="o">=</span><span class="s1">'-c role=awa_owner'</span><span class="w"> </span><span class="se">\</span>
@@ -2298,7 +2298,7 @@ physical queue. Use <code>--schema</code> for a custom storage schema.</p>
 <p>Apply the sequence grants above after provisioning, or set the owner's default
 privileges first. Lane cursors need <code>UPDATE</code> for <code>setval</code>, in addition to <code>USAGE</code>
 and <code>SELECT</code>. <code>CREATE SEQUENCE IF NOT EXISTS</code> requires schema CREATE even when
-the sequence already exists, so provisioning alone does not repair pre-v047
+the sequence already exists, so provisioning alone does not repair pre-v049
 helpers: apply the migration first. Schema owners retain lazy creation for
 single-role installations; a restricted runtime encountering an unprepared
 lane fails with a provisioning hint.</p>

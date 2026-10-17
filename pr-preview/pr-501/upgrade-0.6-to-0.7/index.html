@@ -1438,10 +1438,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#restricted-runtime-roles-and-v047" class="md-nav__link">
+  <a href="#restricted-runtime-roles-and-v049" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Restricted runtime roles and v047
+        Restricted runtime roles and v049
       
     </span>
   </a>
@@ -1565,6 +1565,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v047-replica-identity-for-every-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v047: replica identity for every table
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v046-wait-free-admin-dirty-key-marks" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1583,6 +1594,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="v045: opt-in periodic ownership">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#v048-claim-cursor-compatibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v048 claim cursor compatibility
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2232,10 +2260,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#restricted-runtime-roles-and-v047" class="md-nav__link">
+  <a href="#restricted-runtime-roles-and-v049" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Restricted runtime roles and v047
+        Restricted runtime roles and v049
       
     </span>
   </a>
@@ -2359,6 +2387,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v047-replica-identity-for-every-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v047: replica identity for every table
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v046-wait-free-admin-dirty-key-marks" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2377,6 +2416,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="v045: opt-in periodic ownership">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#v048-claim-cursor-compatibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v048 claim cursor compatibility
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2411,18 +2467,21 @@
 <h1 id="upgrading-from-06-to-07">Upgrading from 0.6 to 0.7<a class="headerlink" href="#upgrading-from-06-to-07" title="Permanent link">&para;</a></h1>
 <p>The 0.6 → 0.7 upgrade is short: <strong>the storage step is "be finalized."</strong> Everything else in
 0.7 is additive.</p>
-<h2 id="restricted-runtime-roles-and-v047">Restricted runtime roles and v047<a class="headerlink" href="#restricted-runtime-roles-and-v047" title="Permanent link">&para;</a></h2>
-<p>v047 refreshes lane-sequence helpers in the default and existing custom
+<h2 id="restricted-runtime-roles-and-v049">Restricted runtime roles and v049<a class="headerlink" href="#restricted-runtime-roles-and-v049" title="Permanent link">&para;</a></h2>
+<p>v049 refreshes lane-sequence helpers in the default and existing custom
 queue-storage schemas without changing function signatures or cursor semantics.
 Existing provisioned lanes run without schema CREATE; single-role owners retain
 lazy creation. The migration adds no runtime version gate or authority flip.</p>
 <p>A <a href="https://github.com/hardbyte/awa/pull/501#compatibility-evidence">migrate-first rehearsal with released <code>awa-pg==0.6.7</code></a>
 verified a restricted worker completing jobs on the upgraded schema. That
 rehearsal does not cover concurrent mixed-version rollouts.</p>
-<p>For a runtime without DDL privileges, apply v047 as the migrator, run
+<p>For a runtime without DDL privileges, apply v049 as the migrator, run
 <code>awa storage prepare-queue --queue &lt;name&gt;</code> for every physical queue, and grant
 sequence <code>USAGE, SELECT, UPDATE</code> before starting producers or workers. Match
 shard and stripe counts and provision extra lanes before increasing them.
+External migration runners must apply the complete generated
+<code>awa migrate --sql --from 48 --to 49</code> bundle: it refreshes the installer
+definition before replacing lane helpers in the installed schemas.
 See <a href="../security/database-roles/#provision-queues-before-starting-restricted-runtimes">Database roles</a>.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
@@ -2563,6 +2622,43 @@ flip the stale compat columns are poisoned, so a pre-flip binary fails loudly an
 back across the flip is <strong>not</strong> supported — roll back only to another 0.7 build. Before
 the flip, rollback to the 0.6.2 stepping-stone is safe. There is no schema downgrade path (unchanged from
 previous releases).</p>
+<h2 id="v047-replica-identity-for-every-table">v047: replica identity for every table<a class="headerlink" href="#v047-replica-identity-for-every-table" title="Permanent link">&para;</a></h2>
+<p>v047 gives the tables that had no primary key a replica identity, so awa keeps
+working when its schema is in a logical-replication publication (Debezium's
+default <code>FOR ALL TABLES</code>, or <code>FOR TABLES IN SCHEMA awa</code>). Without one PostgreSQL
+rejects every UPDATE and DELETE on a published table, which stopped the
+maintenance leader on each tick. <code>awa.job_unique_claims</code> identifies rows by its
+existing uniqueness index; <code>awa.admin_dirty_queue_marks</code>,
+<code>awa.admin_dirty_kind_marks</code>, <code>queue_terminal_rollup_deltas</code> and
+<code>queue_terminal_count_deltas</code> with its partitions use <code>REPLICA IDENTITY FULL</code>
+(ADR-045 forbids an index on the mark tables; the delta tables are append-only,
+so FULL costs nothing on their hot path).</p>
+<p>0.7.x runtimes retain the same query behavior after migration; replica identity
+changes WAL images for UPDATE and DELETE. Apply the migration with DDL credentials
+that own, or inherit ownership of, the canonical and installed custom substrates.
+Schema USAGE alone does not permit ALTER TABLE. Discovery uses the full
+<code>claim_ready_runtime(text,bigint,double precision,double precision)</code> signature
+and skips unrelated same-named functions.</p>
+<p>Use <code>awa migrate</code> or the generated version bundle. For an external runner,
+<code>awa migrate --sql --from 46 --to 47</code> emits the installer definition and
+default-substrate replay followed by the v047 tail. Raw v047 is only
+that tail. The default SQL export wraps a transaction and migration advisory lock,
+but does not run Rust runtime/cron preflights. External runners must perform the
+documented cron preflight below before installer replay:
+when <code>awa.cron_jobs</code> exists, acquire its ACCESS EXCLUSIVE lock before the first
+pending statement. Use <code>--no-transaction</code> when the external runner owns the
+transaction and migration lock. Apply the full bundle transactionally; see
+<a href="../adr/041-rolling-upgrade-policy/">migration policy</a>.</p>
+<p>The identity ALTERs and installer trigger replacement acquire table locks,
+including ACCESS EXCLUSIVE locks on ring state and queue heads. Locks can wait
+behind live transactions and remain held until the entire pending range commits.
+Neither first application nor replay has a millisecond or lock-free guarantee.
+Use an operational quiet window and a bounded <code>lock_timeout</code>; on timeout roll
+back and retry the complete bundle. Applying earlier pending versions separately
+can shorten the final lock-holding transaction, but the v047 bundle still includes
+installer DDL. See <a href="https://github.com/hardbyte/awa/pull/509">tracking PR #509</a>,
+<a href="https://github.com/hardbyte/awa/issues/427">released-artifact rehearsal tracking #427</a>,
+and <a href="../deploying-on-managed-postgres/#logical-replication-and-cdc">Logical replication and CDC</a>.</p>
 <h2 id="v046-wait-free-admin-dirty-key-marks">v046: wait-free admin dirty-key marks<a class="headerlink" href="#v046-wait-free-admin-dirty-key-marks" title="Permanent link">&para;</a></h2>
 <p>v046 replaces the keyed <code>admin_dirty_queues</code> / <code>admin_dirty_kinds</code> tables the
 canonical triggers wrote with <code>INSERT ... ON CONFLICT DO NOTHING</code> by append-only
@@ -2622,6 +2718,19 @@ time. Foreign ownership still fails startup and requires explicit transfer.
 During mixed-manifest rollouts, existing definitions retain their last agreed
 value; new names can be inserted immediately. Definition updates wait for fresh
 capable fleet agreement, while removals additionally wait through grace.</p>
+<h3 id="v048-claim-cursor-compatibility">v048 claim cursor compatibility<a class="headerlink" href="#v048-claim-cursor-compatibility" title="Permanent link">&para;</a></h3>
+<p>Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds <code>lane_drained</code> and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.</p>
+<p>For v048 use <code>awa migrate</code> or the complete generated
+<code>awa migrate --sql --from 47 --to 48</code> bundle. It includes the installer
+definition and default-substrate replay before the v048 tail reinstalls custom
+substrates. Raw <code>v048_claim_cursor_catch_up.sql</code> alone calls
+whatever installer is already stored in the database; it does not supply the
+new function definition. The generated bundle path supplies that dependency.
+The same table-lock, ownership, external preflight and timeout/retry requirements
+<a href="#v047-replica-identity-for-every-table">documented for v047</a> apply. Trigger replay
+is DDL and can block claim/enqueue/rotation activity until commit; there is no
+fixed completion-time guarantee. See <a href="https://github.com/hardbyte/awa/pull/513">tracking PR #513</a>
+and <a href="https://github.com/hardbyte/awa/issues/427">released-artifact rehearsal tracking #427</a>.</p>
 
 
 
