@@ -199,6 +199,8 @@ Awa has three rescue paths:
 
 Rescue closes the old attempt before making work available again. If the old handler later writes a completion, the `run_lease` guard rejects it as stale. When rescue happens in a process that still has the handler registered, the runtime also flips the in-memory cancellation flag.
 
+Rescue is the fallback, not the first response to a lost database connection. A finished attempt whose finalize fails because the connection dropped, the pool timed out or the server was restarting keeps re-trying the lease-guarded finalize for up to 120 s, so an outage shorter than that completes the attempt as soon as the server is back instead of leaving it for stale-heartbeat rescue and a second handler run.
+
 ## Partition Rotation And Reclamation
 
 Queue storage has three independent rings, each advanced by the elected maintenance leader:

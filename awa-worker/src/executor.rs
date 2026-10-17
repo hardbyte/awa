@@ -411,6 +411,8 @@ impl JobExecutor {
                 // it again is safe. Without the retry the job would sit
                 // `running` until heartbeat rescue re-ran the handler.
                 let mut deadlock_retries = 0u32;
+                let mut reconnect_retries = 0u32;
+                let finalize_started = std::time::Instant::now();
                 let outcome = loop {
                     let outcome = complete_job(
                         &pool,
@@ -442,6 +444,28 @@ impl JobExecutor {
                                 max_retries = COMPLETION_DEADLOCK_RETRIES,
                                 delay_ms = delay.as_millis() as u64,
                                 "Completion transaction aborted by the deadlock detector; retrying"
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                        // The result is already in hand and every finalize
+                        // path is lease-guarded, so re-running it after the
+                        // server comes back either lands the completion or
+                        // reports the attempt as already rescued. Giving up
+                        // instead leaves the claim open until heartbeat
+                        // rescue re-runs the handler.
+                        Err(err)
+                            if err.is_connection_lost()
+                                && finalize_started.elapsed() < COMPLETION_RECONNECT_WINDOW =>
+                        {
+                            reconnect_retries += 1;
+                            metrics.record_completion_reconnect_retry(&job_kind, &job_queue);
+                            let delay = completion_reconnect_backoff(reconnect_retries);
+                            warn!(
+                                job_id,
+                                retry = reconnect_retries,
+                                error = %err,
+                                delay_ms = delay.as_millis() as u64,
+                                "Completion failed because the database connection was lost; retrying"
                             );
                             tokio::time::sleep(delay).await;
                         }
@@ -535,6 +559,21 @@ const COMPLETION_DEADLOCK_RETRIES: u32 = 3;
 /// committed by the time the retry runs.
 fn completion_deadlock_backoff(retry: u32) -> Duration {
     Duration::from_millis(10u64 << retry.saturating_sub(1).min(4))
+}
+
+/// How long a finished attempt keeps re-trying its finalize after the
+/// database connection is lost, measured from the first attempt. Longer than
+/// the default `heartbeat_staleness` (90 s) so a finalize that reaches the
+/// server first wins over the rescue sweep on default settings; the work
+/// held per retrying attempt is one job row and its result, bounded by the
+/// runtime's worker capacity because claims fail during the same outage.
+const COMPLETION_RECONNECT_WINDOW: Duration = Duration::from_secs(120);
+
+/// Backoff between reconnect retries (500ms, 1s, 2s, then 4s). Each attempt
+/// already waits up to the pool's `acquire_timeout` for a connection, so this
+/// only spaces out immediate refusals.
+fn completion_reconnect_backoff(retry: u32) -> Duration {
+    Duration::from_millis(500u64 << retry.saturating_sub(1).min(3))
 }
 
 /// Update job state in the database based on handler result.
@@ -3047,4 +3086,19 @@ async fn retry_backoff_canonical_with_followups(
 
     tx.commit().await?;
     Ok(Some(updated_job))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_doubles_from_half_a_second_and_caps_at_four() {
+        assert_eq!(completion_reconnect_backoff(1), Duration::from_millis(500));
+        assert_eq!(completion_reconnect_backoff(2), Duration::from_secs(1));
+        assert_eq!(completion_reconnect_backoff(3), Duration::from_secs(2));
+        assert_eq!(completion_reconnect_backoff(4), Duration::from_secs(4));
+        assert_eq!(completion_reconnect_backoff(5), Duration::from_secs(4));
+        assert_eq!(completion_reconnect_backoff(40), Duration::from_secs(4));
+    }
 }
