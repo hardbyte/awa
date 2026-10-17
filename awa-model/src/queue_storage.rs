@@ -379,6 +379,59 @@ pub enum RotateOutcome {
         /// Cursor generation left unchanged by the idle skip.
         generation: i64,
     },
+    /// The current slot holds rows but is younger than
+    /// [`RingRotationCadence::min_slot_age`] and smaller than
+    /// [`RingRotationCadence::target_slot_bytes`], so it stays open and keeps
+    /// filling. Sealing it now would spend a prune (`TRUNCATE` of every
+    /// child that received rows, one `pg_class` row version per relation)
+    /// on a slot that has barely been used. `slot` is the current slot.
+    SkippedFilling {
+        slot: i32,
+        /// Cursor generation left unchanged by the skip.
+        generation: i64,
+    },
+}
+
+/// When a maintenance tick may seal the current slot of a ring.
+///
+/// A non-empty slot becomes eligible to seal after `min_slot_age` since this
+/// store first observed it holding rows, or when its total physical storage
+/// reaches `target_slot_bytes`. Age uses a local monotonic clock; a new store
+/// starts a fresh observation window. Observing an empty slot clears its timer
+/// and lets the existing busy, idle and reclamation gates decide rotation.
+///
+/// The byte target includes heap, indexes, TOAST and auxiliary forks. It is
+/// sampled on rotate calls and is not a storage limit: batches, delayed ticks,
+/// blocked reuse and writes to sealed slots can exceed it.
+///
+/// [`RingRotationCadence::EAGER`] restores sealing on every tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingRotationCadence {
+    /// Time since the first non-empty observation before a tick may seal.
+    pub min_slot_age: Duration,
+    /// Physical size that makes a non-empty slot eligible regardless of age.
+    /// Zero disables the size trigger.
+    pub target_slot_bytes: u64,
+}
+
+impl RingRotationCadence {
+    /// Seal on every tick: the pre-cadence behaviour.
+    pub const EAGER: Self = Self {
+        min_slot_age: Duration::ZERO,
+        target_slot_bytes: 0,
+    };
+
+    /// Eligible after five seconds of observed filling or at 2 MiB.
+    pub const DEFAULT: Self = Self {
+        min_slot_age: Duration::from_secs(5),
+        target_slot_bytes: 2 * 1024 * 1024,
+    };
+}
+
+impl Default for RingRotationCadence {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// Per-table presence observed at a rotation gate. Each non-zero value means
@@ -1032,11 +1085,17 @@ fn oldest_initialized_ring_slot(
 /// `{schema}.{ring}_ring_rotations`; the `{ring}_ring_state` singleton
 /// holds only cold config (`slot_count`, plus the #290 trust marker on
 /// the queue ring).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RingFamily {
     Queue,
     Lease,
     Claim,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlotFillObservation {
+    cursor: (i32, i64),
+    first_nonempty_at: Instant,
 }
 
 impl RingFamily {
@@ -2762,6 +2821,7 @@ pub struct QueueStorage {
     /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
     /// (head row gone after a rolled-back ensure_lane).
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
+    slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
 }
 
@@ -2808,6 +2868,7 @@ impl QueueStorage {
             claimer_gates: Mutex::new(HashMap::new()),
             claim_cursor_folded: tokio::sync::OnceCell::new(),
             ensured_lanes: Mutex::new(HashSet::new()),
+            slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
         })
     }
@@ -2856,6 +2917,14 @@ impl QueueStorage {
 
     pub fn lease_claim_receipts(&self) -> bool {
         self.config.lease_claim_receipts
+    }
+
+    /// Start fresh fill-age windows after acquiring maintenance leadership.
+    pub fn reset_rotation_observations(&self) {
+        self.slot_fill_observations
+            .lock()
+            .expect("slot fill observations poisoned")
+            .clear();
     }
 
     fn uses_queue_striping(&self) -> bool {
@@ -3754,6 +3823,7 @@ impl QueueStorage {
             .lock()
             .expect("claimer gate cache poisoned")
             .clear();
+        self.reset_rotation_observations();
         Ok(())
     }
 
@@ -15329,8 +15399,73 @@ impl QueueStorage {
         Ok(true)
     }
 
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
+    async fn slot_still_filling_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        family: RingFamily,
+        cursor: (i32, i64),
+        cadence: RingRotationCadence,
+        children: &[String],
+    ) -> Result<bool, AwaError> {
+        if cadence.min_slot_age.is_zero() {
+            return Ok(false);
+        }
+        let row_sources = children
+            .iter()
+            .map(|relation| format!("SELECT 1 FROM {relation}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let (has_rows, bytes): (bool, i64) = sqlx::query_as(audited_sql(format!(
+            "WITH occupancy AS (SELECT EXISTS ({row_sources}) AS has_rows) \
+             SELECT has_rows, CASE WHEN has_rows THEN (\
+                 SELECT COALESCE(SUM(pg_total_relation_size(relation::regclass)), 0)::bigint \
+                 FROM unnest($1::text[]) AS relation\
+             ) ELSE 0::bigint END FROM occupancy"
+        )))
+        .bind(children)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let mut observations = self
+            .slot_fill_observations
+            .lock()
+            .expect("slot fill observations poisoned");
+        if !has_rows {
+            observations.remove(&family);
+            return Ok(false);
+        }
+        let now = Instant::now();
+        let observation = observations.entry(family).or_insert(SlotFillObservation {
+            cursor,
+            first_nonempty_at: now,
+        });
+        if observation.cursor != cursor {
+            *observation = SlotFillObservation {
+                cursor,
+                first_nonempty_at: now,
+            };
+        }
+        let bytes = u64::try_from(bytes).unwrap_or(0);
+        if cadence.target_slot_bytes > 0 && bytes >= cadence.target_slot_bytes {
+            return Ok(false);
+        }
+        Ok(now.duration_since(observation.first_nonempty_at) < cadence.min_slot_age)
+    }
+
+    /// Seal the current queue-ring slot on every call that passes the busy
+    /// and idle gates. Equivalent to [`Self::rotate_with_cadence`] with
+    /// [`RingRotationCadence::EAGER`].
     pub async fn rotate(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
+        self.rotate_with_cadence(pool, RingRotationCadence::EAGER)
+            .await
+    }
+
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate")]
+    pub async fn rotate_with_cadence(
+        &self,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -15360,6 +15495,33 @@ impl QueueStorage {
             .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Queue).await?;
         let state = (current_slot, generation, slot_count);
+
+        let current_children = [
+            ready_child_name(schema, state.0 as usize),
+            ready_claim_attempt_batch_child_name(schema, state.0 as usize),
+            done_child_name(schema, state.0 as usize),
+            ready_tombstone_child_name(schema, state.0 as usize),
+            ready_segment_child_name(schema, state.0 as usize),
+            receipt_completion_batch_child_name(schema, state.0 as usize),
+            receipt_completion_tombstone_child_name(schema, state.0 as usize),
+            terminal_delta_child_name(schema, state.0 as usize),
+        ];
+        if self
+            .slot_still_filling_tx(
+                &mut tx,
+                RingFamily::Queue,
+                (state.0, state.1),
+                cadence,
+                &current_children,
+            )
+            .await?
+        {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedFilling {
+                slot: state.0,
+                generation: state.1,
+            });
+        }
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
         let ready_busy =
@@ -15499,8 +15661,20 @@ impl QueueStorage {
         })
     }
 
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_leases")]
+    /// Seal the current lease-ring slot on every call that passes the busy
+    /// and idle gates. Equivalent to [`Self::rotate_leases_with_cadence`]
+    /// with [`RingRotationCadence::EAGER`].
     pub async fn rotate_leases(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
+        self.rotate_leases_with_cadence(pool, RingRotationCadence::EAGER)
+            .await
+    }
+
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_leases")]
+    pub async fn rotate_leases_with_cadence(
+        &self,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -15533,6 +15707,24 @@ impl QueueStorage {
             .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Lease).await?;
         let state = (current_slot, generation, slot_count);
+
+        let current_children = [lease_child_name(schema, state.0 as usize)];
+        if self
+            .slot_still_filling_tx(
+                &mut tx,
+                RingFamily::Lease,
+                (state.0, state.1),
+                cadence,
+                &current_children,
+            )
+            .await?
+        {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedFilling {
+                slot: state.0,
+                generation: state.1,
+            });
+        }
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
         let lease_busy =
@@ -16415,10 +16607,21 @@ impl QueueStorage {
         set_prune_lock_timeout_tx(&mut tx, self.prune_lock_timeout).await?;
 
         let lock_started = Instant::now();
-        let lock_tables = sqlx::query(audited_sql(format!(
-            "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {segment_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE"
-        )))
-        .execute(tx.as_mut())
+        // Claims read segments before ready rows, while producers write in
+        // the opposite order. Queue behind segment readers, then abandon
+        // the transaction rather than wait with an exclusive child held.
+        let lock_tables = async {
+            sqlx::query(audited_sql(format!(
+                "LOCK TABLE {segment_child} IN ACCESS EXCLUSIVE MODE"
+            )))
+            .execute(tx.as_mut())
+            .await?;
+            sqlx::query(audited_sql(format!(
+                "LOCK TABLE {ready_child}, {claim_attempt_child}, {done_child}, {tomb_child}, {receipt_batch_child}, {receipt_tomb_child}, {delta_child} IN ACCESS EXCLUSIVE MODE NOWAIT"
+            )))
+            .execute(tx.as_mut())
+            .await
+        }
         .await;
         let lock_duration = lock_started.elapsed();
 
@@ -16929,8 +17132,20 @@ impl QueueStorage {
     /// must be empty. This is what the `rotate → prune → rotate` ring
     /// invariant requires — we only hand out a slot to new claims when a
     /// prior prune has truncated it.
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_claims")]
+    /// Seal the current claim-ring slot on every call that passes the busy
+    /// and idle gates. Equivalent to [`Self::rotate_claims_with_cadence`]
+    /// with [`RingRotationCadence::EAGER`].
     pub async fn rotate_claims(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
+        self.rotate_claims_with_cadence(pool, RingRotationCadence::EAGER)
+            .await
+    }
+
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_claims")]
+    pub async fn rotate_claims_with_cadence(
+        &self,
+        pool: &PgPool,
+        cadence: RingRotationCadence,
+    ) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
@@ -16958,6 +17173,29 @@ impl QueueStorage {
             .await?;
         let slot_count = self.ring_slot_count_tx(&mut tx, RingFamily::Claim).await?;
         let state = (current_slot, generation, slot_count);
+
+        let current_children = [
+            claim_child_name(schema, state.0 as usize),
+            claim_batch_child_name(schema, state.0 as usize),
+            closure_child_name(schema, state.0 as usize),
+            claim_closure_batch_child_name(schema, state.0 as usize),
+        ];
+        if self
+            .slot_still_filling_tx(
+                &mut tx,
+                RingFamily::Claim,
+                (state.0, state.1),
+                cadence,
+                &current_children,
+            )
+            .await?
+        {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedFilling {
+                slot: state.0,
+                generation: state.1,
+            });
+        }
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
 

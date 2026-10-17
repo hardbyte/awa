@@ -566,8 +566,13 @@ await client.start(
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `1000ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions. |
+| `ring_rotation_cadence` | 5 s / 2 MiB target | A non-empty slot becomes eligible after `min_slot_age` since the first non-empty observation, or when `target_slot_bytes` is reached. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. Age uses a monotonic clock and resets on an empty observation or leader change. Configure with `ClientBuilder::ring_rotation_cadence` (Rust) or `queue_storage_rotate_min_slot_age_ms` / `queue_storage_rotate_target_slot_bytes` (Python). A zero byte target disables the size trigger; zero age or `RingRotationCadence::EAGER` permits sealing on every tick. The target is sampled and does not bound retained storage. |
 
 The benchmark harness in [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking) reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.
+
+Rust builder overrides for cadence and claim rotation interval may be set before
+or after `queue_storage`; reconfiguring storage preserves those overrides. With
+no claim interval override, the claim ring uses the queue decision interval.
 
 Use the defaults unless you have a reason not to:
 

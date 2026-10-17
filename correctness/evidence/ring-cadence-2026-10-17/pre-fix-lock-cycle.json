@@ -1,0 +1,73 @@
+{
+  "description": "Filtered live pg_locks/pg_stat_activity evidence of queue-prune versus claim cycle, captured read-only during the private eager saturation benchmark.",
+  "database": "127.0.0.1:15558/awa_bench",
+  "source_revision": "0f4a9bc6528ac25fb8ef8095e6c206b6e3df5a6a",
+  "date": "2026-10-17",
+  "capture": "One SELECT using MATERIALIZED waiting/involved CTEs; pg_locks and pg_blocking_pids were read without acquiring application locks. This artifact retains only the relevant locks from the full tool output.",
+  "processes": [
+    {
+      "pid": 151,
+      "role": "queue prune",
+      "wait_event": "relation",
+      "blocking_pids": [
+        295
+      ],
+      "query": "LOCK TABLE awa.ready_entries_4, awa.ready_claim_attempt_batches_4, awa.done_entries_4, awa.ready_tombstones_4, awa.ready_segments_4, awa.receipt_completion_batches_4, awa.receipt_completion_tombstones_4, awa.queue_terminal_count_deltas_4 IN ACCESS EXCLUSIVE MODE"
+    },
+    {
+      "pid": 295,
+      "role": "claim_ready_runtime caller",
+      "wait_event": "relation",
+      "blocking_pids": [
+        151
+      ],
+      "query_prefix_normalized": "SELECT ready_slot, ready_generation, lane_seq, enqueue_shard, lease_slot, lease_generation, claim_slot, receipt_id, claim_batch_id, claim_batch_index, job_id, kind, queue, args, lane_priority,",
+      "query_is_truncated": true
+    }
+  ],
+  "locks": [
+    {
+      "pid": 151,
+      "relation": "awa.ready_entries_4",
+      "mode": "AccessExclusiveLock",
+      "granted": true
+    },
+    {
+      "pid": 151,
+      "relation": "awa.ready_claim_attempt_batches_4",
+      "mode": "AccessExclusiveLock",
+      "granted": true
+    },
+    {
+      "pid": 151,
+      "relation": "awa.done_entries_4",
+      "mode": "AccessExclusiveLock",
+      "granted": true
+    },
+    {
+      "pid": 151,
+      "relation": "awa.ready_tombstones_4",
+      "mode": "AccessExclusiveLock",
+      "granted": true
+    },
+    {
+      "pid": 151,
+      "relation": "awa.ready_segments_4",
+      "mode": "AccessExclusiveLock",
+      "granted": false
+    },
+    {
+      "pid": 295,
+      "relation": "awa.ready_segments_4",
+      "mode": "AccessShareLock",
+      "granted": true
+    },
+    {
+      "pid": 295,
+      "relation": "awa.ready_claim_attempt_batches_4",
+      "mode": "AccessShareLock",
+      "granted": false
+    }
+  ],
+  "cycle": "151 waits for 295 to release ready_segments_4; 295 waits for 151 to release ready_claim_attempt_batches_4. The prune lock timeout aborts the prune transaction and breaks this cycle."
+}

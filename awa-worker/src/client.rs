@@ -17,6 +17,7 @@ use awa_model::admin::{
 use awa_model::audited_sql;
 use awa_model::{
     storage as transition, JobArgs, PartitionedQueue, PeriodicJob, QueueStorageConfig,
+    RingRotationCadence,
 };
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -170,6 +171,8 @@ pub struct ClientBuilder {
     dlq_cleanup_batch_size: Option<i64>,
     dlq_overrides: HashMap<String, bool>,
     storage: RuntimeStorage,
+    ring_rotation_cadence: RingRotationCadence,
+    claim_rotate_interval: Option<Duration>,
     transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
     health_addr: Option<SocketAddr>,
@@ -230,6 +233,8 @@ impl ClientBuilder {
             dlq_cleanup_batch_size: None,
             dlq_overrides: HashMap::new(),
             storage,
+            ring_rotation_cadence: RingRotationCadence::DEFAULT,
+            claim_rotate_interval: None,
             transition_role: TransitionWorkerRole::Auto,
             storage_error,
             health_addr: None,
@@ -925,13 +930,24 @@ impl ClientBuilder {
     ///
     /// Defaults to `queue_rotate_interval` so claim partitions age out in
     /// step with the ready / done partitions they reference. Only takes
-    /// effect when queue storage is active; no-op on the canonical engine.
+    /// effect when queue storage is active. May be set before or after
+    /// [`Self::queue_storage`]; retained across storage configuration changes.
     pub fn claim_rotate_interval(mut self, claim_rotate_interval: Duration) -> Self {
-        if let RuntimeStorage::QueueStorage(runtime) = self.storage {
-            self.storage = RuntimeStorage::QueueStorage(
-                runtime.with_claim_rotate_interval(claim_rotate_interval),
-            );
-        }
+        self.claim_rotate_interval = Some(claim_rotate_interval);
+        self
+    }
+
+    /// Override when a maintenance tick may seal the current slot of the
+    /// queue, lease and claim rings (default
+    /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling or
+    /// a 2 MiB physical-size target). The rotate
+    /// intervals set how often the decision is made; the cadence decides
+    /// whether a slot that holds rows is sealed on that tick. Use
+    /// [`RingRotationCadence::EAGER`] to seal on every tick. Only takes
+    /// effect when queue storage is active. May be set before or after
+    /// [`Self::queue_storage`]; retained across storage configuration changes.
+    pub fn ring_rotation_cadence(mut self, cadence: RingRotationCadence) -> Self {
+        self.ring_rotation_cadence = cadence;
         self
     }
 
@@ -979,7 +995,7 @@ impl ClientBuilder {
     }
 
     /// Build the client.
-    pub fn build(self) -> Result<Client, BuildError> {
+    pub fn build(mut self) -> Result<Client, BuildError> {
         let periodic_manifest = if let Some(config) = &self.periodic_reconciliation {
             config
                 .validate()
@@ -997,6 +1013,13 @@ impl ClientBuilder {
 
         if let Some(err) = self.storage_error.clone() {
             return Err(err);
+        }
+
+        if let RuntimeStorage::QueueStorage(runtime) = &mut self.storage {
+            runtime.rotation_cadence = self.ring_rotation_cadence;
+            if let Some(interval) = self.claim_rotate_interval {
+                runtime.claim_rotate_interval = interval;
+            }
         }
 
         let mut queue_names = HashSet::with_capacity(self.queues.len());
@@ -2721,6 +2744,97 @@ mod tests {
         let config = QueueConfig::default();
         assert_eq!(config.claimers, 1);
         assert_eq!(config.claim_batch_size, 512);
+    }
+
+    #[tokio::test]
+    async fn rotation_builder_options_are_independent_of_storage_call_order() {
+        let cadence = RingRotationCadence {
+            min_slot_age: Duration::from_secs(13),
+            target_slot_bytes: 123_456,
+        };
+        let claim_interval = Duration::from_secs(17);
+        let config = QueueStorageConfig {
+            schema: "builder_rotation_options".into(),
+            ..Default::default()
+        };
+        for configure_first in [true, false] {
+            let mut builder = Client::builder(lazy_pool()).queue("q", QueueConfig::default());
+            if configure_first {
+                builder = builder
+                    .ring_rotation_cadence(cadence)
+                    .claim_rotate_interval(claim_interval);
+            }
+            builder = builder.queue_storage(
+                config.clone(),
+                Duration::from_secs(3),
+                Duration::from_secs(7),
+            );
+            if !configure_first {
+                builder = builder
+                    .ring_rotation_cadence(cadence)
+                    .claim_rotate_interval(claim_interval);
+            }
+            let client = builder.build().unwrap();
+            let runtime = client.storage.queue_storage().unwrap();
+            assert_eq!(runtime.store.schema(), config.schema);
+            assert_eq!(runtime.rotation_cadence, cadence);
+            assert_eq!(runtime.claim_rotate_interval, claim_interval);
+            assert_eq!(runtime.queue_rotate_interval, Duration::from_secs(3));
+            assert_eq!(runtime.lease_rotate_interval, Duration::from_secs(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_builder_options_survive_storage_reconfiguration() {
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .ring_rotation_cadence(RingRotationCadence::EAGER)
+            .claim_rotate_interval(Duration::from_secs(17))
+            .canonical_storage()
+            .queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(3),
+                Duration::from_secs(7),
+            )
+            .queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(19),
+                Duration::from_secs(11),
+            )
+            .build()
+            .unwrap();
+        let runtime = client.storage.queue_storage().unwrap();
+        assert_eq!(runtime.rotation_cadence, RingRotationCadence::EAGER);
+        assert_eq!(runtime.claim_rotate_interval, Duration::from_secs(17));
+        assert_eq!(runtime.queue_rotate_interval, Duration::from_secs(19));
+        assert_eq!(runtime.lease_rotate_interval, Duration::from_secs(11));
+
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(19),
+                Duration::from_secs(11),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage()
+                .unwrap()
+                .claim_rotate_interval,
+            Duration::from_secs(19)
+        );
+
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .canonical_storage()
+            .ring_rotation_cadence(RingRotationCadence::EAGER)
+            .claim_rotate_interval(Duration::from_secs(17))
+            .build()
+            .unwrap();
+        assert!(client.storage.queue_storage().is_none());
     }
 
     #[tokio::test]

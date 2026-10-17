@@ -136,6 +136,12 @@ Run the broken correlated-hash witness with:
 ./correctness/run-tlc.sh storage/AwaPartitionedQueueRouting.tla storage/AwaPartitionedQueueRoutingBroken.cfg
 ```
 
+## Rotation cadence
+
+[`AwaRotationCadence.tla`](./AwaRotationCadence.tla) covers scheduling separately from lifecycle safety. Rows and allocated bytes are distinct: DELETE can empty a lease heap while physical storage remains. Observed age starts at the first non-empty decision and resets on an empty observation, generation change or leader change. The passing configuration checks that empty slots never wait for fill age, young small slots stay open, and already-prunable storage eventually drains after writes and leader changes stop. That progress claim assumes continuing ticks and eventual successful prune opportunities; it does not cover permanently blocked jobs or locks. The model retains the Rust oldest-slot selection during initial ring fill and after wrap.
+
+Three negative configurations reproduce using allocated bytes as row presence, using an old slot timestamp for new traffic, and interpreting a sampled byte target as a hard cap. These complement PostgreSQL regressions and the existing storage model's closure and reuse invariants. The model uses three slots and abstract byte units and makes no wall-clock latency or total-storage guarantee.
+
 ## Lock-order companion spec
 
 [`AwaUniqueClaimLockOrder.tla`](./AwaUniqueClaimLockOrder.tla) checks three row-level lock orders omitted by the partition-level model below. Its passing configurations cover a producer and DLQ retry acquiring a unique claim before the enqueue lane, two batches acquiring unique claims in key order, and pruning versus counter rebuild or reset acquiring the queue-ring singleton before the done child. The corresponding `*Broken.cfg` configurations reproduce a waits-for cycle for each old inverse order. Each scenario has two transactions and two exclusive resources; it checks ordering, while PostgreSQL integration tests cover the actual SQL paths.
@@ -149,7 +155,9 @@ Run the broken correlated-hash witness with:
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. It checks the represented lock plans; implicit resources absent from a plan are outside the proof.
+- [`AwaQueuePruneLockOrder.cfg`](./AwaQueuePruneLockOrder.cfg): segment-first claim readers and entry-first producers versus queue pruning. Prune waits on routing first and aborts the entire transaction if any later `NOWAIT` lock conflicts. Both authority modes use that tail. This proves cycle avoidance at the represented lock level, not successful pruning under perpetual contention.
+- [`AwaQueuePruneLockOrderBlocking.cfg`](./AwaQueuePruneLockOrderBlocking.cfg): old body-first blocking prune versus the segment-first reader; TLC must find the cycle captured during the saturation benchmark. The main claim plans now include the previously omitted routing-child read.
 - [`AwaStorageLockOrderPrepareQueue.cfg`](./AwaStorageLockOrderPrepareQueue.cfg): producer and preparer both lock `q#10` before `q#2`, matching the string order of the batched Rust producer path.
 - [`AwaStorageLockOrderPrepareQueueNumeric.cfg`](./AwaStorageLockOrderPrepareQueueNumeric.cfg): numeric preparation order locks `q#2` before `q#10`; TLC finds a waits-for cycle against a producer.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).

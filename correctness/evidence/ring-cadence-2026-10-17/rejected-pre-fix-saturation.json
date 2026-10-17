@@ -1,0 +1,44 @@
+[
+  {
+    "policy": "eager",
+    "run_dir": "/tmp/awa-518-benchmarks/eager/results/custom-20261017T045347Z-18ab6d",
+    "claim_batch_size": 512,
+    "workers": 64,
+    "producer_mode": "depth-target",
+    "target_depth": 4000,
+    "producer_limit": 50000,
+    "warmup_seconds": 240,
+    "warmup_generations": {
+      "queue": 15.0,
+      "claim": 239.0
+    },
+    "required_generations": {
+      "queue": 32,
+      "claim": 16
+    },
+    "status": "rejected: queue warmup did not complete two wraps; diagnostic lock probes followed; stopped before completion",
+    "raw_sha256": "9557e3b3382b72d4baaa9db282ffa95151055072c71f96e79e1f946d03c4c20f",
+    "binary_sha256": "7bcbb257f3f396a236ebd960f046f5d581bf6a9e276608637ded160341d9f47c"
+  },
+  {
+    "policy": "cadence",
+    "run_dir": "/tmp/awa-518-benchmarks/cadence/results/custom-20261017T045347Z-61d289",
+    "claim_batch_size": 512,
+    "workers": 64,
+    "producer_mode": "depth-target",
+    "target_depth": 4000,
+    "producer_limit": 50000,
+    "warmup_seconds": 240,
+    "warmup_generations": {
+      "queue": 20.0,
+      "claim": 42.0
+    },
+    "required_generations": {
+      "queue": 32,
+      "claim": 16
+    },
+    "status": "rejected: queue warmup did not complete two wraps; diagnostic lock probes followed; stopped before completion",
+    "raw_sha256": "310471beed2978fd14e5f68d20282ec7e9c4975c69c3ee424efb92e3b87665e3",
+    "binary_sha256": "7bcbb257f3f396a236ebd960f046f5d581bf6a9e276608637ded160341d9f47c"
+  }
+]

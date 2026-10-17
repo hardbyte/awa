@@ -563,6 +563,9 @@ async fn maintenance_loop(
                     RotateOutcome::SkippedIdle { .. } => {
                         counters.queue_rotate_skipped_idle.fetch_add(1, Ordering::Relaxed);
                     }
+                    RotateOutcome::SkippedFilling { .. } => {
+                        unreachable!("eager rotate never holds a filling slot open")
+                    }
                 }
 
                 match store.prune_oldest(&pool, Duration::ZERO).await {
@@ -598,6 +601,9 @@ async fn maintenance_loop(
                         counters
                             .lease_rotate_skipped_idle
                             .fetch_add(1, Ordering::Relaxed);
+                    }
+                    RotateOutcome::SkippedFilling { .. } => {
+                        unreachable!("eager rotate_leases never holds a filling slot open")
                     }
                 }
 

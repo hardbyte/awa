@@ -20,7 +20,7 @@ mod storage;
 // Re-exports
 pub use awa_model::{
     CallbackConfig, CronMissedFirePolicy, PartitionedQueue, PartitionedQueueError, PeriodicJob,
-    PeriodicJobBuilder,
+    PeriodicJobBuilder, RingRotationCadence,
 };
 pub use client::{
     BuildError, Client, ClientBuilder, HealthCheck, QueueCapacity, QueueHealth,

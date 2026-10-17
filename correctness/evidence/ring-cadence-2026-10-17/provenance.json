@@ -1,0 +1,11 @@
+{
+  "awa_head": "3f9fff94c005c8f94a1b7dce8f445c98042b5f78",
+  "awa_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "harness_head": "770c297234a67e27d6f33ee48ca3a2f26afb1905",
+  "harness_status": "M awa-bench/Cargo.lock",
+  "awa_runtime_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "rustc_version": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+  "adapter_lock_sha256": "f47d04efb730ee638b1cb16065fdd02496d2eb17e619f092f4c44e64a02c4f0c",
+  "runner_sha256": "0fa3598eae0e4c74105ce0f324d53129f9827dd8d531ed31830f8a10889db770",
+  "binary_sha256": "ed6656893cb7b669dc0e0e7877952e1585652d2b1a279836f2f8d5c994b1b68a"
+}

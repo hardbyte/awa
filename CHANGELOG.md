@@ -10,6 +10,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
   sequence `USAGE, SELECT, UPDATE`; existing sequence positions are preserved.
+- Ring rotation uses a five-second observed fill window or a 2 MiB total physical-size target before sealing a non-empty slot. Empty slots can advance immediately to reclaim sealed history. `RingRotationCadence::EAGER` restores rotation on every tick; the size target is sampled and does not impose a storage limit. See [#518](https://github.com/hardbyte/awa/issues/518).
 
 - v048 catches claim cursors up from committed same-lane, same-generation attempt evidence. Current binaries retain guarded post-commit advances against pre-v048 schemas and use the old result shape until migration. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 
@@ -56,6 +57,9 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - **Claims reuse the instance's claimer lease.** A queue-storage claim no longer re-reads the queue's claimer target and its own claimer lease on every call; the last read or refreshed lease is reused for up to 250 ms (never within a second of expiry), removing two round trips and two transactions from each claim. At W=4 this cuts transactions per completed job from 2.35 to 1.39.
 
 ### Fixed
+
+- Queue pruning waits on routing metadata first and uses `NOWAIT` for every remaining child lock, rolling back the whole attempt on contention. This avoids the prune/claim lock cycle while allowing entry-first producers to finish. Transient lock contention retries on the next decision tick; active-data skips retain backoff.
+- Rust cadence and claim-rotation interval overrides survive later `queue_storage` calls, regardless of builder call order.
 
 - **awa keeps working when its schema is in a logical-replication publication (v047).** A `CREATE PUBLICATION ... FOR ALL TABLES` (Debezium's default) or `FOR TABLES IN SCHEMA awa` made PostgreSQL reject every UPDATE and DELETE on the awa tables that had no primary key, so the maintenance leader failed each tick with `cannot delete from table "queue_terminal_rollup_deltas" because it does not have a replica identity and publishes deletes` and the dirty-mark drain, rollup fold and unique-claim release stopped. v047 gives every such table a replica identity: `awa.job_unique_claims` uses its uniqueness index, and the ADR-045 mark tables plus the append-only `queue_terminal_count_deltas` partitions and `queue_terminal_rollup_deltas` use `REPLICA IDENTITY FULL`, which adds no WAL on their insert-and-truncate hot path. `install_queue_storage_substrate` sets it for fresh installs and custom schemas, and a schema test asserts every awa table, including each partition, has a usable identity. No operator action; 0.7.x binaries operate unchanged on the migrated schema. Keeping the awa schema out of CDC publications remains the recommendation — see the new "Logical replication and CDC" section in the managed-Postgres guide.
 
