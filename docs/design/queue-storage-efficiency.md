@@ -1,7 +1,9 @@
 # Queue storage efficiency: bottleneck map and design
 
-Status: design with measured prototypes (branch `brian/qs-efficiency-design`,
-stacked on #506, #507, #508). Scope: the queue-storage engine only.
+Status: design notes with measured prototypes, as of 2026-10-18. P1 and P1b
+landed in #510, P2 and P2b in #511 and #514, P3 in #512, P6 in #513 (adjusted
+by #524); P5 and P8 are #515. Measurements were taken on top of #506, #507 and
+#508. Scope: the queue-storage engine only.
 
 Goal: make awa competitive across the benchmark matrix with **no degenerate
 shapes**. A degenerate shape is one where cost grows with something other
@@ -321,13 +323,16 @@ is simply dropped, a lane whose last claim left rows behind keeps a lagging
 cursor until the *next* claim on that lane, which blocks queue prune
 ("retained ready rows at or ahead of the cursor"), inflates the
 head-difference depth signal and shows claimed rows as available in the
-`awa.jobs` compat view (28 suite failures). The built form therefore reports
-`lane_drained` from the claim (last examined position plus one reaches the
-enqueue cursor) and keeps the post-commit advance for drained lanes only;
-while rows remain the next claim is imminent and catches the cursor up
-itself, so the lag never outlives one poll. The fold applies only in
-receipts mode: legacy materialised-lease claims write no
-`ready_claim_attempt_batches` evidence and keep advancing unconditionally.
+`awa.jobs` compat view. The first built form (#513) therefore reported
+`lane_drained` from the claim and skipped the post-commit advance only for
+lanes that were not drained. That still left the cursor lagging whenever an
+enqueue reservation was open, and the lagging lane's already-claimed segment
+then ranked first on the next claim, which found nothing and returned empty
+while another lane held ready rows (#523). #524 sends the post-commit advance
+after every committed claim again; the in-claim fold is the recovery path for
+an advance that never ran (for example a claimer that stopped between commit
+and advance). `claim_ready_runtime` still returns `lane_drained`, but runtimes
+no longer read it.
 
 #### P5 as built
 
@@ -407,15 +412,16 @@ changes evidence.
 
 ## 3. Prototype results
 
-Prototypes on this branch, each its own commit with tests:
+Each prototype was measured as its own change with tests and has since
+landed:
 
-| Commit | Content |
-| --- | --- |
-| `3c0f813` | P1: shared listener, idle poll back-off |
-| `780c9b2` | P2: close compact receipt claims by batch identity |
-| `ba4dba8` | P1b: bounded claim concurrency (`max_concurrent_claims`) |
-| `59181a6` | P3: truncate only ring children that hold rows |
-| `feb1cab` | P2b: slow completion addresses claim batches by identity |
+| Prototype | Content | Landed in |
+| --- | --- | --- |
+| P1 | shared listener, idle poll back-off | #510 |
+| P2 | close compact receipt claims by batch identity | #511, #514 |
+| P1b | bounded claim concurrency (`max_concurrent_claims`) | #510 |
+| P3 | truncate only ring children that hold rows | #512 |
+| P2b | slow completion addresses claim batches by identity | #511, #514 |
 
 ### 3.1 First pass: baseline vs P1+P2 (runs hours apart, same conditions)
 
@@ -445,8 +451,7 @@ back-to-back table below separates the two.
 
 ### 3.2 Back-to-back comparison (same hour, variants alternated)
 
-Variants: `base` = #508 head (`59b244f`); `p12` = P1+P2; `p123` = P1+P1b+P2+P2b+P3
-(branch head). Every row is a fresh Postgres; `fan200` was run for all
+Variants: `base` = main with #508; `p12` = P1+P2; `p123` = P1+P1b+P2+P2b+P3. Every row is a fresh Postgres; `fan200` was run for all
 three variants in sequence, the other cells alternated base/p123.
 
 | Cell | Metric | base | p12 | p123 |
@@ -515,8 +520,8 @@ Reading the table:
 ### 3.3 Tests
 
 `cargo test -p awa-model` and the full `cargo test -p awa --test
-queue_storage_runtime_test` (136 tests) pass on PostgreSQL 17 at the branch
-head; `cargo fmt` and `cargo clippy --all-targets --all-features -D warnings`
+queue_storage_runtime_test` (136 tests) passed on PostgreSQL 17 with all
+prototypes applied; `cargo fmt` and `cargo clippy --all-targets --all-features -D warnings`
 are clean. New tests: `idle_poll_sleep_doubles_up_to_the_idle_cap`
 (worker), `test_queue_storage_receipt_claim_hint_closes_compact_claim_once`,
 and the idle-prune test now asserts that an empty child's relfilenode is
