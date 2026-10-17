@@ -13069,6 +13069,11 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
         .await
         .expect("rebuild");
     assert!(rebuilt >= 1, "rebuild should re-populate counter rows");
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the rebuild writes one live-count row per lane, not one per job-id bucket"
+    );
     assert_invariant_holds(&pool, schema, queue, "after rebuild").await;
 }
 
