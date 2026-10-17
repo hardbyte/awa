@@ -2817,9 +2817,8 @@ async fn test_rotation_cadence_size_trigger_includes_indexes() {
         .enqueue_batch(&pool, "total_bytes", 1, 4)
         .await
         .unwrap();
-    let (main_bytes, total_bytes): (i64, i64) = sqlx::query_as(audited_sql(format!(
-        "SELECT SUM(pg_relation_size(child.oid) + CASE WHEN child.reltoastrelid <> 0 \
-                    THEN pg_relation_size(child.reltoastrelid) ELSE 0 END)::bigint, \
+    let (table_bytes, total_bytes): (i64, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT SUM(pg_table_size(child.oid))::bigint, \
                 SUM(pg_total_relation_size(child.oid))::bigint \
          FROM pg_inherits inheritance JOIN pg_class child ON child.oid = inheritance.inhrelid \
          WHERE inheritance.inhparent = ANY(ARRAY[\
@@ -2832,10 +2831,10 @@ async fn test_rotation_cadence_size_trigger_includes_indexes() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(total_bytes > main_bytes);
+    assert!(total_bytes > table_bytes);
     let cadence = RingRotationCadence {
         min_slot_age: Duration::from_secs(3600),
-        target_slot_bytes: (main_bytes + 1) as u64,
+        target_slot_bytes: (table_bytes + 1) as u64,
     };
     assert!(matches!(
         store.rotate_with_cadence(&pool, cadence).await.unwrap(),

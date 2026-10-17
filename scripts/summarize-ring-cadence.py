@@ -20,12 +20,22 @@ COUNTERS = {
     "relfilenode_churn_total",
     "pg_db_xacts_total",
     "pg_wal_bytes",
+    "pg_cpu_seconds_total",
+    "adapter_cpu_seconds_total",
+    "logical_consumer_bytes_total",
+    "logical_consumer_disconnects_total",
+    "logical_consumer_errors_total",
+    "logical_consumer_exits_total",
 }
 GAUGES = {
     "enqueue_rate",
     "completion_rate",
     "retryable_failure_rate",
     "terminal_failure_rate",
+    "injected_failure_rate",
+    "retried_completion_rate",
+    "poison_exhausted_rate",
+    "logical_consumer_paused",
     "producer_call_p99_ms",
     "subscriber_p99_ms",
     "end_to_end_p99_ms",
@@ -110,6 +120,8 @@ def main() -> None:
         json.dumps(results, indent=2) + "\n"
     )
     shutil.copy2(args.source / "provenance.json", args.destination / "provenance.json")
+    with gzip.open(args.destination / "adapter-Cargo.lock.gz", "wb") as output:
+        output.write((args.source / "eager/awa-bench/Cargo.lock").read_bytes())
     with gzip.open(args.destination / "samples.csv.gz", "wt", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=list(selected[0]))
         writer.writeheader()

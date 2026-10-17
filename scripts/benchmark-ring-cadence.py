@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import gzip
 import hashlib
 import json
 import os
@@ -196,6 +197,9 @@ def main() -> None:
     parser.add_argument("--harness", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
+        "--adapter-lock", type=Path, help="Cargo.lock or Cargo.lock.gz for the adapter"
+    )
+    parser.add_argument(
         "--cells", default="idle,low,reference,saturation,retry,logical"
     )
     parser.add_argument("--resume", action="store_true")
@@ -203,14 +207,19 @@ def main() -> None:
     awa = Path(__file__).resolve().parent.parent
     harness, root = args.harness.resolve(), args.output.resolve()
     target = root / "target"
-    policies = [("eager", "0-3,12-15", 15558), ("cadence", "4-7,16-19", 15559)]
+    policies = [("eager", "0-3,12-15", 15558), ("cadence", "6-9,18-21", 15559)]
     root.mkdir(parents=True, exist_ok=True)
     if not args.resume:
         for policy, cpus, _ in policies:
             prepare(harness, root / policy, awa, cpus)
+            if args.adapter_lock:
+                lock = args.adapter_lock.read_bytes()
+                if args.adapter_lock.suffix == ".gz":
+                    lock = gzip.decompress(lock)
+                (root / policy / "awa-bench/Cargo.lock").write_bytes(lock)
         with (root / "build.log").open("w") as log:
             subprocess.run(
-                ["cargo", "build", "--release"],
+                ["cargo", "build", "--release", "--locked"],
                 cwd=root / "eager/awa-bench",
                 env={
                     **os.environ,
@@ -228,6 +237,26 @@ def main() -> None:
             ).hexdigest(),
             "harness_head": command(["git", "rev-parse", "HEAD"], cwd=harness),
             "harness_status": command(["git", "status", "--short"], cwd=harness),
+            "awa_runtime_diff_sha256": hashlib.sha256(
+                subprocess.check_output(
+                    [
+                        "git",
+                        "diff",
+                        "HEAD",
+                        "--",
+                        "awa-model",
+                        "awa-worker",
+                        "awa-macros",
+                        "awa-metrics",
+                        "Cargo.toml",
+                        "Cargo.lock",
+                    ],
+                    cwd=awa,
+                )
+            ).hexdigest(),
+            "rustc_version": command(["rustc", "--version", "--verbose"]),
+            "adapter_lock_sha256": digest(root / "eager/awa-bench/Cargo.lock"),
+            "runner_sha256": digest(Path(__file__).resolve()),
             "binary_sha256": hashlib.file_digest(
                 (target / "release/awa-bench").open("rb"), "sha256"
             ).hexdigest(),
