@@ -201,6 +201,10 @@ Awa has three rescue paths:
 
 Rescue closes the old attempt before making work available again. If the old handler later writes a completion, the `run_lease` guard rejects it as stale. When rescue happens in a process that still has the handler registered, the runtime also flips the in-memory cancellation flag.
 
+A finished attempt retries lease-guarded finalization after transport, pool-acquire or server-availability errors, within an absolute 120-second budget starting at its first finalize attempt. A connection loss may hide a successful commit. Replaying the saved result cannot apply a second transition or duplicate transactional follow-ups; if rescue already claimed a newer lease, the old result is ignored. Rescue remains the fallback if the budget expires, shutdown cancels finalization, or rescue wins the race. This reduces avoidable handler re-execution without changing the at-least-once execution contract.
+
+Pending durable finalizers are limited to the runtime's worker capacity. When that capacity fills, returning handlers retain their worker and heartbeat ownership until a finalizer slot is available. Shutdown drains both handlers and finalizers within the caller's drain budget, then cancels outstanding finalizers. Lifecycle hooks release finalizer capacity before they run. The `awa.completion.reconnect_retry` counter records reconnect retries; a burst can indicate either database unavailability or pool pressure.
+
 ## Partition Rotation And Reclamation
 
 Queue storage has three independent rings, each advanced by the elected maintenance leader:
