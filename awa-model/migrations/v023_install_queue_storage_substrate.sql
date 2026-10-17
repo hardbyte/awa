@@ -34,7 +34,197 @@
 --   non-partitioned shape, queue_count_snapshots drop) — these are
 --   one-shot upgrade fixups that don't belong in a forward-only DDL
 --   function. They remain in `prepare_schema()` for custom schemas; the
---   default `awa` migration path runs the `awa`-specific copy below.
+--   default `awa` migration step runs the `awa`-specific copy separately.
+
+CREATE OR REPLACE FUNCTION awa.refresh_lane_sequence_helpers(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $refresh$
+BEGIN
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.ensure_lane_sequences(
+            p_queue TEXT,
+            p_priority SMALLINT,
+            p_enqueue_shard SMALLINT
+        )
+        RETURNS VOID
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_enqueue_seq TEXT := %1$I.queue_lane_sequence_name(
+                'queue_enqueue_seq',
+                p_queue,
+                p_priority,
+                p_enqueue_shard
+            );
+            v_claim_seq TEXT := %1$I.queue_lane_sequence_name(
+                'queue_claim_seq',
+                p_queue,
+                p_priority,
+                p_enqueue_shard
+            );
+        BEGIN
+            IF to_regclass(format('%%I.%%I', %1$L, v_enqueue_seq)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_enqueue_seq
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_enqueue_seq
+                );
+            END IF;
+            IF to_regclass(format('%%I.%%I', %1$L, v_claim_seq)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_claim_seq
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_claim_seq
+                );
+            END IF;
+
+            UPDATE %1$I.queue_enqueue_heads
+            SET seq_name = v_enqueue_seq
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard
+              AND seq_name IS DISTINCT FROM v_enqueue_seq;
+
+            UPDATE %1$I.queue_claim_heads
+            SET seq_name = v_claim_seq
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard
+              AND seq_name IS DISTINCT FROM v_claim_seq;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.queue_enqueue_head_sequence_sync()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
+                'queue_enqueue_seq',
+                NEW.queue,
+                NEW.priority,
+                NEW.enqueue_shard
+            );
+            v_qualified_seq TEXT := format('%%I.%%I', %1$L, v_seq_name);
+            v_count BIGINT;
+            v_start BIGINT;
+        BEGIN
+            IF to_regclass(format('%%I.%%I', %1$L, v_seq_name)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_seq_name
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_seq_name
+                );
+            END IF;
+            NEW.seq_name := v_seq_name;
+
+            IF TG_OP = 'UPDATE'
+               AND NEW.next_seq IS DISTINCT FROM OLD.next_seq
+               AND NEW.next_seq > OLD.next_seq
+            THEN
+                v_count := NEW.next_seq - OLD.next_seq;
+                PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
+                BEGIN
+                    EXECUTE format(
+                        'SELECT nextval(%%L::regclass)::bigint',
+                        v_qualified_seq
+                    )
+                    INTO v_start;
+
+                    IF v_count > 1 THEN
+                        EXECUTE format(
+                            'SELECT setval(%%L::regclass, %%s, true)',
+                            v_qualified_seq,
+                            v_start + v_count - 1
+                        );
+                    END IF;
+                EXCEPTION WHEN OTHERS THEN
+                    PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                    RAISE;
+                END;
+                PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                NEW.next_seq := v_start + v_count;
+            ELSE
+                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
+            END IF;
+
+            RETURN NEW;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.queue_claim_head_sequence_sync()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
+                'queue_claim_seq',
+                NEW.queue,
+                NEW.priority,
+                NEW.enqueue_shard
+            );
+        BEGIN
+            IF to_regclass(format('%%I.%%I', %1$L, v_seq_name)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_seq_name
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_seq_name
+                );
+            END IF;
+            NEW.seq_name := v_seq_name;
+
+            IF TG_OP = 'INSERT' THEN
+                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.claim_seq);
+            END IF;
+
+            RETURN NEW;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
@@ -1058,60 +1248,7 @@ BEGIN
         p_schema
     );
 
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.ensure_lane_sequences(
-            p_queue TEXT,
-            p_priority SMALLINT,
-            p_enqueue_shard SMALLINT
-        )
-        RETURNS VOID
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_enqueue_seq TEXT := %1$I.queue_lane_sequence_name(
-                'queue_enqueue_seq',
-                p_queue,
-                p_priority,
-                p_enqueue_shard
-            );
-            v_claim_seq TEXT := %1$I.queue_lane_sequence_name(
-                'queue_claim_seq',
-                p_queue,
-                p_priority,
-                p_enqueue_shard
-            );
-        BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_enqueue_seq
-            );
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_claim_seq
-            );
-
-            UPDATE %1$I.queue_enqueue_heads
-            SET seq_name = v_enqueue_seq
-            WHERE queue = p_queue
-              AND priority = p_priority
-              AND enqueue_shard = p_enqueue_shard
-              AND seq_name IS DISTINCT FROM v_enqueue_seq;
-
-            UPDATE %1$I.queue_claim_heads
-            SET seq_name = v_claim_seq
-            WHERE queue = p_queue
-              AND priority = p_priority
-              AND enqueue_shard = p_enqueue_shard
-              AND seq_name IS DISTINCT FROM v_claim_seq;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
+    PERFORM awa.refresh_lane_sequence_helpers(p_schema);
 
     EXECUTE format(
         $ddl$
@@ -1180,101 +1317,6 @@ BEGIN
             END IF;
 
             RETURN v_start;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.queue_enqueue_head_sequence_sync()
-        RETURNS TRIGGER
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
-                'queue_enqueue_seq',
-                NEW.queue,
-                NEW.priority,
-                NEW.enqueue_shard
-            );
-            v_qualified_seq TEXT := format('%%I.%%I', %1$L, v_seq_name);
-            v_count BIGINT;
-            v_start BIGINT;
-        BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_seq_name
-            );
-            NEW.seq_name := v_seq_name;
-
-            IF TG_OP = 'UPDATE'
-               AND NEW.next_seq IS DISTINCT FROM OLD.next_seq
-               AND NEW.next_seq > OLD.next_seq
-            THEN
-                v_count := NEW.next_seq - OLD.next_seq;
-                PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
-                BEGIN
-                    EXECUTE format(
-                        'SELECT nextval(%%L::regclass)::bigint',
-                        v_qualified_seq
-                    )
-                    INTO v_start;
-
-                    IF v_count > 1 THEN
-                        EXECUTE format(
-                            'SELECT setval(%%L::regclass, %%s, true)',
-                            v_qualified_seq,
-                            v_start + v_count - 1
-                        );
-                    END IF;
-                EXCEPTION WHEN OTHERS THEN
-                    PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
-                    RAISE;
-                END;
-                PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
-                NEW.next_seq := v_start + v_count;
-            ELSE
-                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
-            END IF;
-
-            RETURN NEW;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.queue_claim_head_sequence_sync()
-        RETURNS TRIGGER
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
-                'queue_claim_seq',
-                NEW.queue,
-                NEW.priority,
-                NEW.enqueue_shard
-            );
-        BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_seq_name
-            );
-            NEW.seq_name := v_seq_name;
-
-            IF TG_OP = 'INSERT' THEN
-                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.claim_seq);
-            END IF;
-
-            RETURN NEW;
         END;
         $func$
         $ddl$,
@@ -4199,110 +4241,3 @@ COMMENT ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOO
     'Installs the queue-storage substrate (sequences, ring-state singletons, partitioned ready/tombstone/done/lease tables, lane indexes, claim_ready_runtime()) into the named schema. The default ''awa'' substrate is migration-owned and default-shaped: lease_claim_receipts=TRUE and (queue=16, lease=8, claim=8). Operators wanting non-default slot counts or lease_claim_receipts=FALSE must use a custom queue-storage schema. SECURITY INVOKER, takes a per-schema advisory xact lock. See #308.';
 
 REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) FROM PUBLIC;
-
--- Install the default `awa` substrate as part of migrate. Unlike the
--- reusable helper, this default-schema path also performs the one-shot
--- legacy fixups that let `awa migrate` upgrade a database where the
--- default `awa` queue-storage substrate was previously prepared by Rust.
--- Keep the whole cleanup -> helper -> copy-back path inside one statement
--- so the per-schema advisory xact lock serializes it with prepare_schema().
-DO $$
-DECLARE
-    v_open_receipt_claims_count BIGINT;
-    v_lease_claims_relkind TEXT;
-    v_closures_relkind TEXT;
-    v_legacy_claim_slot INT;
-BEGIN
-    PERFORM pg_advisory_xact_lock(
-        hashtextextended('awa.queue_storage.install:awa', 0)
-    );
-
-    IF to_regclass('awa.open_receipt_claims') IS NOT NULL THEN
-        SELECT count(*)::bigint
-        INTO v_open_receipt_claims_count
-        FROM awa.open_receipt_claims;
-
-        IF v_open_receipt_claims_count > 0 THEN
-            RAISE EXCEPTION 'awa.open_receipt_claims has % rows but the runtime no longer reads or writes this table',
-                v_open_receipt_claims_count
-                USING ERRCODE = '22023',
-                      HINT = 'Run the ADR-023 reverse migration (recreate from lease_claims minus durable closure evidence) to drain it, then re-run awa migrate.';
-        END IF;
-
-        DROP TABLE IF EXISTS awa.open_receipt_claims CASCADE;
-    END IF;
-
-    SELECT c.relkind::text
-    INTO v_lease_claims_relkind
-    FROM pg_class AS c
-    JOIN pg_namespace AS n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'awa'
-      AND c.relname = 'lease_claims';
-
-    SELECT c.relkind::text
-    INTO v_closures_relkind
-    FROM pg_class AS c
-    JOIN pg_namespace AS n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'awa'
-      AND c.relname = 'lease_claim_closures';
-
-    IF v_lease_claims_relkind = 'r' THEN
-        ALTER TABLE awa.lease_claims RENAME TO lease_claims_legacy;
-    END IF;
-    IF v_closures_relkind = 'r' THEN
-        ALTER TABLE awa.lease_claim_closures RENAME TO lease_claim_closures_legacy;
-    END IF;
-
-    DROP TABLE IF EXISTS awa.queue_count_snapshots;
-
-    PERFORM awa.install_queue_storage_substrate('awa');
-
-    IF to_regclass('awa.lease_claims_legacy') IS NOT NULL
-       OR to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
-        -- #371: the install above seeded both cursor representations and
-        -- the authority resolver; read the current claim cursor through it.
-        SELECT slot
-        INTO v_legacy_claim_slot
-        FROM awa.ring_cursor('claim');
-    END IF;
-
-    IF to_regclass('awa.lease_claims_legacy') IS NOT NULL THEN
-        ALTER TABLE awa.lease_claims_legacy
-            ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0;
-        ALTER TABLE awa.lease_claims_legacy
-            ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ;
-
-        INSERT INTO awa.lease_claims (
-            claim_slot, job_id, run_lease, ready_slot, ready_generation,
-            queue, priority, attempt, max_attempts, lane_seq,
-            enqueue_shard, claimed_at, materialized_at, deadline_at
-        )
-        SELECT
-            v_legacy_claim_slot,
-            job_id, run_lease, ready_slot, ready_generation,
-            queue, priority, attempt, max_attempts, lane_seq,
-            enqueue_shard, claimed_at, materialized_at, deadline_at
-        FROM awa.lease_claims_legacy
-        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING;
-
-        DROP TABLE awa.lease_claims_legacy;
-    END IF;
-
-    IF to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
-        INSERT INTO awa.lease_claim_closures (
-            claim_slot, job_id, run_lease, outcome, closed_at
-        )
-        SELECT
-            v_legacy_claim_slot,
-            job_id, run_lease, outcome, closed_at
-        FROM awa.lease_claim_closures_legacy
-        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING;
-
-        DROP TABLE awa.lease_claim_closures_legacy;
-    END IF;
-END
-$$;
-
-INSERT INTO awa.schema_version (version, description)
-VALUES (23, 'Install default awa queue-storage substrate via awa.install_queue_storage_substrate() helper (#308)')
-ON CONFLICT (version) DO NOTHING;

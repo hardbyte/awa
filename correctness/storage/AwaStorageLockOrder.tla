@@ -239,6 +239,13 @@ EnqueueTwoStripePlan(p) ==
     << Step(LaneResource(StripeA, p), ModeExclusive),
        Step(LaneResource(StripeB, p), ModeExclusive) >>
 
+\* prepare_queue visits physical queues in the same lexical order as the
+\* producer's BTreeMap<(queue, priority, shard)> grouping.
+PrepareTwoStripePlan(p) == EnqueueTwoStripePlan(p)
+PrepareNumericStripePlan(p) ==
+    << Step(LaneResource(StripeB, p), ModeExclusive),
+       Step(LaneResource(StripeA, p), ModeExclusive) >>
+
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
 \*   FOR UPDATE OF queue_claim_heads SKIP LOCKED (per-(queue,priority) row)
@@ -743,6 +750,24 @@ StartEnqueueTwoStripe(t, p) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
+StartPrepareTwoStripe(t, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = PrepareTwoStripePlan(p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+StartPrepareNumericStripe(t, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = PrepareNumericStripePlan(p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
 StartComplete(t, claimSlot, readySlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -968,6 +993,7 @@ Stutter == /\ UNCHANGED vars
 
 Next ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, p \in Priorities : StartPrepareTwoStripe(t, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
          rs \in ReadySlots, cs \in ClaimSlots :
           StartClaimReceipts(t, q, p, rs, cs)
@@ -1006,6 +1032,26 @@ Next ==
     \/ Stutter
 
 Spec == ConfigOK /\ Init /\ [][Next]_vars
+
+NextPrepareQueue ==
+    \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, p \in Priorities : StartPrepareTwoStripe(t, p)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecPrepareQueue == ConfigOK /\ Init /\ [][NextPrepareQueue]_vars
+
+NextPrepareQueueNumeric ==
+    \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, p \in Priorities : StartPrepareNumericStripe(t, p)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecPrepareQueueNumeric == ConfigOK /\ Init /\ [][NextPrepareQueueNumeric]_vars
 
 \* ---- Sanity check for the deadlock detector ----
 \*

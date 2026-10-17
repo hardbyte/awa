@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 48;
+pub const CURRENT_VERSION: i32 = 49;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -162,7 +162,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         23,
         "Install default awa queue-storage substrate via SQL helper",
-        &[V23_UP],
+        &[V23_UP, V23_DEFAULT_UP],
     ),
     (
         24,
@@ -182,18 +182,18 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         27,
         "Move lane cursors to sequences and stripe terminal counters",
-        &[V23_UP, V22_UP, V27_UP],
+        &[V23_UP, V23_DEFAULT_UP, V22_UP, V27_UP],
     ),
     (
         28,
         "Add ready_tombstones ledger and compatibility filters (#295)",
-        &[V23_UP, V22_UP, V28_UP],
+        &[V23_UP, V23_DEFAULT_UP, V22_UP, V28_UP],
     ),
     (29, "Add durable batch operations control table", &[V29_UP]),
     (
         30,
         "Add terminal-count delta ledger and async rollup",
-        &[V23_UP, V30_UP],
+        &[V23_UP, V23_DEFAULT_UP, V30_UP],
     ),
     (
         31,
@@ -208,7 +208,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         33,
         "Add per-slot receipt-rescue cursors for queue storage",
-        &[V23_UP, V33_UP],
+        &[V23_UP, V23_DEFAULT_UP, V33_UP],
     ),
     (
         34,
@@ -223,22 +223,22 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         36,
         "Compact successful receipt completions into batch terminal history",
-        &[V18_UP, V23_UP, V36_UP],
+        &[V18_UP, V23_UP, V23_DEFAULT_UP, V36_UP],
     ),
     (
         37,
         "Add ready_segments claim-routing ledger for queue storage",
-        &[V18_UP, V23_UP, V37_UP],
+        &[V18_UP, V23_UP, V23_DEFAULT_UP, V37_UP],
     ),
     (
         38,
         "Add compact receipt claim batch ledger for queue storage",
-        &[V23_UP, V38_UP],
+        &[V23_UP, V23_DEFAULT_UP, V38_UP],
     ),
     (
         39,
         "Refresh claim_ready_runtime to cache-free ready-segment routing",
-        &[V23_UP, V39_UP],
+        &[V23_UP, V23_DEFAULT_UP, V39_UP],
     ),
     (
         40,
@@ -249,12 +249,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         42,
         "Compact deadline receipt claims and batch deadline-rescue cursors (#246)",
-        &[V23_UP, V42_UP],
+        &[V23_UP, V23_DEFAULT_UP, V42_UP],
     ),
     (
         43,
         "Append-only ring-rotation ledgers and terminal-rollup deltas (#371)",
-        &[V18_UP, V23_UP, V43_UP],
+        &[V18_UP, V23_UP, V23_DEFAULT_UP, V43_UP],
     ),
     (
         44,
@@ -266,12 +266,17 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         47,
         "Replica identity for tables without a primary key",
-        &[V23_UP, V47_UP],
+        &[V23_UP, V23_DEFAULT_UP, V47_UP],
     ),
     (
         48,
         "Claim cursor catch-up inside the claim",
-        &[V23_UP, V48_UP],
+        &[V23_UP, V23_DEFAULT_UP, V48_UP],
+    ),
+    (
+        49,
+        "Use provisioned lane sequences without runtime DDL",
+        &[V23_UP, V49_UP],
     ),
 ];
 
@@ -297,6 +302,8 @@ const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schem
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
 const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
+const V23_DEFAULT_UP: &str =
+    include_str!("../migrations/v023_install_default_queue_storage_substrate.sql");
 const V24_UP: &str = include_str!("../migrations/v024_receipt_plane_fillfactor.sql");
 const V25_UP: &str = include_str!("../migrations/v025_drop_leases_state_hb_index.sql");
 const V26_UP: &str = include_str!("../migrations/v026_cron_jobs_pause.sql");
@@ -322,6 +329,7 @@ const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
 const V46_UP: &str = include_str!("../migrations/v046_wait_free_dirty_marks.sql");
 const V47_UP: &str = include_str!("../migrations/v047_replica_identity.sql");
 const V48_UP: &str = include_str!("../migrations/v048_claim_cursor_catch_up.sql");
+const V49_UP: &str = include_str!("../migrations/v049_prepared_lane_sequences.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

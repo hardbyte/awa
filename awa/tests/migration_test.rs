@@ -4441,7 +4441,7 @@ async fn v048_generated_bundle_refreshes_a_stale_installer() {
     let pool = db.pool();
     // A stale-installer sentinel makes the missing dependency observable. It
     // is not a released-binary rehearsal; existing runtime tests cover shapes.
-    sqlx::raw_sql("CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(p_schema text, p_queue_slot_count int DEFAULT 16, p_lease_slot_count int DEFAULT 8, p_claim_slot_count int DEFAULT 8, p_lease_claim_receipts boolean DEFAULT TRUE) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'stale_installer_fixture'; END $$; DELETE FROM awa.schema_version WHERE version=48")
+    sqlx::raw_sql("CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(p_schema text, p_queue_slot_count int DEFAULT 16, p_lease_slot_count int DEFAULT 8, p_claim_slot_count int DEFAULT 8, p_lease_claim_receipts boolean DEFAULT TRUE) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'stale_installer_fixture'; END $$; DELETE FROM awa.schema_version WHERE version>=48")
         .execute(pool).await.unwrap();
     let mut raw = pool.begin().await.unwrap();
     let error = sqlx::raw_sql(include_str!(
