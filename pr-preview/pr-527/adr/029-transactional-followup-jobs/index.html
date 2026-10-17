@@ -1,0 +1,2645 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/029-transactional-followup-jobs/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>ADR-029: Transactional follow-up jobs for durable lifecycle effects - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  
+  
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="ADR-029: Transactional follow-up jobs for durable lifecycle effects — AWA">
+  <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/029-transactional-followup-jobs/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#adr-029-transactional-follow-up-jobs-for-durable-lifecycle-effects" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              ADR-029: Transactional follow-up jobs for durable lifecycle effects
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../security/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Security
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Migrations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migration overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Status
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#context" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Decision">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#principle" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Principle
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#builder-api" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Builder API
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#where-the-enqueue-runs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where the enqueue runs
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#registry-lives-in-process-for-now" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Registry lives in process — for now
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#notify-is-a-wakeup-hint-not-the-delivery-channel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        NOTIFY is a wakeup hint, not the delivery channel
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#boundary-with-hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Boundary with hooks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-this-is-not" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What this is not
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#consequences" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Consequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Consequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#positive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positive
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#negative-risks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Negative / Risks
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alternatives-considered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternatives considered
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Alternatives considered">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#a-stay-with-in-process-hooks-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A. Stay with in-process hooks only
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b-postgres-notify-listen-fan-out-as-the-event-channel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B. Postgres NOTIFY / LISTEN fan-out as the event channel
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c-dedicated-awaevents-outbox-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C. Dedicated awa.events outbox table
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#d-chosen-transactional-follow-up-jobs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        D. (Chosen) Transactional follow-up jobs
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#e-postgres-logical-decoding-wal-cdc" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        E. Postgres logical decoding / WAL CDC
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#relationship-to-other-adrs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Relationship to other ADRs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Implementation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Implementation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#atomicity-matrix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Atomicity matrix
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#open-extensions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open extensions
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
+                  
+
+
+  
+  
+
+
+<h1 id="adr-029-transactional-follow-up-jobs-for-durable-lifecycle-effects">ADR-029: Transactional follow-up jobs for durable lifecycle effects<a class="headerlink" href="#adr-029-transactional-follow-up-jobs-for-durable-lifecycle-effects" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Accepted. Worker-driven outcomes and callback resolution via the worker <code>Client</code> commit follow-ups atomically with the state transition; maintenance rescue dispatches follow-ups best-effort in a separate transaction (see <a href="#atomicity-matrix">Atomicity matrix</a>).</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p>Awa exposes two ways for application code to react to a job's lifecycle:</p>
+<ul>
+<li><strong>Builder-side lifecycle hooks</strong> (ADR-015). Closures registered on <code>ClientBuilder::on_event</code> fire after the state commit, in-process, best-effort. They are explicitly not durable: a process crash between the state commit and the hook dispatch loses the event. ADR-015 states the guidance: <em>"If a hook side effect must be durable or retried, that logic should enqueue another job instead."</em> That guidance lives in prose, not in the API.</li>
+<li><strong>Tracing spans and structured logs</strong> (PRD §15). Useful for observability, but not a delivery mechanism for side effects.</li>
+</ul>
+<p>Two adjacent design tracks make the gap acute:</p>
+<ul>
+<li><strong>Callback ingress as a separate surface</strong> (ADR-027, proposed). A callback-only receiver has no <code>Client</code> and no in-process hook registry, so resolving a callback there fires no hook. ADR-027 punts: <em>"If callback completion should produce lifecycle notifications beyond the storage transition itself, that mechanism needs to be durable or otherwise runtime-independent."</em></li>
+<li><strong>Maintenance-only runtime role</strong> (ADR-028, proposed). Rescue paths (expired callback, stale heartbeat, exceeded deadline) commit state transitions from the maintenance worker, with no notion of a per-kind hook registry. Today an attempt that times out emits a <code>Started</code> and then goes silent; the rescue itself produces no lifecycle event.</li>
+</ul>
+<p>Users routinely ask for "reliable events" for things like "send a welcome email when this signup completes." They reach for hooks — the only event surface that exists — and ship code that quietly drops events on a deploy or when the resolving process changes. The naming and ergonomics of the current hooks API encourage this mistake.</p>
+<p>Two distinct needs are being conflated:</p>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Examples</th>
+<th>Acceptable loss</th>
+<th>Latency budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Observation</td>
+<td>metrics, traces, logs, alerting</td>
+<td>low single-digit %</td>
+<td>sub-second</td>
+</tr>
+<tr>
+<td>Side effects</td>
+<td>send email, kick off workflow, persist record</td>
+<td>zero</td>
+<td>seconds to minutes</td>
+</tr>
+</tbody>
+</table>
+<p>A single mechanism cannot honestly serve both.</p>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p>Treat observation and side effects as separate mechanisms with separate APIs. Keep ADR-015's in-process hooks unchanged for observation. Add a first-class <strong>transactional follow-up enqueue</strong> API for durable side effects.</p>
+<h3 id="principle">Principle<a class="headerlink" href="#principle" title="Permanent link">&para;</a></h3>
+<p>A side effect that must survive process crash, deployment, or a split deployment topology (per ADR-027) is delivered as an Awa job. For worker-driven outcomes and callback resolution through the worker <code>Client</code>, follow-up <code>INSERT</code>s run <strong>in the same database transaction</strong> as the triggering state transition — both commit together or both roll back. Maintenance rescue dispatches its follow-ups in a separate transaction (best-effort, see <a href="#atomicity-matrix">Atomicity matrix</a>) because the rescue transition has already committed by the time the dispatcher sees it. Either way the follow-up inherits Awa's existing durability properties: at-least-once delivery, retries, dead-letter (ADR-020), DLQ replay, observability through the admin UI, and crash recovery via run-lease guarded finalization (ADR-013).</p>
+<h3 id="builder-api">Builder API<a class="headerlink" href="#builder-api" title="Permanent link">&para;</a></h3>
+<p><code>ClientBuilder</code> gains transactional enqueue counterparts to <code>on_event</code>. The naming mirrors the existing hook surface so the choice between observation and side effect is explicit at the registration site:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">Client</span><span class="p">::</span><span class="n">builder</span><span class="p">(</span><span class="n">pool</span><span class="p">)</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="p">.</span><span class="n">register</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Signup</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="n">handle_signup</span><span class="p">)</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="c1">// Observation — best-effort, in-process, no delivery guarantee.</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="p">.</span><span class="n">on_event</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Signup</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">event</span><span class="o">|</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">metrics</span><span class="p">::</span><span class="n">record</span><span class="p">(</span><span class="n">event</span><span class="p">)</span><span class="w"> </span><span class="p">})</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="c1">// Durable side effect — committed atomically with the Signup outcome.</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="p">.</span><span class="n">on_completed_enqueue</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Signup</span><span class="p">,</span><span class="w"> </span><span class="n">SendWelcomeEmail</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">signup_args</span><span class="p">,</span><span class="w"> </span><span class="n">_job</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">        </span><span class="n">SendWelcomeEmail</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">user_id</span><span class="p">:</span><span class="w"> </span><span class="nc">signup_args</span><span class="p">.</span><span class="n">user_id</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="p">})</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="p">.</span><span class="n">on_exhausted_enqueue</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Signup</span><span class="p">,</span><span class="w"> </span><span class="n">NotifyOps</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">signup_args</span><span class="p">,</span><span class="w"> </span><span class="n">job</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">        </span><span class="n">NotifyOps</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">            </span><span class="n">user_id</span><span class="p">:</span><span class="w"> </span><span class="nc">signup_args</span><span class="p">.</span><span class="n">user_id</span><span class="p">,</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">            </span><span class="n">failure</span><span class="p">:</span><span class="w"> </span><span class="nc">job</span><span class="p">.</span><span class="n">errors</span><span class="p">.</span><span class="n">clone</span><span class="p">(),</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">        </span><span class="p">}</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">    </span><span class="p">});</span>
+</span></code></pre></div>
+<p>The closure returns a follow-up <code>JobArgs</code> value (default <code>InsertOpts</code>) or an <code>EnqueueRequest&lt;F&gt;</code> with <code>InsertOpts</code> overrides. For worker-driven outcomes and callback resolution via the worker <code>Client</code>, the engine <code>INSERT</code>s the follow-up in the same transaction as the triggering state change; the follow-up commits with the trigger or rolls back with it (a spec INSERT failure or a panic in the user-supplied closure rolls the trigger transition back as well). For maintenance rescue the engine <code>INSERT</code>s the follow-up in a separate transaction opened <em>after</em> the rescue commits (see <a href="#atomicity-matrix">Atomicity matrix</a>). In either case, once the follow-up <code>INSERT</code> commits the row is durably visible and rides Awa's existing retry / DLQ machinery.</p>
+<p>Counterparts cover the outcomes that benefit most from durable delivery: <code>on_completed_enqueue</code>, <code>on_retried_enqueue</code>, <code>on_exhausted_enqueue</code>, <code>on_cancelled_enqueue</code>, <code>on_waiting_for_callback_enqueue</code>, and <code>on_rescued_enqueue</code>. <code>Started</code> is intentionally excluded — claim-time enqueue would join the dispatcher's hot path and the use case for "job started" is observation, which <code>on_event</code> already covers. <code>Snooze</code> continues to emit nothing on either surface.</p>
+<h3 id="where-the-enqueue-runs">Where the enqueue runs<a class="headerlink" href="#where-the-enqueue-runs" title="Permanent link">&para;</a></h3>
+<p>The enqueue is performed by whatever process performs the state transition:</p>
+<table>
+<thead>
+<tr>
+<th>Transition</th>
+<th>Performed by</th>
+<th>Follow-up enqueued by</th>
+<th>Atomic?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inline outcomes (Completed, Retried, Exhausted, Cancelled, WaitingForCallback)</td>
+<td>Worker executor</td>
+<td>Worker executor, in the finalization transaction</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Callback resolution via worker <code>Client</code></td>
+<td>The resolving process</td>
+<td>That process, in the resolution transaction (via <code>admin::*_external_in_tx</code> / <code>store::*_external_in_tx</code>)</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Callback resolution via callback-only ingress (ADR-027)</td>
+<td>Callback receiver</td>
+<td>Pending: callback-only ingress does not yet own a worker registry. When that surface lands it can reuse the same <code>_in_tx</code> admin / store helpers used by the worker <code>Client</code>.</td>
+<td>pending</td>
+</tr>
+<tr>
+<td>Caller-owned completion (ADR-042)</td>
+<td>Handler-owned Postgres transaction</td>
+<td>The handler explicitly inserts any follow-up/outbox work before guarded completion</td>
+<td>yes — registered process-local Completed specs are rejected for this kind in v1</td>
+</tr>
+<tr>
+<td>Expired-callback / stale-heartbeat / deadline rescue (ADR-028)</td>
+<td>Maintenance runtime</td>
+<td>Maintenance runtime, in a separate transaction after the rescue commits</td>
+<td>no — best-effort</td>
+</tr>
+</tbody>
+</table>
+<p>Why rescue stays best-effort: a panic in a user-supplied <code>on_rescued_enqueue</code> closure would otherwise roll the rescue UPDATE back, coupling rescue liveness (the maintenance loop's job recovery guarantee) to the correctness of user follow-up code. A zero-loss rescue-notification story is better served by an outbox/sweeper than by inlining user code into the rescue tx. The current best-effort behaviour means the trigger has already committed, so the worst case is a missing follow-up — not a phantom follow-up. See <a href="#atomicity-matrix">Atomicity matrix</a> for the call sites involved.</p>
+<h3 id="registry-lives-in-process-for-now">Registry lives in process — for now<a class="headerlink" href="#registry-lives-in-process-for-now" title="Permanent link">&para;</a></h3>
+<p>The mapping from "trigger kind + outcome" to "make follow-up args" is a Rust closure (or a Python callable, when the Python API gains parity). Closures cannot be portably stored in the database, so each process that performs a state transition must have the spec registered locally:</p>
+<ul>
+<li>A worker process: registers via its own <code>ClientBuilder</code>.</li>
+<li>A callback-only ingress process (ADR-027): registers via the callback router's config (planned in #279).</li>
+<li>A maintenance-only process (ADR-028): registers via its own <code>ClientBuilder</code> in the library form, or via a future config file for the pool-only CLI form.</li>
+</ul>
+<p>In normal deployments every process is built from the same code, so the registries agree. When they disagree — a worker on a new build registers a new follow-up that an older callback-receiver doesn't know about — the emitter that <em>doesn't</em> know the spec simply doesn't enqueue; the trigger still commits. This is the same drift behavior as in-process hooks today and is acceptable for v1.</p>
+<p>A future ADR may introduce a database-stored registry (mapping trigger → follow-up kind, with the args transformation expressed declaratively — for example, JSONata-style mapping or a CEL expression like ADR-021's callback filters use). That option is deferred until the in-process surface is in use and the missing mapping in another process becomes a real operational problem.</p>
+<h3 id="notify-is-a-wakeup-hint-not-the-delivery-channel">NOTIFY is a wakeup hint, not the delivery channel<a class="headerlink" href="#notify-is-a-wakeup-hint-not-the-delivery-channel" title="Permanent link">&para;</a></h3>
+<p>Postgres <code>LISTEN</code> / <code>NOTIFY</code> is suitable for low-latency wakeup but not for delivery: payloads are capped, undelivered notifications are dropped, and a process not currently listening misses the event. The follow-up enqueue already provides durability; pairing it with a <code>pg_notify</code> of the follow-up job's queue (in the same transaction) is a useful latency optimisation — listening workers can claim immediately rather than waiting for the next poll interval — but the notification carries no payload and no event semantics. It is purely a wakeup signal layered on top of a durable INSERT.</p>
+<h3 id="boundary-with-hooks">Boundary with hooks<a class="headerlink" href="#boundary-with-hooks" title="Permanent link">&para;</a></h3>
+<p>The two APIs are deliberately separate and orthogonal:</p>
+<ul>
+<li>A user may register <code>on_event</code> and <code>on_*_enqueue</code> for the same trigger. Both fire; the hook is observation, the enqueue is delivery.</li>
+<li>An <code>on_*_enqueue</code> registration on a process that does <em>not</em> perform the relevant state transition is dormant; the engine has nothing to insert for that process. This is consistent with the registry being per-process.</li>
+<li>Snooze and rescue produce no hooks today; only the enqueue path covers them. This is intentional — rescues happen in the maintenance process, which has no user handler registry, but can still insert a follow-up job from its transaction. Cancellation has both: <code>Cancelled</code> is a hook event in ADR-015 and gains an <code>on_cancelled_enqueue</code> counterpart here.</li>
+</ul>
+<p><code>docs/lifecycle-hooks.md</code> describes the hook path. The follow-up enqueue path gets its own section that names the trade-off explicitly: pick the API whose guarantees match the side effect.</p>
+<h3 id="what-this-is-not">What this is not<a class="headerlink" href="#what-this-is-not" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Not a generic event bus. The mechanism is one Awa job per follow-up registration per transition. Fan-out across application components happens by registering multiple follow-ups, each its own job.</li>
+<li>Not a replacement for tracing spans or logs (PRD §15). Those continue to describe execution; this describes deliberate downstream work.</li>
+<li>Not a CDC stream. WAL-level change capture is out of scope (alternative E below).</li>
+<li>Not a sub-millisecond reactor. Follow-up latency is bounded by claim cadence (helped, but not eliminated, by the NOTIFY-as-wakeup hint).</li>
+</ul>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
+<ul>
+<li>A single durable mechanism covers every state transition Awa makes, across every deployment role ADR-027 and ADR-028 introduce: inline outcomes, callback resolution (worker-<code>Client</code> or callback-only), rescue, and any future transition.</li>
+<li>The rescue / timeout event gap closes: a rescue can dispatch <code>job_failed_rescue</code> (or any user-defined follow-up) — best-effort, in a separate transaction after the rescue commits, but the follow-up itself is then a durable Awa job with full retry / DLQ semantics. Closing this gap fully atomically is tracked as an open extension.</li>
+<li>The "what should be in a hook?" mistake disappears at the API level — observation and delivery have different names and obviously different guarantees.</li>
+<li>No new event log table, no new subscriber protocol, no separate retention policy. The follow-up is a job, with all of Awa's existing operator and developer affordances.</li>
+<li>Composes with the bridge adapters (ADR-016, ADR-017): a user resolving a callback from their own application can pass their own transaction to the resolution path, and the follow-up enqueues in <em>their</em> transaction with the app rows.</li>
+</ul>
+<h3 id="negative-risks">Negative / Risks<a class="headerlink" href="#negative-risks" title="Permanent link">&para;</a></h3>
+<ul>
+<li>The cost of a "durable event" equals the cost of an Awa job: a row in storage, a claim cycle, a worker pass. That is correctly more expensive than a hook. Users who reach for the durable path for what is really observation will pay that cost without benefit; docs and naming have to make the cheaper option obvious for metrics-style use cases.</li>
+<li>Latency for downstream work is bounded by Awa's poll cadence rather than by an in-process callback. The NOTIFY-as-wakeup hint reduces but does not eliminate this.</li>
+<li>More API surface to teach. The split into two APIs is the design's whole point, but the difference between <code>on_event</code> and <code>on_*_enqueue</code> must be unmistakable in docs and examples; otherwise users will pick the wrong one and observe one of the two failure modes (lost reliable side effect or expensive metrics counter).</li>
+<li>Cross-process registry drift is possible. The in-process registry choice trades portability for simplicity; future work may have to harden it with a database-stored spec if real deployments hit drift.</li>
+<li>The maintenance runtime now has a way to insert user-defined jobs from its rescue transactions. That is a deliberate broadening of what maintenance writes and must be documented alongside ADR-028.</li>
+</ul>
+<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="a-stay-with-in-process-hooks-only">A. Stay with in-process hooks only<a class="headerlink" href="#a-stay-with-in-process-hooks-only" title="Permanent link">&para;</a></h3>
+<p>Status quo. Loses on every cross-process and crash scenario above. The prose-only guidance from ADR-015 does not survive contact with real deployments where the resolver process is different from the worker process. Rejected as the long-term answer.</p>
+<h3 id="b-postgres-notify-listen-fan-out-as-the-event-channel">B. Postgres NOTIFY / LISTEN fan-out as the event channel<a class="headerlink" href="#b-postgres-notify-listen-fan-out-as-the-event-channel" title="Permanent link">&para;</a></h3>
+<p>Tempting because <code>awa:cancel</code> is precedent. NOTIFY is at-most-once delivery to <em>currently-connected</em> listeners, with an ~8 KB payload cap, and dropped notifications are not replayed. It is a viable wakeup primitive but cannot provide durability on its own. Using NOTIFY as the substrate would re-introduce the same losses this ADR exists to fix; using it as a wakeup hint on top of a durable enqueue is the right role.</p>
+<h3 id="c-dedicated-awaevents-outbox-table">C. Dedicated <code>awa.events</code> outbox table<a class="headerlink" href="#c-dedicated-awaevents-outbox-table" title="Permanent link">&para;</a></h3>
+<p>A standard transactional-outbox pattern. Considered seriously. The decision weighed:</p>
+<ul>
+<li>A dedicated events table is durable and replayable and supports cursor- based subscribers.</li>
+<li>But Awa is <em>already</em> a durable, retry-capable, dead-letter-aware queue. Building an events log next to it duplicates the engine: a new subscriber protocol, cursor management, retention policy, admin UI surface, and test matrix.</li>
+<li>"Queryable event history" — the main argument for an events table — is addressable with tagged follow-up jobs and the existing completed/failed history (ADR-026).</li>
+<li>The follow-up-job pattern is composable: a follow-up may itself emit follow-ups, may fan out across kinds, and is observable in the existing UI.</li>
+</ul>
+<p>Rejected because the engine for it already exists; building another would trade familiarity for parallel infrastructure.</p>
+<h3 id="d-chosen-transactional-follow-up-jobs">D. (Chosen) Transactional follow-up jobs<a class="headerlink" href="#d-chosen-transactional-follow-up-jobs" title="Permanent link">&para;</a></h3>
+<p>Described above. Reuses Awa's existing primitives; needs only an API on <code>ClientBuilder</code> and an enqueue hook in each state-transition path.</p>
+<h3 id="e-postgres-logical-decoding-wal-cdc">E. Postgres logical decoding / WAL CDC<a class="headerlink" href="#e-postgres-logical-decoding-wal-cdc" title="Permanent link">&para;</a></h3>
+<p>Powerful and durable but heavy infra (logical replication slot, Debezium-class consumer), inconsistent support across managed Postgres providers, and contrary to Awa's "self-contained queue in Postgres" positioning (ADR-001). Out of scope.</p>
+<h2 id="relationship-to-other-adrs">Relationship to other ADRs<a class="headerlink" href="#relationship-to-other-adrs" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>ADR-015</strong> (lifecycle hooks). This ADR codifies ADR-015's prose advice ("enqueue another job") into a first-class API. ADR-015's hooks remain the correct mechanism for observation; this ADR adds the mechanism for delivery.</li>
+<li><strong>ADR-027</strong> (callback ingress, proposed). Addresses the open question ADR-027 punts on: durable callback notifications. The worker <code>Client</code> drives resolution + follow-up dispatch in a single transaction via <code>admin::*_external_in_tx</code>. A callback-only ingress process built per ADR-027 will need its own registry hookup to reuse the same <code>_in_tx</code> admin path; until that hookup lands, callback ingress outside the worker <code>Client</code> is a separate transition with no follow-up dispatch. See the "Open extensions" section below for the current implementation boundary.</li>
+<li><strong>ADR-028</strong> (maintenance-only runtime, proposed). Gives rescue paths a way to dispatch durable lifecycle work without owning a handler registry. The dispatch is best-effort (separate transaction); the follow-up itself is a regular Awa job once enqueued.</li>
+<li><strong>ADR-013</strong> (run-lease, guarded finalization). For worker-driven outcomes the follow-up enqueue joins the same transaction as the guarded-finalization UPDATE; if the UPDATE matches zero rows (stale outcome), the transaction rolls back and the follow-up is not enqueued, preserving the at-most-once finalization contract.</li>
+<li><strong>ADR-020</strong> (DLQ). Follow-up jobs participate in the DLQ family unchanged; a side effect that exhausts retries lands in the DLQ with full args and history.</li>
+<li><strong>ADR-021</strong> (sequential callbacks, callback heartbeats). The callback resolution surface is unchanged; resolution through the worker <code>Client</code> dispatches follow-ups in the same transaction, while bare storage/admin callers have no process-local registry to dispatch.</li>
+<li><strong>ADR-006</strong> (insert-only transaction bridge) and <strong>ADR-016/017</strong> (Postgres adapter / Python transaction bridge). The same transactional insert primitive is reused; nothing new is added to the bridge contract.</li>
+<li><strong>ADR-042</strong> (caller-owned finalization). A caller-owned completion cannot evaluate a process-local <code>on_completed_enqueue</code> closure from the generic SQL function. Its v1 contract therefore rejects combining registered Completed specs and caller-owned completion for the same kind; the handler inserts explicit follow-up/outbox work in its transaction instead.</li>
+</ul>
+<h2 id="implementation">Implementation<a class="headerlink" href="#implementation" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Outcome surface.</strong> <code>Outcome::{Completed, Retried, Exhausted, Cancelled, WaitingForCallback, Rescued}</code>. <code>Started</code> is intentionally excluded — claim-time enqueue would join the dispatcher's hot path, and the durable-side-effect use case for "job started" is uncommon. Observation belongs to <code>on_event</code>. <code>on_started_enqueue</code> is not blocked by anything in this design; whether to add it is left as an open question rather than a v1 commitment.</li>
+<li><strong>Builder API.</strong> Each outcome has a pair of builders: <code>on_&lt;outcome&gt;_enqueue</code> (closure returns <code>JobArgs</code>) and <code>on_&lt;outcome&gt;_enqueue_with</code> (closure returns <code>EnqueueRequest&lt;F&gt;</code> for <code>InsertOpts</code> overrides — queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key).</li>
+<li><strong>Closure signatures</strong> carry the per-outcome context: Completed/WaitingForCallback: <code>(args, &amp;job_row)</code>; Cancelled: <code>(args, &amp;job_row, &amp;reason)</code>; Retried: <code>(args, &amp;job_row, &amp;error, attempt, next_run_at)</code>; Exhausted: <code>(args, &amp;job_row, &amp;error, attempt)</code>; Rescued: <code>(args, &amp;job_row, RescueReason)</code>.</li>
+<li><strong>Rescued event variant.</strong> Maintenance rescues fire <code>JobEvent::Rescued { args, job, reason: RescueReason }</code> alongside the follow-up spec dispatch, keeping rescue context distinct from Retried/Exhausted rather than overloading either.</li>
+</ul>
+<h3 id="atomicity-matrix">Atomicity matrix<a class="headerlink" href="#atomicity-matrix" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Emission site</th>
+<th>Atomic with state commit?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Worker-driven outcomes on canonical storage</td>
+<td>yes — <code>*_canonical_with_followups</code> helpers open one tx, run the state UPDATE (UPDATE...RETURNING on <code>awa.jobs_hot</code>; for <code>retryable</code> the DELETE+INSERT move into <code>awa.scheduled_jobs</code> is in a CTE), dispatch specs, commit</td>
+</tr>
+<tr>
+<td>Worker-driven outcomes on queue storage</td>
+<td>yes — <code>*_queue_storage_with_followups</code> helpers run inside <code>complete_runtime_batch_slow_in_tx</code> / <code>cancel_running_in_tx</code> / <code>fail_*_in_tx</code> / <code>retry_*_in_tx</code> / <code>enter_callback_wait_in_tx</code></td>
+</tr>
+<tr>
+<td>Callback resolution on <code>Client</code> (<code>complete_external</code>, <code>fail_external</code>, <code>retry_external</code>, <code>resolve_callback</code>) on either storage engine</td>
+<td>yes — <code>Client::*_external</code> opens one tx, drives the transition via <code>admin::*_external_in_tx</code> / <code>store::*_external_in_tx</code>, dispatches specs via <code>dispatch_specs_in_tx</code>, commits. A spec failure rolls the resolution back so the external sender can retry.</td>
+</tr>
+<tr>
+<td>Caller-owned completion (ADR-042)</td>
+<td>yes — explicit application/outbox/follow-up writes and the guarded completion share the caller's transaction; process-local registered Completed specs are incompatible with that kind in v1</td>
+</tr>
+<tr>
+<td>Maintenance rescue (stale heartbeat, deadline exceeded, expired callback)</td>
+<td><strong>no — best-effort.</strong> Spec dispatch runs in a separate tx after the rescue commits. A spec failure leaves the rescue applied and is logged. Kept best-effort by design (see <a href="#open-extensions">Open extensions</a>).</td>
+</tr>
+</tbody>
+</table>
+<p>Worker-driven outcomes inherit ADR-013's run-lease guard (zero rows matched → tx rollback → no follow-up); callback resolution inherits a matching guard from the <code>SELECT ... FOR UPDATE</code> lookup on <code>awa.jobs_hot</code> or <code>FOR UPDATE OF lease</code> on the queue-storage leases table. The trigger transition and the follow-up <code>INSERT</code> either both commit or neither does, so each committed worker-driven outcome or callback resolution enqueues each registered follow-up exactly once. <em>Delivery</em> of the follow-up itself is at-least-once — once enqueued the row rides Awa's normal claim/retry semantics, and the follow-up handler must remain safe under re-execution. The maintenance rescue path remains best-effort because coupling rescue liveness to the correctness of user follow-up code (a panic in <code>on_rescued_enqueue</code>) would be a worse trade than a missed Rescued follow-up; the rescue UPDATE has already committed when the dispatch runs, so the worst case is a missing follow-up — not a phantom follow-up.</p>
+<h3 id="open-extensions">Open extensions<a class="headerlink" href="#open-extensions" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Python parity.</strong> The Python binding does not yet expose <code>on_*_enqueue</code> or <code>on_event</code>. The implementation path mirrors <code>register_worker</code> in <code>awa-python/src/worker.rs</code>: a <code>PythonFollowUp</code> type that wraps a Python callable, takes the GIL inside <code>dispatch_specs_in_tx</code>, serialises <code>JobRow + OutcomeContext</code> to Python, invokes the callable, and decodes the returned dict to (<code>JobArgs</code>, <code>InsertOpts</code>) before the underlying <code>insert_with</code> fires. ADR-015's hook surface (<code>@on_event</code>) needs the same scaffold first.</li>
+<li><strong>Atomic callback-resolution for callback-only ingress (ADR-027).</strong> The worker <code>Client::*_external</code> paths now drive the resolution and spec dispatch in a single tx via <code>admin::*_external_in_tx</code> and the matching <code>store::*_external_in_tx</code> helpers. The callback-only ingress process landed by ADR-027 will need its own registry hookup to reuse the same <code>_in_tx</code> admin path; until then, callback ingress outside the worker <code>Client</code> remains a separate transition with no follow-up dispatch.</li>
+<li><strong>Atomic rescue + follow-up enqueue: deliberately not pursued.</strong> Threading <code>&amp;mut tx</code> through <code>maintenance::rescue_*</code> would couple rescue liveness to the correctness of user follow-up code — a panic in <code>on_rescued_enqueue</code> could roll back a rescue UPDATE and prevent maintenance from recovering stale jobs. A future zero-loss rescue-notification design should use an outbox/sweeper rather than inlining user code into the rescue tx.</li>
+<li><strong><code>on_started_enqueue</code>.</strong> Not blocked by the design; deliberately out of scope to keep the claim/dispatch hot path uncontended. The observation use case is already covered by <code>on_event</code>.</li>
+<li><strong>Conditional spec dispatch.</strong> Skipping enqueue based on a predicate over the triggering row is not part of the API; conditioning belongs inside the follow-up handler instead.</li>
+<li><strong>In-DB spec registry.</strong> Not part of the design; the in-process registry is sufficient while specs are declared in one place per deployment.</li>
+<li><strong>NOTIFY-as-wakeup-hint for follow-up queue poll cadence.</strong> An implementation-level tuning lever rather than an architectural concern.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../javascripts/language-switch.js"></script>
+      
+        <script src="../../javascripts/agent-docs.js"></script>
+      
+    
+  </body>
+</html>
