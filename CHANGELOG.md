@@ -6,6 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- Runtimes advance the lane claim cursor after every committed claim again. Omitting the advance for a non-drained lane left the cursor behind whenever an enqueue reservation was open; the lane's claimed segment then ranked first on the next claim, the catch-up found nothing and the claim returned empty while another lane held ready rows. The v048 in-claim catch-up remains the recovery path for advances that never ran.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant

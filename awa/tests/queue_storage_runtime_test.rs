@@ -689,30 +689,6 @@ async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) ->
         .expect("Failed to count lease_claim_closures")
 }
 
-/// Moves every lane cursor of `queue` over its committed attempt-batch
-/// evidence, as the next claim on each lane would (v048). After a partial
-/// receipt-mode claim the runtime leaves that catch-up to the next claim, so
-/// count comparisons that expect an exact cursor settle it first.
-async fn settle_claim_cursor(pool: &sqlx::PgPool, schema: &str, queue: &str) {
-    sqlx::query(audited_sql(format!(
-        "SELECT {schema}.set_sequence_next(claims.seq_name, evidence.next_seq)
-         FROM {schema}.queue_claim_heads AS claims
-         JOIN LATERAL (
-             SELECT max(attempts.next_lane_seq) AS next_seq
-             FROM {schema}.ready_claim_attempt_batches AS attempts
-             WHERE attempts.queue = claims.queue
-               AND attempts.priority = claims.priority
-               AND attempts.enqueue_shard = claims.enqueue_shard
-               AND attempts.next_lane_seq > {schema}.sequence_next_value(claims.seq_name)
-         ) AS evidence ON evidence.next_seq IS NOT NULL
-         WHERE claims.queue = $1"
-    )))
-    .bind(queue)
-    .execute(pool)
-    .await
-    .expect("settle claim cursors");
-}
-
 async fn lease_claim_closure_batch_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     let sql = format!(
         "SELECT count(*)::bigint FROM {}.lease_claim_closure_batches",
@@ -9537,6 +9513,84 @@ async fn test_queue_storage_claim_catches_cursor_up_and_claims_in_one_call() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_partial_claim_does_not_shadow_another_lane() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_partial_claim_other_lane";
+    let schema = "awa_qs_partial_claim_other_lane";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    for id in 0..2 {
+        enqueue_job(
+            &pool,
+            &store,
+            &HeartbeatRescueJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                priority: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    // An open enqueue reservation inflates the priority-1 lane's next
+    // sequence, so claiming both committed rows does not drain the lane.
+    let mut reservation_tx = pool.begin().await.expect("begin enqueue reservation");
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+    )))
+    .bind(queue)
+    .bind(1_i16)
+    .bind(0_i16)
+    .bind(1_i64)
+    .fetch_one(reservation_tx.as_mut())
+    .await
+    .expect("reserve enqueue sequence");
+
+    let urgent = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+        .await
+        .expect("claim priority-1 rows");
+    assert_eq!(urgent.len(), 2);
+
+    let low_id = enqueue_job(
+        &pool,
+        &store,
+        &HeartbeatRescueJob { id: 10 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let low = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+        .await
+        .expect("claim priority-4 row");
+    assert_eq!(
+        low.iter().map(|claimed| claimed.job.id).collect::<Vec<_>>(),
+        vec![low_id],
+        "a lane whose cursor lags its committed claims must not shadow another lane's ready rows"
+    );
+    reservation_tx
+        .rollback()
+        .await
+        .expect("release enqueue reservation");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advance_is_lost() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_receipt_claim_lost_cursor_advance";
@@ -16383,7 +16437,6 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
         .await
         .expect("claim two jobs into the receipt plane");
     assert_eq!(claimed.len(), 2, "two jobs must be claimed");
-    settle_claim_cursor(&pool, schema, queue).await;
 
     let after = read_state_counts(&pool, queue).await;
     let mut states: Vec<(String, i64)> = after;
@@ -16892,24 +16945,16 @@ async fn binary_first_claim_shape_and_cursor_interoperation(receipts: bool) {
         .await
         .unwrap();
     assert_eq!(second.len(), 1);
-    let cursor = claim_cursor_for(&pool, &new_store, queue, 1, 0).await;
     assert_eq!(
-        cursor,
-        if receipts {
-            second[0].claim.lane_seq
-        } else {
-            second[0].claim.lane_seq + 1
-        }
+        claim_cursor_for(&pool, &new_store, queue, 1, 0).await,
+        second[0].claim.lane_seq + 1,
+        "the migrated runtime still advances after commit"
     );
     let third = new_store
         .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
         .await
         .unwrap();
-    assert_eq!(
-        third.len(),
-        1,
-        "new in-claim fold catches the preceding committed claim"
-    );
+    assert_eq!(third.len(), 1);
     let last = store
         .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(60))
         .await
