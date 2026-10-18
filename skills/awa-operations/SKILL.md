@@ -276,7 +276,9 @@ The condition to alert on is a frozen generation *with* accumulating rows
 For queue storage, `ClientBuilder::ring_rotation_cadence` sets a five-second
 observed fill window and a 2 MiB total physical-size target by default. Python
 exposes `queue_storage_rotate_min_slot_age_ms` and
-`queue_storage_rotate_target_slot_bytes`. A zero byte target disables the size
+`queue_storage_rotate_target_slot_bytes`, plus `queue_storage_rotate_min_slot_rows`
+and `queue_storage_rotate_max_slot_age_ms` (row floor before the age window seals,
+and the ceiling that seals regardless). A zero byte target disables the size
 trigger; zero age or Rust `RingRotationCadence::EAGER` permits sealing each tick.
 Rust cadence and claim-interval overrides survive `queue_storage` calls in either order.
 Empty slots bypass the fill window so reclamation can continue after drain.

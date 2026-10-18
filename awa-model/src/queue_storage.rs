@@ -412,6 +412,13 @@ pub struct RingRotationCadence {
     /// Physical size that makes a non-empty slot eligible regardless of age.
     /// Zero disables the size trigger.
     pub target_slot_bytes: u64,
+    /// Rows the slot must hold before `min_slot_age` alone seals it, so a
+    /// trickle of writes does not seal a nearly empty slot every window.
+    /// Zero disables the row floor.
+    pub min_slot_rows: u64,
+    /// Age after which a non-empty slot seals regardless of `min_slot_rows`,
+    /// bounding how long a trickle keeps a slot open. Zero disables it.
+    pub max_slot_age: Duration,
 }
 
 impl RingRotationCadence {
@@ -419,12 +426,18 @@ impl RingRotationCadence {
     pub const EAGER: Self = Self {
         min_slot_age: Duration::ZERO,
         target_slot_bytes: 0,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
 
-    /// Eligible after five seconds of observed filling or at 2 MiB.
+    /// Eligible after five seconds of observed filling once the slot holds
+    /// 256 rows, at 2 MiB regardless of age, or after 60 seconds regardless
+    /// of rows.
     pub const DEFAULT: Self = Self {
         min_slot_age: Duration::from_secs(5),
         target_slot_bytes: 2 * 1024 * 1024,
+        min_slot_rows: 256,
+        max_slot_age: Duration::from_secs(60),
     };
 }
 
@@ -15347,14 +15360,17 @@ impl QueueStorage {
         if cadence.min_slot_age.is_zero() {
             return Ok(false);
         }
+        // Sample at most `min_slot_rows` rows per child so the probe stays
+        // bounded on a full slot; one row is enough to know it is non-empty.
+        let sample_limit = cadence.min_slot_rows.max(1);
         let row_sources = children
             .iter()
-            .map(|relation| format!("SELECT 1 FROM {relation}"))
+            .map(|relation| format!("(SELECT 1 FROM {relation} LIMIT {sample_limit})"))
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
-        let (has_rows, bytes): (bool, i64) = sqlx::query_as(audited_sql(format!(
-            "WITH occupancy AS (SELECT EXISTS ({row_sources}) AS has_rows) \
-             SELECT has_rows, CASE WHEN has_rows THEN (\
+        let (sampled_rows, bytes): (i64, i64) = sqlx::query_as(audited_sql(format!(
+            "WITH occupancy AS (SELECT count(*) AS sampled FROM ({row_sources}) AS rows) \
+             SELECT sampled, CASE WHEN sampled > 0 THEN (\
                  SELECT COALESCE(SUM(pg_total_relation_size(relation::regclass)), 0)::bigint \
                  FROM unnest($1::text[]) AS relation\
              ) ELSE 0::bigint END FROM occupancy"
@@ -15363,6 +15379,7 @@ impl QueueStorage {
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        let has_rows = sampled_rows > 0;
         let mut observations = self
             .slot_fill_observations
             .lock()
@@ -15386,7 +15403,15 @@ impl QueueStorage {
         if cadence.target_slot_bytes > 0 && bytes >= cadence.target_slot_bytes {
             return Ok(false);
         }
-        Ok(now.duration_since(observation.first_nonempty_at) < cadence.min_slot_age)
+        let age = now.duration_since(observation.first_nonempty_at);
+        if !cadence.max_slot_age.is_zero() && age >= cadence.max_slot_age {
+            return Ok(false);
+        }
+        if age < cadence.min_slot_age {
+            return Ok(true);
+        }
+        let sampled_rows = u64::try_from(sampled_rows).unwrap_or(0);
+        Ok(sampled_rows < cadence.min_slot_rows)
     }
 
     /// Seal the current queue-ring slot on every call that passes the busy

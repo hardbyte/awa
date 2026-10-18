@@ -2765,6 +2765,8 @@ mod tests {
         let cadence = RingRotationCadence {
             min_slot_age: Duration::from_secs(13),
             target_slot_bytes: 123_456,
+            min_slot_rows: 0,
+            max_slot_age: Duration::ZERO,
         };
         let claim_interval = Duration::from_secs(17);
         let config = QueueStorageConfig {

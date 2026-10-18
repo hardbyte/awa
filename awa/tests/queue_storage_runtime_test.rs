@@ -2510,6 +2510,8 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
     let patient = RingRotationCadence {
         min_slot_age: Duration::from_secs(3600),
         target_slot_bytes: 1 << 30,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
 
     // Slot 0 (genesis) holds one row and is seconds old: a patient cadence
@@ -2608,6 +2610,103 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_row_floor_and_age_ceiling() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_rows";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    let seed_done_rows = |slot: i32, generation: i64, count: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(audited_sql(format!(
+                "INSERT INTO {schema}.done_entries (
+                    ready_slot, ready_generation, job_id, kind, queue, state,
+                    priority, attempt, run_lease, lane_seq, enqueue_shard,
+                    attempted_at, finalized_at, payload
+                ) SELECT $1, $2, 8_000_000 + $2 * 10_000 + n, 'cadence_job', 'cadence_rows_q',
+                         'completed'::awa.job_state, 2::smallint, 1::smallint,
+                         1::bigint, 1_000 + n, 0::smallint, now(), now(), '{{}}'::jsonb
+                  FROM generate_series(1, $3) AS n"
+            )))
+            .bind(slot)
+            .bind(generation)
+            .bind(count)
+            .execute(&pool)
+            .await
+            .expect("seed done rows in the current slot");
+        }
+    };
+    // Past the age window but under the row floor: stays open.
+    let trickle = RingRotationCadence {
+        min_slot_age: Duration::from_millis(1),
+        target_slot_bytes: 1 << 30,
+        min_slot_rows: 50,
+        max_slot_age: Duration::from_secs(3600),
+    };
+    seed_done_rows(0, 0, 10).await;
+    let outcome = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let outcome = match outcome {
+        RotateOutcome::SkippedFilling { .. } => {
+            store.rotate_with_cadence(&pool, trickle).await.unwrap()
+        }
+        other => other,
+    };
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::SkippedFilling {
+                slot: 0,
+                generation: 0
+            }
+        ),
+        "ten rows under a 50-row floor must stay open past the age window, got {outcome:?}"
+    );
+
+    // The age ceiling seals it regardless of rows.
+    let ceiling = RingRotationCadence {
+        max_slot_age: Duration::from_millis(1),
+        ..trickle
+    };
+    let outcome = store.rotate_with_cadence(&pool, ceiling).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 1,
+                generation: 1
+            }
+        ),
+        "a slot past the age ceiling must seal, got {outcome:?}"
+    );
+
+    // Enough rows past the age window seals under the ordinary rule.
+    seed_done_rows(1, 1, 60).await;
+    let _ = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let outcome = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 2,
+                generation: 2
+            }
+        ),
+        "sixty rows over a 50-row floor past the age window must seal, got {outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_change() {
     let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_cadence_observed_age";
@@ -2625,6 +2724,8 @@ async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_cha
     let cadence = RingRotationCadence {
         min_slot_age: Duration::from_millis(50),
         target_slot_bytes: 0,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
     assert!(matches!(
         store.rotate_with_cadence(&pool, cadence).await.unwrap(),
@@ -2673,6 +2774,8 @@ async fn test_rotation_cadence_empty_observation_resets_age_on_same_cursor() {
     let cadence = RingRotationCadence {
         min_slot_age: Duration::from_millis(50),
         target_slot_bytes: 0,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
     assert!(matches!(
         store
@@ -2756,6 +2859,8 @@ async fn test_rotation_cadence_empty_used_leases_reclaim_without_age_delay() {
     let cadence = RingRotationCadence {
         min_slot_age: Duration::from_secs(3600),
         target_slot_bytes: 1 << 30,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
     assert!(matches!(
         store
@@ -2811,6 +2916,8 @@ async fn test_rotation_cadence_size_trigger_includes_indexes() {
     let cadence = RingRotationCadence {
         min_slot_age: Duration::from_secs(3600),
         target_slot_bytes: (table_bytes + 1) as u64,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
     assert!(matches!(
         store.rotate_with_cadence(&pool, cadence).await.unwrap(),
@@ -2833,6 +2940,8 @@ async fn test_rotation_cadence_burst_can_exceed_target_without_reusing_busy_slot
     let cadence = RingRotationCadence {
         min_slot_age: Duration::from_secs(3600),
         target_slot_bytes: 64 * 1024,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
     store.enqueue_batch(&pool, "burst", 1, 4096).await.unwrap();
     let current_bytes: i64 = sqlx::query_scalar(audited_sql(format!(
@@ -2904,6 +3013,8 @@ async fn test_rotation_cadence_claim_ring_drains_empty_current_slots() {
     let cadence = RingRotationCadence {
         min_slot_age: Duration::from_secs(3600),
         target_slot_bytes: 1 << 30,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
     assert!(matches!(
         store
