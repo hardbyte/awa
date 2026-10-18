@@ -2546,7 +2546,9 @@ must belong to the effective migration role or the owner of the <code>awa</code>
 The claim allocator signature must exist and ring-state relations must be
 ordinary tables. <code>public</code>, <code>information_schema</code> and <code>pg_*</code> are excluded.</p>
 <p>Only those same owners may hold schema <code>CREATE</code> or table <code>TRIGGER</code> privileges.
-Existing user triggers must also call trusted routines. This prevents an
+Existing user triggers must also call trusted routines, and every function,
+operator, type or cast their <code>WHEN</code> expressions depend on must be a
+<code>pg_catalog</code> object or belong to those owners. This prevents an
 outsider from planting another object in an otherwise owned substrate, or
 racing discovery with new objects. Role membership alone does not establish
 trust, and superusers do not bypass these checks.</p>

@@ -34,7 +34,9 @@ The claim allocator signature must exist and ring-state relations must be
 ordinary tables. `public`, `information_schema` and `pg_*` are excluded.
 
 Only those same owners may hold schema `CREATE` or table `TRIGGER` privileges.
-Existing user triggers must also call trusted routines. This prevents an
+Existing user triggers must also call trusted routines, and every function,
+operator, type or cast their `WHEN` expressions depend on must be a
+`pg_catalog` object or belong to those owners. This prevents an
 outsider from planting another object in an otherwise owned substrate, or
 racing discovery with new objects. Role membership alone does not establish
 trust, and superusers do not bypass these checks.
