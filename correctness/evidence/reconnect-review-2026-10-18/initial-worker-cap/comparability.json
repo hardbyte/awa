@@ -1,0 +1,27 @@
+{
+  "identical_harness_source_files": 21,
+  "harness_source_sha256": {
+    "bench_harness/__init__.py": "b74b1163664d8df36872ce69a9a98aa67721387423786fb380b02eb6b621fa76",
+    "bench_harness/adapters.py": "d22e817db5df2fc6b8b2d330b17bb9e5b240adf9eb4127fbbf78eb15573a9398",
+    "bench_harness/combine.py": "760051c259ec39d13a966e2a84368bf8049a9c13ac61a5139cdb2b9ea90ff7b6",
+    "bench_harness/compare.py": "a1a7c0a92882feb46914f3b0350a66605456a7c433e5d38ed4907503bf7d9709",
+    "bench_harness/config.py": "aaece099d373d714944ac5e40b4d6af0f1fc47ab38fb7b17ddfd533ba8bf38fd",
+    "bench_harness/cpu.py": "eb2d5fe2dbb8c823c663a10d054fcccdea74819566eaf394a88323f818f893f7",
+    "bench_harness/hooks.py": "79137043b5a7e6c4da56a48750e025c2105aa67a46725583c6a5b79d4ad609c4",
+    "bench_harness/metrics.py": "57d0080e456537e65cf402077fd7c8d6c86f13d1539dca2b199dc37fe5f00ded",
+    "bench_harness/orchestrator.py": "3cd55da8008fe9f020f4a8939d46aa3f99b049a5982196b19cc18c67b59574ff",
+    "bench_harness/pacer.py": "3fb46c741820ddfc951c52144b9f8a7031ec29f5e3e3fb2d893709d6c5f8643c",
+    "bench_harness/phases.py": "0b893a5eeb5d0fedd18eaa21663e82303dae9fc1d5ec4da09a2412880821ac86",
+    "bench_harness/plots.py": "3bf709fe590865141ccc74595180bc077ce8e5b1536936ea57eed57fe9b1edf1",
+    "bench_harness/replica_pool.py": "ac76871d07228ace58ccb58bb9ed6b702954552338e7a1389bd3c24ac2b1025c",
+    "bench_harness/report.py": "a98978dc83523c6736ce0122cb613d07a87a098f6b829b55c12f5756cc4f1346",
+    "bench_harness/sample.py": "fd907ae30eb05639705a4a89d2873db7f754894764ee934f3c1eb568f8e3f12f",
+    "bench_harness/versions.py": "6af80fb408c55dfd1ea465d561a75f1087c62c9fb9e9734f9291eca1c089cd95",
+    "bench_harness/wait_events.py": "1cde43eedca24df106553abf829f50c429b33420d2037ce5427dc7b97430e4d3",
+    "bench_harness/writers.py": "e398ccbc7e68deb312d77b21c4ce5ae7d9be1fae5e34f30df6df4ab8d6bbe4c2",
+    "awa-bench/src/long_horizon.rs": "9dc914348da837dae9c2d8f1b219d591c7951254e756791fd6552823658bb56a",
+    "awa-bench/src/main.rs": "ed8da2015ea9aa6645b1b4501ec8facf807d45c13a7d5136384686c09e78e4dd",
+    "awa-bench/src/scenario_controls.rs": "c0162bad350eaccefc9462d0e3abdf23cbea910091f394a6cf4a43f484292cc9"
+  },
+  "identical_dependency_package_versions": 274
+}

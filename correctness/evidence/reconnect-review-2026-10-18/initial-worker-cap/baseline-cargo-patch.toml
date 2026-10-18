@@ -1,0 +1,4 @@
+[patch."https://github.com/hardbyte/awa"]
+awa-model = { path = "/home/brian/.codex/worktrees/recovery-review-base/awa/awa-model" }
+awa-worker = { path = "/home/brian/.codex/worktrees/recovery-review-base/awa/awa-worker" }
+awa-macros = { path = "/home/brian/.codex/worktrees/recovery-review-base/awa/awa-macros" }
