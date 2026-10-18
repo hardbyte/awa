@@ -6,6 +6,17 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- Heartbeats no longer scan or lock every open claim batch. Each tick looks up
+  only the attempts the worker is running, so its cost follows in-flight work
+  rather than open claims, and failures, retries and slow completions no
+  longer wait for a heartbeat tick to release their claim batch.
+- v051 moves the claim query into one function per queue-ring slot, so
+  PostgreSQL keeps a cached plan across ring rotations instead of re-planning
+  most claims. Like other installer-replay migrations it holds table locks
+  until commit: apply it in a quiet window with a bounded `lock_timeout` (see
+  the 0.6 to 0.7 upgrade guide). Binaries before v051 run unchanged on the
+  migrated schema.
+
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant

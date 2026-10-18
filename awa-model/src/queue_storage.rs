@@ -228,6 +228,39 @@ pub struct ClaimedRuntimeJob {
     pub unique_states: Option<String>,
 }
 
+/// Identity of a compact receipt claim for heartbeat purposes: addresses
+/// `lease_claim_batches` by primary key and the attempt by item index, so a
+/// heartbeat does not have to scan every open claim batch. Built with
+/// [`ClaimHeartbeatRef::from_claim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClaimHeartbeatRef {
+    pub job_id: i64,
+    pub run_lease: i64,
+    pub claim_slot: i32,
+    pub claim_batch_id: i64,
+    pub claim_batch_index: i32,
+    pub receipt_id: i64,
+}
+
+impl ClaimHeartbeatRef {
+    /// The heartbeat identity of a compact receipt claim, or `None` for
+    /// legacy or row-local claims.
+    pub fn from_claim(job_id: i64, run_lease: i64, claim: &ClaimedEntry) -> Option<Self> {
+        if !claim.lease_claim_receipt {
+            return None;
+        }
+        Some(Self {
+            job_id,
+            run_lease,
+            claim_slot: claim.claim_slot,
+            claim_batch_id: claim.claim_batch_id?,
+            claim_batch_index: claim.claim_batch_index?,
+            receipt_id: claim.receipt_id?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct QueueClaimerLease {
     pub claimer_slot: i16,
@@ -13708,6 +13741,96 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(())
+    }
+
+    /// Heartbeat compact receipt claims by their batch identity. Each claim
+    /// batch is addressed by primary key and the attempt by item index, with
+    /// index-only closure probes and no batch row lock, so the cost is
+    /// O(in-flight attempts) rather than O(open claim batches).
+    pub async fn heartbeat_claims_batch(
+        &self,
+        pool: &PgPool,
+        claims: &[ClaimHeartbeatRef],
+    ) -> Result<usize, AwaError> {
+        if claims.is_empty() {
+            return Ok(0);
+        }
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let pairs: Vec<(i64, i64)> = claims
+            .iter()
+            .map(|claim| (claim.job_id, claim.run_lease))
+            .collect();
+        self.lock_receipt_attempts_tx(&mut tx, &pairs).await?;
+        let job_ids: Vec<i64> = claims.iter().map(|claim| claim.job_id).collect();
+        let run_leases: Vec<i64> = claims.iter().map(|claim| claim.run_lease).collect();
+        let claim_slots: Vec<i32> = claims.iter().map(|claim| claim.claim_slot).collect();
+        let batch_ids: Vec<i64> = claims.iter().map(|claim| claim.claim_batch_id).collect();
+        let batch_indices: Vec<i32> = claims.iter().map(|claim| claim.claim_batch_index).collect();
+        let receipt_ids: Vec<i64> = claims.iter().map(|claim| claim.receipt_id).collect();
+        let updated: i64 = sqlx::query_scalar(audited_sql(format!(
+            r#"
+            WITH inflight(job_id, run_lease, claim_slot, batch_id, batch_index, receipt_id) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::int[], $4::bigint[], $5::int[], $6::bigint[])
+            ),
+            open_claims AS (
+                SELECT inflight.job_id, inflight.run_lease
+                FROM inflight
+                JOIN {schema}.lease_claim_batches AS claim_batches
+                  ON claim_batches.claim_slot = inflight.claim_slot
+                 AND claim_batches.batch_id = inflight.batch_id
+                WHERE inflight.batch_index BETWEEN 1 AND claim_batches.claimed_count
+                  AND claim_batches.job_ids[inflight.batch_index] = inflight.job_id
+                  AND claim_batches.run_leases[inflight.batch_index] = inflight.run_lease
+                  AND claim_batches.receipt_ids[inflight.batch_index] = inflight.receipt_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = inflight.claim_slot
+                        AND closures.job_id = inflight.job_id
+                        AND closures.run_lease = inflight.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = inflight.claim_slot
+                        AND closure_batches.receipt_ranges @> inflight.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = inflight.job_id AND done.run_lease = inflight.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = inflight.job_id AND deferred.run_lease = inflight.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = inflight.job_id AND dlq.run_lease = inflight.run_lease
+                  )
+            ),
+            upserted AS (
+                INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
+                SELECT open_claims.job_id, open_claims.run_lease, clock_timestamp(), clock_timestamp()
+                FROM open_claims
+                ON CONFLICT (job_id, run_lease)
+                DO UPDATE SET
+                    heartbeat_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+                RETURNING job_id
+            )
+            SELECT count(*)::bigint FROM upserted
+            "#
+        )))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .bind(&claim_slots)
+        .bind(&batch_ids)
+        .bind(&batch_indices)
+        .bind(&receipt_ids)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(updated as usize)
     }
 
     pub async fn heartbeat_batch(
