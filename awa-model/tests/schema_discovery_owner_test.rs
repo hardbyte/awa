@@ -239,6 +239,14 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
         .await?
         .contains(&OWNED_SCHEMA.into()));
 
+    assert_foreign_when_clause_is_rejected(
+        &migrator_pool,
+        &superuser_pool,
+        &outsider_pool,
+        outsider,
+    )
+    .await?;
+
     assert_configured_substrates_fail_closed(&migrator_pool, &superuser_pool, outsider).await?;
 
     superuser_pool
@@ -348,6 +356,107 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
     superuser_pool.close().await;
     migrator_pool.close().await;
     outsider_pool.close().await;
+    Ok(())
+}
+
+/// A trigger's WHEN expression is evaluated by the session whose statement
+/// fires the trigger, so functions it calls run with the migrator's
+/// privileges even when the trigger routine itself is the installer's own.
+/// The expression is stored in `pg_trigger.tgqual`, not behind `tgfoid`, and
+/// a trigger survives revocation of the TRIGGER privilege that created it.
+/// Discovery must reject the schema while such a trigger exists, and a
+/// replay must neither evaluate it nor refresh that schema.
+async fn assert_foreign_when_clause_is_rejected(
+    migrator_pool: &PgPool,
+    superuser_pool: &PgPool,
+    outsider_pool: &PgPool,
+    outsider: &str,
+) -> TestResult {
+    outsider_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "CREATE FUNCTION {DECOY_SCHEMA}.tripwire_when() RETURNS BOOLEAN LANGUAGE plpgsql AS $when$ \
+             BEGIN INSERT INTO {DECOY_SCHEMA}.tripwire VALUES (current_user); RETURN FALSE; END $when$;"
+        ))))
+        .await?;
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "GRANT TRIGGER ON {OWNED_SCHEMA}.queue_ring_state TO {outsider}"
+        ))))
+        .await?;
+    outsider_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "CREATE TRIGGER foreign_when BEFORE INSERT OR UPDATE OR DELETE \
+             ON {OWNED_SCHEMA}.queue_ring_state FOR EACH ROW \
+             WHEN ({DECOY_SCHEMA}.tripwire_when()) \
+             EXECUTE FUNCTION {OWNED_SCHEMA}.reject_compat_ring_cursor_update_after_flip()"
+        ))))
+        .await?;
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "REVOKE TRIGGER ON {OWNED_SCHEMA}.queue_ring_state FROM {outsider}"
+        ))))
+        .await?;
+
+    assert!(
+        !hardened_discovery(migrator_pool)
+            .await?
+            .contains(&OWNED_SCHEMA.into()),
+        "a trusted trigger routine with a foreign WHEN expression must make the schema untrusted"
+    );
+
+    migrator_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "COMMENT ON FUNCTION {OWNED_SCHEMA}.{CLAIM_SIGNATURE} IS 'stale'"
+        ))))
+        .await?;
+    let mut replay_failed_closed = false;
+    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+        if let Err(error) = migrator_pool
+            .execute(sqlx::raw_sql(audited_sql(statement)))
+            .await
+        {
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("42501"),
+                "a replay may only stop with the fail-closed privilege error: {error}"
+            );
+            replay_failed_closed = true;
+            break;
+        }
+    }
+    let tripwire_hits: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {DECOY_SCHEMA}.tripwire"
+    )))
+    .fetch_one(migrator_pool)
+    .await?;
+    assert_eq!(
+        tripwire_hits, 0,
+        "a replay must not evaluate a foreign WHEN expression"
+    );
+    if !replay_failed_closed {
+        let comment: Option<String> = sqlx::query_scalar(audited_sql(format!(
+            "SELECT obj_description('{OWNED_SCHEMA}.{CLAIM_SIGNATURE}'::regprocedure, 'pg_proc')"
+        )))
+        .fetch_one(migrator_pool)
+        .await?;
+        assert_eq!(
+            comment.as_deref(),
+            Some("stale"),
+            "a replay must skip a schema carrying a foreign WHEN expression"
+        );
+    }
+
+    migrator_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "DROP TRIGGER foreign_when ON {OWNED_SCHEMA}.queue_ring_state"
+        ))))
+        .await?;
+    assert!(hardened_discovery(migrator_pool)
+        .await?
+        .contains(&OWNED_SCHEMA.into()));
     Ok(())
 }
 

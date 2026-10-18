@@ -58,6 +58,55 @@ AS $trusted$
                     AND routine_namespace.nspname <> 'pg_catalog'
                     AND routine.proowner NOT IN (SELECT owner FROM trusted_owners)
               )
+              OR EXISTS (
+                  SELECT 1
+                  FROM pg_trigger AS trigger
+                  JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+                  JOIN pg_depend AS dependency
+                    ON dependency.classid = 'pg_trigger'::regclass
+                   AND dependency.objid = trigger.oid
+                  WHERE relation.relnamespace = namespace.oid
+                    AND NOT trigger.tgisinternal
+                    AND CASE dependency.refclassid
+                        WHEN 'pg_proc'::regclass THEN EXISTS (
+                            SELECT 1 FROM pg_proc AS routine
+                            WHERE routine.oid = dependency.refobjid
+                              AND routine.pronamespace <> 'pg_catalog'::regnamespace
+                              AND routine.proowner NOT IN (SELECT owner FROM trusted_owners)
+                        )
+                        WHEN 'pg_operator'::regclass THEN EXISTS (
+                            SELECT 1
+                            FROM pg_operator AS operator
+                            LEFT JOIN pg_proc AS routine ON routine.oid = operator.oprcode
+                            WHERE operator.oid = dependency.refobjid
+                              AND (
+                                  (operator.oprnamespace <> 'pg_catalog'::regnamespace
+                                   AND operator.oprowner NOT IN (SELECT owner FROM trusted_owners))
+                                  OR (routine.pronamespace <> 'pg_catalog'::regnamespace
+                                      AND routine.proowner NOT IN (SELECT owner FROM trusted_owners))
+                              )
+                        )
+                        WHEN 'pg_type'::regclass THEN EXISTS (
+                            SELECT 1 FROM pg_type AS data_type
+                            WHERE data_type.oid = dependency.refobjid
+                              AND data_type.typnamespace <> 'pg_catalog'::regnamespace
+                              AND data_type.typowner NOT IN (SELECT owner FROM trusted_owners)
+                        )
+                        WHEN 'pg_cast'::regclass THEN EXISTS (
+                            SELECT 1
+                            FROM pg_cast AS cast_rule
+                            JOIN pg_proc AS routine ON routine.oid = cast_rule.castfunc
+                            WHERE cast_rule.oid = dependency.refobjid
+                              AND routine.pronamespace <> 'pg_catalog'::regnamespace
+                              AND routine.proowner NOT IN (SELECT owner FROM trusted_owners)
+                        )
+                        WHEN 'pg_class'::regclass THEN FALSE
+                        WHEN 'pg_collation'::regclass THEN FALSE
+                        WHEN 'pg_constraint'::regclass THEN FALSE
+                        WHEN 'pg_trigger'::regclass THEN FALSE
+                        ELSE TRUE
+                    END
+              )
           )
     )
 $trusted$;
