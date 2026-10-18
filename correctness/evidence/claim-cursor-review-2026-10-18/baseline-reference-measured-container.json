@@ -1,0 +1,60 @@
+{
+  "Id": "5406b2d960e858048a842ae24d9a17b5b4b15b0d3de2ee7554b040503e5fd341",
+  "Image": "sha256:c293117fcecda7344b5480222e813b9f673d7abd69b1dd95eff239b768b04f59",
+  "Created": "2026-10-17T23:50:13.300592338Z",
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 870629,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-10-17T23:50:14.101940131Z",
+    "FinishedAt": "0001-01-01T00:00:00Z",
+    "Health": {
+      "Status": "healthy",
+      "FailingStreak": 0,
+      "Log": [
+        {
+          "Start": "2026-10-18T12:55:15.732040139+13:00",
+          "End": "2026-10-18T12:55:15.774134821+13:00",
+          "ExitCode": 0,
+          "Output": "127.0.0.1:5432 - accepting connections\n"
+        },
+        {
+          "Start": "2026-10-18T12:55:17.774908245+13:00",
+          "End": "2026-10-18T12:55:17.816107673+13:00",
+          "ExitCode": 0,
+          "Output": "127.0.0.1:5432 - accepting connections\n"
+        },
+        {
+          "Start": "2026-10-18T12:55:19.816678495+13:00",
+          "End": "2026-10-18T12:55:19.864175872+13:00",
+          "ExitCode": 0,
+          "Output": "127.0.0.1:5432 - accepting connections\n"
+        },
+        {
+          "Start": "2026-10-18T12:55:21.8648219+13:00",
+          "End": "2026-10-18T12:55:21.910535595+13:00",
+          "ExitCode": 0,
+          "Output": "127.0.0.1:5432 - accepting connections\n"
+        },
+        {
+          "Start": "2026-10-18T12:55:23.911390356+13:00",
+          "End": "2026-10-18T12:55:23.956832359+13:00",
+          "ExitCode": 0,
+          "Output": "127.0.0.1:5432 - accepting connections\n"
+        }
+      ]
+    }
+  },
+  "limits": {
+    "NanoCpus": 4000000000,
+    "Memory": 8589934592,
+    "CpusetCpus": "0-3,12-15"
+  },
+  "sampled_at": "2026-10-17T23:55:25.837000+00:00"
+}

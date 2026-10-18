@@ -22,7 +22,7 @@ Commit ==
     /\ state' = [state EXCEPT ![pending] = "claimed"]
     /\ evidence' = IF mode = "legacy" THEN evidence ELSE evidence \cup {pending}
     /\ legacy' = IF mode = "legacy" THEN legacy \cup {pending} ELSE legacy
-    /\ replay' = IF mode = "new" THEN replay ELSE replay \cup {pending}
+    /\ replay' = replay \cup {pending}
     /\ owner' = 0 /\ pending' = 0 /\ mode' = "none"
     /\ UNCHANGED <<cursor, rotated, pruned>>
 Abort == /\ owner = 1
@@ -45,9 +45,9 @@ GapAdvance(p) ==
     /\ \A q \in Positions : q >= cursor /\ q < p => state[q] = "hole"
     /\ cursor' = p
     /\ UNCHANGED <<state, evidence, legacy, owner, pending, mode, replay, rotated, pruned>>
-\* Old post-commit receipt and legacy advances share the committed-evidence
-\* boundary. Closure/prune can remove evidence; stale replay then stays behind.
-OldAdvance(p) ==
+\* Every committed claim queues a post-commit advance. Closure/prune can
+\* remove evidence before replay, in which case the cursor stays behind.
+PostCommitAdvance(p) ==
     /\ owner = 0 /\ p \in replay
     /\ cursor' = IF p \in evidence \cup legacy THEN Max({cursor, p+1}) ELSE cursor
     /\ replay' = replay \ {p}
@@ -67,7 +67,7 @@ Prune ==
     /\ pruned' = TRUE /\ evidence' = evidence \ {1,2,3}
     /\ UNCHANGED <<state, legacy, cursor, owner, pending, mode, replay, rotated>>
 Next == (\E m \in (IF NewOnly THEN {"new"} ELSE {"old", "new", "legacy"}), p \in Positions : Begin(m,p))
-        \/ Commit \/ Abort \/ Fold \/ (\E p \in Positions : GapAdvance(p)) \/ (\E p \in Positions : OldAdvance(p))
+        \/ Commit \/ Abort \/ Fold \/ (\E p \in Positions : GapAdvance(p)) \/ (\E p \in Positions : PostCommitAdvance(p))
         \/ (\E p \in Positions : Cancel(p)) \/ (\E p \in Positions : Close(p)) \/ Rotate \/ Prune
 NoSkippedLive == \A p \in Positions : state[p] = "live" => cursor <= p
 TypeOK == /\ cursor \in 1..5 /\ evidence \subseteq Positions /\ replay \subseteq Positions
