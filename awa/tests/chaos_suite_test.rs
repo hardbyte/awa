@@ -1250,6 +1250,28 @@ struct PoolStarvingWorker {
     runs: Arc<AtomicU32>,
 }
 
+struct GatedFinalizeWorker {
+    started: mpsc::UnboundedSender<(i64, i64)>,
+    finish: Arc<tokio::sync::Notify>,
+    runs: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Worker for GatedFinalizeWorker {
+    fn kind(&self) -> &'static str {
+        "simple_chaos_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        self.started
+            .send((ctx.job.id, ctx.job.run_lease))
+            .map_err(|_| JobError::terminal("finalization test observer stopped"))?;
+        self.finish.notified().await;
+        Ok(JobResult::Completed)
+    }
+}
+
 #[async_trait]
 impl Worker for PoolStarvingWorker {
     fn kind(&self) -> &'static str {
@@ -2535,6 +2557,199 @@ async fn test_finalize_retries_after_pool_connection_loss() {
         sum_counter_metric(&resource_metrics, "awa.completion.reconnect_retry") >= 1,
         "the finalize should have been retried at least once"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_finalize_retries_after_terminated_finalization_backends() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
+    let app_name = chaos_queue("finalize_transport");
+    let app_pool = PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&database_url_with_app_name(&app_name))
+        .await
+        .expect("Failed to connect finalization transport pool");
+    migrations::run(&app_pool).await.unwrap();
+    let observer_pool = pool_with(2).await;
+    let queue = chaos_queue("finalize_transport");
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+    let runs = Arc::new(AtomicU32::new(0));
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let (started, mut handler_started) = mpsc::unbounded_channel();
+    let quiet = Duration::from_secs(60);
+    let client = Client::builder(app_pool.clone())
+        .queue(
+            &queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .heartbeat_interval(quiet)
+        .heartbeat_rescue_interval(quiet)
+        .heartbeat_staleness(scaled_staleness(quiet * 3))
+        .deadline_rescue_interval(quiet)
+        .promote_interval(quiet)
+        .leader_check_interval(quiet)
+        .queue_stats_interval(quiet)
+        .runtime_snapshot_interval(quiet)
+        .register_worker(GatedFinalizeWorker {
+            started,
+            finish: finish.clone(),
+            runs: runs.clone(),
+        })
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    insert_with(
+        &observer_pool,
+        &SimpleChaosJob { seq: 0 },
+        InsertOpts {
+            queue: queue.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (job_id, run_lease) = tokio::time::timeout(
+        scaled_timeout(Duration::from_secs(10)),
+        handler_started.recv(),
+    )
+    .await
+    .expect("handler must start")
+    .unwrap();
+    let mut blocker = observer_pool.begin().await.unwrap();
+    let blocking_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(blocker.as_mut())
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.receipt.complete:{job_id}:{run_lease}"))
+        .execute(blocker.as_mut())
+        .await
+        .unwrap();
+    finish.notify_one();
+    let mut terminated = Vec::<i32>::new();
+    // Fail the active batch flush and its direct fallback, rather than idle sockets
+    // that SQLx can discard during its release health check.
+    for _ in 0..2 {
+        let pid = tokio::time::timeout(scaled_timeout(Duration::from_secs(10)), async {
+            loop {
+                let pid: Option<i32> = sqlx::query_scalar(
+                    "SELECT pid FROM pg_stat_activity WHERE application_name = $1 \
+                     AND $2 = ANY(pg_blocking_pids(pid)) AND NOT (pid = ANY($3)) \
+                     ORDER BY pid LIMIT 1",
+                )
+                .bind(&app_name)
+                .bind(blocking_pid)
+                .bind(&terminated)
+                .fetch_optional(&observer_pool)
+                .await
+                .unwrap();
+                if let Some(pid) = pid {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finalization must be blocked on the receipt attempt lock");
+        let killed: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&observer_pool)
+            .await
+            .unwrap();
+        assert!(killed, "the active finalization backend must be terminated");
+        terminated.push(pid);
+    }
+    blocker.commit().await.unwrap();
+    let counts = wait_for_counts(
+        &observer_pool,
+        &queue,
+        |counts| state_count(counts, "completed") == 1,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(state_count(&counts, "running"), 0, "{counts:?}");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "transport recovery must retain the handler result"
+    );
+    client.shutdown(Duration::from_secs(5)).await;
+    meter_provider.force_flush().unwrap();
+    let metrics = exporter.get_finished_metrics().unwrap();
+    assert!(sum_counter_metric(&metrics, "awa.completion.reconnect_retry") >= 1);
+    app_pool.close().await;
+    observer_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_retry_after_exhaustion_counts_failure_instead_of_retry() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
+    let pool = setup(6).await;
+    let queue = chaos_queue("retry_after_exhaustion_metrics");
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+    let client = Client::builder(pool.clone())
+        .queue(
+            &queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .register_worker(MixedChaosWorker)
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    insert_with(
+        &pool,
+        &ChaosJob {
+            seq: 0,
+            mode: "retry_once_manual".into(),
+        },
+        InsertOpts {
+            queue: queue.clone(),
+            max_attempts: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let counts = wait_for_counts(
+        &pool,
+        &queue,
+        |counts| state_count(counts, "failed") == 1,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(state_count(&counts, "retryable"), 0);
+    let (attempt, errors): (i16, String) =
+        sqlx::query_as("SELECT attempt, errors::text FROM awa.jobs WHERE queue = $1")
+            .bind(&queue)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attempt, 1);
+    assert!(errors.contains("max_attempts exhausted"), "{errors}");
+    assert!(errors.contains("handler requested retry"), "{errors}");
+    client.shutdown(Duration::from_secs(5)).await;
+    meter_provider.force_flush().unwrap();
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let latest = metrics.last().expect("force_flush should export metrics");
+    let latest_metrics = std::slice::from_ref(latest);
+    assert_eq!(sum_counter_metric(latest_metrics, "awa.job.failed"), 1);
+    assert_eq!(sum_counter_metric(latest_metrics, "awa.job.retried"), 0);
+    pool.close().await;
 }
 
 /// Full Postgres outage: terminate ALL application backends twice in succession,

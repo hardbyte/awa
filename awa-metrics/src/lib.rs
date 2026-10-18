@@ -115,9 +115,9 @@ pub struct AwaMetrics {
     /// executor re-ran. A non-zero rate means job transitions are still
     /// waiting on each other somewhere in the hot path.
     pub completion_deadlock_retries: Counter<u64>,
-    /// Finalize attempts re-run after the database connection was lost. A
-    /// burst marks an outage the executor rode out instead of leaving the
-    /// finished attempts for heartbeat rescue.
+    /// Finalize retries started after database writes became unavailable,
+    /// including connection failures, pool timeouts, and read-only failover.
+    /// This counts retries, not successful recoveries.
     pub completion_reconnect_retries: Counter<u64>,
     /// Total jobs cancelled.
     pub jobs_cancelled: Counter<u64>,
@@ -305,7 +305,7 @@ impl AwaMetrics {
             completion_reconnect_retries: meter
                 .u64_counter(names::COMPLETION_RECONNECT_RETRY)
                 .with_description(
-                    "Number of finalize attempts re-run after the database connection was lost",
+                    "Number of finalize retries started after database writes became unavailable",
                 )
                 .with_unit("{transaction}")
                 .build(),
