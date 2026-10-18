@@ -23,10 +23,59 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
+## Custom-schema discovery during migration
+
+Migration bundles discover custom substrates using catalog metadata without
+evaluating their views or functions. Schemas, relations, routines and types
+must belong to the effective migration role or the owner of the `awa` schema.
+The claim allocator signature must exist and ring-state relations must be
+ordinary tables. `public`, `information_schema` and `pg_*` are excluded.
+
+Only those same owners may hold schema `CREATE` or table `TRIGGER` privileges.
+Existing user triggers must also call trusted routines, and every function,
+operator, type or cast their `WHEN` expressions depend on must be a
+`pg_catalog` object or belong to those owners. This prevents an
+outsider from planting another object in an otherwise owned substrate, or
+racing discovery with new objects. Role membership alone does not establish
+trust, and superusers do not bypass these checks.
+
+Unregistered unsafe custom schemas are skipped. Unsafe registered or prepared
+targets abort the pending bundle, so the global version cannot advance while
+leaving a configured substrate behind. Registry and transition references are
+checked separately; unnamed legacy prepared targets also check `awa_exp`.
+Use an explicit schema in transition metadata to disambiguate that legacy case.
+Unsafe ownership or privileges in the default `awa` schema abort before the
+installer runs. Use a dedicated owner role consistently, including `SET ROLE`
+when connecting through a different login.
+Review separately owned objects and remove untrusted creation/trigger grants
+before migrating; a blanket role grant is not a substitute for this review.
+
+### Existing migration history and external runners
+
+The built-in runner records migration versions, descriptions and application times;
+it does not store SQL checksums or automatically rerun applied steps. These security
+checks harden pending historical discovery loops, because an appended migration
+would execute after those loops had already inspected untrusted objects. Standalone
+steps receive only the small discovery bootstrap, without redefining the installer.
+
+An already-current database has no pending discovery loop and does not run this
+bootstrap; it need not receive the internal helper until a later bundle uses it. No new
+schema version or runtime capability is introduced. Older binaries and previously
+exported SQL retain the old behavior: use an updated binary and regenerate the
+**pending** SQL bundle for upgrades. For external runners that track checksums,
+preserve files already applied and generate a new pending bundle; do not overwrite
+their historical files or reset checksum records to accept changed contents.
+For example, extract with `awa migrate --pending --extract-to ./pending-migrations`
+into a new directory. Execute complete generated bundles; individual discovery
+tail files in the repository do not include their bootstrap prerequisites.
+
 ## v050: one lane index per ready partition
 
 v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every `ready_entries`
-partition in the default and discovered custom schemas. The partition primary
+partition in the default schema and in the custom schemas that
+`awa.queue_storage_schemas()` selects (see
+[Custom-schema discovery](#custom-schema-discovery-during-migration)); other
+schemas keep their indexes. The partition primary
 key `(ready_slot, queue, priority, enqueue_shard, lane_seq)` serves every
 per-lane lookup because current binaries pin `ready_slot` in claims, in the
 queue prune and terminal-count fold gates, and in the maintenance lag gauge
@@ -38,10 +87,15 @@ What the migration locks: it redefines `awa.install_queue_storage_substrate`
 it until the migration transaction commits, so enqueues and claims touching
 that partition wait for the commit. No rows are scanned or rewritten; on a
 scratch PostgreSQL 17 database with 409,600 ready rows the whole 49 → 50 step
-took 27 ms. When the session has no `lock_timeout`, the migration waits at
-most 2 s for each partition. If it times out (SQLSTATE `55P03`, typically
-behind a long-running read of `awa.jobs` or a backup) the whole migration
-rolls back and can simply be re-run. External runners apply the complete
+took 27 ms. When the session has no `lock_timeout`, the migration sets a 2 s
+timeout for each lock acquisition. It bounds each wait, not the total
+migration time: every lock already taken is kept until commit, so a
+migration that waits on several partitions holds the earlier ones meanwhile.
+"Only ready partitions" describes the application tables it locks; the drop
+also locks the dropped indexes and the catalog rows it changes. If an
+acquisition times out (SQLSTATE `55P03`, typically behind a long-running read
+of `awa.jobs` or a backup) the whole migration rolls back and can simply be
+re-run. External runners apply the complete
 generated `awa migrate --sql --from 49 --to 50` bundle.
 
 Rollout order: roll the binaries first, then migrate. Current binaries work

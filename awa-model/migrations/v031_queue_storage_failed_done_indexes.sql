@@ -13,23 +13,12 @@ DECLARE
     v_child_name TEXT;
 BEGIN
     FOR v_schema IN
-        SELECT n.nspname
-        FROM pg_namespace AS n
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_class AS awa_c
-              WHERE awa_c.relnamespace = n.oid AND awa_c.relname = 'queue_ring_state'
-          )
-          AND EXISTS (
+        SELECT discovered.schema_name
+        FROM awa.queue_storage_schemas() AS discovered
+        JOIN pg_namespace AS n ON n.nspname = discovered.schema_name
+        WHERE EXISTS (
               SELECT 1 FROM pg_class AS awa_c
               WHERE awa_c.relnamespace = n.oid AND awa_c.relname = 'done_entries'
-          )
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS awa_p
-              WHERE awa_p.pronamespace = n.oid
-                AND awa_p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(awa_p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
           )
     LOOP
         EXECUTE format(
