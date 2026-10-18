@@ -3707,6 +3707,16 @@
 <li><strong><code>heartbeat_rescue_interval</code></strong> can match <code>heartbeat_interval</code> for low-latency rescue, or be higher to reduce maintenance load on big fleets.</li>
 </ol>
 <p>For a 5-second crash detection target: <code>heartbeat_interval=1s</code>, <code>heartbeat_staleness=4s</code>, <code>heartbeat_rescue_interval=1s</code>. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.</p>
+<p>A finished handler retains its result and retries durable finalization for up to 120 s
+from the first finalize attempt when database writes are unavailable. This includes
+pool-acquire timeouts and read-only-session errors during failover, as well as
+connection errors. A writable endpoint and usable pooled connections are required
+for recovery; changing DNS alone does not redirect existing read-only sessions.
+The retry budget is independent of heartbeat staleness. Rescue uses the last
+heartbeat or claim stamp, so it can become eligible before the 120 s expires;
+the next rescue sweep or an attempt deadline may claim a newer lease first.
+Keep handlers idempotent. Monitor <code>awa.completion.reconnect_retry</code> alongside
+pool waits and database errors; a retry count does not prove recovery.</p>
 <h3 id="deadline-bounding-a-single-attempt">Deadline — bounding a single attempt<a class="headerlink" href="#deadline-bounding-a-single-attempt" title="Permanent link">&para;</a></h3>
 <p>Each queue has a <code>deadline_duration</code> (default <code>5m</code> on <code>QueueConfig</code>). At claim time the runtime stamps <code>now() + deadline_duration</code> onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.</p>
 <table>
