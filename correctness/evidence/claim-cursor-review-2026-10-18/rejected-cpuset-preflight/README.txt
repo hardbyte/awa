@@ -1,0 +1,1 @@
+Rejected before baseline warmup: copied candidate Compose override assigned both databases candidate CPU set. Actual-container resource assertion failed. Candidate warmup was interrupted; neither measurement accepted. Corrected override, retained frozen binaries, started fresh databases and raw results.

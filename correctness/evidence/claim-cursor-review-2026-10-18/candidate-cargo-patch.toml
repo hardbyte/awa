@@ -1,0 +1,4 @@
+[patch."https://github.com/hardbyte/awa"]
+awa-model = { path = "/home/brian/dev/awa-wt/tail-regression/awa-model" }
+awa-worker = { path = "/home/brian/dev/awa-wt/tail-regression/awa-worker" }
+awa-macros = { path = "/home/brian/dev/awa-wt/tail-regression/awa-macros" }

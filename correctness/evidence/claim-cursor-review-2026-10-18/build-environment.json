@@ -1,0 +1,16 @@
+{
+  "captured_at": "2026-10-17T23:28:35.822782+00:00",
+  "scope": "Current host toolchain and selected environment from the still-running benchmark driver, with CARGO_TARGET_DIR and SQLX_OFFLINE overridden by the runner for the native build. Not a historical compiler invocation trace.",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+  "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)\n",
+  "driver_environment": {
+    "RUSTFLAGS": "",
+    "CARGO_ENCODED_RUSTFLAGS": "",
+    "RUSTC_WRAPPER": "",
+    "RUSTUP_TOOLCHAIN": "",
+    "CARGO_BUILD_TARGET": "",
+    "CARGO_PROFILE_RELEASE_LTO": "",
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "",
+    "CARGO_PROFILE_RELEASE_OPT_LEVEL": ""
+  }
+}
