@@ -1,0 +1,28 @@
+[package]
+name = "awa-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "awa-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Tracks the awa 0.7 line (main); no stable 0.7 release exists yet. Bump the
+# rev alongside any new results directory.
+awa-model = { git = "https://github.com/hardbyte/awa", rev = "c3a503e0c1f1cf4de3408748b89e6f5d53ef36c8" }
+awa-worker = { git = "https://github.com/hardbyte/awa", rev = "c3a503e0c1f1cf4de3408748b89e6f5d53ef36c8" }
+awa-macros = { git = "https://github.com/hardbyte/awa", rev = "c3a503e0c1f1cf4de3408748b89e6f5d53ef36c8" }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "chrono", "json", "migrate"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hdrhistogram = "7"
+opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }

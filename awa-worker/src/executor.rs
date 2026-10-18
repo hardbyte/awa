@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
@@ -227,6 +230,9 @@ pub struct JobExecutor {
     completion_batcher: CompletionBatcherHandle,
     storage: RuntimeStorage,
     dlq_policy: DlqPolicy,
+    finalizers: TaskTracker,
+    finalize_cancel: CancellationToken,
+    finalize_capacity: Arc<Semaphore>,
 }
 
 impl JobExecutor {
@@ -248,7 +254,13 @@ impl JobExecutor {
         completion_batcher: CompletionBatcherHandle,
         storage: RuntimeStorage,
         dlq_policy: DlqPolicy,
+        finalizers: TaskTracker,
+        finalize_cancel: CancellationToken,
+        runtime_worker_capacity: u32,
     ) -> Self {
+        let finalize_capacity = Arc::new(Semaphore::new(
+            completion_batcher.finalizer_capacity(runtime_worker_capacity),
+        ));
         Self {
             pool,
             workers,
@@ -261,6 +273,9 @@ impl JobExecutor {
             completion_batcher,
             storage,
             dlq_policy,
+            finalizers,
+            finalize_cancel,
+            finalize_capacity,
         }
     }
 
@@ -286,6 +301,9 @@ impl JobExecutor {
         let completion_batcher = self.completion_batcher.clone();
         let storage = self.storage.clone();
         let dlq_policy = self.dlq_policy.clone();
+        let finalizers = self.finalizers.clone();
+        let finalize_cancel = self.finalize_cancel.clone();
+        let finalize_capacity = self.finalize_capacity.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -394,25 +412,28 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
-            // Remove from in-flight immediately after the handler returns and
-            // the progress snapshot is captured. This keeps local worker
-            // capacity tied to active handler execution, not to the tail
-            // latency of durable completion bookkeeping.
+            // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
+            let finalize_permit = tokio::select! {
+                permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
+                _ = finalize_cancel.cancelled() => None,
+            };
+
             in_flight.remove((job_id, job_run_lease));
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_sub(1, Ordering::SeqCst);
             }
             metrics.record_in_flight_change(&job_queue, -1);
 
+            let Some(finalize_permit) = finalize_permit else {
+                return;
+            };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
-            tokio::spawn(async move {
-                // Every finalize path is one lease-guarded transaction, and a
-                // deadlock abort rolls the whole transaction back, so running
-                // it again is safe. Without the retry the job would sit
-                // `running` until heartbeat rescue re-ran the handler.
-                let mut deadlock_retries = 0u32;
-                let outcome = loop {
-                    let outcome = complete_job(
+            finalizers.spawn(async move {
+                let event_kind = job_kind.clone();
+                let finalize = async move {
+
+                let outcome = finalize_with_retry(
+                    || complete_job(
                         &pool,
                         &job,
                         queue_storage_claim.as_ref(),
@@ -426,28 +447,13 @@ impl JobExecutor {
                         &storage,
                         dlq_enabled,
                         &metrics,
-                    )
-                    .await;
-                    match outcome {
-                        Err(err)
-                            if err.is_deadlock()
-                                && deadlock_retries < COMPLETION_DEADLOCK_RETRIES =>
-                        {
-                            deadlock_retries += 1;
-                            metrics.record_completion_deadlock_retry(&job_kind, &job_queue);
-                            let delay = completion_deadlock_backoff(deadlock_retries);
-                            warn!(
-                                job_id,
-                                retry = deadlock_retries,
-                                max_retries = COMPLETION_DEADLOCK_RETRIES,
-                                delay_ms = delay.as_millis() as u64,
-                                "Completion transaction aborted by the deadlock detector; retrying"
-                            );
-                            tokio::time::sleep(delay).await;
-                        }
-                        outcome => break outcome,
-                    }
-                };
+                    ),
+                    &metrics,
+                    job_id,
+                    &job_kind,
+                    &job_queue,
+                    COMPLETION_RECONNECT_WINDOW,
+                ).await;
 
                 match &outcome {
                     Ok(CompletionOutcome::Applied { terminal, .. }) => {
@@ -518,9 +524,26 @@ impl JobExecutor {
                     event: Some(event), ..
                 }) = outcome
                 {
-                    dispatch_lifecycle_event(&lifecycle_handlers, &job_kind, event).await;
+                    Some(event)
+                } else {
+                    None
                 }
-            });
+                };
+                let event = tokio::select! {
+                    event = finalize => event,
+                    _ = finalize_cancel.cancelled() => {
+                        warn!(job_id, "Finalization cancelled after runtime drain");
+                        None
+                    },
+                };
+                drop(finalize_permit);
+                if let Some(event) = event {
+                    tokio::select! {
+                        _ = dispatch_lifecycle_event(&lifecycle_handlers, &event_kind, event) => {},
+                        _ = finalize_cancel.cancelled() => {},
+                    }
+                }
+            }.in_current_span());
         }
         .instrument(span)
     }
@@ -535,6 +558,69 @@ const COMPLETION_DEADLOCK_RETRIES: u32 = 3;
 /// committed by the time the retry runs.
 fn completion_deadlock_backoff(retry: u32) -> Duration {
     Duration::from_millis(10u64 << retry.saturating_sub(1).min(4))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum FinalizeError {
+    #[error(transparent)]
+    Operation(#[from] AwaError),
+    #[error("durable finalization was not acknowledged before its retry deadline")]
+    Deadline,
+}
+
+async fn finalize_with_retry<T, F, Fut>(
+    mut finalize: F,
+    metrics: &crate::metrics::AwaMetrics,
+    job_id: i64,
+    kind: &str,
+    queue: &str,
+    window: Duration,
+) -> Result<T, FinalizeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AwaError>>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    let mut deadlock_retries = 0;
+    let mut reconnect_retries = 0;
+    loop {
+        let outcome = tokio::time::timeout_at(deadline, finalize())
+            .await
+            .map_err(|_| FinalizeError::Deadline)?;
+        let error = match outcome {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let delay = if error.is_deadlock() && deadlock_retries < COMPLETION_DEADLOCK_RETRIES {
+            deadlock_retries += 1;
+            completion_deadlock_backoff(deadlock_retries)
+        } else if error.is_connection_lost() {
+            reconnect_retries += 1;
+            completion_reconnect_backoff(reconnect_retries)
+        } else {
+            return Err(error.into());
+        };
+        warn!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
+        tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+            .await
+            .map_err(|_| FinalizeError::Deadline)?;
+        if error.is_connection_lost() {
+            metrics.record_completion_reconnect_retry(kind, queue);
+        } else {
+            metrics.record_completion_deadlock_retry(kind, queue);
+        }
+    }
+}
+
+/// Reconnect retry budget measured from the first finalize attempt. Rescue
+/// can win before this expires; the lease guard then rejects the old result.
+const COMPLETION_RECONNECT_WINDOW: Duration = Duration::from_secs(120);
+
+/// Backoff between reconnect retries (500ms, 1s, 2s, then 4s). Each attempt
+/// already waits up to the pool's `acquire_timeout` for a connection, so this
+/// only spaces out immediate refusals.
+fn completion_reconnect_backoff(retry: u32) -> Duration {
+    Duration::from_millis(500u64 << retry.saturating_sub(1).min(3))
 }
 
 /// Update job state in the database based on handler result.
@@ -2629,9 +2715,9 @@ pub(crate) async fn dispatch_lifecycle_event(
         for handler in handlers {
             let handler = handler.clone();
             let event = event.clone();
-            let result = tokio::spawn(async move {
+            let result = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                 (handler)(event).await;
-            })
+            }))
             .await;
             if let Err(err) = result {
                 tracing::warn!(
@@ -3047,4 +3133,639 @@ async fn retry_backoff_canonical_with_followups(
 
     tx.commit().await?;
     Ok(Some(updated_job))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_metrics() -> crate::metrics::AwaMetrics {
+        crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("finalize-test"))
+    }
+
+    #[tokio::test]
+    async fn cancelling_lifecycle_dispatch_drops_its_pending_hook() {
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let hook_started = Arc::new(tokio::sync::Notify::new());
+        let hook_dropped = Arc::new(tokio::sync::Notify::new());
+        let handler_started = hook_started.clone();
+        let handler_dropped = hook_dropped.clone();
+        let hook: BoxedUntypedEventHandler = Arc::new(move |_event| {
+            let handler_started = handler_started.clone();
+            let handler_dropped = handler_dropped.clone();
+            Box::pin(async move {
+                let _drop_notification = NotifyOnDrop(handler_dropped);
+                handler_started.notify_one();
+                std::future::pending::<()>().await;
+            })
+        });
+        let now = chrono::Utc::now();
+        let job = JobRow {
+            id: 1,
+            kind: "pending_hook".into(),
+            queue: "test".into(),
+            args: serde_json::json!({}),
+            state: JobState::Completed,
+            priority: 2,
+            attempt: 1,
+            run_lease: 1,
+            max_attempts: 5,
+            run_at: now,
+            heartbeat_at: None,
+            deadline_at: None,
+            attempted_at: Some(now),
+            finalized_at: Some(now),
+            created_at: now,
+            errors: None,
+            metadata: serde_json::json!({}),
+            tags: Vec::new(),
+            unique_key: None,
+            unique_states: None,
+            callback_id: None,
+            callback_timeout_at: None,
+            callback_filter: None,
+            callback_on_complete: None,
+            callback_on_fail: None,
+            callback_transform: None,
+            progress: None,
+        };
+        let handlers = HashMap::from([("pending_hook".into(), vec![hook])]);
+        let dispatch = tokio::spawn(async move {
+            dispatch_lifecycle_event(
+                &handlers,
+                "pending_hook",
+                UntypedJobEvent::Completed {
+                    job,
+                    duration: Duration::ZERO,
+                },
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), hook_started.notified())
+            .await
+            .expect("hook must be running before dispatch cancellation");
+        dispatch.abort();
+        assert!(dispatch.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), hook_dropped.notified())
+            .await
+            .expect("cancelling dispatch must drop the spawned hook future");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_deadline_bounds_an_unresponsive_attempt() {
+        let started = tokio::time::Instant::now();
+        let result = finalize_with_retry(
+            std::future::pending::<Result<(), AwaError>>,
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_deadline_bounds_reconnect_backoff_and_retries() {
+        let started = tokio::time::Instant::now();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = finalize_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(AwaError::Database(sqlx::Error::PoolTimedOut)))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Deadline)));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_does_not_retry_statement_or_closed_pool_errors() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = finalize_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(AwaError::Database(sqlx::Error::PoolClosed)))
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(120),
+        )
+        .await;
+        assert!(matches!(result, Err(FinalizeError::Operation(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Fresh partitioned-schema fixtures share PostgreSQL's cluster-wide lock table.
+    static RECONNECT_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct ReconnectFollowup;
+
+    impl crate::enqueue_specs::EnqueueFollowUp for ReconnectFollowup {
+        fn run<'a>(
+            &'a self,
+            connection: &'a mut sqlx::PgConnection,
+            job: &'a JobRow,
+            _context: Option<&'a crate::enqueue_specs::OutcomeContext>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AwaError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                sqlx::query("INSERT INTO awa.jobs_hot (kind, queue, args) VALUES ('reconnect_child', 'reconnect_test', $1)")
+                    .bind(serde_json::json!({"parent": job.id}))
+                    .execute(connection).await?;
+                Ok(())
+            })
+        }
+    }
+
+    async fn running_reconnect_job(pool: &PgPool) -> JobRow {
+        sqlx::query_as("INSERT INTO awa.jobs_hot (kind, queue, args, state, run_lease, attempt, max_attempts) VALUES ('reconnect_parent', 'reconnect_test', '{}', 'running', 1, 1, 5) RETURNING *")
+            .fetch_one(pool).await.unwrap()
+    }
+
+    fn reconnect_specs() -> Arc<EnqueueSpecsByOutcome> {
+        let mut registry = HashMap::new();
+        for outcome in [
+            crate::enqueue_specs::Outcome::Completed,
+            crate::enqueue_specs::Outcome::Retried,
+        ] {
+            let specs: Vec<crate::enqueue_specs::BoxedEnqueueSpec> =
+                vec![Arc::new(ReconnectFollowup)];
+            registry.insert(outcome, HashMap::from([("reconnect_parent".into(), specs)]));
+        }
+        Arc::new(registry)
+    }
+
+    fn connection_reset() -> AwaError {
+        AwaError::Database(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "lost acknowledgement",
+        )))
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn reconnect_replays_committed_outcomes_without_duplicate_followups(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let metrics = test_metrics();
+        let specs = reconnect_specs();
+        let (_, batcher) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        for result in [
+            Ok(JobResult::Completed),
+            Ok(JobResult::RetryAfter(Duration::from_secs(60))),
+            Ok(JobResult::Snooze(Duration::from_secs(60))),
+        ] {
+            let job = running_reconnect_job(&pool).await;
+            let calls = AtomicU32::new(0);
+            let outcome = finalize_with_retry(
+                || async {
+                    let outcome = complete_job_canonical(
+                        &pool,
+                        &job,
+                        &result,
+                        &batcher,
+                        None,
+                        Duration::ZERO,
+                        false,
+                        &specs,
+                        false,
+                        &metrics,
+                    )
+                    .await?;
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+                        Err(connection_reset())
+                    } else {
+                        Ok(outcome)
+                    }
+                },
+                &metrics,
+                job.id,
+                &job.kind,
+                &job.queue,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, CompletionOutcome::IgnoredStale));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let children: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.jobs_hot WHERE kind = 'reconnect_child' AND args->>'parent' = $1")
+                .bind(job.id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                children,
+                if matches!(result, Ok(JobResult::Snooze(_))) {
+                    0
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn reconnect_saved_result_cannot_complete_a_newer_lease(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let job = running_reconnect_job(&pool).await;
+        let metrics = test_metrics();
+        let specs = reconnect_specs();
+        let (_, batcher) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        let calls = AtomicU32::new(0);
+        let outcome = finalize_with_retry(|| async {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                sqlx::query("UPDATE awa.jobs_hot SET run_lease = run_lease + 1, attempt = attempt + 1 WHERE id = $1")
+                    .bind(job.id).execute(&pool).await.unwrap();
+                return Err(connection_reset());
+            }
+            complete_job_canonical(&pool, &job, &Ok(JobResult::Completed), &batcher, None, Duration::ZERO, false, &specs, false, &metrics).await
+        }, &metrics, job.id, &job.kind, &job.queue, Duration::from_secs(5)).await.unwrap();
+        assert!(matches!(outcome, CompletionOutcome::IgnoredStale));
+        let current: JobRow = sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(current.run_lease, job.run_lease + 1);
+        assert_eq!(current.state, JobState::Running);
+        let children: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM awa.jobs_hot WHERE kind = 'reconnect_child'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(children, 0);
+    }
+
+    struct ReconnectWorker(Arc<AtomicU32>);
+
+    #[async_trait::async_trait]
+    impl Worker for ReconnectWorker {
+        fn kind(&self) -> &'static str {
+            "reconnect_parent"
+        }
+        async fn perform(&self, _context: &JobContext) -> Result<JobResult, JobError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(JobResult::Completed)
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pending_outcome_hook_does_not_hold_durable_finalizer_capacity(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let first = running_reconnect_job(&pool).await;
+        let second = running_reconnect_job(&pool).await;
+        let first_id = first.id;
+        let second_id = second.id;
+        let hook_started = Arc::new(tokio::sync::Notify::new());
+        let second_completed = Arc::new(tokio::sync::Notify::new());
+        let release_hook = CancellationToken::new();
+        let handler_started = hook_started.clone();
+        let handler_completed = second_completed.clone();
+        let handler_release = release_hook.clone();
+        let hook: BoxedUntypedEventHandler = Arc::new(move |event| {
+            let handler_started = handler_started.clone();
+            let handler_completed = handler_completed.clone();
+            let handler_release = handler_release.clone();
+            Box::pin(async move {
+                if let UntypedJobEvent::Completed { job, .. } = event {
+                    if job.id == first_id {
+                        handler_started.notify_one();
+                        handler_release.cancelled().await;
+                    } else if job.id == second_id {
+                        handler_completed.notify_one();
+                    }
+                }
+            })
+        });
+        let metrics = test_metrics();
+        let finalizers = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let (_batcher, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            cancel.clone(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        let workers: HashMap<String, BoxedWorker> = HashMap::from([(
+            "reconnect_parent".into(),
+            Box::new(ReconnectWorker(Arc::new(AtomicU32::new(0)))) as BoxedWorker,
+        )]);
+        let mut executor = JobExecutor::new(
+            pool.clone(),
+            Arc::new(workers),
+            Arc::new(HashMap::from([("reconnect_parent".into(), vec![hook])])),
+            reconnect_specs(),
+            Arc::new(crate::runtime::InFlightRegistry::default()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            metrics,
+            handle,
+            RuntimeStorage::Canonical,
+            DlqPolicy::default(),
+            finalizers.clone(),
+            cancel,
+            1,
+        );
+        executor.finalize_capacity = Arc::new(Semaphore::new(1));
+        let dispatched = |job| DispatchedJob {
+            job,
+            queue_storage_claim: None,
+            queue_storage_unique_states: None,
+        };
+        executor
+            .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), hook_started.notified())
+            .await
+            .expect("first durable finalize must reach its outcome hook");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            executor.execute_task(dispatched(second), Arc::new(AtomicBool::new(false))),
+        )
+        .await
+        .expect("pending outcome hook must not consume the only finalize permit");
+        tokio::time::timeout(Duration::from_secs(2), second_completed.notified())
+            .await
+            .expect("second durable finalize must finish while the first hook is pending");
+        let states: Vec<String> =
+            sqlx::query_scalar("SELECT state::text FROM awa.jobs_hot WHERE id = ANY($1)")
+                .bind([first_id, second_id].as_slice())
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().all(|state| state == "completed"));
+        release_hook.cancel();
+        finalizers.close();
+        tokio::time::timeout(Duration::from_secs(2), finalizers.wait())
+            .await
+            .expect("tracked outcome hooks must drain after release");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn finalizer_capacity_backpressures_handlers_and_cancellation_releases_them(
+        pool: PgPool,
+    ) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let first = running_reconnect_job(&pool).await;
+        let second = running_reconnect_job(&pool).await;
+        let metrics = test_metrics();
+        let finalizers = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let runs = Arc::new(AtomicU32::new(0));
+        // Keep the unstarted batcher alive: finalization cannot receive an acknowledgement.
+        let (_batcher, handle) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            cancel.clone(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        let workers: HashMap<String, BoxedWorker> = HashMap::from([(
+            "reconnect_parent".into(),
+            Box::new(ReconnectWorker(runs.clone())) as BoxedWorker,
+        )]);
+        let mut executor = JobExecutor::new(
+            pool,
+            Arc::new(workers),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            metrics,
+            handle,
+            RuntimeStorage::Canonical,
+            DlqPolicy::default(),
+            finalizers.clone(),
+            cancel.clone(),
+            1,
+        );
+        executor.finalize_capacity = Arc::new(Semaphore::new(1));
+        let dispatched = |job| DispatchedJob {
+            job,
+            queue_storage_claim: None,
+            queue_storage_unique_states: None,
+        };
+        executor
+            .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
+            .await;
+        assert_eq!(finalizers.len(), 1);
+        let second_key = (second.id, second.run_lease);
+        let second_task = tokio::spawn(
+            executor.execute_task(dispatched(second), Arc::new(AtomicBool::new(false))),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runs.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !second_task.is_finished(),
+            "worker ownership must remain while finalizer capacity is full"
+        );
+        assert!(in_flight.get_cancel(second_key).is_some());
+        assert_eq!(finalizers.len(), 1);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .unwrap()
+            .unwrap();
+        finalizers.close();
+        tokio::time::timeout(Duration::from_secs(2), finalizers.wait())
+            .await
+            .unwrap();
+        assert!(in_flight.get_cancel(second_key).is_none());
+        assert!(finalizers.is_empty());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn finalizers_fill_completion_pipeline_then_backpressure_handlers(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let mut jobs = Vec::new();
+        for _ in 0..12 {
+            jobs.push(running_reconnect_job(&pool).await);
+        }
+        let job_ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+        let mut blocking_tx = pool.begin().await.unwrap();
+        let blocking_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocking_tx)
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM awa.jobs_hot WHERE id = ANY($1) FOR UPDATE")
+            .bind(&job_ids[..4])
+            .fetch_all(&mut *blocking_tx)
+            .await
+            .unwrap();
+
+        let metrics = test_metrics();
+        let finalizers = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let runs = Arc::new(AtomicU32::new(0));
+        let (batcher, handle) = crate::completion::CompletionBatcher::with_batching(
+            pool.clone(),
+            cancel.clone(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+            4,
+            Duration::from_secs(3600),
+        );
+        let workers: HashMap<String, BoxedWorker> = HashMap::from([(
+            "reconnect_parent".into(),
+            Box::new(ReconnectWorker(runs.clone())) as BoxedWorker,
+        )]);
+        let executor = JobExecutor::new(
+            pool.clone(),
+            Arc::new(workers),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            metrics,
+            handle,
+            RuntimeStorage::Canonical,
+            DlqPolicy::default(),
+            finalizers.clone(),
+            cancel.clone(),
+            1,
+        );
+        let dispatched = |job| DispatchedJob {
+            job,
+            queue_storage_claim: None,
+            queue_storage_unique_states: None,
+        };
+        let mut jobs = jobs.into_iter();
+        for job in jobs.by_ref().take(4) {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                executor.execute_task(dispatched(job), Arc::new(AtomicBool::new(false))),
+            )
+            .await
+            .expect("short handlers must fill a complete batch even with one worker");
+        }
+        let batcher_handles = batcher.spawn();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(blocking_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the full first batch must reach its blocked SQL flush");
+        for job in jobs.by_ref().take(4) {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                executor.execute_task(dispatched(job), Arc::new(AtomicBool::new(false))),
+            )
+            .await
+            .expect("another complete batch must queue while the first flush is blocked");
+        }
+        let waiting_job = jobs.next().unwrap();
+        let waiting_key = (waiting_job.id, waiting_job.run_lease);
+        let waiting_task = tokio::spawn(
+            executor.execute_task(dispatched(waiting_job), Arc::new(AtomicBool::new(false))),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs.load(Ordering::SeqCst) != 9 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!waiting_task.is_finished());
+        assert!(in_flight.get_cancel(waiting_key).is_some());
+        assert_eq!(finalizers.len(), 8);
+
+        blocking_tx.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiting_task)
+            .await
+            .unwrap()
+            .unwrap();
+        for job in jobs {
+            executor
+                .execute_task(dispatched(job), Arc::new(AtomicBool::new(false)))
+                .await;
+        }
+        finalizers.close();
+        tokio::time::timeout(Duration::from_secs(5), finalizers.wait())
+            .await
+            .expect("three full batches must persist and drain without the flush timer");
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.jobs_hot WHERE id = ANY($1) AND state = 'completed'",
+        )
+        .bind(&job_ids)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(completed, job_ids.len() as i64);
+        assert_eq!(runs.load(Ordering::SeqCst), 12);
+        assert!(in_flight.get_cancel(waiting_key).is_none());
+        cancel.cancel();
+        for handle in batcher_handles {
+            tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_from_half_a_second_and_caps_at_four() {
+        assert_eq!(completion_reconnect_backoff(1), Duration::from_millis(500));
+        assert_eq!(completion_reconnect_backoff(2), Duration::from_secs(1));
+        assert_eq!(completion_reconnect_backoff(3), Duration::from_secs(2));
+        assert_eq!(completion_reconnect_backoff(4), Duration::from_secs(4));
+        assert_eq!(completion_reconnect_backoff(5), Duration::from_secs(4));
+        assert_eq!(completion_reconnect_backoff(40), Duration::from_secs(4));
+    }
 }

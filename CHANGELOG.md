@@ -11,6 +11,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `awa storage prepare-queue` as the migrator before deployment and grant
   sequence `USAGE, SELECT, UPDATE`; existing sequence positions are preserved.
 - Ring rotation uses a five-second observed fill window or a 2 MiB total physical-size target before sealing a non-empty slot. Empty slots can advance immediately to reclaim sealed history. `RingRotationCadence::EAGER` restores rotation on every tick; the size target is sampled and does not impose a storage limit. See [#518](https://github.com/hardbyte/awa/issues/518).
+- Finished attempts retry lease-guarded finalization after connection loss or pool-acquire timeouts within a 120 s deadline, reducing avoidable heartbeat rescue and handler re-execution after outages. Pending finalizers have a bounded budget sized for workers and completion batching, and drain during shutdown; a newer lease fences stale retries. Counted by `awa.completion.reconnect_retry`.
 
 - v048 catches claim cursors up from committed same-lane, same-generation attempt evidence. Current binaries retain guarded post-commit advances against pre-v048 schemas and use the old result shape until migration. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 

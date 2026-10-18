@@ -15,6 +15,8 @@ use sqlx::postgres::PgPoolOptions;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -1240,6 +1242,35 @@ impl Worker for CompleteWorker {
     }
 }
 
+/// Holds every free pool connection for `hold` after the handler returns, so
+/// the attempt's finalize cannot reach Postgres until the hold ends.
+struct PoolStarvingWorker {
+    pool: sqlx::PgPool,
+    hold: Duration,
+    runs: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Worker for PoolStarvingWorker {
+    fn kind(&self) -> &'static str {
+        "simple_chaos_job"
+    }
+
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let mut held = Vec::new();
+        while let Ok(conn) = self.pool.acquire().await {
+            held.push(conn);
+        }
+        let hold = self.hold;
+        tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
+            drop(held);
+        });
+        Ok(JobResult::Completed)
+    }
+}
+
 struct MixedChaosWorker;
 
 #[async_trait]
@@ -2410,6 +2441,100 @@ async fn test_leader_failover_rescues_callback_timeouts() {
     assert_eq!(attempts.1, Some(2));
 
     follower.shutdown(Duration::from_secs(5)).await;
+}
+
+/// A finished attempt whose finalize cannot get a connection keeps re-trying
+/// until the pool recovers, instead of leaving the claim for stale-heartbeat
+/// rescue to re-run the handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_finalize_retries_after_pool_connection_loss() {
+    let _suite_guard = CHAOS_SUITE_LOCK.lock().await;
+    let app_pool = PgPoolOptions::new()
+        .max_connections(6)
+        .acquire_timeout(Duration::from_millis(300))
+        .connect(&database_url())
+        .await
+        .expect("Failed to connect pool-loss pool");
+    migrations::run(&app_pool)
+        .await
+        .expect("Failed to migrate pool-loss pool");
+    let observer_pool = pool_with(2).await;
+    let queue = chaos_queue("chaos_pool_loss");
+    clean_queue(&observer_pool, &queue).await;
+
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let runs = Arc::new(AtomicU32::new(0));
+    let quiet = Duration::from_secs(60);
+    let client = Client::builder(app_pool.clone())
+        .queue(
+            &queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .heartbeat_interval(quiet)
+        .heartbeat_rescue_interval(quiet)
+        .heartbeat_staleness(quiet * 3)
+        .deadline_rescue_interval(quiet)
+        .promote_interval(quiet)
+        .leader_check_interval(quiet)
+        .queue_stats_interval(quiet)
+        .runtime_snapshot_interval(quiet)
+        .register_worker(PoolStarvingWorker {
+            pool: app_pool.clone(),
+            hold: Duration::from_secs(3),
+            runs: Arc::clone(&runs),
+        })
+        .build()
+        .expect("Failed to build pool-loss client");
+    client
+        .start()
+        .await
+        .expect("Failed to start pool-loss client");
+
+    insert_with(
+        &observer_pool,
+        &SimpleChaosJob { seq: 0 },
+        InsertOpts {
+            queue: queue.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to insert pool-loss job");
+
+    let counts = wait_for_counts(
+        &observer_pool,
+        &queue,
+        |counts| state_count(counts, "completed") == 1,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(state_count(&counts, "running"), 0, "{counts:?}");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the handler must not run again for a finalize that only lost its connection"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush pool-loss metrics");
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("Failed to read pool-loss metrics");
+    assert!(
+        sum_counter_metric(&resource_metrics, "awa.completion.reconnect_retry") >= 1,
+        "the finalize should have been retried at least once"
+    );
 }
 
 /// Full Postgres outage: terminate ALL application backends twice in succession,

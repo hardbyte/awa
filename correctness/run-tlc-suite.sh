@@ -21,6 +21,9 @@ AwaClaimCursorFold.tla         ;; -                                      ;; pass
 AwaClaimCursorFold.tla         ;; AwaClaimCursorFoldNonPrefix.cfg         ;; NoSkippedLive is violated ;; non-prefix evidence cannot justify max cursor
 AwaAsyncClaimCursor.tla        ;; -                                      ;; pass ;; evidence-guarded async claim replay
 AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; NoSkippedJob is violated ;; lost claim on promoted standby witness
+AwaFinalizeReconnect.tla      ;; -                                      ;; pass ;; saved finalize replay after unknown commit acknowledgement
+AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectUnfenced.cfg        ;; NewerLeaseUnaffected is violated ;; old finalize changes a rescued and reclaimed attempt
+AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectSeparateFollowup.cfg ;; ResolvedFinalizeHasFollowup is violated ;; lost commit acknowledgement strands a separate follow-up
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
