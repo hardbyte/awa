@@ -1457,6 +1457,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Custom-schema discovery during migration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#existing-migration-history-and-external-runners" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Existing migration history and external runners
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2290,6 +2307,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Custom-schema discovery during migration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#existing-migration-history-and-external-runners" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Existing migration history and external runners
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2506,22 +2540,42 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See <a href="../security/database-roles/#provision-queues-before-starting-restricted-runtimes">Database roles</a>.</p>
 <h2 id="custom-schema-discovery-during-migration">Custom-schema discovery during migration<a class="headerlink" href="#custom-schema-discovery-during-migration" title="Permanent link">&para;</a></h2>
-<p>Migrations that refresh custom queue-storage schemas select them through
-<code>awa.queue_storage_schemas()</code>. A schema qualifies when it has the
-<code>claim_ready_runtime(text, bigint, double precision, double precision)</code>
-function and the migrating role holds <code>USAGE</code> membership in the owners of the
-schema, that function and the <code>queue_ring_state</code>, <code>lease_ring_state</code> and
-<code>claim_ring_state</code> tables, which must be ordinary tables. <code>public</code> and <code>pg_*</code>
-qualify only when their <code>claim_ready_runtime</code> is owned by the owner of the
-<code>awa</code> schema. The default <code>awa</code> schema always qualifies. Schemas prepared by
-the migrator, or by a role the migrator is a member of, through
-<code>awa storage prepare-queue-storage-schema</code> or <code>QueueStorage::prepare_schema</code>
-are unaffected. A custom schema prepared by an unrelated role is now skipped.
-To have it refreshed, grant that role to the migrator, or prepare the schema
-again as its owner after migrating.
-PostgreSQL superusers pass every role-membership test, so for a superuser
-migrator only the <code>public</code>/<code>pg_*</code> and table-kind checks apply. Run migrations
-as a dedicated owner role.</p>
+<p>Migration bundles discover custom substrates using catalog metadata without
+evaluating their views or functions. Schemas, relations, routines and types
+must belong to the effective migration role or the owner of the <code>awa</code> schema.
+The claim allocator signature must exist and ring-state relations must be
+ordinary tables. <code>public</code>, <code>information_schema</code> and <code>pg_*</code> are excluded.</p>
+<p>Only those same owners may hold schema <code>CREATE</code> or table <code>TRIGGER</code> privileges.
+Existing user triggers must also call trusted routines. This prevents an
+outsider from planting another object in an otherwise owned substrate, or
+racing discovery with new objects. Role membership alone does not establish
+trust, and superusers do not bypass these checks.</p>
+<p>Unregistered unsafe custom schemas are skipped. Unsafe registered or prepared
+targets abort the pending bundle, so the global version cannot advance while
+leaving a configured substrate behind. Registry and transition references are
+checked separately; unnamed legacy prepared targets also check <code>awa_exp</code>.
+Use an explicit schema in transition metadata to disambiguate that legacy case.
+Unsafe ownership or privileges in the default <code>awa</code> schema abort before the
+installer runs. Use a dedicated owner role consistently, including <code>SET ROLE</code>
+when connecting through a different login.
+Review separately owned objects and remove untrusted creation/trigger grants
+before migrating; a blanket role grant is not a substitute for this review.</p>
+<h3 id="existing-migration-history-and-external-runners">Existing migration history and external runners<a class="headerlink" href="#existing-migration-history-and-external-runners" title="Permanent link">&para;</a></h3>
+<p>The built-in runner records migration versions, descriptions and application times;
+it does not store SQL checksums or automatically rerun applied steps. These security
+checks harden pending historical discovery loops, because an appended migration
+would execute after those loops had already inspected untrusted objects. Standalone
+steps receive only the small discovery bootstrap, without redefining the installer.</p>
+<p>An already-current database has no pending discovery loop and does not run this
+bootstrap; it need not receive the internal helper until a later bundle uses it. No new
+schema version or runtime capability is introduced. Older binaries and previously
+exported SQL retain the old behavior: use an updated binary and regenerate the
+<strong>pending</strong> SQL bundle for upgrades. For external runners that track checksums,
+preserve files already applied and generate a new pending bundle; do not overwrite
+their historical files or reset checksum records to accept changed contents.
+For example, extract with <code>awa migrate --pending --extract-to ./pending-migrations</code>
+into a new directory. Execute complete generated bundles; individual discovery
+tail files in the repository do not include their bootstrap prerequisites.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
@@ -2758,7 +2812,7 @@ During mixed-manifest rollouts, existing definitions retain their last agreed
 value; new names can be inserted immediately. Definition updates wait for fresh
 capable fleet agreement, while removals additionally wait through grace.</p>
 <h3 id="v048-claim-cursor-compatibility">v048 claim cursor compatibility<a class="headerlink" href="#v048-claim-cursor-compatibility" title="Permanent link">&para;</a></h3>
-<p>Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds <code>lane_drained</code> and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.</p>
+<p>Current runtimes work against both the pre-v048 and the v048 claim result shape and advance the lane cursor after every committed claim on either schema. <code>claim_ready_runtime</code> still returns <code>lane_drained</code>; current runtimes ignore it. v048 adds same-lane committed-evidence catch-up inside the claim, which covers an advance that never ran (for example a claimer that stopped between commit and advance). Legacy materialized-lease claims write no attempt evidence, so only their post-commit advance moves the cursor. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.</p>
 <p>For v048 use <code>awa migrate</code> or the complete generated
 <code>awa migrate --sql --from 47 --to 48</code> bundle. It includes the installer
 definition and default-substrate replay before the v048 tail reinstalls custom
