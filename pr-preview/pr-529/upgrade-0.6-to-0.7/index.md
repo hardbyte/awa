@@ -25,6 +25,26 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See [Database roles](../security/database-roles/index.md#provision-queues-before-starting-restricted-runtimes).
 
+## Terminal live counts: one row per lane
+
+Runtimes from this release fold sealed-slot terminal-count deltas into one
+`queue_terminal_live_counts` row per `(ready_slot, queue, priority,
+enqueue_shard)` with `counter_bucket = 0`. Each fold collapses every bucket of a
+lane it touches and adds the signed delta, so rows left in per-job-id buckets by
+earlier folds, the installer backfill or the v027 rebuild stay exact. No
+migration is involved and readers sum every bucket either way.
+
+While an older binary can still win the maintenance election, it folds into
+job-id buckets. A negative delta it folds against a lane that a new binary has
+already collapsed finds no row in its bucket and is dropped, so exact terminal
+counts can read high until the slot is pruned (prune recomputes from
+`done_entries`, so permanent rollups are unaffected). Once every runtime runs
+this release, run `awa storage rebuild-terminal-counters` once. It rebuilds the
+live counts from `done_entries` as one bucket-0 row per lane and clears pending
+deltas. It takes ACCESS EXCLUSIVE locks on `done_entries`, the compact
+completion tables and both counter tables for its duration, so run it in a
+quiet window.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:
@@ -311,7 +331,7 @@ capable fleet agreement, while removals additionally wait through grace.
 
 ### v048 claim cursor compatibility
 
-Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds `lane_drained` and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.
+Current runtimes work against both the pre-v048 and the v048 claim result shape and advance the lane cursor after every committed claim on either schema. `claim_ready_runtime` still returns `lane_drained`; current runtimes ignore it. v048 adds same-lane committed-evidence catch-up inside the claim, which covers an advance that never ran (for example a claimer that stopped between commit and advance). Legacy materialized-lease claims write no attempt evidence, so only their post-commit advance moves the cursor. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.
 
 For v048 use `awa migrate` or the complete generated
 `awa migrate --sql --from 47 --to 48` bundle. It includes the installer
