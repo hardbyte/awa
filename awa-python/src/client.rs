@@ -1991,8 +1991,7 @@ impl PyClient {
                     .map_or(default.min_slot_age, Duration::from_millis),
                 target_slot_bytes: queue_storage_rotate_target_slot_bytes
                     .unwrap_or(default.target_slot_bytes),
-                min_slot_rows: queue_storage_rotate_min_slot_rows
-                    .unwrap_or(default.min_slot_rows),
+                min_slot_rows: queue_storage_rotate_min_slot_rows.unwrap_or(default.min_slot_rows),
                 max_slot_age: queue_storage_rotate_max_slot_age_ms
                     .map_or(default.max_slot_age, Duration::from_millis),
             });
