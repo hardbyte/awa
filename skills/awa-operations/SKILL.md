@@ -133,6 +133,21 @@ Late completions from a rescued attempt lose against the newer attempt via the
 (default 90s) to at least 3× the heartbeat interval; detection latency is
 roughly `heartbeat_staleness + heartbeat_rescue_interval`.
 
+Finished handlers retry durable finalization for up to 120s from the first
+finalize attempt when database writes are unavailable, including connection,
+pool-acquire and read-only-session errors. Recovery requires a writable endpoint
+and usable pooled connections; a DNS change alone does not redirect existing
+read-only sessions. Monitor
+`awa.completion.reconnect_retry` for outages or pool pressure. Pending durable
+finalizers are bounded by the larger of worker capacity and twice the configured
+completion batch size times completion shards (one flushing and one queued batch
+per shard). A full budget backpressures returning handlers, retaining at most one
+additional saved result per worker. Shutdown drains finalizers with handlers until the drain
+deadline. Rescue can still win first, and expired/cancelled finalization falls
+back to rescue, so keep handlers idempotent. A stale reply after an availability
+error may mean the first finalize committed or another actor closed the lease;
+completion metrics and lifecycle hooks are best effort in that case.
+
 Health signals:
 
 - Runtime listener (opt in via `AWA_HEALTH_ADDR`): `GET /healthz` liveness (200

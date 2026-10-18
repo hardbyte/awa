@@ -1,0 +1,3 @@
+services:
+  postgres:
+    cpuset: "6-9,18-21"

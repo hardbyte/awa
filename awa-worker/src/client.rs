@@ -31,6 +31,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -1161,6 +1162,7 @@ impl ClientBuilder {
             dispatcher_handles: RwLock::new(Vec::new()),
             service_handles: RwLock::new(Vec::new()),
             job_set: Arc::new(Mutex::new(JoinSet::new())),
+            finalizers: TaskTracker::new(),
             in_flight: Arc::new(InFlightRegistry::default()),
             queue_in_flight,
             dispatcher_alive,
@@ -1265,6 +1267,7 @@ pub struct Client {
     service_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
     /// JoinSet tracking in-flight job tasks for graceful drain.
     job_set: Arc<Mutex<JoinSet<()>>>,
+    finalizers: TaskTracker,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
@@ -1744,6 +1747,9 @@ impl Client {
             completion_handle,
             effective_storage.clone(),
             self.dlq_policy.clone(),
+            self.finalizers.clone(),
+            self.service_cancel.clone(),
+            runtime_worker_capacity,
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag
@@ -2051,6 +2057,14 @@ impl Client {
                 timeout_secs = timeout.as_secs(),
                 "Shutdown drain timeout exceeded, some jobs may not have completed"
             );
+        }
+
+        self.finalizers.close();
+        if tokio::time::timeout_at(drain_deadline, self.finalizers.wait())
+            .await
+            .is_err()
+        {
+            warn!("Shutdown drain timeout exceeded waiting for durable finalization");
         }
 
         // Phase 5: Stop background services (heartbeat + maintenance)
@@ -3164,6 +3178,31 @@ mod tests {
         builder.storage = RuntimeStorage::Canonical;
         builder.storage_error = None;
         builder
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_finalizers_after_handlers_have_returned() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.unwrap();
+        let client = force_canonical(
+            Client::builder(pool.clone()).queue("finalizer_drain", QueueConfig::default()),
+        )
+        .build()
+        .unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finalizer_finished = finished.clone();
+        client.finalizers.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            finalizer_finished.store(true, Ordering::SeqCst);
+        });
+        client.shutdown(Duration::from_secs(2)).await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "shutdown must wait for durable finalization after handlers return"
+        );
+        assert!(client.finalizers.is_empty());
     }
 
     #[tokio::test]

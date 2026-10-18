@@ -1,0 +1,27 @@
+{
+  "runtime_head": "a8a5eb8cdc751439065815751cf446d9b339e10d",
+  "source_ci": "https://github.com/hardbyte/awa/actions/runs/39078991472",
+  "local_final_gates": {
+    "fmt_clippy_build_worker_suite_python_fmt_clippy": 0,
+    "strict_docs_and_skill_validation": 0,
+    "worker_tests": {
+      "passed": 67,
+      "existing_ignored": 2
+    }
+  },
+  "old_cap_negative_regression": {
+    "test": "finalizers_fill_completion_pipeline_then_backpressure_handlers",
+    "mutation": "restore worker-sized finalizer cap",
+    "expected_test_exit": 101,
+    "failure": "short handlers must fill a complete batch even with one worker"
+  },
+  "earlier_recovery_checks": {
+    "source_head": "3daaff7f5e5d5b835f01cf8e9af13b01910784c5",
+    "pg17_restart": "2 passed; legacy and receipt-plane",
+    "pg18_restart": "2 passed; legacy and receipt-plane",
+    "pool_starvation": "one handler execution, retry observed"
+  },
+  "final_benchmark_driver_exit": 0,
+  "tlc_expected_checks": 51,
+  "source_ci_conclusion": "success"
+}

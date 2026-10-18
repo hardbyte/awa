@@ -33,6 +33,7 @@ pub mod names {
     pub const JOB_FAILED: &str = "awa.job.failed";
     pub const JOB_RETRIED: &str = "awa.job.retried";
     pub const COMPLETION_DEADLOCK_RETRY: &str = "awa.completion.deadlock_retry";
+    pub const COMPLETION_RECONNECT_RETRY: &str = "awa.completion.reconnect_retry";
     pub const JOB_CANCELLED: &str = "awa.job.cancelled";
     pub const JOB_CLAIMED: &str = "awa.job.claimed";
     pub const JOB_DURATION: &str = "awa.job.duration";
@@ -114,6 +115,10 @@ pub struct AwaMetrics {
     /// executor re-ran. A non-zero rate means job transitions are still
     /// waiting on each other somewhere in the hot path.
     pub completion_deadlock_retries: Counter<u64>,
+    /// Finalize retries started after database writes became unavailable,
+    /// including connection failures, pool timeouts, and read-only failover.
+    /// This counts retries, not successful recoveries.
+    pub completion_reconnect_retries: Counter<u64>,
     /// Total jobs cancelled.
     pub jobs_cancelled: Counter<u64>,
     /// Total jobs claimed (dequeued) for execution.
@@ -294,6 +299,13 @@ impl AwaMetrics {
                 .u64_counter(names::COMPLETION_DEADLOCK_RETRY)
                 .with_description(
                     "Number of finalize transactions re-run after a deadlock abort (SQLSTATE 40P01)",
+                )
+                .with_unit("{transaction}")
+                .build(),
+            completion_reconnect_retries: meter
+                .u64_counter(names::COMPLETION_RECONNECT_RETRY)
+                .with_description(
+                    "Number of finalize retries started after database writes became unavailable",
                 )
                 .with_unit("{transaction}")
                 .build(),
@@ -575,6 +587,16 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
         ];
         self.completion_deadlock_retries.add(1, &attrs);
+    }
+
+    /// Record one re-run of a finalize attempt after the database connection
+    /// was lost.
+    pub fn record_completion_reconnect_retry(&self, kind: &str, queue: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+        ];
+        self.completion_reconnect_retries.add(1, &attrs);
     }
 
     pub fn record_job_retried(&self, kind: &str, queue: &str) {
