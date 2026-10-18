@@ -8,13 +8,14 @@ use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
 ///
@@ -428,122 +429,156 @@ impl JobExecutor {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
-            finalizers.spawn(async move {
-                let event_kind = job_kind.clone();
-                let finalize = async move {
+            finalizers.spawn(
+                async move {
+                    let event_kind = job_kind.clone();
+                    let finalize = async move {
+                        let outcome = finalize_with_retry(
+                            |completion_path| complete_job(
+                                &pool,
+                                &job,
+                                queue_storage_claim.as_ref(),
+                                queue_storage_unique_states.as_deref(),
+                                &result,
+                                &completion_batcher,
+                                completion_path,
+                                progress_snapshot.clone(),
+                                duration,
+                                has_lifecycle_handlers,
+                                &enqueue_specs,
+                                &storage,
+                                dlq_enabled,
+                                &metrics,
+                            ),
+                            &metrics,
+                            job_id,
+                            &job_kind,
+                            &job_queue,
+                            COMPLETION_RECONNECT_WINDOW,
+                        ).await;
 
-                let outcome = finalize_with_retry(
-                    || complete_job(
-                        &pool,
-                        &job,
-                        queue_storage_claim.as_ref(),
-                        queue_storage_unique_states.as_deref(),
-                        &result,
-                        &completion_batcher,
-                        progress_snapshot.clone(),
-                        duration,
-                        has_lifecycle_handlers,
-                        &enqueue_specs,
-                        &storage,
-                        dlq_enabled,
-                        &metrics,
-                    ),
-                    &metrics,
-                    job_id,
-                    &job_kind,
-                    &job_queue,
-                    COMPLETION_RECONNECT_WINDOW,
-                ).await;
-
-                match &outcome {
-                    Ok(CompletionOutcome::Applied { terminal, .. }) => {
-                        // State transition succeeded — record metrics. `terminal`
-                        // is the source of truth for retry-vs-failure because
-                        // JobError::Retryable can resolve to either path.
-                        match &result {
-                            Ok(JobResult::Completed) => {
-                                metrics.record_job_completed(&job_kind, &job_queue, duration);
-                            }
-                            Ok(JobResult::RetryAfter(_)) => {
-                                metrics.record_job_retried(&job_kind, &job_queue);
-                            }
-                            Ok(JobResult::Cancel(_)) => {
-                                metrics.jobs_cancelled.add(
-                                    1,
-                                    &[
-                                        opentelemetry::KeyValue::new(
-                                            "awa.job.kind",
-                                            job_kind.clone(),
-                                        ),
-                                        opentelemetry::KeyValue::new(
-                                            "awa.job.queue",
-                                            job_queue.clone(),
-                                        ),
-                                    ],
-                                );
-                            }
-                            Ok(JobResult::Snooze(_)) => {}
-                            Ok(JobResult::WaitForCallback(_)) => {
-                                if *terminal {
-                                    metrics.record_job_failed(&job_kind, &job_queue, true);
-                                } else {
-                                    metrics.jobs_waiting_external.add(
-                                        1,
-                                        &[
-                                            opentelemetry::KeyValue::new(
-                                                "awa.job.kind",
-                                                job_kind.clone(),
-                                            ),
-                                            opentelemetry::KeyValue::new(
-                                                "awa.job.queue",
-                                                job_queue.clone(),
-                                            ),
-                                        ],
+                        match &outcome {
+                            Ok(FinalizeAck {
+                                outcome: CompletionOutcome::Applied { terminal, .. },
+                                reconnect_retries,
+                                elapsed,
+                            }) => {
+                                log_applied_outcome(&job, &result, *terminal);
+                                if *reconnect_retries > 0 {
+                                    info!(
+                                        job_id,
+                                        retries = reconnect_retries,
+                                        elapsed_ms = elapsed.as_millis() as u64,
+                                        "Durable finalization acknowledged after database unavailability"
                                     );
                                 }
-                            }
-                            Err(JobError::Terminal(_)) => {
-                                metrics.record_job_failed(&job_kind, &job_queue, true);
-                            }
-                            Err(JobError::Retryable(_)) => {
-                                if *terminal {
-                                    metrics.record_job_failed(&job_kind, &job_queue, true);
-                                } else {
-                                    metrics.record_job_retried(&job_kind, &job_queue);
+                                // State transition succeeded — record metrics. `terminal`
+                                // is the source of truth for retry-vs-failure because
+                                // JobError::Retryable can resolve to either path.
+                                match &result {
+                                    Ok(JobResult::Completed) => {
+                                        metrics.record_job_completed(&job_kind, &job_queue, duration);
+                                    }
+                                    Ok(JobResult::RetryAfter(_)) => {
+                                        if *terminal {
+                                            metrics.record_job_failed(&job_kind, &job_queue, true);
+                                        } else {
+                                            metrics.record_job_retried(&job_kind, &job_queue);
+                                        }
+                                    }
+                                    Ok(JobResult::Cancel(_)) => {
+                                        metrics.jobs_cancelled.add(
+                                            1,
+                                            &[
+                                                opentelemetry::KeyValue::new(
+                                                    "awa.job.kind",
+                                                    job_kind.clone(),
+                                                ),
+                                                opentelemetry::KeyValue::new(
+                                                    "awa.job.queue",
+                                                    job_queue.clone(),
+                                                ),
+                                            ],
+                                        );
+                                    }
+                                    Ok(JobResult::Snooze(_)) => {}
+                                    Ok(JobResult::WaitForCallback(_)) => {
+                                        if *terminal {
+                                            metrics.record_job_failed(&job_kind, &job_queue, true);
+                                        } else {
+                                            metrics.jobs_waiting_external.add(
+                                                1,
+                                                &[
+                                                    opentelemetry::KeyValue::new(
+                                                        "awa.job.kind",
+                                                        job_kind.clone(),
+                                                    ),
+                                                    opentelemetry::KeyValue::new(
+                                                        "awa.job.queue",
+                                                        job_queue.clone(),
+                                                    ),
+                                                ],
+                                            );
+                                        }
+                                    }
+                                    Err(JobError::Terminal(_)) => {
+                                        metrics.record_job_failed(&job_kind, &job_queue, true);
+                                    }
+                                    Err(JobError::Retryable(_)) => {
+                                        if *terminal {
+                                            metrics.record_job_failed(&job_kind, &job_queue, true);
+                                        } else {
+                                            metrics.record_job_retried(&job_kind, &job_queue);
+                                        }
+                                    }
                                 }
                             }
+                            Ok(FinalizeAck {
+                                outcome: CompletionOutcome::IgnoredStale,
+                                reconnect_retries,
+                                ..
+                            }) => {
+                                if *reconnect_retries > 0 {
+                                    info!(
+                                        job_id,
+                                        retries = reconnect_retries,
+                                        "Finalization outcome unknown after database unavailability; an earlier attempt may have committed or another actor closed the lease"
+                                    );
+                                } else {
+                                    debug!(job_id, "Attempt is no longer current; finalization ignored");
+                                }
+                            }
+                            Err(err) => {
+                                error!(job_id, error = %err, "Failed to complete job");
+                            }
+                        }
+
+                        if let Ok(FinalizeAck {
+                            outcome: CompletionOutcome::Applied { event: Some(event), .. }, ..
+                        }) = outcome
+                        {
+                            Some(event)
+                        } else {
+                            None
+                        }
+                    };
+                    let event = tokio::select! {
+                        event = finalize => event,
+                        _ = finalize_cancel.cancelled() => {
+                            warn!(job_id, "Finalization cancelled after runtime drain");
+                            None
+                        },
+                    };
+                    drop(finalize_permit);
+                    if let Some(event) = event {
+                        tokio::select! {
+                            _ = dispatch_lifecycle_event(&lifecycle_handlers, &event_kind, event) => {},
+                            _ = finalize_cancel.cancelled() => {},
                         }
                     }
-                    Ok(CompletionOutcome::IgnoredStale) => {}
-                    Err(err) => {
-                        error!(job_id, error = %err, "Failed to complete job");
-                    }
                 }
-
-                if let Ok(CompletionOutcome::Applied {
-                    event: Some(event), ..
-                }) = outcome
-                {
-                    Some(event)
-                } else {
-                    None
-                }
-                };
-                let event = tokio::select! {
-                    event = finalize => event,
-                    _ = finalize_cancel.cancelled() => {
-                        warn!(job_id, "Finalization cancelled after runtime drain");
-                        None
-                    },
-                };
-                drop(finalize_permit);
-                if let Some(event) = event {
-                    tokio::select! {
-                        _ = dispatch_lifecycle_event(&lifecycle_handlers, &event_kind, event) => {},
-                        _ = finalize_cancel.cancelled() => {},
-                    }
-                }
-            }.in_current_span());
+                .in_current_span(),
+            );
         }
         .instrument(span)
     }
@@ -568,6 +603,19 @@ enum FinalizeError {
     Deadline,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionPath {
+    Batched,
+    Direct,
+}
+
+#[derive(Debug)]
+struct FinalizeAck<T> {
+    outcome: T,
+    reconnect_retries: u32,
+    elapsed: Duration,
+}
+
 async fn finalize_with_retry<T, F, Fut>(
     mut finalize: F,
     metrics: &crate::metrics::AwaMetrics,
@@ -575,20 +623,28 @@ async fn finalize_with_retry<T, F, Fut>(
     kind: &str,
     queue: &str,
     window: Duration,
-) -> Result<T, FinalizeError>
+) -> Result<FinalizeAck<T>, FinalizeError>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(CompletionPath) -> Fut,
     Fut: std::future::Future<Output = Result<T, AwaError>>,
 {
-    let deadline = tokio::time::Instant::now() + window;
+    let started = tokio::time::Instant::now();
+    let deadline = started + window;
     let mut deadlock_retries = 0;
     let mut reconnect_retries = 0;
+    let mut completion_path = CompletionPath::Batched;
     loop {
-        let outcome = tokio::time::timeout_at(deadline, finalize())
+        let outcome = tokio::time::timeout_at(deadline, finalize(completion_path))
             .await
             .map_err(|_| FinalizeError::Deadline)?;
         let error = match outcome {
-            Ok(value) => return Ok(value),
+            Ok(outcome) => {
+                return Ok(FinalizeAck {
+                    outcome,
+                    reconnect_retries,
+                    elapsed: started.elapsed(),
+                });
+            }
             Err(error) => error,
         };
         let delay = if error.is_deadlock() && deadlock_retries < COMPLETION_DEADLOCK_RETRIES {
@@ -600,7 +656,11 @@ where
         } else {
             return Err(error.into());
         };
-        warn!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
+        if deadlock_retries + reconnect_retries == 1 {
+            warn!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
+        } else {
+            debug!(job_id, error = %error, delay_ms = delay.as_millis() as u64, "Durable finalization failed; retrying");
+        }
         tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
             .await
             .map_err(|_| FinalizeError::Deadline)?;
@@ -609,6 +669,7 @@ where
         } else {
             metrics.record_completion_deadlock_retry(kind, queue);
         }
+        completion_path = CompletionPath::Direct;
     }
 }
 
@@ -616,11 +677,55 @@ where
 /// can win before this expires; the lease guard then rejects the old result.
 const COMPLETION_RECONNECT_WINDOW: Duration = Duration::from_secs(120);
 
-/// Backoff between reconnect retries (500ms, 1s, 2s, then 4s). Each attempt
-/// already waits up to the pool's `acquire_timeout` for a connection, so this
-/// only spaces out immediate refusals.
+/// Equal jitter between half and all of an exponentially increasing delay,
+/// capped at four seconds.
 fn completion_reconnect_backoff(retry: u32) -> Duration {
-    Duration::from_millis(500u64 << retry.saturating_sub(1).min(3))
+    let ceiling_ms = 500u64 << retry.saturating_sub(1).min(3);
+    let half_ms = ceiling_ms / 2;
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    Duration::from_millis(half_ms + random % (half_ms + 1))
+}
+
+fn log_applied_outcome(job: &JobRow, result: &Result<JobResult, JobError>, terminal: bool) {
+    if terminal {
+        tracing::Span::current().record("otel.status_code", "ERROR");
+        let reason = match result {
+            Err(error) => error.to_string(),
+            Ok(JobResult::RetryAfter(delay)) => {
+                format!("max_attempts exhausted (handler requested retry after {delay:?})")
+            }
+            Ok(JobResult::WaitForCallback(_)) => {
+                "WaitForCallback returned without calling register_callback".into()
+            }
+            _ => "attempt exhausted".into(),
+        };
+        error!(job_id = job.id, kind = %job.kind, attempt = job.attempt, max_attempts = job.max_attempts, error = %reason, "Job failed terminally");
+        return;
+    }
+    match result {
+        Ok(JobResult::Completed) => {
+            tracing::Span::current().record("otel.status_code", "OK");
+            info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
+        }
+        Ok(JobResult::RetryAfter(delay)) => {
+            info!(job_id = job.id, kind = %job.kind, retry_after_secs = delay.as_secs_f64(), "Job requested retry after duration");
+        }
+        Ok(JobResult::Snooze(delay)) => {
+            info!(job_id = job.id, kind = %job.kind, snooze_secs = delay.as_secs_f64(), "Job snoozed");
+        }
+        Ok(JobResult::Cancel(reason)) => {
+            info!(job_id = job.id, kind = %job.kind, reason = %reason, "Job cancelled");
+        }
+        Ok(JobResult::WaitForCallback(_)) => {
+            info!(job_id = job.id, kind = %job.kind, "Callback wait finalization acknowledged");
+        }
+        Err(error) => {
+            tracing::Span::current().record("otel.status_code", "ERROR");
+            warn!(job_id = job.id, kind = %job.kind, attempt = job.attempt, error = %error, "Job failed; retry scheduled");
+        }
+    }
 }
 
 /// Update job state in the database based on handler result.
@@ -635,6 +740,7 @@ async fn complete_job(
     queue_storage_unique_states: Option<&str>,
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
+    completion_path: CompletionPath,
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
@@ -655,6 +761,7 @@ async fn complete_job(
                 job,
                 result,
                 completion_batcher,
+                completion_path,
                 progress_snapshot,
                 duration,
                 needs_event,
@@ -673,6 +780,7 @@ async fn complete_job(
                 queue_storage_unique_states,
                 result,
                 completion_batcher,
+                completion_path,
                 progress_snapshot,
                 duration,
                 needs_event,
@@ -703,16 +811,6 @@ async fn exhaust_canonical(
     progress_snapshot: &Option<serde_json::Value>,
     needs_event: bool,
 ) -> Result<CompletionOutcome, AwaError> {
-    tracing::Span::current().record("otel.status_code", "ERROR");
-    error!(
-        job_id = job.id,
-        kind = %job.kind,
-        attempt = job.attempt,
-        max_attempts = job.max_attempts,
-        error = %error_msg,
-        "Job failed (max attempts exhausted)"
-    );
-
     // ADR-029: retries exhausted -> Exhausted outcome.
     let kind_specs = enqueue_specs
         .get(&crate::enqueue_specs::Outcome::Exhausted)
@@ -728,13 +826,7 @@ async fn exhaust_canonical(
         )
         .await?;
         return match result {
-            None => {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, failure ignored"
-                );
-                Ok(CompletionOutcome::IgnoredStale)
-            }
+            None => Ok(CompletionOutcome::IgnoredStale),
             Some(updated_job) => {
                 let event = if needs_event {
                     Some(UntypedJobEvent::Exhausted {
@@ -779,10 +871,6 @@ async fn exhaust_canonical(
     .execute(pool)
     .await?;
     if result.rows_affected() == 0 {
-        warn!(
-            job_id = job.id,
-            "Job already rescued/cancelled, failure ignored"
-        );
         return Ok(CompletionOutcome::IgnoredStale);
     }
     if needs_event {
@@ -824,16 +912,6 @@ async fn exhaust_queue_storage(
     metrics: &crate::metrics::AwaMetrics,
     needs_event: bool,
 ) -> Result<CompletionOutcome, AwaError> {
-    tracing::Span::current().record("otel.status_code", "ERROR");
-    error!(
-        job_id = job.id,
-        kind = %job.kind,
-        attempt = job.attempt,
-        max_attempts = job.max_attempts,
-        error = %error_msg,
-        "Job failed (max attempts exhausted)"
-    );
-
     // ADR-029: retries exhausted -> Exhausted outcome.
     let kind_specs = enqueue_specs
         .get(&crate::enqueue_specs::Outcome::Exhausted)
@@ -854,13 +932,7 @@ async fn exhaust_queue_storage(
         )
         .await?;
         return match result {
-            None => {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, failure ignored"
-                );
-                Ok(CompletionOutcome::IgnoredStale)
-            }
+            None => Ok(CompletionOutcome::IgnoredStale),
             Some(updated_job) => {
                 let event = if needs_event {
                     Some(UntypedJobEvent::Exhausted {
@@ -910,10 +982,6 @@ async fn exhaust_queue_storage(
             .await?
     };
     let Some(updated_job) = updated_job else {
-        warn!(
-            job_id = job.id,
-            "Job already rescued/cancelled, failure ignored"
-        );
         return Ok(CompletionOutcome::IgnoredStale);
     };
     if needs_event {
@@ -939,6 +1007,7 @@ async fn complete_job_canonical(
     job: &JobRow,
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
+    completion_path: CompletionPath,
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
@@ -953,9 +1022,6 @@ async fn complete_job_canonical(
 ) -> Result<CompletionOutcome, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
-            tracing::Span::current().record("otel.status_code", "OK");
-            info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
-
             // ADR-029: when this kind has follow-up specs registered, drive
             // completion through a dedicated transaction so the UPDATE and
             // the follow-up INSERTs commit atomically. The batched path
@@ -967,13 +1033,7 @@ async fn complete_job_canonical(
             if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
                 let outcome = complete_canonical_with_followups(pool, job, &specs).await?;
                 return match outcome {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, completion ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Completed {
@@ -991,22 +1051,16 @@ async fn complete_job_canonical(
                 };
             }
 
-            let result = match completion_batcher.complete(job.id, job.run_lease).await {
-                Ok(updated) => updated,
-                Err(err) => {
-                    warn!(
-                        job_id = job.id,
-                        error = %err,
-                        "Completion batch flush failed, falling back to direct finalize"
-                    );
-                    direct_complete_job(pool, job).await?
+            let result = match completion_path {
+                CompletionPath::Direct => direct_complete_job(pool, job).await?,
+                CompletionPath::Batched => {
+                    match completion_batcher.complete(job.id, job.run_lease).await {
+                        Ok(updated) => updated,
+                        Err(_) => direct_complete_job(pool, job).await?,
+                    }
                 }
             };
             if !result {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, completion ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
@@ -1050,12 +1104,6 @@ async fn complete_job_canonical(
             }
 
             let seconds = retry_duration.as_secs() as f64;
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                retry_after_secs = seconds,
-                "Job requested retry after duration"
-            );
 
             // ADR-029: caller-requested retry. The Retried OutcomeContext
             // carries an empty error string (parity with the event emitted
@@ -1075,13 +1123,7 @@ async fn complete_job_canonical(
                 )
                 .await?;
                 return match result {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, retry ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Retried {
@@ -1123,10 +1165,6 @@ async fn complete_job_canonical(
                 attempt,
             }) = outcome
             else {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, retry ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             };
             if needs_event {
@@ -1158,12 +1196,6 @@ async fn complete_job_canonical(
 
         Ok(JobResult::Snooze(snooze_duration)) => {
             let seconds = snooze_duration.as_secs() as f64;
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                snooze_secs = seconds,
-                "Job snoozed (attempt not incremented)"
-            );
             let outcome = awa_model::reschedule::reschedule_canonical_attempt(
                 pool,
                 job.id,
@@ -1179,10 +1211,6 @@ async fn complete_job_canonical(
                 outcome,
                 RescheduleOutcome::Stale | RescheduleOutcome::CancelledDuplicate { .. }
             ) {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, snooze ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             Ok(CompletionOutcome::Applied {
@@ -1192,14 +1220,6 @@ async fn complete_job_canonical(
         }
 
         Ok(JobResult::Cancel(reason)) => {
-            tracing::Span::current().record("otel.status_code", "OK");
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                reason = %reason,
-                "Job cancelled by handler"
-            );
-
             // ADR-029: when this kind has Cancelled specs registered, drive
             // the cancellation through a transaction so the UPDATE and the
             // follow-up `INSERT`s commit atomically.
@@ -1221,13 +1241,7 @@ async fn complete_job_canonical(
                 )
                 .await?;
                 return match result {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, cancel ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Cancelled {
@@ -1266,10 +1280,6 @@ async fn complete_job_canonical(
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, cancel ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
@@ -1294,12 +1304,6 @@ async fn complete_job_canonical(
         }
 
         Ok(JobResult::WaitForCallback(_guard)) => {
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                "Job waiting for external callback"
-            );
-
             // ADR-029: WaitingForCallback follow-up enqueue. The triggering
             // UPDATE and the follow-up INSERTs commit in the same transaction.
             // Race / missing-callback paths below are unchanged and dispatch
@@ -1354,21 +1358,12 @@ async fn complete_job_canonical(
                 .await?;
                 match current {
                     Some((state, _)) if state.is_terminal() => {
-                        info!(
-                            job_id = job.id,
-                            state = %state,
-                            "Job already completed by racing callback"
-                        );
                         return Ok(CompletionOutcome::Applied {
                             event: None,
                             terminal: false,
                         });
                     }
                     Some((_, None)) => {
-                        error!(
-                            job_id = job.id,
-                            "WaitForCallback returned without calling register_callback"
-                        );
                         let result = sqlx::query(
                             r#"
                             UPDATE awa.jobs_hot
@@ -1397,10 +1392,6 @@ async fn complete_job_canonical(
                         });
                     }
                     _ => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, wait-for-callback ignored"
-                        );
                         return Ok(CompletionOutcome::IgnoredStale);
                     }
                 }
@@ -1421,14 +1412,6 @@ async fn complete_job_canonical(
         }
 
         Err(JobError::Terminal(msg)) => {
-            tracing::Span::current().record("otel.status_code", "ERROR");
-            error!(
-                job_id = job.id,
-                kind = %job.kind,
-                error = %msg,
-                "Job failed terminally"
-            );
-
             // ADR-029: terminal error counts as Exhausted (the error is
             // fatal; no further attempts will run).
             let kind_specs = enqueue_specs
@@ -1445,13 +1428,7 @@ async fn complete_job_canonical(
                 )
                 .await?;
                 return match result {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, terminal failure ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Exhausted {
@@ -1492,10 +1469,6 @@ async fn complete_job_canonical(
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, terminal failure ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
@@ -1533,14 +1506,6 @@ async fn complete_job_canonical(
                 )
                 .await
             } else {
-                warn!(
-                    job_id = job.id,
-                    kind = %job.kind,
-                    attempt = job.attempt,
-                    error = %error_msg,
-                    "Job failed (will retry)"
-                );
-
                 // ADR-029: retryable error with backoff -> Retried outcome.
                 let kind_specs = enqueue_specs
                     .get(&crate::enqueue_specs::Outcome::Retried)
@@ -1556,13 +1521,7 @@ async fn complete_job_canonical(
                     )
                     .await?;
                     return match result {
-                        None => {
-                            warn!(
-                                job_id = job.id,
-                                "Job already rescued/cancelled, retry ignored"
-                            );
-                            Ok(CompletionOutcome::IgnoredStale)
-                        }
+                        None => Ok(CompletionOutcome::IgnoredStale),
                         Some(updated_job) => {
                             let event = if needs_event {
                                 Some(UntypedJobEvent::Retried {
@@ -1607,10 +1566,6 @@ async fn complete_job_canonical(
                     attempt,
                 }) = outcome
                 else {
-                    warn!(
-                        job_id = job.id,
-                        "Job already rescued/cancelled, retry ignored"
-                    );
                     return Ok(CompletionOutcome::IgnoredStale);
                 };
                 if needs_event {
@@ -1686,6 +1641,7 @@ async fn complete_job_queue_storage(
     queue_storage_unique_states: Option<&str>,
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
+    completion_path: CompletionPath,
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
@@ -1700,9 +1656,6 @@ async fn complete_job_queue_storage(
 ) -> Result<CompletionOutcome, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
-            tracing::Span::current().record("otel.status_code", "OK");
-            info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
-
             // ADR-029: when this kind has follow-up specs registered, drive
             // completion through a dedicated transaction so the
             // receipt-plane / lease cleanup + done_entries append +
@@ -1725,13 +1678,7 @@ async fn complete_job_queue_storage(
                 )
                 .await?;
                 return match outcome {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, completion ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Completed {
@@ -1749,26 +1696,8 @@ async fn complete_job_queue_storage(
                 };
             }
 
-            let updated = match match queue_storage_claim {
-                Some(claim) => {
-                    completion_batcher
-                        .complete_runtime_job(ClaimedRuntimeJob {
-                            claim: claim.clone(),
-                            job: job.clone(),
-                            unique_states: queue_storage_unique_states
-                                .map(std::string::ToString::to_string),
-                        })
-                        .await
-                }
-                None => completion_batcher.complete(job.id, job.run_lease).await,
-            } {
-                Ok(updated) => updated,
-                Err(err) => {
-                    warn!(
-                        job_id = job.id,
-                        error = %err,
-                        "Completion batch flush failed, falling back to direct finalize"
-                    );
+            let updated = match completion_path {
+                CompletionPath::Direct => {
                     direct_complete_job_queue_storage(
                         runtime,
                         pool,
@@ -1778,12 +1707,33 @@ async fn complete_job_queue_storage(
                     )
                     .await?
                 }
+                CompletionPath::Batched => match match queue_storage_claim {
+                    Some(claim) => {
+                        completion_batcher
+                            .complete_runtime_job(ClaimedRuntimeJob {
+                                claim: claim.clone(),
+                                job: job.clone(),
+                                unique_states: queue_storage_unique_states
+                                    .map(std::string::ToString::to_string),
+                            })
+                            .await
+                    }
+                    None => completion_batcher.complete(job.id, job.run_lease).await,
+                } {
+                    Ok(updated) => updated,
+                    Err(_) => {
+                        direct_complete_job_queue_storage(
+                            runtime,
+                            pool,
+                            job,
+                            queue_storage_claim,
+                            queue_storage_unique_states,
+                        )
+                        .await?
+                    }
+                },
             };
             if !updated {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, completion ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
@@ -1837,13 +1787,6 @@ async fn complete_job_queue_storage(
                 .await;
             }
 
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                retry_after_secs = retry_duration.as_secs_f64(),
-                "Job requested retry after duration"
-            );
-
             // ADR-029: caller-requested retry on queue storage.
             let kind_specs = enqueue_specs
                 .get(&crate::enqueue_specs::Outcome::Retried)
@@ -1861,13 +1804,7 @@ async fn complete_job_queue_storage(
                 )
                 .await?;
                 return match result {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, retry ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Retried {
@@ -1899,10 +1836,6 @@ async fn complete_job_queue_storage(
                 )
                 .await?
             else {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, retry ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             };
             if needs_event {
@@ -1924,12 +1857,6 @@ async fn complete_job_queue_storage(
         }
 
         Ok(JobResult::Snooze(snooze_duration)) => {
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                snooze_secs = snooze_duration.as_secs_f64(),
-                "Job snoozed (attempt not incremented)"
-            );
             let updated = runtime
                 .store
                 .snooze_with_claim(
@@ -1942,10 +1869,6 @@ async fn complete_job_queue_storage(
                 )
                 .await?;
             if updated.is_none() {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, snooze ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             Ok(CompletionOutcome::Applied {
@@ -1955,13 +1878,6 @@ async fn complete_job_queue_storage(
         }
 
         Ok(JobResult::Cancel(reason)) => {
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                reason = %reason,
-                "Job cancelled by handler"
-            );
-
             // ADR-029: queue-storage Cancelled follow-ups.
             let kind_specs = enqueue_specs
                 .get(&crate::enqueue_specs::Outcome::Cancelled)
@@ -1978,13 +1894,7 @@ async fn complete_job_queue_storage(
                 )
                 .await?;
                 return match result {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, cancel ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Cancelled {
@@ -2013,10 +1923,6 @@ async fn complete_job_queue_storage(
                 )
                 .await?
             else {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, cancel ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             };
             if needs_event {
@@ -2036,12 +1942,6 @@ async fn complete_job_queue_storage(
         }
 
         Ok(JobResult::WaitForCallback(guard)) => {
-            info!(
-                job_id = job.id,
-                kind = %job.kind,
-                "Job waiting for external callback"
-            );
-
             // ADR-029: queue-storage WaitingForCallback follow-ups. Race /
             // missing-callback paths below remain unchanged — they dispatch
             // no follow-ups because the row didn't actually park.
@@ -2075,11 +1975,6 @@ async fn complete_job_queue_storage(
                 let current = runtime.store.load_job(pool, job.id).await?;
                 match current {
                     Some(current) if current.state.is_terminal() => {
-                        info!(
-                            job_id = job.id,
-                            state = %current.state,
-                            "Job already completed by racing callback"
-                        );
                         return Ok(CompletionOutcome::Applied {
                             event: None,
                             terminal: false,
@@ -2088,10 +1983,6 @@ async fn complete_job_queue_storage(
                     Some(current)
                         if current.state == JobState::Running && current.callback_id.is_none() =>
                     {
-                        error!(
-                            job_id = job.id,
-                            "WaitForCallback returned without calling register_callback"
-                        );
                         let failed =
                             if dlq_enabled {
                                 let failed = runtime
@@ -2132,10 +2023,6 @@ async fn complete_job_queue_storage(
                         });
                     }
                     _ => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, wait-for-callback ignored"
-                        );
                         return Ok(CompletionOutcome::IgnoredStale);
                     }
                 }
@@ -2161,14 +2048,6 @@ async fn complete_job_queue_storage(
         }
 
         Err(JobError::Terminal(msg)) => {
-            tracing::Span::current().record("otel.status_code", "ERROR");
-            error!(
-                job_id = job.id,
-                kind = %job.kind,
-                error = %msg,
-                "Job failed terminally"
-            );
-
             // ADR-029: queue-storage Exhausted follow-ups (Terminal counts).
             let kind_specs = enqueue_specs
                 .get(&crate::enqueue_specs::Outcome::Exhausted)
@@ -2189,13 +2068,7 @@ async fn complete_job_queue_storage(
                 )
                 .await?;
                 return match result {
-                    None => {
-                        warn!(
-                            job_id = job.id,
-                            "Job already rescued/cancelled, terminal failure ignored"
-                        );
-                        Ok(CompletionOutcome::IgnoredStale)
-                    }
+                    None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
                         let event = if needs_event {
                             Some(UntypedJobEvent::Exhausted {
@@ -2245,10 +2118,6 @@ async fn complete_job_queue_storage(
                     .await?
             };
             let Some(updated_job) = updated_job else {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, terminal failure ignored"
-                );
                 return Ok(CompletionOutcome::IgnoredStale);
             };
             if needs_event {
@@ -2285,14 +2154,6 @@ async fn complete_job_queue_storage(
                 )
                 .await
             } else {
-                warn!(
-                    job_id = job.id,
-                    kind = %job.kind,
-                    attempt = job.attempt,
-                    error = %error_msg,
-                    "Job failed (will retry)"
-                );
-
                 // ADR-029: retryable error with backoff -> Retried outcome.
                 let kind_specs = enqueue_specs
                     .get(&crate::enqueue_specs::Outcome::Retried)
@@ -2310,13 +2171,7 @@ async fn complete_job_queue_storage(
                     )
                     .await?;
                     return match result {
-                        None => {
-                            warn!(
-                                job_id = job.id,
-                                "Job already rescued/cancelled, retry ignored"
-                            );
-                            Ok(CompletionOutcome::IgnoredStale)
-                        }
+                        None => Ok(CompletionOutcome::IgnoredStale),
                         Some(updated_job) => {
                             let event = if needs_event {
                                 Some(UntypedJobEvent::Retried {
@@ -2348,10 +2203,6 @@ async fn complete_job_queue_storage(
                     )
                     .await?
                 else {
-                    warn!(
-                        job_id = job.id,
-                        "Job already rescued/cancelled, retry ignored"
-                    );
                     return Ok(CompletionOutcome::IgnoredStale);
                 };
                 if needs_event {
@@ -3222,7 +3073,7 @@ mod tests {
     async fn finalize_deadline_bounds_an_unresponsive_attempt() {
         let started = tokio::time::Instant::now();
         let result = finalize_with_retry(
-            std::future::pending::<Result<(), AwaError>>,
+            |_| std::future::pending::<Result<(), AwaError>>(),
             &test_metrics(),
             1,
             "test",
@@ -3239,7 +3090,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let calls = std::sync::atomic::AtomicU32::new(0);
         let result = finalize_with_retry(
-            || {
+            |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Err::<(), _>(AwaError::Database(sqlx::Error::PoolTimedOut)))
             },
@@ -3252,14 +3103,14 @@ mod tests {
         .await;
         assert!(matches!(result, Err(FinalizeError::Deadline)));
         assert_eq!(started.elapsed(), Duration::from_secs(2));
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!((3..=4).contains(&calls.load(Ordering::SeqCst)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn finalize_does_not_retry_statement_or_closed_pool_errors() {
         let calls = std::sync::atomic::AtomicU32::new(0);
         let result = finalize_with_retry(
-            || {
+            |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Err::<(), _>(AwaError::Database(sqlx::Error::PoolClosed)))
             },
@@ -3276,6 +3127,171 @@ mod tests {
 
     // Fresh partitioned-schema fixtures share PostgreSQL's cluster-wide lock table.
     static RECONNECT_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_bypass_batching_and_only_the_first_failure_warns() {
+        use std::io::Write;
+        use tracing::instrument::WithSubscriber;
+
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_logs = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || LogWriter(writer_logs.clone()))
+            .finish();
+        let paths = std::sync::Mutex::new(Vec::new());
+        let ack = finalize_with_retry(
+            |path| {
+                let mut paths = paths.lock().unwrap();
+                paths.push(path);
+                std::future::ready(if paths.len() <= 3 {
+                    Err(connection_reset())
+                } else {
+                    Ok(42)
+                })
+            },
+            &test_metrics(),
+            1,
+            "test",
+            "test",
+            Duration::from_secs(120),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        assert_eq!(ack.outcome, 42);
+        assert_eq!(ack.reconnect_retries, 3);
+        assert_eq!(
+            *paths.lock().unwrap(),
+            [
+                CompletionPath::Batched,
+                CompletionPath::Direct,
+                CompletionPath::Direct,
+                CompletionPath::Direct,
+            ]
+        );
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let retry_lines: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("Durable finalization failed; retrying"))
+            .collect();
+        assert_eq!(retry_lines.len(), 3, "{logs}");
+        assert_eq!(
+            retry_lines
+                .iter()
+                .filter(|line| line.contains("WARN"))
+                .count(),
+            1,
+            "{logs}"
+        );
+        assert_eq!(
+            retry_lines
+                .iter()
+                .filter(|line| line.contains("DEBUG"))
+                .count(),
+            2,
+            "{logs}"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn direct_finalization_does_not_wait_for_the_completion_batcher(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let canonical_job = running_reconnect_job(&pool).await;
+        let runtime = QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig::default(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        runtime
+            .store
+            .enqueue_batch(&pool, "direct_retry", 2, 1)
+            .await
+            .unwrap();
+        let runtime_job = runtime
+            .store
+            .claim_runtime_batch(&pool, "direct_retry", 1, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let metrics = test_metrics();
+        for (job, claim, storage) in [
+            (canonical_job, None, RuntimeStorage::Canonical),
+            (
+                runtime_job.job,
+                Some(runtime_job.claim),
+                RuntimeStorage::QueueStorage(runtime),
+            ),
+        ] {
+            let (_unstarted_batcher, handle) = crate::completion::CompletionBatcher::new(
+                pool.clone(),
+                CancellationToken::new(),
+                metrics.clone(),
+                storage.clone(),
+                1,
+            );
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                complete_job(
+                    &pool,
+                    &job,
+                    claim.as_ref(),
+                    None,
+                    &Ok(JobResult::Completed),
+                    &handle,
+                    CompletionPath::Direct,
+                    None,
+                    Duration::ZERO,
+                    false,
+                    &Arc::new(HashMap::new()),
+                    &storage,
+                    false,
+                    &metrics,
+                ),
+            )
+            .await
+            .expect("a direct retry must not wait on an unstarted batcher")
+            .unwrap();
+            assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+            let state = match storage {
+                RuntimeStorage::Canonical => sqlx::query_scalar::<_, JobState>(
+                    "SELECT state FROM awa.jobs_hot WHERE id = $1",
+                )
+                .bind(job.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                RuntimeStorage::QueueStorage(runtime) => {
+                    runtime
+                        .store
+                        .load_job(&pool, job.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state
+                }
+            };
+            assert_eq!(state, JobState::Completed);
+        }
+    }
 
     struct ReconnectFollowup;
 
@@ -3342,25 +3358,35 @@ mod tests {
             let job = running_reconnect_job(&pool).await;
             let calls = AtomicU32::new(0);
             let outcome = finalize_with_retry(
-                || async {
-                    let outcome = complete_job_canonical(
-                        &pool,
-                        &job,
-                        &result,
-                        &batcher,
-                        None,
-                        Duration::ZERO,
-                        false,
-                        &specs,
-                        false,
-                        &metrics,
-                    )
-                    .await?;
-                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
-                        Err(connection_reset())
-                    } else {
-                        Ok(outcome)
+                |completion_path| {
+                    let pool = &pool;
+                    let job = &job;
+                    let result = &result;
+                    let batcher = &batcher;
+                    let specs = &specs;
+                    let metrics = &metrics;
+                    let calls = &calls;
+                    async move {
+                        let outcome = complete_job_canonical(
+                            pool,
+                            job,
+                            result,
+                            batcher,
+                            completion_path,
+                            None,
+                            Duration::ZERO,
+                            false,
+                            specs,
+                            false,
+                            metrics,
+                        )
+                        .await?;
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+                            Err(connection_reset())
+                        } else {
+                            Ok(outcome)
+                        }
                     }
                 },
                 &metrics,
@@ -3371,7 +3397,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(matches!(outcome, CompletionOutcome::IgnoredStale));
+            assert!(matches!(outcome.outcome, CompletionOutcome::IgnoredStale));
             assert_eq!(calls.load(Ordering::SeqCst), 2);
             let children: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.jobs_hot WHERE kind = 'reconnect_child' AND args->>'parent' = $1")
                 .bind(job.id.to_string()).fetch_one(&pool).await.unwrap();
@@ -3401,15 +3427,29 @@ mod tests {
             1,
         );
         let calls = AtomicU32::new(0);
-        let outcome = finalize_with_retry(|| async {
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                sqlx::query("UPDATE awa.jobs_hot SET run_lease = run_lease + 1, attempt = attempt + 1 WHERE id = $1")
-                    .bind(job.id).execute(&pool).await.unwrap();
-                return Err(connection_reset());
-            }
-            complete_job_canonical(&pool, &job, &Ok(JobResult::Completed), &batcher, None, Duration::ZERO, false, &specs, false, &metrics).await
-        }, &metrics, job.id, &job.kind, &job.queue, Duration::from_secs(5)).await.unwrap();
-        assert!(matches!(outcome, CompletionOutcome::IgnoredStale));
+        let outcome = finalize_with_retry(
+            |completion_path| {
+                let pool = &pool;
+                let job = &job;
+                let batcher = &batcher;
+                let specs = &specs;
+                let metrics = &metrics;
+                let calls = &calls;
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        sqlx::query("UPDATE awa.jobs_hot SET run_lease = run_lease + 1, attempt = attempt + 1 WHERE id = $1")
+                            .bind(job.id).execute(pool).await.unwrap();
+                        return Err(connection_reset());
+                    }
+                    complete_job_canonical(
+                        pool, job, &Ok(JobResult::Completed), batcher, completion_path,
+                        None, Duration::ZERO, false, specs, false, metrics,
+                    ).await
+                }
+            },
+            &metrics, job.id, &job.kind, &job.queue, Duration::from_secs(5),
+        ).await.unwrap();
+        assert!(matches!(outcome.outcome, CompletionOutcome::IgnoredStale));
         let current: JobRow = sqlx::query_as("SELECT * FROM awa.jobs_hot WHERE id = $1")
             .bind(job.id)
             .fetch_one(&pool)
@@ -3760,12 +3800,26 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_doubles_from_half_a_second_and_caps_at_four() {
-        assert_eq!(completion_reconnect_backoff(1), Duration::from_millis(500));
-        assert_eq!(completion_reconnect_backoff(2), Duration::from_secs(1));
-        assert_eq!(completion_reconnect_backoff(3), Duration::from_secs(2));
-        assert_eq!(completion_reconnect_backoff(4), Duration::from_secs(4));
-        assert_eq!(completion_reconnect_backoff(5), Duration::from_secs(4));
-        assert_eq!(completion_reconnect_backoff(40), Duration::from_secs(4));
+    fn reconnect_backoff_spreads_retries_within_bounded_equal_jitter() {
+        for (retry, ceiling_ms) in [
+            (1, 500),
+            (2, 1000),
+            (3, 2000),
+            (4, 4000),
+            (5, 4000),
+            (40, 4000),
+        ] {
+            let samples: std::collections::HashSet<_> = (0..64)
+                .map(|_| completion_reconnect_backoff(retry))
+                .collect();
+            assert!(
+                samples.len() > 1,
+                "retry {retry} must not use a fixed delay"
+            );
+            assert!(samples.iter().all(|delay| {
+                *delay >= Duration::from_millis(ceiling_ms / 2)
+                    && *delay <= Duration::from_millis(ceiling_ms)
+            }));
+        }
     }
 }

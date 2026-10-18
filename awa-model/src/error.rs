@@ -89,9 +89,11 @@ impl AwaError {
         )
     }
 
-    /// A transport/pool/server-availability failure that may recover after
-    /// reconnecting. The transaction may already have committed: callers must
-    /// establish replay safety independently before retrying it.
+    /// Database writes are unavailable because of a transport, TLS, protocol,
+    /// pool-acquire, server-availability or read-only-session error.
+    ///
+    /// A retry may recover, but the transaction may already have committed:
+    /// callers must establish replay safety independently before retrying it.
     pub fn is_connection_lost(&self) -> bool {
         match self {
             AwaError::Database(sqlx::Error::Io(_))
@@ -100,7 +102,8 @@ impl AwaError {
             | AwaError::Database(sqlx::Error::Tls(_)) => true,
             AwaError::Database(sqlx::Error::Database(database)) => {
                 database.code().is_some_and(|code| {
-                    code.starts_with("08") || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+                    code.starts_with("08")
+                        || matches!(code.as_ref(), "57P01" | "57P02" | "57P03" | "25006")
                 })
             }
             _ => false,
@@ -186,10 +189,18 @@ mod tests {
         assert!(AwaError::Database(sqlx::Error::Io(io)).is_connection_lost());
         assert!(AwaError::Database(sqlx::Error::PoolTimedOut).is_connection_lost());
         assert!(
+            AwaError::Database(sqlx::Error::Tls(Box::new(std::io::Error::other(
+                "TLS failure"
+            ))))
+            .is_connection_lost()
+        );
+        assert!(
             AwaError::Database(sqlx::Error::Protocol("unexpected response".into()))
                 .is_connection_lost()
         );
-        for code in ["08000", "08003", "08006", "57P01", "57P02", "57P03"] {
+        for code in [
+            "08000", "08003", "08006", "57P01", "57P02", "57P03", "25006",
+        ] {
             assert!(sqlstate(code).is_connection_lost(), "{code}");
         }
     }
