@@ -2508,13 +2508,29 @@ See <a href="../security/database-roles/#provision-queues-before-starting-restri
 <h2 id="v050-one-lane-index-per-ready-partition">v050: one lane index per ready partition<a class="headerlink" href="#v050-one-lane-index-per-ready-partition" title="Permanent link">&para;</a></h2>
 <p>v050 drops <code>idx_&lt;schema&gt;_ready_&lt;slot&gt;_lane_shard</code> from every <code>ready_entries</code>
 partition in the default and discovered custom schemas. The partition primary
-key <code>(ready_slot, queue, priority, enqueue_shard, lane_seq)</code> serves the same
-lane scans because every claim pins <code>ready_slot</code>. Each <code>DROP INDEX</code> holds an
-ACCESS EXCLUSIVE lock on its partition until the migration transaction
-commits, so run it with a bounded <code>lock_timeout</code>; no rows are scanned or
-rewritten. External runners apply the complete generated
-<code>awa migrate --sql --from 49 --to 50</code> bundle, which refreshes the installer
-before the tail drops the existing indexes.</p>
+key <code>(ready_slot, queue, priority, enqueue_shard, lane_seq)</code> serves every
+per-lane lookup because current binaries pin <code>ready_slot</code> in claims, in the
+queue prune and terminal-count fold gates, and in the maintenance lag gauge
+(through <code>ready_segments</code>).</p>
+<p>What the migration locks: it redefines <code>awa.install_queue_storage_substrate</code>
+(no schema is reinstalled) and then drops the indexes in slot order. Each
+<code>DROP INDEX</code> takes ACCESS EXCLUSIVE on its <code>ready_entries</code> partition and holds
+it until the migration transaction commits, so enqueues and claims touching
+that partition wait for the commit. No rows are scanned or rewritten; on a
+scratch PostgreSQL 17 database with 409,600 ready rows the whole 49 → 50 step
+took 27 ms. When the session has no <code>lock_timeout</code>, the migration waits at
+most 2 s for each partition. If it times out (SQLSTATE <code>55P03</code>, typically
+behind a long-running read of <code>awa.jobs</code> or a backup) the whole migration
+rolls back and can simply be re-run. External runners apply the complete
+generated <code>awa migrate --sql --from 49 --to 50</code> bundle.</p>
+<p>Rollout order: roll the binaries first, then migrate. Current binaries work
+with or without the index. Pre-v050 binaries keep working against a v050
+schema, but on PostgreSQL 17 and earlier their maintenance lag gauge,
+queue prune gate and terminal-count fold gate fall back to sequential scans of every ready partition
+(PostgreSQL 18 can skip-scan the primary key). Rolling back a binary is
+therefore safe for correctness; to restore the old binary's query plans,
+recreate the index per partition with
+<code>CREATE INDEX CONCURRENTLY idx_&lt;schema&gt;_ready_&lt;slot&gt;_lane_shard ON &lt;schema&gt;.ready_entries_&lt;slot&gt; (queue, priority, enqueue_shard, lane_seq)</code>.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
@@ -2751,7 +2767,7 @@ During mixed-manifest rollouts, existing definitions retain their last agreed
 value; new names can be inserted immediately. Definition updates wait for fresh
 capable fleet agreement, while removals additionally wait through grace.</p>
 <h3 id="v048-claim-cursor-compatibility">v048 claim cursor compatibility<a class="headerlink" href="#v048-claim-cursor-compatibility" title="Permanent link">&para;</a></h3>
-<p>Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds <code>lane_drained</code> and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.</p>
+<p>Current runtimes work against both the pre-v048 and the v048 claim result shape and advance the lane cursor after every committed claim on either schema. <code>claim_ready_runtime</code> still returns <code>lane_drained</code>; current runtimes ignore it. v048 adds same-lane committed-evidence catch-up inside the claim, which covers an advance that never ran (for example a claimer that stopped between commit and advance). Legacy materialized-lease claims write no attempt evidence, so only their post-commit advance moves the cursor. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.</p>
 <p>For v048 use <code>awa migrate</code> or the complete generated
 <code>awa migrate --sql --from 47 --to 48</code> bundle. It includes the installer
 definition and default-substrate replay before the v048 tail reinstalls custom
