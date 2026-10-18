@@ -1,5 +1,5 @@
 //! Migration loops over custom queue-storage schemas only touch schemas the
-//! migrating role owns (directly or through membership). A schema planted
+//! migrating role or awa schema owner owns. A schema planted
 //! by another role with a look-alike `claim_ready_runtime` and ring-state
 //! views must be skipped without evaluating those views, while a custom
 //! schema prepared by the migrator is still refreshed.
@@ -115,6 +115,155 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
         vec!["awa".to_string(), OWNED_SCHEMA.to_string()],
     );
 
+    let standalone_steps: Vec<_> = migrations::migration_sql()
+        .into_iter()
+        .filter(|(_, _, sql)| {
+            sql.contains("FROM awa.queue_storage_schemas() AS discovered")
+                && !sql.contains("CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(")
+        })
+        .collect();
+    assert!(!standalone_steps.is_empty());
+    migrator_pool.execute(
+        "ALTER FUNCTION awa.install_queue_storage_substrate(text, integer, integer, integer, boolean) \
+         SET application_name = 'standalone_discovery_marker'",
+    ).await?;
+    let installer_before: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('awa.install_queue_storage_substrate(text, integer, integer, integer, boolean)'::regprocedure)",
+    ).fetch_one(&migrator_pool).await?;
+    drop_discovery_helpers(&migrator_pool).await?;
+    migrations::run(&migrator_pool).await?;
+    let helper_absent: bool =
+        sqlx::query_scalar("SELECT to_regprocedure('awa.queue_storage_schemas()') IS NULL")
+            .fetch_one(&migrator_pool)
+            .await?;
+    assert!(
+        helper_absent,
+        "already-applied migrations must not be replayed"
+    );
+    for (version, _, sql) in standalone_steps {
+        drop_discovery_helpers(&migrator_pool).await?;
+        migrator_pool
+            .execute(sqlx::raw_sql(audited_sql(sql)))
+            .await?;
+        assert_eq!(
+            hardened_discovery(&migrator_pool).await?,
+            vec!["awa".to_string(), OWNED_SCHEMA.to_string()],
+            "pending migration {version} must bootstrap discovery without an existing helper",
+        );
+    }
+    let installer_after: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('awa.install_queue_storage_substrate(text, integer, integer, integer, boolean)'::regprocedure)",
+    ).fetch_one(&migrator_pool).await?;
+    assert_eq!(
+        installer_before, installer_after,
+        "standalone steps must not redefine the installer"
+    );
+
+    QueueStorage::new(QueueStorageConfig {
+        schema: "injected_custom".into(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 2,
+        ..Default::default()
+    })?
+    .prepare_schema(&migrator_pool)
+    .await?;
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "GRANT USAGE, CREATE ON SCHEMA injected_custom TO {outsider}; \
+         GRANT USAGE ON SCHEMA {OWNED_SCHEMA} TO {outsider}; \
+         GRANT SELECT ON ALL TABLES IN SCHEMA {OWNED_SCHEMA} TO {outsider}; \
+         DROP TABLE injected_custom.queue_ring_rotations;"
+        ))))
+        .await?;
+    assert!(
+        !hardened_discovery(&migrator_pool)
+            .await?
+            .contains(&"injected_custom".into()),
+        "a foreign CREATE grant must be rejected before another object is planted"
+    );
+    outsider_pool.execute(sqlx::raw_sql(audited_sql(format!(
+        "CREATE TABLE injected_custom.queue_ring_rotations \
+         (LIKE {OWNED_SCHEMA}.queue_ring_rotations INCLUDING ALL); \
+         CREATE FUNCTION {DECOY_SCHEMA}.tripwire_trigger() RETURNS trigger LANGUAGE plpgsql AS $trigger$ \
+         BEGIN INSERT INTO {DECOY_SCHEMA}.tripwire VALUES (current_user); RETURN NEW; END $trigger$; \
+         CREATE TRIGGER tripwire BEFORE INSERT ON injected_custom.queue_ring_rotations \
+         FOR EACH ROW EXECUTE FUNCTION {DECOY_SCHEMA}.tripwire_trigger();"
+    )))).await?;
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "REVOKE CREATE ON SCHEMA injected_custom FROM {outsider}"
+        ))))
+        .await?;
+    assert!(
+        !hardened_discovery(&migrator_pool)
+            .await?
+            .contains(&"injected_custom".into()),
+        "revoking CREATE must not hide an existing foreign-owned object"
+    );
+
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "GRANT TRIGGER ON {OWNED_SCHEMA}.queue_ring_state TO {outsider}"
+        ))))
+        .await?;
+    assert!(
+        !hardened_discovery(&migrator_pool)
+            .await?
+            .contains(&OWNED_SCHEMA.into()),
+        "a foreign TRIGGER grant must be rejected before another trigger is planted"
+    );
+    outsider_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "CREATE TRIGGER foreign_trigger BEFORE INSERT ON {OWNED_SCHEMA}.queue_ring_state \
+         FOR EACH ROW EXECUTE FUNCTION {DECOY_SCHEMA}.tripwire_trigger()"
+        ))))
+        .await?;
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "REVOKE TRIGGER ON {OWNED_SCHEMA}.queue_ring_state FROM {outsider}"
+        ))))
+        .await?;
+    assert!(
+        !hardened_discovery(&migrator_pool)
+            .await?
+            .contains(&OWNED_SCHEMA.into()),
+        "an existing foreign trigger function must still be rejected after revoking TRIGGER"
+    );
+    migrator_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "DROP TRIGGER foreign_trigger ON {OWNED_SCHEMA}.queue_ring_state"
+        ))))
+        .await?;
+    assert!(hardened_discovery(&migrator_pool)
+        .await?
+        .contains(&OWNED_SCHEMA.into()));
+
+    assert_configured_substrates_fail_closed(&migrator_pool, &superuser_pool, outsider).await?;
+
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "GRANT CREATE ON SCHEMA awa TO {outsider}"
+        ))))
+        .await?;
+    let pending = migrations::migration_sql_range(47, 48);
+    let error = migrator_pool
+        .execute(sqlx::raw_sql(audited_sql(pending[0].2.clone())))
+        .await
+        .expect_err("the default schema must be checked before any installer refresh");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("42501")
+    );
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "REVOKE CREATE ON SCHEMA awa FROM {outsider}"
+        ))))
+        .await?;
+
     migrator_pool
         .execute(sqlx::raw_sql(audited_sql(format!(
             "COMMENT ON FUNCTION {OWNED_SCHEMA}.{CLAIM_SIGNATURE} IS 'stale'"
@@ -148,9 +297,181 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
         "the migrator's own custom schema must still be reinstalled, got {refreshed_comment:?}"
     );
 
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "CREATE SCHEMA foreign_tables AUTHORIZATION {outsider}; \
+         GRANT USAGE ON SCHEMA foreign_tables TO {migrator};"
+        ))))
+        .await?;
+    outsider_pool.execute(sqlx::raw_sql(audited_sql(format!(
+        "CREATE FUNCTION foreign_tables.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION) \
+         RETURNS VOID LANGUAGE sql AS $decoy$ SELECT $decoy$; \
+         CREATE TABLE foreign_tables.queue_ring_state (LIKE {OWNED_SCHEMA}.queue_ring_state INCLUDING ALL); \
+         CREATE TABLE foreign_tables.lease_ring_state (LIKE {OWNED_SCHEMA}.lease_ring_state INCLUDING ALL); \
+         CREATE TABLE foreign_tables.claim_ring_state (LIKE {OWNED_SCHEMA}.claim_ring_state INCLUDING ALL); \
+         CREATE TRIGGER tripwire BEFORE INSERT ON foreign_tables.queue_ring_state \
+         FOR EACH ROW EXECUTE FUNCTION {DECOY_SCHEMA}.tripwire_trigger();"
+    )))).await?;
+    assert!(legacy_discovery(&superuser_pool)
+        .await?
+        .contains(&"foreign_tables".into()));
+    assert_eq!(
+        hardened_discovery(&superuser_pool).await?,
+        vec!["awa".to_string(), OWNED_SCHEMA.to_string()],
+        "superuser authority must not turn foreign ownership into trusted ownership"
+    );
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "GRANT {outsider} TO {migrator}"
+        ))))
+        .await?;
+    assert_eq!(
+        hardened_discovery(&migrator_pool).await?,
+        vec!["awa".to_string(), OWNED_SCHEMA.to_string()],
+        "role membership alone must not authorize refreshing foreign schemas"
+    );
+    for (_, _, statement) in migrations::migration_sql_range(47, 48) {
+        superuser_pool
+            .execute(sqlx::raw_sql(audited_sql(statement)))
+            .await?;
+    }
+    let hits: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*)::bigint FROM {DECOY_SCHEMA}.tripwire"
+    )))
+    .fetch_one(&superuser_pool)
+    .await?;
+    assert_eq!(
+        hits, 0,
+        "superuser refresh must not execute foreign triggers"
+    );
+
     superuser_pool.close().await;
     migrator_pool.close().await;
     outsider_pool.close().await;
+    Ok(())
+}
+
+async fn drop_discovery_helpers(pool: &PgPool) -> Result<(), sqlx::Error> {
+    pool.execute(sqlx::raw_sql(
+        "DROP FUNCTION IF EXISTS awa.queue_storage_schemas(); \
+         DROP FUNCTION IF EXISTS awa.queue_storage_schema_is_trusted(text);",
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn assert_configured_substrates_fail_closed(
+    migrator_pool: &PgPool,
+    superuser_pool: &PgPool,
+    outsider: &str,
+) -> TestResult {
+    let registered_before: Option<String> = sqlx::query_scalar(
+        "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'",
+    )
+    .fetch_optional(migrator_pool)
+    .await?;
+    let transition_before: (Option<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT prepared_engine, details FROM awa.storage_transition_state WHERE singleton",
+    )
+    .fetch_one(migrator_pool)
+    .await?;
+    sqlx::query("DELETE FROM awa.schema_version WHERE version = $1")
+        .bind(migrations::CURRENT_VERSION)
+        .execute(migrator_pool)
+        .await?;
+    let previous_version: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
+        .fetch_one(migrator_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO awa.runtime_storage_backends (backend, schema_name) VALUES ('queue_storage', 'injected_custom') \
+         ON CONFLICT (backend) DO UPDATE SET schema_name = EXCLUDED.schema_name",
+    ).execute(migrator_pool).await?;
+    let error = migrations::run(migrator_pool)
+        .await
+        .expect_err("an unsafe registered substrate must block migration");
+    match error {
+        awa_model::AwaError::Database(error) => {
+            assert_eq!(
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("42501"),
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsafe configured queue-storage schema: injected_custom"),
+                "refusal must come from the preflight, got {error}"
+            );
+        }
+        error => panic!("expected ownership preflight refusal, got {error}"),
+    }
+    let version_after: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
+        .fetch_one(migrator_pool)
+        .await?;
+    assert_eq!(
+        version_after, previous_version,
+        "refusal must not advance the global version"
+    );
+    sqlx::query("UPDATE awa.runtime_storage_backends SET schema_name = 'awa' WHERE backend = 'queue_storage'")
+        .execute(migrator_pool).await?;
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "CREATE SCHEMA awa_exp AUTHORIZATION {outsider}"
+        ))))
+        .await?;
+    let (_, _, pending_sql) = migrations::migration_sql().pop().unwrap();
+    for (details, expected_schema) in [
+        (
+            serde_json::json!({"schema": "injected_custom"}),
+            "injected_custom",
+        ),
+        (serde_json::json!({}), "awa_exp"),
+    ] {
+        sqlx::query("UPDATE awa.storage_transition_state SET prepared_engine = 'queue_storage', details = $1 WHERE singleton")
+            .bind(details).execute(migrator_pool).await?;
+        let error = migrator_pool
+            .execute(sqlx::raw_sql(audited_sql(pending_sql.clone())))
+            .await
+            .expect_err("unsafe prepared targets must block exported bundles too");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("42501")
+        );
+        assert!(
+            error.to_string().contains(&format!(
+                "unsafe configured queue-storage schema: {expected_schema}"
+            )),
+            "refusal must come from the preflight, got {error}"
+        );
+        let version_after: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
+            .fetch_one(migrator_pool)
+            .await?;
+        assert_eq!(version_after, previous_version);
+    }
+    sqlx::query("UPDATE awa.storage_transition_state SET prepared_engine = $1, details = $2 WHERE singleton")
+        .bind(transition_before.0).bind(transition_before.1).execute(migrator_pool).await?;
+    if let Some(schema) = registered_before {
+        sqlx::query("UPDATE awa.runtime_storage_backends SET schema_name = $1 WHERE backend = 'queue_storage'")
+            .bind(schema).execute(migrator_pool).await?;
+    } else {
+        sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+            .execute(migrator_pool)
+            .await?;
+    }
+    migrations::run(migrator_pool).await?;
+    let version_after: i32 = sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
+        .fetch_one(migrator_pool)
+        .await?;
+    assert_eq!(
+        version_after,
+        migrations::CURRENT_VERSION,
+        "an unregistered decoy must not prevent a legitimate upgrade"
+    );
     Ok(())
 }
 

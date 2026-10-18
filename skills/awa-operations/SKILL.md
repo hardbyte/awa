@@ -36,6 +36,16 @@ file. Never print database URLs or passwords in logs or issues.
 Migrations are forward-only; there are no down migrations. Roll back with a
 database snapshot or reverse SQL, not with the CLI.
 
+Use an updated binary to generate pending upgrade SQL. The runner records
+versions, not checksums; applied steps are not rerun. Preserve already-applied
+files in checksum-based external runners rather than replacing their history.
+
+Migration discovery skips unregistered custom schemas with foreign-owned objects
+or untrusted `CREATE`/`TRIGGER` grants. Unsafe registered/prepared substrates block
+the bundle before version advancement. The same condition in `awa` aborts before
+installation, including for superuser migrators. Use a consistent dedicated owner
+role and review ownership and grants before retrying; see the upgrade guide.
+
 One `awa migrate` applies the whole pending range in a single transaction under
 an advisory lock, so a failed or interrupted run commits nothing and concurrent
 runners converge on one application. Every migration is re-runnable, so a retry

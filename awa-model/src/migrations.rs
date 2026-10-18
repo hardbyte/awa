@@ -67,8 +67,11 @@ pub struct MigrateOptions {
 /// authority-transition procedure.
 ///
 /// A step that loops over queue-storage schemas selects them with
-/// `awa.queue_storage_schemas()` and lists `V23_UP` first, so the helper
-/// exists even when upgrading from a schema installed by an older binary.
+/// `awa.queue_storage_schemas()`. Its discovery bootstrap is included in
+/// `V23_UP` and prepended to standalone discovery steps, including SQL exports.
+/// This hardens pending historical steps before they can evaluate untrusted
+/// objects; an appended migration would run too late. Applied versions are
+/// never replayed automatically, and the runner does not store checksums.
 ///
 /// **v043 (#371) stays additive.** The ring cursors move to append-only
 /// `{ring}_ring_rotations` ledgers, but v043 is the *expand* phase of a
@@ -171,12 +174,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         24,
         "Lower fillfactor to 50 on leases and lease_claims partitions",
-        &[V23_UP, V24_UP],
+        &[SCHEMA_DISCOVERY_UP, V24_UP],
     ),
     (
         25,
         "Drop idx_<schema>_leases_<slot>_state_hb on all AWA substrates",
-        &[V23_UP, V25_UP],
+        &[SCHEMA_DISCOVERY_UP, V25_UP],
     ),
     (
         26,
@@ -202,12 +205,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         31,
         "Backfill failed done-entry metric indexes for queue storage",
-        &[V23_UP, V31_UP],
+        &[SCHEMA_DISCOVERY_UP, V31_UP],
     ),
     (
         32,
         "Add pruned_failed_count to queue_terminal_rollups for the failed terminal retention floor",
-        &[V23_UP, V32_UP],
+        &[SCHEMA_DISCOVERY_UP, V32_UP],
     ),
     (
         33,
@@ -222,7 +225,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         35,
         "Add per-slot receipt deadline-rescue cursors for queue storage",
-        &[V23_UP, V35_UP],
+        &[SCHEMA_DISCOVERY_UP, V35_UP],
     ),
     (
         36,
@@ -305,7 +308,12 @@ const V19_UP: &str = include_str!("../migrations/v019_queue_storage_jobs_compat_
 const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schema_fallback.sql");
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
-const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
+const SCHEMA_DISCOVERY_UP: &str = include_str!("../migrations/queue_storage_schema_discovery.sql");
+const V23_UP: &str = concat!(
+    include_str!("../migrations/queue_storage_schema_discovery.sql"),
+    "\n",
+    include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+);
 const V23_DEFAULT_UP: &str =
     include_str!("../migrations/v023_install_default_queue_storage_substrate.sql");
 const V24_UP: &str = include_str!("../migrations/v024_receipt_plane_fillfactor.sql");
@@ -1078,6 +1086,26 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_bundles_bootstrap_before_discovery_and_default_installation() {
+        for (version, _, sql) in migration_sql() {
+            let Some(discovery) = sql.find("FROM awa.queue_storage_schemas() AS discovered") else {
+                continue;
+            };
+            let bootstrap = sql
+                .find("CREATE OR REPLACE FUNCTION awa.queue_storage_schemas()")
+                .unwrap_or_else(|| panic!("migration {version} needs its discovery bootstrap"));
+            let preflight = sql.find("DO $preflight$").unwrap_or_else(|| {
+                panic!("migration {version} needs its default-schema preflight")
+            });
+            assert!(bootstrap < discovery, "migration {version}");
+            assert!(preflight < discovery, "migration {version}");
+            if let Some(default_install) = sql.find("SELECT awa.install_queue_storage_substrate(") {
+                assert!(preflight < default_install, "migration {version}");
+            }
+        }
+    }
 
     /// Strip SQL line comments, block comments, single-quoted literals, and
     /// dollar-quoted bodies, leaving only top-level statement text.
