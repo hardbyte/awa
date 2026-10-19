@@ -2208,7 +2208,7 @@
 </span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">jobs</span><span class="p">.</span><span class="k">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'running'</span>
 </span></code></pre></div></li>
 <li>Batches are chunked at 500 in-flight attempts to avoid oversized queries.</li>
-<li>When <code>heartbeat_staleness</code> is at least three intervals, an attempt is first heartbeated once it is half an interval old; until then the heartbeat stamp written at claim time stands in for it. Attempts shorter than half an interval are never heartbeated.</li>
+<li>When <code>heartbeat_staleness</code> is at least three intervals, an attempt is first heartbeated once its claim is up to half an interval old (less when recent heartbeat passes have been slow); until then the heartbeat stamp written at claim time stands in for it. Ticks fire at a fixed rate, so a failed pass is retried one interval later, inside the staleness window. Attempts shorter than the deferral that report no progress are never heartbeated.</li>
 <li>The maintenance leader scans every 30 seconds for running jobs with <code>heartbeat_at &lt; now() - 90s</code> and transitions them to <code>retryable</code>.</li>
 <li><strong>Catches:</strong> Process crash, OOM kill, network partition, pod eviction -- any failure where the worker process stops entirely.</li>
 </ul>

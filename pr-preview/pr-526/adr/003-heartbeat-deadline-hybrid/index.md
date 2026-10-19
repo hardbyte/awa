@@ -36,7 +36,7 @@ Awa uses both heartbeat and deadline crash recovery, running as independent main
     AND jobs.state = 'running'
   ```
 - Batches are chunked at 500 in-flight attempts to avoid oversized queries.
-- When `heartbeat_staleness` is at least three intervals, an attempt is first heartbeated once it is half an interval old; until then the heartbeat stamp written at claim time stands in for it. Attempts shorter than half an interval are never heartbeated.
+- When `heartbeat_staleness` is at least three intervals, an attempt is first heartbeated once its claim is up to half an interval old (less when recent heartbeat passes have been slow); until then the heartbeat stamp written at claim time stands in for it. Ticks fire at a fixed rate, so a failed pass is retried one interval later, inside the staleness window. Attempts shorter than the deferral that report no progress are never heartbeated.
 - The maintenance leader scans every 30 seconds for running jobs with `heartbeat_at < now() - 90s` and transitions them to `retryable`.
 - **Catches:** Process crash, OOM kill, network partition, pod eviction -- any failure where the worker process stops entirely.
 

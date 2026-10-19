@@ -3703,11 +3703,21 @@
 <p>Pick them in this order:</p>
 <ol>
 <li><strong>Decide your detection target.</strong> "Crashes should be noticed within X seconds." That target is roughly <code>heartbeat_staleness + heartbeat_rescue_interval</code> in the worst case.</li>
-<li><strong>Set <code>heartbeat_staleness</code> to at least <code>3× heartbeat_interval</code>.</strong> The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it. At 3× or more a new attempt's first heartbeat is deferred by half an interval (step 4), so a fresh attempt has 1.5 intervals of margin before the cutoff rather than 2; use 4× if your handlers or database see pauses longer than an interval.</li>
+<li><strong>Set <code>heartbeat_staleness</code> to at least <code>3× heartbeat_interval</code>.</strong> The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it. At 3× or more a new attempt's first heartbeat is deferred by up to half an interval from its claim (step 4); the deferral shrinks when heartbeat passes are slow and switches off when they take an interval or more, so a failed pass is always retried before the cutoff. Use 4× if your handlers or database see pauses longer than an interval.</li>
 <li><strong><code>heartbeat_rescue_interval</code></strong> can match <code>heartbeat_interval</code> for low-latency rescue, or be higher to reduce maintenance load on big fleets.</li>
-<li><strong>Use the same three values on every runtime that shares a queue-storage schema.</strong> Rescue runs on whichever runtime holds the maintenance election and applies that runtime's <code>heartbeat_staleness</code>. Each runtime decides when to send heartbeats from its own settings: when its <code>heartbeat_staleness</code> is at least <code>3× heartbeat_interval</code>, it skips an attempt's first heartbeat until the attempt is half an interval old, because the claim time counts as the first heartbeat. A runtime whose interval is long relative to the leader's staleness can see its live attempts rescued.</li>
+<li><strong>Use the same three values on every runtime that shares a queue-storage schema.</strong> Rescue runs on whichever runtime holds the maintenance election and applies that runtime's <code>heartbeat_staleness</code>. Each runtime decides when to send heartbeats from its own settings: when its <code>heartbeat_staleness</code> is at least <code>3× heartbeat_interval</code>, it skips an attempt's first heartbeat until the attempt's claim is up to half an interval old, because the claim time counts as the first heartbeat. A runtime whose interval is long relative to the leader's staleness can see its live attempts rescued.</li>
 </ol>
 <p>For a 5-second crash detection target: <code>heartbeat_interval=1s</code>, <code>heartbeat_staleness=4s</code>, <code>heartbeat_rescue_interval=1s</code>. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.</p>
+<p>A finished handler retains its result and retries durable finalization for up to 120 s
+from the first finalize attempt when database writes are unavailable. This includes
+pool-acquire timeouts and read-only-session errors during failover, as well as
+connection errors. A writable endpoint and usable pooled connections are required
+for recovery; changing DNS alone does not redirect existing read-only sessions.
+The retry budget is independent of heartbeat staleness. Rescue uses the last
+heartbeat or claim stamp, so it can become eligible before the 120 s expires;
+the next rescue sweep or an attempt deadline may claim a newer lease first.
+Keep handlers idempotent. Monitor <code>awa.completion.reconnect_retry</code> alongside
+pool waits and database errors; a retry count does not prove recovery.</p>
 <h3 id="deadline-bounding-a-single-attempt">Deadline — bounding a single attempt<a class="headerlink" href="#deadline-bounding-a-single-attempt" title="Permanent link">&para;</a></h3>
 <p>Each queue has a <code>deadline_duration</code> (default <code>5m</code> on <code>QueueConfig</code>). At claim time the runtime stamps <code>now() + deadline_duration</code> onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.</p>
 <table>
