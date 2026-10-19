@@ -42,7 +42,10 @@ files in checksum-based external runners rather than replacing their history.
 
 Migration discovery skips unregistered custom schemas with foreign-owned objects,
 untrusted `CREATE`/`TRIGGER` grants, or any trigger awa did not install. Unsafe
-registered/prepared substrates block the bundle before version advancement. The same condition in `awa` aborts before
+registered/prepared substrates block the bundle before version advancement.
+The error names up to five offending objects; the upgrade guide gives fixes for
+`GRANT ALL` table grants, a 0.6 runtime's schema `CREATE` grant, and schemas
+prepared by another role. Sequences owned by another role are accepted. The same condition in `awa` aborts before
 installation, including for superuser migrators. Use a consistent dedicated owner
 role and review ownership and grants before retrying; see the upgrade guide.
 
