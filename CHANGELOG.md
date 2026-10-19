@@ -91,6 +91,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- A receipt claim could be closed twice. Stale-heartbeat and deadline rescue
+  try-locked each attempt inside the statement that checked it was still open,
+  so a completion, failure or retry that committed while that statement ran
+  was invisible to it: the job was recorded as finished and also rescued to
+  retry. Rescue now takes the attempt locks in one statement and decides in
+  the next, which sees every closer that went first. Admin cancel of a
+  receipt-only attempt took no attempt lock at all; it now try-locks the
+  attempt and re-checks it, and leaves an attempt another closer is finishing.
+
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
 

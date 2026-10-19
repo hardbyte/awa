@@ -9075,7 +9075,7 @@ impl QueueStorage {
                 i64,
                 bool,
             );
-            let receipt: Option<ReceiptCancelRow> = sqlx::query_as(audited_sql(format!(
+            let open_receipt_sql = format!(
                 r#"
                 WITH row_receipt AS (
                     SELECT
@@ -9169,11 +9169,41 @@ impl QueueStorage {
                 ORDER BY run_lease DESC
                 LIMIT 1
                 "#
-            )))
-            .bind(job_id)
-            .fetch_optional(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            );
+            let mut receipt: Option<ReceiptCancelRow> =
+                sqlx::query_as(audited_sql(open_receipt_sql.clone()))
+                    .bind(job_id)
+                    .fetch_optional(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+            // Every closer of this attempt holds its advisory lock while it
+            // writes. Take it, then look again in a new statement, whose
+            // snapshot includes any closer that committed before the lock was
+            // free. A closer still holding it is finishing the attempt, so
+            // the cancel does not apply. A try-lock keeps a multi-job cancel
+            // from waiting on a lock in a different order than a batch closer.
+            if let Some(found) = receipt.as_ref() {
+                let found_run_lease = found.1;
+                let locked: bool = sqlx::query_scalar(
+                    "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(\
+                     format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+                )
+                .bind(job_id)
+                .bind(found_run_lease)
+                .fetch_one(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                receipt = if locked {
+                    sqlx::query_as::<_, ReceiptCancelRow>(audited_sql(open_receipt_sql))
+                        .bind(job_id)
+                        .fetch_optional(tx.as_mut())
+                        .await
+                        .map_err(map_sqlx_error)?
+                        .filter(|recheck| recheck.1 == found_run_lease)
+                } else {
+                    None
+                };
+            }
 
             if let Some((
                 claim_slot,

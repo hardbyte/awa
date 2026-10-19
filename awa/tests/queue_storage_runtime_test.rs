@@ -17826,6 +17826,78 @@ async fn test_deadline_receipt_rescue_sees_completion_committed_mid_statement() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_receipt_cancel_does_not_close_an_attempt_a_closer_holds() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_vs_closer";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "cancel_vs_closer";
+    store.enqueue_batch(&pool, queue, 1, 1).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let job = &claimed[0];
+    assert!(job.claim.claim_batch_id.is_some());
+
+    // A dead-letter closer writes no done row, so no unique key stops a
+    // second disposition; only the attempt lock serializes the two.
+    let mut closer = pool.begin().await.unwrap();
+    let dead_lettered = store
+        .fail_to_dlq_in_tx_with_claim(
+            &mut closer,
+            job.job.id,
+            job.job.run_lease,
+            "closer",
+            "closer",
+            None,
+            Some(&job.claim),
+        )
+        .await
+        .unwrap();
+    assert!(dead_lettered.is_some());
+
+    let cancelled =
+        tokio::time::timeout(Duration::from_secs(10), store.cancel_job(&pool, job.job.id))
+            .await
+            .expect("cancel returns while the closer is open")
+            .unwrap();
+    assert!(
+        cancelled.is_none(),
+        "cancel must not close an attempt another closer is finishing"
+    );
+    closer.commit().await.unwrap();
+
+    let closures: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.lease_claim_closure_batches \
+         WHERE claim_slot = $1 AND receipt_ranges @> $2::bigint"
+    )))
+    .bind(job.claim.claim_slot)
+    .bind(job.claim.receipt_id.unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(closures, 1, "one durable closure per receipt");
+    let done: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.done_entries WHERE job_id = $1"
+    )))
+    .bind(job.job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(done, 0, "a dead-lettered attempt gets no cancelled row");
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
     let (_db_guard, pool) = setup_pool(8).await;
     let schema = "awa_qs_deleted_lease_prune";
