@@ -50,6 +50,81 @@ AS $canonical$
     WHERE p_schema = 'awa'
 $canonical$;
 
+-- Why p_schema is not trusted for a migrator refresh, one row per rule and
+-- object. Trusted owners are the awa schema owner and the current role;
+-- superusers pass every pg_has_role check, so authority is identity here.
+-- Sequences are exempt from the ownership rule: they run no code.
+CREATE OR REPLACE FUNCTION awa.queue_storage_schema_trust_violations(p_schema TEXT)
+RETURNS TABLE (rule TEXT, object TEXT)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $violations$
+    WITH trusted_owners AS (
+        SELECT nspowner AS owner FROM pg_namespace WHERE nspname = 'awa'
+        UNION
+        SELECT oid FROM pg_roles WHERE rolname = current_user
+    ),
+    target AS (
+        SELECT oid, nspname, nspowner, nspacl FROM pg_namespace WHERE nspname = p_schema
+    )
+    SELECT 'reserved schema', format('schema %I', target.nspname)
+    FROM target
+    WHERE target.nspname IN ('public', 'information_schema') OR target.nspname ~ '^pg_'
+    UNION ALL
+    SELECT format('owned by %s', pg_get_userbyid(target.nspowner)), format('schema %I', target.nspname)
+    FROM target
+    WHERE target.nspowner NOT IN (SELECT owner FROM trusted_owners)
+    UNION ALL
+    SELECT format('CREATE granted to %s',
+                  CASE privilege.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(privilege.grantee) END),
+           format('schema %I', target.nspname)
+    FROM target
+    CROSS JOIN LATERAL aclexplode(COALESCE(target.nspacl, acldefault('n', target.nspowner))) AS privilege
+    WHERE privilege.privilege_type = 'CREATE'
+      AND privilege.grantee NOT IN (SELECT owner FROM trusted_owners)
+    UNION ALL
+    SELECT format('owned by %s', pg_get_userbyid(relation.relowner)),
+           format('relation %I.%I', target.nspname, relation.relname)
+    FROM target
+    JOIN pg_class AS relation ON relation.relnamespace = target.oid
+    WHERE relation.relkind <> 'S'
+      AND relation.relowner NOT IN (SELECT owner FROM trusted_owners)
+    UNION ALL
+    SELECT format('owned by %s', pg_get_userbyid(routine.proowner)),
+           format('function %s', routine.oid::regprocedure)
+    FROM target
+    JOIN pg_proc AS routine ON routine.pronamespace = target.oid
+    WHERE routine.proowner NOT IN (SELECT owner FROM trusted_owners)
+    UNION ALL
+    SELECT format('owned by %s', pg_get_userbyid(data_type.typowner)),
+           format('type %s', data_type.oid::regtype)
+    FROM target
+    JOIN pg_type AS data_type ON data_type.typnamespace = target.oid
+    WHERE data_type.typowner NOT IN (SELECT owner FROM trusted_owners)
+    UNION ALL
+    SELECT format('TRIGGER granted to %s',
+                  CASE privilege.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(privilege.grantee) END),
+           format('relation %I.%I', target.nspname, relation.relname)
+    FROM target
+    JOIN pg_class AS relation ON relation.relnamespace = target.oid
+    CROSS JOIN LATERAL aclexplode(COALESCE(relation.relacl, acldefault('r', relation.relowner))) AS privilege
+    WHERE relation.relkind <> 'S'
+      AND privilege.privilege_type = 'TRIGGER'
+      AND privilege.grantee NOT IN (SELECT owner FROM trusted_owners)
+    UNION ALL
+    SELECT 'not a trigger awa installs',
+           format('trigger %I on %I.%I', trigger.tgname, target.nspname, relation.relname)
+    FROM target
+    JOIN pg_class AS relation ON relation.relnamespace = target.oid
+    JOIN pg_trigger AS trigger ON trigger.tgrelid = relation.oid
+    WHERE NOT trigger.tgisinternal
+      AND pg_get_triggerdef(trigger.oid) NOT IN (
+          SELECT awa.queue_storage_canonical_triggers(target.nspname)
+      )
+$violations$;
+
 CREATE OR REPLACE FUNCTION awa.queue_storage_schema_is_trusted(p_schema TEXT)
 RETURNS BOOLEAN
 LANGUAGE sql
@@ -57,62 +132,27 @@ STABLE
 SECURITY INVOKER
 SET search_path = pg_catalog, pg_temp
 AS $trusted$
-    WITH trusted_owners AS (
-        SELECT nspowner AS owner FROM pg_namespace WHERE nspname = 'awa'
-        UNION
-        SELECT oid FROM pg_roles WHERE rolname = current_user
-    )
-    SELECT NOT EXISTS (
-        SELECT 1 FROM pg_namespace AS namespace
-        WHERE namespace.nspname = p_schema
-          AND (
-              namespace.nspname IN ('public', 'information_schema')
-              OR namespace.nspname ~ '^pg_'
-              -- Superusers pass every pg_has_role check; authority is identity here.
-              OR namespace.nspowner NOT IN (SELECT owner FROM trusted_owners)
-              OR EXISTS (
-                  SELECT 1
-                  FROM aclexplode(COALESCE(namespace.nspacl,
-                                          acldefault('n', namespace.nspowner))) AS privilege
-                  WHERE privilege.privilege_type = 'CREATE'
-                    AND privilege.grantee NOT IN (SELECT owner FROM trusted_owners)
-              )
-              OR EXISTS (
-                  SELECT 1 FROM pg_class AS relation
-                  WHERE relation.relnamespace = namespace.oid
-                    AND relation.relowner NOT IN (SELECT owner FROM trusted_owners)
-              )
-              OR EXISTS (
-                  SELECT 1 FROM pg_proc AS routine
-                  WHERE routine.pronamespace = namespace.oid
-                    AND routine.proowner NOT IN (SELECT owner FROM trusted_owners)
-              )
-              OR EXISTS (
-                  SELECT 1 FROM pg_type AS data_type
-                  WHERE data_type.typnamespace = namespace.oid
-                    AND data_type.typowner NOT IN (SELECT owner FROM trusted_owners)
-              )
-              OR EXISTS (
-                  SELECT 1 FROM pg_class AS relation
-                  CROSS JOIN LATERAL aclexplode(COALESCE(relation.relacl,
-                      acldefault('r', relation.relowner))) AS privilege
-                  WHERE relation.relnamespace = namespace.oid
-                    AND privilege.privilege_type = 'TRIGGER'
-                    AND privilege.grantee NOT IN (SELECT owner FROM trusted_owners)
-              )
-              OR EXISTS (
-                  SELECT 1
-                  FROM pg_trigger AS trigger
-                  JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
-                  WHERE relation.relnamespace = namespace.oid
-                    AND NOT trigger.tgisinternal
-                    AND pg_get_triggerdef(trigger.oid) NOT IN (
-                        SELECT awa.queue_storage_canonical_triggers(namespace.nspname)
-                    )
-              )
-          )
-    )
+    SELECT NOT EXISTS (SELECT 1 FROM awa.queue_storage_schema_trust_violations(p_schema))
 $trusted$;
+
+-- The first few violations for p_schema as one line, for error text.
+CREATE OR REPLACE FUNCTION awa.queue_storage_schema_trust_summary(p_schema TEXT)
+RETURNS TEXT
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp
+AS $summary$
+    WITH violation AS (
+        SELECT rule, object, count(*) OVER () AS total,
+               row_number() OVER (ORDER BY object, rule) AS position
+        FROM awa.queue_storage_schema_trust_violations(p_schema)
+    )
+    SELECT string_agg(format('%s %s', object, rule), '; ' ORDER BY position)
+           || CASE WHEN max(total) > 5 THEN format('; and %s more', max(total) - 5) ELSE '' END
+    FROM violation
+    WHERE position <= 5
+$summary$;
 
 CREATE OR REPLACE FUNCTION awa.queue_storage_schemas()
 RETURNS TABLE (schema_name TEXT)
@@ -121,10 +161,10 @@ STABLE
 SECURITY INVOKER
 SET search_path = pg_catalog, pg_temp
 AS $discover$
-    SELECT namespace.nspname::text
+    WITH candidate AS MATERIALIZED (
+    SELECT namespace.nspname::text AS schema_name
     FROM pg_namespace AS namespace
     WHERE has_schema_privilege(current_user, namespace.oid, 'USAGE')
-      AND awa.queue_storage_schema_is_trusted(namespace.nspname)
       AND EXISTS (
           SELECT 1 FROM pg_proc AS claim_fn
           WHERE claim_fn.pronamespace = namespace.oid
@@ -142,20 +182,28 @@ AS $discover$
             AND ring.relname IN ('queue_ring_state', 'lease_ring_state', 'claim_ring_state')
             AND ring.relkind <> 'r'
       )
-    ORDER BY namespace.nspname
+    )
+    SELECT candidate.schema_name
+    FROM candidate
+    WHERE awa.queue_storage_schema_is_trusted(candidate.schema_name)
+    ORDER BY candidate.schema_name
 $discover$;
 
 -- Default-substrate refreshes precede discovery in some migration bundles.
 DO $preflight$
 DECLARE
     configured_schema TEXT;
+    skipped_schema TEXT;
+    configured_schemas TEXT[];
 BEGIN
     IF NOT awa.queue_storage_schema_is_trusted('awa') THEN
-        RAISE EXCEPTION 'unsafe ownership or privileges in the awa schema'
+        RAISE EXCEPTION 'unsafe ownership or privileges in the awa schema: %. Nothing was migrated; see "Custom-schema discovery during migration" in the 0.6 to 0.7 upgrade guide',
+            awa.queue_storage_schema_trust_summary('awa')
             USING ERRCODE = '42501',
                   HINT = 'Use the migration role or awa schema owner for schema objects; remove foreign-owned objects, triggers awa did not install, and untrusted CREATE or TRIGGER grants before migrating.';
     END IF;
-    FOR configured_schema IN
+    SELECT array_agg(DISTINCT schema_name) INTO configured_schemas
+    FROM (
         SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'
         UNION
         SELECT NULLIF(details->>'schema', '') FROM awa.storage_transition_state
@@ -164,13 +212,32 @@ BEGIN
         -- Legacy SQL activation used awa_exp for an unnamed prepared backend.
         SELECT 'awa_exp' FROM awa.storage_transition_state
         WHERE prepared_engine = 'queue_storage' AND NULLIF(details->>'schema', '') IS NULL
-    LOOP
-        IF configured_schema IS NOT NULL
-           AND NOT awa.queue_storage_schema_is_trusted(configured_schema) THEN
-            RAISE EXCEPTION 'unsafe configured queue-storage schema: %', configured_schema
+    ) AS configured
+    WHERE schema_name IS NOT NULL;
+    FOREACH configured_schema IN ARRAY COALESCE(configured_schemas, ARRAY[]::TEXT[]) LOOP
+        IF NOT awa.queue_storage_schema_is_trusted(configured_schema) THEN
+            RAISE EXCEPTION 'unsafe configured queue-storage schema: %: %. The global schema version has not advanced; see "Custom-schema discovery during migration" in the 0.6 to 0.7 upgrade guide',
+                configured_schema, awa.queue_storage_schema_trust_summary(configured_schema)
                 USING ERRCODE = '42501',
                       HINT = 'Review the registered/prepared substrate ownership and grants before upgrading; the global schema version has not advanced.';
         END IF;
+    END LOOP;
+    FOR skipped_schema IN
+        SELECT namespace.nspname
+        FROM pg_namespace AS namespace
+        WHERE namespace.nspname <> 'awa'
+          AND namespace.nspname <> ALL (COALESCE(configured_schemas, ARRAY[]::TEXT[]))
+          AND has_schema_privilege(current_user, namespace.oid, 'USAGE')
+          AND EXISTS (
+              SELECT 1 FROM pg_proc AS claim_fn
+              WHERE claim_fn.pronamespace = namespace.oid
+                AND claim_fn.proname = 'claim_ready_runtime'
+          )
+          AND NOT awa.queue_storage_schema_is_trusted(namespace.nspname)
+        ORDER BY namespace.nspname
+    LOOP
+        RAISE WARNING 'skipping untrusted queue-storage schema %: %; it will not be upgraded',
+            skipped_schema, awa.queue_storage_schema_trust_summary(skipped_schema);
     END LOOP;
 END
 $preflight$;

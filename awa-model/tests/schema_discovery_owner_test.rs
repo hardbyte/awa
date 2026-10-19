@@ -213,6 +213,17 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
             .contains(&OWNED_SCHEMA.into()),
         "a foreign TRIGGER grant must be rejected before another trigger is planted"
     );
+    let summary: String = sqlx::query_scalar(audited_sql(format!(
+        "SELECT awa.queue_storage_schema_trust_summary('{OWNED_SCHEMA}')"
+    )))
+    .fetch_one(&migrator_pool)
+    .await?;
+    assert!(
+        summary.contains(&format!(
+            "relation {OWNED_SCHEMA}.queue_ring_state TRIGGER granted to {outsider}"
+        )),
+        "the refusal names the object and the rule: {summary}"
+    );
     outsider_pool
         .execute(sqlx::raw_sql(audited_sql(format!(
             "CREATE TRIGGER foreign_trigger BEFORE INSERT ON {OWNED_SCHEMA}.queue_ring_state \
@@ -238,6 +249,26 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
     assert!(hardened_discovery(&migrator_pool)
         .await?
         .contains(&OWNED_SCHEMA.into()));
+
+    // A sequence runs no code, so another role owning one is accepted; 0.6
+    // runtimes created their own lane sequences.
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "CREATE SEQUENCE {OWNED_SCHEMA}.outsider_lane_seq; \
+             ALTER SEQUENCE {OWNED_SCHEMA}.outsider_lane_seq OWNER TO {outsider}"
+        ))))
+        .await?;
+    assert!(
+        hardened_discovery(&migrator_pool)
+            .await?
+            .contains(&OWNED_SCHEMA.into()),
+        "a foreign-owned sequence must not make the schema untrusted"
+    );
+    superuser_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "DROP SEQUENCE {OWNED_SCHEMA}.outsider_lane_seq"
+        ))))
+        .await?;
 
     outsider_pool
         .execute(sqlx::raw_sql(audited_sql(format!(
