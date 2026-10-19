@@ -2608,6 +2608,61 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ledger_rotation_does_not_wait_for_the_ring_state_row() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_ledger_rotate_nolock";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The assertion is about ledger authority; make that explicit rather than
+    // depending on when the maintenance auto-flip happens to run.
+    let flipped = storage::flip_ring_authority(&pool, schema, false)
+        .await
+        .expect("flip to ledger authority");
+    assert_eq!(flipped, "ledger");
+    // Rotate through connections that refuse to wait on a lock, so the test
+    // tells "did not wait" from "was slow" regardless of host load.
+    let impatient = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '3s'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .unwrap();
+    let outcome = store
+        .rotate(&impatient)
+        .await
+        .expect("a ledger-mode rotation must not queue behind the ring-state row lock");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedIdle { .. }),
+        "an empty ring reports idle, got {outcome:?}"
+    );
+    holder.rollback().await.unwrap();
+    impatient.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_change() {
     let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_cadence_observed_age";

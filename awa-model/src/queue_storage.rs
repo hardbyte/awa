@@ -4210,12 +4210,16 @@ impl QueueStorage {
     /// commit. In compat mode this singleton lock is also the SAME row lock a
     /// live 0.6 rotator takes, so 0.7 and 0.6 rotators serialize.
     ///
-    /// In ledger authority it ADDITIONALLY takes the non-blocking per-ring
-    /// `pg_try_advisory_xact_lock` so a periodic rotate skips under
-    /// contention with prune/rollup instead of queueing; `Ok((_, false))`
-    /// means "skip this tick". (Holding the singleton momentarily in ledger
-    /// mode is a cold, uncontended write-free row-share and does not
-    /// reintroduce the churn — nothing UPDATEs the singleton in ledger mode.)
+    /// In ledger authority the non-blocking per-ring
+    /// `pg_try_advisory_xact_lock` is the whole serializer, so a periodic
+    /// rotate skips under contention with prune/rollup instead of queueing;
+    /// `Ok((_, false))` means "skip this tick". The singleton row is not
+    /// locked in ledger mode: a row lock writes a heap lock record and a
+    /// commit record per tick even when nothing rotates, and ledger authority
+    /// is one-way, so a ledger reading taken without the row lock is final.
+    /// Compat authority keeps the row lock as the outer gate, taken before
+    /// the authority is read, which is what lets the flip exclude in-flight
+    /// compat rotators.
     async fn acquire_ring_serializer_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4224,16 +4228,21 @@ impl QueueStorage {
         let schema = self.schema();
         let state = family.state_relname();
 
-        // Universal outer gate: serialize against the flip and against 0.6
-        // rotators, BEFORE reading the authority.
-        sqlx::query(audited_sql(format!(
-            "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
-        )))
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let authority = self.ring_authority_tx(tx).await?;
+        let authority = match self.ring_authority_tx(tx).await? {
+            RingAuthority::Ledger => RingAuthority::Ledger,
+            RingAuthority::Columns => {
+                // Serialize against the flip and against 0.6 rotators, then
+                // re-read the authority under the lock: a rotator that
+                // loses the race to the flip sees `ledger` here.
+                sqlx::query(audited_sql(format!(
+                    "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
+                )))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                self.ring_authority_tx(tx).await?
+            }
+        };
 
         match authority {
             RingAuthority::Columns => Ok((authority, true)),
