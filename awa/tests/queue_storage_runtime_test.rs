@@ -14139,7 +14139,9 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let store = Arc::new(
         create_store(&pool, schema)
             .await
-            .with_prune_lock_timeout(Duration::from_secs(5))
+            // Well above the reader's handoff time on a loaded server; the
+            // test is about lock order, not the timeout.
+            .with_prune_lock_timeout(Duration::from_secs(60))
             .expect("prune lock timeout"),
     );
     store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
@@ -14161,7 +14163,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let prune_pool = pool.clone();
     let prune =
         tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let waiting: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = $1::regclass AND mode = 'AccessExclusiveLock' AND NOT granted)",
@@ -14187,7 +14189,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     .await
     .expect("a segment reader must finish acquiring the claim relations while prune waits");
     reader.commit().await.unwrap();
-    let outcome = tokio::time::timeout(Duration::from_secs(2), prune)
+    let outcome = tokio::time::timeout(Duration::from_secs(30), prune)
         .await
         .unwrap()
         .unwrap()
