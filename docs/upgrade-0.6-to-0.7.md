@@ -23,6 +23,21 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
+## v052: enqueue round trips
+
+v052 replaces functions only. `reserve_enqueue_seq` keeps its signature, lane
+lock and return value, so earlier 0.7 binaries and SQL producers
+(`insert_job_compat`) run unchanged on the migrated schema. A new
+`{schema}.enqueue_ready_rows` lets current runtimes enqueue a ready batch in
+one statement; they probe for it once per store and keep the multi-statement
+path on a schema without it, so deploying binaries before migrating is safe. A
+running binary uses the function after its next restart. Runtimes need
+`EXECUTE` on the new function, which the default privileges in
+[Database roles](security/database-roles.md#runtime-grants) grant; without it
+they also keep the multi-statement path. External runners must apply the
+complete generated `awa migrate --sql` bundle, which redefines the installer
+before refreshing the installed schemas.
+
 ## Custom-schema discovery during migration
 
 Migration bundles discover custom substrates using catalog metadata without
