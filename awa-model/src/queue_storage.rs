@@ -4200,32 +4200,6 @@ impl QueueStorage {
         .map_err(map_sqlx_error)
     }
 
-    /// Acquire the per-ring rotate ↔ prune ↔ delta-rollup serializer AND
-    /// resolve the authority under it, in one step.
-    ///
-    /// The ring-state singleton `FOR UPDATE` is taken FIRST, unconditionally,
-    /// as the universal outer gate. This is load-bearing for the #371 staged
-    /// upgrade: the one-way flip (`awa.flip_ring_authority`) also takes the
-    /// three singletons `FOR UPDATE` before promoting the authority, so
-    /// taking the singleton before reading the authority closes the TOCTOU
-    /// where a rotator reads `columns`, the flip commits, and the rotator
-    /// then advances under the stale mode (a `MixedFleet` violation the
-    /// `AwaStorageLockOrder` model flags). Whoever wins the singleton wins:
-    /// a rotator that loses the race to the flip reads `ledger` here and runs
-    /// the ledger path; the flip that loses to a rotator waits for it to
-    /// commit. In compat mode this singleton lock is also the SAME row lock a
-    /// live 0.6 rotator takes, so 0.7 and 0.6 rotators serialize.
-    ///
-    /// In ledger authority the non-blocking per-ring
-    /// `pg_try_advisory_xact_lock` is the whole serializer, so a periodic
-    /// rotate skips under contention with prune/rollup instead of queueing;
-    /// `Ok((_, false))` means "skip this tick". The singleton row is not
-    /// locked in ledger mode: a row lock writes a heap lock record and a
-    /// commit record per tick even when nothing rotates, and ledger authority
-    /// is one-way, so a ledger reading taken without the row lock is final.
-    /// Compat authority keeps the row lock as the outer gate, taken before
-    /// the authority is read, which is what lets the flip exclude in-flight
-    /// compat rotators.
     /// Wait for the per-ring rotation advisory locks, in a fixed ring order.
     /// Whole-schema operations (reset, counter rebuild) take these before any
     /// row or table lock, so in ledger authority, where rotate, prune and the
@@ -4247,6 +4221,25 @@ impl QueueStorage {
         Ok(())
     }
 
+    /// Acquire the per-ring rotate ↔ prune ↔ delta-rollup serializer and
+    /// resolve the authority under it.
+    ///
+    /// In compat (`columns`) authority the ring-state singleton `FOR UPDATE`
+    /// is the serializer. It is taken before the authority is re-read: the
+    /// one-way flip (`awa.flip_ring_authority`) takes the same three
+    /// singletons before promoting the authority, so a rotator that loses the
+    /// race to the flip reads `ledger` under the lock and runs the ledger
+    /// path, and a flip that loses waits for the rotator to commit. The same
+    /// row lock is the one a 0.6 rotator takes, so mixed-version rotators
+    /// serialize.
+    ///
+    /// In ledger authority the non-blocking per-ring
+    /// `pg_try_advisory_xact_lock` is the whole serializer, so a periodic
+    /// rotate skips under contention with prune or rollup instead of
+    /// queueing. `Ok((_, false))` means "skip this tick". The singleton row
+    /// is not locked: a row lock writes a heap lock record and a commit
+    /// record per tick even when nothing rotates, and because the flip is
+    /// one-way a `ledger` reading taken without the row lock is final.
     async fn acquire_ring_serializer_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
