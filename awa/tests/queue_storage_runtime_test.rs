@@ -13068,6 +13068,60 @@ async fn test_terminal_deltas_are_per_lane_after_the_flip() {
     }
 }
 
+/// A flip seen inside a caller's transaction that then rolls back must not
+/// change how later transactions bucket their deltas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_delta_bucketing_ignores_a_rolled_back_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rolled_back_flip";
+    let schema = "awa_qs_terminal_delta_rolled_back_flip";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim");
+    let job = claimed[0].job.clone();
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.ring_cursor_authority SET authority = 'ledger' WHERE singleton"
+    )))
+    .execute(tx.as_mut())
+    .await
+    .unwrap();
+    store
+        .fail_terminal_in_tx(&mut tx, job.id, job.run_lease, "boom", None)
+        .await
+        .expect("fail in the caller's transaction")
+        .expect("running job fails");
+    tx.rollback().await.unwrap();
+
+    store
+        .fail_terminal(&pool, job.id, job.run_lease, "boom", None)
+        .await
+        .expect("fail")
+        .expect("running job fails");
+    let buckets: Vec<i16> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT counter_bucket FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected = (job.id.rem_euclid(256)) as i16;
+    assert_ne!(expected, 0, "the test needs a job outside bucket 0");
+    assert_eq!(
+        buckets,
+        vec![expected],
+        "columns authority keeps the job-id bucket after a rolled-back flip"
+    );
+}
+
 /// Terminal-count rollup mutates `queue_terminal_live_counts`, so it should
 /// stand down while another backend is pinning the MVCC horizon. Exact reads
 /// remain correct because they include pending delta rows.
