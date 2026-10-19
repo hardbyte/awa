@@ -239,13 +239,30 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
         .await?
         .contains(&OWNED_SCHEMA.into()));
 
-    assert_foreign_when_clause_is_rejected(
-        &migrator_pool,
-        &superuser_pool,
-        &outsider_pool,
-        outsider,
-    )
-    .await?;
+    outsider_pool
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "CREATE FUNCTION {DECOY_SCHEMA}.tripwire_when() RETURNS BOOLEAN LANGUAGE plpgsql AS $when$ \
+             BEGIN INSERT INTO {DECOY_SCHEMA}.tripwire VALUES (current_user); RETURN FALSE; END $when$;"
+        ))))
+        .await?;
+    for when_expression in [
+        format!("{DECOY_SCHEMA}.tripwire_when()"),
+        // pg_depend records no dependency on the foreign function here: it is
+        // only text, and pinned catalog functions are never recorded.
+        format!(
+            "pg_catalog.query_to_xml('SELECT {DECOY_SCHEMA}.tripwire_when()', true, false, '') \
+             IS NULL"
+        ),
+    ] {
+        assert_foreign_when_clause_is_rejected(
+            &migrator_pool,
+            &superuser_pool,
+            &outsider_pool,
+            outsider,
+            &when_expression,
+        )
+        .await?;
+    }
 
     assert_configured_substrates_fail_closed(&migrator_pool, &superuser_pool, outsider).await?;
 
@@ -371,13 +388,8 @@ async fn assert_foreign_when_clause_is_rejected(
     superuser_pool: &PgPool,
     outsider_pool: &PgPool,
     outsider: &str,
+    when_expression: &str,
 ) -> TestResult {
-    outsider_pool
-        .execute(sqlx::raw_sql(audited_sql(format!(
-            "CREATE FUNCTION {DECOY_SCHEMA}.tripwire_when() RETURNS BOOLEAN LANGUAGE plpgsql AS $when$ \
-             BEGIN INSERT INTO {DECOY_SCHEMA}.tripwire VALUES (current_user); RETURN FALSE; END $when$;"
-        ))))
-        .await?;
     superuser_pool
         .execute(sqlx::raw_sql(audited_sql(format!(
             "GRANT TRIGGER ON {OWNED_SCHEMA}.queue_ring_state TO {outsider}"
@@ -387,7 +399,7 @@ async fn assert_foreign_when_clause_is_rejected(
         .execute(sqlx::raw_sql(audited_sql(format!(
             "CREATE TRIGGER foreign_when BEFORE INSERT OR UPDATE OR DELETE \
              ON {OWNED_SCHEMA}.queue_ring_state FOR EACH ROW \
-             WHEN ({DECOY_SCHEMA}.tripwire_when()) \
+             WHEN ({when_expression}) \
              EXECUTE FUNCTION {OWNED_SCHEMA}.reject_compat_ring_cursor_update_after_flip()"
         ))))
         .await?;
@@ -401,7 +413,8 @@ async fn assert_foreign_when_clause_is_rejected(
         !hardened_discovery(migrator_pool)
             .await?
             .contains(&OWNED_SCHEMA.into()),
-        "a trusted trigger routine with a foreign WHEN expression must make the schema untrusted"
+        "a trusted trigger routine with a foreign WHEN expression must make the schema untrusted: \
+         {when_expression}"
     );
 
     migrator_pool
