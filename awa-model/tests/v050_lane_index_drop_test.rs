@@ -134,6 +134,37 @@ async fn exercise(options: PgConnectOptions, owner: &str, outsider: &str) -> Tes
     );
     assert_eq!(lane_indexes(&superuser_pool, DECOY_SCHEMA).await?, 1);
 
+    let mut reader = owner_pool.begin().await?;
+    reader
+        .execute(sqlx::raw_sql(audited_sql(format!(
+            "LOCK TABLE {LEGIT_SCHEMA}.ready_entries_1 IN ACCESS SHARE MODE"
+        ))))
+        .await?;
+    superuser_pool.execute("SET lock_timeout = '200ms'").await?;
+    let mut timed_out = None;
+    for (_, _, statement) in migrations::migration_sql_range(49, 50) {
+        if let Err(error) = superuser_pool
+            .execute(sqlx::raw_sql(audited_sql(statement)))
+            .await
+        {
+            timed_out = Some(error);
+            break;
+        }
+    }
+    let error = timed_out.expect("v050 must not wait past lock_timeout");
+    let database_error = error.as_database_error().expect("a database error");
+    assert_eq!(database_error.code().as_deref(), Some("55P03"));
+    assert!(
+        database_error
+            .message()
+            .contains(&format!("{LEGIT_SCHEMA}.ready_entries_1"))
+            && database_error.message().contains("re-run"),
+        "the timeout names the partition and says the step can be re-run: {}",
+        database_error.message()
+    );
+    reader.rollback().await?;
+    superuser_pool.execute("RESET lock_timeout").await?;
+
     for (_, _, statement) in migrations::migration_sql_range(49, 50) {
         superuser_pool
             .execute(sqlx::raw_sql(audited_sql(statement)))
