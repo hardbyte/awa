@@ -4143,9 +4143,15 @@ async fn test_newer_schema_guard_leaves_normal_paths_untouched() {
         .execute(&pool)
         .await
         .expect("drop the newest version row to simulate a one-behind schema");
+    let previous_version = migrations::migration_sql()
+        .iter()
+        .map(|(version, _, _)| *version)
+        .filter(|version| *version < migrations::CURRENT_VERSION)
+        .max()
+        .expect("a migration precedes CURRENT_VERSION");
     assert_eq!(
         migrations::current_version(&pool).await.unwrap(),
-        migrations::CURRENT_VERSION - 1
+        previous_version
     );
     migrations::run(&pool)
         .await
