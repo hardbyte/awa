@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -2816,6 +2816,10 @@ pub struct QueueStorage {
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
+    /// Set once the enqueue path has read `ledger` ring authority. The flip
+    /// to ledger is one-way, so later enqueue cursor reads go straight to
+    /// the ledger. Cleared by `prepare_schema` and `reset`.
+    enqueue_ledger_authority: AtomicBool,
 }
 
 impl QueueStorage {
@@ -2862,6 +2866,7 @@ impl QueueStorage {
             ensured_lanes: Mutex::new(HashSet::new()),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
+            enqueue_ledger_authority: AtomicBool::new(false),
         })
     }
 
@@ -3267,6 +3272,7 @@ impl QueueStorage {
     /// upgrade get built; the rest are no-ops.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prepare_schema")]
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
+        self.forget_schema_observations();
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
         let mut install_tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -3807,6 +3813,7 @@ impl QueueStorage {
         // Clear the caches so the next ensure_lane / shard_for_enqueue /
         // claim calls re-observe DB state.
         self.clear_lane_cache();
+        self.forget_schema_observations();
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
@@ -3858,6 +3865,23 @@ impl QueueStorage {
             self.invalidate_cached_lane(queue, priority, enqueue_shard);
         }
 
+        self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
+            .await
+    }
+
+    /// Lane rows for a caller that reserves through `advance_enqueue_head`
+    /// next. A cached lane needs no visibility probe here: the reserve reads
+    /// the head row itself and repairs a stale cache entry when it is missing.
+    async fn ensure_lane_for_reserve<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+    ) -> Result<(), AwaError> {
+        if self.lane_is_cached(queue, priority, enqueue_shard) {
+            return Ok(());
+        }
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
             .await
     }
@@ -4057,6 +4081,11 @@ impl QueueStorage {
             .lock()
             .expect("ensured_lanes mutex")
             .remove(&(queue.to_string(), priority, enqueue_shard));
+    }
+
+    fn forget_schema_observations(&self) {
+        self.enqueue_ledger_authority
+            .store(false, Ordering::Release);
     }
 
     fn clear_lane_cache(&self) {
@@ -4344,13 +4373,22 @@ impl QueueStorage {
 
     /// Current queue-ring cursor for the Rust-side enqueue paths, honouring
     /// the schema's authority (#371 staged upgrade). Reads the authority row
-    /// (single cached page) then the O(1) cursor; callers that already hold
-    /// an authority for the transaction should use `ring_cursor_tx` directly.
+    /// until it has seen `ledger`, then only the O(1) ledger cursor; callers
+    /// that already hold an authority for the transaction should use
+    /// `ring_cursor_tx` directly.
     async fn current_queue_ring<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     ) -> Result<(i32, i64), AwaError> {
-        let authority = self.ring_authority_tx(tx).await?;
+        let authority = if self.enqueue_ledger_authority.load(Ordering::Acquire) {
+            RingAuthority::Ledger
+        } else {
+            let authority = self.ring_authority_tx(tx).await?;
+            if authority == RingAuthority::Ledger {
+                self.enqueue_ledger_authority.store(true, Ordering::Release);
+            }
+            authority
+        };
         self.ring_cursor_tx(tx, RingFamily::Queue, authority).await
     }
 
@@ -4898,7 +4936,7 @@ impl QueueStorage {
                 .await?;
         }
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+            self.ensure_lane_for_reserve(tx, &queue, priority, enqueue_shard)
                 .await?;
 
             let count = (range_end - range_start) as i64;
@@ -5048,7 +5086,7 @@ impl QueueStorage {
                 .await?;
         }
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+            self.ensure_lane_for_reserve(tx, &queue, priority, enqueue_shard)
                 .await?;
 
             let count = (range_end - range_start) as i64;
@@ -5115,7 +5153,7 @@ impl QueueStorage {
             // retries must re-enqueue with the original key from the
             // application layer.
             let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue, None).await?;
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+            self.ensure_lane_for_reserve(tx, &queue, priority, enqueue_shard)
                 .await?;
 
             let count = lane_rows.len() as i64;
