@@ -281,8 +281,8 @@ exposes `queue_storage_rotate_min_slot_age_ms` and
 and `queue_storage_rotate_max_slot_age_ms` (row floor before the age window seals,
 and the ceiling that seals regardless). A zero byte target disables the size
 trigger, a zero row floor disables the floor, and a zero maximum age disables the
-ceiling. A row floor needs a size target or a ceiling, and the client refuses to
-build without one: lease rows are deleted as attempts finish, so a lease slot may
+ceiling. A row floor needs a size target or a ceiling, and a queue-storage client
+refuses to build without one: lease rows are deleted as attempts finish, so a lease slot may
 never reach the floor. A zero minimum age, or Rust `RingRotationCadence::EAGER`,
 permits sealing each tick whatever the other settings.
 Rust cadence and claim-interval overrides survive `queue_storage` calls in either order.

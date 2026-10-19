@@ -942,8 +942,8 @@ impl ClientBuilder {
     /// queue, lease and claim rings (default
     /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling
     /// once the slot holds 256 rows, a 2 MiB physical-size target, or 60
-    /// seconds regardless of rows). A row floor needs a size target or an
-    /// age ceiling, or [`Self::build`] fails: lease rows are deleted as
+    /// seconds regardless of rows). With queue storage, a row floor needs a
+    /// size target or an age ceiling, or [`Self::build`] fails: lease rows are deleted as
     /// attempts finish, so a lease slot may never reach the floor. The rotate
     /// intervals set how often the decision is made; the cadence decides
     /// whether a slot that holds rows is sealed on that tick. Use
@@ -1020,7 +1020,19 @@ impl ClientBuilder {
         }
 
         if let RuntimeStorage::QueueStorage(runtime) = &mut self.storage {
-            runtime.rotation_cadence = self.ring_rotation_cadence;
+            let cadence = self.ring_rotation_cadence;
+            if !cadence.min_slot_age.is_zero()
+                && cadence.min_slot_rows > 0
+                && cadence.max_slot_age.is_zero()
+                && cadence.target_slot_bytes == 0
+            {
+                return Err(BuildError::InvalidQueueStorage(
+                    "ring_rotation_cadence: min_slot_rows needs max_slot_age or target_slot_bytes, \
+                     otherwise a slot whose rows are deleted may never seal"
+                        .into(),
+                ));
+            }
+            runtime.rotation_cadence = cadence;
             if let Some(interval) = self.claim_rotate_interval {
                 runtime.claim_rotate_interval = interval;
             }
@@ -1077,18 +1089,6 @@ impl ClientBuilder {
             .is_some_and(|interval| interval.is_zero())
         {
             return Err(BuildError::InvalidTerminalCountRollupInterval);
-        }
-        let cadence = self.ring_rotation_cadence;
-        if !cadence.min_slot_age.is_zero()
-            && cadence.min_slot_rows > 0
-            && cadence.max_slot_age.is_zero()
-            && cadence.target_slot_bytes == 0
-        {
-            return Err(BuildError::InvalidQueueStorage(
-                "ring_rotation_cadence: min_slot_rows needs max_slot_age or target_slot_bytes, \
-                 otherwise a slot whose rows are deleted may never seal"
-                    .into(),
-            ));
         }
 
         // Validate weighted mode constraints
@@ -3403,17 +3403,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotation_row_floor_requires_a_ceiling() {
+    async fn rotation_row_floor_requires_a_ceiling_under_queue_storage() {
         let unbounded = RingRotationCadence {
             max_slot_age: Duration::ZERO,
             target_slot_bytes: 0,
             ..RingRotationCadence::DEFAULT
         };
-        let result = Client::builder(lazy_pool())
-            .queue("default", QueueConfig::default())
-            .ring_rotation_cadence(unbounded)
-            .build();
-        assert!(matches!(result, Err(BuildError::InvalidQueueStorage(_))));
+        let build = |cadence: RingRotationCadence, queue_storage: bool| {
+            let builder = Client::builder(lazy_pool())
+                .queue("default", QueueConfig::default())
+                .ring_rotation_cadence(cadence);
+            let builder = if queue_storage {
+                builder.queue_storage(
+                    QueueStorageConfig {
+                        schema: "builder_rotation_floor".into(),
+                        ..Default::default()
+                    },
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+            } else {
+                builder.canonical_storage()
+            };
+            builder.build()
+        };
+        assert!(matches!(
+            build(unbounded, true),
+            Err(BuildError::InvalidQueueStorage(_))
+        ));
+        assert!(
+            build(unbounded, false).is_ok(),
+            "canonical storage ignores the cadence"
+        );
 
         for bounded in [
             RingRotationCadence {
@@ -3429,11 +3450,7 @@ mod tests {
                 ..unbounded
             },
         ] {
-            assert!(Client::builder(lazy_pool())
-                .queue("default", QueueConfig::default())
-                .ring_rotation_cadence(bounded)
-                .build()
-                .is_ok());
+            assert!(build(bounded, true).is_ok());
         }
     }
 
