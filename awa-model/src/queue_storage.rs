@@ -5483,25 +5483,12 @@ impl QueueStorage {
         self.append_terminal_count_deltas_tx(tx, by_group).await
     }
 
-    /// Whether terminal-count deltas keep their job-id bucket. N-1
-    /// maintenance folds deltas into the bucket of the original row, so they
-    /// keep it until the ring authority flip fences that maintenance; after
-    /// it, folds collapse each lane and one delta row per lane suffices.
-    ///
-    /// Read in the caller's transaction every time rather than cached: the
-    /// deltas written here follow that transaction's view of the authority
-    /// and roll back with it, so a flip performed and rolled back inside a
-    /// caller's transaction leaves no trace.
-    async fn terminal_deltas_bucketed_tx<'a>(
-        &self,
-        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-    ) -> Result<bool, AwaError> {
-        Ok(matches!(
-            self.ring_authority_tx(tx).await?,
-            RingAuthority::Columns
-        ))
-    }
-
+    /// Append terminal-count deltas. Before the ring authority flip they keep
+    /// their job-id bucket, because N-1 maintenance folds each delta into the
+    /// bucket of the original row; after it, folds collapse each lane, so the
+    /// statement writes one row per lane. The authority is read inside the
+    /// statement, so the choice follows the caller's transaction, including a
+    /// flip made and rolled back in it.
     async fn append_terminal_count_deltas_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5510,18 +5497,6 @@ impl QueueStorage {
         if by_group.is_empty() {
             return Ok(());
         }
-        let by_group = if self.terminal_deltas_bucketed_tx(tx).await? {
-            by_group
-        } else {
-            let mut by_lane: BTreeMap<TerminalCounterKey, i64> = BTreeMap::new();
-            for ((slot, generation, queue, priority, shard, _bucket), delta) in by_group {
-                *by_lane
-                    .entry((slot, generation, queue, priority, shard, 0))
-                    .or_insert(0) += delta;
-            }
-            by_lane
-        };
-
         let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
         let mut ready_generations: Vec<i64> = Vec::with_capacity(by_group.len());
         let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
@@ -5549,6 +5524,16 @@ impl QueueStorage {
         let schema = self.schema();
         sqlx::query(audited_sql(format!(
             r#"
+            WITH authority AS (
+                SELECT COALESCE(
+                    (
+                        SELECT authority = 'ledger'
+                        FROM {schema}.ring_cursor_authority
+                        WHERE singleton = TRUE
+                    ),
+                    FALSE
+                ) AS per_lane
+            )
             INSERT INTO {schema}.queue_terminal_count_deltas (
                 ready_slot,
                 ready_generation,
@@ -5559,13 +5544,13 @@ impl QueueStorage {
                 terminal_delta
             )
             SELECT
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                enqueue_shard,
-                counter_bucket,
-                terminal_delta
+                d.ready_slot,
+                d.ready_generation,
+                d.queue,
+                d.priority,
+                d.enqueue_shard,
+                CASE WHEN authority.per_lane THEN 0::smallint ELSE d.counter_bucket END,
+                sum(d.terminal_delta)::bigint
             FROM unnest(
                 $1::int[],
                 $2::bigint[],
@@ -5583,13 +5568,10 @@ impl QueueStorage {
                 counter_bucket,
                 terminal_delta
             )
-            ORDER BY
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                enqueue_shard,
-                counter_bucket
+            CROSS JOIN authority
+            GROUP BY 1, 2, 3, 4, 5, 6
+            HAVING sum(d.terminal_delta) <> 0
+            ORDER BY 1, 2, 3, 4, 5, 6
             "#
         )))
         .bind(&ready_slots)
