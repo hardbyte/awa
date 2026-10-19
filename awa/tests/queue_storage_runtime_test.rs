@@ -17485,6 +17485,43 @@ async fn test_queue_storage_reserve_names_unnamed_lane_and_stays_contiguous() {
     assert_eq!(reserve(1).await, 1);
     assert_eq!(reserve(3).await, 2);
 
+    let ensure_calls_in_reserve = || {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.expect("Failed to begin");
+            sqlx::query("SET LOCAL track_functions = 'pl'")
+                .execute(tx.as_mut())
+                .await
+                .expect("Failed to track functions");
+            sqlx::query(audited_sql(format!(
+                "SELECT {schema}.reserve_enqueue_seq($1, 2::smallint, 0::smallint, 2)"
+            )))
+            .bind(queue)
+            .execute(tx.as_mut())
+            .await
+            .expect("Failed to reserve");
+            let calls: i64 = sqlx::query_scalar(audited_sql(format!(
+                "SELECT COALESCE(pg_stat_get_xact_function_calls(\
+                 '{schema}.ensure_lane_sequences(text, smallint, smallint)'::regprocedure), 0)"
+            )))
+            .fetch_one(tx.as_mut())
+            .await
+            .expect("Failed to read function calls");
+            tx.rollback().await.expect("Failed to roll back");
+            calls
+        }
+    };
+    assert_eq!(
+        ensure_calls_in_reserve().await,
+        0,
+        "a named lane reserves without provisioning"
+    );
+    assert_eq!(
+        reserve(1).await,
+        7,
+        "the probe's rolled-back range is a gap"
+    );
+
     sqlx::query(audited_sql(format!(
         "UPDATE {schema}.queue_enqueue_heads SET seq_name = NULL \
          WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
@@ -17494,9 +17531,22 @@ async fn test_queue_storage_reserve_names_unnamed_lane_and_stays_contiguous() {
     .await
     .expect("Failed to clear the sequence name");
 
-    assert_eq!(reserve(1).await, 5);
-    assert_eq!(reserve(2).await, 6);
-    assert_eq!(reserve(0).await, 8, "a zero count reads the next value");
+    assert_eq!(
+        ensure_calls_in_reserve().await,
+        1,
+        "an unnamed lane is provisioned on reserve"
+    );
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_enqueue_heads SET seq_name = NULL \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to clear the sequence name");
+    assert_eq!(reserve(1).await, 10);
+    assert_eq!(reserve(2).await, 11);
+    assert_eq!(reserve(0).await, 13, "a zero count reads the next value");
     let named: bool = sqlx::query_scalar(audited_sql(format!(
         "SELECT seq_name IS NOT NULL FROM {schema}.queue_enqueue_heads \
          WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
