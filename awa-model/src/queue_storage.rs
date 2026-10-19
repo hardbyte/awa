@@ -3666,6 +3666,12 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+        self.lock_ring_serializers_tx(
+            &mut tx,
+            &[RingFamily::Queue, RingFamily::Lease, RingFamily::Claim],
+        )
+        .await?;
+
         for family in [RingFamily::Queue, RingFamily::Lease, RingFamily::Claim] {
             let state = family.state_relname();
             sqlx::query(audited_sql(format!(
@@ -4220,6 +4226,27 @@ impl QueueStorage {
     /// Compat authority keeps the row lock as the outer gate, taken before
     /// the authority is read, which is what lets the flip exclude in-flight
     /// compat rotators.
+    /// Wait for the per-ring rotation advisory locks, in a fixed ring order.
+    /// Whole-schema operations (reset, counter rebuild) take these before any
+    /// row or table lock, so in ledger authority, where rotate, prune and the
+    /// delta rollup serialize only on these locks, they wait for an
+    /// in-flight tick instead of interleaving table locks with it.
+    async fn lock_ring_serializers_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        families: &[RingFamily],
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        for family in families {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(family.rotation_lock_name(schema))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        Ok(())
+    }
+
     async fn acquire_ring_serializer_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -15797,6 +15824,8 @@ impl QueueStorage {
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+        self.lock_ring_serializers_tx(&mut tx, &[RingFamily::Queue])
+            .await?;
 
         sqlx::query(audited_sql(format!(
             "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"

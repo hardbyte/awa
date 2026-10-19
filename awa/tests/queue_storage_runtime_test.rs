@@ -2662,6 +2662,97 @@ async fn test_ledger_rotation_does_not_wait_for_the_ring_state_row() {
     impatient.close().await;
 }
 
+/// A ledger-mode prune holds the queue-ring advisory lock, then locks a done
+/// partition, then the done parent to carry retained failures forward. A
+/// counter rebuild must wait for the advisory lock before touching tables;
+/// locking the parent first would deadlock against that prune.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_counter_rebuild_waits_for_an_in_flight_prune() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_rebuild_vs_prune";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut prune = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries_0 IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .unwrap();
+
+    let rebuild = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.rebuild_terminal_counters(&pool).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .expect("the prune's parent lock must not deadlock with a waiting rebuild");
+    prune.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), rebuild)
+        .await
+        .expect("rebuild finishes after the prune")
+        .unwrap()
+        .expect("rebuild succeeds");
+}
+
+/// A ledger-mode rotation holds the queue-ring advisory lock while it reads
+/// ring tables. A reset must wait for that lock before truncating; taking
+/// its table locks first would deadlock against the rotation's later reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_reset_waits_for_an_in_flight_rotation() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_reset_vs_rotate";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut rotate = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_rotations LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .unwrap();
+
+    let reset = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.reset(&pool).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.ready_entries_0 LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .expect("the rotation's later read must not deadlock with a waiting reset");
+    rotate.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), reset)
+        .await
+        .expect("reset finishes after the rotation")
+        .unwrap()
+        .expect("reset succeeds");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_change() {
     let (_db_guard, pool) = setup_pool(4).await;
