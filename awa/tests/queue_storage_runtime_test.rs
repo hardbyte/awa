@@ -18018,6 +18018,116 @@ async fn test_multi_job_cancel_does_not_wait_on_a_materialized_attempt_lock() {
     pool.close().await;
 }
 
+/// Closers take an attempt's advisory lock and then its claim batch row. A
+/// cancel waiting for the attempt lock must not already hold that row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_waiting_cancel_holds_no_claim_row_a_closer_needs() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_row_order";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "q", 1, Duration::ZERO)
+        .await
+        .unwrap();
+    let job = &claimed[0];
+    let batch_id = job.claim.claim_batch_id.expect("compact claim");
+
+    let mut closer = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "awa.receipt.complete:{}:{}",
+            job.job.id, job.job.run_lease
+        ))
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+
+    let cancel = store.cancel_job(&pool, job.job.id);
+    let closer_takes_the_batch_row = async {
+        wait_for_lock_wait(&pool, "advisory").await;
+        let row_lock = sqlx::query(audited_sql(format!(
+            "SELECT 1 FROM {schema}.lease_claim_batches \
+             WHERE claim_slot = $1 AND batch_id = $2 FOR UPDATE"
+        )))
+        .bind(job.claim.claim_slot)
+        .bind(batch_id)
+        .execute(closer.as_mut())
+        .await;
+        closer.commit().await.map(|_| ()).and(row_lock.map(|_| ()))
+    };
+    let (cancelled, closer_result) = tokio::join!(cancel, closer_takes_the_batch_row);
+    closer_result.expect("the closer takes the batch row while cancel waits");
+    assert!(
+        cancelled.expect("cancel completes").is_some(),
+        "the attempt was still open, so cancel applies once the lock is free"
+    );
+    pool.close().await;
+}
+
+/// Only a receipt attempt lock already held by the transaction makes cancel
+/// try instead of wait. A caller's own advisory lock must not turn a briefly
+/// busy attempt into JobNotFound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_tx_with_an_unrelated_advisory_lock_waits_for_the_attempt() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_unrelated_lock";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "q", 1, Duration::ZERO)
+        .await
+        .unwrap();
+    let job = &claimed[0];
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "awa.receipt.complete:{}:{}",
+            job.job.id, job.job.run_lease
+        ))
+        .execute(holder.as_mut())
+        .await
+        .unwrap();
+
+    let mut caller = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(42)")
+        .execute(caller.as_mut())
+        .await
+        .unwrap();
+    let cancel = admin::cancel_tx(caller.as_mut(), job.job.id);
+    let release_once_cancel_waits = async {
+        wait_for_lock_wait(&pool, "advisory").await;
+        holder.rollback().await.unwrap();
+    };
+    let (cancelled, ()) = tokio::join!(cancel, release_once_cancel_waits);
+    assert!(cancelled
+        .expect("cancel waits instead of reporting the busy attempt as missing")
+        .is_some());
+    caller.commit().await.unwrap();
+    pool.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
     let (_db_guard, pool) = setup_pool(8).await;

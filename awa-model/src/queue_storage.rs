@@ -17,6 +17,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Transaction-local setting that marks a transaction holding a receipt
+/// attempt lock, so a later cancel in it does not wait for another.
+const ATTEMPT_LOCKS_HELD_SETTING: &str = "awa.attempt_locks_held";
+
 const DEFAULT_SCHEMA: &str = "awa";
 const DEFAULT_QUEUE_SLOT_COUNT: usize = 16;
 const DEFAULT_LEASE_SLOT_COUNT: usize = 8;
@@ -9196,16 +9200,23 @@ impl QueueStorage {
                 LIMIT 1
                 "#
             );
+            // Find the attempt without row locks: closers take the attempt
+            // lock before the claim or batch row, so the row locks wait for
+            // the re-check below.
+            let find_receipt_sql = open_receipt_sql
+                .replace("FOR UPDATE OF claims SKIP LOCKED", "")
+                .replace("FOR UPDATE OF claim_batches SKIP LOCKED", "");
+            debug_assert!(!find_receipt_sql.contains("FOR UPDATE"));
             let mut receipt: Option<ReceiptCancelRow> =
-                sqlx::query_as(audited_sql(open_receipt_sql.clone()))
+                sqlx::query_as(audited_sql(find_receipt_sql))
                     .bind(job_id)
                     .fetch_optional(tx.as_mut())
                     .await
                     .map_err(map_sqlx_error)?;
             // Every closer of this attempt holds its advisory lock while it
-            // writes. Take it, then look again in a new statement, whose
-            // snapshot includes any closer that committed before the lock was
-            // free. If the lock is busy and this cancel may not wait (see
+            // writes. Take it, then look again with the row locks in a new
+            // statement, whose snapshot includes any closer that committed
+            // before the lock was free. If the lock is busy and this cancel may not wait (see
             // `lock_cancel_attempts_tx`), the attempt is left as it is and the
             // cancel reports nothing cancelled; the holder may be a closer, a
             // materializer, or a transaction that later rolls back.
@@ -10101,24 +10112,24 @@ impl QueueStorage {
         Ok(())
     }
 
-    /// Attempt locks for a cancel. A transaction that holds no advisory lock
+    /// Attempt locks for a cancel. A transaction that holds no attempt lock
     /// yet waits for them like any closer. One that already holds one, such
-    /// as an earlier attempt of the same multi-job cancel, only tries: waiting
-    /// there could close a cycle with a batch closer that takes its attempt
-    /// locks in hash order. Returns whether every lock is held.
+    /// as an earlier job of the same bulk cancel or a completion made earlier
+    /// in the caller's transaction, only tries: waiting there could close a
+    /// cycle with a batch closer that takes its attempt locks in hash order.
+    /// Returns whether every lock is held.
     async fn lock_cancel_attempts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         jobs: &[(i64, i64)],
     ) -> Result<bool, AwaError> {
-        let holds_advisory_lock: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks \
-             WHERE pid = pg_catalog.pg_backend_pid() AND locktype = 'advisory' AND granted)",
-        )
+        let holds_attempt_lock: bool = sqlx::query_scalar(audited_sql(format!(
+            "SELECT COALESCE(current_setting('{ATTEMPT_LOCKS_HELD_SETTING}', true), '') = 'on'"
+        )))
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        if !holds_advisory_lock {
+        if !holds_attempt_lock {
             self.lock_receipt_attempts_tx(tx, jobs).await?;
             return Ok(true);
         }
@@ -10142,6 +10153,12 @@ impl QueueStorage {
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        if !all_locked {
+            tracing::info!(
+                ?jobs,
+                "cancel left a running attempt whose attempt lock another transaction holds"
+            );
+        }
         Ok(all_locked)
     }
 
@@ -10161,7 +10178,7 @@ impl QueueStorage {
             .map(|(_, run_lease)| *run_lease)
             .collect();
 
-        sqlx::query(
+        sqlx::query(audited_sql(format!(
             r#"
             WITH locks AS MATERIALIZED (
                 SELECT DISTINCT pg_catalog.hashtextextended(
@@ -10170,11 +10187,17 @@ impl QueueStorage {
                 ) AS lock_key
                 FROM unnest($1::bigint[], $2::bigint[]) AS input(job_id, run_lease)
                 ORDER BY lock_key
+            ),
+            acquired AS MATERIALIZED (
+                SELECT pg_catalog.pg_advisory_xact_lock(lock_key) FROM locks
             )
-            SELECT pg_catalog.pg_advisory_xact_lock(lock_key)
-            FROM locks
-            "#,
-        )
+            SELECT count(*)
+            FROM acquired
+            CROSS JOIN (
+                SELECT pg_catalog.set_config('{ATTEMPT_LOCKS_HELD_SETTING}', 'on', true)
+            ) AS marked
+            "#
+        )))
         .bind(&job_ids)
         .bind(&run_leases)
         .execute(tx.as_mut())

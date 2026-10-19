@@ -98,13 +98,16 @@ Notable changes between releases. Detailed migration notes for storage transitio
   retry. Rescue now takes the attempt locks in one statement and decides in
   the next, which sees every closer that went first. Admin cancel of a
   receipt-only attempt took no attempt lock at all. Both cancel paths now take
-  the attempt lock before writing and re-check the attempt. A cancel whose
-  transaction holds no advisory lock waits for that lock and then sees the
-  holder's outcome. One that already holds one, such as later jobs of a bulk
-  cancel, only tries: an attempt that is busy at that moment, because a
-  closer, a materializer or a transaction that later rolls back holds it, is
-  left running and is not in the returned rows, so callers that need it
-  cancelled should retry.
+  the attempt lock before taking any claim or lease row, as closers do, and
+  re-check the attempt. A cancel waits for that lock and then sees the
+  holder's outcome, unless its transaction already holds a receipt attempt
+  lock: later jobs of a bulk cancel, or a cancel after a completion in the
+  same transaction. That cancel only tries, so a busy attempt, held by a
+  closer, a materializer or a transaction that later rolls back, is left
+  running. `bulk_cancel` leaves it out of the returned rows; `cancel_tx` in
+  such a transaction reports `JobNotFound`. Each skip is logged at info level.
+  A bulk cancel holds one advisory lock per running attempt until it commits,
+  so cancel very large sets of running jobs in batches.
 
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
