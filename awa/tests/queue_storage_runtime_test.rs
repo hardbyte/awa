@@ -17279,3 +17279,68 @@ async fn test_brin_fsm_baseline_block_size_model() {
     }
     pool.close().await;
 }
+
+fn fold_test_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    }
+}
+
+/// A lane row without a sequence name (written before the head trigger
+/// existed) is provisioned on its first reservation; reservations of one and
+/// of several rows stay contiguous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_reserve_names_unnamed_lane_and_stays_contiguous() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_reserve_unnamed_lane";
+    let schema = "awa_qs_reserve_unnamed_lane";
+    let store = create_store_with_config(&pool, fold_test_config(schema)).await;
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare lane");
+
+    let reserve = |count: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+            )))
+            .bind(queue)
+            .bind(2_i16)
+            .bind(0_i16)
+            .bind(count)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to reserve")
+        }
+    };
+    assert_eq!(reserve(1).await, 1);
+    assert_eq!(reserve(3).await, 2);
+
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_enqueue_heads SET seq_name = NULL \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to clear the sequence name");
+
+    assert_eq!(reserve(1).await, 5);
+    assert_eq!(reserve(2).await, 6);
+    assert_eq!(reserve(0).await, 8, "a zero count reads the next value");
+    let named: bool = sqlx::query_scalar(audited_sql(format!(
+        "SELECT seq_name IS NOT NULL FROM {schema}.queue_enqueue_heads \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read the sequence name");
+    assert!(named);
+}

@@ -226,6 +226,102 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
+-- Enqueue-path functions. Function replacement only: no table DDL and no
+-- trigger changes, so a migration can refresh a live substrate through it.
+CREATE OR REPLACE FUNCTION awa.refresh_enqueue_functions(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $refresh$
+BEGIN
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.reserve_enqueue_seq(
+            p_queue TEXT,
+            p_priority SMALLINT,
+            p_enqueue_shard SMALLINT,
+            p_count BIGINT
+        )
+        RETURNS BIGINT
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT;
+            v_qualified_seq TEXT;
+            v_start BIGINT;
+        BEGIN
+            SELECT seq_name
+            INTO v_seq_name
+            FROM %1$I.queue_enqueue_heads
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard;
+
+            IF p_count <= 0 THEN
+                RETURN %1$I.sequence_next_value(v_seq_name);
+            END IF;
+
+            -- The head trigger names the sequence when the lane row is
+            -- inserted; only a lane row written before that trigger existed
+            -- still needs its sequences provisioned here.
+            IF v_seq_name IS NULL THEN
+                PERFORM %1$I.ensure_lane_sequences(p_queue, p_priority, p_enqueue_shard);
+
+                SELECT seq_name
+                INTO v_seq_name
+                FROM %1$I.queue_enqueue_heads
+                WHERE queue = p_queue
+                  AND priority = p_priority
+                  AND enqueue_shard = p_enqueue_shard;
+
+                IF v_seq_name IS NULL THEN
+                    RAISE EXCEPTION 'missing enqueue lane sequence for queue %%, priority %%, shard %%',
+                        p_queue, p_priority, p_enqueue_shard
+                        USING ERRCODE = '55000';
+                END IF;
+            END IF;
+
+            v_qualified_seq := format('%%I.%%I', %1$L, v_seq_name);
+            -- Hold the lane reservation lock until the surrounding enqueue
+            -- transaction ends. Sequence movement is non-transactional: if a
+            -- later producer could reserve and commit lane N+1 while an
+            -- earlier producer still holds uncommitted lane N, claim could
+            -- advance past N and strand the earlier job when it eventually
+            -- commits. The transaction-scoped lock preserves visibility order
+            -- within a lane while aborted reservations still become harmless
+            -- sequence gaps.
+            PERFORM pg_advisory_xact_lock(hashtextextended(v_qualified_seq, 0));
+
+            -- Every writer of a lane sequence holds this key (set_sequence_next
+            -- and the head trigger take it too), so a read followed by one
+            -- setval reserves the range with a single sequence write.
+            IF p_count = 1 THEN
+                v_start := nextval(v_qualified_seq::regclass);
+            ELSE
+                EXECUTE format(
+                    'SELECT setval(%%L::regclass, '
+                    'CASE WHEN is_called THEN last_value + 1 ELSE last_value END + $1 - 1, true) '
+                    '- $1 + 1 FROM %%s',
+                    v_qualified_seq,
+                    v_qualified_seq
+                )
+                INTO v_start
+                USING p_count;
+            END IF;
+
+            RETURN v_start;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_enqueue_functions(TEXT) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,
@@ -1250,78 +1346,7 @@ BEGIN
 
     PERFORM awa.refresh_lane_sequence_helpers(p_schema);
 
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.reserve_enqueue_seq(
-            p_queue TEXT,
-            p_priority SMALLINT,
-            p_enqueue_shard SMALLINT,
-            p_count BIGINT
-        )
-        RETURNS BIGINT
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_seq_name TEXT;
-            v_lock_key TEXT;
-            v_start BIGINT;
-        BEGIN
-            IF p_count <= 0 THEN
-                RETURN %1$I.sequence_next_value((
-                    SELECT seq_name
-                    FROM %1$I.queue_enqueue_heads
-                    WHERE queue = p_queue
-                      AND priority = p_priority
-                      AND enqueue_shard = p_enqueue_shard
-                ));
-            END IF;
-
-            PERFORM %1$I.ensure_lane_sequences(p_queue, p_priority, p_enqueue_shard);
-
-            SELECT seq_name
-            INTO v_seq_name
-            FROM %1$I.queue_enqueue_heads
-            WHERE queue = p_queue
-              AND priority = p_priority
-              AND enqueue_shard = p_enqueue_shard;
-
-            IF v_seq_name IS NULL THEN
-                RAISE EXCEPTION 'missing enqueue lane sequence for queue %%, priority %%, shard %%',
-                    p_queue, p_priority, p_enqueue_shard
-                    USING ERRCODE = '55000';
-            END IF;
-
-            v_lock_key := format('%%I.%%I', %1$L, v_seq_name);
-            -- Hold the lane reservation lock until the surrounding enqueue
-            -- transaction ends. Sequence movement is non-transactional: if a
-            -- later producer could reserve and commit lane N+1 while an
-            -- earlier producer still holds uncommitted lane N, claim could
-            -- advance past N and strand the earlier job when it eventually
-            -- commits. The transaction-scoped lock preserves visibility order
-            -- within a lane while aborted reservations still become harmless
-            -- sequence gaps.
-            PERFORM pg_advisory_xact_lock(hashtextextended(v_lock_key, 0));
-            EXECUTE format(
-                'SELECT nextval(%%L::regclass)::bigint',
-                format('%%I.%%I', %1$L, v_seq_name)
-            )
-            INTO v_start;
-
-            IF p_count > 1 THEN
-                EXECUTE format(
-                    'SELECT setval(%%L::regclass, %%s, true)',
-                    format('%%I.%%I', %1$L, v_seq_name),
-                    v_start + p_count - 1
-                );
-            END IF;
-
-            RETURN v_start;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
+    PERFORM awa.refresh_enqueue_functions(p_schema);
 
     EXECUTE format(
         'DROP TRIGGER IF EXISTS queue_enqueue_heads_sequence_sync ON %I.queue_enqueue_heads',
