@@ -17826,7 +17826,7 @@ async fn test_deadline_receipt_rescue_sees_completion_committed_mid_statement() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_receipt_cancel_does_not_close_an_attempt_a_closer_holds() {
+async fn test_receipt_cancel_waits_for_a_closer_and_sees_its_outcome() {
     let (_db_guard, pool) = setup_pool(6).await;
     let schema = "awa_qs_cancel_vs_closer";
     let store = create_store_with_config(
@@ -17865,16 +17865,39 @@ async fn test_receipt_cancel_does_not_close_an_attempt_a_closer_holds() {
         .unwrap();
     assert!(dead_lettered.is_some());
 
-    let cancelled =
-        tokio::time::timeout(Duration::from_secs(10), store.cancel_job(&pool, job.job.id))
+    // A single-job cancel holds no other attempt lock, so it waits for the
+    // closer and then must see the closer's outcome.
+    let cancel = store.cancel_job(&pool, job.job.id);
+    let commit_once_cancel_waits = async {
+        let started = Instant::now();
+        loop {
+            let cancel_waits: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND wait_event = 'advisory'
+                 )",
+            )
+            .fetch_one(&pool)
             .await
-            .expect("cancel returns while the closer is open")
             .unwrap();
+            if cancel_waits {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "cancel never waited for the closer's attempt lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        closer.commit().await.unwrap();
+    };
+    let (cancelled, ()) = tokio::join!(cancel, commit_once_cancel_waits);
     assert!(
-        cancelled.is_none(),
-        "cancel must not close an attempt another closer is finishing"
+        cancelled.unwrap().is_none(),
+        "cancel must not close an attempt another closer finished"
     );
-    closer.commit().await.unwrap();
 
     let closures: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT count(*) FROM {schema}.lease_claim_closure_batches \
@@ -17894,6 +17917,104 @@ async fn test_receipt_cancel_does_not_close_an_attempt_a_closer_holds() {
     .await
     .unwrap();
     assert_eq!(done, 0, "a dead-lettered attempt gets no cancelled row");
+    pool.close().await;
+}
+
+/// A cancel of a receipt-only attempt A then a materialized attempt B, while
+/// a batch closer holds B and then asks for A (hash order), must not wait on
+/// B: holding A and waiting on B would close a cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multi_job_cancel_does_not_wait_on_a_materialized_attempt_lock() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_cancel_lock_cycle";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "cancel_lock_cycle";
+    store.enqueue_batch(&pool, queue, 1, 2).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    let (receipt_only, materialized) = (&claimed[0], &claimed[1]);
+    store
+        .register_callback(
+            &pool,
+            materialized.job.id,
+            materialized.job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback to materialize a lease");
+    let attempt_key = |job: &awa::model::ClaimedRuntimeJob| {
+        format!("awa.receipt.complete:{}:{}", job.job.id, job.job.run_lease)
+    };
+
+    let mut closer = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(attempt_key(materialized))
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+
+    let cancel_done = std::sync::atomic::AtomicBool::new(false);
+    let cancel = async {
+        let result = store
+            .cancel_jobs_by_ids(&pool, &[receipt_only.job.id, materialized.job.id])
+            .await;
+        cancel_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        result
+    };
+    let closer_takes_the_other_lock = async {
+        let started = Instant::now();
+        loop {
+            let cancel_waits: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND wait_event = 'advisory'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if cancel_waits || cancel_done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "cancel neither finished nor waited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let second = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(attempt_key(receipt_only))
+            .execute(closer.as_mut())
+            .await;
+        closer.commit().await.map(|_| ()).and(second.map(|_| ()))
+    };
+    let (cancelled, closer_result) = tokio::join!(cancel, closer_takes_the_other_lock);
+    closer_result.expect("the closer takes both attempt locks without a deadlock");
+    let cancelled = cancelled.expect("cancel completes without a deadlock");
+    let cancelled_ids: Vec<i64> = cancelled.iter().map(|row| row.id).collect();
+    assert_eq!(
+        cancelled_ids,
+        vec![receipt_only.job.id],
+        "the busy materialized attempt is left to its lock holder"
+    );
+    assert_eq!(lease_count(&pool, &store).await, 1);
     pool.close().await;
 }
 
