@@ -98,12 +98,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   retry. Rescue now takes the attempt locks in one statement and decides in
   the next, which sees every closer that went first. Admin cancel of a
   receipt-only attempt took no attempt lock at all. Both cancel paths now take
-  the attempt lock before writing and re-check the attempt. A single-job
-  cancel waits for that lock and then sees the holder's outcome. A multi-job
-  cancel, or a cancel inside the caller's transaction, only tries the lock:
-  an attempt that is busy at that moment, because a closer, a materializer
-  or a transaction that later rolls back holds it, is left running and is
-  not in the returned rows, so callers that need it cancelled should retry.
+  the attempt lock before writing and re-check the attempt. A cancel whose
+  transaction holds no advisory lock waits for that lock and then sees the
+  holder's outcome. One that already holds one, such as later jobs of a bulk
+  cancel, only tries: an attempt that is busy at that moment, because a
+  closer, a materializer or a transaction that later rolls back holds it, is
+  left running and is not in the returned rows, so callers that need it
+  cancelled should retry.
 
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
