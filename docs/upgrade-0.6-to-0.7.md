@@ -32,9 +32,11 @@ The claim allocator signature must exist and ring-state relations must be
 ordinary tables. `public`, `information_schema` and `pg_*` are excluded.
 
 Only those same owners may hold schema `CREATE` or table `TRIGGER` privileges.
-Existing user triggers must also call trusted routines, and every function,
-operator, type or cast their `WHEN` expressions depend on must be a
-`pg_catalog` object or belong to those owners. This prevents an
+Every trigger in the schema must be one awa installs, with exactly the
+definition awa gives it. A trigger needs only the `TRIGGER` privilege to
+create or replace, and its `WHEN` clause or arguments can run code that no
+catalog dependency records, so an added or altered trigger, including one of
+your own on an awa table, makes the schema untrusted. This prevents an
 outsider from planting another object in an otherwise owned substrate, or
 racing discovery with new objects. Role membership alone does not establish
 trust, and superusers do not bypass these checks.
@@ -47,7 +49,7 @@ Use an explicit schema in transition metadata to disambiguate that legacy case.
 Unsafe ownership or privileges in the default `awa` schema abort before the
 installer runs. Use a dedicated owner role consistently, including `SET ROLE`
 when connecting through a different login.
-Review separately owned objects and remove untrusted creation/trigger grants
+Review separately owned objects, remove triggers awa did not install, and remove untrusted creation/trigger grants
 before migrating; a blanket role grant is not a substitute for this review.
 
 ### Existing migration history and external runners
