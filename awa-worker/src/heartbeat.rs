@@ -28,15 +28,20 @@ impl HeartbeatCadence {
     ///
     /// A claim stamps the attempt's start, and the stale-heartbeat rescue
     /// treats that stamp as the heartbeat until one is written. Ticks fire at
-    /// a fixed rate, so an attempt skipped at one tick is included by the next
-    /// tick (at most one interval later); if that pass fails, the tick after
-    /// it retries. The second attempt therefore starts no later than
-    /// `deferral + 2 * interval` after the claim, delayed further only by how
-    /// long the failed pass ran, and must finish before `staleness`. The
-    /// deferral is capped at half an interval and reduced by the slowest
-    /// recent pass, so a database that is slow to answer heartbeats shortens
-    /// it and one that takes an interval or more disables it. Below the
-    /// documented floor of three intervals every tick includes every attempt.
+    /// a fixed rate, so the first tick that includes an attempt comes between
+    /// `deferral` and `deferral + interval` after its claim, instead of within
+    /// one interval. The deferral is capped at half an interval and reduced
+    /// by the slowest recent pass, so a database that has been slow to answer
+    /// heartbeats shortens it and one that takes an interval or more disables
+    /// it. Below the documented floor of three intervals every tick includes
+    /// every attempt.
+    ///
+    /// The cost is stall tolerance for a fresh attempt. If its first included
+    /// pass stalls, for example waiting for a pool connection, the attempt
+    /// survives a stall shorter than `staleness - interval - deferral` rather
+    /// than `staleness - interval`. Recent passes cannot predict a later
+    /// stall, so a stall that starts after a healthy period can rescue a live
+    /// attempt that an immediate first heartbeat would have protected.
     ///
     /// `staleness` is this runtime's setting; the rescue sweep applies the
     /// elected leader's. Fleets should use the same heartbeat settings on
@@ -396,10 +401,11 @@ mod tests {
         assert_eq!(cadence.first_heartbeat_after(45 * SECOND), Duration::ZERO);
     }
 
-    /// The review's schedule: I = 30 s, S = 90 s, the first pass that
-    /// includes the attempt fails after 20 s. With fixed-rate ticks and the
-    /// slow pass counted, the retry finishes inside the staleness window
-    /// whatever the attempt's phase.
+    /// I = 30 s, S = 90 s, and the first pass that includes the attempt
+    /// fails after 20 s while the next one is fast. With fixed-rate ticks the
+    /// retry finishes inside the staleness window whatever the attempt's
+    /// phase. A pass that stalls instead of failing is bounded separately;
+    /// see the stall-tolerance test.
     #[test]
     fn a_failed_slow_pass_is_followed_by_a_retry_inside_the_window() {
         let interval = 30.0_f64;
@@ -427,5 +433,43 @@ mod tests {
                 claim + staleness
             );
         }
+    }
+
+    /// The first pass that includes a fresh attempt stalls before it reaches
+    /// the database, for example waiting for a pool connection, and its
+    /// heartbeat lands only when the stall ends. Over every claim phase the
+    /// attempt survives exactly the stalls shorter than
+    /// `staleness - interval - deferral`: 45 s at the 30 s / 90 s defaults,
+    /// against 60 s without the deferral.
+    #[test]
+    fn deferral_shortens_first_heartbeat_stall_tolerance() {
+        let interval = 30.0_f64;
+        let staleness = 90.0_f64;
+        let deferral = HeartbeatCadence::new(
+            Duration::from_secs_f64(interval),
+            Duration::from_secs_f64(staleness),
+        )
+        .first_heartbeat_after(Duration::ZERO)
+        .as_secs_f64();
+        assert_eq!(deferral, 15.0);
+        let survives_every_phase = |deferral: f64, stall: f64| {
+            (0..300).all(|tenth| {
+                let claim = f64::from(tenth) / 10.0 + 0.05;
+                let first_included = ((claim + deferral) / interval).ceil() * interval;
+                first_included + stall < claim + staleness
+            })
+        };
+        let tolerance = staleness - interval - deferral;
+        assert!(survives_every_phase(deferral, tolerance - 0.1));
+        assert!(!survives_every_phase(deferral, tolerance + 0.1));
+        assert!(survives_every_phase(0.0, staleness - interval - 0.1));
+
+        // Claim at 15.1 s: the healthy 30 s tick skips the attempt, the 60 s
+        // pass waits for a connection until 109 s, and rescue runs at 105.1 s.
+        // An immediate first heartbeat at 30 s would have covered it to 120 s.
+        let claim = 15.1;
+        let first_included = ((claim + deferral) / interval).ceil() * interval;
+        assert_eq!(first_included, 60.0);
+        assert!(109.0 > claim + staleness);
     }
 }

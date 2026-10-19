@@ -3548,6 +3548,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            claim_started_at: std::time::Instant::now(),
         };
         executor
             .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
@@ -3625,6 +3626,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            claim_started_at: std::time::Instant::now(),
         };
         executor
             .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
@@ -3719,6 +3721,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            claim_started_at: std::time::Instant::now(),
         };
         let mut jobs = jobs.into_iter();
         for job in jobs.by_ref().take(4) {
