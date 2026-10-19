@@ -16831,6 +16831,41 @@ async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() 
     pool.close().await;
 }
 
+/// A store that has seen enqueue_ready_rows must not keep calling it once it
+/// is gone: the failed call forgets the observation, and the next enqueue
+/// probes again and takes the multi-statement path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_enqueue_falls_back_after_the_enqueue_function_disappears() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_enqueue_function_vanishes";
+    let store = create_store(&pool, schema).await;
+    assert_eq!(store.enqueue_batch(&pool, "q", 1, 1).await.unwrap(), 1);
+
+    let signature: String = sqlx::query_scalar(audited_sql(format!(
+        "SELECT oid::regprocedure::text FROM pg_proc \
+         WHERE pronamespace = '{schema}'::regnamespace AND proname = 'enqueue_ready_rows'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!("DROP FUNCTION {signature}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        store.enqueue_batch(&pool, "q", 1, 1).await.is_err(),
+        "the call that finds the function gone fails"
+    );
+    assert_eq!(
+        store.enqueue_batch(&pool, "q", 1, 1).await.unwrap(),
+        1,
+        "the next enqueue probes again and uses the multi-statement path"
+    );
+    assert_eq!(store.queue_counts(&pool, "q").await.unwrap().available, 2);
+    pool.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_prune_deleted_materialized_lease_heap_is_reclaimed_once() {
     let (_db_guard, pool) = setup_pool(8).await;

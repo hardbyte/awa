@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -2216,9 +2216,10 @@ const ENQUEUE_READY_ROWS_ARGUMENT_TYPES: &str = "text[], smallint[], smallint[],
      timestamptz[], timestamptz[], bytea[], text[], jsonb[], integer[], bigint[], bigint[], \
      timestamptz[], text[]";
 
-const ENQUEUE_FUNCTION_UNKNOWN: u8 = 0;
-const ENQUEUE_FUNCTION_AVAILABLE: u8 = 1;
-const ENQUEUE_FUNCTION_UNAVAILABLE: u8 = 2;
+/// How long an "enqueue_ready_rows is unavailable" observation stands before
+/// the store probes again, so a runtime started before v052 picks the
+/// function up once the migration lands.
+const ENQUEUE_FUNCTION_REPROBE: Duration = Duration::from_secs(60);
 
 /// One ready row as `{schema}.enqueue_ready_rows` takes it. Queue, priority
 /// and shard come from the row's lane; `lane_seq` from the lane's
@@ -3006,13 +3007,11 @@ pub struct QueueStorage {
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
-    /// Set once the enqueue path has read `ledger` ring authority. The flip
-    /// to ledger is one-way, so later enqueue cursor reads go straight to
-    /// the ledger. Cleared by `prepare_schema` and `reset`.
-    enqueue_ledger_authority: AtomicBool,
-    /// Whether the schema has an executable `enqueue_ready_rows` (v052).
-    /// Probed once; cleared by `prepare_schema` and `reset`.
-    enqueue_function: AtomicU8,
+    /// Last probe of whether the schema has an executable
+    /// `enqueue_ready_rows` (v052), and when it ran. A missing function is
+    /// probed again after `ENQUEUE_FUNCTION_REPROBE`; an available one until
+    /// a call fails for want of it. Cleared by `prepare_schema` and `reset`.
+    enqueue_function: Mutex<Option<(bool, Instant)>>,
     enqueue_function_disabled: bool,
 }
 
@@ -3060,8 +3059,7 @@ impl QueueStorage {
             ensured_lanes: Mutex::new(HashSet::new()),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
-            enqueue_ledger_authority: AtomicBool::new(false),
-            enqueue_function: AtomicU8::new(ENQUEUE_FUNCTION_UNKNOWN),
+            enqueue_function: Mutex::new(None),
             enqueue_function_disabled: false,
         })
     }
@@ -4288,10 +4286,10 @@ impl QueueStorage {
     }
 
     fn forget_schema_observations(&self) {
-        self.enqueue_ledger_authority
-            .store(false, Ordering::Release);
-        self.enqueue_function
-            .store(ENQUEUE_FUNCTION_UNKNOWN, Ordering::Release);
+        *self
+            .enqueue_function
+            .lock()
+            .expect("enqueue function observation mutex") = None;
     }
 
     async fn enqueue_function_available(
@@ -4301,29 +4299,32 @@ impl QueueStorage {
         if self.enqueue_function_disabled {
             return Ok(false);
         }
-        match self.enqueue_function.load(Ordering::Acquire) {
-            ENQUEUE_FUNCTION_AVAILABLE => return Ok(true),
-            ENQUEUE_FUNCTION_UNAVAILABLE => return Ok(false),
+        let observed = *self
+            .enqueue_function
+            .lock()
+            .expect("enqueue function observation mutex");
+        match observed {
+            Some((true, _)) => return Ok(true),
+            Some((false, at)) if at.elapsed() < ENQUEUE_FUNCTION_REPROBE => return Ok(false),
             _ => {}
         }
+        // The function calls ring_cursor, whose EXECUTE is revoked from PUBLIC.
         let available: bool = sqlx::query_scalar(
-            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), FALSE)",
+            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), FALSE) \
+                AND COALESCE(has_function_privilege(to_regprocedure($2), 'EXECUTE'), FALSE)",
         )
         .bind(format!(
             "{}.enqueue_ready_rows({ENQUEUE_READY_ROWS_ARGUMENT_TYPES})",
             self.schema()
         ))
+        .bind(format!("{}.ring_cursor(text)", self.schema()))
         .fetch_one(executor)
         .await
         .map_err(map_sqlx_error)?;
-        self.enqueue_function.store(
-            if available {
-                ENQUEUE_FUNCTION_AVAILABLE
-            } else {
-                ENQUEUE_FUNCTION_UNAVAILABLE
-            },
-            Ordering::Release,
-        );
+        *self
+            .enqueue_function
+            .lock()
+            .expect("enqueue function observation mutex") = Some((available, Instant::now()));
         Ok(available)
     }
 
@@ -4369,7 +4370,18 @@ impl QueueStorage {
         .bind(notify_channels)
         .fetch_one(connection)
         .await
-        .map_err(map_sqlx_error)?;
+        .map_err(|err| {
+            // The probe can have run in a transaction that created the
+            // function and rolled back, or privileges can since have been
+            // revoked; forget it so the next enqueue probes again.
+            if matches!(
+                err.as_database_error().and_then(|db| db.code()).as_deref(),
+                Some("42883" | "42501")
+            ) {
+                self.forget_schema_observations();
+            }
+            map_sqlx_error(err)
+        })?;
         Ok(inserted as usize)
     }
 
@@ -4694,20 +4706,39 @@ impl QueueStorage {
     /// until it has seen `ledger`, then only the O(1) ledger cursor; callers
     /// that already hold an authority for the transaction should use
     /// `ring_cursor_tx` directly.
+    /// Current queue-ring cursor under the authority in force for this
+    /// statement, read in one round trip.
     async fn current_queue_ring<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     ) -> Result<(i32, i64), AwaError> {
-        let authority = if self.enqueue_ledger_authority.load(Ordering::Acquire) {
-            RingAuthority::Ledger
-        } else {
-            let authority = self.ring_authority_tx(tx).await?;
-            if authority == RingAuthority::Ledger {
-                self.enqueue_ledger_authority.store(true, Ordering::Release);
-            }
-            authority
-        };
-        self.ring_cursor_tx(tx, RingFamily::Queue, authority).await
+        let schema = self.schema();
+        sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH authority AS (
+                SELECT authority = 'ledger' AS ledger
+                FROM {schema}.ring_cursor_authority
+                WHERE singleton = TRUE
+            )
+            (
+                SELECT ledger.slot, ledger.generation
+                FROM {schema}.queue_ring_rotations AS ledger
+                WHERE (SELECT authority.ledger FROM authority)
+                ORDER BY ledger.generation DESC
+                LIMIT 1
+            )
+            UNION ALL
+            (
+                SELECT state.current_slot, state.generation
+                FROM {schema}.queue_ring_state AS state
+                WHERE state.singleton = TRUE
+                  AND NOT (SELECT authority.ledger FROM authority)
+            )
+            "#
+        )))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
     }
 
     async fn next_job_ids<'a>(
