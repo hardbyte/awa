@@ -12814,6 +12814,214 @@ async fn test_queue_terminal_count_delta_rollup_collapses_bucketed_rows() {
     assert_eq!(counts.terminal, 5);
 }
 
+/// Seeds one lane with `completed` completions and `failed` terminal
+/// failures in the genesis slot, rotates it out and folds its deltas.
+/// Returns the failed jobs so a caller can retry them into negative deltas.
+async fn seed_sealed_terminal_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    completed: usize,
+    failed: usize,
+) -> Vec<awa_model::JobRow> {
+    let total = completed + failed;
+    store
+        .enqueue_batch(pool, queue, 1, total as i64)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(pool, queue, total as i64, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), total);
+    let (done, failing) = claimed.split_at(completed);
+    if !done.is_empty() {
+        let claims: Vec<_> = done.iter().map(|job| job.claim.clone()).collect();
+        store.complete_batch(pool, &claims).await.expect("complete");
+    }
+    let mut failed_jobs = Vec::new();
+    for job in failing {
+        store
+            .fail_terminal(pool, job.job.id, job.job.run_lease, "boom", None)
+            .await
+            .expect("fail terminally")
+            .expect("running job fails");
+        failed_jobs.push(job.job.clone());
+    }
+    match store.rotate(pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    store
+        .rollup_terminal_count_deltas(pool, 4)
+        .await
+        .expect("first rollup");
+    failed_jobs
+}
+
+/// Before the ring authority flip, N-1 maintenance may still fold, so the
+/// fold and the rebuild keep the per-job-id bucket shape it applies deltas to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_keeps_job_id_buckets_before_the_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_fold_compat";
+    let schema = "awa_qs_terminal_fold_compat";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 5, 1).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert!(
+        live_count_rows(&pool, schema, queue).await > 1,
+        "compat folds keep one row per job-id bucket"
+    );
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("second rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert!(live_count_rows(&pool, schema, queue).await > 1);
+
+    store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert!(
+        live_count_rows(&pool, schema, queue).await > 1,
+        "a compat rebuild writes per-bucket rows"
+    );
+}
+
+/// Counts folded per bucket before the flip stay exact when the first fold
+/// after the flip collapses the lane and applies a negative delta from a
+/// different bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_handoff_across_the_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_fold_handoff";
+    let schema = "awa_qs_terminal_fold_handoff";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 5, 1).await;
+    assert!(live_count_rows(&pool, schema, queue).await > 1);
+    set_ring_authority(&pool, schema, "ledger").await;
+
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup after the flip");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert_eq!(live_count_rows(&pool, schema, queue).await, 1);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("counts")
+            .terminal,
+        5
+    );
+}
+
+/// After the flip: repeated negative folds against the collapsed row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_repeated_negatives_against_the_collapsed_row() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges";
+    let store = create_store(&pool, schema).await;
+
+    let queue = "qs_terminal_fold_two_negatives";
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 4, 2).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    for (expected, job) in [(5, &failed[0]), (4, &failed[1])] {
+        store
+            .retry_job(&pool, job.id)
+            .await
+            .expect("retry")
+            .expect("failed job is retryable");
+        store
+            .rollup_terminal_count_deltas(&pool, 4)
+            .await
+            .expect("rollup");
+        assert_eq!(live_count_sum(&pool, schema, queue).await, expected);
+        assert_eq!(live_count_rows(&pool, schema, queue).await, 1);
+    }
+}
+
+/// After the flip: a lane folded to zero keeps no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_collapsed_lane_reduces_to_zero() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges_zero";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_terminal_fold_to_zero";
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 0, 1).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 1);
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        0,
+        "a lane folded to zero keeps no row"
+    );
+}
+
+/// After the flip: a sealed slot whose deltas net to zero leaves the lane
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_ignores_net_zero_deltas() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges_net_zero";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_terminal_fold_net_zero";
+    seed_sealed_terminal_lane(&pool, &store, queue, 3, 0).await;
+    let (slot, generation): (i32, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT ready_slot, ready_generation FROM {schema}.done_entries WHERE queue = $1 LIMIT 1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("sealed slot of the lane");
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_terminal_count_deltas
+             (ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket, terminal_delta)
+         VALUES ($1, $2, $3, 1, 0, 3, 1), ($1, $2, $3, 1, 0, 7, -1)"
+    )))
+    .bind(slot)
+    .bind(generation)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("mixed-sign deltas that net to zero");
+    let rows_before = live_count_rows(&pool, schema, queue).await;
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 3);
+    assert_eq!(live_count_rows(&pool, schema, queue).await, rows_before);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+}
+
 /// Terminal-count rollup mutates `queue_terminal_live_counts`, so it should
 /// stand down while another backend is pinning the MVCC horizon. Exact reads
 /// remain correct because they include pending delta rows.

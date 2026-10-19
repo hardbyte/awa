@@ -15803,6 +15803,16 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // One row per lane once the ring authority flip has fenced N-1
+        // maintenance; per job-id bucket before it, which is the shape N-1
+        // folds apply their deltas to (ADR-041).
+        let counter_bucket = match self.ring_authority_tx(&mut tx).await? {
+            RingAuthority::Ledger => "0::smallint".to_string(),
+            RingAuthority::Columns => format!(
+                "mod(mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint) \
+                 + {TERMINAL_COUNTER_BUCKETS}::bigint, {TERMINAL_COUNTER_BUCKETS}::bigint)::smallint"
+            ),
+        };
         let inserted: i64 = sqlx::query_scalar(audited_sql(format!(
             r#"
             WITH inserted AS (
@@ -15814,10 +15824,10 @@ impl QueueStorage {
                     queue,
                     priority,
                     enqueue_shard,
-                    0::smallint AS counter_bucket,
+                    {counter_bucket} AS counter_bucket,
                     count(*)::bigint
                 FROM {schema}.done_entries
-                GROUP BY ready_slot, queue, priority, enqueue_shard
+                GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
                 RETURNING 1
             )
             SELECT COALESCE(count(*), 0)::bigint FROM inserted
@@ -16194,14 +16204,15 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::Empty);
         }
 
-        // Each touched lane collapses to one bucket-0 row holding its old
-        // total (summed over every bucket) plus the signed delta. Applying
-        // the delta to the lane total rather than to one bucket keeps a
-        // negative delta exact when the matching positive count was folded
-        // into a different bucket (pre-collapse folds, the installer
-        // backfill and older rebuilds wrote one row per job-id bucket).
-        let grouped_keys: i64 = sqlx::query_scalar(audited_sql(format!(
-            r#"
+        // In ledger authority each touched lane collapses to one bucket-0 row
+        // holding its old total (summed over every bucket) plus the signed
+        // delta, which keeps a negative delta exact when the matching positive
+        // count sits in another bucket. Before the flip, N-1 maintenance can
+        // still win the election and folds per job-id bucket, so the fold
+        // keeps that shape until the flip fences it (ADR-041).
+        let grouped_keys: i64 = match authority {
+            RingAuthority::Ledger => sqlx::query_scalar(audited_sql(format!(
+                r#"
             WITH grouped AS MATERIALIZED (
                 SELECT
                     ready_slot,
@@ -16272,11 +16283,83 @@ impl QueueStorage {
             )
             SELECT count(*)::bigint FROM grouped
             "#
-        )))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+            )))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?,
+            RingAuthority::Columns => sqlx::query_scalar(audited_sql(format!(
+                r#"
+            WITH grouped AS MATERIALIZED (
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    SUM(terminal_delta)::bigint AS delta
+                FROM {delta_child}
+                WHERE ready_generation = $1
+                GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                HAVING SUM(terminal_delta) <> 0
+            ),
+            updated AS (
+                UPDATE {schema}.queue_terminal_live_counts AS counts
+                SET live_terminal_count = GREATEST(0, counts.live_terminal_count + grouped.delta)
+                FROM grouped
+                WHERE counts.ready_slot = grouped.ready_slot
+                  AND counts.queue = grouped.queue
+                  AND counts.priority = grouped.priority
+                  AND counts.enqueue_shard = grouped.enqueue_shard
+                  AND counts.counter_bucket = grouped.counter_bucket
+                RETURNING
+                    counts.ready_slot,
+                    counts.queue,
+                    counts.priority,
+                    counts.enqueue_shard,
+                    counts.counter_bucket
+            ),
+            inserted AS (
+                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    live_terminal_count
+                )
+                SELECT
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    grouped.counter_bucket,
+                    grouped.delta
+                FROM grouped
+                WHERE grouped.delta > 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM updated
+                      WHERE updated.ready_slot = grouped.ready_slot
+                        AND updated.queue = grouped.queue
+                        AND updated.priority = grouped.priority
+                        AND updated.enqueue_shard = grouped.enqueue_shard
+                        AND updated.counter_bucket = grouped.counter_bucket
+                  )
+                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
+                SET live_terminal_count =
+                    GREATEST(0, counts.live_terminal_count + EXCLUDED.live_terminal_count)
+                RETURNING 1
+            )
+            SELECT count(*)::bigint FROM grouped
+            "#
+            )))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?,
+        };
 
         let truncate_delta = sqlx::query(audited_sql(format!("TRUNCATE TABLE {delta_child}")))
             .execute(tx.as_mut())
