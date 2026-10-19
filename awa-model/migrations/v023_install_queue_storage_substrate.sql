@@ -300,15 +300,11 @@ BEGIN
             IF p_count = 1 THEN
                 v_start := nextval(v_qualified_seq::regclass);
             ELSE
-                EXECUTE format(
-                    'SELECT setval(%%L::regclass, '
-                    'CASE WHEN is_called THEN last_value + 1 ELSE last_value END + $1 - 1, true) '
-                    '- $1 + 1 FROM %%s',
-                    v_qualified_seq,
-                    v_qualified_seq
-                )
-                INTO v_start
-                USING p_count;
+                v_start := COALESCE(
+                    pg_sequence_last_value(v_qualified_seq::regclass) + 1,
+                    %1$I.sequence_next_value(v_seq_name)
+                );
+                PERFORM setval(v_qualified_seq::regclass, v_start + p_count - 1, true);
             END IF;
 
             RETURN v_start;
