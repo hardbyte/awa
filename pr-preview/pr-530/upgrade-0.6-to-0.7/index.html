@@ -2543,6 +2543,7 @@ See <a href="../security/database-roles/#provision-queues-before-starting-restri
 <p>Migration bundles discover custom substrates using catalog metadata without
 evaluating their views or functions. Schemas, relations, routines and types
 must belong to the effective migration role or the owner of the <code>awa</code> schema.
+Sequences may belong to another role, because they run no code.
 The claim allocator signature must exist and ring-state relations must be
 ordinary tables. <code>public</code>, <code>information_schema</code> and <code>pg_*</code> are excluded.</p>
 <p>Only those same owners may hold schema <code>CREATE</code> or table <code>TRIGGER</code> privileges.
@@ -2564,6 +2565,44 @@ installer runs. Use a dedicated owner role consistently, including <code>SET ROL
 when connecting through a different login.
 Review separately owned objects, remove triggers awa did not install, and remove untrusted creation/trigger grants
 before migrating; a blanket role grant is not a substitute for this review.</p>
+<p>A refused migration names the schema and up to five offending objects with the
+rule each breaks, for example <code>relation awa.jobs_hot TRIGGER granted to
+awa_runtime</code>. Nothing is applied. An unregistered schema that fails the check is
+reported as a warning (<code>skipping untrusted queue-storage schema</code>) and left at
+its current version. The common causes and their fixes, run as the <code>awa</code>
+schema owner:</p>
+<ul>
+<li><strong><code>GRANT ALL ON ALL TABLES</code> to the runtime role.</strong> <code>ALL</code> includes <code>TRIGGER</code>.
+  Grant the documented privileges instead, and fix default privileges the same
+  way:</li>
+</ul>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">REVOKE</span><span class="w"> </span><span class="k">TRIGGER</span><span class="p">,</span><span class="w"> </span><span class="k">REFERENCES</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">DEFAULT</span><span class="w"> </span><span class="k">PRIVILEGES</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="n">awa_owner</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="k">REVOKE</span><span class="w"> </span><span class="k">TRIGGER</span><span class="p">,</span><span class="w"> </span><span class="k">REFERENCES</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span></code></pre></div>
+<ul>
+<li><strong>A 0.6 split-role install whose runtime holds <code>CREATE</code> on the schema.</strong> 0.6
+  runtimes created lane sequences themselves, so they needed <code>CREATE</code>.
+  Sequences they own are accepted; the <code>CREATE</code> grant is not, because it lets
+  the runtime add objects while a migration runs. Provision every queue's lanes
+  as the migrator first, so running 0.6 workers never need to create one, then
+  revoke the grant:</li>
+</ul>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">PGOPTIONS</span><span class="o">=</span><span class="s1">'-c role=awa_owner'</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_MIGRATOR_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>prepare-queue<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>--queue<span class="w"> </span>&lt;queue&gt;<span class="w"> </span>--enqueue-shards<span class="w"> </span>&lt;n&gt;
+</span></code></pre></div>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">REVOKE</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span></code></pre></div>
+<ul>
+<li><strong>A custom schema prepared by a runtime or another role.</strong> A worker that
+  auto-prepares a schema, or a DBA who ran the preparation as another user,
+  leaves it owned by that role. Transfer the schema and every object the error
+  lists to the <code>awa</code> schema owner, for example
+  <code>ALTER SCHEMA tenant_qs OWNER TO awa_owner</code> and <code>ALTER TABLE ... OWNER TO</code>,
+  <code>ALTER FUNCTION ... OWNER TO</code> for each listed object. If the runtime and the
+  migrator are deliberately the same role, connect the migration as that role.</li>
+</ul>
 <h3 id="existing-migration-history-and-external-runners">Existing migration history and external runners<a class="headerlink" href="#existing-migration-history-and-external-runners" title="Permanent link">&para;</a></h3>
 <p>The built-in runner records migration versions, descriptions and application times;
 it does not store SQL checksums or automatically rerun applied steps. These security
@@ -2601,9 +2640,9 @@ needs a canonical implementation, and gives operators one unambiguous instructio
 <h2 id="if-you-are-on-06-not-yet-finalized">If you are on 0.6, not yet finalized<a class="headerlink" href="#if-you-are-on-06-not-yet-finalized" title="Permanent link">&para;</a></h2>
 <p>Complete the staged transition <strong>on your 0.6 binaries</strong> first
 (full procedure: <a href="../upgrade-0.5-to-0.6/">Upgrade 0.5 to 0.6</a>):</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
 </span></code></pre></div>
 <p>For a stopped fleet, a CLI containing #457 can replace the middle command
 with <code>awa storage enter-mixed-transition --quiesced</code>; follow the

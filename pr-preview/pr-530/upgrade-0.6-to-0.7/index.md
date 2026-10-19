@@ -30,6 +30,7 @@ See [Database roles](../security/database-roles/index.md#provision-queues-before
 Migration bundles discover custom substrates using catalog metadata without
 evaluating their views or functions. Schemas, relations, routines and types
 must belong to the effective migration role or the owner of the `awa` schema.
+Sequences may belong to another role, because they run no code.
 The claim allocator signature must exist and ring-state relations must be
 ordinary tables. `public`, `information_schema` and `pg_*` are excluded.
 
@@ -53,6 +54,48 @@ installer runs. Use a dedicated owner role consistently, including `SET ROLE`
 when connecting through a different login.
 Review separately owned objects, remove triggers awa did not install, and remove untrusted creation/trigger grants
 before migrating; a blanket role grant is not a substitute for this review.
+
+A refused migration names the schema and up to five offending objects with the
+rule each breaks, for example `relation awa.jobs_hot TRIGGER granted to
+awa_runtime`. Nothing is applied. An unregistered schema that fails the check is
+reported as a warning (`skipping untrusted queue-storage schema`) and left at
+its current version. The common causes and their fixes, run as the `awa`
+schema owner:
+
+- **`GRANT ALL ON ALL TABLES` to the runtime role.** `ALL` includes `TRIGGER`.
+  Grant the documented privileges instead, and fix default privileges the same
+  way:
+
+  ```sql
+  REVOKE TRIGGER, REFERENCES ON ALL TABLES IN SCHEMA awa FROM awa_runtime;
+  ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
+    REVOKE TRIGGER, REFERENCES ON TABLES FROM awa_runtime;
+  ```
+
+- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** 0.6
+  runtimes created lane sequences themselves, so they needed `CREATE`.
+  Sequences they own are accepted; the `CREATE` grant is not, because it lets
+  the runtime add objects while a migration runs. Provision every queue's lanes
+  as the migrator first, so running 0.6 workers never need to create one, then
+  revoke the grant:
+
+  ```bash
+  PGOPTIONS='-c role=awa_owner' \
+    awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
+    --queue <queue> --enqueue-shards <n>
+  ```
+
+  ```sql
+  REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
+  ```
+
+- **A custom schema prepared by a runtime or another role.** A worker that
+  auto-prepares a schema, or a DBA who ran the preparation as another user,
+  leaves it owned by that role. Transfer the schema and every object the error
+  lists to the `awa` schema owner, for example
+  `ALTER SCHEMA tenant_qs OWNER TO awa_owner` and `ALTER TABLE ... OWNER TO`,
+  `ALTER FUNCTION ... OWNER TO` for each listed object. If the runtime and the
+  migrator are deliberately the same role, connect the migration as that role.
 
 ### Existing migration history and external runners
 
