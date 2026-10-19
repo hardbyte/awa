@@ -8900,15 +8900,10 @@ impl QueueStorage {
         Ok(())
     }
 
-    /// `wait_for_attempt` lets the cancel wait for a busy attempt's lock.
-    /// Only a caller whose transaction holds no other attempt lock may pass
-    /// `true`; otherwise a waiting cancel could close a cycle with a batch
-    /// closer that takes its attempt locks in hash order.
     async fn cancel_job_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
-        wait_for_attempt: bool,
     ) -> Result<Option<CancelJobTxResult>, AwaError> {
         let schema = self.schema();
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
@@ -9017,10 +9012,7 @@ impl QueueStorage {
                     .iter()
                     .map(|run_lease| (job_id, *run_lease))
                     .collect();
-                if !self
-                    .lock_cancel_attempts_tx(tx, &pairs, wait_for_attempt)
-                    .await?
-                {
+                if !self.lock_cancel_attempts_tx(tx, &pairs).await? {
                     return Ok(None);
                 }
             }
@@ -9213,14 +9205,14 @@ impl QueueStorage {
             // Every closer of this attempt holds its advisory lock while it
             // writes. Take it, then look again in a new statement, whose
             // snapshot includes any closer that committed before the lock was
-            // free. If the lock is busy and this cancel may not wait, the
-            // attempt is left as it is and the cancel reports nothing
-            // cancelled; the holder may be a closer, a materializer, or a
-            // transaction that later rolls back.
+            // free. If the lock is busy and this cancel may not wait (see
+            // `lock_cancel_attempts_tx`), the attempt is left as it is and the
+            // cancel reports nothing cancelled; the holder may be a closer, a
+            // materializer, or a transaction that later rolls back.
             if let Some(found) = receipt.as_ref() {
                 let found_run_lease = found.1;
                 let locked = self
-                    .lock_cancel_attempts_tx(tx, &[(job_id, found_run_lease)], wait_for_attempt)
+                    .lock_cancel_attempts_tx(tx, &[(job_id, found_run_lease)])
                     .await?;
                 receipt = if locked {
                     sqlx::query_as::<_, ReceiptCancelRow>(audited_sql(open_receipt_sql))
@@ -9487,7 +9479,7 @@ impl QueueStorage {
 
     pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let result = self.cancel_job_tx(&mut tx, job_id, true).await?;
+        let result = self.cancel_job_tx(&mut tx, job_id).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         if let Some(result) = result {
             if let Some(advance) = result.claim_cursor_advance.as_ref() {
@@ -9511,7 +9503,7 @@ impl QueueStorage {
         job_id: i64,
     ) -> Result<Option<JobRow>, AwaError> {
         Ok(self
-            .cancel_job_tx(tx, job_id, false)
+            .cancel_job_tx(tx, job_id)
             .await?
             .map(|result| result.row))
     }
@@ -9529,7 +9521,7 @@ impl QueueStorage {
         let mut rows = Vec::with_capacity(ids.len());
         let mut claim_cursor_advances = Vec::new();
         for job_id in ids {
-            if let Some(result) = self.cancel_job_tx(&mut tx, *job_id, false).await? {
+            if let Some(result) = self.cancel_job_tx(&mut tx, *job_id).await? {
                 if let Some(advance) = result.claim_cursor_advance {
                     claim_cursor_advances.push(advance);
                 }
@@ -10109,17 +10101,24 @@ impl QueueStorage {
         Ok(())
     }
 
-    /// Attempt locks for a cancel. With `wait`, block like any closer; without
-    /// it, only try, so a cancel already holding other attempt locks never
-    /// waits in an order a batch closer does not use. Returns whether every
-    /// lock is held.
+    /// Attempt locks for a cancel. A transaction that holds no advisory lock
+    /// yet waits for them like any closer. One that already holds one, such
+    /// as an earlier attempt of the same multi-job cancel, only tries: waiting
+    /// there could close a cycle with a batch closer that takes its attempt
+    /// locks in hash order. Returns whether every lock is held.
     async fn lock_cancel_attempts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         jobs: &[(i64, i64)],
-        wait: bool,
     ) -> Result<bool, AwaError> {
-        if wait {
+        let holds_advisory_lock: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks \
+             WHERE pid = pg_catalog.pg_backend_pid() AND locktype = 'advisory' AND granted)",
+        )
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if !holds_advisory_lock {
             self.lock_receipt_attempts_tx(tx, jobs).await?;
             return Ok(true);
         }
