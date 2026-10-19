@@ -2546,9 +2546,11 @@ must belong to the effective migration role or the owner of the <code>awa</code>
 The claim allocator signature must exist and ring-state relations must be
 ordinary tables. <code>public</code>, <code>information_schema</code> and <code>pg_*</code> are excluded.</p>
 <p>Only those same owners may hold schema <code>CREATE</code> or table <code>TRIGGER</code> privileges.
-Existing user triggers must also call trusted routines, and every function,
-operator, type or cast their <code>WHEN</code> expressions depend on must be a
-<code>pg_catalog</code> object or belong to those owners. This prevents an
+Every trigger in the schema must be one awa installs, with exactly the
+definition awa gives it. A trigger needs only the <code>TRIGGER</code> privilege to
+create or replace, and its <code>WHEN</code> clause or arguments can run code that no
+catalog dependency records, so an added or altered trigger, including one of
+your own on an awa table, makes the schema untrusted. This prevents an
 outsider from planting another object in an otherwise owned substrate, or
 racing discovery with new objects. Role membership alone does not establish
 trust, and superusers do not bypass these checks.</p>
@@ -2560,7 +2562,7 @@ Use an explicit schema in transition metadata to disambiguate that legacy case.
 Unsafe ownership or privileges in the default <code>awa</code> schema abort before the
 installer runs. Use a dedicated owner role consistently, including <code>SET ROLE</code>
 when connecting through a different login.
-Review separately owned objects and remove untrusted creation/trigger grants
+Review separately owned objects, remove triggers awa did not install, and remove untrusted creation/trigger grants
 before migrating; a blanket role grant is not a substitute for this review.</p>
 <h3 id="existing-migration-history-and-external-runners">Existing migration history and external runners<a class="headerlink" href="#existing-migration-history-and-external-runners" title="Permanent link">&para;</a></h3>
 <p>The built-in runner records migration versions, descriptions and application times;
