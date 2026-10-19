@@ -190,6 +190,12 @@ fn idle_poll_sleep(
         .min(idle_poll_interval.max(poll_interval))
 }
 
+/// How long a capacity wake waits for more workers to free up before
+/// claiming, when the queue is backlogged and only a few permits are free.
+/// A burst of short jobs finishing together then costs one claim round trip
+/// instead of one per job.
+const CAPACITY_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+
 /// Wraps permits so the correct resource is released on drop.
 /// The OwnedSemaphorePermit fields are held purely for their Drop behavior.
 #[allow(dead_code)]
@@ -366,6 +372,8 @@ pub struct Dispatcher {
     /// Runtime-wide bound on concurrent claim round-trips.
     claim_gate: Arc<Semaphore>,
     claimer_owner_id: Uuid,
+    /// Whether the last claim filled every permit it asked for.
+    backlogged: bool,
 }
 
 impl Dispatcher {
@@ -414,6 +422,7 @@ impl Dispatcher {
             notify_wake,
             claim_gate,
             claimer_owner_id,
+            backlogged: false,
         }
     }
 
@@ -454,6 +463,13 @@ impl Dispatcher {
                     self.drain_ready(WakeReason::Notify, Instant::now()).await;
                 }
                 _ = self.capacity_wake.notified() => {
+                    if self.should_coalesce_capacity_wake() {
+                        tokio::select! {
+                            biased;
+                            _ = self.cancel.cancelled() => {}
+                            _ = tokio::time::sleep(CAPACITY_COALESCE_WINDOW) => {}
+                        }
+                    }
                     self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
                 // Cap the sleep at the override refresh cadence: overrides
@@ -473,6 +489,24 @@ impl Dispatcher {
         }
 
         self.alive.store(false, Ordering::SeqCst);
+    }
+
+    /// Free worker permits right now, without taking any.
+    fn free_permits(&self) -> usize {
+        match &self.concurrency {
+            ConcurrencyMode::HardReserved { semaphore } => semaphore.available_permits(),
+            ConcurrencyMode::Weighted {
+                local_semaphore, ..
+            } => local_semaphore.available_permits(),
+        }
+    }
+
+    /// A capacity wake waits briefly for more permits when the last claim
+    /// was full (so there is a backlog to claim from) and fewer than half the
+    /// workers are free.
+    fn should_coalesce_capacity_wake(&self) -> bool {
+        let half = (self.config.max_workers as usize / 2).max(1);
+        self.backlogged && self.free_permits() < half
     }
 
     /// Pre-acquire permits (non-blocking). Returns a vec of permits.
@@ -817,6 +851,7 @@ impl Dispatcher {
                 }
             }
         };
+        self.backlogged = jobs.len() == batch_size;
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
         tracing::Span::current().record("messaging.batch.message_count", jobs.len() as u64);
