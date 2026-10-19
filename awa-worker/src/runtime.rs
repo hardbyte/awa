@@ -18,8 +18,9 @@ type InFlightShard = RwLock<HashMap<InFlightKey, InFlightState>>;
 pub(crate) struct InFlightState {
     pub cancel: CancelFlag,
     pub progress: Arc<std::sync::Mutex<ProgressState>>,
-    /// When the attempt was registered, just after its claim returned.
-    pub registered_at: Instant,
+    /// When the dispatcher sent this attempt's claim request; ages measured
+    /// from here never undercount the age the rescue sweep sees.
+    pub claim_started_at: Instant,
 }
 
 /// Mutable progress buffer shared between handler and heartbeat service.
@@ -160,7 +161,7 @@ impl InFlightRegistry {
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
-    /// Keys of attempts registered at least `min_age` ago.
+    /// Keys of attempts whose claim started at least `min_age` ago.
     pub fn keys_older_than(&self, min_age: Duration) -> Vec<InFlightKey> {
         let now = Instant::now();
         let mut keys = Vec::new();
@@ -169,7 +170,7 @@ impl InFlightRegistry {
             keys.extend(
                 guard
                     .iter()
-                    .filter(|(_, state)| now.duration_since(state.registered_at) >= min_age)
+                    .filter(|(_, state)| now.duration_since(state.claim_started_at) >= min_age)
                     .map(|(key, _)| *key),
             );
         }
@@ -280,7 +281,7 @@ mod tests {
             InFlightState {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: progress.clone(),
-                registered_at: Instant::now(),
+                claim_started_at: Instant::now(),
             },
         );
 
@@ -302,7 +303,7 @@ mod tests {
             InFlightState {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: fresh_progress(),
-                registered_at: Instant::now() - Duration::from_secs(60),
+                claim_started_at: Instant::now() - Duration::from_secs(60),
             },
         );
         registry.insert(
@@ -310,7 +311,7 @@ mod tests {
             InFlightState {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: fresh_progress(),
-                registered_at: Instant::now(),
+                claim_started_at: Instant::now(),
             },
         );
 

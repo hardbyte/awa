@@ -7,42 +7,53 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-/// Heartbeat timing: the tick interval and how old an attempt must be before
-/// its first heartbeat is written.
+/// Heartbeat timing: the tick interval and the staleness the deferral of a
+/// fresh attempt's first heartbeat is budgeted against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HeartbeatCadence {
     pub interval: Duration,
-    pub first_heartbeat_after: Duration,
+    pub staleness: Duration,
 }
 
 impl HeartbeatCadence {
-    /// A claim stamps the attempt's start time, and the stale-heartbeat rescue
-    /// treats that stamp as the heartbeat until one is written, so an attempt
-    /// is covered for a full staleness window from its claim. Ticks run at an
-    /// arbitrary phase relative to registration, so an attempt first becomes
-    /// due on the first tick at least `first_heartbeat_after` after it was
-    /// registered: with half an interval, that is at most 1.5 intervals after
-    /// registration. When `staleness` honours the documented floor of three
-    /// intervals this leaves 1.5 intervals before the cutoff, so one failed or
-    /// stalled tick is still followed by another before the attempt goes
-    /// stale. Attempts that finish within half an interval write no heartbeat.
-    /// Below the floor every tick heartbeats every attempt.
+    pub fn new(interval: Duration, staleness: Duration) -> Self {
+        Self {
+            interval,
+            staleness,
+        }
+    }
+
+    /// How long after its claim started an attempt may go without a
+    /// heartbeat before a tick includes it.
+    ///
+    /// A claim stamps the attempt's start, and the stale-heartbeat rescue
+    /// treats that stamp as the heartbeat until one is written. Ticks fire at
+    /// a fixed rate, so an attempt skipped at one tick is included by the next
+    /// tick (at most one interval later); if that pass fails, the tick after
+    /// it retries. The second attempt therefore starts no later than
+    /// `deferral + 2 * interval` after the claim, delayed further only by how
+    /// long the failed pass ran, and must finish before `staleness`. The
+    /// deferral is capped at half an interval and reduced by the slowest
+    /// recent pass, so a database that is slow to answer heartbeats shortens
+    /// it and one that takes an interval or more disables it. Below the
+    /// documented floor of three intervals every tick includes every attempt.
     ///
     /// `staleness` is this runtime's setting; the rescue sweep applies the
     /// elected leader's. Fleets should use the same heartbeat settings on
     /// every runtime.
-    pub fn new(interval: Duration, staleness: Duration) -> Self {
-        let first_heartbeat_after = if staleness >= interval * 3 {
-            interval / 2
-        } else {
-            Duration::ZERO
-        };
-        Self {
-            interval,
-            first_heartbeat_after,
+    pub fn first_heartbeat_after(&self, slowest_recent_pass: Duration) -> Duration {
+        if self.staleness < self.interval * 3 {
+            return Duration::ZERO;
         }
+        (self.interval / 2).min(
+            self.staleness
+                .saturating_sub(self.interval * 2)
+                .saturating_sub(slowest_recent_pass),
+        )
     }
 }
+
+const RECENT_PASSES: usize = 8;
 
 /// Background heartbeat service that periodically updates heartbeat_at
 /// for all in-flight jobs, and flushes pending progress updates.
@@ -55,6 +66,7 @@ pub struct HeartbeatService {
     alive: Arc<AtomicBool>,
     cancel: CancellationToken,
     metrics: crate::metrics::AwaMetrics,
+    recent_passes: std::sync::Mutex<std::collections::VecDeque<Duration>>,
 }
 
 impl HeartbeatService {
@@ -76,7 +88,33 @@ impl HeartbeatService {
             alive,
             cancel,
             metrics,
+            recent_passes: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                RECENT_PASSES,
+            )),
         }
+    }
+
+    fn slowest_recent_pass(&self) -> Duration {
+        self.recent_passes
+            .lock()
+            .expect("recent heartbeat passes poisoned")
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(Duration::ZERO)
+    }
+
+    async fn timed_pass(&self) {
+        let started = std::time::Instant::now();
+        self.heartbeat_once().await;
+        let mut passes = self
+            .recent_passes
+            .lock()
+            .expect("recent heartbeat passes poisoned");
+        if passes.len() == RECENT_PASSES {
+            passes.pop_front();
+        }
+        passes.push_back(started.elapsed());
     }
 
     /// Run the heartbeat loop. Returns when cancelled.
@@ -87,6 +125,13 @@ impl HeartbeatService {
             "Heartbeat service started"
         );
 
+        // Fixed-rate ticks: a slow pass does not push the next tick a full
+        // interval past its end, which the first-heartbeat budget relies on.
+        let mut ticks = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.cadence.interval,
+            self.cadence.interval,
+        );
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
@@ -95,8 +140,8 @@ impl HeartbeatService {
                     self.heartbeat_once().await;
                     break;
                 }
-                _ = tokio::time::sleep(self.cadence.interval) => {
-                    self.heartbeat_once().await;
+                _ = ticks.tick() => {
+                    self.timed_pass().await;
                 }
             }
         }
@@ -115,9 +160,10 @@ impl HeartbeatService {
         fields(interval_ms = self.cadence.interval.as_millis() as u64)
     )]
     async fn heartbeat_once(&self) {
-        let mut all_keys: Vec<(i64, RunLease)> = self
-            .in_flight
-            .keys_older_than(self.cadence.first_heartbeat_after);
+        let mut all_keys: Vec<(i64, RunLease)> = self.in_flight.keys_older_than(
+            self.cadence
+                .first_heartbeat_after(self.slowest_recent_pass()),
+        );
         all_keys.sort_unstable();
 
         // Snapshot pending progress updates from the in-flight registry.
@@ -319,24 +365,66 @@ mod tests {
     use super::HeartbeatCadence;
     use std::time::Duration;
 
+    const SECOND: Duration = Duration::from_secs(1);
+
     #[test]
     fn first_heartbeat_waits_half_an_interval_when_staleness_meets_the_floor() {
-        let interval = Duration::from_secs(30);
-        for staleness in [Duration::from_secs(90), Duration::from_secs(600)] {
+        for staleness in [90 * SECOND, 600 * SECOND] {
             assert_eq!(
-                HeartbeatCadence::new(interval, staleness).first_heartbeat_after,
-                Duration::from_secs(15)
+                HeartbeatCadence::new(30 * SECOND, staleness).first_heartbeat_after(Duration::ZERO),
+                15 * SECOND
             );
         }
     }
 
     #[test]
     fn first_heartbeat_is_immediate_below_the_floor() {
-        let interval = Duration::from_secs(30);
-        for staleness in [Duration::from_secs(89), Duration::ZERO] {
+        for staleness in [89 * SECOND, Duration::ZERO] {
             assert_eq!(
-                HeartbeatCadence::new(interval, staleness).first_heartbeat_after,
+                HeartbeatCadence::new(30 * SECOND, staleness).first_heartbeat_after(Duration::ZERO),
                 Duration::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn slow_passes_shorten_and_then_disable_the_deferral() {
+        let cadence = HeartbeatCadence::new(30 * SECOND, 90 * SECOND);
+        assert_eq!(cadence.first_heartbeat_after(10 * SECOND), 15 * SECOND);
+        assert_eq!(cadence.first_heartbeat_after(20 * SECOND), 10 * SECOND);
+        assert_eq!(cadence.first_heartbeat_after(30 * SECOND), Duration::ZERO);
+        assert_eq!(cadence.first_heartbeat_after(45 * SECOND), Duration::ZERO);
+    }
+
+    /// The review's schedule: I = 30 s, S = 90 s, the first pass that
+    /// includes the attempt fails after 20 s. With fixed-rate ticks and the
+    /// slow pass counted, the retry finishes inside the staleness window
+    /// whatever the attempt's phase.
+    #[test]
+    fn a_failed_slow_pass_is_followed_by_a_retry_inside_the_window() {
+        let interval = 30.0_f64;
+        let staleness = 90.0_f64;
+        let failed_pass = 20.0_f64;
+        let retry_pass = 2.0_f64;
+        let cadence = HeartbeatCadence::new(
+            Duration::from_secs_f64(interval),
+            Duration::from_secs_f64(staleness),
+        );
+        let deferral = cadence.first_heartbeat_after(Duration::ZERO).as_secs_f64();
+        for tenth in 0..300 {
+            let claim = f64::from(tenth) / 10.0;
+            let first_due = ((claim + deferral) / interval).ceil() * interval;
+            let first_due = if first_due - claim < deferral {
+                first_due + interval
+            } else {
+                first_due
+            };
+            let retry_start = (first_due + interval).max(first_due + failed_pass);
+            assert!(
+                retry_start + retry_pass < claim + staleness,
+                "claim at {claim}: retry finishes at {} after cutoff {}",
+                retry_start + retry_pass,
+                claim + staleness
             );
         }
     }
