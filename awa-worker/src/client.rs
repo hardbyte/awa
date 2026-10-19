@@ -940,8 +940,11 @@ impl ClientBuilder {
 
     /// Override when a maintenance tick may seal the current slot of the
     /// queue, lease and claim rings (default
-    /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling or
-    /// a 2 MiB physical-size target). The rotate
+    /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling
+    /// once the slot holds 256 rows, a 2 MiB physical-size target, or 60
+    /// seconds regardless of rows). A row floor needs a size target or an
+    /// age ceiling, or [`Self::build`] fails: lease rows are deleted as
+    /// attempts finish, so a lease slot may never reach the floor. The rotate
     /// intervals set how often the decision is made; the cadence decides
     /// whether a slot that holds rows is sealed on that tick. Use
     /// [`RingRotationCadence::EAGER`] to seal on every tick. Only takes
@@ -1074,6 +1077,18 @@ impl ClientBuilder {
             .is_some_and(|interval| interval.is_zero())
         {
             return Err(BuildError::InvalidTerminalCountRollupInterval);
+        }
+        let cadence = self.ring_rotation_cadence;
+        if !cadence.min_slot_age.is_zero()
+            && cadence.min_slot_rows > 0
+            && cadence.max_slot_age.is_zero()
+            && cadence.target_slot_bytes == 0
+        {
+            return Err(BuildError::InvalidQueueStorage(
+                "ring_rotation_cadence: min_slot_rows needs max_slot_age or target_slot_bytes, \
+                 otherwise a slot whose rows are deleted may never seal"
+                    .into(),
+            ));
         }
 
         // Validate weighted mode constraints
@@ -3385,6 +3400,41 @@ mod tests {
             .build();
 
         assert!(matches!(result, Err(BuildError::InvalidDlqBatchSize)));
+    }
+
+    #[tokio::test]
+    async fn rotation_row_floor_requires_a_ceiling() {
+        let unbounded = RingRotationCadence {
+            max_slot_age: Duration::ZERO,
+            target_slot_bytes: 0,
+            ..RingRotationCadence::DEFAULT
+        };
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .ring_rotation_cadence(unbounded)
+            .build();
+        assert!(matches!(result, Err(BuildError::InvalidQueueStorage(_))));
+
+        for bounded in [
+            RingRotationCadence {
+                target_slot_bytes: 0,
+                ..RingRotationCadence::DEFAULT
+            },
+            RingRotationCadence {
+                max_slot_age: Duration::ZERO,
+                ..RingRotationCadence::DEFAULT
+            },
+            RingRotationCadence {
+                min_slot_rows: 0,
+                ..unbounded
+            },
+        ] {
+            assert!(Client::builder(lazy_pool())
+                .queue("default", QueueConfig::default())
+                .ring_rotation_cadence(bounded)
+                .build()
+                .is_ok());
+        }
     }
 
     #[tokio::test]
