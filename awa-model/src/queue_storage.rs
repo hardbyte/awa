@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -2806,6 +2806,9 @@ pub struct QueueStorage {
     /// This instance's claimer lease per queue, as last read or written, so a
     /// claim does not re-read the lease and claimer target on every call.
     claimer_gates: Mutex<HashMap<(String, Uuid), CachedClaimerGate>>,
+    /// The ring cursor authority has been read as `ledger` for this schema.
+    /// The flip is one-way, so the reading never needs repeating.
+    ledger_authority_observed: AtomicBool,
     /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
     /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
     /// queue_claim_heads) we have previously inserted. Skips the three
@@ -2859,6 +2862,7 @@ impl QueueStorage {
             shard_rotor: AtomicU16::new(0),
             enqueue_shards_cache: Mutex::new(HashMap::new()),
             claimer_gates: Mutex::new(HashMap::new()),
+            ledger_authority_observed: AtomicBool::new(false),
             ensured_lanes: Mutex::new(HashSet::new()),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
@@ -5483,6 +5487,27 @@ impl QueueStorage {
         self.append_terminal_count_deltas_tx(tx, by_group).await
     }
 
+    /// Whether terminal-count deltas keep their job-id bucket. N-1
+    /// maintenance folds deltas into the bucket of the original row, so they
+    /// keep it until the ring authority flip fences that maintenance; after
+    /// it, folds collapse each lane and one delta row per lane suffices.
+    async fn terminal_deltas_bucketed_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    ) -> Result<bool, AwaError> {
+        if self.ledger_authority_observed.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        match self.ring_authority_tx(tx).await? {
+            RingAuthority::Ledger => {
+                self.ledger_authority_observed
+                    .store(true, Ordering::Relaxed);
+                Ok(false)
+            }
+            RingAuthority::Columns => Ok(true),
+        }
+    }
+
     async fn append_terminal_count_deltas_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5491,6 +5516,17 @@ impl QueueStorage {
         if by_group.is_empty() {
             return Ok(());
         }
+        let by_group = if self.terminal_deltas_bucketed_tx(tx).await? {
+            by_group
+        } else {
+            let mut by_lane: BTreeMap<TerminalCounterKey, i64> = BTreeMap::new();
+            for ((slot, generation, queue, priority, shard, _bucket), delta) in by_group {
+                *by_lane
+                    .entry((slot, generation, queue, priority, shard, 0))
+                    .or_insert(0) += delta;
+            }
+            by_lane
+        };
 
         let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
         let mut ready_generations: Vec<i64> = Vec::with_capacity(by_group.len());

@@ -12692,7 +12692,10 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
         .await
         .expect("rollup terminal deltas");
     assert_eq!(outcome.rolled_slots, 1);
-    assert_eq!(outcome.delta_rows, 6);
+    assert_eq!(
+        outcome.delta_rows, 1,
+        "after the flip a lane's completions append one delta row"
+    );
     assert_eq!(outcome.grouped_keys, 1);
     assert_eq!(outcome.skipped_active_slots, 0);
     assert_eq!(outcome.blocked_slots, 0);
@@ -13022,6 +13025,49 @@ async fn test_terminal_count_fold_ignores_net_zero_deltas() {
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
 }
 
+/// After the flip a batch of terminal rows appends one delta row per lane;
+/// before it, one per job-id bucket, which N-1 folds need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_deltas_are_per_lane_after_the_flip() {
+    for (authority, expect_one_row) in [("ledger", true), ("columns", false)] {
+        let (_db_guard, pool) = setup_pool(10).await;
+        let queue = "qs_terminal_delta_lanes";
+        let schema = "awa_qs_terminal_delta_lanes";
+        let store = create_store(&pool, schema).await;
+        set_ring_authority(&pool, schema, authority).await;
+        store
+            .enqueue_batch(&pool, queue, 1, 8)
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 8, Duration::ZERO)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 8);
+        let claims: Vec<_> = claimed.iter().map(|job| job.claim.clone()).collect();
+        store
+            .complete_batch(&pool, &claims)
+            .await
+            .expect("complete");
+        let rows: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT count(*) FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+        )))
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .expect("delta rows");
+        assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 8);
+        if expect_one_row {
+            assert_eq!(rows, 1, "{authority}: one delta row per lane");
+        } else {
+            assert!(
+                rows > 1,
+                "{authority}: deltas keep job-id buckets, got {rows} rows"
+            );
+        }
+    }
+}
+
 /// Terminal-count rollup mutates `queue_terminal_live_counts`, so it should
 /// stand down while another backend is pinning the MVCC horizon. Exact reads
 /// remain correct because they include pending delta rows.
@@ -13087,7 +13133,10 @@ async fn test_queue_terminal_count_delta_rollup_skips_pinned_mvcc_horizon() {
         .await
         .expect("rollup terminal deltas after pin release");
     assert_eq!(outcome.rolled_slots, 1);
-    assert_eq!(outcome.delta_rows, 6);
+    assert_eq!(
+        outcome.delta_rows, 1,
+        "after the flip a lane's completions append one delta row"
+    );
     assert_eq!(outcome.grouped_keys, 1);
     assert!(!outcome.skipped_mvcc_pinned);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
