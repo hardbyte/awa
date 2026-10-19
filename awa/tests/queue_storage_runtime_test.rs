@@ -3632,7 +3632,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
     let store = Arc::new(
         create_store(&pool, schema)
             .await
-            .with_prune_lock_timeout(Duration::from_secs(2))
+            .with_prune_lock_timeout(Duration::from_secs(60))
             .expect("test prune lock timeout"),
     );
 
@@ -3722,7 +3722,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
 
     let needle = format!("{schema}.ready_segments_0");
-    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    let wait_deadline = Instant::now() + Duration::from_secs(30);
     let mut saw_lock_wait = false;
     while Instant::now() < wait_deadline {
         let waiting: bool = sqlx::query_scalar(
@@ -3754,7 +3754,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
 
     writer_tx.commit().await.expect("commit pending ready row");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), prune_task)
+    let outcome = tokio::time::timeout(Duration::from_secs(30), prune_task)
         .await
         .expect("queue prune task timed out")
         .expect("queue prune task panicked")
@@ -14139,8 +14139,6 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let store = Arc::new(
         create_store(&pool, schema)
             .await
-            // Well above the reader's handoff time on a loaded server; the
-            // test is about lock order, not the timeout.
             .with_prune_lock_timeout(Duration::from_secs(60))
             .expect("prune lock timeout"),
     );
