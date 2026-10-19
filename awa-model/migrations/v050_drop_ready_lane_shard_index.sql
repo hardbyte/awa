@@ -26,6 +26,7 @@ DECLARE
     v_schema TEXT;
     v_parent_oid OID;
     v_slot INT;
+    v_index TEXT;
     v_previous_lock_timeout TEXT := current_setting('lock_timeout');
 BEGIN
     IF v_previous_lock_timeout = '0' THEN
@@ -48,11 +49,15 @@ BEGIN
               AND c.relname ~ '^ready_entries_[0-9]+$'
             ORDER BY 1
         LOOP
-            EXECUTE format(
-                'DROP INDEX IF EXISTS %I.%I',
-                v_schema,
-                format('idx_%s_ready_%s_lane_shard', v_schema, v_slot)
-            );
+            v_index := format('idx_%s_ready_%s_lane_shard', v_schema, v_slot);
+            CONTINUE WHEN to_regclass(format('%I.%I', v_schema, v_index)) IS NULL;
+            BEGIN
+                EXECUTE format('DROP INDEX %I.%I', v_schema, v_index);
+            EXCEPTION WHEN lock_not_available THEN
+                RAISE EXCEPTION 'v050 could not lock %.ready_entries_% within lock_timeout % to drop its redundant lane index; a long transaction, claim or maintenance tick holds it. Nothing was migrated: re-run when the partition is free, or with a longer lock_timeout for the migration session',
+                    quote_ident(v_schema), v_slot, current_setting('lock_timeout')
+                    USING ERRCODE = '55P03';
+            END;
         END LOOP;
     END LOOP;
 
