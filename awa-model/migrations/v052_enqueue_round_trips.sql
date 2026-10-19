@@ -3,7 +3,11 @@
 -- reserve_enqueue_seq keeps its signature, lock key and return value. It
 -- provisions lane sequences only for a lane row without a sequence name and
 -- reserves a multi-row range with one sequence write instead of two.
--- N-1 binaries call it unchanged.
+-- enqueue_ready_rows is new: one ready batch's lane reservations, ring
+-- cursor read, ready and segment appends and NOTIFY in a single call.
+-- N-1 binaries call reserve_enqueue_seq unchanged and never call the new
+-- function; current binaries probe for it and keep the multi-statement path
+-- on a schema without it.
 -- Live load: function replacement only, with no table DDL or row scans.
 -- Function lock waits and schema count determine wall time.
 

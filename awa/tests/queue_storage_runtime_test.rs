@@ -17290,6 +17290,169 @@ fn fold_test_config(schema: &str) -> QueueStorageConfig {
     }
 }
 
+fn fold_test_jobs(
+    queue: &str,
+    ids: std::ops::RangeInclusive<i64>,
+) -> Vec<awa::model::InsertParams> {
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        ..Default::default()
+    };
+    ids.map(|id| insert::params_with(&DlqJob { id }, opts.clone()).expect("Failed to prepare job"))
+        .collect()
+}
+
+/// A runtime that enqueues through `enqueue_ready_rows` and one that uses the
+/// multi-statement path (as a binary without the function does) interleave
+/// on one lane: the lane stays gap-free and FIFO, each call writes its own
+/// segment, and a store on a schema without the function falls back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_function_and_fallback_share_one_lane() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_enqueue_function_lane";
+    let schema = "awa_qs_enqueue_function_lane";
+    let store = create_store_with_config(&pool, fold_test_config(schema)).await;
+    let fallback = QueueStorage::new(fold_test_config(schema))
+        .expect("Failed to create fallback store")
+        .without_enqueue_function();
+
+    let mut next_id = 1_i64;
+    for (through_function, batch_size) in [(true, 3), (false, 1), (true, 1), (false, 4), (true, 2)]
+    {
+        let jobs = fold_test_jobs(queue, next_id..=next_id + batch_size - 1);
+        next_id += batch_size;
+        let writer = if through_function { &store } else { &fallback };
+        let inserted = writer
+            .enqueue_params_copy(&pool, &jobs)
+            .await
+            .expect("Failed to enqueue");
+        assert_eq!(inserted, batch_size as usize);
+    }
+
+    let rows: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT lane_seq, (args->>'id')::bigint FROM {schema}.ready_entries \
+         WHERE queue = $1 ORDER BY lane_seq"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read ready rows");
+    assert_eq!(rows, (1..=11).map(|seq| (seq, seq)).collect::<Vec<_>>());
+
+    let segments: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT first_lane_seq, next_lane_seq FROM {schema}.ready_segments \
+         WHERE queue = $1 ORDER BY first_lane_seq"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read ready segments");
+    assert_eq!(segments, vec![(1, 4), (4, 5), (5, 6), (6, 10), (10, 12)]);
+
+    let distinct_job_ids: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(DISTINCT job_id) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count job ids");
+    assert_eq!(distinct_job_ids, 11);
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 11, Duration::ZERO)
+        .await
+        .expect("Failed to claim");
+    let claimed_lane_seqs: Vec<i64> = claimed.iter().map(|job| job.claim.lane_seq).collect();
+    assert_eq!(claimed_lane_seqs, (1..=11).collect::<Vec<_>>());
+
+    sqlx::query(audited_sql(format!(
+        "DROP FUNCTION {schema}.enqueue_ready_rows(text[], smallint[], smallint[], bigint[], \
+         bigint[], text[], jsonb[], smallint[], bigint[], smallint[], timestamptz[], \
+         timestamptz[], timestamptz[], bytea[], text[], jsonb[], integer[], bigint[], bigint[], \
+         timestamptz[], text[])"
+    )))
+    .execute(&pool)
+    .await
+    .expect("Failed to drop enqueue function");
+    let older_schema_store =
+        QueueStorage::new(fold_test_config(schema)).expect("Failed to create store");
+    older_schema_store
+        .enqueue_params_copy(&pool, &fold_test_jobs(queue, 12..=13))
+        .await
+        .expect("Failed to enqueue without the function");
+    let last_lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT max(lane_seq) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read last lane sequence");
+    assert_eq!(last_lane_seq, 13);
+}
+
+/// The one-statement enqueue takes the same per-lane reservation lock as
+/// `reserve_enqueue_seq`, so it cannot publish past an open reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_function_waits_for_open_lane_reservation() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_enqueue_function_waits";
+    let schema = "awa_qs_enqueue_function_waits";
+    let store = Arc::new(create_store_with_config(&pool, fold_test_config(schema)).await);
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare lane");
+
+    let mut reservation = pool.begin().await.expect("Failed to begin reservation");
+    let reserved: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+    )))
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .bind(2_i64)
+    .fetch_one(reservation.as_mut())
+    .await
+    .expect("Failed to reserve");
+    assert_eq!(reserved, 1);
+
+    let enqueue_pool = pool.clone();
+    let enqueue_store = Arc::clone(&store);
+    let jobs = fold_test_jobs(queue, 1..=1);
+    let enqueue = tokio::spawn(async move {
+        enqueue_store
+            .enqueue_params_copy(&enqueue_pool, &jobs)
+            .await
+    });
+    wait_for_lock_wait(&pool, "advisory").await;
+    let visible: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count ready rows");
+    assert_eq!(visible, 0);
+
+    reservation
+        .rollback()
+        .await
+        .expect("Failed to release reservation");
+    tokio::time::timeout(Duration::from_secs(5), enqueue)
+        .await
+        .expect("Enqueue remained blocked")
+        .expect("Enqueue task panicked")
+        .expect("Enqueue failed");
+    let lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT lane_seq FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read lane sequence");
+    assert_eq!(lane_seq, 3, "the rolled-back reservation leaves a gap");
+}
+
 /// A lane row without a sequence name (written before the head trigger
 /// existed) is provisioned on its first reservation; reservations of one and
 /// of several rows stay contiguous.
