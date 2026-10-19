@@ -111,7 +111,21 @@ impl HeartbeatService {
 
     async fn timed_pass(&self) {
         let started = std::time::Instant::now();
+        let deferral = self
+            .cadence
+            .first_heartbeat_after(self.slowest_recent_pass());
         self.heartbeat_once().await;
+        let elapsed = started.elapsed();
+        if elapsed > self.cadence.interval {
+            warn!(
+                pass_ms = elapsed.as_millis() as u64,
+                interval_ms = self.cadence.interval.as_millis() as u64,
+                first_heartbeat_deferral_ms = deferral.as_millis() as u64,
+                staleness_ms = self.cadence.staleness.as_millis() as u64,
+                "Heartbeat pass took longer than the heartbeat interval; attempts it covered \
+                 may be rescued as stale if this continues"
+            );
+        }
         let mut passes = self
             .recent_passes
             .lock()
@@ -119,7 +133,7 @@ impl HeartbeatService {
         if passes.len() == RECENT_PASSES {
             passes.pop_front();
         }
-        passes.push_back(started.elapsed());
+        passes.push_back(elapsed);
     }
 
     /// Run the heartbeat loop. Returns when cancelled.
@@ -130,13 +144,15 @@ impl HeartbeatService {
             "Heartbeat service started"
         );
 
-        // Fixed-rate ticks: a slow pass does not push the next tick a full
-        // interval past its end, which the first-heartbeat budget relies on.
+        // Ticks on a fixed grid: a slow pass does not push the next tick a
+        // full interval past its end, which the first-heartbeat budget relies
+        // on. A pass that overruns skips to the next grid tick rather than
+        // starting another pass at once.
         let mut ticks = tokio::time::interval_at(
             tokio::time::Instant::now() + self.cadence.interval,
             self.cadence.interval,
         );
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
