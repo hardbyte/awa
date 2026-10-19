@@ -1032,6 +1032,21 @@ impl ClientBuilder {
                         .into(),
                 ));
             }
+            if cadence.min_slot_age.is_zero() && cadence.min_slot_rows > 0 {
+                tracing::warn!(
+                    min_slot_rows = cadence.min_slot_rows,
+                    "ring_rotation_cadence: min_slot_age is zero, so slots seal on every tick and \
+                     min_slot_rows has no effect"
+                );
+            }
+            if !cadence.max_slot_age.is_zero() && cadence.max_slot_age < cadence.min_slot_age {
+                tracing::warn!(
+                    max_slot_age_ms = cadence.max_slot_age.as_millis() as u64,
+                    min_slot_age_ms = cadence.min_slot_age.as_millis() as u64,
+                    "ring_rotation_cadence: max_slot_age is below min_slot_age, so slots seal at \
+                     max_slot_age"
+                );
+            }
             runtime.rotation_cadence = cadence;
             if let Some(interval) = self.claim_rotate_interval {
                 runtime.claim_rotate_interval = interval;

@@ -287,7 +287,7 @@ never reach the floor. A zero minimum age, or Rust `RingRotationCadence::EAGER`,
 permits sealing each tick whatever the other settings.
 Rust cadence and claim-interval overrides survive `queue_storage` calls in either order.
 Empty slots bypass the fill window so reclamation can continue after drain.
-Leader changes reset the local monotonic fill timers. The size is sampled and
+Leader changes reset the local monotonic fill timers; the 60-second ceiling counts from when the slot opened on the database clock, so it still applies. The size is sampled and
 can be exceeded by bursts or blocked reuse; use actual retained storage and
 blocked-prune metrics for capacity planning. It is not a retention policy or
 storage limit. Queue prune lock contention retries on the next decision tick;

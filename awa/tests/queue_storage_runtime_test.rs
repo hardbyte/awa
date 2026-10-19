@@ -2609,6 +2609,66 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
     );
 }
 
+/// A new maintenance leader starts its local fill timers afresh, so the age
+/// ceiling also counts from when the slot opened on the database clock;
+/// otherwise leadership that moves more often than the ceiling keeps a
+/// trickle slot open indefinitely.
+#[tokio::test]
+async fn test_rotation_age_ceiling_survives_a_leader_change() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_leader_change";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        ) SELECT 0, 0, 9_000_000 + n, 'cadence_job', 'cadence_leader_q',
+                 'completed'::awa.job_state, 2::smallint, 1::smallint,
+                 1::bigint, 1_000 + n, 0::smallint, now(), now(), '{{}}'::jsonb
+          FROM generate_series(1, 10) AS n"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let trickle = RingRotationCadence {
+        min_slot_age: Duration::from_millis(1),
+        target_slot_bytes: 1 << 30,
+        min_slot_rows: 50,
+        max_slot_age: Duration::from_secs(60),
+    };
+    store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, trickle).await.unwrap(),
+        RotateOutcome::SkippedFilling { slot: 0, .. }
+    ));
+
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_ring_rotations \
+         SET rotated_at = clock_timestamp() - interval '2 minutes' WHERE generation = 0"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    store.reset_rotation_observations();
+    let outcome = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    assert!(
+        matches!(outcome, RotateOutcome::Rotated { slot: 1, generation: 1 }),
+        "a slot open past the ceiling seals even when a new leader just started observing it, got {outcome:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rotation_cadence_row_floor_and_age_ceiling() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -2713,11 +2773,8 @@ async fn test_rotation_cadence_row_floor_and_age_ceiling() {
         max_slot_age: Duration::from_millis(1),
         ..trickle
     };
-    let _ = store
-        .rotate_with_cadence(&pool, unreachable_floor)
-        .await
-        .expect("an out-of-range row floor must not fail the probe");
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // The slot opened more than the 1 ms ceiling ago on the database clock,
+    // so the first observation already seals it.
     let outcome = store
         .rotate_with_cadence(&pool, unreachable_floor)
         .await
