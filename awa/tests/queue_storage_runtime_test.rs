@@ -2689,7 +2689,7 @@ async fn test_counter_rebuild_waits_for_an_in_flight_prune() {
         let pool = pool.clone();
         tokio::spawn(async move { store.rebuild_terminal_counters(&pool).await })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_any_lock_wait(&pool).await;
     sqlx::query("SET LOCAL lock_timeout = '5s'")
         .execute(prune.as_mut())
         .await
@@ -2734,7 +2734,7 @@ async fn test_reset_waits_for_an_in_flight_rotation() {
         let pool = pool.clone();
         tokio::spawn(async move { store.reset(&pool).await })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_any_lock_wait(&pool).await;
     sqlx::query("SET LOCAL lock_timeout = '5s'")
         .execute(rotate.as_mut())
         .await
@@ -15391,6 +15391,29 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
         dlq_entry.is_some(),
         "DLQ row should survive the failed retry"
     );
+}
+
+/// Wait until another backend is blocked on a heavyweight lock of any kind.
+async fn wait_for_any_lock_wait(pool: &sqlx::PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                SELECT 1 FROM pg_stat_activity \
+                WHERE datname = current_database() \
+                  AND pid <> pg_backend_pid() \
+                  AND wait_event_type = 'Lock'\
+            )",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("Failed to inspect lock waits");
+        if waiting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "Expected a lock wait");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn wait_for_lock_wait(pool: &sqlx::PgPool, wait_event: &str) {
