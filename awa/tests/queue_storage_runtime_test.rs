@@ -2704,6 +2704,34 @@ async fn test_rotation_cadence_row_floor_and_age_ceiling() {
         ),
         "sixty rows over a 50-row floor past the age window must seal, got {outcome:?}"
     );
+
+    // A floor beyond PostgreSQL's bigint LIMIT range must not break the
+    // probe; the ceiling still seals.
+    seed_done_rows(2, 2, 3).await;
+    let unreachable_floor = RingRotationCadence {
+        min_slot_rows: u64::MAX,
+        max_slot_age: Duration::from_millis(1),
+        ..trickle
+    };
+    let _ = store
+        .rotate_with_cadence(&pool, unreachable_floor)
+        .await
+        .expect("an out-of-range row floor must not fail the probe");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let outcome = store
+        .rotate_with_cadence(&pool, unreachable_floor)
+        .await
+        .expect("an out-of-range row floor must not fail the probe");
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 3,
+                generation: 3
+            }
+        ),
+        "the age ceiling seals regardless of the row floor, got {outcome:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

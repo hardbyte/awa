@@ -15362,7 +15362,7 @@ impl QueueStorage {
         }
         // Sample at most `min_slot_rows` rows per child so the probe stays
         // bounded on a full slot; one row is enough to know it is non-empty.
-        let sample_limit = cadence.min_slot_rows.max(1);
+        let sample_limit = cadence.min_slot_rows.clamp(1, i64::MAX as u64);
         let row_sources = children
             .iter()
             .map(|relation| format!("(SELECT 1 FROM {relation} LIMIT {sample_limit})"))
