@@ -12,13 +12,13 @@
 -- `awa migrate --sql --from 49 --to 50` run V23_UP first, which only
 -- redefines the installer function so later installs omit the index; the
 -- default substrate is not replayed. This tail drops the existing copies in
--- every discovered queue-storage schema, in slot order.
+-- every schema awa.queue_storage_schemas() selects, in slot order.
 --
 -- Locks: each `DROP INDEX` takes ACCESS EXCLUSIVE on its ready partition and
 -- holds it until the migration transaction commits. No rows are scanned or
--- rewritten. When no lock_timeout is set, the tail waits at most 2 s for each
--- partition; a timeout (SQLSTATE 55P03) rolls the whole migration back and it
--- can be re-run.
+-- rewritten. When no lock_timeout is set, each lock acquisition waits at most
+-- 2 s; locks already taken stay held until commit. A timeout (SQLSTATE 55P03)
+-- rolls the whole migration back and it can be re-run.
 -- Tracking: https://github.com/hardbyte/awa/issues/522
 
 DO $$
@@ -33,17 +33,7 @@ BEGIN
     END IF;
 
     FOR v_schema IN
-        SELECT n.nspname
-        FROM pg_namespace AS n
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS awa_p
-              WHERE awa_p.pronamespace = n.oid
-                AND awa_p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(awa_p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
-          )
-        ORDER BY n.nspname
+        SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered
     LOOP
         v_parent_oid := to_regclass(format('%I.ready_entries', v_schema));
         IF v_parent_oid IS NULL THEN
