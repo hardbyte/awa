@@ -15747,6 +15747,16 @@ async fn test_queue_storage_counter_rebuild_locks_ring_before_done_table() {
         "Counter rebuild should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Counter rebuild should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), rebuild)
@@ -15786,6 +15796,16 @@ async fn test_queue_storage_reset_locks_ring_before_done_table() {
         "Reset should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Reset should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), reset)

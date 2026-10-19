@@ -15786,15 +15786,16 @@ impl QueueStorage {
     /// - as a routine drift-recovery step before relying on counter-fed
     ///   reads for billing-grade accuracy.
     ///
-    /// The rebuild is wrapped in an advisory lock so concurrent writers
-    /// don't interleave new inserts mid-rebuild. The lock key is scoped
-    /// to the queue-storage schema, so other schemas / other operations
-    /// are unaffected. Writers that hit the lock will block briefly
-    /// rather than fail.
+    /// The rebuild takes a schema-scoped rebuild lock so two rebuilds do not
+    /// overlap, then waits for the queue ring's rotation lock, so it starts
+    /// only between maintenance ticks; ticks that arrive meanwhile skip
+    /// rather than wait. It then locks the terminal tables exclusively, so
+    /// completions, failures and retries that write terminal rows wait for
+    /// it to commit. Other schemas are unaffected.
     ///
     /// **Operator note:** this is best run on a quiesced fleet (workers
-    /// paused or fully drained). Concurrent inserts during the rebuild
-    /// will block on the lock; long-held locks can stall the fleet. The
+    /// paused or fully drained). Terminal writes during the rebuild wait on
+    /// its table locks, and a long rebuild stalls them for its duration. The
     /// rebuild itself is O(rows in `{schema}.done_entries`). Compact receipt
     /// completions remain counted directly from retained
     /// `receipt_completion_batches` until queue prune folds them into
