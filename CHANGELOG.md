@@ -97,17 +97,21 @@ Notable changes between releases. Detailed migration notes for storage transitio
   was invisible to it: the job was recorded as finished and also rescued to
   retry. Rescue now takes the attempt locks in one statement and decides in
   the next, which sees every closer that went first. Admin cancel of a
-  receipt-only attempt took no attempt lock at all. Both cancel paths now take
-  the attempt lock before taking any claim or lease row, as closers do, and
-  re-check the attempt. A cancel waits for that lock and then sees the
-  holder's outcome, unless its transaction already holds a receipt attempt
-  lock: later jobs of a bulk cancel, or a cancel after a completion in the
-  same transaction. That cancel only tries, so a busy attempt, held by a
-  closer, a materializer or a transaction that later rolls back, is left
-  running. `bulk_cancel` leaves it out of the returned rows; `cancel_tx` in
-  such a transaction reports `JobNotFound`. Each skip is logged at info level.
-  A bulk cancel holds one advisory lock per running attempt until it commits,
-  so cancel very large sets of running jobs in batches.
+  receipt-only attempt took no attempt lock at all. A cancel of a running
+  attempt now waits on no lock: closers disagree on order (receipt closers
+  take the attempt lock before claim rows, lease-side closers delete the lease
+  first), so waiting in either order could deadlock. Each try runs in a
+  savepoint, takes the attempt lock and the lease or claim rows without
+  waiting, re-reads the attempt under the lock (catching a lease materialized
+  meanwhile), and on contention rolls the savepoint back, releasing what it
+  took, before retrying for up to five seconds. A transaction that already
+  holds an attempt lock, such as later jobs of a bulk cancel, tries once. An
+  attempt still busy after that, because a closer, a materializer or a
+  transaction that later rolls back holds it, is left running and logged:
+  `bulk_cancel` leaves it out of the returned rows and `cancel` reports
+  `JobNotFound`, so callers that need it cancelled should retry. A bulk cancel
+  holds one advisory lock per running attempt until it commits, so cancel very
+  large sets of running jobs in batches.
 
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
