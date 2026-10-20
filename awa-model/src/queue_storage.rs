@@ -2025,6 +2025,24 @@ type GroupedClaimCursorAdvances = BTreeMap<
 >;
 type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 
+/// Test hook awaited at named points of a running-attempt cancel:
+/// `"lease_lookup"` after the first lease read, `"attempt_locked"` once the
+/// attempt lock is held, and `"attempt_busy"` before a retry pause.
+#[doc(hidden)]
+pub type CancelPhaseHook = std::sync::Arc<
+    dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+struct CancelPhaseHookSlot(Option<CancelPhaseHook>);
+
+impl std::fmt::Debug for CancelPhaseHookSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
 /// How long a cancel keeps retrying a running attempt that other
 /// transactions keep busy before reporting it as not cancelled.
 const CANCEL_BUSY_BUDGET: Duration = Duration::from_secs(5);
@@ -2887,6 +2905,7 @@ pub struct QueueStorage {
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
+    cancel_phase_hook: CancelPhaseHookSlot,
 }
 
 impl QueueStorage {
@@ -2933,10 +2952,25 @@ impl QueueStorage {
             ensured_lanes: Mutex::new(HashSet::new()),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
+            cancel_phase_hook: CancelPhaseHookSlot(None),
         })
     }
 
     #[doc(hidden)]
+    /// Await `hook` at named points of a running-attempt cancel, so tests can
+    /// commit a concurrent change at an exact step. Not for production use.
+    #[doc(hidden)]
+    pub fn with_cancel_phase_hook(mut self, hook: CancelPhaseHook) -> Self {
+        self.cancel_phase_hook = CancelPhaseHookSlot(Some(hook));
+        self
+    }
+
+    async fn cancel_phase(&self, phase: &'static str) {
+        if let Some(hook) = &self.cancel_phase_hook.0 {
+            hook(phase).await;
+        }
+    }
+
     pub fn with_prune_lock_timeout(mut self, timeout: Duration) -> Result<Self, AwaError> {
         if timeout.is_zero() {
             return Err(AwaError::Validation(
@@ -9051,6 +9085,7 @@ impl QueueStorage {
                 return Ok(RunningAttemptCancel::Left);
             }
             if busy {
+                self.cancel_phase("attempt_busy").await;
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_millis(100));
             }
@@ -9186,6 +9221,7 @@ impl QueueStorage {
         .fetch_optional(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        self.cancel_phase("lease_lookup").await;
         let found_receipt: Option<ReceiptCancelRow> = if lease_run_lease.is_none() {
             let find_receipt_sql = open_receipt_sql
                 .replace("FOR UPDATE OF claims NOWAIT", "")
@@ -9201,17 +9237,47 @@ impl QueueStorage {
         };
         let Some(run_lease) = lease_run_lease.or(found_receipt.as_ref().map(|found| found.1))
         else {
-            return Ok(CancelStep::Done(RunningAttemptCancel::NotRunning));
+            // The two reads are separate statements: a lease materialized
+            // between them hides the receipt from the second. Look again.
+            let lease_appeared: bool = sqlx::query_scalar(audited_sql(format!(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.leases \
+                 WHERE job_id = $1 AND state IN ('running', 'waiting_external'))"
+            )))
+            .bind(job_id)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            return Ok(if lease_appeared {
+                CancelStep::Again
+            } else {
+                CancelStep::Done(RunningAttemptCancel::NotRunning)
+            });
         };
 
         if !self.try_lock_attempt_tx(tx, job_id, run_lease).await? {
             return Ok(CancelStep::Busy);
         }
+        self.cancel_phase("attempt_locked").await;
+
+        // Materializers take the attempt lock, so under it the attempt's
+        // representation is settled. Resolve it with a fresh statement: a
+        // lease that exists now, whatever the receipt kind, goes through the
+        // lease path, whose row lock does not wait.
+        let lease_now: bool = sqlx::query_scalar(audited_sql(format!(
+            "SELECT EXISTS (SELECT 1 FROM {schema}.leases \
+             WHERE job_id = $1 AND run_lease = $2 \
+               AND state IN ('running', 'waiting_external'))"
+        )))
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         // Under the attempt lock, take the rows without waiting. A row lock
         // held elsewhere belongs to a closer that may be waiting for this
         // attempt lock, so contention means: let go and try again.
-        if lease_run_lease.is_some() {
+        if lease_now {
             let lease_lock = sqlx::query_scalar::<_, i32>(audited_sql(format!(
                 "SELECT 1 FROM {schema}.leases \
                  WHERE job_id = $1 AND run_lease = $2 AND state IN ('running', 'waiting_external') \
@@ -9417,17 +9483,6 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
         }
-        // Materializers take the attempt lock this cancel holds, and the
-        // re-check excluded materialized attempts, so this is a no-op
-        // kept as a guard against an orphaned lease row.
-        sqlx::query(audited_sql(format!(
-            "DELETE FROM {schema}.leases WHERE job_id = $1 AND run_lease = $2"
-        )))
-        .bind(job_id)
-        .bind(run_lease)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
         self.notify_cancellation_tx(tx, job_id, run_lease).await?;
         Ok(CancelStep::Done(RunningAttemptCancel::Cancelled(Box::new(
             CancelJobTxResult {
