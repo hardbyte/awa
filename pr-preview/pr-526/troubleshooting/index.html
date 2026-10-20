@@ -3040,7 +3040,7 @@
 <p>Interpretation:</p>
 <ul>
 <li>low <code>heartbeat_age_s</code>: the worker is still alive</li>
-<li>an attempt that started less than about 1.5 <code>heartbeat_interval</code>s ago may still show its claim time as <code>heartbeat_at</code>, because its first heartbeat is deferred; an age up to 1.5 intervals is normal for a fresh attempt (less when heartbeat passes have been slow, since the deferral shrinks then)</li>
+<li>with <code>defer_first_heartbeat</code> enabled, an attempt that started less than about 1.5 <code>heartbeat_interval</code>s ago may still show its claim time as <code>heartbeat_at</code>, because its first heartbeat is deferred; an age up to 1.5 intervals is normal for a fresh attempt (less when heartbeat passes have been slow, since the deferral shrinks then)</li>
 <li><code>heartbeat_age_s</code> well above <code>heartbeat_staleness</code> (default <code>90s</code>): stale-heartbeat rescue should pick it up on the next scan</li>
 <li>very negative <code>deadline_remaining_s</code>: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)</li>
 </ul>
