@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 pub(crate) struct HeartbeatCadence {
     pub interval: Duration,
     pub staleness: Duration,
+    pub defer_first: bool,
 }
 
 impl HeartbeatCadence {
@@ -20,7 +21,13 @@ impl HeartbeatCadence {
         Self {
             interval,
             staleness,
+            defer_first: false,
         }
+    }
+
+    pub fn with_first_heartbeat_deferral(mut self, enabled: bool) -> Self {
+        self.defer_first = enabled;
+        self
     }
 
     /// How long after its claim started an attempt may go without a
@@ -30,11 +37,13 @@ impl HeartbeatCadence {
     /// treats that stamp as the heartbeat until one is written. Ticks fire at
     /// a fixed rate, so the first tick that includes an attempt comes between
     /// `deferral` and `deferral + interval` after its claim, instead of within
-    /// one interval. The deferral is capped at half an interval and reduced
-    /// by the slowest recent pass, so a database that has been slow to answer
-    /// heartbeats shortens it and one that takes an interval or more disables
-    /// it. Below the documented floor of three intervals every tick includes
-    /// every attempt.
+    /// one interval. The deferral is capped at half an interval and is at
+    /// most `staleness - 2 * interval - slowest recent pass`, so a database
+    /// that has been slow to answer heartbeats shortens it; at the 3x floor a
+    /// pass of one interval disables it. This is feedback from completed
+    /// passes, not a prediction: a later stall still eats into the budget.
+    /// Below the documented floor of three intervals, or when deferral is not
+    /// enabled, every tick includes every attempt.
     ///
     /// The cost is stall tolerance for a fresh attempt. If its first included
     /// pass stalls, for example waiting for a pool connection, the attempt
@@ -47,7 +56,7 @@ impl HeartbeatCadence {
     /// elected leader's. Fleets should use the same heartbeat settings on
     /// every runtime.
     pub fn first_heartbeat_after(&self, slowest_recent_pass: Duration) -> Duration {
-        if self.staleness < self.interval * 3 {
+        if !self.defer_first || self.staleness < self.interval * 3 {
             return Duration::ZERO;
         }
         (self.interval / 2).min(
@@ -59,6 +68,30 @@ impl HeartbeatCadence {
 }
 
 const RECENT_PASSES: usize = 8;
+
+/// Run `pass` every `interval` on a fixed grid until `cancel` fires. A pass
+/// that outlasts the interval is followed by one full interval of rest, as
+/// a sleep after each pass would give, rather than by an immediate pass.
+pub(crate) async fn run_on_grid<F, Fut>(interval: Duration, cancel: &CancellationToken, mut pass: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = ticks.tick() => {
+                let started = tokio::time::Instant::now();
+                pass().await;
+                if started.elapsed() >= interval {
+                    ticks.reset();
+                }
+            }
+        }
+    }
+}
 
 /// Background heartbeat service that periodically updates heartbeat_at
 /// for all in-flight jobs, and flushes pending progress updates.
@@ -144,28 +177,10 @@ impl HeartbeatService {
             "Heartbeat service started"
         );
 
-        // Ticks on a fixed grid: a slow pass does not push the next tick a
-        // full interval past its end, which the first-heartbeat budget relies
-        // on. A pass that overruns skips to the next grid tick rather than
-        // starting another pass at once.
-        let mut ticks = tokio::time::interval_at(
-            tokio::time::Instant::now() + self.cadence.interval,
-            self.cadence.interval,
-        );
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = self.cancel.cancelled() => {
-                    debug!("Heartbeat service shutting down");
-                    // Final heartbeat before exit
-                    self.heartbeat_once().await;
-                    break;
-                }
-                _ = ticks.tick() => {
-                    self.timed_pass().await;
-                }
-            }
-        }
+        run_on_grid(self.cadence.interval, &self.cancel, || self.timed_pass()).await;
+        debug!("Heartbeat service shutting down");
+        // Final heartbeat before exit
+        self.heartbeat_once().await;
 
         self.alive.store(false, Ordering::SeqCst);
     }
@@ -392,7 +407,9 @@ mod tests {
     fn first_heartbeat_waits_half_an_interval_when_staleness_meets_the_floor() {
         for staleness in [90 * SECOND, 600 * SECOND] {
             assert_eq!(
-                HeartbeatCadence::new(30 * SECOND, staleness).first_heartbeat_after(Duration::ZERO),
+                HeartbeatCadence::new(30 * SECOND, staleness)
+                    .with_first_heartbeat_deferral(true)
+                    .first_heartbeat_after(Duration::ZERO),
                 15 * SECOND
             );
         }
@@ -402,7 +419,9 @@ mod tests {
     fn first_heartbeat_is_immediate_below_the_floor() {
         for staleness in [89 * SECOND, Duration::ZERO] {
             assert_eq!(
-                HeartbeatCadence::new(30 * SECOND, staleness).first_heartbeat_after(Duration::ZERO),
+                HeartbeatCadence::new(30 * SECOND, staleness)
+                    .with_first_heartbeat_deferral(true)
+                    .first_heartbeat_after(Duration::ZERO),
                 Duration::ZERO
             );
         }
@@ -410,7 +429,8 @@ mod tests {
 
     #[test]
     fn slow_passes_shorten_and_then_disable_the_deferral() {
-        let cadence = HeartbeatCadence::new(30 * SECOND, 90 * SECOND);
+        let cadence =
+            HeartbeatCadence::new(30 * SECOND, 90 * SECOND).with_first_heartbeat_deferral(true);
         assert_eq!(cadence.first_heartbeat_after(10 * SECOND), 15 * SECOND);
         assert_eq!(cadence.first_heartbeat_after(20 * SECOND), 10 * SECOND);
         assert_eq!(cadence.first_heartbeat_after(30 * SECOND), Duration::ZERO);
@@ -431,7 +451,8 @@ mod tests {
         let cadence = HeartbeatCadence::new(
             Duration::from_secs_f64(interval),
             Duration::from_secs_f64(staleness),
-        );
+        )
+        .with_first_heartbeat_deferral(true);
         let deferral = cadence.first_heartbeat_after(Duration::ZERO).as_secs_f64();
         for tenth in 0..300 {
             let claim = f64::from(tenth) / 10.0;
@@ -465,6 +486,7 @@ mod tests {
             Duration::from_secs_f64(interval),
             Duration::from_secs_f64(staleness),
         )
+        .with_first_heartbeat_deferral(true)
         .first_heartbeat_after(Duration::ZERO)
         .as_secs_f64();
         assert_eq!(deferral, 15.0);
@@ -487,5 +509,53 @@ mod tests {
         let first_included = ((claim + deferral) / interval).ceil() * interval;
         assert_eq!(first_included, 60.0);
         assert!(109.0 > claim + staleness);
+    }
+
+    #[test]
+    fn deferral_is_off_unless_enabled() {
+        assert_eq!(
+            HeartbeatCadence::new(30 * SECOND, 90 * SECOND).first_heartbeat_after(Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    async fn pass_starts(pass_duration: Duration, passes: usize) -> Vec<u64> {
+        use std::sync::{Arc, Mutex};
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let origin = tokio::time::Instant::now();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&starts);
+        let stopper = cancel.clone();
+        super::run_on_grid(30 * SECOND, &cancel, move || {
+            let recorder = Arc::clone(&recorder);
+            let stopper = stopper.clone();
+            async move {
+                let count = {
+                    let mut starts = recorder.lock().unwrap();
+                    starts.push(origin.elapsed().as_secs());
+                    starts.len()
+                };
+                tokio::time::sleep(pass_duration).await;
+                if count == passes {
+                    stopper.cancel();
+                }
+            }
+        })
+        .await;
+        let starts = starts.lock().unwrap().clone();
+        starts
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn passes_shorter_than_the_interval_keep_the_grid() {
+        assert_eq!(pass_starts(5 * SECOND, 4).await, vec![30, 60, 90, 120]);
+    }
+
+    /// A 45 s pass every 30 s would otherwise run back to back (30, 75, 120);
+    /// each overrun is followed by a full interval of rest, as main's
+    /// sleep-after-pass loop gave.
+    #[tokio::test(start_paused = true)]
+    async fn an_overrunning_pass_is_followed_by_a_full_interval() {
+        assert_eq!(pass_starts(45 * SECOND, 4).await, vec![30, 105, 180, 255]);
     }
 }

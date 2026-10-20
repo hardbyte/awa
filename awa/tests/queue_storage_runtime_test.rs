@@ -9093,6 +9093,7 @@ async fn test_queue_storage_deferred_first_heartbeat_keeps_live_attempt_at_stale
         })
         .heartbeat_interval(interval)
         .heartbeat_staleness(staleness)
+        .defer_first_heartbeat(true)
         .heartbeat_rescue_interval(Duration::from_millis(50))
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))

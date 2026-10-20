@@ -579,6 +579,7 @@ class Client:
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
         heartbeat_staleness_ms: int | None = None,
+        defer_first_heartbeat: bool = False,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
         terminal_count_rollup_interval_ms: int | None = None,
