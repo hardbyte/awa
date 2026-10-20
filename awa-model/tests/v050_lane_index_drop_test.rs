@@ -164,6 +164,19 @@ async fn exercise(options: PgConnectOptions, owner: &str, outsider: &str) -> Tes
     );
     reader.rollback().await?;
     superuser_pool.execute("RESET lock_timeout").await?;
+    let version_after_timeout: i32 =
+        sqlx::query_scalar("SELECT max(version) FROM awa.schema_version")
+            .fetch_one(&superuser_pool)
+            .await?;
+    assert_eq!(
+        version_after_timeout, 49,
+        "a timed-out v050 must not record its version"
+    );
+    assert_eq!(
+        lane_indexes(&superuser_pool, LEGIT_SCHEMA).await?,
+        LEGIT_SLOTS as i64,
+        "a timed-out v050 must leave every lane index, including those dropped before the timeout"
+    );
 
     for (_, _, statement) in migrations::migration_sql_range(49, 50) {
         superuser_pool
