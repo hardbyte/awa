@@ -250,6 +250,25 @@ async fn exercise(options: PgConnectOptions, migrator: &str, outsider: &str) -> 
         .await?
         .contains(&OWNED_SCHEMA.into()));
 
+    // pg_get_triggerdef honours quote_all_identifiers; an unchanged install
+    // must still match its canonical trigger text with it on.
+    let mut quoting = migrator_pool.acquire().await?;
+    quoting.execute("SET quote_all_identifiers = on").await?;
+    let discovered: Vec<String> = sqlx::query_scalar(
+        "SELECT schema_name FROM awa.queue_storage_schemas() ORDER BY schema_name",
+    )
+    .fetch_all(&mut *quoting)
+    .await?;
+    let awa_trusted: bool = sqlx::query_scalar("SELECT awa.queue_storage_schema_is_trusted('awa')")
+        .fetch_one(&mut *quoting)
+        .await?;
+    quoting.execute("RESET quote_all_identifiers").await?;
+    drop(quoting);
+    assert!(
+        discovered.contains(&OWNED_SCHEMA.to_string()) && awa_trusted,
+        "quote_all_identifiers must not make awa's own triggers look foreign: {discovered:?}"
+    );
+
     // A sequence runs no code, so another role owning one is accepted; 0.6
     // runtimes created their own lane sequences.
     superuser_pool

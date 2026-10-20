@@ -88,19 +88,36 @@ schema owner:
 - **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** 0.6
   runtimes created lane sequences themselves, so they needed `CREATE`.
   Sequences they own are accepted; the `CREATE` grant is not, because it lets
-  the runtime add objects while a migration runs. Provision every queue's lanes
-  as the migrator first, so running 0.6 workers never need to create one, then
-  revoke the grant:
+  the runtime add objects while a migration runs. Until the migration refreshes
+  them, the 0.6 lane helpers and enqueue-head triggers run
+  `CREATE SEQUENCE IF NOT EXISTS` on every reservation, and that checks
+  `CREATE` even for a sequence that exists, so revoking the grant makes running
+  0.6 producers and workers fail with `42501` until the migration commits.
+  Provisioning lanes in advance does not avoid this. Take a short pause:
 
-  ```bash
-  PGOPTIONS='-c role=awa_owner' \
-    awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
-    --queue <queue> --enqueue-shards <n>
-  ```
+  1. Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
+     enqueue or claim runs.
+  2. Revoke the grant and commit:
 
-  ```sql
-  REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
-  ```
+     ```sql
+     REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
+     ```
+
+  3. Run `awa migrate` as the migrator. The bundle refreshes the lane helpers
+     to use provisioned sequences without `CREATE` (v049).
+  4. Provision any lanes the 0.7 runtimes will need, as the migrator:
+
+     ```bash
+     PGOPTIONS='-c role=awa_owner' \
+       awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
+       --queue <queue> --enqueue-shards <n>
+     ```
+
+  5. Start the 0.7 runtimes.
+
+  An uninterrupted path would need the revoke and the helper refresh to become
+  visible to every session at once; that has not been verified, so do not
+  combine them into one transaction as a substitute for the pause.
 
 - **A custom schema prepared by a runtime or another role.** A worker that
   auto-prepares a schema, or a DBA who ran the preparation as another user,
@@ -128,6 +145,49 @@ their historical files or reset checksum records to accept changed contents.
 For example, extract with `awa migrate --pending --extract-to ./pending-migrations`
 into a new directory. Execute complete generated bundles; individual discovery
 tail files in the repository do not include their bootstrap prerequisites.
+
+## v050: one lane index per ready partition
+
+v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every `ready_entries`
+partition in the default schema and in the custom schemas that
+`awa.queue_storage_schemas()` selects (see
+[Custom-schema discovery](#custom-schema-discovery-during-migration)); other
+schemas keep their indexes. The partition primary
+key `(ready_slot, queue, priority, enqueue_shard, lane_seq)` serves every
+per-lane lookup because current binaries pin `ready_slot` in claims, in the
+queue prune and terminal-count fold gates, and in the maintenance lag gauge
+(through `ready_segments`).
+
+What the migration locks: it redefines `awa.install_queue_storage_substrate`
+(no schema is reinstalled) and then drops the indexes in slot order. Each
+`DROP INDEX` takes ACCESS EXCLUSIVE on its `ready_entries` partition and holds
+it until the migration transaction commits, so enqueues and claims touching
+that partition wait for the commit. No rows are scanned or rewritten; on a
+scratch PostgreSQL 17 database with 409,600 ready rows the whole 49 → 50 step
+took 27 ms. When the session has no `lock_timeout`, the migration sets a 2 s
+timeout for each lock acquisition. It bounds each wait, not the total
+migration time: every lock already taken is kept until commit, so a
+migration that waits on several partitions holds the earlier ones meanwhile.
+"Only ready partitions" describes the application tables it locks; the drop
+also locks the dropped indexes and the catalog rows it changes. If an
+acquisition times out (SQLSTATE `55P03`, typically behind a long-running read
+of `awa.jobs` or a backup) the error names the partition, the whole migration
+rolls back, and it can simply be re-run. Locks taken are held until commit,
+about 60 per 16-slot schema, so a database with hundreds of queue-storage
+schemas may need a larger `max_locks_per_transaction` for this step.
+`queue_counts_exact`, which filters ready rows by queue across every slot,
+seq-scans the ready partitions on PostgreSQL 17 without the index; at
+200,000 ready rows across 20 queues it measured 177 ms against 136 ms. External runners apply the complete
+generated `awa migrate --sql --from 49 --to 50` bundle.
+
+Rollout order: roll the binaries first, then migrate. Current binaries work
+with or without the index. Pre-v050 binaries keep working against a v050
+schema, but on PostgreSQL 17 and earlier their maintenance lag gauge,
+queue prune gate and terminal-count fold gate fall back to sequential scans of every ready partition
+(PostgreSQL 18 can skip-scan the primary key). Rolling back a binary is
+therefore safe for correctness; to restore the old binary's query plans,
+recreate the index per partition with
+`CREATE INDEX CONCURRENTLY idx_<schema>_ready_<slot>_lane_shard ON <schema>.ready_entries_<slot> (queue, priority, enqueue_shard, lane_seq)`.
 
 ## The one gate
 

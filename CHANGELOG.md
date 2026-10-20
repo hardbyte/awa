@@ -7,6 +7,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 ### Changed
 
 - **A ready enqueue is one statement (v052, [#522](https://github.com/hardbyte/awa/issues/522)).** `QueueStorage::enqueue_params_copy` and `enqueue_params_batch` send a ready-only batch with no uniqueness claims below the 2,048-row COPY threshold as one autocommit call to the new `{schema}.enqueue_ready_rows`, which reserves the lanes, reads the ring cursor, appends the ready rows and segments and notifies; the previous path took ten round trips. Inside a transaction (uniqueness claims, deferred rows) the function replaces the per-lane reservation, cursor reads and both inserts. `reserve_enqueue_seq` provisions lane sequences only for a lane row without a sequence name and reserves a range with one sequence write instead of two. On a schema without the function, current runtimes keep the multi-statement path, which also drops the cached-lane probe and, after the ledger flip, the authority read. At 800 jobs/s with 20-row calls the producer call p50 fell 19-62% against main in the same benchmark round (0.94 ms in the quietest round) and WAL per job by about 5 B; throughput and saturation (64 workers) are unchanged within run-to-run noise.
+- v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every ready_entries
+  partition of the default schema and of the custom schemas
+  `awa.queue_storage_schemas()` selects. Each enqueued job writes two index entries instead of three and
+  each rotation initialises one fewer index. Every per-lane lookup now pins
+  `ready_slot` and uses the partition primary key: the queue prune and
+  terminal-count fold gates filter on the slot, and the maintenance lag gauge
+  walks `ready_segments` to the slot holding each lane's next row. The
+  migration only redefines the installer function and drops the indexes; it
+  holds ACCESS EXCLUSIVE on each `ready_entries` partition until commit.
+  When no `lock_timeout` is set it bounds each lock acquisition to 2 s (not
+  the total duration; earlier locks stay held) and rolls back on timeout so
+  it can be re-run.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant

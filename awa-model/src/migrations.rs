@@ -285,7 +285,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Use provisioned lane sequences without runtime DDL",
         &[V23_UP, V49_UP],
     ),
-    // v050 and v051 are reserved for parallel branches.
+    (
+        50,
+        "Drop the redundant lane index on ready_entries partitions",
+        &[V23_UP, V50_UP],
+    ),
+    // v051 is reserved for a parallel branch.
     (
         52,
         "Fewer round trips and sequence writes per queue-storage enqueue",
@@ -348,6 +353,7 @@ const V46_UP: &str = include_str!("../migrations/v046_wait_free_dirty_marks.sql"
 const V47_UP: &str = include_str!("../migrations/v047_replica_identity.sql");
 const V48_UP: &str = include_str!("../migrations/v048_claim_cursor_catch_up.sql");
 const V49_UP: &str = include_str!("../migrations/v049_prepared_lane_sequences.sql");
+const V50_UP: &str = include_str!("../migrations/v050_drop_ready_lane_shard_index.sql");
 const V52_UP: &str = include_str!("../migrations/v052_enqueue_round_trips.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.

@@ -918,12 +918,17 @@ async fn queue_prune_has_active_leases_tx(
     .map_err(map_sqlx_error)
 }
 
+/// Whether the ready slot still holds a row at or after its lane's claim
+/// cursor. The `ready_slot` predicate lets each per-lane probe use the
+/// partition primary key `(ready_slot, queue, priority, enqueue_shard,
+/// lane_seq)`.
 async fn queue_prune_has_pending_ready_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     schema: &str,
-    ready_child: &str,
+    slot: i32,
     generation: i64,
 ) -> Result<bool, AwaError> {
+    let ready_child = ready_child_name(schema, slot as usize);
     sqlx::query_scalar(audited_sql(format!(
         r#"
         WITH claim_cursors AS MATERIALIZED (
@@ -940,7 +945,8 @@ async fn queue_prune_has_pending_ready_tx(
             CROSS JOIN LATERAL (
                 SELECT 1
                 FROM {ready_child} AS ready
-                WHERE ready.ready_generation = $1
+                WHERE ready.ready_slot = $2
+                  AND ready.ready_generation = $1
                   AND ready.queue = claims.queue
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
@@ -952,6 +958,7 @@ async fn queue_prune_has_pending_ready_tx(
         "#
     )))
     .bind(generation)
+    .bind(slot)
     .fetch_one(tx.as_mut())
     .await
     .map_err(map_sqlx_error)
@@ -16547,38 +16554,8 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::SkippedMvccPinned);
         }
 
-        let ready_child = ready_child_name(schema, slot as usize);
-        let pending_ready: bool = sqlx::query_scalar(audited_sql(format!(
-            r#"
-            WITH claim_cursors AS MATERIALIZED (
-                SELECT
-                    queue,
-                    priority,
-                    enqueue_shard,
-                    {schema}.sequence_next_value(seq_name) AS claim_seq
-                FROM {schema}.queue_claim_heads
-            )
-            SELECT EXISTS (
-                SELECT 1
-                FROM claim_cursors AS claims
-                CROSS JOIN LATERAL (
-                    SELECT 1
-                    FROM {ready_child} AS ready
-                    WHERE ready.ready_generation = $1
-                      AND ready.queue = claims.queue
-                      AND ready.priority = claims.priority
-                      AND ready.enqueue_shard = claims.enqueue_shard
-                      AND ready.lane_seq >= claims.claim_seq
-                    LIMIT 1
-                ) AS pending_ready
-                LIMIT 1
-            )
-            "#
-        )))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let pending_ready =
+            queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
 
         if pending_ready {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -16957,8 +16934,7 @@ impl QueueStorage {
             });
         }
 
-        let pending =
-            queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
+        let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
 
         if pending {
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -17024,8 +17000,7 @@ impl QueueStorage {
             });
         }
 
-        let pending =
-            queue_prune_has_pending_ready_tx(&mut tx, schema, &ready_child, generation).await?;
+        let pending = queue_prune_has_pending_ready_tx(&mut tx, schema, slot, generation).await?;
         if pending {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::SkippedActive {

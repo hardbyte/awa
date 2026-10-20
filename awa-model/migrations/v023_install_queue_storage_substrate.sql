@@ -2694,13 +2694,10 @@ BEGIN
             p_schema, format('ready_entries_%s', v_slot), p_schema, v_slot
         );
 
-        -- Shard-aware lane index (v021): includes enqueue_shard so
-        -- claim_ready_runtime's WHERE clause hits the index directly.
-        EXECUTE format(
-            'CREATE INDEX IF NOT EXISTS idx_%s_ready_%s_lane_shard ON %I.%I (queue, priority, enqueue_shard, lane_seq)',
-            p_schema, v_slot, p_schema, format('ready_entries_%s', v_slot)
-        );
-
+        -- Lane lookups on ready children always pin ready_slot, so the
+        -- partition primary key (ready_slot, queue, priority, enqueue_shard,
+        -- lane_seq) is the lane index; v050 dropped the separate lane_shard
+        -- copy.
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%s_ready_%s_job ON %I.%I (job_id)',
             p_schema, v_slot, p_schema, format('ready_entries_%s', v_slot)
