@@ -73,19 +73,36 @@ schema owner:
 - **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** 0.6
   runtimes created lane sequences themselves, so they needed `CREATE`.
   Sequences they own are accepted; the `CREATE` grant is not, because it lets
-  the runtime add objects while a migration runs. Provision every queue's lanes
-  as the migrator first, so running 0.6 workers never need to create one, then
-  revoke the grant:
+  the runtime add objects while a migration runs. Until the migration refreshes
+  them, the 0.6 lane helpers and enqueue-head triggers run
+  `CREATE SEQUENCE IF NOT EXISTS` on every reservation, and that checks
+  `CREATE` even for a sequence that exists, so revoking the grant makes running
+  0.6 producers and workers fail with `42501` until the migration commits.
+  Provisioning lanes in advance does not avoid this. Take a short pause:
 
-  ```bash
-  PGOPTIONS='-c role=awa_owner' \
-    awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
-    --queue <queue> --enqueue-shards <n>
-  ```
+  1. Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
+     enqueue or claim runs.
+  2. Revoke the grant and commit:
 
-  ```sql
-  REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
-  ```
+     ```sql
+     REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
+     ```
+
+  3. Run `awa migrate` as the migrator. The bundle refreshes the lane helpers
+     to use provisioned sequences without `CREATE` (v049).
+  4. Provision any lanes the 0.7 runtimes will need, as the migrator:
+
+     ```bash
+     PGOPTIONS='-c role=awa_owner' \
+       awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
+       --queue <queue> --enqueue-shards <n>
+     ```
+
+  5. Start the 0.7 runtimes.
+
+  An uninterrupted path would need the revoke and the helper refresh to become
+  visible to every session at once; that has not been verified, so do not
+  combine them into one transaction as a substitute for the pause.
 
 - **A custom schema prepared by a runtime or another role.** A worker that
   auto-prepares a schema, or a DBA who ran the preparation as another user,

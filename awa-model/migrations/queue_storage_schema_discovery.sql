@@ -6,6 +6,7 @@ RETURNS SETOF TEXT
 LANGUAGE sql
 IMMUTABLE
 SET search_path = pg_catalog, pg_temp
+SET quote_all_identifiers = off
 AS $canonical$
     SELECT format(template.definition, p_schema)
     FROM (VALUES
@@ -60,6 +61,7 @@ LANGUAGE sql
 STABLE
 SECURITY INVOKER
 SET search_path = pg_catalog, pg_temp
+SET quote_all_identifiers = off
 AS $violations$
     WITH trusted_owners AS (
         SELECT nspowner AS owner FROM pg_namespace WHERE nspname = 'awa'
@@ -160,6 +162,7 @@ LANGUAGE sql
 STABLE
 SECURITY INVOKER
 SET search_path = pg_catalog, pg_temp
+SET quote_all_identifiers = off
 AS $discover$
     WITH candidate AS MATERIALIZED (
     SELECT namespace.nspname::text AS schema_name
