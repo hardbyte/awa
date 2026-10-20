@@ -259,6 +259,11 @@ BEGIN
               AND priority = p_priority
               AND enqueue_shard = p_enqueue_shard;
 
+            IF p_count IS NULL THEN
+                RAISE EXCEPTION 'reserve_enqueue_seq: count must not be NULL'
+                    USING ERRCODE = '22004';
+            END IF;
+
             IF p_count <= 0 THEN
                 RETURN %1$I.sequence_next_value(v_seq_name);
             END IF;

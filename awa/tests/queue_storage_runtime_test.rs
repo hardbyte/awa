@@ -15750,10 +15750,25 @@ async fn test_priority_aging_off_does_not_stamp_original() {
 /// helper's comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
+    check_ensure_lane_cache_recovers_after_rollback("awa_qs_ensure_lane_rollback", false).await;
+}
+
+/// The multi-statement path is the one that fills the Rust lane cache, so
+/// the recovery must also hold when the function is not used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback_without_function() {
+    check_ensure_lane_cache_recovers_after_rollback("awa_qs_ensure_lane_rollback_nf", true).await;
+}
+
+async fn check_ensure_lane_cache_recovers_after_rollback(schema: &str, without_function: bool) {
     let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_ensure_lane_rollback";
-    let schema = "awa_qs_ensure_lane_rollback";
     let store = create_store(&pool, schema).await;
+    let store = if without_function {
+        store.without_enqueue_function()
+    } else {
+        store
+    };
 
     // Simulate the rolled-back ensure_lane: run the three lane
     // inserts in a transaction that we explicitly roll back. After
@@ -16828,6 +16843,30 @@ async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() 
         "stale completion cannot create another disposition"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+/// A NULL count would return a start without advancing the lane sequence,
+/// handing the same range to the next caller.
+#[tokio::test]
+async fn test_reserve_enqueue_seq_rejects_a_null_count() {
+    let (_db_guard, pool) = setup_pool(2).await;
+    let schema = "awa_qs_reserve_null_count";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let error = sqlx::query(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq('q', 1::smallint, 0::smallint, NULL::bigint)"
+    )))
+    .execute(&pool)
+    .await
+    .expect_err("a NULL count must be rejected");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("22004")
+    );
     pool.close().await;
 }
 

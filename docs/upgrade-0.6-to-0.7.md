@@ -29,14 +29,26 @@ v052 replaces functions only. `reserve_enqueue_seq` keeps its signature, lane
 lock and return value, so earlier 0.7 binaries and SQL producers
 (`insert_job_compat`) run unchanged on the migrated schema. A new
 `{schema}.enqueue_ready_rows` lets current runtimes enqueue a ready batch in
-one statement; they probe for it once per store and keep the multi-statement
-path on a schema without it, so deploying binaries before migrating is safe. A
-running binary uses the function after its next restart. Runtimes need
-`EXECUTE` on the new function, which the default privileges in
-[Database roles](security/database-roles.md#runtime-grants) grant; without it
-they also keep the multi-statement path. External runners must apply the
-complete generated `awa migrate --sql` bundle, which redefines the installer
-before refreshing the installed schemas.
+one statement. Runtimes use it when they have `EXECUTE` on it and on
+`{schema}.ring_cursor`, which it calls and which is revoked from `PUBLIC`; the
+default privileges in [Database roles](security/database-roles.md#runtime-grants)
+grant both. Otherwise they keep the multi-statement path. A store that finds
+the function missing probes again after a minute, so it picks the function up
+without a restart once the migration commits. If the function disappears or
+loses `EXECUTE` after a store has used it, the next call fails and the one
+after that probes again and falls back.
+
+Deploy order: the fallback keeps enqueue, claim and completion working when a
+current binary runs against a pre-v052 schema, but worker readiness does not
+follow it. `/readyz` reports a worker ready only once the schema is at the
+binary's version, so health-gated workers started before the migration stay
+unready until it commits. Migrate first for health-gated workers; binary-first
+is safe for producers and for workers without a readiness gate.
+
+Apply v050 before v052: the runner applies only versions above the highest one
+recorded, so a database stamped v052 would never apply a v050 added later.
+External runners must apply the complete generated `awa migrate --sql` bundle,
+which redefines the installer before refreshing the installed schemas.
 
 ## Custom-schema discovery during migration
 

@@ -4708,13 +4708,10 @@ impl QueueStorage {
         }
     }
 
-    /// Current queue-ring cursor for the Rust-side enqueue paths, honouring
-    /// the schema's authority (#371 staged upgrade). Reads the authority row
-    /// until it has seen `ledger`, then only the O(1) ledger cursor; callers
-    /// that already hold an authority for the transaction should use
-    /// `ring_cursor_tx` directly.
-    /// Current queue-ring cursor under the authority in force for this
-    /// statement, read in one round trip.
+    /// Current queue-ring cursor for the Rust-side enqueue paths, under the
+    /// authority in force for this statement (#371 staged upgrade), read in
+    /// one round trip. Callers that already hold an authority for the
+    /// transaction should use `ring_cursor_tx` directly.
     async fn current_queue_ring<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
