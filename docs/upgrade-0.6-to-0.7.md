@@ -165,11 +165,16 @@ seq-scans the ready partitions on PostgreSQL 17 without the index; at
 200,000 ready rows across 20 queues it measured 177 ms against 136 ms. External runners apply the complete
 generated `awa migrate --sql --from 49 --to 50` bundle.
 
-Rollout order: roll the binaries first, then migrate. Current binaries work
-with or without the index. Pre-v050 binaries keep working against a v050
-schema, but on PostgreSQL 17 and earlier their maintenance lag gauge,
-queue prune gate and terminal-count fold gate fall back to sequential scans of every ready partition
-(PostgreSQL 18 can skip-scan the primary key). Rolling back a binary is
+Rollout order: current binaries' SQL works with or without the index, so
+producers and workers without a readiness gate can roll before the
+migration. Health-gated workers cannot: `/readyz` reports a worker ready only
+once the schema reaches the binary's version, so a v050 worker on a v049
+schema stays unready and a readiness-gated rollout stalls before its
+migration step. For those, migrate first. Pre-v050 binaries keep working
+against a v050 schema, but on PostgreSQL 17 and earlier their maintenance lag
+gauge, queue prune gate and terminal-count fold gate fall back to sequential
+scans of every ready partition until they are replaced (PostgreSQL 18 can
+skip-scan the primary key), so keep that window short. Rolling back a binary is
 therefore safe for correctness; to restore the old binary's query plans,
 recreate the index per partition with
 `CREATE INDEX CONCURRENTLY idx_<schema>_ready_<slot>_lane_shard ON <schema>.ready_entries_<slot> (queue, priority, enqueue_shard, lane_seq)`.
