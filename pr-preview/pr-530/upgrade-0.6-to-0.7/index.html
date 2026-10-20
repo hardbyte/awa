@@ -2581,19 +2581,44 @@ schema owner:</p>
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="k">REVOKE</span><span class="w"> </span><span class="k">TRIGGER</span><span class="p">,</span><span class="w"> </span><span class="k">REFERENCES</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
 </span></code></pre></div>
 <ul>
-<li><strong>A 0.6 split-role install whose runtime holds <code>CREATE</code> on the schema.</strong> 0.6
+<li>
+<p><strong>A 0.6 split-role install whose runtime holds <code>CREATE</code> on the schema.</strong> 0.6
   runtimes created lane sequences themselves, so they needed <code>CREATE</code>.
   Sequences they own are accepted; the <code>CREATE</code> grant is not, because it lets
-  the runtime add objects while a migration runs. Provision every queue's lanes
-  as the migrator first, so running 0.6 workers never need to create one, then
-  revoke the grant:</li>
+  the runtime add objects while a migration runs. Until the migration refreshes
+  them, the 0.6 lane helpers and enqueue-head triggers run
+  <code>CREATE SEQUENCE IF NOT EXISTS</code> on every reservation, and that checks
+  <code>CREATE</code> even for a sequence that exists, so revoking the grant makes running
+  0.6 producers and workers fail with <code>42501</code> until the migration commits.
+  Provisioning lanes in advance does not avoid this. Take a short pause:</p>
+</li>
+<li>
+<p>Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
+     enqueue or claim runs.</p>
+</li>
+<li>
+<p>Revoke the grant and commit:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">REVOKE</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span></code></pre></div>
+</li>
+<li>
+<p>Run <code>awa migrate</code> as the migrator. The bundle refreshes the lane helpers
+     to use provisioned sequences without <code>CREATE</code> (v049).</p>
+</li>
+<li>
+<p>Provision any lanes the 0.7 runtimes will need, as the migrator:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">PGOPTIONS</span><span class="o">=</span><span class="s1">'-c role=awa_owner'</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_MIGRATOR_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>prepare-queue<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>--queue<span class="w"> </span>&lt;queue&gt;<span class="w"> </span>--enqueue-shards<span class="w"> </span>&lt;n&gt;
+</span></code></pre></div>
+</li>
+<li>
+<p>Start the 0.7 runtimes.</p>
+</li>
 </ul>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">PGOPTIONS</span><span class="o">=</span><span class="s1">'-c role=awa_owner'</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_MIGRATOR_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>prepare-queue<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>--queue<span class="w"> </span>&lt;queue&gt;<span class="w"> </span>--enqueue-shards<span class="w"> </span>&lt;n&gt;
-</span></code></pre></div>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">REVOKE</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
-</span></code></pre></div>
+<p>An uninterrupted path would need the revoke and the helper refresh to become
+  visible to every session at once; that has not been verified, so do not
+  combine them into one transaction as a substitute for the pause.</p>
 <ul>
 <li><strong>A custom schema prepared by a runtime or another role.</strong> A worker that
   auto-prepares a schema, or a DBA who ran the preparation as another user,
