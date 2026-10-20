@@ -1986,15 +1986,23 @@ impl PyClient {
             || queue_storage_rotate_max_slot_age_ms.is_some()
         {
             let default = RingRotationCadence::default();
-            builder = builder.ring_rotation_cadence(RingRotationCadence {
-                min_slot_age: queue_storage_rotate_min_slot_age_ms
-                    .map_or(default.min_slot_age, Duration::from_millis),
-                target_slot_bytes: queue_storage_rotate_target_slot_bytes
-                    .unwrap_or(default.target_slot_bytes),
-                min_slot_rows: queue_storage_rotate_min_slot_rows.unwrap_or(default.min_slot_rows),
-                max_slot_age: queue_storage_rotate_max_slot_age_ms
-                    .map_or(default.max_slot_age, Duration::from_millis),
-            });
+            builder = builder.ring_rotation_cadence(
+                default
+                    .with_min_slot_age(
+                        queue_storage_rotate_min_slot_age_ms
+                            .map_or(default.min_slot_age, Duration::from_millis),
+                    )
+                    .with_target_slot_bytes(
+                        queue_storage_rotate_target_slot_bytes.unwrap_or(default.target_slot_bytes),
+                    )
+                    .with_min_slot_rows(
+                        queue_storage_rotate_min_slot_rows.unwrap_or(default.min_slot_rows),
+                    )
+                    .with_max_slot_age(
+                        queue_storage_rotate_max_slot_age_ms
+                            .map_or(default.max_slot_age, Duration::from_millis),
+                    ),
+            );
         }
         builder = builder.transition_role(parse_transition_worker_role(
             storage_transition_role.as_deref(),

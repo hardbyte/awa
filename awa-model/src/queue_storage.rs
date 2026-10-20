@@ -409,8 +409,11 @@ pub enum RotateOutcome {
 /// sampled on rotate calls and is not a storage limit: batches, delayed ticks,
 /// blocked reuse and writes to sealed slots can exceed it.
 ///
-/// [`RingRotationCadence::EAGER`] restores sealing on every tick.
+/// [`RingRotationCadence::EAGER`] restores sealing on every tick. Build other
+/// cadences from [`RingRotationCadence::DEFAULT`] or `EAGER` with the `with_*`
+/// methods, so that later fields do not break callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RingRotationCadence {
     /// Time since the first non-empty observation before a tick may seal.
     pub min_slot_age: Duration,
@@ -444,6 +447,30 @@ impl RingRotationCadence {
         min_slot_rows: 256,
         max_slot_age: Duration::from_secs(60),
     };
+
+    /// Set [`Self::min_slot_age`].
+    pub const fn with_min_slot_age(mut self, min_slot_age: Duration) -> Self {
+        self.min_slot_age = min_slot_age;
+        self
+    }
+
+    /// Set [`Self::target_slot_bytes`].
+    pub const fn with_target_slot_bytes(mut self, target_slot_bytes: u64) -> Self {
+        self.target_slot_bytes = target_slot_bytes;
+        self
+    }
+
+    /// Set [`Self::min_slot_rows`].
+    pub const fn with_min_slot_rows(mut self, min_slot_rows: u64) -> Self {
+        self.min_slot_rows = min_slot_rows;
+        self
+    }
+
+    /// Set [`Self::max_slot_age`].
+    pub const fn with_max_slot_age(mut self, max_slot_age: Duration) -> Self {
+        self.max_slot_age = max_slot_age;
+        self
+    }
 }
 
 impl Default for RingRotationCadence {

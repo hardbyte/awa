@@ -2792,12 +2792,11 @@ mod tests {
 
     #[tokio::test]
     async fn rotation_builder_options_are_independent_of_storage_call_order() {
-        let cadence = RingRotationCadence {
-            min_slot_age: Duration::from_secs(13),
-            target_slot_bytes: 123_456,
-            min_slot_rows: 0,
-            max_slot_age: Duration::ZERO,
-        };
+        let cadence = RingRotationCadence::EAGER
+            .with_min_slot_age(Duration::from_secs(13))
+            .with_target_slot_bytes(123_456)
+            .with_min_slot_rows(0)
+            .with_max_slot_age(Duration::ZERO);
         let claim_interval = Duration::from_secs(17);
         let config = QueueStorageConfig {
             schema: "builder_rotation_options".into(),
@@ -3419,11 +3418,9 @@ mod tests {
 
     #[tokio::test]
     async fn rotation_row_floor_requires_a_ceiling_under_queue_storage() {
-        let unbounded = RingRotationCadence {
-            max_slot_age: Duration::ZERO,
-            target_slot_bytes: 0,
-            ..RingRotationCadence::DEFAULT
-        };
+        let unbounded = RingRotationCadence::DEFAULT
+            .with_max_slot_age(Duration::ZERO)
+            .with_target_slot_bytes(0);
         let build = |cadence: RingRotationCadence, queue_storage: bool| {
             let builder = Client::builder(lazy_pool())
                 .queue("default", QueueConfig::default())
@@ -3452,18 +3449,9 @@ mod tests {
         );
 
         for bounded in [
-            RingRotationCadence {
-                target_slot_bytes: 0,
-                ..RingRotationCadence::DEFAULT
-            },
-            RingRotationCadence {
-                max_slot_age: Duration::ZERO,
-                ..RingRotationCadence::DEFAULT
-            },
-            RingRotationCadence {
-                min_slot_rows: 0,
-                ..unbounded
-            },
+            RingRotationCadence::DEFAULT.with_target_slot_bytes(0),
+            RingRotationCadence::DEFAULT.with_max_slot_age(Duration::ZERO),
+            unbounded.with_min_slot_rows(0),
         ] {
             assert!(build(bounded, true).is_ok());
         }
