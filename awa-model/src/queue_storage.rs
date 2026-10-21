@@ -17,6 +17,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Transaction-local setting that marks a transaction holding a receipt
+/// attempt lock, so a later cancel in it does not wait for another.
+const ATTEMPT_LOCKS_HELD_SETTING: &str = "awa.attempt_locks_held";
+
 const DEFAULT_SCHEMA: &str = "awa";
 const DEFAULT_QUEUE_SLOT_COUNT: usize = 16;
 const DEFAULT_LEASE_SLOT_COUNT: usize = 8;
@@ -2021,6 +2025,46 @@ type GroupedClaimCursorAdvances = BTreeMap<
 >;
 type TerminalCounterKey = (i32, i64, String, i16, i16, i16);
 
+/// Test hook awaited at named points of a running-attempt cancel:
+/// `"lease_lookup"` after the first lease read, `"attempt_locked"` once the
+/// attempt lock is held, and `"attempt_busy"` before a retry pause.
+#[doc(hidden)]
+pub type CancelPhaseHook = std::sync::Arc<
+    dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+struct CancelPhaseHookSlot(Option<CancelPhaseHook>);
+
+impl std::fmt::Debug for CancelPhaseHookSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
+/// How long a cancel keeps retrying a running attempt that other
+/// transactions keep busy before reporting it as not cancelled.
+const CANCEL_BUSY_BUDGET: Duration = Duration::from_secs(5);
+
+/// What cancelling a job's running attempt did.
+enum RunningAttemptCancel {
+    Cancelled(Box<CancelJobTxResult>),
+    /// No running attempt: not claimed, or already closed.
+    NotRunning,
+    /// A running attempt stayed busy, or could not be hydrated; left as is.
+    Left,
+}
+
+/// One savepoint-scoped try at cancelling a running attempt.
+enum CancelStep {
+    Done(RunningAttemptCancel),
+    /// A lock was held elsewhere; roll back and retry after a pause.
+    Busy,
+    /// The attempt changed representation; roll back and look again.
+    Again,
+}
+
 struct CancelJobTxResult {
     row: JobRow,
     claim_cursor_advance: Option<ClaimCursorAdvance>,
@@ -2861,6 +2905,7 @@ pub struct QueueStorage {
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
+    cancel_phase_hook: CancelPhaseHookSlot,
 }
 
 impl QueueStorage {
@@ -2907,7 +2952,22 @@ impl QueueStorage {
             ensured_lanes: Mutex::new(HashSet::new()),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
+            cancel_phase_hook: CancelPhaseHookSlot(None),
         })
+    }
+
+    /// Await `hook` at named points of a running-attempt cancel, so tests can
+    /// commit a concurrent change at an exact step. Not for production use.
+    #[doc(hidden)]
+    pub fn with_cancel_phase_hook(mut self, hook: CancelPhaseHook) -> Self {
+        self.cancel_phase_hook = CancelPhaseHookSlot(Some(hook));
+        self
+    }
+
+    async fn cancel_phase(&self, phase: &'static str) {
+        if let Some(hook) = &self.cancel_phase_hook.0 {
+            hook(phase).await;
+        }
     }
 
     #[doc(hidden)]
@@ -8900,6 +8960,566 @@ impl QueueStorage {
         Ok(())
     }
 
+    /// Delete and cancel the running lease of `job_id`, or of exactly
+    /// `run_lease` when given.
+    async fn cancel_materialized_lease_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: Option<i64>,
+    ) -> Result<Option<CancelJobTxResult>, AwaError> {
+        let schema = self.schema();
+        let deleted_lease: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            DELETE FROM {schema}.leases
+            WHERE job_id = $1
+              AND state IN ('running', 'waiting_external')
+              AND ($2::bigint IS NULL OR run_lease = $2)
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                queue,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                enqueue_shard,
+                heartbeat_at,
+                deadline_at,
+                attempted_at,
+                callback_id,
+                callback_timeout_at
+            "#
+        )))
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if deleted_lease.is_empty() {
+            return Ok(None);
+        }
+        let lease = self
+            .hydrate_deleted_leases_tx(tx, deleted_lease, true)
+            .await?
+            .into_iter()
+            .next()
+            .expect("deleted running lease");
+        let done_payload =
+            Self::payload_with_attempt_state(lease.payload.clone(), lease.progress.clone())?;
+        let done = lease
+            .clone()
+            .into_done_row(JobState::Cancelled, Utc::now(), done_payload);
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
+            .await?;
+        // Receipt-plane consistency: close any matching open
+        // receipt so the ADR-023 anti-join no longer considers this
+        // attempt live, and rescue doesn't try to revive it.
+        self.close_receipt_tx(tx, lease.job_id, lease.run_lease, "cancelled")
+            .await?;
+        // Wake any worker currently executing this attempt.
+        self.notify_cancellation_tx(tx, lease.job_id, lease.run_lease)
+            .await?;
+        Ok(Some(CancelJobTxResult {
+            row: done.into_job_row()?,
+            claim_cursor_advance: None,
+        }))
+    }
+
+    /// Cancel the running attempt of `job_id` on a receipts-mode store.
+    ///
+    /// Closers disagree on lock order: receipt closers take the attempt's
+    /// advisory lock before its claim rows, while lease-side closers delete
+    /// the lease row first and then take the advisory lock. A cancel that
+    /// waited in either order could close a cycle with the other, so it
+    /// waits on nothing. Each try runs in a savepoint, takes the attempt
+    /// lock and the row locks without waiting, and on contention rolls the
+    /// savepoint back, releasing everything it took, before trying again
+    /// for up to `CANCEL_BUSY_BUDGET`. A transaction that already holds an
+    /// attempt lock, such as a later job of a bulk cancel, tries once, so it
+    /// does not hold that lock against its closers while it retries.
+    async fn cancel_running_attempt_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<RunningAttemptCancel, AwaError> {
+        let holds_attempt_lock: bool = sqlx::query_scalar(audited_sql(format!(
+            "SELECT COALESCE(current_setting('{ATTEMPT_LOCKS_HELD_SETTING}', true), '') = 'on'"
+        )))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let deadline = Instant::now() + CANCEL_BUSY_BUDGET;
+        let mut backoff = Duration::from_millis(5);
+        loop {
+            let mut attempt = tx.begin().await.map_err(map_sqlx_error)?;
+            let step = self
+                .try_cancel_running_attempt_tx(&mut attempt, job_id)
+                .await;
+            let busy = match step {
+                Ok(CancelStep::Done(outcome)) => {
+                    attempt.commit().await.map_err(map_sqlx_error)?;
+                    return Ok(outcome);
+                }
+                Ok(CancelStep::Again) => {
+                    attempt.rollback().await.map_err(map_sqlx_error)?;
+                    false
+                }
+                Ok(CancelStep::Busy) => {
+                    attempt.rollback().await.map_err(map_sqlx_error)?;
+                    true
+                }
+                Err(err) => {
+                    let _ = attempt.rollback().await;
+                    return Err(err);
+                }
+            };
+            if Instant::now() >= deadline || (busy && holds_attempt_lock) {
+                tracing::info!(
+                    job_id,
+                    "cancel left a running attempt that another transaction kept busy"
+                );
+                return Ok(RunningAttemptCancel::Left);
+            }
+            if busy {
+                self.cancel_phase("attempt_busy").await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(100));
+            }
+        }
+    }
+
+    async fn try_cancel_running_attempt_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<CancelStep, AwaError> {
+        let schema = self.schema();
+        let closure_rel = format!("{schema}.lease_claim_closures");
+        let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
+        let closed_evidence =
+            receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
+        type ReceiptCancelRow = (
+            i32,
+            i64,
+            i32,
+            i64,
+            String,
+            i16,
+            i16,
+            i16,
+            i64,
+            DateTime<Utc>,
+            i64,
+            bool,
+        );
+        let open_receipt_sql = format!(
+            r#"
+            WITH row_receipt AS (
+                SELECT
+                    claims.claim_slot,
+                    claims.run_lease,
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.queue,
+                    claims.priority,
+                    claims.attempt,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.claimed_at,
+                    claims.receipt_id,
+                    false AS compact_batch
+                FROM {schema}.lease_claims AS claims
+                WHERE claims.job_id = $1
+                  AND NOT {closed_evidence}
+                ORDER BY claims.run_lease DESC
+                LIMIT 1
+                FOR UPDATE OF claims NOWAIT
+            ),
+            batch_receipt AS (
+                SELECT
+                    claim_batches.claim_slot,
+                    items.run_lease,
+                    claim_batches.ready_slot,
+                    claim_batches.ready_generation,
+                    claim_batches.queue,
+                    claim_batches.priority,
+                    items.attempt,
+                    items.max_attempts,
+                    items.lane_seq,
+                    claim_batches.claimed_at,
+                    items.receipt_id,
+                    true AS compact_batch
+                FROM {schema}.lease_claim_batches AS claim_batches
+                CROSS JOIN LATERAL unnest(
+                    claim_batches.job_ids,
+                    claim_batches.run_leases,
+                    claim_batches.receipt_ids,
+                    claim_batches.lane_seqs,
+                    claim_batches.attempts,
+                    claim_batches.max_attempts
+                ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+                WHERE items.job_id = $1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claim_batches.claim_slot
+                        AND closures.job_id = items.job_id
+                        AND closures.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closure_batches AS closure_batches
+                      WHERE closure_batches.claim_slot = claim_batches.claim_slot
+                        AND closure_batches.receipt_ranges @> items.receipt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.leases AS lease
+                      WHERE lease.job_id = items.job_id
+                        AND lease.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.done_entries AS done
+                      WHERE done.job_id = items.job_id
+                        AND done.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                      WHERE deferred.job_id = items.job_id
+                        AND deferred.run_lease = items.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.dlq_entries AS dlq
+                      WHERE dlq.job_id = items.job_id
+                        AND dlq.run_lease = items.run_lease
+                  )
+                ORDER BY items.run_lease DESC
+                LIMIT 1
+                FOR UPDATE OF claim_batches NOWAIT
+            )
+            SELECT *
+            FROM (
+                SELECT * FROM row_receipt
+                UNION ALL
+                SELECT * FROM batch_receipt
+            ) AS receipt
+            ORDER BY run_lease DESC
+            LIMIT 1
+            "#
+        );
+        // Find the attempt with plain reads; take nothing yet.
+        let lease_run_lease: Option<i64> = sqlx::query_scalar(audited_sql(format!(
+            "SELECT run_lease FROM {schema}.leases \
+             WHERE job_id = $1 AND state IN ('running', 'waiting_external') \
+             ORDER BY run_lease DESC LIMIT 1"
+        )))
+        .bind(job_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        self.cancel_phase("lease_lookup").await;
+        let found_receipt: Option<ReceiptCancelRow> = if lease_run_lease.is_none() {
+            let find_receipt_sql = open_receipt_sql
+                .replace("FOR UPDATE OF claims NOWAIT", "")
+                .replace("FOR UPDATE OF claim_batches NOWAIT", "");
+            debug_assert!(!find_receipt_sql.contains("FOR UPDATE"));
+            sqlx::query_as(audited_sql(find_receipt_sql))
+                .bind(job_id)
+                .fetch_optional(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?
+        } else {
+            None
+        };
+        let Some(run_lease) = lease_run_lease.or(found_receipt.as_ref().map(|found| found.1))
+        else {
+            // The two reads are separate statements: a lease materialized
+            // between them hides the receipt from the second. Look again.
+            let lease_appeared: bool = sqlx::query_scalar(audited_sql(format!(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.leases \
+                 WHERE job_id = $1 AND state IN ('running', 'waiting_external'))"
+            )))
+            .bind(job_id)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            return Ok(if lease_appeared {
+                CancelStep::Again
+            } else {
+                CancelStep::Done(RunningAttemptCancel::NotRunning)
+            });
+        };
+
+        if !self.try_lock_attempt_tx(tx, job_id, run_lease).await? {
+            return Ok(CancelStep::Busy);
+        }
+        self.cancel_phase("attempt_locked").await;
+
+        // Materializers take the attempt lock, so under it the attempt's
+        // representation is settled. Resolve it with a fresh statement: a
+        // lease that exists now, whatever the receipt kind, goes through the
+        // lease path, whose row lock does not wait.
+        let lease_now: bool = sqlx::query_scalar(audited_sql(format!(
+            "SELECT EXISTS (SELECT 1 FROM {schema}.leases \
+             WHERE job_id = $1 AND run_lease = $2 \
+               AND state IN ('running', 'waiting_external'))"
+        )))
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Under the attempt lock, take the rows without waiting. A row lock
+        // held elsewhere belongs to a closer that may be waiting for this
+        // attempt lock, so contention means: let go and try again.
+        if lease_now {
+            let lease_lock = sqlx::query_scalar::<_, i32>(audited_sql(format!(
+                "SELECT 1 FROM {schema}.leases \
+                 WHERE job_id = $1 AND run_lease = $2 AND state IN ('running', 'waiting_external') \
+                 FOR UPDATE NOWAIT"
+            )))
+            .bind(job_id)
+            .bind(run_lease)
+            .fetch_optional(tx.as_mut())
+            .await;
+            return match lease_lock {
+                Err(err) if is_lock_contention_error(&err) => Ok(CancelStep::Busy),
+                Err(err) => Err(map_sqlx_error(err)),
+                Ok(None) => Ok(CancelStep::Again),
+                Ok(Some(_)) => Ok(
+                    match self
+                        .cancel_materialized_lease_tx(tx, job_id, Some(run_lease))
+                        .await?
+                    {
+                        Some(result) => {
+                            CancelStep::Done(RunningAttemptCancel::Cancelled(Box::new(result)))
+                        }
+                        None => CancelStep::Again,
+                    },
+                ),
+            };
+        }
+
+        let locked_receipt = sqlx::query_as::<_, ReceiptCancelRow>(audited_sql(open_receipt_sql))
+            .bind(job_id)
+            .fetch_optional(tx.as_mut())
+            .await;
+        let receipt = match locked_receipt {
+            Err(err) if is_lock_contention_error(&err) => return Ok(CancelStep::Busy),
+            Err(err) => return Err(map_sqlx_error(err)),
+            Ok(Some(receipt)) if receipt.1 == run_lease => receipt,
+            Ok(Some(_)) => return Ok(CancelStep::Again),
+            Ok(None) => {
+                // Closed by another closer, or materialized before this
+                // cancel took the lock; the latter goes through the lease.
+                let materialized: bool = sqlx::query_scalar(audited_sql(format!(
+                    "SELECT EXISTS (SELECT 1 FROM {schema}.leases \
+                     WHERE job_id = $1 AND run_lease = $2 \
+                       AND state IN ('running', 'waiting_external'))"
+                )))
+                .bind(job_id)
+                .bind(run_lease)
+                .fetch_one(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                return Ok(if materialized {
+                    CancelStep::Again
+                } else {
+                    CancelStep::Done(RunningAttemptCancel::NotRunning)
+                });
+            }
+        };
+        let (
+            claim_slot,
+            run_lease,
+            ready_slot,
+            ready_generation,
+            queue,
+            priority,
+            attempt,
+            max_attempts,
+            lane_seq,
+            claimed_at,
+            receipt_id,
+            compact_batch,
+        ) = receipt;
+        // Hydrate the ready row so we can synthesize the done
+        // row with the original args/payload.
+        let ready_match: Option<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+                SELECT
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    kind,
+                    queue,
+                    args,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    enqueue_shard,
+                    run_at,
+                    attempted_at,
+                    created_at,
+                    unique_key,
+                    unique_states,
+                    COALESCE(payload, '{{}}'::jsonb) AS payload
+                FROM {schema}.ready_entries
+                WHERE job_id = $1
+                  AND ready_slot = $2
+                  AND ready_generation = $3
+                  AND queue = $4
+                  AND lane_seq = $5
+                "#
+        )))
+        .bind(job_id)
+        .bind(ready_slot)
+        .bind(ready_generation)
+        .bind(&queue)
+        .bind(lane_seq)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some(ready) = ready_match else {
+            // Shouldn't happen: the claim references a ready row.
+            return Ok(CancelStep::Done(RunningAttemptCancel::Left));
+        };
+
+        let done = DoneJobRow {
+            ready_slot,
+            ready_generation,
+            job_id,
+            kind: ready.kind,
+            queue: queue.clone(),
+            args: ready.args,
+            state: JobState::Cancelled,
+            priority,
+            attempt,
+            run_lease,
+            max_attempts,
+            lane_seq,
+            enqueue_shard: ready.enqueue_shard,
+            run_at: ready.run_at,
+            attempted_at: Some(claimed_at),
+            finalized_at: Utc::now(),
+            created_at: ready.created_at,
+            unique_key: ready.unique_key,
+            unique_states: ready.unique_states,
+            payload: ready.payload,
+        };
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Running))
+            .await?;
+        // Write the closure into the same claim partition. A
+        // compact batch-sourced claim has no lease_claims row, so
+        // it closes into the batch ledger the queue prune gate
+        // counts via compact_count; a deadline lease claim keeps
+        // its explicit closure so the gate balances it against the
+        // lease_claims row.
+        if compact_batch {
+            sqlx::query(audited_sql(format!(
+                r#"
+                    INSERT INTO {schema}.lease_claim_closure_batches (
+                        claim_slot,
+                        ready_slot,
+                        ready_generation,
+                        outcome,
+                        closed_count,
+                        receipt_ids,
+                        receipt_ranges,
+                        closed_at
+                    )
+                    VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        'cancelled',
+                        1,
+                        ARRAY[$4::bigint],
+                        int8multirange(int8range($4::bigint, $4::bigint + 1, '[)')),
+                        clock_timestamp()
+                    )
+                    "#
+            )))
+            .bind(claim_slot)
+            .bind(ready_slot)
+            .bind(ready_generation)
+            .bind(receipt_id)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        } else {
+            sqlx::query(audited_sql(format!(
+                    r#"
+                    WITH inserted AS (
+                        INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                        VALUES ($1, $2, $3, 'cancelled', clock_timestamp())
+                        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                        RETURNING claim_slot, job_id, run_lease, closed_at
+                    ),
+                    marked AS (
+                        UPDATE {schema}.lease_claims AS claims
+                        SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
+                        FROM inserted
+                        WHERE claims.claim_slot = inserted.claim_slot
+                          AND claims.job_id = inserted.job_id
+                          AND claims.run_lease = inserted.run_lease
+                        RETURNING claims.job_id
+                    )
+                    SELECT count(*) FROM marked
+                    "#
+                )))
+                .bind(claim_slot)
+                .bind(job_id)
+                .bind(run_lease)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        self.notify_cancellation_tx(tx, job_id, run_lease).await?;
+        Ok(CancelStep::Done(RunningAttemptCancel::Cancelled(Box::new(
+            CancelJobTxResult {
+                row: done.into_job_row()?,
+                claim_cursor_advance: None,
+            },
+        ))))
+    }
+
+    /// Try the attempt's advisory lock without waiting, marking the
+    /// transaction as an attempt-lock holder when it is taken.
+    async fn try_lock_attempt_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+    ) -> Result<bool, AwaError> {
+        let locked: bool = sqlx::query_scalar(
+            "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(\
+             format('awa.receipt.complete:%s:%s', $1::bigint, $2::bigint), 0))",
+        )
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        if locked {
+            sqlx::query(audited_sql(format!(
+                "SELECT pg_catalog.set_config('{ATTEMPT_LOCKS_HELD_SETTING}', 'on', true)"
+            )))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+        Ok(locked)
+    }
+
     async fn cancel_job_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -8994,363 +9614,14 @@ impl QueueStorage {
             }));
         }
 
-        let deleted_lease: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND state IN ('running', 'waiting_external')
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        )))
-        .bind(job_id)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if !deleted_lease.is_empty() {
-            let lease = self
-                .hydrate_deleted_leases_tx(tx, deleted_lease, true)
-                .await?
-                .into_iter()
-                .next()
-                .expect("deleted running lease");
-            let done_payload =
-                Self::payload_with_attempt_state(lease.payload.clone(), lease.progress.clone())?;
-            let done = lease
-                .clone()
-                .into_done_row(JobState::Cancelled, Utc::now(), done_payload);
-            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
-                .await?;
-            // Receipt-plane consistency: close any matching open
-            // receipt so the ADR-023 anti-join no longer considers this
-            // attempt live, and rescue doesn't try to revive it.
-            self.close_receipt_tx(tx, lease.job_id, lease.run_lease, "cancelled")
-                .await?;
-            // Wake any worker currently executing this attempt.
-            self.notify_cancellation_tx(tx, lease.job_id, lease.run_lease)
-                .await?;
-            return Ok(Some(CancelJobTxResult {
-                row: done.into_job_row()?,
-                claim_cursor_advance: None,
-            }));
-        }
-
-        // ADR-023 receipt-only cancel: the job may be running on a
-        // receipt-backed short path that never materialized a `leases`
-        // row. Find it by anti-joining lease_claims with
-        // lease_claim_closures, cancel it by writing a closure and a
-        // done row, and notify listening workers.
         if self.lease_claim_receipts() {
-            let closure_rel = format!("{schema}.lease_claim_closures");
-            let closure_batch_rel = format!("{schema}.lease_claim_closure_batches");
-            let closed_evidence =
-                receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
-            type ReceiptCancelRow = (
-                i32,
-                i64,
-                i32,
-                i64,
-                String,
-                i16,
-                i16,
-                i16,
-                i64,
-                DateTime<Utc>,
-                i64,
-                bool,
-            );
-            let receipt: Option<ReceiptCancelRow> = sqlx::query_as(audited_sql(format!(
-                r#"
-                WITH row_receipt AS (
-                    SELECT
-                        claims.claim_slot,
-                        claims.run_lease,
-                        claims.ready_slot,
-                        claims.ready_generation,
-                        claims.queue,
-                        claims.priority,
-                        claims.attempt,
-                        claims.max_attempts,
-                        claims.lane_seq,
-                        claims.claimed_at,
-                        claims.receipt_id,
-                        false AS compact_batch
-                    FROM {schema}.lease_claims AS claims
-                    WHERE claims.job_id = $1
-                      AND NOT {closed_evidence}
-                    ORDER BY claims.run_lease DESC
-                    LIMIT 1
-                    FOR UPDATE OF claims SKIP LOCKED
-                ),
-                batch_receipt AS (
-                    SELECT
-                        claim_batches.claim_slot,
-                        items.run_lease,
-                        claim_batches.ready_slot,
-                        claim_batches.ready_generation,
-                        claim_batches.queue,
-                        claim_batches.priority,
-                        items.attempt,
-                        items.max_attempts,
-                        items.lane_seq,
-                        claim_batches.claimed_at,
-                        items.receipt_id,
-                        true AS compact_batch
-                    FROM {schema}.lease_claim_batches AS claim_batches
-                    CROSS JOIN LATERAL unnest(
-                        claim_batches.job_ids,
-                        claim_batches.run_leases,
-                        claim_batches.receipt_ids,
-                        claim_batches.lane_seqs,
-                        claim_batches.attempts,
-                        claim_batches.max_attempts
-                    ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-                    WHERE items.job_id = $1
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.lease_claim_closures AS closures
-                          WHERE closures.claim_slot = claim_batches.claim_slot
-                            AND closures.job_id = items.job_id
-                            AND closures.run_lease = items.run_lease
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.lease_claim_closure_batches AS closure_batches
-                          WHERE closure_batches.claim_slot = claim_batches.claim_slot
-                            AND closure_batches.receipt_ranges @> items.receipt_id
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.leases AS lease
-                          WHERE lease.job_id = items.job_id
-                            AND lease.run_lease = items.run_lease
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.done_entries AS done
-                          WHERE done.job_id = items.job_id
-                            AND done.run_lease = items.run_lease
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.deferred_jobs AS deferred
-                          WHERE deferred.job_id = items.job_id
-                            AND deferred.run_lease = items.run_lease
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM {schema}.dlq_entries AS dlq
-                          WHERE dlq.job_id = items.job_id
-                            AND dlq.run_lease = items.run_lease
-                      )
-                    ORDER BY items.run_lease DESC
-                    LIMIT 1
-                    FOR UPDATE OF claim_batches SKIP LOCKED
-                )
-                SELECT *
-                FROM (
-                    SELECT * FROM row_receipt
-                    UNION ALL
-                    SELECT * FROM batch_receipt
-                ) AS receipt
-                ORDER BY run_lease DESC
-                LIMIT 1
-                "#
-            )))
-            .bind(job_id)
-            .fetch_optional(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            if let Some((
-                claim_slot,
-                run_lease,
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                attempt,
-                max_attempts,
-                lane_seq,
-                claimed_at,
-                receipt_id,
-                compact_batch,
-            )) = receipt
-            {
-                // Hydrate the ready row so we can synthesize the done
-                // row with the original args/payload.
-                let ready_match: Option<ReadyTransitionRow> = sqlx::query_as(audited_sql(format!(
-                    r#"
-                    SELECT
-                        ready_slot,
-                        ready_generation,
-                        job_id,
-                        kind,
-                        queue,
-                        args,
-                        priority,
-                        attempt,
-                        run_lease,
-                        max_attempts,
-                        lane_seq,
-                        enqueue_shard,
-                        run_at,
-                        attempted_at,
-                        created_at,
-                        unique_key,
-                        unique_states,
-                        COALESCE(payload, '{{}}'::jsonb) AS payload
-                    FROM {schema}.ready_entries
-                    WHERE job_id = $1
-                      AND ready_slot = $2
-                      AND ready_generation = $3
-                      AND queue = $4
-                      AND lane_seq = $5
-                    "#
-                )))
-                .bind(job_id)
-                .bind(ready_slot)
-                .bind(ready_generation)
-                .bind(&queue)
-                .bind(lane_seq)
-                .fetch_optional(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                let Some(ready) = ready_match else {
-                    // Shouldn't happen — the claim references a ready
-                    // row. Fall through to the deferred / not-found
-                    // branches.
-                    return Ok(None);
-                };
-
-                let done = DoneJobRow {
-                    ready_slot,
-                    ready_generation,
-                    job_id,
-                    kind: ready.kind,
-                    queue: queue.clone(),
-                    args: ready.args,
-                    state: JobState::Cancelled,
-                    priority,
-                    attempt,
-                    run_lease,
-                    max_attempts,
-                    lane_seq,
-                    enqueue_shard: ready.enqueue_shard,
-                    run_at: ready.run_at,
-                    attempted_at: Some(claimed_at),
-                    finalized_at: Utc::now(),
-                    created_at: ready.created_at,
-                    unique_key: ready.unique_key,
-                    unique_states: ready.unique_states,
-                    payload: ready.payload,
-                };
-                self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Running))
-                    .await?;
-                // Write the closure into the same claim partition. A
-                // compact batch-sourced claim has no lease_claims row, so
-                // it closes into the batch ledger the queue prune gate
-                // counts via compact_count; a deadline lease claim keeps
-                // its explicit closure so the gate balances it against the
-                // lease_claims row.
-                if compact_batch {
-                    sqlx::query(audited_sql(format!(
-                        r#"
-                        INSERT INTO {schema}.lease_claim_closure_batches (
-                            claim_slot,
-                            ready_slot,
-                            ready_generation,
-                            outcome,
-                            closed_count,
-                            receipt_ids,
-                            receipt_ranges,
-                            closed_at
-                        )
-                        VALUES (
-                            $1,
-                            $2,
-                            $3,
-                            'cancelled',
-                            1,
-                            ARRAY[$4::bigint],
-                            int8multirange(int8range($4::bigint, $4::bigint + 1, '[)')),
-                            clock_timestamp()
-                        )
-                        "#
-                    )))
-                    .bind(claim_slot)
-                    .bind(ready_slot)
-                    .bind(ready_generation)
-                    .bind(receipt_id)
-                    .execute(tx.as_mut())
-                    .await
-                    .map_err(map_sqlx_error)?;
-                } else {
-                    sqlx::query(audited_sql(format!(
-                        r#"
-                        WITH inserted AS (
-                            INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
-                            VALUES ($1, $2, $3, 'cancelled', clock_timestamp())
-                            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                            RETURNING claim_slot, job_id, run_lease, closed_at
-                        ),
-                        marked AS (
-                            UPDATE {schema}.lease_claims AS claims
-                            SET closed_at = COALESCE(claims.closed_at, inserted.closed_at)
-                            FROM inserted
-                            WHERE claims.claim_slot = inserted.claim_slot
-                              AND claims.job_id = inserted.job_id
-                              AND claims.run_lease = inserted.run_lease
-                            RETURNING claims.job_id
-                        )
-                        SELECT count(*) FROM marked
-                        "#
-                    )))
-                    .bind(claim_slot)
-                    .bind(job_id)
-                    .bind(run_lease)
-                    .execute(tx.as_mut())
-                    .await
-                    .map_err(map_sqlx_error)?;
-                }
-                // Defensive: between the leases DELETE at the top of
-                // this function and the FOR UPDATE on claims above, a
-                // concurrent `ensure_running_leases_from_receipts_tx`
-                // can have materialized a `leases` row for this
-                // (job_id, run_lease). Materialize and we both lock the
-                // same claim evidence; whichever ran first commits, the
-                // other replays under the new snapshot. If materialize
-                // committed first, that lease is now an orphan pointing
-                // at a job we're about to mark `cancelled`. Sweep it
-                // defensively. If no race occurred this is a no-op.
-                sqlx::query(audited_sql(format!(
-                    "DELETE FROM {schema}.leases WHERE job_id = $1 AND run_lease = $2"
-                )))
-                .bind(job_id)
-                .bind(run_lease)
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-                self.notify_cancellation_tx(tx, job_id, run_lease).await?;
-                return Ok(Some(CancelJobTxResult {
-                    row: done.into_job_row()?,
-                    claim_cursor_advance: None,
-                }));
+            match self.cancel_running_attempt_tx(tx, job_id).await? {
+                RunningAttemptCancel::Cancelled(result) => return Ok(Some(*result)),
+                RunningAttemptCancel::Left => return Ok(None),
+                RunningAttemptCancel::NotRunning => {}
             }
+        } else if let Some(result) = self.cancel_materialized_lease_tx(tx, job_id, None).await? {
+            return Ok(Some(result));
         }
 
         let deferred: Option<DeferredJobRow> = sqlx::query_as(audited_sql(format!(
@@ -10066,7 +10337,7 @@ impl QueueStorage {
             .map(|(_, run_lease)| *run_lease)
             .collect();
 
-        sqlx::query(
+        sqlx::query(audited_sql(format!(
             r#"
             WITH locks AS MATERIALIZED (
                 SELECT DISTINCT pg_catalog.hashtextextended(
@@ -10075,11 +10346,17 @@ impl QueueStorage {
                 ) AS lock_key
                 FROM unnest($1::bigint[], $2::bigint[]) AS input(job_id, run_lease)
                 ORDER BY lock_key
+            ),
+            acquired AS MATERIALIZED (
+                SELECT pg_catalog.pg_advisory_xact_lock(lock_key) FROM locks
             )
-            SELECT pg_catalog.pg_advisory_xact_lock(lock_key)
-            FROM locks
-            "#,
-        )
+            SELECT count(*)
+            FROM acquired
+            CROSS JOIN (
+                SELECT pg_catalog.set_config('{ATTEMPT_LOCKS_HELD_SETTING}', 'on', true)
+            ) AS marked
+            "#
+        )))
         .bind(&job_ids)
         .bind(&run_leases)
         .execute(tx.as_mut())
@@ -11363,9 +11640,9 @@ impl QueueStorage {
         let claim_batch_child = claim_batch_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
+        let candidate_ctes = format!(
             r#"
-            WITH cursor_row AS (
+            cursor_row AS (
                 SELECT
                     rescue_cursor_claimed_at,
                     rescue_cursor_job_id,
@@ -11544,7 +11821,39 @@ impl QueueStorage {
                   AND is_stale
                 ORDER BY rn
                 LIMIT $4
-            ),
+            )"#
+        );
+        // Closers take the attempt's advisory lock before their statement
+        // snapshot. Rescue takes the same locks in a statement of its own,
+        // so the statement that decides and writes the closure starts after
+        // any closer that held a lock first has committed and sees its
+        // evidence. Only attempts locked here may be closed below.
+        let (locked_job_ids, locked_run_leases): (Vec<i64>, Vec<i64>) =
+            sqlx::query_as::<_, (i64, i64)>(audited_sql(format!(
+                r#"
+                WITH {candidate_ctes}
+                SELECT job_id, run_lease
+                FROM stale_candidates
+                WHERE pg_catalog.pg_try_advisory_xact_lock(
+                    pg_catalog.hashtextextended(
+                        format('awa.receipt.complete:%s:%s', job_id, run_lease),
+                        0
+                    )
+                )
+                "#
+            )))
+            .bind(slot)
+            .bind(cutoff)
+            .bind(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT)
+            .bind(rescue_limit)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .unzip();
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH {candidate_ctes},
             stale_row_locked AS (
                 SELECT stale_candidates.*
                 FROM stale_candidates
@@ -11580,11 +11889,9 @@ impl QueueStorage {
                       WHERE dlq.job_id = claims.job_id
                         AND dlq.run_lease = claims.run_lease
                   )
-                  AND pg_catalog.pg_try_advisory_xact_lock(
-                      pg_catalog.hashtextextended(
-                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
-                          0
-                      )
+                  AND (claims.job_id, claims.run_lease) IN (
+                      SELECT locked.job_id, locked.run_lease
+                      FROM unnest($5::bigint[], $6::bigint[]) AS locked(job_id, run_lease)
                   )
                   -- A claim that already materialized into `leases` is
                   -- on the lease-side heartbeat-rescue path (see
@@ -11631,11 +11938,9 @@ impl QueueStorage {
                       WHERE dlq.job_id = stale_candidates.job_id
                         AND dlq.run_lease = stale_candidates.run_lease
                   )
-                  AND pg_catalog.pg_try_advisory_xact_lock(
-                      pg_catalog.hashtextextended(
-                          format('awa.receipt.complete:%s:%s', stale_candidates.job_id, stale_candidates.run_lease),
-                          0
-                      )
+                  AND (stale_candidates.job_id, stale_candidates.run_lease) IN (
+                      SELECT locked.job_id, locked.run_lease
+                      FROM unnest($5::bigint[], $6::bigint[]) AS locked(job_id, run_lease)
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
@@ -11773,6 +12078,8 @@ impl QueueStorage {
         .bind(cutoff)
         .bind(RECEIPT_RESCUE_CURSOR_SCAN_LIMIT)
         .bind(rescue_limit)
+        .bind(&locked_job_ids)
+        .bind(&locked_run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -11893,9 +12200,9 @@ impl QueueStorage {
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_child, &closure_batch_child, "claims");
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
+        let candidate_ctes = format!(
             r#"
-            WITH cursor_row AS (
+            cursor_row AS (
                 SELECT
                     deadline_cursor_deadline_at,
                     deadline_cursor_job_id,
@@ -11996,7 +12303,34 @@ impl QueueStorage {
                   AND is_expired
                 ORDER BY rn
                 LIMIT $3
-            ),
+            )"#
+        );
+        // Lock before deciding; see `rescue_stale_receipt_claims_for_slot_tx`.
+        let (locked_job_ids, locked_run_leases): (Vec<i64>, Vec<i64>) =
+            sqlx::query_as::<_, (i64, i64)>(audited_sql(format!(
+                r#"
+                WITH {candidate_ctes}
+                SELECT job_id, run_lease
+                FROM expired_candidates
+                WHERE pg_catalog.pg_try_advisory_xact_lock(
+                    pg_catalog.hashtextextended(
+                        format('awa.receipt.complete:%s:%s', job_id, run_lease),
+                        0
+                    )
+                )
+                "#
+            )))
+            .bind(slot)
+            .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
+            .bind(rescue_limit)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .unzip();
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH {candidate_ctes},
             expired_locked AS (
                 SELECT expired_candidates.*
                 FROM expired_candidates
@@ -12006,11 +12340,9 @@ impl QueueStorage {
                  AND claims.run_lease = expired_candidates.run_lease
                 WHERE NOT {closed_evidence}
                   AND claims.deadline_at < clock_timestamp()
-                  AND pg_catalog.pg_try_advisory_xact_lock(
-                      pg_catalog.hashtextextended(
-                          format('awa.receipt.complete:%s:%s', claims.job_id, claims.run_lease),
-                          0
-                      )
+                  AND (claims.job_id, claims.run_lease) IN (
+                      SELECT locked.job_id, locked.run_lease
+                      FROM unnest($4::bigint[], $5::bigint[]) AS locked(job_id, run_lease)
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
@@ -12104,6 +12436,8 @@ impl QueueStorage {
         .bind(slot)
         .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
         .bind(rescue_limit)
+        .bind(&locked_job_ids)
+        .bind(&locked_run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -12144,9 +12478,9 @@ impl QueueStorage {
         let claim_batch_child = claim_batch_child_name(schema, slot as usize);
         let closure_child = closure_child_name(schema, slot as usize);
         let closure_batch_child = claim_closure_batch_child_name(schema, slot as usize);
-        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
+        let candidate_ctes = format!(
             r#"
-            WITH cursor_row AS (
+            cursor_row AS (
                 SELECT
                     batch_deadline_cursor_deadline_at,
                     batch_deadline_cursor_batch_id
@@ -12281,7 +12615,34 @@ impl QueueStorage {
                   AND NOT is_lease_managed
                 ORDER BY rn, receipt_id
                 LIMIT $3
-            ),
+            )"#
+        );
+        // Lock before deciding; see `rescue_stale_receipt_claims_for_slot_tx`.
+        let (locked_job_ids, locked_run_leases): (Vec<i64>, Vec<i64>) =
+            sqlx::query_as::<_, (i64, i64)>(audited_sql(format!(
+                r#"
+                WITH {candidate_ctes}
+                SELECT job_id, run_lease
+                FROM expired_members
+                WHERE pg_catalog.pg_try_advisory_xact_lock(
+                    pg_catalog.hashtextextended(
+                        format('awa.receipt.complete:%s:%s', job_id, run_lease),
+                        0
+                    )
+                )
+                "#
+            )))
+            .bind(slot)
+            .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
+            .bind(rescue_limit)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .unzip();
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH {candidate_ctes},
             expired_locked AS (
                 SELECT expired_members.*
                 FROM expired_members
@@ -12315,11 +12676,9 @@ impl QueueStorage {
                       WHERE dlq.job_id = expired_members.job_id
                         AND dlq.run_lease = expired_members.run_lease
                   )
-                  AND pg_catalog.pg_try_advisory_xact_lock(
-                      pg_catalog.hashtextextended(
-                          format('awa.receipt.complete:%s:%s', expired_members.job_id, expired_members.run_lease),
-                          0
-                      )
+                  AND (expired_members.job_id, expired_members.run_lease) IN (
+                      SELECT locked.job_id, locked.run_lease
+                      FROM unnest($4::bigint[], $5::bigint[]) AS locked(job_id, run_lease)
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM {schema}.leases AS lease
@@ -12430,6 +12789,8 @@ impl QueueStorage {
         .bind(slot)
         .bind(RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT)
         .bind(rescue_limit)
+        .bind(&locked_job_ids)
+        .bind(&locked_run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;

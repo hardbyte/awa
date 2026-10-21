@@ -91,6 +91,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A running job could be both finished and retried.** If a job completed,
+  failed or was retried while stale-heartbeat or deadline rescue was examining
+  it, rescue could miss that outcome and also send the job back for a retry, so
+  it ran again. Cancelling a running job could race a finishing worker the same
+  way. Rescue now sees every outcome that commits first. Cancel never waits on a
+  lock held by a finishing worker, because waiting could deadlock with it.
+  Instead it retries for up to five seconds. If the job is still being finished
+  after that, cancel leaves it alone and logs it: `cancel` returns
+  `JobNotFound` and `bulk_cancel` leaves it out of its result, so retry if you
+  need it cancelled. A bulk cancel holds a lock for each running job until it
+  commits, so cancel very large sets of running jobs in batches.
+
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
 
