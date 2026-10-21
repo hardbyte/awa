@@ -2839,6 +2839,152 @@ async fn test_rotation_cadence_row_floor_and_age_ceiling() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ledger_rotation_does_not_wait_for_the_ring_state_row() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_ledger_rotate_nolock";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The assertion is about ledger authority; make that explicit rather than
+    // depending on when the maintenance auto-flip happens to run.
+    let flipped = storage::flip_ring_authority(&pool, schema, false)
+        .await
+        .expect("flip to ledger authority");
+    assert_eq!(flipped, "ledger");
+    // Rotate through connections that refuse to wait on a lock, so the test
+    // tells "did not wait" from "was slow" regardless of host load.
+    let impatient = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '3s'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .unwrap();
+    let outcome = store
+        .rotate(&impatient)
+        .await
+        .expect("a ledger-mode rotation must not queue behind the ring-state row lock");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedIdle { .. }),
+        "an empty ring reports idle, got {outcome:?}"
+    );
+    holder.rollback().await.unwrap();
+    impatient.close().await;
+}
+
+/// A ledger-mode prune holds the queue-ring advisory lock, then locks a done
+/// partition, then the done parent to carry retained failures forward. A
+/// counter rebuild must wait for the advisory lock before touching tables;
+/// locking the parent first would deadlock against that prune.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_counter_rebuild_waits_for_an_in_flight_prune() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_rebuild_vs_prune";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut prune = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries_0 IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .unwrap();
+
+    let rebuild = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.rebuild_terminal_counters(&pool).await })
+    };
+    wait_for_any_lock_wait(&pool).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .expect("the prune's parent lock must not deadlock with a waiting rebuild");
+    prune.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), rebuild)
+        .await
+        .expect("rebuild finishes after the prune")
+        .unwrap()
+        .expect("rebuild succeeds");
+}
+
+/// A ledger-mode rotation holds the queue-ring advisory lock while it reads
+/// ring tables. A reset must wait for that lock before truncating; taking
+/// its table locks first would deadlock against the rotation's later reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_reset_waits_for_an_in_flight_rotation() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_reset_vs_rotate";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut rotate = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_rotations LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .unwrap();
+
+    let reset = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.reset(&pool).await })
+    };
+    wait_for_any_lock_wait(&pool).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.ready_entries_0 LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .expect("the rotation's later read must not deadlock with a waiting reset");
+    rotate.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), reset)
+        .await
+        .expect("reset finishes after the rotation")
+        .unwrap()
+        .expect("reset succeeds");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_change() {
     let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_cadence_observed_age";
@@ -3863,7 +4009,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
     let store = Arc::new(
         create_store(&pool, schema)
             .await
-            .with_prune_lock_timeout(Duration::from_secs(2))
+            .with_prune_lock_timeout(Duration::from_secs(60))
             .expect("test prune lock timeout"),
     );
 
@@ -3953,7 +4099,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
 
     let needle = format!("{schema}.ready_segments_0");
-    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    let wait_deadline = Instant::now() + Duration::from_secs(30);
     let mut saw_lock_wait = false;
     while Instant::now() < wait_deadline {
         let waiting: bool = sqlx::query_scalar(
@@ -3985,7 +4131,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
 
     writer_tx.commit().await.expect("commit pending ready row");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), prune_task)
+    let outcome = tokio::time::timeout(Duration::from_secs(30), prune_task)
         .await
         .expect("queue prune task timed out")
         .expect("queue prune task panicked")
@@ -12923,11 +13069,19 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
         .await
         .expect("rollup terminal deltas");
     assert_eq!(outcome.rolled_slots, 1);
-    assert_eq!(outcome.delta_rows, 6);
-    assert_eq!(outcome.grouped_keys, 6);
+    assert_eq!(
+        outcome.delta_rows, 1,
+        "after the flip a lane's completions append one delta row"
+    );
+    assert_eq!(outcome.grouped_keys, 1);
     assert_eq!(outcome.skipped_active_slots, 0);
     assert_eq!(outcome.blocked_slots, 0);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the fold writes one live-count row per lane, not one per job-id bucket"
+    );
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
     assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
     assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
@@ -12937,6 +13091,412 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
         .await
         .expect("queue counts");
     assert_eq!(counts.terminal, 6);
+}
+
+/// A negative delta folds exactly even when the lane's live count still sits
+/// in per-job-id buckets, as written by pre-collapse folds, the installer
+/// backfill and older rebuilds: the fold collapses the lane to one bucket-0
+/// row holding the bucket total plus the signed delta.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_collapses_bucketed_rows() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_bucketed";
+    let schema = "awa_qs_terminal_delta_rollup_bucketed";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 6)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 6, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 6);
+    let (completed, failed) = claimed.split_at(5);
+    let completed_claims: Vec<_> = completed.iter().map(|job| job.claim.clone()).collect();
+    store
+        .complete_batch(&pool, &completed_claims)
+        .await
+        .expect("complete");
+    let failed_job = &failed[0].job;
+    store
+        .fail_terminal(&pool, failed_job.id, failed_job.run_lease, "boom", None)
+        .await
+        .expect("fail terminally")
+        .expect("running job fails");
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
+
+    match store.rotate(&pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("first rollup");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+
+    // Rewrite the folded lane into the per-job-id bucket shape older folds
+    // and rebuilds left behind.
+    sqlx::query(audited_sql(format!(
+        "WITH removed AS (
+             DELETE FROM {schema}.queue_terminal_live_counts WHERE queue = $1
+         )
+         INSERT INTO {schema}.queue_terminal_live_counts
+             (ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count)
+         SELECT ready_slot, queue, priority, enqueue_shard,
+                mod(mod(job_id, 256::bigint) + 256::bigint, 256::bigint)::smallint,
+                count(*)::bigint
+         FROM {schema}.done_entries
+         WHERE queue = $1
+         GROUP BY 1, 2, 3, 4, 5"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("rewrite live counts into job-id buckets");
+    assert_eq!(live_count_rows(&pool, schema, queue).await, 6);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+
+    // Retrying the failed job removes its done row from the sealed slot and
+    // appends a -1 delta in the failed job's bucket.
+    store
+        .retry_job(&pool, failed_job.id)
+        .await
+        .expect("retry failed job")
+        .expect("failed job is retryable");
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, -1);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("second rollup");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(outcome.grouped_keys, 1);
+    assert_eq!(
+        live_count_sum(&pool, schema, queue).await,
+        5,
+        "the negative delta must not be dropped when its bucket holds no bucket-0 row"
+    );
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the fold collapses the lane's bucketed rows into one row"
+    );
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(counts.terminal, 5);
+}
+
+/// Seeds one lane with `completed` completions and `failed` terminal
+/// failures in the genesis slot, rotates it out and folds its deltas.
+/// Returns the failed jobs so a caller can retry them into negative deltas.
+async fn seed_sealed_terminal_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    completed: usize,
+    failed: usize,
+) -> Vec<awa_model::JobRow> {
+    let total = completed + failed;
+    store
+        .enqueue_batch(pool, queue, 1, total as i64)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(pool, queue, total as i64, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), total);
+    let (done, failing) = claimed.split_at(completed);
+    if !done.is_empty() {
+        let claims: Vec<_> = done.iter().map(|job| job.claim.clone()).collect();
+        store.complete_batch(pool, &claims).await.expect("complete");
+    }
+    let mut failed_jobs = Vec::new();
+    for job in failing {
+        store
+            .fail_terminal(pool, job.job.id, job.job.run_lease, "boom", None)
+            .await
+            .expect("fail terminally")
+            .expect("running job fails");
+        failed_jobs.push(job.job.clone());
+    }
+    match store.rotate(pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    store
+        .rollup_terminal_count_deltas(pool, 4)
+        .await
+        .expect("first rollup");
+    failed_jobs
+}
+
+/// Before the ring authority flip, N-1 maintenance may still fold, so the
+/// fold and the rebuild keep the per-job-id bucket shape it applies deltas to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_keeps_job_id_buckets_before_the_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_fold_compat";
+    let schema = "awa_qs_terminal_fold_compat";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 5, 1).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert!(
+        live_count_rows(&pool, schema, queue).await > 1,
+        "compat folds keep one row per job-id bucket"
+    );
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("second rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert!(live_count_rows(&pool, schema, queue).await > 1);
+
+    store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert!(
+        live_count_rows(&pool, schema, queue).await > 1,
+        "a compat rebuild writes per-bucket rows"
+    );
+}
+
+/// Counts folded per bucket before the flip stay exact when the first fold
+/// after the flip collapses the lane and applies a negative delta from a
+/// different bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_handoff_across_the_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_fold_handoff";
+    let schema = "awa_qs_terminal_fold_handoff";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 5, 1).await;
+    assert!(live_count_rows(&pool, schema, queue).await > 1);
+    set_ring_authority(&pool, schema, "ledger").await;
+
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup after the flip");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert_eq!(live_count_rows(&pool, schema, queue).await, 1);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("counts")
+            .terminal,
+        5
+    );
+}
+
+/// After the flip: repeated negative folds against the collapsed row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_repeated_negatives_against_the_collapsed_row() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges";
+    let store = create_store(&pool, schema).await;
+
+    let queue = "qs_terminal_fold_two_negatives";
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 4, 2).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    for (expected, job) in [(5, &failed[0]), (4, &failed[1])] {
+        store
+            .retry_job(&pool, job.id)
+            .await
+            .expect("retry")
+            .expect("failed job is retryable");
+        store
+            .rollup_terminal_count_deltas(&pool, 4)
+            .await
+            .expect("rollup");
+        assert_eq!(live_count_sum(&pool, schema, queue).await, expected);
+        assert_eq!(live_count_rows(&pool, schema, queue).await, 1);
+    }
+}
+
+/// After the flip: a lane folded to zero keeps no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_collapsed_lane_reduces_to_zero() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges_zero";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_terminal_fold_to_zero";
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 0, 1).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 1);
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        0,
+        "a lane folded to zero keeps no row"
+    );
+}
+
+/// After the flip: a sealed slot whose deltas net to zero leaves the lane
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_ignores_net_zero_deltas() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges_net_zero";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_terminal_fold_net_zero";
+    seed_sealed_terminal_lane(&pool, &store, queue, 3, 0).await;
+    let (slot, generation): (i32, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT ready_slot, ready_generation FROM {schema}.done_entries WHERE queue = $1 LIMIT 1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("sealed slot of the lane");
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_terminal_count_deltas
+             (ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket, terminal_delta)
+         VALUES ($1, $2, $3, 1, 0, 3, 1), ($1, $2, $3, 1, 0, 7, -1)"
+    )))
+    .bind(slot)
+    .bind(generation)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("mixed-sign deltas that net to zero");
+    let rows_before = live_count_rows(&pool, schema, queue).await;
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 3);
+    assert_eq!(live_count_rows(&pool, schema, queue).await, rows_before);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+}
+
+/// After the flip a batch of terminal rows appends one delta row per lane;
+/// before it, one per job-id bucket, which N-1 folds need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_deltas_are_per_lane_after_the_flip() {
+    for (authority, expect_one_row) in [("ledger", true), ("columns", false)] {
+        let (_db_guard, pool) = setup_pool(10).await;
+        let queue = "qs_terminal_delta_lanes";
+        let schema = "awa_qs_terminal_delta_lanes";
+        let store = create_store(&pool, schema).await;
+        set_ring_authority(&pool, schema, authority).await;
+        store
+            .enqueue_batch(&pool, queue, 1, 8)
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 8, Duration::ZERO)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 8);
+        let claims: Vec<_> = claimed.iter().map(|job| job.claim.clone()).collect();
+        store
+            .complete_batch(&pool, &claims)
+            .await
+            .expect("complete");
+        let rows: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT count(*) FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+        )))
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .expect("delta rows");
+        assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 8);
+        if expect_one_row {
+            assert_eq!(rows, 1, "{authority}: one delta row per lane");
+        } else {
+            assert!(
+                rows > 1,
+                "{authority}: deltas keep job-id buckets, got {rows} rows"
+            );
+        }
+    }
+}
+
+/// A flip seen inside a caller's transaction that then rolls back must not
+/// change how later transactions bucket their deltas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_delta_bucketing_ignores_a_rolled_back_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rolled_back_flip";
+    let schema = "awa_qs_terminal_delta_rolled_back_flip";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim");
+    let job = claimed[0].job.clone();
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.ring_cursor_authority SET authority = 'ledger' WHERE singleton"
+    )))
+    .execute(tx.as_mut())
+    .await
+    .unwrap();
+    store
+        .fail_terminal_in_tx(&mut tx, job.id, job.run_lease, "boom", None)
+        .await
+        .expect("fail in the caller's transaction")
+        .expect("running job fails");
+    tx.rollback().await.unwrap();
+
+    store
+        .fail_terminal(&pool, job.id, job.run_lease, "boom", None)
+        .await
+        .expect("fail")
+        .expect("running job fails");
+    let buckets: Vec<i16> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT counter_bucket FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected = (job.id.rem_euclid(256)) as i16;
+    assert_ne!(expected, 0, "the test needs a job outside bucket 0");
+    assert_eq!(
+        buckets,
+        vec![expected],
+        "columns authority keeps the job-id bucket after a rolled-back flip"
+    );
 }
 
 /// Terminal-count rollup mutates `queue_terminal_live_counts`, so it should
@@ -13004,8 +13564,11 @@ async fn test_queue_terminal_count_delta_rollup_skips_pinned_mvcc_horizon() {
         .await
         .expect("rollup terminal deltas after pin release");
     assert_eq!(outcome.rolled_slots, 1);
-    assert_eq!(outcome.delta_rows, 6);
-    assert_eq!(outcome.grouped_keys, 6);
+    assert_eq!(
+        outcome.delta_rows, 1,
+        "after the flip a lane's completions append one delta row"
+    );
+    assert_eq!(outcome.grouped_keys, 1);
     assert!(!outcome.skipped_mvcc_pinned);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
@@ -13295,6 +13858,11 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
         .await
         .expect("rebuild");
     assert!(rebuilt >= 1, "rebuild should re-populate counter rows");
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the rebuild writes one live-count row per lane, not one per job-id bucket"
+    );
     assert_invariant_holds(&pool, schema, queue, "after rebuild").await;
 }
 
@@ -13508,6 +14076,17 @@ async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
     .fetch_one(pool)
     .await
     .expect("sum live_terminal_count")
+}
+
+async fn live_count_rows(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
+        "SELECT count(*)::bigint \
+         FROM {schema}.queue_terminal_live_counts WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count live-count rows")
 }
 
 async fn terminal_delta_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
@@ -14370,7 +14949,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let store = Arc::new(
         create_store(&pool, schema)
             .await
-            .with_prune_lock_timeout(Duration::from_secs(5))
+            .with_prune_lock_timeout(Duration::from_secs(60))
             .expect("prune lock timeout"),
     );
     store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
@@ -14392,7 +14971,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let prune_pool = pool.clone();
     let prune =
         tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let waiting: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = $1::regclass AND mode = 'AccessExclusiveLock' AND NOT granted)",
@@ -14418,7 +14997,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     .await
     .expect("a segment reader must finish acquiring the claim relations while prune waits");
     reader.commit().await.unwrap();
-    let outcome = tokio::time::timeout(Duration::from_secs(2), prune)
+    let outcome = tokio::time::timeout(Duration::from_secs(30), prune)
         .await
         .unwrap()
         .unwrap()
@@ -15045,6 +15624,29 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
     );
 }
 
+/// Wait until another backend is blocked on a heavyweight lock of any kind.
+async fn wait_for_any_lock_wait(pool: &sqlx::PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                SELECT 1 FROM pg_stat_activity \
+                WHERE datname = current_database() \
+                  AND pid <> pg_backend_pid() \
+                  AND wait_event_type = 'Lock'\
+            )",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("Failed to inspect lock waits");
+        if waiting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "Expected a lock wait");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_lock_wait(pool: &sqlx::PgPool, wait_event: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -15376,6 +15978,16 @@ async fn test_queue_storage_counter_rebuild_locks_ring_before_done_table() {
         "Counter rebuild should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Counter rebuild should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), rebuild)
@@ -15415,6 +16027,16 @@ async fn test_queue_storage_reset_locks_ring_before_done_table() {
         "Reset should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Reset should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), reset)

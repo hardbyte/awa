@@ -3711,6 +3711,12 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+        self.lock_ring_serializers_tx(
+            &mut tx,
+            &[RingFamily::Queue, RingFamily::Lease, RingFamily::Claim],
+        )
+        .await?;
+
         for family in [RingFamily::Queue, RingFamily::Lease, RingFamily::Claim] {
             let state = family.state_relname();
             sqlx::query(audited_sql(format!(
@@ -4239,28 +4245,46 @@ impl QueueStorage {
         .map_err(map_sqlx_error)
     }
 
-    /// Acquire the per-ring rotate ↔ prune ↔ delta-rollup serializer AND
-    /// resolve the authority under it, in one step.
+    /// Wait for the per-ring rotation advisory locks, in a fixed ring order.
+    /// Whole-schema operations (reset, counter rebuild) take these before any
+    /// row or table lock, so in ledger authority, where rotate, prune and the
+    /// delta rollup serialize only on these locks, they wait for an
+    /// in-flight tick instead of interleaving table locks with it.
+    async fn lock_ring_serializers_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        families: &[RingFamily],
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        for family in families {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(family.rotation_lock_name(schema))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        Ok(())
+    }
+
+    /// Acquire the per-ring rotate ↔ prune ↔ delta-rollup serializer and
+    /// resolve the authority under it.
     ///
-    /// The ring-state singleton `FOR UPDATE` is taken FIRST, unconditionally,
-    /// as the universal outer gate. This is load-bearing for the #371 staged
-    /// upgrade: the one-way flip (`awa.flip_ring_authority`) also takes the
-    /// three singletons `FOR UPDATE` before promoting the authority, so
-    /// taking the singleton before reading the authority closes the TOCTOU
-    /// where a rotator reads `columns`, the flip commits, and the rotator
-    /// then advances under the stale mode (a `MixedFleet` violation the
-    /// `AwaStorageLockOrder` model flags). Whoever wins the singleton wins:
-    /// a rotator that loses the race to the flip reads `ledger` here and runs
-    /// the ledger path; the flip that loses to a rotator waits for it to
-    /// commit. In compat mode this singleton lock is also the SAME row lock a
-    /// live 0.6 rotator takes, so 0.7 and 0.6 rotators serialize.
+    /// In compat (`columns`) authority the ring-state singleton `FOR UPDATE`
+    /// is the serializer. It is taken before the authority is re-read: the
+    /// one-way flip (`awa.flip_ring_authority`) takes the same three
+    /// singletons before promoting the authority, so a rotator that loses the
+    /// race to the flip reads `ledger` under the lock and runs the ledger
+    /// path, and a flip that loses waits for the rotator to commit. The same
+    /// row lock is the one a 0.6 rotator takes, so mixed-version rotators
+    /// serialize.
     ///
-    /// In ledger authority it ADDITIONALLY takes the non-blocking per-ring
-    /// `pg_try_advisory_xact_lock` so a periodic rotate skips under
-    /// contention with prune/rollup instead of queueing; `Ok((_, false))`
-    /// means "skip this tick". (Holding the singleton momentarily in ledger
-    /// mode is a cold, uncontended write-free row-share and does not
-    /// reintroduce the churn — nothing UPDATEs the singleton in ledger mode.)
+    /// In ledger authority the non-blocking per-ring
+    /// `pg_try_advisory_xact_lock` is the whole serializer, so a periodic
+    /// rotate skips under contention with prune or rollup instead of
+    /// queueing. `Ok((_, false))` means "skip this tick". The singleton row
+    /// is not locked: a row lock writes a heap lock record and a commit
+    /// record per tick even when nothing rotates, and because the flip is
+    /// one-way a `ledger` reading taken without the row lock is final.
     async fn acquire_ring_serializer_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4269,16 +4293,21 @@ impl QueueStorage {
         let schema = self.schema();
         let state = family.state_relname();
 
-        // Universal outer gate: serialize against the flip and against 0.6
-        // rotators, BEFORE reading the authority.
-        sqlx::query(audited_sql(format!(
-            "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
-        )))
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let authority = self.ring_authority_tx(tx).await?;
+        let authority = match self.ring_authority_tx(tx).await? {
+            RingAuthority::Ledger => RingAuthority::Ledger,
+            RingAuthority::Columns => {
+                // Serialize against the flip and against 0.6 rotators, then
+                // re-read the authority under the lock: a rotator that
+                // loses the race to the flip sees `ledger` here.
+                sqlx::query(audited_sql(format!(
+                    "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
+                )))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                self.ring_authority_tx(tx).await?
+            }
+        };
 
         match authority {
             RingAuthority::Columns => Ok((authority, true)),
@@ -5528,6 +5557,12 @@ impl QueueStorage {
         self.append_terminal_count_deltas_tx(tx, by_group).await
     }
 
+    /// Append terminal-count deltas. Before the ring authority flip they keep
+    /// their job-id bucket, because N-1 maintenance folds each delta into the
+    /// bucket of the original row; after it, folds collapse each lane, so the
+    /// statement writes one row per lane. The authority is read inside the
+    /// statement, so the choice follows the caller's transaction, including a
+    /// flip made and rolled back in it.
     async fn append_terminal_count_deltas_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5536,7 +5571,6 @@ impl QueueStorage {
         if by_group.is_empty() {
             return Ok(());
         }
-
         let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
         let mut ready_generations: Vec<i64> = Vec::with_capacity(by_group.len());
         let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
@@ -5564,6 +5598,16 @@ impl QueueStorage {
         let schema = self.schema();
         sqlx::query(audited_sql(format!(
             r#"
+            WITH authority AS (
+                SELECT COALESCE(
+                    (
+                        SELECT authority = 'ledger'
+                        FROM {schema}.ring_cursor_authority
+                        WHERE singleton = TRUE
+                    ),
+                    FALSE
+                ) AS per_lane
+            )
             INSERT INTO {schema}.queue_terminal_count_deltas (
                 ready_slot,
                 ready_generation,
@@ -5574,13 +5618,13 @@ impl QueueStorage {
                 terminal_delta
             )
             SELECT
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                enqueue_shard,
-                counter_bucket,
-                terminal_delta
+                d.ready_slot,
+                d.ready_generation,
+                d.queue,
+                d.priority,
+                d.enqueue_shard,
+                CASE WHEN authority.per_lane THEN 0::smallint ELSE d.counter_bucket END,
+                sum(d.terminal_delta)::bigint
             FROM unnest(
                 $1::int[],
                 $2::bigint[],
@@ -5598,13 +5642,10 @@ impl QueueStorage {
                 counter_bucket,
                 terminal_delta
             )
-            ORDER BY
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                enqueue_shard,
-                counter_bucket
+            CROSS JOIN authority
+            GROUP BY 1, 2, 3, 4, 5, 6
+            HAVING sum(d.terminal_delta) <> 0
+            ORDER BY 1, 2, 3, 4, 5, 6
             "#
         )))
         .bind(&ready_slots)
@@ -15827,15 +15868,16 @@ impl QueueStorage {
     /// - as a routine drift-recovery step before relying on counter-fed
     ///   reads for billing-grade accuracy.
     ///
-    /// The rebuild is wrapped in an advisory lock so concurrent writers
-    /// don't interleave new inserts mid-rebuild. The lock key is scoped
-    /// to the queue-storage schema, so other schemas / other operations
-    /// are unaffected. Writers that hit the lock will block briefly
-    /// rather than fail.
+    /// The rebuild takes a schema-scoped rebuild lock so two rebuilds do not
+    /// overlap, then waits for the queue ring's rotation lock, so it starts
+    /// only between maintenance ticks; ticks that arrive meanwhile skip
+    /// rather than wait. It then locks the terminal tables exclusively, so
+    /// completions, failures and retries that write terminal rows wait for
+    /// it to commit. Other schemas are unaffected.
     ///
     /// **Operator note:** this is best run on a quiesced fleet (workers
-    /// paused or fully drained). Concurrent inserts during the rebuild
-    /// will block on the lock; long-held locks can stall the fleet. The
+    /// paused or fully drained). Terminal writes during the rebuild wait on
+    /// its table locks, and a long rebuild stalls them for its duration. The
     /// rebuild itself is O(rows in `{schema}.done_entries`). Compact receipt
     /// completions remain counted directly from retained
     /// `receipt_completion_batches` until queue prune folds them into
@@ -15858,6 +15900,8 @@ impl QueueStorage {
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+        self.lock_ring_serializers_tx(&mut tx, &[RingFamily::Queue])
+            .await?;
 
         sqlx::query(audited_sql(format!(
             "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"
@@ -15885,6 +15929,16 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // One row per lane once the ring authority flip has fenced N-1
+        // maintenance; per job-id bucket before it, which is the shape N-1
+        // folds apply their deltas to (ADR-041).
+        let counter_bucket = match self.ring_authority_tx(&mut tx).await? {
+            RingAuthority::Ledger => "0::smallint".to_string(),
+            RingAuthority::Columns => format!(
+                "mod(mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint) \
+                 + {TERMINAL_COUNTER_BUCKETS}::bigint, {TERMINAL_COUNTER_BUCKETS}::bigint)::smallint"
+            ),
+        };
         let inserted: i64 = sqlx::query_scalar(audited_sql(format!(
             r#"
             WITH inserted AS (
@@ -15896,11 +15950,7 @@ impl QueueStorage {
                     queue,
                     priority,
                     enqueue_shard,
-                    mod(
-                        mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                            + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                        {TERMINAL_COUNTER_BUCKETS}::bigint
-                    )::smallint AS counter_bucket,
+                    {counter_bucket} AS counter_bucket,
                     count(*)::bigint
                 FROM {schema}.done_entries
                 GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
@@ -16280,8 +16330,92 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::Empty);
         }
 
-        let grouped_keys: i64 = sqlx::query_scalar(audited_sql(format!(
-            r#"
+        // In ledger authority each touched lane collapses to one bucket-0 row
+        // holding its old total (summed over every bucket) plus the signed
+        // delta, which keeps a negative delta exact when the matching positive
+        // count sits in another bucket. Before the flip, N-1 maintenance can
+        // still win the election and folds per job-id bucket, so the fold
+        // keeps that shape until the flip fences it (ADR-041).
+        let grouped_keys: i64 = match authority {
+            RingAuthority::Ledger => sqlx::query_scalar(audited_sql(format!(
+                r#"
+            WITH grouped AS MATERIALIZED (
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    SUM(terminal_delta)::bigint AS delta
+                FROM {delta_child}
+                WHERE ready_generation = $1
+                GROUP BY ready_slot, queue, priority, enqueue_shard
+                HAVING SUM(terminal_delta) <> 0
+            ),
+            collapsed AS (
+                DELETE FROM {schema}.queue_terminal_live_counts AS counts
+                USING grouped
+                WHERE counts.ready_slot = grouped.ready_slot
+                  AND counts.queue = grouped.queue
+                  AND counts.priority = grouped.priority
+                  AND counts.enqueue_shard = grouped.enqueue_shard
+                RETURNING
+                    counts.ready_slot,
+                    counts.queue,
+                    counts.priority,
+                    counts.enqueue_shard,
+                    counts.live_terminal_count
+            ),
+            folded AS (
+                SELECT
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    (grouped.delta + COALESCE(SUM(collapsed.live_terminal_count), 0))::bigint
+                        AS live_terminal_count
+                FROM grouped
+                LEFT JOIN collapsed
+                  ON collapsed.ready_slot = grouped.ready_slot
+                 AND collapsed.queue = grouped.queue
+                 AND collapsed.priority = grouped.priority
+                 AND collapsed.enqueue_shard = grouped.enqueue_shard
+                GROUP BY
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    grouped.delta
+            ),
+            inserted AS (
+                INSERT INTO {schema}.queue_terminal_live_counts (
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    live_terminal_count
+                )
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    0::smallint,
+                    live_terminal_count
+                FROM folded
+                WHERE live_terminal_count <> 0
+                ORDER BY ready_slot, queue, priority, enqueue_shard
+                RETURNING 1
+            )
+            SELECT count(*)::bigint FROM grouped
+            "#
+            )))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?,
+            RingAuthority::Columns => sqlx::query_scalar(audited_sql(format!(
+                r#"
             WITH grouped AS MATERIALIZED (
                 SELECT
                     ready_slot,
@@ -16346,11 +16480,12 @@ impl QueueStorage {
             )
             SELECT count(*)::bigint FROM grouped
             "#
-        )))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+            )))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?,
+        };
 
         let truncate_delta = sqlx::query(audited_sql(format!("TRUNCATE TABLE {delta_child}")))
             .execute(tx.as_mut())
