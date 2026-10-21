@@ -328,6 +328,7 @@ fn access_for(command: &Commands) -> context::Access {
             StorageCommands::Prepare { .. }
             | StorageCommands::PrepareQueueStorageSchema { .. }
             | StorageCommands::PrepareQueue { .. }
+            | StorageCommands::PrepareCreateRevoke
             | StorageCommands::Abort
             | StorageCommands::EnterMixedTransition { .. }
             | StorageCommands::Finalize { .. }
@@ -821,6 +822,11 @@ enum StorageCommands {
         #[arg(long, default_value_t = 1)]
         queue_stripe_count: usize,
     },
+    /// Before revoking runtime roles' schema CREATE under a running 0.6 fleet:
+    /// switch the lane helpers to provisioned sequences and provision every
+    /// lane already in use. Run as the migrator; prints the REVOKE statements
+    /// to run next
+    PrepareCreateRevoke,
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
     /// Enter mixed transition and begin routing new writes to the prepared engine
@@ -1902,6 +1908,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 "routing_changed": false,
                             }))?
                         );
+                    }
+                    StorageCommands::PrepareCreateRevoke => {
+                        let schemas = awa_model::storage::prepare_create_revoke(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&schemas)?);
+                        let blocked: Vec<&str> = schemas
+                            .iter()
+                            .filter(|schema| !schema.prepared)
+                            .map(|schema| schema.schema.as_str())
+                            .collect();
+                        if !blocked.is_empty() {
+                            return Err(format!(
+                                "not prepared: {}; fix the listed blocking violations and re-run",
+                                blocked.join(", ")
+                            )
+                            .into());
+                        }
                     }
                     StorageCommands::PrepareQueue {
                         schema,
