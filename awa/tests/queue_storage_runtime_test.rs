@@ -2608,6 +2608,152 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ledger_rotation_does_not_wait_for_the_ring_state_row() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_ledger_rotate_nolock";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The assertion is about ledger authority; make that explicit rather than
+    // depending on when the maintenance auto-flip happens to run.
+    let flipped = storage::flip_ring_authority(&pool, schema, false)
+        .await
+        .expect("flip to ledger authority");
+    assert_eq!(flipped, "ledger");
+    // Rotate through connections that refuse to wait on a lock, so the test
+    // tells "did not wait" from "was slow" regardless of host load.
+    let impatient = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '3s'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .unwrap();
+    let outcome = store
+        .rotate(&impatient)
+        .await
+        .expect("a ledger-mode rotation must not queue behind the ring-state row lock");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedIdle { .. }),
+        "an empty ring reports idle, got {outcome:?}"
+    );
+    holder.rollback().await.unwrap();
+    impatient.close().await;
+}
+
+/// A ledger-mode prune holds the queue-ring advisory lock, then locks a done
+/// partition, then the done parent to carry retained failures forward. A
+/// counter rebuild must wait for the advisory lock before touching tables;
+/// locking the parent first would deadlock against that prune.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_counter_rebuild_waits_for_an_in_flight_prune() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_rebuild_vs_prune";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut prune = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries_0 IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .unwrap();
+
+    let rebuild = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.rebuild_terminal_counters(&pool).await })
+    };
+    wait_for_any_lock_wait(&pool).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .expect("the prune's parent lock must not deadlock with a waiting rebuild");
+    prune.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), rebuild)
+        .await
+        .expect("rebuild finishes after the prune")
+        .unwrap()
+        .expect("rebuild succeeds");
+}
+
+/// A ledger-mode rotation holds the queue-ring advisory lock while it reads
+/// ring tables. A reset must wait for that lock before truncating; taking
+/// its table locks first would deadlock against the rotation's later reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_reset_waits_for_an_in_flight_rotation() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_reset_vs_rotate";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut rotate = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_rotations LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .unwrap();
+
+    let reset = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.reset(&pool).await })
+    };
+    wait_for_any_lock_wait(&pool).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.ready_entries_0 LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .expect("the rotation's later read must not deadlock with a waiting reset");
+    rotate.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), reset)
+        .await
+        .expect("reset finishes after the rotation")
+        .unwrap()
+        .expect("reset succeeds");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_change() {
     let (_db_guard, pool) = setup_pool(4).await;
     let schema = "awa_qs_cadence_observed_age";
@@ -15247,6 +15393,29 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
     );
 }
 
+/// Wait until another backend is blocked on a heavyweight lock of any kind.
+async fn wait_for_any_lock_wait(pool: &sqlx::PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                SELECT 1 FROM pg_stat_activity \
+                WHERE datname = current_database() \
+                  AND pid <> pg_backend_pid() \
+                  AND wait_event_type = 'Lock'\
+            )",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("Failed to inspect lock waits");
+        if waiting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "Expected a lock wait");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_lock_wait(pool: &sqlx::PgPool, wait_event: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -15578,6 +15747,16 @@ async fn test_queue_storage_counter_rebuild_locks_ring_before_done_table() {
         "Counter rebuild should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Counter rebuild should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), rebuild)
@@ -15617,6 +15796,16 @@ async fn test_queue_storage_reset_locks_ring_before_done_table() {
         "Reset should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Reset should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), reset)

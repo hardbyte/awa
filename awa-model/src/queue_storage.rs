@@ -3666,6 +3666,12 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+        self.lock_ring_serializers_tx(
+            &mut tx,
+            &[RingFamily::Queue, RingFamily::Lease, RingFamily::Claim],
+        )
+        .await?;
+
         for family in [RingFamily::Queue, RingFamily::Lease, RingFamily::Claim] {
             let state = family.state_relname();
             sqlx::query(audited_sql(format!(
@@ -4194,28 +4200,46 @@ impl QueueStorage {
         .map_err(map_sqlx_error)
     }
 
-    /// Acquire the per-ring rotate ↔ prune ↔ delta-rollup serializer AND
-    /// resolve the authority under it, in one step.
+    /// Wait for the per-ring rotation advisory locks, in a fixed ring order.
+    /// Whole-schema operations (reset, counter rebuild) take these before any
+    /// row or table lock, so in ledger authority, where rotate, prune and the
+    /// delta rollup serialize only on these locks, they wait for an
+    /// in-flight tick instead of interleaving table locks with it.
+    async fn lock_ring_serializers_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        families: &[RingFamily],
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        for family in families {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(family.rotation_lock_name(schema))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+        Ok(())
+    }
+
+    /// Acquire the per-ring rotate ↔ prune ↔ delta-rollup serializer and
+    /// resolve the authority under it.
     ///
-    /// The ring-state singleton `FOR UPDATE` is taken FIRST, unconditionally,
-    /// as the universal outer gate. This is load-bearing for the #371 staged
-    /// upgrade: the one-way flip (`awa.flip_ring_authority`) also takes the
-    /// three singletons `FOR UPDATE` before promoting the authority, so
-    /// taking the singleton before reading the authority closes the TOCTOU
-    /// where a rotator reads `columns`, the flip commits, and the rotator
-    /// then advances under the stale mode (a `MixedFleet` violation the
-    /// `AwaStorageLockOrder` model flags). Whoever wins the singleton wins:
-    /// a rotator that loses the race to the flip reads `ledger` here and runs
-    /// the ledger path; the flip that loses to a rotator waits for it to
-    /// commit. In compat mode this singleton lock is also the SAME row lock a
-    /// live 0.6 rotator takes, so 0.7 and 0.6 rotators serialize.
+    /// In compat (`columns`) authority the ring-state singleton `FOR UPDATE`
+    /// is the serializer. It is taken before the authority is re-read: the
+    /// one-way flip (`awa.flip_ring_authority`) takes the same three
+    /// singletons before promoting the authority, so a rotator that loses the
+    /// race to the flip reads `ledger` under the lock and runs the ledger
+    /// path, and a flip that loses waits for the rotator to commit. The same
+    /// row lock is the one a 0.6 rotator takes, so mixed-version rotators
+    /// serialize.
     ///
-    /// In ledger authority it ADDITIONALLY takes the non-blocking per-ring
-    /// `pg_try_advisory_xact_lock` so a periodic rotate skips under
-    /// contention with prune/rollup instead of queueing; `Ok((_, false))`
-    /// means "skip this tick". (Holding the singleton momentarily in ledger
-    /// mode is a cold, uncontended write-free row-share and does not
-    /// reintroduce the churn — nothing UPDATEs the singleton in ledger mode.)
+    /// In ledger authority the non-blocking per-ring
+    /// `pg_try_advisory_xact_lock` is the whole serializer, so a periodic
+    /// rotate skips under contention with prune or rollup instead of
+    /// queueing. `Ok((_, false))` means "skip this tick". The singleton row
+    /// is not locked: a row lock writes a heap lock record and a commit
+    /// record per tick even when nothing rotates, and because the flip is
+    /// one-way a `ledger` reading taken without the row lock is final.
     async fn acquire_ring_serializer_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4224,16 +4248,21 @@ impl QueueStorage {
         let schema = self.schema();
         let state = family.state_relname();
 
-        // Universal outer gate: serialize against the flip and against 0.6
-        // rotators, BEFORE reading the authority.
-        sqlx::query(audited_sql(format!(
-            "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
-        )))
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let authority = self.ring_authority_tx(tx).await?;
+        let authority = match self.ring_authority_tx(tx).await? {
+            RingAuthority::Ledger => RingAuthority::Ledger,
+            RingAuthority::Columns => {
+                // Serialize against the flip and against 0.6 rotators, then
+                // re-read the authority under the lock: a rotator that
+                // loses the race to the flip sees `ledger` here.
+                sqlx::query(audited_sql(format!(
+                    "SELECT 1 FROM {schema}.{state} WHERE singleton = TRUE FOR UPDATE"
+                )))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                self.ring_authority_tx(tx).await?
+            }
+        };
 
         match authority {
             RingAuthority::Columns => Ok((authority, true)),
@@ -15757,15 +15786,16 @@ impl QueueStorage {
     /// - as a routine drift-recovery step before relying on counter-fed
     ///   reads for billing-grade accuracy.
     ///
-    /// The rebuild is wrapped in an advisory lock so concurrent writers
-    /// don't interleave new inserts mid-rebuild. The lock key is scoped
-    /// to the queue-storage schema, so other schemas / other operations
-    /// are unaffected. Writers that hit the lock will block briefly
-    /// rather than fail.
+    /// The rebuild takes a schema-scoped rebuild lock so two rebuilds do not
+    /// overlap, then waits for the queue ring's rotation lock, so it starts
+    /// only between maintenance ticks; ticks that arrive meanwhile skip
+    /// rather than wait. It then locks the terminal tables exclusively, so
+    /// completions, failures and retries that write terminal rows wait for
+    /// it to commit. Other schemas are unaffected.
     ///
     /// **Operator note:** this is best run on a quiesced fleet (workers
-    /// paused or fully drained). Concurrent inserts during the rebuild
-    /// will block on the lock; long-held locks can stall the fleet. The
+    /// paused or fully drained). Terminal writes during the rebuild wait on
+    /// its table locks, and a long rebuild stalls them for its duration. The
     /// rebuild itself is O(rows in `{schema}.done_entries`). Compact receipt
     /// completions remain counted directly from retained
     /// `receipt_completion_batches` until queue prune folds them into
@@ -15788,6 +15818,8 @@ impl QueueStorage {
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+        self.lock_ring_serializers_tx(&mut tx, &[RingFamily::Queue])
+            .await?;
 
         sqlx::query(audited_sql(format!(
             "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"

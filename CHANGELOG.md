@@ -14,6 +14,14 @@ Notable changes between releases. Detailed migration notes for storage transitio
   2,517 to 19. `awa storage rebuild-terminal-counters` writes the same
   shape. No migration or configuration. Before the flip the existing layout is
   kept, so counts stay exact in a mixed 0.6/0.7 fleet and after a rollback.
+- **Idle ring maintenance no longer writes.** Once the ring authority has
+  flipped to the ledger, a rotation or prune tick with nothing to seal or prune
+  no longer locks the `{ring}_ring_state` row, so it runs as a read-only
+  transaction. `QueueStorage::reset` and `awa storage rebuild-terminal-counters`
+  now wait for in-progress rotation before taking their table locks. Run
+  `rebuild-terminal-counters` from an upgraded binary once upgraded runtimes are
+  running: an older binary can deadlock with a rotation tick, and PostgreSQL
+  then aborts one of them with `40P01`.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant

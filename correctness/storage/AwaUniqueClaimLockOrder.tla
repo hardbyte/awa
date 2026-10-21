@@ -4,22 +4,17 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 CONSTANTS Scenario, Broken
 
 TxIds == {"producer", "other"}
-Resources == {"unique:a", "unique:b", "enqueue_lane", "queue_ring_state", "done_child"}
+Resources == {"unique:a", "unique:b", "enqueue_lane"}
 
 ProducerPlan ==
     IF Scenario = "multiple_keys"
     THEN <<"unique:a", "unique:b">>
-    ELSE IF Scenario = "counter_rebuild"
-    THEN <<"queue_ring_state", "done_child">>
     ELSE <<"unique:a", "enqueue_lane">>
 
 OtherPlan ==
     IF Scenario = "multiple_keys"
     THEN IF Broken THEN <<"unique:b", "unique:a">>
          ELSE <<"unique:a", "unique:b">>
-    ELSE IF Scenario = "counter_rebuild"
-    THEN IF Broken THEN <<"done_child", "queue_ring_state">>
-         ELSE <<"queue_ring_state", "done_child">>
     ELSE IF Broken THEN <<"enqueue_lane", "unique:a">>
          ELSE <<"unique:a", "enqueue_lane">>
 
@@ -60,7 +55,7 @@ NoDeadlock ==
     ~(WaitingFor("producer", "other") /\ WaitingFor("other", "producer"))
 
 TypeOK ==
-    /\ Scenario \in {"unique_lane", "multiple_keys", "counter_rebuild"}
+    /\ Scenario \in {"unique_lane", "multiple_keys"}
     /\ Broken \in BOOLEAN
     /\ \A t \in TxIds :
          /\ position[t] \in 1..(Len(Plan(t)) + 1)
