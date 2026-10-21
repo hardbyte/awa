@@ -6,7 +6,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
-- Retry-heavy workloads leave far fewer dead tuples in `queue_terminal_live_counts`: the terminal-count fold and `rebuild_terminal_counters` write one row per lane instead of up to 256, so queue prune deletes one row per lane (peak dead tuples in that table fell from 2,517 to 19 in a 200 jobs/s retry storm). No migration. The one-row shape starts at the ring authority flip, which already fences 0.6 maintenance; until then folds and rebuilds keep the per-job-id buckets older binaries apply their deltas to, so exact counts stay exact through a mixed-version rollout and a pre-flip rollback. The first fold after the flip collapses a lane's bucketed rows into one row, keeping negative deltas exact.
+- **Retry-heavy workloads leave far fewer dead tuples.** After the ring authority
+  flip, awa keeps one terminal-count row per lane in `queue_terminal_live_counts`
+  instead of up to 256, so pruning a queue deletes one row per lane. In a
+  200 jobs/s retry storm, peak dead tuples in that table fell from 2,517 to 19.
+  `awa storage rebuild-terminal-counters` writes the same shape. No migration or
+  configuration. Before the flip the existing layout is kept, so counts stay
+  exact in a mixed 0.6/0.7 fleet and after a rollback.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
