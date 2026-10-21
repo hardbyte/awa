@@ -106,6 +106,21 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
 
+- **Migrations no longer run code another role planted in a queue-storage
+  schema.** A role that could add objects or triggers to the `awa` schema or a
+  custom queue-storage schema could get its code run by the migrator, even
+  when the migrator is a superuser. Before upgrading a schema, `awa migrate`
+  now checks that its objects belong to the migrating role or the `awa` schema
+  owner, that no other role can create objects or triggers in it, and that
+  every trigger is one awa installs, unchanged. A custom schema awa has not
+  registered that fails the check is skipped with a warning. Any other schema
+  that fails stops the migration before anything is applied, with an error
+  naming the offending objects. Common causes are `GRANT ALL ON ALL TABLES`
+  to the runtime role, which includes `TRIGGER`, a 0.6 runtime holding
+  `CREATE` on the schema (revoking it needs a short pause of 0.6 runtimes),
+  and your own triggers on awa tables. No new schema version. If an external
+  runner tracks checksums, keep the files it has applied and generate only
+  the pending SQL. The upgrade guide lists the fixes.
 - Queue pruning waits on routing metadata first and uses `NOWAIT` for every remaining child lock, rolling back the whole attempt on contention. This avoids the prune/claim lock cycle while allowing entry-first producers to finish. Transient lock contention retries on the next decision tick; active-data skips retain backoff.
 - Rust cadence and claim-rotation interval overrides survive later `queue_storage` calls, regardless of builder call order.
 

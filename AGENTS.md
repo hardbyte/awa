@@ -88,6 +88,16 @@ Migrations are forward-only and must stay rolling-upgrade compatible. Version
 floors, exclusive migrations, and the newer-schema fail-safe live in
 `awa-model/src/migrations.rs`.
 
+Custom-substrate migration loops must use `awa.queue_storage_schemas()`. Include
+the discovery bootstrap before discovery and default-substrate installation in
+both built-in and exported SQL bundles. Do not infer trust from role membership
+or a function name alone. Historical discovery loops may need security hardening
+before a later migration can safely execute; applied versions are not replayed
+and external checksum-based runners must preserve already-applied files.
+A migration that adds or changes a trigger in `awa` or a queue-storage schema
+must add its exact `pg_get_triggerdef` text to
+`awa.queue_storage_canonical_triggers`; discovery rejects any other trigger.
+
 The implementation checklist lives here rather than in `docs/`: it is
 contributor-internal, and `docs/` is published as the public documentation site.
 [`docs/development.md`](docs/development.md#authoring-schema-migrations) carries
