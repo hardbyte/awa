@@ -2956,7 +2956,6 @@ impl QueueStorage {
         })
     }
 
-    #[doc(hidden)]
     /// Await `hook` at named points of a running-attempt cancel, so tests can
     /// commit a concurrent change at an exact step. Not for production use.
     #[doc(hidden)]
@@ -2971,6 +2970,7 @@ impl QueueStorage {
         }
     }
 
+    #[doc(hidden)]
     pub fn with_prune_lock_timeout(mut self, timeout: Duration) -> Result<Self, AwaError> {
         if timeout.is_zero() {
             return Err(AwaError::Validation(
