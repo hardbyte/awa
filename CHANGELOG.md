@@ -6,15 +6,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v050 and v052. Run `awa migrate` as the migrator
-role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
-for each step.
+This release adds migrations v044 to v050 and v052. Run `awa migrate` as the
+migrator role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the
+details for each step.
 
 - **Rollout order.** Health-gated workers report ready only once the schema
   reaches their version, so migrate before rolling them out. Producers and
-  workers without a readiness gate can roll before v050 and v052. On PostgreSQL 17 and
-  earlier, pre-v050 binaries scan every ready partition during maintenance
-  once v050 is applied, so replace them promptly.
+  workers without a readiness gate can roll before v050 and v052. On
+  PostgreSQL 17 and earlier, pre-v050 binaries scan every ready partition
+  during maintenance once v050 is applied, so replace them promptly.
 - **Runtime roles no longer need `CREATE` (v049).** Provision lanes with
   `awa storage prepare-queue` as the migrator before deploying, and grant the
   runtime role `USAGE, SELECT, UPDATE` on the lane sequences. Existing
