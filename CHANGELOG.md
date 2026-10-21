@@ -22,6 +22,21 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `rebuild-terminal-counters` from an upgraded binary once upgraded runtimes are
   running: an older binary can deadlock with a rotation tick, and PostgreSQL
   then aborts one of them with `40P01`.
+- **Each enqueued job writes one fewer index entry (v050).** v050 drops the
+  `lane_shard` index from every `ready_entries` partition, in the `awa` schema
+  and each custom schema the migration upgrades; current binaries look lanes up
+  through the partition's primary key instead. Each enqueue writes two index
+  entries instead of three, and each ring rotation initialises one fewer
+  index. The migration rewrites no rows (27 ms on a test database with 409,600
+  ready rows), but it holds an exclusive lock on each `ready_entries` partition
+  until it commits, so enqueues and claims wait meanwhile. If the session sets
+  no `lock_timeout`, each lock wait is capped at 2 s; on a timeout (`55P03`,
+  usually behind a long `awa.jobs` read or a backup) the migration rolls back
+  and can be re-run. Producers and workers without a readiness gate can be
+  upgraded before migrating. Health-gated workers report ready only on a v050
+  schema, so migrate first for them. On PostgreSQL 17 and earlier, pre-v050
+  binaries scan every ready partition during maintenance until they are
+  replaced, so keep that window short. See the upgrade guide.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
