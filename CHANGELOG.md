@@ -26,7 +26,19 @@ Notable changes between releases. Detailed migration notes for storage transitio
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
   sequence `USAGE, SELECT, UPDATE`; existing sequence positions are preserved.
-- Ring rotation uses a five-second observed fill window or a 2 MiB total physical-size target before sealing a non-empty slot. Empty slots can advance immediately to reclaim sealed history. `RingRotationCadence::EAGER` restores rotation on every tick; the size target is sampled and does not impose a storage limit. See [#518](https://github.com/hardbyte/awa/issues/518).
+- **Ring rotation waits for a slot to fill before sealing it.** A non-empty slot
+  is sealed once it has been filling for five seconds and holds 256 rows, once
+  it reaches about 2 MiB, or once it is 60 seconds old. Before, any non-empty
+  slot was sealed after five seconds, so a trickle of writes paid a full
+  rotation and prune (WAL and catalog churn) every five seconds for a handful
+  of rows. Empty slots still advance immediately to reclaim sealed history.
+  Tune it with `ClientBuilder::ring_rotation_cadence`, starting from
+  `RingRotationCadence::DEFAULT` and adjusting with `with_min_slot_age`,
+  `with_target_slot_bytes`, `with_min_slot_rows` and `with_max_slot_age`, or
+  the matching `queue_storage_rotate_*` Python options. A client refuses a row
+  floor without a size target or age ceiling. `RingRotationCadence::EAGER`
+  seals on every tick. The size target is sampled and is not a storage limit.
+  See [#518](https://github.com/hardbyte/awa/issues/518).
 
 - v048 catches claim cursors up from committed same-lane, same-generation attempt evidence inside the claim, so a post-commit advance that never ran (for example because the claimer stopped between commit and advance) no longer leaves the lane behind. Runtimes still advance the cursor after every committed claim, on pre-v048 and v048 schemas alike. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 

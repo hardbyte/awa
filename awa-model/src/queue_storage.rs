@@ -379,9 +379,11 @@ pub enum RotateOutcome {
         /// Cursor generation left unchanged by the idle skip.
         generation: i64,
     },
-    /// The current slot holds rows but is younger than
-    /// [`RingRotationCadence::min_slot_age`] and smaller than
-    /// [`RingRotationCadence::target_slot_bytes`], so it stays open and keeps
+    /// The current slot holds rows, is smaller than
+    /// [`RingRotationCadence::target_slot_bytes`] and younger than
+    /// [`RingRotationCadence::max_slot_age`], and is either younger than
+    /// [`RingRotationCadence::min_slot_age`] or holds fewer than
+    /// [`RingRotationCadence::min_slot_rows`], so it stays open and keeps
     /// filling. Sealing it now would spend a prune (`TRUNCATE` of every
     /// child that received rows, one `pg_class` row version per relation)
     /// on a slot that has barely been used. `slot` is the current slot.
@@ -394,24 +396,37 @@ pub enum RotateOutcome {
 
 /// When a maintenance tick may seal the current slot of a ring.
 ///
-/// A non-empty slot becomes eligible to seal after `min_slot_age` since this
-/// store first observed it holding rows, or when its total physical storage
-/// reaches `target_slot_bytes`. Age uses a local monotonic clock; a new store
-/// starts a fresh observation window. Observing an empty slot clears its timer
-/// and lets the existing busy, idle and reclamation gates decide rotation.
+/// A non-empty slot becomes eligible to seal once it is `min_slot_age` past
+/// this store's first observation of rows and holds `min_slot_rows`, when its
+/// total physical storage reaches `target_slot_bytes`, or once it is
+/// `max_slot_age` old. The minimum age uses a local monotonic clock, and a new
+/// store starts a fresh observation window. The maximum age also counts from
+/// when the slot opened on the database clock, so a change of maintenance
+/// leader does not restart it. Observing an empty slot clears its timer and
+/// lets the existing busy, idle and reclamation gates decide rotation.
 ///
 /// The byte target includes heap, indexes, TOAST and auxiliary forks. It is
 /// sampled on rotate calls and is not a storage limit: batches, delayed ticks,
 /// blocked reuse and writes to sealed slots can exceed it.
 ///
-/// [`RingRotationCadence::EAGER`] restores sealing on every tick.
+/// [`RingRotationCadence::EAGER`] restores sealing on every tick. Build other
+/// cadences from [`RingRotationCadence::DEFAULT`] or `EAGER` with the `with_*`
+/// methods, so that later fields do not break callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RingRotationCadence {
     /// Time since the first non-empty observation before a tick may seal.
     pub min_slot_age: Duration,
     /// Physical size that makes a non-empty slot eligible regardless of age.
     /// Zero disables the size trigger.
     pub target_slot_bytes: u64,
+    /// Rows the slot must hold before `min_slot_age` alone seals it, so a
+    /// trickle of writes does not seal a nearly empty slot every window.
+    /// Zero disables the row floor.
+    pub min_slot_rows: u64,
+    /// Age after which a non-empty slot seals regardless of `min_slot_rows`,
+    /// bounding how long a trickle keeps a slot open. Zero disables it.
+    pub max_slot_age: Duration,
 }
 
 impl RingRotationCadence {
@@ -419,13 +434,43 @@ impl RingRotationCadence {
     pub const EAGER: Self = Self {
         min_slot_age: Duration::ZERO,
         target_slot_bytes: 0,
+        min_slot_rows: 0,
+        max_slot_age: Duration::ZERO,
     };
 
-    /// Eligible after five seconds of observed filling or at 2 MiB.
+    /// Eligible after five seconds of observed filling once the slot holds
+    /// 256 rows, at 2 MiB regardless of age, or after 60 seconds regardless
+    /// of rows.
     pub const DEFAULT: Self = Self {
         min_slot_age: Duration::from_secs(5),
         target_slot_bytes: 2 * 1024 * 1024,
+        min_slot_rows: 256,
+        max_slot_age: Duration::from_secs(60),
     };
+
+    /// Set [`Self::min_slot_age`].
+    pub const fn with_min_slot_age(mut self, min_slot_age: Duration) -> Self {
+        self.min_slot_age = min_slot_age;
+        self
+    }
+
+    /// Set [`Self::target_slot_bytes`].
+    pub const fn with_target_slot_bytes(mut self, target_slot_bytes: u64) -> Self {
+        self.target_slot_bytes = target_slot_bytes;
+        self
+    }
+
+    /// Set [`Self::min_slot_rows`].
+    pub const fn with_min_slot_rows(mut self, min_slot_rows: u64) -> Self {
+        self.min_slot_rows = min_slot_rows;
+        self
+    }
+
+    /// Set [`Self::max_slot_age`].
+    pub const fn with_max_slot_age(mut self, max_slot_age: Duration) -> Self {
+        self.max_slot_age = max_slot_age;
+        self
+    }
 }
 
 impl Default for RingRotationCadence {
@@ -15388,22 +15433,37 @@ impl QueueStorage {
         if cadence.min_slot_age.is_zero() {
             return Ok(false);
         }
+        // Sample at most `min_slot_rows` rows per child so the probe stays
+        // bounded on a full slot; one row is enough to know it is non-empty.
+        let sample_limit = cadence.min_slot_rows.clamp(1, i64::MAX as u64);
         let row_sources = children
             .iter()
-            .map(|relation| format!("SELECT 1 FROM {relation}"))
+            .map(|relation| format!("(SELECT 1 FROM {relation} LIMIT {sample_limit})"))
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
-        let (has_rows, bytes): (bool, i64) = sqlx::query_as(audited_sql(format!(
-            "WITH occupancy AS (SELECT EXISTS ({row_sources}) AS has_rows) \
-             SELECT has_rows, CASE WHEN has_rows THEN (\
-                 SELECT COALESCE(SUM(pg_total_relation_size(relation::regclass)), 0)::bigint \
-                 FROM unnest($1::text[]) AS relation\
-             ) ELSE 0::bigint END FROM occupancy"
-        )))
-        .bind(children)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        // The ledger row of the current generation records when the slot
+        // opened on the database clock, so the age ceiling survives a change
+        // of maintenance leader; it is absent only while compat authority's
+        // shadow ledger lags, when the local observation stands alone.
+        let schema = self.schema();
+        let ledger = family.ledger_relname();
+        let (sampled_rows, bytes, open_secs): (i64, i64, Option<f64>) =
+            sqlx::query_as(audited_sql(format!(
+                "WITH occupancy AS (SELECT count(*) AS sampled FROM ({row_sources}) AS rows) \
+                 SELECT sampled, CASE WHEN sampled > 0 THEN (\
+                     SELECT COALESCE(SUM(pg_total_relation_size(relation::regclass)), 0)::bigint \
+                     FROM unnest($1::text[]) AS relation\
+                 ) ELSE 0::bigint END, \
+                 (SELECT EXTRACT(EPOCH FROM clock_timestamp() - rotated_at)::float8 \
+                  FROM {schema}.{ledger} WHERE generation = $2) \
+                 FROM occupancy"
+            )))
+            .bind(children)
+            .bind(cursor.1)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        let has_rows = sampled_rows > 0;
         let mut observations = self
             .slot_fill_observations
             .lock()
@@ -15427,7 +15487,29 @@ impl QueueStorage {
         if cadence.target_slot_bytes > 0 && bytes >= cadence.target_slot_bytes {
             return Ok(false);
         }
-        Ok(now.duration_since(observation.first_nonempty_at) < cadence.min_slot_age)
+        let age = now.duration_since(observation.first_nonempty_at);
+        let open_for = open_secs
+            .filter(|secs| secs.is_finite() && *secs > 0.0)
+            .map(Duration::from_secs_f64)
+            .unwrap_or_default();
+        if !cadence.max_slot_age.is_zero() && age.max(open_for) >= cadence.max_slot_age {
+            return Ok(false);
+        }
+        if age < cadence.min_slot_age {
+            tracing::debug!(?family, ?age, "slot left open: younger than min_slot_age");
+            return Ok(true);
+        }
+        let sampled_rows = u64::try_from(sampled_rows).unwrap_or(0);
+        if sampled_rows < cadence.min_slot_rows {
+            tracing::debug!(
+                ?family,
+                sampled_rows,
+                min_slot_rows = cadence.min_slot_rows,
+                "slot left open: below min_slot_rows"
+            );
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Seal the current queue-ring slot on every call that passes the busy
