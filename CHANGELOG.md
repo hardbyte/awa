@@ -6,11 +6,39 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
+- **Retry-heavy workloads leave far fewer dead tuples.** After the ring authority
+  flip, awa keeps one terminal-count row per lane in `queue_terminal_live_counts`
+  instead of up to 256, and a batch of finished jobs appends one count-delta row
+  per lane instead of up to 256. Pruning a queue deletes one live-count row per
+  lane: in a 200 jobs/s retry storm, peak dead tuples in that table fell from
+  2,517 to 19. `awa storage rebuild-terminal-counters` writes the same
+  shape. No migration or configuration. Before the flip the existing layout is
+  kept, so counts stay exact in a mixed 0.6/0.7 fleet and after a rollback.
+- **Idle ring maintenance no longer writes.** Once the ring authority has
+  flipped to the ledger, a rotation or prune tick with nothing to seal or prune
+  no longer locks the `{ring}_ring_state` row, so it runs as a read-only
+  transaction. `QueueStorage::reset` and `awa storage rebuild-terminal-counters`
+  now wait for in-progress rotation before taking their table locks. Run
+  `rebuild-terminal-counters` from an upgraded binary once upgraded runtimes are
+  running: an older binary can deadlock with a rotation tick, and PostgreSQL
+  then aborts one of them with `40P01`.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
   sequence `USAGE, SELECT, UPDATE`; existing sequence positions are preserved.
-- Ring rotation uses a five-second observed fill window or a 2 MiB total physical-size target before sealing a non-empty slot. Empty slots can advance immediately to reclaim sealed history. `RingRotationCadence::EAGER` restores rotation on every tick; the size target is sampled and does not impose a storage limit. See [#518](https://github.com/hardbyte/awa/issues/518).
+- **Ring rotation waits for a slot to fill before sealing it.** A non-empty slot
+  is sealed once it has been filling for five seconds and holds 256 rows, once
+  it reaches about 2 MiB, or once it is 60 seconds old. Before, any non-empty
+  slot was sealed after five seconds, so a trickle of writes paid a full
+  rotation and prune (WAL and catalog churn) every five seconds for a handful
+  of rows. Empty slots still advance immediately to reclaim sealed history.
+  Tune it with `ClientBuilder::ring_rotation_cadence`, starting from
+  `RingRotationCadence::DEFAULT` and adjusting with `with_min_slot_age`,
+  `with_target_slot_bytes`, `with_min_slot_rows` and `with_max_slot_age`, or
+  the matching `queue_storage_rotate_*` Python options. A client refuses a row
+  floor without a size target or age ceiling. `RingRotationCadence::EAGER`
+  seals on every tick. The size target is sampled and is not a storage limit.
+  See [#518](https://github.com/hardbyte/awa/issues/518).
 
 - v048 catches claim cursors up from committed same-lane, same-generation attempt evidence inside the claim, so a post-commit advance that never ran (for example because the claimer stopped between commit and advance) no longer leaves the lane behind. Runtimes still advance the cursor after every committed claim, on pre-v048 and v048 schemas alike. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 
@@ -62,6 +90,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - Update the frontend seroval dependency to 1.6.4 (supersedes PR #453).
 
 ### Fixed
+
+- **A running job could be both finished and retried.** If a job completed,
+  failed or was retried while stale-heartbeat or deadline rescue was examining
+  it, rescue could miss that outcome and also send the job back for a retry, so
+  it ran again. Cancelling a running job could race a finishing worker the same
+  way. Rescue now sees every outcome that commits first. Cancel never waits on a
+  lock held by a finishing worker, because waiting could deadlock with it.
+  Instead it retries for up to five seconds. If the job is still being finished
+  after that, cancel leaves it alone and logs it: `cancel` returns
+  `JobNotFound` and `bulk_cancel` leaves it out of its result, so retry if you
+  need it cancelled. A bulk cancel holds a lock for each running job until it
+  commits, so cancel very large sets of running jobs in batches.
 
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
