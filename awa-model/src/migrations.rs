@@ -314,6 +314,32 @@ const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schem
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
 const SCHEMA_DISCOVERY_UP: &str = include_str!("../migrations/queue_storage_schema_discovery.sql");
+
+/// The trust and discovery functions every pending bundle installs, without
+/// the preflight that refuses an untrusted configured schema.
+pub(crate) fn schema_trust_functions_sql() -> &'static str {
+    SCHEMA_DISCOVERY_UP
+        .split_once("DO $preflight$")
+        .map(|(functions, _)| functions)
+        .expect("the discovery bootstrap ends with its preflight")
+}
+
+/// `awa.refresh_lane_sequence_helpers` as v023's installer defines it.
+pub(crate) fn lane_sequence_helper_refresh_sql() -> &'static str {
+    const START: &str =
+        "CREATE OR REPLACE FUNCTION awa.refresh_lane_sequence_helpers(p_schema TEXT)";
+    const END: &str =
+        "REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;";
+    let installer = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
+    let start = installer
+        .find(START)
+        .expect("v023 defines refresh_lane_sequence_helpers");
+    let end = installer[start..]
+        .find(END)
+        .map(|offset| start + offset + END.len())
+        .expect("v023 revokes refresh_lane_sequence_helpers from PUBLIC");
+    &installer[start..end]
+}
 const V23_UP: &str = concat!(
     include_str!("../migrations/queue_storage_schema_discovery.sql"),
     "\n",
@@ -1092,6 +1118,24 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_trust_functions_stop_before_the_preflight() {
+        let functions = schema_trust_functions_sql();
+        assert!(functions.contains("FUNCTION awa.queue_storage_schema_trust_violations"));
+        assert!(functions.contains("FUNCTION awa.queue_storage_schemas()"));
+        assert!(!functions.contains("$preflight$"));
+        assert_eq!(SCHEMA_DISCOVERY_UP.matches("DO $preflight$").count(), 1);
+    }
+
+    #[test]
+    fn lane_sequence_helper_refresh_is_one_function_and_its_revoke() {
+        let refresh = lane_sequence_helper_refresh_sql();
+        assert!(refresh.starts_with("CREATE OR REPLACE FUNCTION awa.refresh_lane_sequence_helpers"));
+        assert!(refresh.ends_with("FROM PUBLIC;"));
+        assert_eq!(refresh.matches("$refresh$;").count(), 1);
+        assert!(!refresh.contains("install_queue_storage_substrate"));
+    }
 
     #[test]
     fn discovery_bundles_bootstrap_before_discovery_and_default_installation() {

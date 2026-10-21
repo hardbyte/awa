@@ -96,6 +96,9 @@ queue with `awa storage prepare-queue` as the migrator before starting producers
 or workers. Match shard/stripe counts; provision additional lanes before changing
 routing. Use the sequence grants and owner defaults in
 [Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
+To revoke `CREATE` from a running 0.6 fleet without stopping it, run
+`awa storage prepare-create-revoke` as the migrator first, then the grants and
+revokes it prints, then `awa migrate`.
 
 ## Rolling Upgrades
 
