@@ -2305,9 +2305,154 @@ struct ReadySegmentInsert {
     first_run_at: DateTime<Utc>,
 }
 
+/// Argument types of `{schema}.enqueue_ready_rows`, as `to_regprocedure`
+/// spells them.
+const ENQUEUE_READY_ROWS_ARGUMENT_TYPES: &str = "text[], smallint[], smallint[], bigint[], \
+     bigint[], text[], jsonb[], smallint[], bigint[], smallint[], timestamptz[], \
+     timestamptz[], timestamptz[], bytea[], text[], jsonb[], integer[], bigint[], bigint[], \
+     timestamptz[], text[]";
+
+/// How long an "enqueue_ready_rows is unavailable" observation stands before
+/// the store probes again, so a runtime started before v052 picks the
+/// function up once the migration lands.
+const ENQUEUE_FUNCTION_REPROBE: Duration = Duration::from_secs(60);
+
+/// One ready row as `{schema}.enqueue_ready_rows` takes it. Queue, priority
+/// and shard come from the row's lane; `lane_seq` from the lane's
+/// reservation; a `None` job id from the schema's job id sequence.
+struct EnqueueReadyRow<'r> {
+    job_id: Option<i64>,
+    kind: &'r str,
+    args: &'r serde_json::Value,
+    attempt: i16,
+    run_lease: i64,
+    max_attempts: i16,
+    run_at: DateTime<Utc>,
+    attempted_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    unique_key: Option<&'r [u8]>,
+    unique_states: Option<&'r str>,
+    payload: &'r serde_json::Value,
+}
+
+impl<'r> EnqueueReadyRow<'r> {
+    fn from_ready_row(row: &'r RuntimeReadyRow) -> Self {
+        Self {
+            job_id: row.job_id,
+            kind: &row.kind,
+            args: &row.args,
+            attempt: row.attempt,
+            run_lease: row.run_lease,
+            max_attempts: row.max_attempts,
+            run_at: row.run_at,
+            attempted_at: row.attempted_at,
+            created_at: row.created_at,
+            unique_key: row.unique_key.as_deref(),
+            unique_states: row.unique_states.as_deref(),
+            payload: &row.payload,
+        }
+    }
+
+    fn from_insert(row: &'r RuntimeReadyInsert) -> Self {
+        Self {
+            job_id: Some(row.job_id),
+            kind: &row.kind,
+            args: &row.args,
+            attempt: row.attempt,
+            run_lease: row.run_lease,
+            max_attempts: row.max_attempts,
+            run_at: row.run_at,
+            attempted_at: row.attempted_at,
+            created_at: row.created_at,
+            unique_key: row.unique_key.as_deref(),
+            unique_states: row.unique_states.as_deref(),
+            payload: &row.payload,
+        }
+    }
+}
+
+/// Column arrays for one `{schema}.enqueue_ready_rows` call. Lanes are pushed
+/// in lock order with their rows contiguous; segment offsets are relative to
+/// the start the function reserves for the lane.
+#[derive(Default)]
+struct EnqueueReadyRowsCall<'r> {
+    lane_queues: Vec<&'r str>,
+    lane_priorities: Vec<i16>,
+    lane_shards: Vec<i16>,
+    lane_counts: Vec<i64>,
+    job_ids: Vec<Option<i64>>,
+    kinds: Vec<&'r str>,
+    args: Vec<&'r serde_json::Value>,
+    attempts: Vec<i16>,
+    run_leases: Vec<i64>,
+    max_attempts: Vec<i16>,
+    run_ats: Vec<DateTime<Utc>>,
+    attempted_ats: Vec<Option<DateTime<Utc>>>,
+    created_ats: Vec<DateTime<Utc>>,
+    unique_keys: Vec<Option<&'r [u8]>>,
+    unique_states: Vec<Option<&'r str>>,
+    payloads: Vec<Option<&'r serde_json::Value>>,
+    segment_lanes: Vec<i32>,
+    segment_first_offsets: Vec<i64>,
+    segment_next_offsets: Vec<i64>,
+    segment_run_ats: Vec<DateTime<Utc>>,
+}
+
+impl<'r> EnqueueReadyRowsCall<'r> {
+    fn push_lane(
+        &mut self,
+        queue: &'r str,
+        priority: i16,
+        enqueue_shard: i16,
+        rows: impl IntoIterator<Item = EnqueueReadyRow<'r>>,
+    ) {
+        let first_row = self.run_ats.len();
+        for row in rows {
+            self.job_ids.push(row.job_id);
+            self.kinds.push(row.kind);
+            self.args.push(row.args);
+            self.attempts.push(row.attempt);
+            self.run_leases.push(row.run_lease);
+            self.max_attempts.push(row.max_attempts);
+            self.run_ats.push(row.run_at);
+            self.attempted_ats.push(row.attempted_at);
+            self.created_ats.push(row.created_at);
+            self.unique_keys.push(row.unique_key);
+            self.unique_states.push(row.unique_states);
+            self.payloads.push(storage_payload(row.payload));
+        }
+        let count = self.run_ats.len() - first_row;
+        if count == 0 {
+            return;
+        }
+        self.lane_queues.push(queue);
+        self.lane_priorities.push(priority);
+        self.lane_shards.push(enqueue_shard);
+        self.lane_counts.push(count as i64);
+
+        // Same split as `ready_segments_from_rows` within one lane, whose
+        // sequence numbers are contiguous: a new segment at each `run_at`
+        // change.
+        let lane_number = self.lane_queues.len() as i32;
+        let mut segment_start = 0usize;
+        for offset in 1..=count {
+            if offset == count
+                || self.run_ats[first_row + offset] != self.run_ats[first_row + segment_start]
+            {
+                self.segment_lanes.push(lane_number);
+                self.segment_first_offsets.push(segment_start as i64);
+                self.segment_next_offsets.push(offset as i64);
+                self.segment_run_ats
+                    .push(self.run_ats[first_row + segment_start]);
+                segment_start = offset;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod ready_segment_tests {
-    use super::{QueueStorage, RuntimeReadyInsert};
+    use super::{EnqueueReadyRow, EnqueueReadyRowsCall, QueueStorage, RuntimeReadyInsert};
     use chrono::{Duration, TimeZone, Utc};
 
     fn ready_row(lane_seq: i64, run_at: chrono::DateTime<Utc>) -> RuntimeReadyInsert {
@@ -2358,6 +2503,52 @@ mod ready_segment_tests {
             .collect();
 
         assert_eq!(ranges, vec![(1, 3, first), (3, 4, second), (4, 5, first)]);
+    }
+
+    #[test]
+    fn enqueue_function_segments_match_rust_segments_after_reservation() {
+        let first = Utc
+            .with_ymd_and_hms(2026, 6, 14, 12, 0, 0)
+            .single()
+            .expect("valid test timestamp");
+        let second = first + Duration::seconds(1);
+        let reserved_start = 41;
+        let rows: Vec<_> = [first, first, second, first, first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(offset, run_at)| ready_row(reserved_start + offset as i64, run_at))
+            .collect();
+
+        let mut call = EnqueueReadyRowsCall::default();
+        call.push_lane(
+            "segment-q",
+            2,
+            0,
+            rows.iter().map(EnqueueReadyRow::from_insert),
+        );
+        let function_ranges: Vec<_> = (0..call.segment_lanes.len())
+            .map(|index| {
+                assert_eq!(call.segment_lanes[index], 1);
+                (
+                    reserved_start + call.segment_first_offsets[index],
+                    reserved_start + call.segment_next_offsets[index],
+                    call.segment_run_ats[index],
+                )
+            })
+            .collect();
+        let rust_ranges: Vec<_> = QueueStorage::ready_segments_from_rows(&rows)
+            .iter()
+            .map(|segment| {
+                (
+                    segment.first_lane_seq,
+                    segment.next_lane_seq,
+                    segment.first_run_at,
+                )
+            })
+            .collect();
+
+        assert_eq!(function_ranges, rust_ranges);
+        assert_eq!(call.lane_counts, vec![6]);
     }
 }
 
@@ -2912,6 +3103,12 @@ pub struct QueueStorage {
     ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
     slot_fill_observations: Mutex<HashMap<RingFamily, SlotFillObservation>>,
     prune_lock_timeout: Duration,
+    /// Last probe of whether the schema has an executable
+    /// `enqueue_ready_rows` (v052), and when it ran. A missing function is
+    /// probed again after `ENQUEUE_FUNCTION_REPROBE`; an available one until
+    /// a call fails for want of it. Cleared by `prepare_schema` and `reset`.
+    enqueue_function: Mutex<Option<(bool, Instant)>>,
+    enqueue_function_disabled: bool,
     cancel_phase_hook: CancelPhaseHookSlot,
 }
 
@@ -2959,8 +3156,18 @@ impl QueueStorage {
             ensured_lanes: Mutex::new(HashSet::new()),
             slot_fill_observations: Mutex::new(HashMap::new()),
             prune_lock_timeout: DEFAULT_PRUNE_LOCK_TIMEOUT,
+            enqueue_function: Mutex::new(None),
+            enqueue_function_disabled: false,
             cancel_phase_hook: CancelPhaseHookSlot(None),
         })
+    }
+
+    /// Enqueue through the multi-statement path even when the schema has
+    /// `enqueue_ready_rows`, as a binary without the function would.
+    #[doc(hidden)]
+    pub fn without_enqueue_function(mut self) -> Self {
+        self.enqueue_function_disabled = true;
+        self
     }
 
     /// Await `hook` at named points of a running-attempt cancel, so tests can
@@ -3379,6 +3586,7 @@ impl QueueStorage {
     /// upgrade get built; the rest are no-ops.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prepare_schema")]
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
+        self.forget_schema_observations();
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
         let mut install_tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -3925,6 +4133,7 @@ impl QueueStorage {
         // Clear the caches so the next ensure_lane / shard_for_enqueue /
         // claim calls re-observe DB state.
         self.clear_lane_cache();
+        self.forget_schema_observations();
         self.enqueue_shards_cache
             .lock()
             .expect("enqueue_shards_cache poisoned")
@@ -3976,6 +4185,23 @@ impl QueueStorage {
             self.invalidate_cached_lane(queue, priority, enqueue_shard);
         }
 
+        self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
+            .await
+    }
+
+    /// Lane rows for a caller that reserves through `advance_enqueue_head`
+    /// next. A cached lane needs no visibility probe here: the reserve reads
+    /// the head row itself and repairs a stale cache entry when it is missing.
+    async fn ensure_lane_for_reserve<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queue: &str,
+        priority: i16,
+        enqueue_shard: i16,
+    ) -> Result<(), AwaError> {
+        if self.lane_is_cached(queue, priority, enqueue_shard) {
+            return Ok(());
+        }
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
             .await
     }
@@ -4175,6 +4401,139 @@ impl QueueStorage {
             .lock()
             .expect("ensured_lanes mutex")
             .remove(&(queue.to_string(), priority, enqueue_shard));
+    }
+
+    fn forget_schema_observations(&self) {
+        *self
+            .enqueue_function
+            .lock()
+            .expect("enqueue function observation mutex") = None;
+    }
+
+    async fn enqueue_function_available(
+        &self,
+        executor: impl sqlx::PgExecutor<'_>,
+    ) -> Result<bool, AwaError> {
+        if self.enqueue_function_disabled {
+            return Ok(false);
+        }
+        let observed = *self
+            .enqueue_function
+            .lock()
+            .expect("enqueue function observation mutex");
+        match observed {
+            Some((true, _)) => return Ok(true),
+            Some((false, at)) if at.elapsed() < ENQUEUE_FUNCTION_REPROBE => return Ok(false),
+            _ => {}
+        }
+        // The function calls ring_cursor, whose EXECUTE is revoked from PUBLIC.
+        let available: bool = sqlx::query_scalar(
+            "SELECT COALESCE(has_function_privilege(to_regprocedure($1), 'EXECUTE'), FALSE) \
+                AND COALESCE(has_function_privilege(to_regprocedure($2), 'EXECUTE'), FALSE)",
+        )
+        .bind(format!(
+            "{}.enqueue_ready_rows({ENQUEUE_READY_ROWS_ARGUMENT_TYPES})",
+            self.schema()
+        ))
+        .bind(format!("{}.ring_cursor(text)", self.schema()))
+        .fetch_one(executor)
+        .await
+        .map_err(map_sqlx_error)?;
+        *self
+            .enqueue_function
+            .lock()
+            .expect("enqueue function observation mutex") = Some((available, Instant::now()));
+        Ok(available)
+    }
+
+    async fn execute_enqueue_ready_rows(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        call: &EnqueueReadyRowsCall<'_>,
+        notify_channels: &[String],
+    ) -> Result<usize, AwaError> {
+        let schema = self.schema();
+        let inserted: i64 = sqlx::query_scalar(audited_sql(format!(
+            r#"
+            SELECT {schema}.enqueue_ready_rows(
+                $1::text[], $2::smallint[], $3::smallint[], $4::bigint[],
+                $5::bigint[], $6::text[], $7::jsonb[], $8::smallint[], $9::bigint[],
+                $10::smallint[], $11::timestamptz[], $12::timestamptz[], $13::timestamptz[],
+                $14::bytea[], $15::text[], $16::jsonb[],
+                $17::integer[], $18::bigint[], $19::bigint[], $20::timestamptz[],
+                $21::text[]
+            )
+            "#
+        )))
+        .bind(&call.lane_queues)
+        .bind(&call.lane_priorities)
+        .bind(&call.lane_shards)
+        .bind(&call.lane_counts)
+        .bind(&call.job_ids)
+        .bind(&call.kinds)
+        .bind(&call.args)
+        .bind(&call.attempts)
+        .bind(&call.run_leases)
+        .bind(&call.max_attempts)
+        .bind(&call.run_ats)
+        .bind(&call.attempted_ats)
+        .bind(&call.created_ats)
+        .bind(&call.unique_keys)
+        .bind(&call.unique_states)
+        .bind(&call.payloads)
+        .bind(&call.segment_lanes)
+        .bind(&call.segment_first_offsets)
+        .bind(&call.segment_next_offsets)
+        .bind(&call.segment_run_ats)
+        .bind(notify_channels)
+        .fetch_one(connection)
+        .await
+        .map_err(|err| {
+            // The probe can have run in a transaction that created the
+            // function and rolled back, or privileges can since have been
+            // revoked; forget it so the next enqueue probes again.
+            if matches!(
+                err.as_database_error().and_then(|db| db.code()).as_deref(),
+                Some("42883" | "42501")
+            ) {
+                self.forget_schema_observations();
+            }
+            map_sqlx_error(err)
+        })?;
+        Ok(inserted as usize)
+    }
+
+    /// Ready-only enqueue with no uniqueness claims in one autocommit
+    /// statement: lane reservation, ring cursor, ready rows, segments and
+    /// NOTIFY all run inside `enqueue_ready_rows`.
+    async fn enqueue_ready_rows_autocommit(
+        &self,
+        pool: &PgPool,
+        rows: Vec<RuntimeReadyRow>,
+    ) -> Result<usize, AwaError> {
+        let notify_channels = self.notify_channels(rows.iter().map(|row| row.queue.clone()));
+        let mut connection = pool.acquire().await.map_err(map_sqlx_error)?;
+        let grouped = self
+            .group_ready_rows_by_shard(&mut connection, rows)
+            .await?;
+        let mut call = EnqueueReadyRowsCall::default();
+        for ((queue, priority, enqueue_shard), lane_rows) in &grouped {
+            call.push_lane(
+                queue,
+                *priority,
+                *enqueue_shard,
+                lane_rows.iter().map(EnqueueReadyRow::from_ready_row),
+            );
+        }
+        self.execute_enqueue_ready_rows(&mut connection, &call, &notify_channels)
+            .await
+    }
+
+    fn ready_rows_take_unique_claims(rows: &[RuntimeReadyRow]) -> bool {
+        rows.iter().any(|row| {
+            row.unique_key.is_some()
+                && unique_state_claims(row.unique_states.as_deref(), JobState::Available)
+        })
     }
 
     fn clear_lane_cache(&self) {
@@ -4483,16 +4842,41 @@ impl QueueStorage {
         }
     }
 
-    /// Current queue-ring cursor for the Rust-side enqueue paths, honouring
-    /// the schema's authority (#371 staged upgrade). Reads the authority row
-    /// (single cached page) then the O(1) cursor; callers that already hold
-    /// an authority for the transaction should use `ring_cursor_tx` directly.
+    /// Current queue-ring cursor for the Rust-side enqueue paths, under the
+    /// authority in force for this statement (#371 staged upgrade), read in
+    /// one round trip. Callers that already hold an authority for the
+    /// transaction should use `ring_cursor_tx` directly.
     async fn current_queue_ring<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
     ) -> Result<(i32, i64), AwaError> {
-        let authority = self.ring_authority_tx(tx).await?;
-        self.ring_cursor_tx(tx, RingFamily::Queue, authority).await
+        let schema = self.schema();
+        sqlx::query_as(audited_sql(format!(
+            r#"
+            WITH authority AS (
+                SELECT authority = 'ledger' AS ledger
+                FROM {schema}.ring_cursor_authority
+                WHERE singleton = TRUE
+            )
+            (
+                SELECT ledger.slot, ledger.generation
+                FROM {schema}.queue_ring_rotations AS ledger
+                WHERE (SELECT authority.ledger FROM authority)
+                ORDER BY ledger.generation DESC
+                LIMIT 1
+            )
+            UNION ALL
+            (
+                SELECT state.current_slot, state.generation
+                FROM {schema}.queue_ring_state AS state
+                WHERE state.singleton = TRUE
+                  AND NOT (SELECT authority.ledger FROM authority)
+            )
+            "#
+        )))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
     }
 
     async fn next_job_ids<'a>(
@@ -4981,7 +5365,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let grouped = self.group_ready_rows_by_shard(tx, rows).await?;
+        let grouped = self.group_ready_rows_by_shard(tx.as_mut(), rows).await?;
         let total_rows: usize = grouped.values().map(Vec::len).sum();
         let missing_job_ids = grouped
             .values()
@@ -5038,8 +5422,13 @@ impl QueueStorage {
             self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
                 .await?;
         }
+        if self.enqueue_function_available(tx.as_mut()).await? {
+            return self
+                .enqueue_lane_ranges_tx(tx, &lane_ranges, &ready_rows)
+                .await;
+        }
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+            self.ensure_lane_for_reserve(tx, &queue, priority, enqueue_shard)
                 .await?;
 
             let count = (range_end - range_start) as i64;
@@ -5055,6 +5444,27 @@ impl QueueStorage {
         self.execute_ready_inserts_tx(tx, ring, &ready_rows).await?;
         self.insert_ready_segments_tx(tx, ring, &ready_rows).await?;
         Ok(total_rows)
+    }
+
+    async fn enqueue_lane_ranges_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        lane_ranges: &[(String, i16, i16, usize, usize)],
+        ready_rows: &[RuntimeReadyInsert],
+    ) -> Result<usize, AwaError> {
+        let mut call = EnqueueReadyRowsCall::default();
+        for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
+            call.push_lane(
+                queue,
+                *priority,
+                *enqueue_shard,
+                ready_rows[*range_start..*range_end]
+                    .iter()
+                    .map(EnqueueReadyRow::from_insert),
+            );
+        }
+        self.execute_enqueue_ready_rows(tx.as_mut(), &call, &[])
+            .await
     }
 
     /// Re-group rows by `(queue, priority, enqueue_shard)` so each
@@ -5077,9 +5487,9 @@ impl QueueStorage {
     /// Mixing keyed and rotor rows in one call is supported — the
     /// keyed rows fan out by key while the rotor rows collapse into
     /// a single shard-sub-batch.
-    async fn group_ready_rows_by_shard<'a>(
+    async fn group_ready_rows_by_shard(
         &self,
-        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        connection: &mut sqlx::PgConnection,
         rows: Vec<RuntimeReadyRow>,
     ) -> Result<BTreeMap<(String, i16, i16), Vec<RuntimeReadyRow>>, AwaError> {
         // Partition by (queue, priority) first so the rotor pick for
@@ -5099,7 +5509,7 @@ impl QueueStorage {
             for row in bucket {
                 if row.ordering_key.is_some() {
                     let shard = self
-                        .shard_for_enqueue(tx.as_mut(), &queue, row.ordering_key.as_deref())
+                        .shard_for_enqueue(&mut *connection, &queue, row.ordering_key.as_deref())
                         .await?;
                     grouped
                         .entry((queue.clone(), priority, shard))
@@ -5110,7 +5520,9 @@ impl QueueStorage {
                 }
             }
             if !rotor_rows.is_empty() {
-                let shard = self.shard_for_enqueue(tx.as_mut(), &queue, None).await?;
+                let shard = self
+                    .shard_for_enqueue(&mut *connection, &queue, None)
+                    .await?;
                 grouped
                     .entry((queue.clone(), priority, shard))
                     .or_default()
@@ -5130,7 +5542,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let grouped = self.group_ready_rows_by_shard(tx, rows).await?;
+        let grouped = self.group_ready_rows_by_shard(tx.as_mut(), rows).await?;
 
         let total_rows: usize = grouped.values().map(Vec::len).sum();
         let missing_job_ids = grouped
@@ -5188,8 +5600,13 @@ impl QueueStorage {
             self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
                 .await?;
         }
+        if ready_rows.len() < COPY_MIN_ROWS && self.enqueue_function_available(tx.as_mut()).await? {
+            return self
+                .enqueue_lane_ranges_tx(tx, &lane_ranges, &ready_rows)
+                .await;
+        }
         for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+            self.ensure_lane_for_reserve(tx, &queue, priority, enqueue_shard)
                 .await?;
 
             let count = (range_end - range_start) as i64;
@@ -5256,7 +5673,7 @@ impl QueueStorage {
             // retries must re-enqueue with the original key from the
             // application layer.
             let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue, None).await?;
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+            self.ensure_lane_for_reserve(tx, &queue, priority, enqueue_shard)
                 .await?;
 
             let count = lane_rows.len() as i64;
@@ -6247,6 +6664,13 @@ impl QueueStorage {
             }
         }
 
+        if deferred_rows.is_empty()
+            && !Self::ready_rows_take_unique_claims(&ready_rows)
+            && self.enqueue_function_available(pool).await?
+        {
+            return self.enqueue_ready_rows_autocommit(pool, ready_rows).await;
+        }
+
         let queues_to_notify: Vec<String> =
             ready_rows.iter().map(|row| row.queue.clone()).collect();
 
@@ -6355,6 +6779,14 @@ impl QueueStorage {
                     )));
                 }
             }
+        }
+
+        if deferred_rows.is_empty()
+            && ready_rows.len() < COPY_MIN_ROWS
+            && !Self::ready_rows_take_unique_claims(&ready_rows)
+            && self.enqueue_function_available(pool).await?
+        {
+            return self.enqueue_ready_rows_autocommit(pool, ready_rows).await;
         }
 
         let queues_to_notify: Vec<String> =
@@ -10303,20 +10735,25 @@ impl QueueStorage {
             .map_err(map_sqlx_error)
     }
 
+    /// Logical-queue NOTIFY channels, deduplicated so a transaction never
+    /// emits the same NOTIFY twice.
+    fn notify_channels(&self, queues: impl IntoIterator<Item = String>) -> Vec<String> {
+        queues
+            .into_iter()
+            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect()
+    }
+
     async fn notify_queues_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queues: impl IntoIterator<Item = String>,
     ) -> Result<(), AwaError> {
-        // BTreeSet dedups so we never emit the same NOTIFY twice per
-        // transaction. Multi-queue enqueues fold into a single round-trip via
+        // Multi-queue enqueues fold into a single round-trip via
         // `unnest($1::text[])` rather than one round-trip per channel.
-        let channels: Vec<String> = queues
-            .into_iter()
-            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect();
+        let channels = self.notify_channels(queues);
         if channels.is_empty() {
             return Ok(());
         }

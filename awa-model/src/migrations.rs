@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 50;
+pub const CURRENT_VERSION: i32 = 52;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -290,6 +290,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Drop the redundant lane index on ready_entries partitions",
         &[V23_UP, V50_UP],
     ),
+    // v051 is reserved for a parallel branch.
+    (
+        52,
+        "Fewer round trips and sequence writes per queue-storage enqueue",
+        &[V23_UP, V52_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -348,6 +354,7 @@ const V47_UP: &str = include_str!("../migrations/v047_replica_identity.sql");
 const V48_UP: &str = include_str!("../migrations/v048_claim_cursor_catch_up.sql");
 const V49_UP: &str = include_str!("../migrations/v049_prepared_lane_sequences.sql");
 const V50_UP: &str = include_str!("../migrations/v050_drop_ready_lane_shard_index.sql");
+const V52_UP: &str = include_str!("../migrations/v052_enqueue_round_trips.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

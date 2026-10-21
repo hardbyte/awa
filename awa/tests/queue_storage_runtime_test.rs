@@ -16603,10 +16603,25 @@ async fn test_priority_aging_off_does_not_stamp_original() {
 /// helper's comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
+    check_ensure_lane_cache_recovers_after_rollback("awa_qs_ensure_lane_rollback", false).await;
+}
+
+/// The multi-statement path is the one that fills the Rust lane cache, so
+/// the recovery must also hold when the function is not used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback_without_function() {
+    check_ensure_lane_cache_recovers_after_rollback("awa_qs_ensure_lane_rollback_nf", true).await;
+}
+
+async fn check_ensure_lane_cache_recovers_after_rollback(schema: &str, without_function: bool) {
     let (_db_guard, pool) = setup_pool(4).await;
     let queue = "qs_ensure_lane_rollback";
-    let schema = "awa_qs_ensure_lane_rollback";
     let store = create_store(&pool, schema).await;
+    let store = if without_function {
+        store.without_enqueue_function()
+    } else {
+        store
+    };
 
     // Simulate the rolled-back ensure_lane: run the three lane
     // inserts in a transaction that we explicitly roll back. After
@@ -17681,6 +17696,65 @@ async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() 
         "stale completion cannot create another disposition"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+/// A NULL count would return a start without advancing the lane sequence,
+/// handing the same range to the next caller.
+#[tokio::test]
+async fn test_reserve_enqueue_seq_rejects_a_null_count() {
+    let (_db_guard, pool) = setup_pool(2).await;
+    let schema = "awa_qs_reserve_null_count";
+    let store = create_store(&pool, schema).await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let error = sqlx::query(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq('q', 1::smallint, 0::smallint, NULL::bigint)"
+    )))
+    .execute(&pool)
+    .await
+    .expect_err("a NULL count must be rejected");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|db| db.code())
+            .as_deref(),
+        Some("22004")
+    );
+    pool.close().await;
+}
+
+/// A store that has seen enqueue_ready_rows must not keep calling it once it
+/// is gone: the failed call forgets the observation, and the next enqueue
+/// probes again and takes the multi-statement path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_enqueue_falls_back_after_the_enqueue_function_disappears() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_enqueue_function_vanishes";
+    let store = create_store(&pool, schema).await;
+    assert_eq!(store.enqueue_batch(&pool, "q", 1, 1).await.unwrap(), 1);
+
+    let signature: String = sqlx::query_scalar(audited_sql(format!(
+        "SELECT oid::regprocedure::text FROM pg_proc \
+         WHERE pronamespace = '{schema}'::regnamespace AND proname = 'enqueue_ready_rows'"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!("DROP FUNCTION {signature}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        store.enqueue_batch(&pool, "q", 1, 1).await.is_err(),
+        "the call that finds the function gone fails"
+    );
+    assert_eq!(
+        store.enqueue_batch(&pool, "q", 1, 1).await.unwrap(),
+        1,
+        "the next enqueue probes again and uses the multi-statement path"
+    );
+    assert_eq!(store.queue_counts(&pool, "q").await.unwrap().available, 2);
     pool.close().await;
 }
 
@@ -18901,4 +18975,282 @@ async fn test_brin_fsm_baseline_block_size_model() {
         assert!(extra_is_used, "extra FSM page at block_size={block_size}");
     }
     pool.close().await;
+}
+
+fn fold_test_config(schema: &str) -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: false,
+        ..Default::default()
+    }
+}
+
+fn fold_test_jobs(
+    queue: &str,
+    ids: std::ops::RangeInclusive<i64>,
+) -> Vec<awa::model::InsertParams> {
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        ..Default::default()
+    };
+    ids.map(|id| insert::params_with(&DlqJob { id }, opts.clone()).expect("Failed to prepare job"))
+        .collect()
+}
+
+/// A runtime that enqueues through `enqueue_ready_rows` and one that uses the
+/// multi-statement path (as a binary without the function does) interleave
+/// on one lane: the lane stays gap-free and FIFO, each call writes its own
+/// segment, and a store on a schema without the function falls back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_function_and_fallback_share_one_lane() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_enqueue_function_lane";
+    let schema = "awa_qs_enqueue_function_lane";
+    let store = create_store_with_config(&pool, fold_test_config(schema)).await;
+    let fallback = QueueStorage::new(fold_test_config(schema))
+        .expect("Failed to create fallback store")
+        .without_enqueue_function();
+
+    let mut next_id = 1_i64;
+    for (through_function, batch_size) in [(true, 3), (false, 1), (true, 1), (false, 4), (true, 2)]
+    {
+        let jobs = fold_test_jobs(queue, next_id..=next_id + batch_size - 1);
+        next_id += batch_size;
+        let writer = if through_function { &store } else { &fallback };
+        let inserted = writer
+            .enqueue_params_copy(&pool, &jobs)
+            .await
+            .expect("Failed to enqueue");
+        assert_eq!(inserted, batch_size as usize);
+    }
+
+    let rows: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT lane_seq, (args->>'id')::bigint FROM {schema}.ready_entries \
+         WHERE queue = $1 ORDER BY lane_seq"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read ready rows");
+    assert_eq!(rows, (1..=11).map(|seq| (seq, seq)).collect::<Vec<_>>());
+
+    let segments: Vec<(i64, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT first_lane_seq, next_lane_seq FROM {schema}.ready_segments \
+         WHERE queue = $1 ORDER BY first_lane_seq"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read ready segments");
+    assert_eq!(segments, vec![(1, 4), (4, 5), (5, 6), (6, 10), (10, 12)]);
+
+    let distinct_job_ids: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(DISTINCT job_id) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count job ids");
+    assert_eq!(distinct_job_ids, 11);
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 11, Duration::ZERO)
+        .await
+        .expect("Failed to claim");
+    let claimed_lane_seqs: Vec<i64> = claimed.iter().map(|job| job.claim.lane_seq).collect();
+    assert_eq!(claimed_lane_seqs, (1..=11).collect::<Vec<_>>());
+
+    sqlx::query(audited_sql(format!(
+        "DROP FUNCTION {schema}.enqueue_ready_rows(text[], smallint[], smallint[], bigint[], \
+         bigint[], text[], jsonb[], smallint[], bigint[], smallint[], timestamptz[], \
+         timestamptz[], timestamptz[], bytea[], text[], jsonb[], integer[], bigint[], bigint[], \
+         timestamptz[], text[])"
+    )))
+    .execute(&pool)
+    .await
+    .expect("Failed to drop enqueue function");
+    let older_schema_store =
+        QueueStorage::new(fold_test_config(schema)).expect("Failed to create store");
+    older_schema_store
+        .enqueue_params_copy(&pool, &fold_test_jobs(queue, 12..=13))
+        .await
+        .expect("Failed to enqueue without the function");
+    let last_lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT max(lane_seq) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read last lane sequence");
+    assert_eq!(last_lane_seq, 13);
+}
+
+/// The one-statement enqueue takes the same per-lane reservation lock as
+/// `reserve_enqueue_seq`, so it cannot publish past an open reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_enqueue_function_waits_for_open_lane_reservation() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_enqueue_function_waits";
+    let schema = "awa_qs_enqueue_function_waits";
+    let store = Arc::new(create_store_with_config(&pool, fold_test_config(schema)).await);
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare lane");
+
+    let mut reservation = pool.begin().await.expect("Failed to begin reservation");
+    let reserved: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+    )))
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .bind(2_i64)
+    .fetch_one(reservation.as_mut())
+    .await
+    .expect("Failed to reserve");
+    assert_eq!(reserved, 1);
+
+    let enqueue_pool = pool.clone();
+    let enqueue_store = Arc::clone(&store);
+    let jobs = fold_test_jobs(queue, 1..=1);
+    let enqueue = tokio::spawn(async move {
+        enqueue_store
+            .enqueue_params_copy(&enqueue_pool, &jobs)
+            .await
+    });
+    wait_for_lock_wait(&pool, "advisory").await;
+    let visible: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count ready rows");
+    assert_eq!(visible, 0);
+
+    reservation
+        .rollback()
+        .await
+        .expect("Failed to release reservation");
+    tokio::time::timeout(Duration::from_secs(5), enqueue)
+        .await
+        .expect("Enqueue remained blocked")
+        .expect("Enqueue task panicked")
+        .expect("Enqueue failed");
+    let lane_seq: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT lane_seq FROM {schema}.ready_entries WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read lane sequence");
+    assert_eq!(lane_seq, 3, "the rolled-back reservation leaves a gap");
+}
+
+/// A lane row without a sequence name (written before the head trigger
+/// existed) is provisioned on its first reservation; reservations of one and
+/// of several rows stay contiguous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_reserve_names_unnamed_lane_and_stays_contiguous() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let queue = "qs_reserve_unnamed_lane";
+    let schema = "awa_qs_reserve_unnamed_lane";
+    let store = create_store_with_config(&pool, fold_test_config(schema)).await;
+    store
+        .prepare_queue(&pool, queue, 1)
+        .await
+        .expect("Failed to prepare lane");
+
+    let reserve = |count: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(audited_sql(format!(
+                "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+            )))
+            .bind(queue)
+            .bind(2_i16)
+            .bind(0_i16)
+            .bind(count)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to reserve")
+        }
+    };
+    assert_eq!(reserve(1).await, 1);
+    assert_eq!(reserve(3).await, 2);
+
+    let ensure_calls_in_reserve = || {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.expect("Failed to begin");
+            sqlx::query("SET LOCAL track_functions = 'pl'")
+                .execute(tx.as_mut())
+                .await
+                .expect("Failed to track functions");
+            sqlx::query(audited_sql(format!(
+                "SELECT {schema}.reserve_enqueue_seq($1, 2::smallint, 0::smallint, 2)"
+            )))
+            .bind(queue)
+            .execute(tx.as_mut())
+            .await
+            .expect("Failed to reserve");
+            let calls: i64 = sqlx::query_scalar(audited_sql(format!(
+                "SELECT COALESCE(pg_stat_get_xact_function_calls(\
+                 '{schema}.ensure_lane_sequences(text, smallint, smallint)'::regprocedure), 0)"
+            )))
+            .fetch_one(tx.as_mut())
+            .await
+            .expect("Failed to read function calls");
+            tx.rollback().await.expect("Failed to roll back");
+            calls
+        }
+    };
+    assert_eq!(
+        ensure_calls_in_reserve().await,
+        0,
+        "a named lane reserves without provisioning"
+    );
+    assert_eq!(
+        reserve(1).await,
+        7,
+        "the probe's rolled-back range is a gap"
+    );
+
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_enqueue_heads SET seq_name = NULL \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to clear the sequence name");
+
+    assert_eq!(
+        ensure_calls_in_reserve().await,
+        1,
+        "an unnamed lane is provisioned on reserve"
+    );
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_enqueue_heads SET seq_name = NULL \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to clear the sequence name");
+    assert_eq!(reserve(1).await, 10);
+    assert_eq!(reserve(2).await, 11);
+    assert_eq!(reserve(0).await, 13, "a zero count reads the next value");
+    let named: bool = sqlx::query_scalar(audited_sql(format!(
+        "SELECT seq_name IS NOT NULL FROM {schema}.queue_enqueue_heads \
+         WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read the sequence name");
+    assert!(named);
 }

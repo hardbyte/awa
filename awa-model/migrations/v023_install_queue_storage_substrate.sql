@@ -226,6 +226,296 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
+-- Enqueue-path functions. Function replacement only: no table DDL and no
+-- trigger changes, so a migration can refresh a live substrate through it.
+CREATE OR REPLACE FUNCTION awa.refresh_enqueue_functions(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $refresh$
+BEGIN
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.reserve_enqueue_seq(
+            p_queue TEXT,
+            p_priority SMALLINT,
+            p_enqueue_shard SMALLINT,
+            p_count BIGINT
+        )
+        RETURNS BIGINT
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT;
+            v_qualified_seq TEXT;
+            v_start BIGINT;
+        BEGIN
+            SELECT seq_name
+            INTO v_seq_name
+            FROM %1$I.queue_enqueue_heads
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard;
+
+            IF p_count IS NULL THEN
+                RAISE EXCEPTION 'reserve_enqueue_seq: count must not be NULL'
+                    USING ERRCODE = '22004';
+            END IF;
+
+            IF p_count <= 0 THEN
+                RETURN %1$I.sequence_next_value(v_seq_name);
+            END IF;
+
+            -- The head trigger names the sequence when the lane row is
+            -- inserted; only a lane row written before that trigger existed
+            -- still needs its sequences provisioned here.
+            IF v_seq_name IS NULL THEN
+                PERFORM %1$I.ensure_lane_sequences(p_queue, p_priority, p_enqueue_shard);
+
+                SELECT seq_name
+                INTO v_seq_name
+                FROM %1$I.queue_enqueue_heads
+                WHERE queue = p_queue
+                  AND priority = p_priority
+                  AND enqueue_shard = p_enqueue_shard;
+
+                IF v_seq_name IS NULL THEN
+                    RAISE EXCEPTION 'missing enqueue lane sequence for queue %%, priority %%, shard %%',
+                        p_queue, p_priority, p_enqueue_shard
+                        USING ERRCODE = '55000';
+                END IF;
+            END IF;
+
+            v_qualified_seq := format('%%I.%%I', %1$L, v_seq_name);
+            -- Hold the lane reservation lock until the surrounding enqueue
+            -- transaction ends. Sequence movement is non-transactional: if a
+            -- later producer could reserve and commit lane N+1 while an
+            -- earlier producer still holds uncommitted lane N, claim could
+            -- advance past N and strand the earlier job when it eventually
+            -- commits. The transaction-scoped lock preserves visibility order
+            -- within a lane while aborted reservations still become harmless
+            -- sequence gaps.
+            PERFORM pg_advisory_xact_lock(hashtextextended(v_qualified_seq, 0));
+
+            -- Every writer of a lane sequence holds this key (set_sequence_next
+            -- and the head trigger take it too), so a read followed by one
+            -- setval reserves the range with a single sequence write.
+            IF p_count = 1 THEN
+                v_start := nextval(v_qualified_seq::regclass);
+            ELSE
+                v_start := COALESCE(
+                    pg_sequence_last_value(v_qualified_seq::regclass) + 1,
+                    %1$I.sequence_next_value(v_seq_name)
+                );
+                PERFORM setval(v_qualified_seq::regclass, v_start + p_count - 1, true);
+            END IF;
+
+            RETURN v_start;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    -- One-call ready enqueue. Rows arrive grouped by lane, lanes in the
+    -- caller's lock order, each lane's rows contiguous. Per lane: provision
+    -- the lane rows if the head is missing (same lane lock and inserts as the
+    -- Rust ensure_lane path), then reserve through reserve_enqueue_seq. Then
+    -- read the queue-ring cursor, append ready rows before their segments,
+    -- and notify. A NULL job id takes the next value of the schema's job id
+    -- sequence. Segment offsets are relative to the lane's reserved start.
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.enqueue_ready_rows(
+            p_lane_queues TEXT[],
+            p_lane_priorities SMALLINT[],
+            p_lane_shards SMALLINT[],
+            p_lane_counts BIGINT[],
+            p_job_ids BIGINT[],
+            p_kinds TEXT[],
+            p_args JSONB[],
+            p_attempts SMALLINT[],
+            p_run_leases BIGINT[],
+            p_max_attempts SMALLINT[],
+            p_run_ats TIMESTAMPTZ[],
+            p_attempted_ats TIMESTAMPTZ[],
+            p_created_ats TIMESTAMPTZ[],
+            p_unique_keys BYTEA[],
+            p_unique_states TEXT[],
+            p_payloads JSONB[],
+            p_segment_lanes INT[],
+            p_segment_first_offsets BIGINT[],
+            p_segment_next_offsets BIGINT[],
+            p_segment_run_ats TIMESTAMPTZ[],
+            p_notify_channels TEXT[]
+        )
+        RETURNS BIGINT
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_lane_total INT := COALESCE(cardinality(p_lane_queues), 0);
+            v_row_total INT := COALESCE(cardinality(p_kinds), 0);
+            v_segment_total INT := COALESCE(cardinality(p_segment_lanes), 0);
+            v_lane INT;
+            v_start BIGINT;
+            v_lane_starts BIGINT[] := ARRAY[]::BIGINT[];
+            v_row_lanes INT[] := ARRAY[]::INT[];
+            v_row_lane_seqs BIGINT[] := ARRAY[]::BIGINT[];
+            v_ready_slot INT;
+            v_ready_generation BIGINT;
+            v_inserted BIGINT;
+        BEGIN
+            IF COALESCE(cardinality(p_lane_priorities), 0) <> v_lane_total
+               OR COALESCE(cardinality(p_lane_shards), 0) <> v_lane_total
+               OR COALESCE(cardinality(p_lane_counts), 0) <> v_lane_total
+               OR COALESCE(cardinality(p_job_ids), 0) <> v_row_total
+               OR COALESCE(cardinality(p_args), 0) <> v_row_total
+               OR COALESCE(cardinality(p_attempts), 0) <> v_row_total
+               OR COALESCE(cardinality(p_run_leases), 0) <> v_row_total
+               OR COALESCE(cardinality(p_max_attempts), 0) <> v_row_total
+               OR COALESCE(cardinality(p_run_ats), 0) <> v_row_total
+               OR COALESCE(cardinality(p_attempted_ats), 0) <> v_row_total
+               OR COALESCE(cardinality(p_created_ats), 0) <> v_row_total
+               OR COALESCE(cardinality(p_unique_keys), 0) <> v_row_total
+               OR COALESCE(cardinality(p_unique_states), 0) <> v_row_total
+               OR COALESCE(cardinality(p_payloads), 0) <> v_row_total
+               OR COALESCE(cardinality(p_segment_first_offsets), 0) <> v_segment_total
+               OR COALESCE(cardinality(p_segment_next_offsets), 0) <> v_segment_total
+               OR COALESCE(cardinality(p_segment_run_ats), 0) <> v_segment_total
+            THEN
+                RAISE EXCEPTION 'enqueue_ready_rows: array lengths disagree'
+                    USING ERRCODE = '22023';
+            END IF;
+
+            FOR v_lane IN 1..v_lane_total LOOP
+                IF p_lane_counts[v_lane] < 1 THEN
+                    RAISE EXCEPTION 'enqueue_ready_rows: lane %% has no rows', v_lane
+                        USING ERRCODE = '22023';
+                END IF;
+
+                PERFORM 1
+                FROM %1$I.queue_enqueue_heads
+                WHERE queue = p_lane_queues[v_lane]
+                  AND priority = p_lane_priorities[v_lane]
+                  AND enqueue_shard = p_lane_shards[v_lane];
+
+                IF NOT FOUND THEN
+                    PERFORM pg_advisory_xact_lock(hashtextextended(
+                        format('%%s:%%s:%%s:%%s', %1$L, p_lane_queues[v_lane],
+                               p_lane_priorities[v_lane], p_lane_shards[v_lane]),
+                        0
+                    ));
+                    INSERT INTO %1$I.queue_lanes (queue, priority)
+                    VALUES (p_lane_queues[v_lane], p_lane_priorities[v_lane])
+                    ON CONFLICT (queue, priority) DO NOTHING;
+                    INSERT INTO %1$I.queue_enqueue_heads (queue, priority, enqueue_shard)
+                    VALUES (p_lane_queues[v_lane], p_lane_priorities[v_lane], p_lane_shards[v_lane])
+                    ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+                    INSERT INTO %1$I.queue_claim_heads (queue, priority, enqueue_shard)
+                    VALUES (p_lane_queues[v_lane], p_lane_priorities[v_lane], p_lane_shards[v_lane])
+                    ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING;
+                    PERFORM %1$I.ensure_lane_sequences(
+                        p_lane_queues[v_lane], p_lane_priorities[v_lane], p_lane_shards[v_lane]
+                    );
+                END IF;
+
+                v_start := %1$I.reserve_enqueue_seq(
+                    p_lane_queues[v_lane],
+                    p_lane_priorities[v_lane],
+                    p_lane_shards[v_lane],
+                    p_lane_counts[v_lane]
+                );
+                v_lane_starts := v_lane_starts || v_start;
+                v_row_lanes := v_row_lanes || array_fill(v_lane, ARRAY[p_lane_counts[v_lane]::INT]);
+                v_row_lane_seqs := v_row_lane_seqs
+                    || ARRAY(SELECT generate_series(v_start, v_start + p_lane_counts[v_lane] - 1));
+            END LOOP;
+
+            IF cardinality(v_row_lane_seqs) <> v_row_total THEN
+                RAISE EXCEPTION 'enqueue_ready_rows: lane counts cover %% rows, got %%',
+                    cardinality(v_row_lane_seqs), v_row_total
+                    USING ERRCODE = '22023';
+            END IF;
+
+            IF v_row_total = 0 THEN
+                RETURN 0;
+            END IF;
+
+            SELECT cursor.slot, cursor.generation
+            INTO v_ready_slot, v_ready_generation
+            FROM %1$I.ring_cursor('queue') AS cursor;
+
+            INSERT INTO %1$I.ready_entries (
+                ready_slot, ready_generation, job_id, kind, queue, args, priority,
+                attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at,
+                attempted_at, created_at, unique_key, unique_states, payload
+            )
+            SELECT
+                v_ready_slot,
+                v_ready_generation,
+                COALESCE(input.job_id, nextval(%2$L::regclass)),
+                input.kind,
+                p_lane_queues[input.lane],
+                input.args,
+                p_lane_priorities[input.lane],
+                input.attempt,
+                input.run_lease,
+                input.max_attempts,
+                input.lane_seq,
+                p_lane_shards[input.lane],
+                input.run_at,
+                input.attempted_at,
+                input.created_at,
+                input.unique_key,
+                input.unique_states,
+                input.payload
+            FROM unnest(
+                v_row_lanes, v_row_lane_seqs, p_job_ids, p_kinds, p_args, p_attempts,
+                p_run_leases, p_max_attempts, p_run_ats, p_attempted_ats, p_created_ats,
+                p_unique_keys, p_unique_states, p_payloads
+            ) AS input(
+                lane, lane_seq, job_id, kind, args, attempt, run_lease, max_attempts,
+                run_at, attempted_at, created_at, unique_key, unique_states, payload
+            );
+            GET DIAGNOSTICS v_inserted = ROW_COUNT;
+
+            INSERT INTO %1$I.ready_segments (
+                ready_slot, ready_generation, queue, priority, enqueue_shard,
+                first_lane_seq, next_lane_seq, first_run_at
+            )
+            SELECT
+                v_ready_slot,
+                v_ready_generation,
+                p_lane_queues[segment.lane],
+                p_lane_priorities[segment.lane],
+                p_lane_shards[segment.lane],
+                v_lane_starts[segment.lane] + segment.first_offset,
+                v_lane_starts[segment.lane] + segment.next_offset,
+                segment.run_at
+            FROM unnest(
+                p_segment_lanes, p_segment_first_offsets, p_segment_next_offsets, p_segment_run_ats
+            ) AS segment(lane, first_offset, next_offset, run_at)
+            ON CONFLICT (ready_slot, ready_generation, queue, priority, enqueue_shard, first_lane_seq)
+            DO NOTHING;
+
+            PERFORM pg_notify(channel, '')
+            FROM unnest(p_notify_channels) AS channel;
+
+            RETURN v_inserted;
+        END;
+        $func$
+        $ddl$,
+        p_schema,
+        format('%I.job_id_seq', p_schema)
+    );
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_enqueue_functions(TEXT) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,
@@ -1250,78 +1540,7 @@ BEGIN
 
     PERFORM awa.refresh_lane_sequence_helpers(p_schema);
 
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.reserve_enqueue_seq(
-            p_queue TEXT,
-            p_priority SMALLINT,
-            p_enqueue_shard SMALLINT,
-            p_count BIGINT
-        )
-        RETURNS BIGINT
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_seq_name TEXT;
-            v_lock_key TEXT;
-            v_start BIGINT;
-        BEGIN
-            IF p_count <= 0 THEN
-                RETURN %1$I.sequence_next_value((
-                    SELECT seq_name
-                    FROM %1$I.queue_enqueue_heads
-                    WHERE queue = p_queue
-                      AND priority = p_priority
-                      AND enqueue_shard = p_enqueue_shard
-                ));
-            END IF;
-
-            PERFORM %1$I.ensure_lane_sequences(p_queue, p_priority, p_enqueue_shard);
-
-            SELECT seq_name
-            INTO v_seq_name
-            FROM %1$I.queue_enqueue_heads
-            WHERE queue = p_queue
-              AND priority = p_priority
-              AND enqueue_shard = p_enqueue_shard;
-
-            IF v_seq_name IS NULL THEN
-                RAISE EXCEPTION 'missing enqueue lane sequence for queue %%, priority %%, shard %%',
-                    p_queue, p_priority, p_enqueue_shard
-                    USING ERRCODE = '55000';
-            END IF;
-
-            v_lock_key := format('%%I.%%I', %1$L, v_seq_name);
-            -- Hold the lane reservation lock until the surrounding enqueue
-            -- transaction ends. Sequence movement is non-transactional: if a
-            -- later producer could reserve and commit lane N+1 while an
-            -- earlier producer still holds uncommitted lane N, claim could
-            -- advance past N and strand the earlier job when it eventually
-            -- commits. The transaction-scoped lock preserves visibility order
-            -- within a lane while aborted reservations still become harmless
-            -- sequence gaps.
-            PERFORM pg_advisory_xact_lock(hashtextextended(v_lock_key, 0));
-            EXECUTE format(
-                'SELECT nextval(%%L::regclass)::bigint',
-                format('%%I.%%I', %1$L, v_seq_name)
-            )
-            INTO v_start;
-
-            IF p_count > 1 THEN
-                EXECUTE format(
-                    'SELECT setval(%%L::regclass, %%s, true)',
-                    format('%%I.%%I', %1$L, v_seq_name),
-                    v_start + p_count - 1
-                );
-            END IF;
-
-            RETURN v_start;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
+    PERFORM awa.refresh_enqueue_functions(p_schema);
 
     EXECUTE format(
         'DROP TRIGGER IF EXISTS queue_enqueue_heads_sequence_sync ON %I.queue_enqueue_heads',
