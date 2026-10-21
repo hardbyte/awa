@@ -889,6 +889,8 @@ class AsyncClient:
         queue_storage_claim_rotate_interval_ms: int | None = None,
         queue_storage_rotate_min_slot_age_ms: int | None = None,
         queue_storage_rotate_target_slot_bytes: int | None = None,
+        queue_storage_rotate_min_slot_rows: int | None = None,
+        queue_storage_rotate_max_slot_age_ms: int | None = None,
         storage_transition_role: Literal[
             "auto", "canonical_drain", "queue_storage_target"
         ] = "auto",
@@ -953,6 +955,8 @@ class AsyncClient:
             queue_storage_claim_rotate_interval_ms=queue_storage_claim_rotate_interval_ms,
             queue_storage_rotate_min_slot_age_ms=queue_storage_rotate_min_slot_age_ms,
             queue_storage_rotate_target_slot_bytes=queue_storage_rotate_target_slot_bytes,
+            queue_storage_rotate_min_slot_rows=queue_storage_rotate_min_slot_rows,
+            queue_storage_rotate_max_slot_age_ms=queue_storage_rotate_max_slot_age_ms,
             storage_transition_role=storage_transition_role,
         )
 

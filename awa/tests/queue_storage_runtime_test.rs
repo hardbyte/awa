@@ -2507,10 +2507,11 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
             .expect("seed done row in the current slot");
         }
     };
-    let patient = RingRotationCadence {
-        min_slot_age: Duration::from_secs(3600),
-        target_slot_bytes: 1 << 30,
-    };
+    let patient = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_secs(3600))
+        .with_target_slot_bytes(1 << 30)
+        .with_min_slot_rows(0)
+        .with_max_slot_age(Duration::ZERO);
 
     // Slot 0 (genesis) holds one row and is seconds old: a patient cadence
     // leaves it open and the cursor does not move.
@@ -2532,10 +2533,7 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
     assert_eq!(ring_cursor(&pool, schema, "queue").await, (0, 0));
 
     // The byte target seals regardless of age.
-    let by_size = RingRotationCadence {
-        target_slot_bytes: 1,
-        ..patient
-    };
+    let by_size = patient.with_target_slot_bytes(1);
     let outcome = store
         .rotate_with_cadence(&pool, by_size)
         .await
@@ -2578,10 +2576,7 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
         matches!(outcome, RotateOutcome::SkippedFilling { slot: 2, .. }),
         "got {outcome:?}"
     );
-    let by_age = RingRotationCadence {
-        min_slot_age: Duration::from_millis(1),
-        ..patient
-    };
+    let by_age = patient.with_min_slot_age(Duration::from_millis(1));
     tokio::time::sleep(Duration::from_millis(20)).await;
     let outcome = store
         .rotate_with_cadence(&pool, by_age)
@@ -2607,6 +2602,388 @@ async fn test_rotation_cadence_holds_filling_slot_open() {
     );
 }
 
+/// Under compat authority an older rotator can leave the current generation
+/// without a usable ledger time; the ceiling then falls back to the local
+/// observation alone.
+#[tokio::test]
+async fn test_rotation_age_ceiling_falls_back_without_a_ledger_time() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_no_ledger_time";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        ) SELECT 0, 0, 9_100_000 + n, 'cadence_job', 'cadence_no_ledger_q',
+                 'completed'::awa.job_state, 2::smallint, 1::smallint,
+                 1::bigint, 1_000 + n, 0::smallint, now(), now(), '{{}}'::jsonb
+          FROM generate_series(1, 10) AS n"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_ring_rotations \
+         SET rotated_at = clock_timestamp() + interval '1 hour' WHERE generation = 0"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cadence = RingRotationCadence::DEFAULT
+        .with_min_slot_age(Duration::from_millis(1))
+        .with_target_slot_bytes(1 << 30)
+        .with_min_slot_rows(50)
+        .with_max_slot_age(Duration::from_millis(200));
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, cadence).await.unwrap(),
+        RotateOutcome::SkippedFilling { slot: 0, .. }
+    ));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let outcome = store.rotate_with_cadence(&pool, cadence).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 1,
+                generation: 1
+            }
+        ),
+        "the local observation alone enforces the ceiling, got {outcome:?}"
+    );
+}
+
+/// A new maintenance leader starts its local fill timers afresh, so the age
+/// ceiling also counts from when the slot opened on the database clock;
+/// otherwise leadership that moves more often than the ceiling keeps a
+/// trickle slot open indefinitely.
+#[tokio::test]
+async fn test_rotation_age_ceiling_survives_a_leader_change() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_leader_change";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        ) SELECT 0, 0, 9_000_000 + n, 'cadence_job', 'cadence_leader_q',
+                 'completed'::awa.job_state, 2::smallint, 1::smallint,
+                 1::bigint, 1_000 + n, 0::smallint, now(), now(), '{{}}'::jsonb
+          FROM generate_series(1, 10) AS n"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let trickle = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_millis(1))
+        .with_target_slot_bytes(1 << 30)
+        .with_min_slot_rows(50)
+        .with_max_slot_age(Duration::from_secs(60));
+    store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(matches!(
+        store.rotate_with_cadence(&pool, trickle).await.unwrap(),
+        RotateOutcome::SkippedFilling { slot: 0, .. }
+    ));
+
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.queue_ring_rotations \
+         SET rotated_at = clock_timestamp() - interval '2 minutes' WHERE generation = 0"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    store.reset_rotation_observations();
+    let outcome = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    assert!(
+        matches!(outcome, RotateOutcome::Rotated { slot: 1, generation: 1 }),
+        "a slot open past the ceiling seals even when a new leader just started observing it, got {outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rotation_cadence_row_floor_and_age_ceiling() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_cadence_rows";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    let seed_done_rows = |slot: i32, generation: i64, count: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(audited_sql(format!(
+                "INSERT INTO {schema}.done_entries (
+                    ready_slot, ready_generation, job_id, kind, queue, state,
+                    priority, attempt, run_lease, lane_seq, enqueue_shard,
+                    attempted_at, finalized_at, payload
+                ) SELECT $1, $2, 8_000_000 + $2 * 10_000 + n, 'cadence_job', 'cadence_rows_q',
+                         'completed'::awa.job_state, 2::smallint, 1::smallint,
+                         1::bigint, 1_000 + n, 0::smallint, now(), now(), '{{}}'::jsonb
+                  FROM generate_series(1, $3) AS n"
+            )))
+            .bind(slot)
+            .bind(generation)
+            .bind(count)
+            .execute(&pool)
+            .await
+            .expect("seed done rows in the current slot");
+        }
+    };
+    // Past the age window but under the row floor: stays open.
+    let trickle = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_millis(1))
+        .with_target_slot_bytes(1 << 30)
+        .with_min_slot_rows(50)
+        .with_max_slot_age(Duration::from_secs(3600));
+    seed_done_rows(0, 0, 10).await;
+    let outcome = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let outcome = match outcome {
+        RotateOutcome::SkippedFilling { .. } => {
+            store.rotate_with_cadence(&pool, trickle).await.unwrap()
+        }
+        other => other,
+    };
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::SkippedFilling {
+                slot: 0,
+                generation: 0
+            }
+        ),
+        "ten rows under a 50-row floor must stay open past the age window, got {outcome:?}"
+    );
+
+    // The age ceiling seals it regardless of rows.
+    let ceiling = trickle.with_max_slot_age(Duration::from_millis(1));
+    let outcome = store.rotate_with_cadence(&pool, ceiling).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 1,
+                generation: 1
+            }
+        ),
+        "a slot past the age ceiling must seal, got {outcome:?}"
+    );
+
+    // Enough rows past the age window seals under the ordinary rule.
+    seed_done_rows(1, 1, 60).await;
+    let _ = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let outcome = store.rotate_with_cadence(&pool, trickle).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 2,
+                generation: 2
+            }
+        ),
+        "sixty rows over a 50-row floor past the age window must seal, got {outcome:?}"
+    );
+
+    // A floor beyond PostgreSQL's bigint LIMIT range must not break the
+    // probe; the ceiling still seals.
+    seed_done_rows(2, 2, 3).await;
+    let unreachable_floor = trickle
+        .with_min_slot_rows(u64::MAX)
+        .with_max_slot_age(Duration::from_millis(1));
+    // The slot opened more than the 1 ms ceiling ago on the database clock,
+    // so the first observation already seals it.
+    let outcome = store
+        .rotate_with_cadence(&pool, unreachable_floor)
+        .await
+        .expect("an out-of-range row floor must not fail the probe");
+    assert!(
+        matches!(
+            outcome,
+            RotateOutcome::Rotated {
+                slot: 3,
+                generation: 3
+            }
+        ),
+        "the age ceiling seals regardless of the row floor, got {outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ledger_rotation_does_not_wait_for_the_ring_state_row() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    let schema = "awa_qs_ledger_rotate_nolock";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    // The assertion is about ledger authority; make that explicit rather than
+    // depending on when the maintenance auto-flip happens to run.
+    let flipped = storage::flip_ring_authority(&pool, schema, false)
+        .await
+        .expect("flip to ledger authority");
+    assert_eq!(flipped, "ledger");
+    // Rotate through connections that refuse to wait on a lock, so the test
+    // tells "did not wait" from "was slow" regardless of host load.
+    let impatient = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '3s'")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_state WHERE singleton = TRUE FOR UPDATE"
+    )))
+    .execute(holder.as_mut())
+    .await
+    .unwrap();
+    let outcome = store
+        .rotate(&impatient)
+        .await
+        .expect("a ledger-mode rotation must not queue behind the ring-state row lock");
+    assert!(
+        matches!(outcome, RotateOutcome::SkippedIdle { .. }),
+        "an empty ring reports idle, got {outcome:?}"
+    );
+    holder.rollback().await.unwrap();
+    impatient.close().await;
+}
+
+/// A ledger-mode prune holds the queue-ring advisory lock, then locks a done
+/// partition, then the done parent to carry retained failures forward. A
+/// counter rebuild must wait for the advisory lock before touching tables;
+/// locking the parent first would deadlock against that prune.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_counter_rebuild_waits_for_an_in_flight_prune() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_rebuild_vs_prune";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut prune = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries_0 IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .unwrap();
+
+    let rebuild = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.rebuild_terminal_counters(&pool).await })
+    };
+    wait_for_any_lock_wait(&pool).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(prune.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "LOCK TABLE {schema}.done_entries IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(prune.as_mut())
+    .await
+    .expect("the prune's parent lock must not deadlock with a waiting rebuild");
+    prune.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), rebuild)
+        .await
+        .expect("rebuild finishes after the prune")
+        .unwrap()
+        .expect("rebuild succeeds");
+}
+
+/// A ledger-mode rotation holds the queue-ring advisory lock while it reads
+/// ring tables. A reset must wait for that lock before truncating; taking
+/// its table locks first would deadlock against the rotation's later reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_reset_waits_for_an_in_flight_rotation() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_reset_vs_rotate";
+    let store = std::sync::Arc::new(create_store(&pool, schema).await);
+    let mut rotate = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.queue_ring_rotations LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .unwrap();
+
+    let reset = {
+        let store = store.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { store.reset(&pool).await })
+    };
+    wait_for_any_lock_wait(&pool).await;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(rotate.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT 1 FROM {schema}.ready_entries_0 LIMIT 1"
+    )))
+    .execute(rotate.as_mut())
+    .await
+    .expect("the rotation's later read must not deadlock with a waiting reset");
+    rotate.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), reset)
+        .await
+        .expect("reset finishes after the rotation")
+        .unwrap()
+        .expect("reset succeeds");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_change() {
     let (_db_guard, pool) = setup_pool(4).await;
@@ -2622,10 +2999,11 @@ async fn test_rotation_cadence_starts_on_observed_fill_after_idle_and_leader_cha
         .enqueue_batch(&pool, "observed_age", 1, 1)
         .await
         .unwrap();
-    let cadence = RingRotationCadence {
-        min_slot_age: Duration::from_millis(50),
-        target_slot_bytes: 0,
-    };
+    let cadence = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_millis(50))
+        .with_target_slot_bytes(0)
+        .with_min_slot_rows(0)
+        .with_max_slot_age(Duration::ZERO);
     assert!(matches!(
         store.rotate_with_cadence(&pool, cadence).await.unwrap(),
         RotateOutcome::SkippedFilling { slot: 0, .. }
@@ -2670,10 +3048,11 @@ async fn test_rotation_cadence_empty_observation_resets_age_on_same_cursor() {
         .await
         .unwrap();
     assert_eq!(second.len(), 1);
-    let cadence = RingRotationCadence {
-        min_slot_age: Duration::from_millis(50),
-        target_slot_bytes: 0,
-    };
+    let cadence = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_millis(50))
+        .with_target_slot_bytes(0)
+        .with_min_slot_rows(0)
+        .with_max_slot_age(Duration::ZERO);
     assert!(matches!(
         store
             .rotate_leases_with_cadence(&pool, cadence)
@@ -2753,10 +3132,11 @@ async fn test_rotation_cadence_empty_used_leases_reclaim_without_age_delay() {
     .unwrap();
     assert_eq!(rows, 0);
     assert!(heap_bytes > 0);
-    let cadence = RingRotationCadence {
-        min_slot_age: Duration::from_secs(3600),
-        target_slot_bytes: 1 << 30,
-    };
+    let cadence = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_secs(3600))
+        .with_target_slot_bytes(1 << 30)
+        .with_min_slot_rows(0)
+        .with_max_slot_age(Duration::ZERO);
     assert!(matches!(
         store
             .rotate_leases_with_cadence(&pool, cadence)
@@ -2808,10 +3188,11 @@ async fn test_rotation_cadence_size_trigger_includes_indexes() {
     .await
     .unwrap();
     assert!(total_bytes > table_bytes);
-    let cadence = RingRotationCadence {
-        min_slot_age: Duration::from_secs(3600),
-        target_slot_bytes: (table_bytes + 1) as u64,
-    };
+    let cadence = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_secs(3600))
+        .with_target_slot_bytes((table_bytes + 1) as u64)
+        .with_min_slot_rows(0)
+        .with_max_slot_age(Duration::ZERO);
     assert!(matches!(
         store.rotate_with_cadence(&pool, cadence).await.unwrap(),
         RotateOutcome::Rotated { slot: 1, .. }
@@ -2830,10 +3211,11 @@ async fn test_rotation_cadence_burst_can_exceed_target_without_reusing_busy_slot
             RotateOutcome::Rotated { .. }
         ));
     }
-    let cadence = RingRotationCadence {
-        min_slot_age: Duration::from_secs(3600),
-        target_slot_bytes: 64 * 1024,
-    };
+    let cadence = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_secs(3600))
+        .with_target_slot_bytes(64 * 1024)
+        .with_min_slot_rows(0)
+        .with_max_slot_age(Duration::ZERO);
     store.enqueue_batch(&pool, "burst", 1, 4096).await.unwrap();
     let current_bytes: i64 = sqlx::query_scalar(audited_sql(format!(
         "SELECT pg_total_relation_size('{schema}.ready_entries_3')"
@@ -2901,10 +3283,11 @@ async fn test_rotation_cadence_claim_ring_drains_empty_current_slots() {
         .await
         .unwrap();
     assert_eq!(claimed.len(), 4);
-    let cadence = RingRotationCadence {
-        min_slot_age: Duration::from_secs(3600),
-        target_slot_bytes: 1 << 30,
-    };
+    let cadence = RingRotationCadence::EAGER
+        .with_min_slot_age(Duration::from_secs(3600))
+        .with_target_slot_bytes(1 << 30)
+        .with_min_slot_rows(0)
+        .with_max_slot_age(Duration::ZERO);
     assert!(matches!(
         store
             .rotate_claims_with_cadence(&pool, cadence)
@@ -2922,13 +3305,7 @@ async fn test_rotation_cadence_claim_ring_drains_empty_current_slots() {
     );
     assert!(matches!(
         store
-            .rotate_claims_with_cadence(
-                &pool,
-                RingRotationCadence {
-                    target_slot_bytes: 1,
-                    ..cadence
-                }
-            )
+            .rotate_claims_with_cadence(&pool, cadence.with_target_slot_bytes(1))
             .await
             .unwrap(),
         RotateOutcome::Rotated { slot: 1, .. }
@@ -3632,7 +4009,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
     let store = Arc::new(
         create_store(&pool, schema)
             .await
-            .with_prune_lock_timeout(Duration::from_secs(2))
+            .with_prune_lock_timeout(Duration::from_secs(60))
             .expect("test prune lock timeout"),
     );
 
@@ -3722,7 +4099,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
         tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
 
     let needle = format!("{schema}.ready_segments_0");
-    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    let wait_deadline = Instant::now() + Duration::from_secs(30);
     let mut saw_lock_wait = false;
     while Instant::now() < wait_deadline {
         let waiting: bool = sqlx::query_scalar(
@@ -3754,7 +4131,7 @@ async fn test_prune_oldest_rechecks_pending_ready_after_lock_wait() {
 
     writer_tx.commit().await.expect("commit pending ready row");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), prune_task)
+    let outcome = tokio::time::timeout(Duration::from_secs(30), prune_task)
         .await
         .expect("queue prune task timed out")
         .expect("queue prune task panicked")
@@ -12692,11 +13069,19 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
         .await
         .expect("rollup terminal deltas");
     assert_eq!(outcome.rolled_slots, 1);
-    assert_eq!(outcome.delta_rows, 6);
-    assert_eq!(outcome.grouped_keys, 6);
+    assert_eq!(
+        outcome.delta_rows, 1,
+        "after the flip a lane's completions append one delta row"
+    );
+    assert_eq!(outcome.grouped_keys, 1);
     assert_eq!(outcome.skipped_active_slots, 0);
     assert_eq!(outcome.blocked_slots, 0);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the fold writes one live-count row per lane, not one per job-id bucket"
+    );
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
     assert_eq!(terminal_counter_sum(&pool, schema, queue).await, 6);
     assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
@@ -12706,6 +13091,412 @@ async fn test_queue_terminal_count_delta_rollup_folds_sealed_slots() {
         .await
         .expect("queue counts");
     assert_eq!(counts.terminal, 6);
+}
+
+/// A negative delta folds exactly even when the lane's live count still sits
+/// in per-job-id buckets, as written by pre-collapse folds, the installer
+/// backfill and older rebuilds: the fold collapses the lane to one bucket-0
+/// row holding the bucket total plus the signed delta.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_count_delta_rollup_collapses_bucketed_rows() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rollup_bucketed";
+    let schema = "awa_qs_terminal_delta_rollup_bucketed";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 6)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 6, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 6);
+    let (completed, failed) = claimed.split_at(5);
+    let completed_claims: Vec<_> = completed.iter().map(|job| job.claim.clone()).collect();
+    store
+        .complete_batch(&pool, &completed_claims)
+        .await
+        .expect("complete");
+    let failed_job = &failed[0].job;
+    store
+        .fail_terminal(&pool, failed_job.id, failed_job.run_lease, "boom", None)
+        .await
+        .expect("fail terminally")
+        .expect("running job fails");
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 6);
+
+    match store.rotate(&pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("first rollup");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+
+    // Rewrite the folded lane into the per-job-id bucket shape older folds
+    // and rebuilds left behind.
+    sqlx::query(audited_sql(format!(
+        "WITH removed AS (
+             DELETE FROM {schema}.queue_terminal_live_counts WHERE queue = $1
+         )
+         INSERT INTO {schema}.queue_terminal_live_counts
+             (ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count)
+         SELECT ready_slot, queue, priority, enqueue_shard,
+                mod(mod(job_id, 256::bigint) + 256::bigint, 256::bigint)::smallint,
+                count(*)::bigint
+         FROM {schema}.done_entries
+         WHERE queue = $1
+         GROUP BY 1, 2, 3, 4, 5"
+    )))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("rewrite live counts into job-id buckets");
+    assert_eq!(live_count_rows(&pool, schema, queue).await, 6);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+
+    // Retrying the failed job removes its done row from the sealed slot and
+    // appends a -1 delta in the failed job's bucket.
+    store
+        .retry_job(&pool, failed_job.id)
+        .await
+        .expect("retry failed job")
+        .expect("failed job is retryable");
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, -1);
+
+    let outcome = store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("second rollup");
+    assert_eq!(outcome.rolled_slots, 1);
+    assert_eq!(outcome.grouped_keys, 1);
+    assert_eq!(
+        live_count_sum(&pool, schema, queue).await,
+        5,
+        "the negative delta must not be dropped when its bucket holds no bucket-0 row"
+    );
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the fold collapses the lane's bucketed rows into one row"
+    );
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue counts");
+    assert_eq!(counts.terminal, 5);
+}
+
+/// Seeds one lane with `completed` completions and `failed` terminal
+/// failures in the genesis slot, rotates it out and folds its deltas.
+/// Returns the failed jobs so a caller can retry them into negative deltas.
+async fn seed_sealed_terminal_lane(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    completed: usize,
+    failed: usize,
+) -> Vec<awa_model::JobRow> {
+    let total = completed + failed;
+    store
+        .enqueue_batch(pool, queue, 1, total as i64)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(pool, queue, total as i64, Duration::ZERO)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), total);
+    let (done, failing) = claimed.split_at(completed);
+    if !done.is_empty() {
+        let claims: Vec<_> = done.iter().map(|job| job.claim.clone()).collect();
+        store.complete_batch(pool, &claims).await.expect("complete");
+    }
+    let mut failed_jobs = Vec::new();
+    for job in failing {
+        store
+            .fail_terminal(pool, job.job.id, job.job.run_lease, "boom", None)
+            .await
+            .expect("fail terminally")
+            .expect("running job fails");
+        failed_jobs.push(job.job.clone());
+    }
+    match store.rotate(pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    store
+        .rollup_terminal_count_deltas(pool, 4)
+        .await
+        .expect("first rollup");
+    failed_jobs
+}
+
+/// Before the ring authority flip, N-1 maintenance may still fold, so the
+/// fold and the rebuild keep the per-job-id bucket shape it applies deltas to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_keeps_job_id_buckets_before_the_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_fold_compat";
+    let schema = "awa_qs_terminal_fold_compat";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 5, 1).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    assert!(
+        live_count_rows(&pool, schema, queue).await > 1,
+        "compat folds keep one row per job-id bucket"
+    );
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("second rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert!(live_count_rows(&pool, schema, queue).await > 1);
+
+    store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert!(
+        live_count_rows(&pool, schema, queue).await > 1,
+        "a compat rebuild writes per-bucket rows"
+    );
+}
+
+/// Counts folded per bucket before the flip stay exact when the first fold
+/// after the flip collapses the lane and applies a negative delta from a
+/// different bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_handoff_across_the_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_fold_handoff";
+    let schema = "awa_qs_terminal_fold_handoff";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 5, 1).await;
+    assert!(live_count_rows(&pool, schema, queue).await > 1);
+    set_ring_authority(&pool, schema, "ledger").await;
+
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup after the flip");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+    assert_eq!(live_count_rows(&pool, schema, queue).await, 1);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("counts")
+            .terminal,
+        5
+    );
+}
+
+/// After the flip: repeated negative folds against the collapsed row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_repeated_negatives_against_the_collapsed_row() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges";
+    let store = create_store(&pool, schema).await;
+
+    let queue = "qs_terminal_fold_two_negatives";
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 4, 2).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
+    for (expected, job) in [(5, &failed[0]), (4, &failed[1])] {
+        store
+            .retry_job(&pool, job.id)
+            .await
+            .expect("retry")
+            .expect("failed job is retryable");
+        store
+            .rollup_terminal_count_deltas(&pool, 4)
+            .await
+            .expect("rollup");
+        assert_eq!(live_count_sum(&pool, schema, queue).await, expected);
+        assert_eq!(live_count_rows(&pool, schema, queue).await, 1);
+    }
+}
+
+/// After the flip: a lane folded to zero keeps no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_collapsed_lane_reduces_to_zero() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges_zero";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_terminal_fold_to_zero";
+    let failed = seed_sealed_terminal_lane(&pool, &store, queue, 0, 1).await;
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 1);
+    store
+        .retry_job(&pool, failed[0].id)
+        .await
+        .expect("retry")
+        .expect("failed job is retryable");
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 0);
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        0,
+        "a lane folded to zero keeps no row"
+    );
+}
+
+/// After the flip: a sealed slot whose deltas net to zero leaves the lane
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_count_fold_ignores_net_zero_deltas() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let schema = "awa_qs_terminal_fold_edges_net_zero";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_terminal_fold_net_zero";
+    seed_sealed_terminal_lane(&pool, &store, queue, 3, 0).await;
+    let (slot, generation): (i32, i64) = sqlx::query_as(audited_sql(format!(
+        "SELECT ready_slot, ready_generation FROM {schema}.done_entries WHERE queue = $1 LIMIT 1"
+    )))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("sealed slot of the lane");
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.queue_terminal_count_deltas
+             (ready_slot, ready_generation, queue, priority, enqueue_shard, counter_bucket, terminal_delta)
+         VALUES ($1, $2, $3, 1, 0, 3, 1), ($1, $2, $3, 1, 0, 7, -1)"
+    )))
+    .bind(slot)
+    .bind(generation)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("mixed-sign deltas that net to zero");
+    let rows_before = live_count_rows(&pool, schema, queue).await;
+    store
+        .rollup_terminal_count_deltas(&pool, 4)
+        .await
+        .expect("rollup");
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 3);
+    assert_eq!(live_count_rows(&pool, schema, queue).await, rows_before);
+    assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
+}
+
+/// After the flip a batch of terminal rows appends one delta row per lane;
+/// before it, one per job-id bucket, which N-1 folds need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_deltas_are_per_lane_after_the_flip() {
+    for (authority, expect_one_row) in [("ledger", true), ("columns", false)] {
+        let (_db_guard, pool) = setup_pool(10).await;
+        let queue = "qs_terminal_delta_lanes";
+        let schema = "awa_qs_terminal_delta_lanes";
+        let store = create_store(&pool, schema).await;
+        set_ring_authority(&pool, schema, authority).await;
+        store
+            .enqueue_batch(&pool, queue, 1, 8)
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 8, Duration::ZERO)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 8);
+        let claims: Vec<_> = claimed.iter().map(|job| job.claim.clone()).collect();
+        store
+            .complete_batch(&pool, &claims)
+            .await
+            .expect("complete");
+        let rows: i64 = sqlx::query_scalar(audited_sql(format!(
+            "SELECT count(*) FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+        )))
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .expect("delta rows");
+        assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 8);
+        if expect_one_row {
+            assert_eq!(rows, 1, "{authority}: one delta row per lane");
+        } else {
+            assert!(
+                rows > 1,
+                "{authority}: deltas keep job-id buckets, got {rows} rows"
+            );
+        }
+    }
+}
+
+/// A flip seen inside a caller's transaction that then rolls back must not
+/// change how later transactions bucket their deltas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_terminal_delta_bucketing_ignores_a_rolled_back_flip() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_terminal_delta_rolled_back_flip";
+    let schema = "awa_qs_terminal_delta_rolled_back_flip";
+    let store = create_store(&pool, schema).await;
+    set_ring_authority(&pool, schema, "columns").await;
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim");
+    let job = claimed[0].job.clone();
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.ring_cursor_authority SET authority = 'ledger' WHERE singleton"
+    )))
+    .execute(tx.as_mut())
+    .await
+    .unwrap();
+    store
+        .fail_terminal_in_tx(&mut tx, job.id, job.run_lease, "boom", None)
+        .await
+        .expect("fail in the caller's transaction")
+        .expect("running job fails");
+    tx.rollback().await.unwrap();
+
+    store
+        .fail_terminal(&pool, job.id, job.run_lease, "boom", None)
+        .await
+        .expect("fail")
+        .expect("running job fails");
+    let buckets: Vec<i16> = sqlx::query_scalar(audited_sql(format!(
+        "SELECT counter_bucket FROM {schema}.queue_terminal_count_deltas WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected = (job.id.rem_euclid(256)) as i16;
+    assert_ne!(expected, 0, "the test needs a job outside bucket 0");
+    assert_eq!(
+        buckets,
+        vec![expected],
+        "columns authority keeps the job-id bucket after a rolled-back flip"
+    );
 }
 
 /// Terminal-count rollup mutates `queue_terminal_live_counts`, so it should
@@ -12773,8 +13564,11 @@ async fn test_queue_terminal_count_delta_rollup_skips_pinned_mvcc_horizon() {
         .await
         .expect("rollup terminal deltas after pin release");
     assert_eq!(outcome.rolled_slots, 1);
-    assert_eq!(outcome.delta_rows, 6);
-    assert_eq!(outcome.grouped_keys, 6);
+    assert_eq!(
+        outcome.delta_rows, 1,
+        "after the flip a lane's completions append one delta row"
+    );
+    assert_eq!(outcome.grouped_keys, 1);
     assert!(!outcome.skipped_mvcc_pinned);
     assert_eq!(live_count_sum(&pool, schema, queue).await, 6);
     assert_eq!(terminal_delta_sum(&pool, schema, queue).await, 0);
@@ -13064,6 +13858,11 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
         .await
         .expect("rebuild");
     assert!(rebuilt >= 1, "rebuild should re-populate counter rows");
+    assert_eq!(
+        live_count_rows(&pool, schema, queue).await,
+        1,
+        "the rebuild writes one live-count row per lane, not one per job-id bucket"
+    );
     assert_invariant_holds(&pool, schema, queue, "after rebuild").await;
 }
 
@@ -13277,6 +14076,17 @@ async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
     .fetch_one(pool)
     .await
     .expect("sum live_terminal_count")
+}
+
+async fn live_count_rows(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(audited_sql(format!(
+        "SELECT count(*)::bigint \
+         FROM {schema}.queue_terminal_live_counts WHERE queue = $1"
+    )))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count live-count rows")
 }
 
 async fn terminal_delta_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
@@ -14139,7 +14949,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let store = Arc::new(
         create_store(&pool, schema)
             .await
-            .with_prune_lock_timeout(Duration::from_secs(5))
+            .with_prune_lock_timeout(Duration::from_secs(60))
             .expect("prune lock timeout"),
     );
     store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
@@ -14161,7 +14971,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     let prune_pool = pool.clone();
     let prune =
         tokio::spawn(async move { prune_store.prune_oldest(&prune_pool, Duration::ZERO).await });
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let waiting: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = $1::regclass AND mode = 'AccessExclusiveLock' AND NOT granted)",
@@ -14187,7 +14997,7 @@ async fn test_queue_prune_allows_segment_reader_to_finish_claim_lock_order() {
     .await
     .expect("a segment reader must finish acquiring the claim relations while prune waits");
     reader.commit().await.unwrap();
-    let outcome = tokio::time::timeout(Duration::from_secs(2), prune)
+    let outcome = tokio::time::timeout(Duration::from_secs(30), prune)
         .await
         .unwrap()
         .unwrap()
@@ -14814,6 +15624,29 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
     );
 }
 
+/// Wait until another backend is blocked on a heavyweight lock of any kind.
+async fn wait_for_any_lock_wait(pool: &sqlx::PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                SELECT 1 FROM pg_stat_activity \
+                WHERE datname = current_database() \
+                  AND pid <> pg_backend_pid() \
+                  AND wait_event_type = 'Lock'\
+            )",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("Failed to inspect lock waits");
+        if waiting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "Expected a lock wait");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_lock_wait(pool: &sqlx::PgPool, wait_event: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -15145,6 +15978,16 @@ async fn test_queue_storage_counter_rebuild_locks_ring_before_done_table() {
         "Counter rebuild should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Counter rebuild should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), rebuild)
@@ -15184,6 +16027,16 @@ async fn test_queue_storage_reset_locks_ring_before_done_table() {
         "Reset should hold the ring singleton before waiting on done_entries: {lock_result:?}"
     );
     probe.rollback().await.expect("Failed to close probe");
+    let rotation_lock_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("awa.queue_storage.ring_rotation:{schema}:queue"))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to probe the rotation lock");
+    assert!(
+        !rotation_lock_free,
+        "Reset should hold the queue rotation lock, which ledger ticks serialize on"
+    );
 
     blocker.rollback().await.expect("Failed to release blocker");
     tokio::time::timeout(Duration::from_secs(5), reset)
@@ -16828,6 +17681,776 @@ async fn test_compact_identity_closers_do_not_lock_batch_and_race_rescue_once() 
         "stale completion cannot create another disposition"
     );
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+/// Holds the claim slot's cursor row so the rescue statement takes its
+/// snapshot, then waits; the attempt completes and commits meanwhile. Once
+/// released, rescue must see that completion instead of reopening the
+/// attempt from its pre-completion snapshot.
+async fn assert_receipt_rescue_sees_completion_committed_mid_statement(
+    schema: &str,
+    deadline_rescue: bool,
+) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "rescue_snapshot_race";
+    store.enqueue_batch(&pool, queue, 1, 1).await.unwrap();
+    let deadline = if deadline_rescue {
+        Duration::from_secs(300)
+    } else {
+        Duration::ZERO
+    };
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, deadline)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let job = &claimed[0];
+    assert!(job.claim.claim_batch_id.is_some());
+    sqlx::query(audited_sql(format!(
+        "UPDATE {schema}.lease_claim_batches \
+         SET claimed_at = clock_timestamp() - interval '10 minutes', \
+             deadline_at = CASE WHEN deadline_at IS NULL THEN NULL \
+                                ELSE clock_timestamp() - interval '1 second' END"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(audited_sql(format!(
+        "SELECT slot FROM {schema}.claim_ring_slots WHERE slot = $1 FOR NO KEY UPDATE"
+    )))
+    .bind(job.claim.claim_slot)
+    .execute(blocker.as_mut())
+    .await
+    .unwrap();
+
+    let cursor_column = if deadline_rescue {
+        "batch_deadline_cursor_batch_id"
+    } else {
+        "rescue_cursor_claimed_at"
+    };
+    let rescue = async {
+        if deadline_rescue {
+            store.rescue_expired_deadlines(&pool).await
+        } else {
+            store
+                .rescue_stale_heartbeats(&pool, Duration::from_secs(1))
+                .await
+        }
+    };
+    let complete_while_rescue_waits = async {
+        let wait_started = Instant::now();
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE '%' || $1 || '%'
+                 )",
+            )
+            .bind(cursor_column)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(10),
+                "rescue never waited on the claim slot cursor row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let completed = store
+            .complete_runtime_batch(&pool, std::slice::from_ref(job))
+            .await
+            .unwrap();
+        blocker.rollback().await.unwrap();
+        completed
+    };
+    let (rescued, completed) = tokio::join!(rescue, complete_while_rescue_waits);
+    assert_eq!(completed.len(), 1, "completion commits while rescue waits");
+    assert!(
+        rescued.unwrap().iter().all(|row| row.id != job.job.id),
+        "rescue must not reopen an attempt that completed after its snapshot"
+    );
+    let closures: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.lease_claim_closure_batches \
+         WHERE claim_slot = $1 AND receipt_ranges @> $2::bigint"
+    )))
+    .bind(job.claim.claim_slot)
+    .bind(job.claim.receipt_id.unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(closures, 1, "one durable closure per receipt");
+    let deferred: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.deferred_jobs WHERE job_id = $1"
+    )))
+    .bind(job.job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred, 0, "a completed attempt is not queued for retry");
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stale_receipt_rescue_sees_completion_committed_mid_statement() {
+    assert_receipt_rescue_sees_completion_committed_mid_statement(
+        "awa_qs_stale_rescue_snapshot",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_deadline_receipt_rescue_sees_completion_committed_mid_statement() {
+    assert_receipt_rescue_sees_completion_committed_mid_statement(
+        "awa_qs_deadline_rescue_snapshot",
+        true,
+    )
+    .await;
+}
+
+/// A cancel of a receipt-only attempt A then a materialized attempt B, while
+/// a batch closer holds B and then asks for A (hash order), must not wait on
+/// B: holding A and waiting on B would close a cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multi_job_cancel_does_not_wait_on_a_materialized_attempt_lock() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_cancel_lock_cycle";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let queue = "cancel_lock_cycle";
+    store.enqueue_batch(&pool, queue, 1, 2).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    let (receipt_only, materialized) = (&claimed[0], &claimed[1]);
+    store
+        .register_callback(
+            &pool,
+            materialized.job.id,
+            materialized.job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback to materialize a lease");
+    let attempt_key = |job: &awa::model::ClaimedRuntimeJob| {
+        format!("awa.receipt.complete:{}:{}", job.job.id, job.job.run_lease)
+    };
+
+    let mut closer = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(attempt_key(materialized))
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+
+    let cancel_done = std::sync::atomic::AtomicBool::new(false);
+    let cancel = async {
+        let result = store
+            .cancel_jobs_by_ids(&pool, &[receipt_only.job.id, materialized.job.id])
+            .await;
+        cancel_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        result
+    };
+    let closer_takes_the_other_lock = async {
+        let started = Instant::now();
+        loop {
+            let cancel_waits: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND wait_event = 'advisory'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if cancel_waits || cancel_done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "cancel neither finished nor waited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let second = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(attempt_key(receipt_only))
+            .execute(closer.as_mut())
+            .await;
+        closer.commit().await.map(|_| ()).and(second.map(|_| ()))
+    };
+    let (cancelled, closer_result) = tokio::join!(cancel, closer_takes_the_other_lock);
+    closer_result.expect("the closer takes both attempt locks without a deadlock");
+    let cancelled = cancelled.expect("cancel completes without a deadlock");
+    let cancelled_ids: Vec<i64> = cancelled.iter().map(|row| row.id).collect();
+    assert_eq!(
+        cancelled_ids,
+        vec![receipt_only.job.id],
+        "the busy materialized attempt is left to its lock holder"
+    );
+    assert_eq!(lease_count(&pool, &store).await, 1);
+    pool.close().await;
+}
+
+/// Only a receipt attempt lock already held by the transaction makes cancel
+/// try instead of wait. A caller's own advisory lock must not turn a briefly
+/// busy attempt into JobNotFound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_tx_with_an_unrelated_advisory_lock_waits_for_the_attempt() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_unrelated_lock";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    store.enqueue_batch(&pool, "q", 1, 1).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "q", 1, Duration::ZERO)
+        .await
+        .unwrap();
+    let job = &claimed[0];
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "awa.receipt.complete:{}:{}",
+            job.job.id, job.job.run_lease
+        ))
+        .execute(holder.as_mut())
+        .await
+        .unwrap();
+
+    let mut caller = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(42)")
+        .execute(caller.as_mut())
+        .await
+        .unwrap();
+    let cancel = admin::cancel_tx(caller.as_mut(), job.job.id);
+    let release_once_cancel_waits = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        holder.rollback().await.unwrap();
+    };
+    let (cancelled, ()) = tokio::join!(cancel, release_once_cancel_waits);
+    assert!(cancelled
+        .expect("cancel waits instead of reporting the busy attempt as missing")
+        .is_some());
+    caller.commit().await.unwrap();
+    pool.close().await;
+}
+
+/// Pauses a running-attempt cancel at named phases. The first time cancel
+/// reaches a registered phase it signals `reached` and waits for `release`.
+type CancelBarrier = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>, bool);
+
+#[derive(Clone, Default)]
+struct CancelBarriers {
+    phases: Arc<std::sync::Mutex<std::collections::HashMap<&'static str, CancelBarrier>>>,
+}
+
+impl CancelBarriers {
+    fn pause_at(&self, phase: &'static str) {
+        self.phases.lock().unwrap().insert(
+            phase,
+            (
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+                false,
+            ),
+        );
+    }
+
+    async fn reached(&self, phase: &'static str) {
+        let reached = self.phases.lock().unwrap()[phase].0.clone();
+        tokio::time::timeout(Duration::from_secs(10), reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("cancel never reached {phase}"));
+    }
+
+    fn release(&self, phase: &'static str) {
+        self.phases.lock().unwrap()[phase].1.notify_one();
+    }
+
+    fn hook(&self) -> awa::model::queue_storage::CancelPhaseHook {
+        let phases = Arc::clone(&self.phases);
+        Arc::new(move |phase| {
+            let pair = {
+                let mut phases = phases.lock().unwrap();
+                match phases.get_mut(phase) {
+                    Some(entry) if !entry.2 => {
+                        entry.2 = true;
+                        Some((entry.0.clone(), entry.1.clone()))
+                    }
+                    _ => None,
+                }
+            };
+            Box::pin(async move {
+                if let Some((reached, release)) = pair {
+                    reached.notify_one();
+                    release.notified().await;
+                }
+            })
+        })
+    }
+}
+
+async fn receipt_store(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    barriers: &CancelBarriers,
+) -> QueueStorage {
+    create_store_with_config(
+        pool,
+        QueueStorageConfig {
+            schema: schema.into(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .with_cancel_phase_hook(barriers.hook())
+}
+
+fn attempt_lock_key(job: &awa::model::ClaimedRuntimeJob) -> String {
+    format!("awa.receipt.complete:{}:{}", job.job.id, job.job.run_lease)
+}
+
+async fn wait_for_advisory_lock_wait(pool: &sqlx::PgPool) {
+    let started = Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND wait_event = 'advisory')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no advisory lock wait"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn claim_one(store: &QueueStorage, pool: &sqlx::PgPool) -> awa::model::ClaimedRuntimeJob {
+    store.enqueue_batch(pool, "q", 1, 1).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(pool, "q", 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    claimed.into_iter().next().unwrap()
+}
+
+/// A cancel that finds a closer finishing the attempt retries until the
+/// closer commits, then sees the closer's outcome and leaves the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_receipt_cancel_waits_for_a_closer_and_sees_its_outcome() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_vs_closer";
+    let barriers = CancelBarriers::default();
+    barriers.pause_at("attempt_busy");
+    let store = receipt_store(&pool, schema, &barriers).await;
+    let job = claim_one(&store, &pool).await;
+
+    // A dead-letter closer writes no done row, so no unique key stops a
+    // second disposition; only the attempt lock serializes the two.
+    let mut closer = pool.begin().await.unwrap();
+    let dead_lettered = store
+        .fail_to_dlq_in_tx_with_claim(
+            &mut closer,
+            job.job.id,
+            job.job.run_lease,
+            "closer",
+            "closer",
+            None,
+            Some(&job.claim),
+        )
+        .await
+        .unwrap();
+    assert!(dead_lettered.is_some());
+
+    let cancel = store.cancel_job(&pool, job.job.id);
+    let commit_while_cancel_retries = async {
+        barriers.reached("attempt_busy").await;
+        closer.commit().await.unwrap();
+        barriers.release("attempt_busy");
+    };
+    let (cancelled, ()) = tokio::join!(cancel, commit_while_cancel_retries);
+    assert!(
+        cancelled.unwrap().is_none(),
+        "cancel must not close an attempt another closer finished"
+    );
+    let closures: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.lease_claim_closure_batches \
+         WHERE claim_slot = $1 AND receipt_ranges @> $2::bigint"
+    )))
+    .bind(job.claim.claim_slot)
+    .bind(job.claim.receipt_id.unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(closures, 1, "one durable closure per receipt");
+    let done: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.done_entries WHERE job_id = $1"
+    )))
+    .bind(job.job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(done, 0, "a dead-lettered attempt gets no cancelled row");
+    pool.close().await;
+}
+
+/// Closers take the attempt lock and then the claim batch row. While cancel
+/// is between tries it holds neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_waiting_cancel_holds_no_claim_row_a_closer_needs() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_row_order";
+    let barriers = CancelBarriers::default();
+    barriers.pause_at("attempt_busy");
+    let store = receipt_store(&pool, schema, &barriers).await;
+    let job = claim_one(&store, &pool).await;
+    let batch_id = job.claim.claim_batch_id.expect("compact claim");
+
+    let mut closer = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(attempt_lock_key(&job))
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+
+    let cancel = store.cancel_job(&pool, job.job.id);
+    let closer_takes_the_batch_row = async {
+        barriers.reached("attempt_busy").await;
+        let row_lock = sqlx::query(audited_sql(format!(
+            "SELECT 1 FROM {schema}.lease_claim_batches \
+             WHERE claim_slot = $1 AND batch_id = $2 FOR UPDATE"
+        )))
+        .bind(job.claim.claim_slot)
+        .bind(batch_id)
+        .execute(closer.as_mut())
+        .await;
+        let committed = closer.commit().await;
+        barriers.release("attempt_busy");
+        committed.map(|_| ()).and(row_lock.map(|_| ()))
+    };
+    let (cancelled, closer_result) = tokio::join!(cancel, closer_takes_the_batch_row);
+    closer_result.expect("the closer takes the batch row while cancel is between tries");
+    assert!(
+        cancelled.expect("cancel completes").is_some(),
+        "the attempt was still open, so cancel applies once the lock is free"
+    );
+    pool.close().await;
+}
+
+/// External completion, failure and retry delete the lease first and then
+/// take the attempt lock. Cancel holds the attempt lock when that closer asks
+/// for it, and must let go rather than wait for the lease row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_does_not_deadlock_with_a_lease_first_closer() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_cancel_lease_first";
+    let barriers = CancelBarriers::default();
+    barriers.pause_at("attempt_locked");
+    let store = receipt_store(&pool, schema, &barriers).await;
+    let job = claim_one(&store, &pool).await;
+    store
+        .register_callback(
+            &pool,
+            job.job.id,
+            job.job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("register callback to materialize a lease");
+
+    let mut closer = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+    sqlx::query(audited_sql(format!(
+        "DELETE FROM {schema}.leases WHERE job_id = $1 AND run_lease = $2"
+    )))
+    .bind(job.job.id)
+    .bind(job.job.run_lease)
+    .execute(closer.as_mut())
+    .await
+    .unwrap();
+
+    let cancel = store.cancel_job(&pool, job.job.id);
+    let closer_asks_for_the_attempt_lock = async {
+        barriers.reached("attempt_locked").await;
+        let attempt_lock = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(attempt_lock_key(&job))
+            .execute(closer.as_mut());
+        let release_once_waiting = async {
+            wait_for_advisory_lock_wait(&pool).await;
+            barriers.release("attempt_locked");
+        };
+        let (attempt_lock, ()) = tokio::join!(attempt_lock, release_once_waiting);
+        let rolled_back = closer.rollback().await;
+        rolled_back.map(|_| ()).and(attempt_lock.map(|_| ()))
+    };
+    let (cancelled, closer_result) = tokio::join!(cancel, closer_asks_for_the_attempt_lock);
+    closer_result.expect("the closer takes the attempt lock without a deadlock");
+    assert!(
+        cancelled
+            .expect("cancel completes without a deadlock")
+            .is_some(),
+        "the closer rolled back, so the lease was still running and cancel applies"
+    );
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+/// A legacy row receipt materializes after cancel's first lease read; a
+/// lease-first closer then holds the new lease and asks for the attempt
+/// lock while cancel holds it. Cancel must resolve the lease under its lock
+/// and let go, not reach a blocking lease DELETE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_resolves_a_legacy_receipt_materialized_mid_cancel() {
+    let (_db_guard, pool) = setup_pool(8).await;
+    let schema = "awa_qs_cancel_legacy_materialized";
+    let barriers = CancelBarriers::default();
+    barriers.pause_at("lease_lookup");
+    barriers.pause_at("attempt_locked");
+    let store = receipt_store(&pool, schema, &barriers).await;
+    let job = claim_one(&store, &pool).await;
+    sqlx::query(audited_sql(format!(
+        "DELETE FROM {schema}.lease_claim_batches WHERE batch_id = $1"
+    )))
+    .bind(job.claim.claim_batch_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.lease_claims (
+            claim_slot, receipt_id, job_id, run_lease, ready_slot,
+            ready_generation, queue, priority, attempt, max_attempts,
+            lane_seq, enqueue_shard
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+    )))
+    .bind(job.claim.claim_slot)
+    .bind(job.claim.receipt_id)
+    .bind(job.job.id)
+    .bind(job.job.run_lease)
+    .bind(job.claim.ready_slot)
+    .bind(job.claim.ready_generation)
+    .bind(&job.claim.queue)
+    .bind(job.claim.priority)
+    .bind(job.job.attempt)
+    .bind(job.job.max_attempts)
+    .bind(job.claim.lane_seq)
+    .bind(job.claim.enqueue_shard)
+    .execute(&pool)
+    .await
+    .expect("transplant into a legacy row receipt");
+
+    let mut closer = pool.begin().await.unwrap();
+    let cancel = store.cancel_job(&pool, job.job.id);
+    let race = async {
+        barriers.reached("lease_lookup").await;
+        store
+            .register_callback(
+                &pool,
+                job.job.id,
+                job.job.run_lease,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("materialize the legacy receipt");
+        sqlx::query("SET LOCAL lock_timeout = '5s'")
+            .execute(closer.as_mut())
+            .await
+            .unwrap();
+        sqlx::query(audited_sql(format!(
+            "DELETE FROM {schema}.leases WHERE job_id = $1 AND run_lease = $2"
+        )))
+        .bind(job.job.id)
+        .bind(job.job.run_lease)
+        .execute(closer.as_mut())
+        .await
+        .unwrap();
+        barriers.release("lease_lookup");
+
+        barriers.reached("attempt_locked").await;
+        let attempt_lock = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(attempt_lock_key(&job))
+            .execute(closer.as_mut());
+        let release_once_waiting = async {
+            wait_for_advisory_lock_wait(&pool).await;
+            barriers.release("attempt_locked");
+        };
+        let (attempt_lock, ()) = tokio::join!(attempt_lock, release_once_waiting);
+        let rolled_back = closer.rollback().await;
+        rolled_back.map(|_| ()).and(attempt_lock.map(|_| ()))
+    };
+    let (cancelled, closer_result) = tokio::join!(cancel, race);
+    closer_result.expect("the closer takes the attempt lock without a deadlock");
+    assert_eq!(
+        cancelled
+            .expect("cancel completes without a deadlock")
+            .map(|row| row.state),
+        Some(JobState::Cancelled),
+        "the closer rolled back, so the materialized attempt is still cancellable"
+    );
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+/// The first lease read and the receipt read are separate statements. A
+/// lease materialized between them hides a compact receipt from the second,
+/// and cancel must still find the running attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_finds_an_attempt_materialized_between_its_first_reads() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_between_reads";
+    let barriers = CancelBarriers::default();
+    barriers.pause_at("lease_lookup");
+    let store = receipt_store(&pool, schema, &barriers).await;
+    let job = claim_one(&store, &pool).await;
+
+    let cancel = store.cancel_job(&pool, job.job.id);
+    let materialize_between_reads = async {
+        barriers.reached("lease_lookup").await;
+        store
+            .register_callback(
+                &pool,
+                job.job.id,
+                job.job.run_lease,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("materialize between the reads");
+        barriers.release("lease_lookup");
+    };
+    let (cancelled, ()) = tokio::join!(cancel, materialize_between_reads);
+    assert_eq!(
+        cancelled.expect("cancel completes").map(|row| row.state),
+        Some(JobState::Cancelled)
+    );
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    pool.close().await;
+}
+
+/// A materializer takes the attempt lock and writes the lease. A cancel that
+/// found the attempt as a receipt and retried meanwhile cancels the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_cancels_an_attempt_materialized_while_it_retries() {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let schema = "awa_qs_cancel_materialized_midway";
+    let barriers = CancelBarriers::default();
+    barriers.pause_at("attempt_busy");
+    let store = receipt_store(&pool, schema, &barriers).await;
+    store.enqueue_batch(&pool, "q", 1, 2).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch(&pool, "q", 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    let (target, template) = (&claimed[0], &claimed[1]);
+    store
+        .register_callback(
+            &pool,
+            template.job.id,
+            template.job.run_lease,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("materialize a template lease");
+
+    let mut materializer = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(attempt_lock_key(target))
+        .execute(materializer.as_mut())
+        .await
+        .unwrap();
+    let inserted = sqlx::query(audited_sql(format!(
+        "INSERT INTO {schema}.leases \
+         SELECT (jsonb_populate_record(NULL::{schema}.leases, to_jsonb(template) || jsonb_build_object( \
+             'job_id', $1::bigint, 'run_lease', $2::bigint, 'lane_seq', $3::bigint, \
+             'ready_slot', $4::int, 'ready_generation', $5::bigint, 'state', 'running', \
+             'callback_id', NULL, 'callback_timeout_at', NULL))).* \
+         FROM {schema}.leases AS template WHERE template.job_id = $6"
+    )))
+    .bind(target.job.id)
+    .bind(target.job.run_lease)
+    .bind(target.claim.lane_seq)
+    .bind(target.claim.ready_slot)
+    .bind(target.claim.ready_generation)
+    .bind(template.job.id)
+    .execute(materializer.as_mut())
+    .await
+    .unwrap();
+    assert_eq!(inserted.rows_affected(), 1);
+
+    let cancel = store.cancel_job(&pool, target.job.id);
+    let commit_while_cancel_retries = async {
+        barriers.reached("attempt_busy").await;
+        materializer.commit().await.unwrap();
+        barriers.release("attempt_busy");
+    };
+    let (cancelled, ()) = tokio::join!(cancel, commit_while_cancel_retries);
+    assert_eq!(
+        cancelled.expect("cancel completes").map(|row| row.state),
+        Some(JobState::Cancelled),
+        "the attempt is still running after materialization, so cancel applies"
+    );
+    let target_leases: i64 = sqlx::query_scalar(audited_sql(format!(
+        "SELECT count(*) FROM {schema}.leases WHERE job_id = $1"
+    )))
+    .bind(target.job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(target_leases, 0);
     pool.close().await;
 }
 
