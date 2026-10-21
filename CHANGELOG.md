@@ -19,11 +19,13 @@ for each step.
   `awa storage prepare-queue` as the migrator before deploying, and grant the
   runtime role `USAGE, SELECT, UPDATE` on the lane sequences. Existing
   sequence positions are kept.
-- **The migration trust check can refuse a schema** (see Security). Before
-  upgrading, remove `TRIGGER` from runtime-role grants, which
-  `GRANT ALL ON ALL TABLES` includes, and remove triggers of your own from awa
-  tables. Revoking a 0.6 runtime's `CREATE` on the schema needs a short pause
-  of 0.6 producers and workers.
+- **`awa migrate` refuses to upgrade a schema another role could inject code
+  into** (see Security). Runtimes do not run this check, so an over-privileged
+  runtime role keeps working; only the migration is refused. Before upgrading,
+  remove `TRIGGER` from runtime-role grants, which `GRANT ALL ON ALL TABLES`
+  includes, remove runtime roles' `CREATE` on the schema, and remove triggers
+  of your own from awa tables. Revoking a running 0.6 fleet's `CREATE` needs
+  the order in the upgrade guide.
 - **External migration runners.** Generate the pending SQL with an upgraded
   binary, for example `awa migrate --pending --extract-to ./pending`, apply
   complete bundles, and keep the files already applied unchanged. Apply
