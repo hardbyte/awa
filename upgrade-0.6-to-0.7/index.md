@@ -133,6 +133,54 @@ For example, extract with `awa migrate --pending --extract-to ./pending-migratio
 into a new directory. Execute complete generated bundles; individual discovery
 tail files in the repository do not include their bootstrap prerequisites.
 
+## v050: one lane index per ready partition
+
+v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every `ready_entries`
+partition in the default schema and in the custom schemas that
+`awa.queue_storage_schemas()` selects (see
+[Custom-schema discovery](#custom-schema-discovery-during-migration)); other
+schemas keep their indexes. The partition primary
+key `(ready_slot, queue, priority, enqueue_shard, lane_seq)` serves every
+per-lane lookup because current binaries pin `ready_slot` in claims, in the
+queue prune and terminal-count fold gates, and in the maintenance lag gauge
+(through `ready_segments`).
+
+What the migration locks: it redefines `awa.install_queue_storage_substrate`
+(no schema is reinstalled) and then drops the indexes in slot order. Each
+`DROP INDEX` takes ACCESS EXCLUSIVE on its `ready_entries` partition and holds
+it until the migration transaction commits, so enqueues and claims touching
+that partition wait for the commit. No rows are scanned or rewritten; on a
+scratch PostgreSQL 17 database with 409,600 ready rows the whole 49 → 50 step
+took 27 ms. When the session has no `lock_timeout`, the migration sets a 2 s
+timeout for each lock acquisition. It bounds each wait, not the total
+migration time: every lock already taken is kept until commit, so a
+migration that waits on several partitions holds the earlier ones meanwhile.
+"Only ready partitions" describes the application tables it locks; the drop
+also locks the dropped indexes and the catalog rows it changes. If an
+acquisition times out (SQLSTATE `55P03`, typically behind a long-running read
+of `awa.jobs` or a backup) the error names the partition, the whole migration
+rolls back, and it can simply be re-run. Locks taken are held until commit,
+about 60 per 16-slot schema, so a database with hundreds of queue-storage
+schemas may need a larger `max_locks_per_transaction` for this step.
+`queue_counts_exact`, which filters ready rows by queue across every slot,
+seq-scans the ready partitions on PostgreSQL 17 without the index; at
+200,000 ready rows across 20 queues it measured 177 ms against 136 ms. External runners apply the complete
+generated `awa migrate --sql --from 49 --to 50` bundle.
+
+Rollout order: current binaries' SQL works with or without the index, so
+producers and workers without a readiness gate can roll before the
+migration. Health-gated workers cannot: `/readyz` reports a worker ready only
+once the schema reaches the binary's version, so a v050 worker on a v049
+schema stays unready and a readiness-gated rollout stalls before its
+migration step. For those, migrate first. Pre-v050 binaries keep working
+against a v050 schema, but on PostgreSQL 17 and earlier their maintenance lag
+gauge, queue prune gate and terminal-count fold gate fall back to sequential
+scans of every ready partition until they are replaced (PostgreSQL 18 can
+skip-scan the primary key), so keep that window short. Rolling back a binary is
+therefore safe for correctness; to restore the old binary's query plans,
+recreate the index per partition with
+`CREATE INDEX CONCURRENTLY idx_<schema>_ready_<slot>_lane_shard ON <schema>.ready_entries_<slot> (queue, priority, enqueue_shard, lane_seq)`.
+
 ## Terminal live counts: one row per lane
 
 After the ring authority flip, runtimes fold sealed-slot terminal-count deltas
