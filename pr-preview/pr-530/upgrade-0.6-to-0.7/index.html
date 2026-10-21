@@ -1477,6 +1477,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#terminal-live-counts-one-row-per-lane" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Terminal live counts: one row per lane
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2327,6 +2338,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#terminal-live-counts-one-row-per-lane" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Terminal live counts: one row per lane
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2644,6 +2666,19 @@ their historical files or reset checksum records to accept changed contents.
 For example, extract with <code>awa migrate --pending --extract-to ./pending-migrations</code>
 into a new directory. Execute complete generated bundles; individual discovery
 tail files in the repository do not include their bootstrap prerequisites.</p>
+<h2 id="terminal-live-counts-one-row-per-lane">Terminal live counts: one row per lane<a class="headerlink" href="#terminal-live-counts-one-row-per-lane" title="Permanent link">&para;</a></h2>
+<p>After the ring authority flip, runtimes fold sealed-slot terminal-count deltas
+into one <code>queue_terminal_live_counts</code> row per <code>(ready_slot, queue, priority,
+enqueue_shard)</code> with <code>counter_bucket = 0</code>, and <code>rebuild_terminal_counters</code>
+writes the same shape. The first fold after the flip collapses every bucket of a
+lane it touches and adds the signed delta, so rows left in per-job-id buckets by
+earlier folds, the installer backfill or the v027 rebuild stay exact. No
+migration is involved and readers sum every bucket either way.</p>
+<p>Before the flip, 0.6 runtimes can still hold the maintenance election and fold
+into job-id buckets, so this release keeps that shape in its own folds and
+rebuilds until the flip fences them. Exact terminal counts stay exact through a
+mixed-version rollout and through a rollback before the flip; no operator action
+is needed.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
