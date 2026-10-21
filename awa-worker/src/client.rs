@@ -62,6 +62,8 @@ pub enum BuildError {
     InvalidDlqBatchSize,
     #[error("terminal_count_rollup_interval must be > 0")]
     InvalidTerminalCountRollupInterval,
+    #[error("heartbeat_interval must be > 0")]
+    InvalidHeartbeatInterval,
     #[error("invalid queue storage config: {0}")]
     InvalidQueueStorage(String),
     #[error("invalid AWA_HEALTH_ADDR '{0}': expected a socket address like 0.0.0.0:8321")]
@@ -146,6 +148,7 @@ pub struct ClientBuilder {
     >,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
+    defer_first_heartbeat: bool,
     promote_interval: Duration,
     heartbeat_rescue_interval: Option<Duration>,
     heartbeat_staleness: Option<Duration>,
@@ -208,6 +211,7 @@ impl ClientBuilder {
             enqueue_specs: HashMap::new(),
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
+            defer_first_heartbeat: false,
             promote_interval: Duration::from_millis(250),
             heartbeat_rescue_interval: None,
             heartbeat_staleness: None,
@@ -737,9 +741,27 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the heartbeat interval (default: 30s).
+    /// Set the heartbeat interval (default: 30s). Must be greater than zero.
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Defer an attempt's first heartbeat by up to half an interval from its
+    /// claim (default: off). The claim stamp covers the attempt until then,
+    /// so attempts shorter than the deferral write no heartbeat at all.
+    ///
+    /// The cost is pause tolerance for a fresh attempt: its first heartbeat
+    /// is tried up to `deferral + interval` after the claim instead of within
+    /// one interval, so a stalled first pass, for example one waiting for a
+    /// pool connection, is survived for about `staleness - interval -
+    /// deferral` instead of `staleness - interval` (45 s instead of 60 s at
+    /// 30 s / 90 s), less whatever earlier passes consume. Applies only when
+    /// `heartbeat_staleness` is at least three intervals, and shrinks as
+    /// recent passes slow down. Use the same heartbeat settings on every
+    /// runtime: rescue applies the elected leader's staleness.
+    pub fn defer_first_heartbeat(mut self, enabled: bool) -> Self {
+        self.defer_first_heartbeat = enabled;
         self
     }
 
@@ -1105,6 +1127,9 @@ impl ClientBuilder {
         {
             return Err(BuildError::InvalidTerminalCountRollupInterval);
         }
+        if self.heartbeat_interval.is_zero() {
+            return Err(BuildError::InvalidHeartbeatInterval);
+        }
 
         // Validate weighted mode constraints
         let overflow_pool = if let Some(global_max) = self.global_max_workers {
@@ -1179,6 +1204,7 @@ impl ClientBuilder {
             enqueue_specs: Arc::new(self.enqueue_specs),
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
+            defer_first_heartbeat: self.defer_first_heartbeat,
             promote_interval: self.promote_interval,
             heartbeat_rescue_interval: self.heartbeat_rescue_interval,
             heartbeat_staleness: self.heartbeat_staleness,
@@ -1279,6 +1305,7 @@ pub struct Client {
     >,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
+    defer_first_heartbeat: bool,
     promote_interval: Duration,
     heartbeat_rescue_interval: Option<Duration>,
     heartbeat_staleness: Option<Duration>,
@@ -1818,7 +1845,12 @@ impl Client {
             self.pool.clone(),
             self.storage.clone(),
             self.in_flight.clone(),
-            self.heartbeat_interval,
+            crate::heartbeat::HeartbeatCadence::new(
+                self.heartbeat_interval,
+                self.heartbeat_staleness
+                    .unwrap_or(crate::maintenance::DEFAULT_HEARTBEAT_STALENESS),
+            )
+            .with_first_heartbeat_deferral(self.defer_first_heartbeat),
             self.heartbeat_alive.clone(),
             self.service_cancel.clone(),
             self.metrics.clone(),
@@ -3414,6 +3446,15 @@ mod tests {
             .build();
 
         assert!(matches!(result, Err(BuildError::InvalidDlqBatchSize)));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_interval_must_be_positive() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .heartbeat_interval(Duration::ZERO)
+            .build();
+        assert!(matches!(result, Err(BuildError::InvalidHeartbeatInterval)));
     }
 
     #[tokio::test]
