@@ -5483,6 +5483,12 @@ impl QueueStorage {
         self.append_terminal_count_deltas_tx(tx, by_group).await
     }
 
+    /// Append terminal-count deltas. Before the ring authority flip they keep
+    /// their job-id bucket, because N-1 maintenance folds each delta into the
+    /// bucket of the original row; after it, folds collapse each lane, so the
+    /// statement writes one row per lane. The authority is read inside the
+    /// statement, so the choice follows the caller's transaction, including a
+    /// flip made and rolled back in it.
     async fn append_terminal_count_deltas_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5491,7 +5497,6 @@ impl QueueStorage {
         if by_group.is_empty() {
             return Ok(());
         }
-
         let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
         let mut ready_generations: Vec<i64> = Vec::with_capacity(by_group.len());
         let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
@@ -5519,6 +5524,16 @@ impl QueueStorage {
         let schema = self.schema();
         sqlx::query(audited_sql(format!(
             r#"
+            WITH authority AS (
+                SELECT COALESCE(
+                    (
+                        SELECT authority = 'ledger'
+                        FROM {schema}.ring_cursor_authority
+                        WHERE singleton = TRUE
+                    ),
+                    FALSE
+                ) AS per_lane
+            )
             INSERT INTO {schema}.queue_terminal_count_deltas (
                 ready_slot,
                 ready_generation,
@@ -5529,13 +5544,13 @@ impl QueueStorage {
                 terminal_delta
             )
             SELECT
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                enqueue_shard,
-                counter_bucket,
-                terminal_delta
+                d.ready_slot,
+                d.ready_generation,
+                d.queue,
+                d.priority,
+                d.enqueue_shard,
+                CASE WHEN authority.per_lane THEN 0::smallint ELSE d.counter_bucket END,
+                sum(d.terminal_delta)::bigint
             FROM unnest(
                 $1::int[],
                 $2::bigint[],
@@ -5553,13 +5568,10 @@ impl QueueStorage {
                 counter_bucket,
                 terminal_delta
             )
-            ORDER BY
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                enqueue_shard,
-                counter_bucket
+            CROSS JOIN authority
+            GROUP BY 1, 2, 3, 4, 5, 6
+            HAVING sum(d.terminal_delta) <> 0
+            ORDER BY 1, 2, 3, 4, 5, 6
             "#
         )))
         .bind(&ready_slots)
