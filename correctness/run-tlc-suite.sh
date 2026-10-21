@@ -42,6 +42,9 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Dea
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
 AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrder.cfg              ;; pass ;; segment-first queue prune with NOWAIT tail
 AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrderBlocking.cfg      ;; NoDeadlock is violated ;; old queue prune versus segment-first claim witness
+AwaStorageLockOrder.tla        ;; AwaWholeSchemaLockOrder.cfg             ;; pass ;; counter rebuild and reset take rotation locks before tables
+AwaStorageLockOrder.tla        ;; AwaWholeSchemaLockOrderRebuildUnordered.cfg ;; NoDeadlock is violated ;; rebuild without rotation lock versus ledger prune witness
+AwaStorageLockOrder.tla        ;; AwaWholeSchemaLockOrderResetUnordered.cfg ;; NoDeadlock is violated ;; reset without rotation locks versus ledger prune witness
 AwaRotationCadence.tla        ;; AwaRotationCadence.cfg                 ;; pass ;; observed fill age and eventual drain under stable leadership
 AwaRotationCadence.tla        ;; AwaRotationCadencePhysicalEmpty.cfg    ;; EmptyNeverWaits is violated ;; allocated empty lease heap witness
 AwaRotationCadence.tla        ;; AwaRotationCadenceOldClock.cfg         ;; YoungSmallSlotStaysOpen is violated ;; old slot timestamp witness
@@ -53,8 +56,6 @@ AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrder.cfg            ;; pass
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrderBroken.cfg      ;; NoDeadlock is violated ;; old retry lane-before-claim witness
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKey.cfg             ;; pass ;; unique claims in key order
 AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKeyBroken.cfg       ;; NoDeadlock is violated ;; reversed batch key-order witness
-AwaUniqueClaimLockOrder.tla    ;; AwaCounterRebuildLockOrder.cfg         ;; pass ;; ring singleton before terminal table
-AwaUniqueClaimLockOrder.tla    ;; AwaCounterRebuildLockOrderBroken.cfg   ;; NoDeadlock is violated ;; old rebuild order witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + 0.7 migrate gate
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence

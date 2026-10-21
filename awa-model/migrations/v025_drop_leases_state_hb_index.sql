@@ -17,13 +17,6 @@
 -- millions), so the seq scan is cheap enough that dropping the index
 -- is the right global trade-off.
 --
--- Discovery uses the same AWA sentinel as v024
--- (`apply_receipt_plane_fillfactor`): a schema is an AWA substrate
--- iff `<schema>.claim_ready_runtime(text, bigint, double precision,
--- double precision)` exists. This stays inside AWA's ownership
--- boundary; unrelated app-owned schemas with `leases` tables are not
--- touched.
---
 -- v023's install helper has been updated to not create the index on
 -- fresh installs, so this migration plus future `prepare_schema`
 -- calls keep the database state coherent.
@@ -35,16 +28,7 @@ DECLARE
     v_slot TEXT;
 BEGIN
     FOR v_schema IN
-        SELECT n.nspname
-        FROM pg_namespace AS n
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS awa_p
-              WHERE awa_p.pronamespace = n.oid
-                AND awa_p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(awa_p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
-          )
+        SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered
     LOOP
         IF to_regclass(format('%I.leases', v_schema)) IS NULL THEN
             CONTINUE;

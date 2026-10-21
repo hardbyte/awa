@@ -111,33 +111,9 @@ DO $$
 DECLARE
     v_schema TEXT;
 BEGIN
-    -- Discover every schema that holds an AWA queue-storage substrate.
-    -- Matching just "has a partitioned `leases` table" would step on
-    -- unrelated app-owned schemas that happen to share the name, so
-    -- the gating sentinel is `awa.claim_ready_runtime` with the
-    -- AWA-specific signature — the same shape
-    -- `awa_model::storage::queue_storage_schema_ready` uses to identify
-    -- an AWA substrate. The install helper creates that function in
-    -- every substrate; no other code path does. This is broader than
-    -- reading `awa.runtime_storage_backends` (active backend only) or
-    -- `awa.storage_transition_state.details->>'schema'` (prepared
-    -- schema only during an in-flight transition), but stays inside
-    -- AWA's ownership boundary.
     FOR v_schema IN
-        SELECT n.nspname
-        FROM pg_namespace AS n
-        WHERE has_schema_privilege(current_user, n.oid, 'USAGE')
-          AND EXISTS (
-              SELECT 1 FROM pg_proc AS awa_p
-              WHERE awa_p.pronamespace = n.oid
-                AND awa_p.proname = 'claim_ready_runtime'
-                AND oidvectortypes(awa_p.proargtypes)
-                    = 'text, bigint, double precision, double precision'
-          )
+        SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered
     LOOP
-        -- The helper itself re-checks the sentinel and verifies the
-        -- partitioned `leases` / `lease_claims` exist before doing
-        -- anything, so this loop is safe to be liberal.
         PERFORM awa.apply_receipt_plane_fillfactor(v_schema);
     END LOOP;
 END

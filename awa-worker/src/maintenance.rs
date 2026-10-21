@@ -3535,23 +3535,36 @@ impl MaintenanceService {
                         AS lag_seconds
                 FROM head_signal
                 JOIN LATERAL (
-                    SELECT ready.run_at
-                    FROM {schema}.ready_entries AS ready
-                    WHERE ready.queue = head_signal.queue
-                      AND ready.priority = head_signal.priority
-                      AND ready.enqueue_shard = head_signal.enqueue_shard
-                      AND ready.lane_seq >= head_signal.claim_seq
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.ready_tombstones AS tomb
-                          WHERE tomb.ready_slot = ready.ready_slot
-                            AND tomb.ready_generation = ready.ready_generation
-                            AND tomb.queue = ready.queue
-                            AND tomb.priority = ready.priority
-                            AND tomb.enqueue_shard = ready.enqueue_shard
-                            AND tomb.lane_seq = ready.lane_seq
-                      )
-                    ORDER BY ready.lane_seq
+                    SELECT next_in_segment.run_at
+                    FROM {schema}.ready_segments AS segment
+                    CROSS JOIN LATERAL (
+                        SELECT ready.run_at
+                        FROM {schema}.ready_entries AS ready
+                        WHERE ready.ready_slot = segment.ready_slot
+                          AND ready.ready_generation = segment.ready_generation
+                          AND ready.queue = segment.queue
+                          AND ready.priority = segment.priority
+                          AND ready.enqueue_shard = segment.enqueue_shard
+                          AND ready.lane_seq >= GREATEST(segment.first_lane_seq, head_signal.claim_seq)
+                          AND ready.lane_seq < segment.next_lane_seq
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.ready_tombstones AS tomb
+                              WHERE tomb.ready_slot = ready.ready_slot
+                                AND tomb.ready_generation = ready.ready_generation
+                                AND tomb.queue = ready.queue
+                                AND tomb.priority = ready.priority
+                                AND tomb.enqueue_shard = ready.enqueue_shard
+                                AND tomb.lane_seq = ready.lane_seq
+                          )
+                        ORDER BY ready.lane_seq
+                        LIMIT 1
+                    ) AS next_in_segment
+                    WHERE segment.queue = head_signal.queue
+                      AND segment.priority = head_signal.priority
+                      AND segment.enqueue_shard = head_signal.enqueue_shard
+                      AND segment.next_lane_seq > head_signal.claim_seq
+                    ORDER BY segment.next_lane_seq
                     LIMIT 1
                 ) AS next_ready ON TRUE
                 GROUP BY head_signal.queue

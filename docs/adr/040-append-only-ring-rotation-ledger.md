@@ -122,10 +122,14 @@ function and the Rust rotate/prune seams branch on it.
   be flip-aware.
 - **Lock discipline & the authority-read ordering.** The compat serializer is the
   singleton `FOR UPDATE`; the ledger serializer is the per-ring advisory lock.
-  A rotator takes the singleton **before** reading the authority (and the flip
-  takes all three singletons), which closes a TOCTOU where a rotator reads
+  A rotator reads the authority first. Under `ledger` that reading is final,
+  because the flip is one-way, so it takes only the advisory lock. Under
+  `columns` it takes the singleton and re-reads the authority under it (the
+  flip takes all three singletons), which closes a TOCTOU where a rotator reads
   `columns`, the flip commits, and the rotator then advances under the stale
-  discipline. `AwaStorageLockOrder.tla` models both disciplines, the flip action,
+  discipline: a rotator that queued behind the flip re-reads `ledger` and
+  try-locks the advisory lock instead. Counter rebuild and reset wait for the
+  per-ring advisory locks before the singletons and their table locks. `AwaStorageLockOrder.tla` models both disciplines, the flip action,
   and a `MixedFleet` invariant (no ring advanced under both disciplines at once);
   the compat-mode singleton churn is a documented, bounded transition-mode
   exemption in `AwaDeadTupleContract.tla`.

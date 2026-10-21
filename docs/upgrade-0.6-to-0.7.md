@@ -23,6 +23,178 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
+## Custom-schema discovery during migration
+
+Migration bundles discover custom substrates using catalog metadata without
+evaluating their views or functions. Schemas, relations, routines and types
+must belong to the effective migration role or the owner of the `awa` schema.
+Sequences may belong to another role, because they run no code.
+The claim allocator signature must exist and ring-state relations must be
+ordinary tables. `public`, `information_schema` and `pg_*` are excluded.
+
+Only those same owners may hold schema `CREATE` or table `TRIGGER` privileges.
+Every trigger in the schema must be one awa installs, with exactly the
+definition awa gives it. A trigger needs only the `TRIGGER` privilege to
+create or replace, and its `WHEN` clause or arguments can run code that no
+catalog dependency records, so an added or altered trigger, including one of
+your own on an awa table, makes the schema untrusted. This prevents an
+outsider from planting another object in an otherwise owned substrate, or
+racing discovery with new objects. Role membership alone does not establish
+trust, and superusers do not bypass these checks.
+
+Unregistered unsafe custom schemas are skipped. Unsafe registered or prepared
+targets abort the pending bundle, so the global version cannot advance while
+leaving a configured substrate behind. Registry and transition references are
+checked separately; unnamed legacy prepared targets also check `awa_exp`.
+Use an explicit schema in transition metadata to disambiguate that legacy case.
+Unsafe ownership or privileges in the default `awa` schema abort before the
+installer runs. Use a dedicated owner role consistently, including `SET ROLE`
+when connecting through a different login.
+Review separately owned objects, remove triggers awa did not install, and remove untrusted creation/trigger grants
+before migrating; a blanket role grant is not a substitute for this review.
+
+A refused migration names the schema and up to five offending objects with the
+rule each breaks, for example `relation awa.jobs_hot TRIGGER granted to
+awa_runtime`. Nothing is applied. An unregistered schema that fails the check is
+reported as a warning (`skipping untrusted queue-storage schema`) and left at
+its current version. The common causes and their fixes, run as the `awa`
+schema owner:
+
+- **`GRANT ALL ON ALL TABLES` to the runtime role.** `ALL` includes `TRIGGER`.
+  Grant the documented privileges instead, and fix default privileges the same
+  way:
+
+  ```sql
+  REVOKE TRIGGER, REFERENCES ON ALL TABLES IN SCHEMA awa FROM awa_runtime;
+  ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
+    REVOKE TRIGGER, REFERENCES ON TABLES FROM awa_runtime;
+  ```
+
+- **A 0.6 split-role install whose runtime holds `CREATE` on the schema.** 0.6
+  runtimes created lane sequences themselves, so they needed `CREATE`.
+  Sequences they own are accepted; the `CREATE` grant is not, because it lets
+  the runtime add objects while a migration runs. Until the migration refreshes
+  them, the 0.6 lane helpers and enqueue-head triggers run
+  `CREATE SEQUENCE IF NOT EXISTS` on every reservation, and that checks
+  `CREATE` even for a sequence that exists, so revoking the grant makes running
+  0.6 producers and workers fail with `42501` until the migration commits.
+  Provisioning lanes in advance does not avoid this. Take a short pause:
+
+  1. Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
+     enqueue or claim runs.
+  2. Revoke the grant and commit:
+
+     ```sql
+     REVOKE CREATE ON SCHEMA awa FROM awa_runtime;
+     ```
+
+  3. Run `awa migrate` as the migrator. The bundle refreshes the lane helpers
+     to use provisioned sequences without `CREATE` (v049).
+  4. Provision any lanes the 0.7 runtimes will need, as the migrator:
+
+     ```bash
+     PGOPTIONS='-c role=awa_owner' \
+       awa --database-url "$AWA_MIGRATOR_DATABASE_URL" storage prepare-queue \
+       --queue <queue> --enqueue-shards <n>
+     ```
+
+  5. Start the 0.7 runtimes.
+
+  An uninterrupted path would need the revoke and the helper refresh to become
+  visible to every session at once; that has not been verified, so do not
+  combine them into one transaction as a substitute for the pause.
+
+- **A custom schema prepared by a runtime or another role.** A worker that
+  auto-prepares a schema, or a DBA who ran the preparation as another user,
+  leaves it owned by that role. Transfer the schema and every object the error
+  lists to the `awa` schema owner, for example
+  `ALTER SCHEMA tenant_qs OWNER TO awa_owner` and `ALTER TABLE ... OWNER TO`,
+  `ALTER FUNCTION ... OWNER TO` for each listed object. If the runtime and the
+  migrator are deliberately the same role, connect the migration as that role.
+
+### Existing migration history and external runners
+
+The built-in runner records migration versions, descriptions and application times;
+it does not store SQL checksums or automatically rerun applied steps. These security
+checks harden pending historical discovery loops, because an appended migration
+would execute after those loops had already inspected untrusted objects. Standalone
+steps receive only the small discovery bootstrap, without redefining the installer.
+
+An already-current database has no pending discovery loop and does not run this
+bootstrap; it need not receive the internal helper until a later bundle uses it. No new
+schema version or runtime capability is introduced. Older binaries and previously
+exported SQL retain the old behavior: use an updated binary and regenerate the
+**pending** SQL bundle for upgrades. For external runners that track checksums,
+preserve files already applied and generate a new pending bundle; do not overwrite
+their historical files or reset checksum records to accept changed contents.
+For example, extract with `awa migrate --pending --extract-to ./pending-migrations`
+into a new directory. Execute complete generated bundles; individual discovery
+tail files in the repository do not include their bootstrap prerequisites.
+
+## v050: one lane index per ready partition
+
+v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every `ready_entries`
+partition in the default schema and in the custom schemas that
+`awa.queue_storage_schemas()` selects (see
+[Custom-schema discovery](#custom-schema-discovery-during-migration)); other
+schemas keep their indexes. The partition primary
+key `(ready_slot, queue, priority, enqueue_shard, lane_seq)` serves every
+per-lane lookup because current binaries pin `ready_slot` in claims, in the
+queue prune and terminal-count fold gates, and in the maintenance lag gauge
+(through `ready_segments`).
+
+What the migration locks: it redefines `awa.install_queue_storage_substrate`
+(no schema is reinstalled) and then drops the indexes in slot order. Each
+`DROP INDEX` takes ACCESS EXCLUSIVE on its `ready_entries` partition and holds
+it until the migration transaction commits, so enqueues and claims touching
+that partition wait for the commit. No rows are scanned or rewritten; on a
+scratch PostgreSQL 17 database with 409,600 ready rows the whole 49 → 50 step
+took 27 ms. When the session has no `lock_timeout`, the migration sets a 2 s
+timeout for each lock acquisition. It bounds each wait, not the total
+migration time: every lock already taken is kept until commit, so a
+migration that waits on several partitions holds the earlier ones meanwhile.
+"Only ready partitions" describes the application tables it locks; the drop
+also locks the dropped indexes and the catalog rows it changes. If an
+acquisition times out (SQLSTATE `55P03`, typically behind a long-running read
+of `awa.jobs` or a backup) the error names the partition, the whole migration
+rolls back, and it can simply be re-run. Locks taken are held until commit,
+about 60 per 16-slot schema, so a database with hundreds of queue-storage
+schemas may need a larger `max_locks_per_transaction` for this step.
+`queue_counts_exact`, which filters ready rows by queue across every slot,
+seq-scans the ready partitions on PostgreSQL 17 without the index; at
+200,000 ready rows across 20 queues it measured 177 ms against 136 ms. External runners apply the complete
+generated `awa migrate --sql --from 49 --to 50` bundle.
+
+Rollout order: current binaries' SQL works with or without the index, so
+producers and workers without a readiness gate can roll before the
+migration. Health-gated workers cannot: `/readyz` reports a worker ready only
+once the schema reaches the binary's version, so a v050 worker on a v049
+schema stays unready and a readiness-gated rollout stalls before its
+migration step. For those, migrate first. Pre-v050 binaries keep working
+against a v050 schema, but on PostgreSQL 17 and earlier their maintenance lag
+gauge, queue prune gate and terminal-count fold gate fall back to sequential
+scans of every ready partition until they are replaced (PostgreSQL 18 can
+skip-scan the primary key), so keep that window short. Rolling back a binary is
+therefore safe for correctness; to restore the old binary's query plans,
+recreate the index per partition with
+`CREATE INDEX CONCURRENTLY idx_<schema>_ready_<slot>_lane_shard ON <schema>.ready_entries_<slot> (queue, priority, enqueue_shard, lane_seq)`.
+
+## Terminal live counts: one row per lane
+
+After the ring authority flip, runtimes fold sealed-slot terminal-count deltas
+into one `queue_terminal_live_counts` row per `(ready_slot, queue, priority,
+enqueue_shard)` with `counter_bucket = 0`, and `rebuild_terminal_counters`
+writes the same shape. The first fold after the flip collapses every bucket of a
+lane it touches and adds the signed delta, so rows left in per-job-id buckets by
+earlier folds, the installer backfill or the v027 rebuild stay exact. No
+migration is involved and readers sum every bucket either way.
+
+Before the flip, 0.6 runtimes can still hold the maintenance election and fold
+into job-id buckets, so this release keeps that shape in its own folds and
+rebuilds until the flip fences them. Exact terminal counts stay exact through a
+mixed-version rollout and through a rollback before the flip; no operator action
+is needed.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:
