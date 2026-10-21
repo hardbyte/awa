@@ -23,6 +23,22 @@ External migration runners must apply the complete generated
 definition before replacing lane helpers in the installed schemas.
 See [Database roles](security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
+## Terminal live counts: one row per lane
+
+After the ring authority flip, runtimes fold sealed-slot terminal-count deltas
+into one `queue_terminal_live_counts` row per `(ready_slot, queue, priority,
+enqueue_shard)` with `counter_bucket = 0`, and `rebuild_terminal_counters`
+writes the same shape. The first fold after the flip collapses every bucket of a
+lane it touches and adds the signed delta, so rows left in per-job-id buckets by
+earlier folds, the installer backfill or the v027 rebuild stay exact. No
+migration is involved and readers sum every bucket either way.
+
+Before the flip, 0.6 runtimes can still hold the maintenance election and fold
+into job-id buckets, so this release keeps that shape in its own folds and
+rebuilds until the flip fences them. Exact terminal counts stay exact through a
+mixed-version rollout and through a rollback before the flip; no operator action
+is needed.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

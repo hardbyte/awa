@@ -15803,6 +15803,16 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // One row per lane once the ring authority flip has fenced N-1
+        // maintenance; per job-id bucket before it, which is the shape N-1
+        // folds apply their deltas to (ADR-041).
+        let counter_bucket = match self.ring_authority_tx(&mut tx).await? {
+            RingAuthority::Ledger => "0::smallint".to_string(),
+            RingAuthority::Columns => format!(
+                "mod(mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint) \
+                 + {TERMINAL_COUNTER_BUCKETS}::bigint, {TERMINAL_COUNTER_BUCKETS}::bigint)::smallint"
+            ),
+        };
         let inserted: i64 = sqlx::query_scalar(audited_sql(format!(
             r#"
             WITH inserted AS (
@@ -15814,11 +15824,7 @@ impl QueueStorage {
                     queue,
                     priority,
                     enqueue_shard,
-                    mod(
-                        mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
-                            + {TERMINAL_COUNTER_BUCKETS}::bigint,
-                        {TERMINAL_COUNTER_BUCKETS}::bigint
-                    )::smallint AS counter_bucket,
+                    {counter_bucket} AS counter_bucket,
                     count(*)::bigint
                 FROM {schema}.done_entries
                 GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
@@ -16198,8 +16204,92 @@ impl QueueStorage {
             return Ok(TerminalDeltaSlotRollup::Empty);
         }
 
-        let grouped_keys: i64 = sqlx::query_scalar(audited_sql(format!(
-            r#"
+        // In ledger authority each touched lane collapses to one bucket-0 row
+        // holding its old total (summed over every bucket) plus the signed
+        // delta, which keeps a negative delta exact when the matching positive
+        // count sits in another bucket. Before the flip, N-1 maintenance can
+        // still win the election and folds per job-id bucket, so the fold
+        // keeps that shape until the flip fences it (ADR-041).
+        let grouped_keys: i64 = match authority {
+            RingAuthority::Ledger => sqlx::query_scalar(audited_sql(format!(
+                r#"
+            WITH grouped AS MATERIALIZED (
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    SUM(terminal_delta)::bigint AS delta
+                FROM {delta_child}
+                WHERE ready_generation = $1
+                GROUP BY ready_slot, queue, priority, enqueue_shard
+                HAVING SUM(terminal_delta) <> 0
+            ),
+            collapsed AS (
+                DELETE FROM {schema}.queue_terminal_live_counts AS counts
+                USING grouped
+                WHERE counts.ready_slot = grouped.ready_slot
+                  AND counts.queue = grouped.queue
+                  AND counts.priority = grouped.priority
+                  AND counts.enqueue_shard = grouped.enqueue_shard
+                RETURNING
+                    counts.ready_slot,
+                    counts.queue,
+                    counts.priority,
+                    counts.enqueue_shard,
+                    counts.live_terminal_count
+            ),
+            folded AS (
+                SELECT
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    (grouped.delta + COALESCE(SUM(collapsed.live_terminal_count), 0))::bigint
+                        AS live_terminal_count
+                FROM grouped
+                LEFT JOIN collapsed
+                  ON collapsed.ready_slot = grouped.ready_slot
+                 AND collapsed.queue = grouped.queue
+                 AND collapsed.priority = grouped.priority
+                 AND collapsed.enqueue_shard = grouped.enqueue_shard
+                GROUP BY
+                    grouped.ready_slot,
+                    grouped.queue,
+                    grouped.priority,
+                    grouped.enqueue_shard,
+                    grouped.delta
+            ),
+            inserted AS (
+                INSERT INTO {schema}.queue_terminal_live_counts (
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    counter_bucket,
+                    live_terminal_count
+                )
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    0::smallint,
+                    live_terminal_count
+                FROM folded
+                WHERE live_terminal_count <> 0
+                ORDER BY ready_slot, queue, priority, enqueue_shard
+                RETURNING 1
+            )
+            SELECT count(*)::bigint FROM grouped
+            "#
+            )))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?,
+            RingAuthority::Columns => sqlx::query_scalar(audited_sql(format!(
+                r#"
             WITH grouped AS MATERIALIZED (
                 SELECT
                     ready_slot,
@@ -16264,11 +16354,12 @@ impl QueueStorage {
             )
             SELECT count(*)::bigint FROM grouped
             "#
-        )))
-        .bind(generation)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+            )))
+            .bind(generation)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?,
+        };
 
         let truncate_delta = sqlx::query(audited_sql(format!("TRUNCATE TABLE {delta_child}")))
             .execute(tx.as_mut())

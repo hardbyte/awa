@@ -52,7 +52,7 @@ Queue-ring prune reclaims retained ready bodies, ready tombstones, compact compl
 
 Exact terminal counts are part of this terminal-history contract. Awa keeps them exact with retained compact batches plus three derived stores:
 
-- `queue_terminal_live_counts`, keyed by `(ready_slot, queue, priority, enqueue_shard, counter_bucket)`, stores folded counts for retained queue segments.
+- `queue_terminal_live_counts`, keyed by `(ready_slot, queue, priority, enqueue_shard, counter_bucket)`, stores folded counts for retained queue segments. Once the ring authority flip has fenced 0.6 maintenance, the fold and the rebuild write one row per `(ready_slot, queue, priority, enqueue_shard)` with `counter_bucket = 0`; before it they keep the job-id bucket, because 0.6 folds apply each delta to the bucket of its original row. Readers sum every bucket, so after the flip the job-id bucketing only needs to survive on the delta ledger.
 - `queue_terminal_count_deltas_*`, partitioned with the queue ring, stores pending signed deltas for `done_entries` terminal mutations that have not been folded yet.
 - `receipt_completion_batches_*` and `receipt_completion_tombstones_*` provide the retained compact completion count directly, without another hot-path derived write.
 - `queue_terminal_rollups` stores permanent counts for pruned queue segments.
