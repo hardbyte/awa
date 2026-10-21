@@ -6,24 +6,68 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Changed
 
-- **A ready enqueue is one statement (v052, [#522](https://github.com/hardbyte/awa/issues/522)).** `QueueStorage::enqueue_params_batch`, and `enqueue_params_copy` for batches below its 2,048-row COPY threshold, send a ready-only batch with no uniqueness claims as one autocommit call to the new `{schema}.enqueue_ready_rows`, which reserves the lanes, reads the ring cursor, appends the ready rows and segments and notifies; the previous path took ten round trips. Inside a transaction (uniqueness claims, deferred rows) the function replaces the per-lane reservation, cursor reads and both inserts. `reserve_enqueue_seq` provisions lane sequences only for a lane row without a sequence name and reserves a range with one sequence write instead of two. On a schema without the function, or without `EXECUTE` on it and on `ring_cursor`, current runtimes keep the multi-statement path, which also drops the cached-lane probe and reads the authority and the ring cursor in one statement. A missing function is probed again after a minute. Health-gated workers report ready only once the schema reaches v052, so migrate first for them. At 800 jobs/s with 20-row calls the producer call p50 fell 19-62% against main in the same benchmark round (0.94 ms in the quietest round) and WAL per job by about 5 B; throughput and saturation (64 workers) are unchanged within run-to-run noise.
-- v050 drops `idx_<schema>_ready_<slot>_lane_shard` from every ready_entries
-  partition of the default schema and of the custom schemas
-  `awa.queue_storage_schemas()` selects. Each enqueued job writes two index entries instead of three and
-  each rotation initialises one fewer index. Every per-lane lookup now pins
-  `ready_slot` and uses the partition primary key: the queue prune and
-  terminal-count fold gates filter on the slot, and the maintenance lag gauge
-  walks `ready_segments` to the slot holding each lane's next row. The
-  migration only redefines the installer function and drops the indexes; it
-  holds ACCESS EXCLUSIVE on each `ready_entries` partition until commit.
-  When no `lock_timeout` is set it bounds each lock acquisition to 2 s (not
-  the total duration; earlier locks stay held) and rolls back on timeout so
-  it can be re-run.
+- **Retry-heavy workloads leave far fewer dead tuples.** After the ring authority
+  flip, awa keeps one terminal-count row per lane in `queue_terminal_live_counts`
+  instead of up to 256, and a batch of finished jobs appends one count-delta row
+  per lane instead of up to 256. Pruning a queue deletes one live-count row per
+  lane: in a 200 jobs/s retry storm, peak dead tuples in that table fell from
+  2,517 to 19. `awa storage rebuild-terminal-counters` writes the same
+  shape. No migration or configuration. Before the flip the existing layout is
+  kept, so counts stay exact in a mixed 0.6/0.7 fleet and after a rollback.
+- **Idle ring maintenance no longer writes.** Once the ring authority has
+  flipped to the ledger, a rotation or prune tick with nothing to seal or prune
+  no longer locks the `{ring}_ring_state` row, so it runs as a read-only
+  transaction. `QueueStorage::reset` and `awa storage rebuild-terminal-counters`
+  now wait for in-progress rotation before taking their table locks. Run
+  `rebuild-terminal-counters` from an upgraded binary once upgraded runtimes are
+  running: an older binary can deadlock with a rotation tick, and PostgreSQL
+  then aborts one of them with `40P01`.
+- **Each enqueued job writes one fewer index entry (v050).** v050 drops the
+  `lane_shard` index from every `ready_entries` partition, in the `awa` schema
+  and each custom schema the migration upgrades; current binaries look lanes up
+  through the partition's primary key instead. Each enqueue writes two index
+  entries instead of three, and each ring rotation initialises one fewer
+  index. The migration rewrites no rows (27 ms on a test database with 409,600
+  ready rows), but it holds an exclusive lock on each `ready_entries` partition
+  until it commits, so enqueues and claims wait meanwhile. If the session sets
+  no `lock_timeout`, each lock wait is capped at 2 s; on a timeout (`55P03`,
+  usually behind a long `awa.jobs` read or a backup) the migration rolls back
+  and can be re-run. Producers and workers without a readiness gate can be
+  upgraded before migrating. Health-gated workers report ready only on a v050
+  schema, so migrate first for them. On PostgreSQL 17 and earlier, pre-v050
+  binaries scan every ready partition during maintenance until they are
+  replaced, so keep that window short. See the upgrade guide.
+- **Enqueueing a batch of ready jobs takes one round trip (v052,
+  [#522](https://github.com/hardbyte/awa/issues/522)).**
+  `QueueStorage::enqueue_params_batch`, and `enqueue_params_copy` below its
+  2,048-row COPY threshold, send a batch of ready jobs without uniqueness
+  claims as one call to the new `{schema}.enqueue_ready_rows` function instead
+  of ten round trips. Batches with uniqueness claims or scheduled jobs still
+  run in a transaction but use the function for most of the work, and
+  reserving a lane's sequence range now writes the sequence once instead of
+  twice. On an earlier revision, at 800 jobs/s in 20-job calls, producer call
+  p50 fell 19-62% and WAL per job by about 5 bytes, with throughput unchanged.
+  On a schema without the function, or without `EXECUTE` on it and on
+  `ring_cursor`, binaries keep using the multi-statement path, which is also
+  shorter now, and look for the function again after a minute. Health-gated
+  workers report ready only on a v052 schema, so migrate first for them.
 - v049 lets restricted runtimes use provisioned lane sequences without schema
   CREATE in the default and existing custom storage schemas. Run
   `awa storage prepare-queue` as the migrator before deployment and grant
   sequence `USAGE, SELECT, UPDATE`; existing sequence positions are preserved.
-- Ring rotation uses a five-second observed fill window or a 2 MiB total physical-size target before sealing a non-empty slot. Empty slots can advance immediately to reclaim sealed history. `RingRotationCadence::EAGER` restores rotation on every tick; the size target is sampled and does not impose a storage limit. See [#518](https://github.com/hardbyte/awa/issues/518).
+- **Ring rotation waits for a slot to fill before sealing it.** A non-empty slot
+  is sealed once it has been filling for five seconds and holds 256 rows, once
+  it reaches about 2 MiB, or once it is 60 seconds old. Before, any non-empty
+  slot was sealed after five seconds, so a trickle of writes paid a full
+  rotation and prune (WAL and catalog churn) every five seconds for a handful
+  of rows. Empty slots still advance immediately to reclaim sealed history.
+  Tune it with `ClientBuilder::ring_rotation_cadence`, starting from
+  `RingRotationCadence::DEFAULT` and adjusting with `with_min_slot_age`,
+  `with_target_slot_bytes`, `with_min_slot_rows` and `with_max_slot_age`, or
+  the matching `queue_storage_rotate_*` Python options. A client refuses a row
+  floor without a size target or age ceiling. `RingRotationCadence::EAGER`
+  seals on every tick. The size target is sampled and is not a storage limit.
+  See [#518](https://github.com/hardbyte/awa/issues/518).
 
 - v048 catches claim cursors up from committed same-lane, same-generation attempt evidence inside the claim, so a post-commit advance that never ran (for example because the claimer stopped between commit and advance) no longer leaves the lane behind. Runtimes still advance the cursor after every committed claim, on pre-v048 and v048 schemas alike. Permanent sequence gaps move the cursor to the next visible ready row, avoiding a tombstone-prefix wedge. A focused mixed-version range model and SQL regressions cover prefix claims, gaps, tombstones and rotation.
 
@@ -76,10 +120,36 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Fixed
 
+- **A running job could be both finished and retried.** If a job completed,
+  failed or was retried while stale-heartbeat or deadline rescue was examining
+  it, rescue could miss that outcome and also send the job back for a retry, so
+  it ran again. Cancelling a running job could race a finishing worker the same
+  way. Rescue now sees every outcome that commits first. Cancel never waits on a
+  lock held by a finishing worker, because waiting could deadlock with it.
+  Instead it retries for up to five seconds. If the job is still being finished
+  after that, cancel leaves it alone and logs it: `cancel` returns
+  `JobNotFound` and `bulk_cancel` leaves it out of its result, so retry if you
+  need it cancelled. A bulk cancel holds a lock for each running job until it
+  commits, so cancel very large sets of running jobs in batches.
+
 - Finished handlers retain their results and retry durable finalization for up to 120 s while database writes are unavailable, reducing avoidable handler re-execution after outages. Pending finalizers remain bounded and drain during shutdown; a newer lease fences stale retries. Retries bypass completion batching, use bounded jitter and log one initial warning. A lost acknowledgement is reported as an unknown outcome rather than a definite rescue. The `awa.completion.reconnect_retry` counter records started availability retries.
 - A `RetryAfter` result on the final allowed attempt now increments the failed-job metric rather than the retry metric.
 
-- Migration discovery rejects foreign-owned objects, untrusted schema creation or trigger grants, and any trigger whose definition differs from one awa installs, including when run as a superuser. Unregistered unsafe substrates are skipped; unsafe configured targets block version advancement, and unsafe ownership or privileges in `awa` abort before installer execution. Pending historical bundles include a small security bootstrap; applied versions are not replayed. External checksum-based runners must preserve applied files and regenerate only pending SQL. No new schema version; see the upgrade guide.
+- **Migrations no longer run code another role planted in a queue-storage
+  schema.** A role that could add objects or triggers to the `awa` schema or a
+  custom queue-storage schema could get its code run by the migrator, even
+  when the migrator is a superuser. Before upgrading a schema, `awa migrate`
+  now checks that its objects belong to the migrating role or the `awa` schema
+  owner, that no other role can create objects or triggers in it, and that
+  every trigger is one awa installs, unchanged. A custom schema awa has not
+  registered that fails the check is skipped with a warning. Any other schema
+  that fails stops the migration before anything is applied, with an error
+  naming the offending objects. Common causes are `GRANT ALL ON ALL TABLES`
+  to the runtime role, which includes `TRIGGER`, a 0.6 runtime holding
+  `CREATE` on the schema (revoking it needs a short pause of 0.6 runtimes),
+  and your own triggers on awa tables. No new schema version. If an external
+  runner tracks checksums, keep the files it has applied and generate only
+  the pending SQL. The upgrade guide lists the fixes.
 - Queue pruning waits on routing metadata first and uses `NOWAIT` for every remaining child lock, rolling back the whole attempt on contention. This avoids the prune/claim lock cycle while allowing entry-first producers to finish. Transient lock contention retries on the next decision tick; active-data skips retain backoff.
 - Rust cadence and claim-rotation interval overrides survive later `queue_storage` calls, regardless of builder call order.
 

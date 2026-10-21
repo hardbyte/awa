@@ -1304,7 +1304,8 @@ async fn test_v027_rebuckets_existing_terminal_live_counts() {
     assert_eq!(
         buckets,
         vec![(233_i16, 1), (234_i16, 1)],
-        "v27 should rebuild existing terminal live counters into job_id buckets"
+        "v27 rebuilds existing terminal live counters into job_id buckets; later folds and \
+         rebuild_terminal_counters collapse a lane to one bucket-0 row"
     );
 
     let trusted: bool = sqlx::query_scalar(
