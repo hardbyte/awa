@@ -66,3 +66,19 @@ When a schema change affects users or operators, update the relevant upgrade gui
 ## Authoring schema migrations
 
 Schema changes must follow [ADR-041's expand, capability-gated flip, and later contract policy](adr/041-rolling-upgrade-policy.md). The implementation checklist lives in [`AGENTS.md`](https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations) alongside the migration tests that enforce it; upgrade guides document any action required from operators.
+
+## Maintaining the interactive failure lab
+
+The [failure lab](concepts/failure-lab.md) launches the canonical interactive model hosted by
+[`hardbyte/postgresql-job-queue-benchmarking`](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
+Its source is `simulations/awa-failure-windows/index.html` there, and the
+comparison-site build copies it to `lab/awa.html`. Change and test the animation
+in that repository; do not add a second JavaScript/model copy to these docs.
+
+When Awa's enqueue, attempt ownership, recovery or claim-durability behavior
+changes, review the lab's source links and assumptions against the new behavior.
+Update the lab's displayed revision with its model, rather than changing the
+version label alone. Its model and browser checks live beside the canonical
+source. The docs page uses an absolute HTTPS URL so project-site and preview
+base paths do not change the lesson target. Verify the launch, worker actions and return flow on phones, plus the optional
+wider-screen embed after a hosting-path change.
