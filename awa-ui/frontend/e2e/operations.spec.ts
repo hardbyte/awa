@@ -205,7 +205,8 @@ test("mobile navigation, controls, job drilldown and layout at narrow sizes", as
           path: `${artifacts}/${view}-${width === 390 ? "mobile" : "desktop"}.png`,
         });
       }
-      if (width === 768 && route === "/jobs") await page.screenshot({ path: `${artifacts}/jobs-tablet.png` });
+      if (width === 768 && route === "/jobs")
+        await page.screenshot({ path: `${artifacts}/jobs-tablet.png` });
       await expect
         .poll(
           () =>
@@ -291,4 +292,34 @@ test("read-only controls remain disabled and dark mode stays legible", async ({
     page.getByRole("button", { name: "Retry", exact: true }),
   ).toBeDisabled();
   expect(fixture.mutations).toEqual([]);
+});
+
+test("mobile drawer closes promptly with both motion preferences", async ({
+  page,
+}) => {
+  await mockOperations(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const reducedMotion of ["reduce", "no-preference"] as const) {
+    await page.emulateMedia({ reducedMotion });
+    await page.goto("/");
+    for (const name of ["Queues", "Overview", "Workers", "Overview"]) {
+      await page.getByRole("button", { name: "Toggle Sidebar" }).click();
+      await page.getByRole("link", { name, exact: true }).click();
+      await expect(page.getByRole("dialog", { name: "Sidebar" })).toHaveCount(
+        0,
+      );
+      await expect(
+        page.getByRole("heading", {
+          name: name === "Overview" ? "Work in motion" : name,
+          exact: true,
+        }),
+      ).toBeVisible();
+    }
+    await page.getByRole("button", { name: "Toggle Sidebar" }).click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "Sidebar" })).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Toggle Sidebar" }),
+    ).toBeFocused();
+  }
 });
