@@ -2326,7 +2326,7 @@
 <h2 id="authoring-schema-migrations">Authoring schema migrations<a class="headerlink" href="#authoring-schema-migrations" title="Permanent link">&para;</a></h2>
 <p>Schema changes must follow <a href="../adr/041-rolling-upgrade-policy/">ADR-041's expand, capability-gated flip, and later contract policy</a>. The implementation checklist lives in <a href="https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations"><code>AGENTS.md</code></a> alongside the migration tests that enforce it; upgrade guides document any action required from operators.</p>
 <h2 id="maintaining-the-interactive-failure-lab">Maintaining the interactive failure lab<a class="headerlink" href="#maintaining-the-interactive-failure-lab" title="Permanent link">&para;</a></h2>
-<p>The <a href="../concepts/failure-lab/">failure lab</a> embeds the canonical animation hosted by
+<p>The <a href="../concepts/failure-lab/">failure lab</a> links to the canonical full-page lessons hosted by
 <a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking"><code>hardbyte/postgresql-job-queue-benchmarking</code></a>.
 Its source is <code>simulations/awa-failure-windows/index.html</code> there, and the
 comparison-site build copies it to <code>lab/awa.html</code>. Change and test the animation
@@ -2336,8 +2336,8 @@ changes, review the lab's source links and assumptions against the new behavior.
 Update the lab's displayed revision with its model, rather than changing the
 version label alone. Its model and browser checks live beside the canonical
 source. The docs page uses an absolute HTTPS URL so project-site and preview
-base paths do not change the embed target; verify the full-page link and iframe
-after a hosting-path change.</p>
+base paths do not change the lesson target. Verify the four experiment links on
+phones and the optional wider-screen embed after a hosting-path change.</p>
 
 
 
