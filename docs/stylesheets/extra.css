@@ -182,3 +182,13 @@ html {
     min-height: auto;
   }
 }
+
+.awa-failure-lab {
+  display: block;
+  width: 100%;
+  height: clamp(42rem, 85vh, 65rem);
+  margin: 1.5rem 0;
+  border: 1px solid var(--awa-border);
+  border-radius: 0.8rem;
+  background: var(--awa-surface);
+}

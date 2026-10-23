@@ -26,3 +26,5 @@ This produces an **at-least-once** contract. The ownership guard prevents a stal
 - `awa-cli` and the web UI provide migrations and operational inspection.
 
 See the detailed [architecture](../architecture.md) and [queue storage substrate](../queue-storage-substrate.md) when you need implementation-level invariants.
+
+Explore these boundaries in the [interactive failure lab](failure-lab.md): step through a crash, replay an execution, and inspect the source behind each transition.
