@@ -100,7 +100,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#where-does-the-guarantee-end" class="md-skip">
+        <a href="#one-job-how-many-receipts" class="md-skip">
           Skip to content
         </a>
       
@@ -2096,37 +2096,33 @@
   
 
 
-<h1 id="where-does-the-guarantee-end">Where does the guarantee end?<a class="headerlink" href="#where-does-the-guarantee-end" title="Permanent link">&para;</a></h1>
-<p>A committed enqueue, a worker claim and a successful external request protect different things. Follow one order through a crash to see the boundary you need to design around.</p>
+<h1 id="one-job-how-many-receipts">One job. How many receipts?<a class="headerlink" href="#one-job-how-many-receipts" title="Permanent link">&para;</a></h1>
+<p>Can you complete one job and deliver two receipts? Operate a worker, stop it at different moments, and recover its unfinished work. The database and external mailbox show what each action changed.</p>
 <div class="awa-failure-launch">
-<p><strong>Start with the failure you want to understand.</strong> Each link opens a full-page lesson, with the current event, state and playback controls together.</p>
-<ul>
-<li><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html?experiment=handoff">Can an order commit without its job? →</a> Compare a shared transaction with separate commits.</li>
-<li><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html?experiment=replay">Could one job send two emails? →</a> Crash after the external effect, before completion is recorded.</li>
-<li><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html?experiment=fence">What if an old worker returns? →</a> Inspect guarded completion and overlapping external requests.</li>
-<li><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html?experiment=wal">Could an acknowledged claim disappear? →</a> Inspect a local crash before asynchronous claim WAL is flushed.</li>
-</ul>
+<p><strong>Try the crash window yourself.</strong> Send a receipt, then stop the worker before saving completion. Recover the job and start a replacement. Does the mailbox change?</p>
+<p>Then repeat with the provider remembering a stable operation key. Compare the handler starts, external requests and delivered receipts from your own runs.</p>
+<p><a class="md-button md-button--primary" href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive model →</a></p>
 </div>
-<p><a class="md-button md-button--primary" href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html?experiment=handoff">Start the interactive lesson</a></p>
+<p>The model starts with a committed order and job. It is an Awa-specific teaching model, not a live system or a benchmark. No email is sent. Source links and technical assumptions are available inside it.</p>
 <details class="awa-failure-desktop">
 <summary>Explore inside this page on a wider screen</summary>
 <iframe
   class="awa-failure-lab"
   src="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html"
   width="100%"
-  height="1450"
-  title="Interactive Awa failure windows simulation"
+  height="1100"
+  title="Interactive Awa job, worker and receipt model"
   loading="lazy"
   referrerpolicy="no-referrer"
 >
-  <p><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive Awa failure lab.</a></p>
+  <p><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive Awa model.</a></p>
 </iframe>
 </details>
 
 <details class="note">
-<summary>What the teaching model assumes</summary>
-<p>The animation uses deterministic events and compressed waits. Its playback speed does not predict recovery latency. It assumes a working maintenance path after recovery and sufficient attempts to retry. The provider-key comparison assumes the provider atomically deduplicates the same operation key across workers; Awa does not supply that external guarantee.</p>
-<p>The lab shows the Awa source revision it describes and links each transition to that source. Development-revision behavior is not a promise about every released version. The lost-claim experiment models a local PostgreSQL crash with an already durable enqueue and storage that honors flushes; it does not model arbitrary standby promotion or storage corruption.</p>
+<summary>What the model assumes</summary>
+<p>The worker really stops and its database claim survives. “Recover for retry” compresses rescue, backoff and due-job promotion; it assumes healthy maintenance and sufficient retry budget. Clicks do not predict recovery latency. Database crashes, standby failover, live stale workers and retry exhaustion are outside this example.</p>
+<p>The provider-key option assumes an external provider atomically deduplicates a stable operation key across attempts. Awa does not supply that external guarantee, and enqueue uniqueness is a different boundary. The component identifies the development source revision it describes, rather than promising behavior across every release.</p>
 </details>
 <p>Continue with <a href="../transactional-enqueue/">transactional enqueue</a>, <a href="../job-lifecycle/">job lifecycle and recovery</a>, or <a href="../../architecture/">queue-storage architecture</a>.</p>
 

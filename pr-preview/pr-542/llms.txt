@@ -20,7 +20,7 @@ These links are curated for agents. Each target is the Markdown representation o
 - [How AWA works](concepts/index.md): AWA is a library and schema, not a separate broker service. Producers, workers, and operational tools coordinate through PostgreSQL.
 - [Job lifecycle](concepts/job-lifecycle/index.md): A job moves through durable states in PostgreSQL. The handler returns the next outcome; AWA validates that the current worker still owns the claim before applying it.
 - [Transactional enqueue](concepts/transactional-enqueue/index.md): The central reason to keep AWA in PostgreSQL is atomic handoff. An application write and the job that follows it can commit together.
-- [Interactive failure lab](concepts/failure-lab/index.md): A committed enqueue, a worker claim and a successful external request protect different things. Follow one order through a crash to see the boundary you need to design around.
+- [Interactive failure lab](concepts/failure-lab/index.md): Can you complete one job and deliver two receipts? Operate a worker, stop it at different moments, and recover its unfinished work. The database and external mailbox show what each action changed.
 - [Architecture](architecture/index.md): Awa (Māori: river) is a Postgres-native background job queue for Rust and Python. Postgres is the sole infrastructure dependency: there is no Redis, RabbitMQ, sidecar scheduler, or separate lease store. Producers enqueue inside ordinary.
 - [Queue storage](queue-storage-substrate/index.md): Queue storage is Awa's PostgreSQL layout for runnable work, in-flight attempts, deferred work, terminal history, and the small control tables that coordinate workers. It is an implementation boundary, not an application API: producers and.
 
