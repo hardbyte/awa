@@ -220,8 +220,8 @@ html {
   background: var(--awa-surface);
 }
 
-@media screen and (max-width: 760px) {
-  .awa-failure-desktop {
+@media screen and (max-width: 760px), screen and (max-height: 500px) and (max-width: 1000px) {
+  .md-typeset .awa-failure-desktop {
     display: none;
   }
 }
