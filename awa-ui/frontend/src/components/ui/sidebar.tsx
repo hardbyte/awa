@@ -216,19 +216,21 @@ const Sidebar = ({
     return (
       <>
         <span className="sr-only" aria-hidden data-intent={intent} />
-        <SheetContent
-          isOpen={isOpenOnMobile}
-          onOpenChange={setIsOpenOnMobile}
-          closeButton={closeButton}
-          aria-label="Sidebar"
-          data-slot="sidebar"
-          data-intent="default"
-          className="w-(--sidebar-width) entering:blur-in exiting:blur-out [--sidebar-width:18rem] has-data-[slot=calendar]:[--sidebar-width:23rem]"
-          side={side}
-          dir={side === "right" ? "rtl" : "ltr"}
-        >
-          {children}
-        </SheetContent>
+        {isOpenOnMobile && (
+          <SheetContent
+            isOpen={isOpenOnMobile}
+            onOpenChange={setIsOpenOnMobile}
+            closeButton={closeButton}
+            aria-label="Sidebar"
+            data-slot="sidebar"
+            data-intent="default"
+            className="w-(--sidebar-width) entering:blur-in exiting:blur-out [--sidebar-width:18rem] has-data-[slot=calendar]:[--sidebar-width:23rem]"
+            side={side}
+            dir={side === "right" ? "rtl" : "ltr"}
+          >
+            {children}
+          </SheetContent>
+        )}
       </>
     )
   }

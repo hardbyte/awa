@@ -2,7 +2,11 @@ import { test, expect, type Page, type Response } from "@playwright/test";
 
 function isQueuesListResponse(response: Response): boolean {
   const url = new URL(response.url());
-  return response.ok() && response.request().method() === "GET" && url.pathname === "/api/queues";
+  return (
+    response.ok() &&
+    response.request().method() === "GET" &&
+    url.pathname === "/api/queues"
+  );
 }
 
 async function loadQueuesPage(page: Page) {
@@ -22,24 +26,20 @@ test.describe("Queues page", () => {
     await loadQueuesPage(page);
 
     // Desktop table (visible at default viewport)
-    const queueTable = page.getByRole("grid", { name: "Queues" });
+    const queueTable = page.getByRole("table", { name: "Queue pressure" });
     await expect(queueTable).toBeVisible();
 
-    // Columns were consolidated: Scheduled/Available fold into Queued;
-    // Mode/RateLimit fold into Capacity; Waiting is a subline under Queue.
     for (const header of [
       "Queue",
-      "Queued",
+      "Available",
+      "Oldest available",
       "Running",
-      "Retry",
-      "Failed",
-      "Completed/hr",
-      "Capacity",
-      "Status",
-      "Actions",
+      "Retryable / failed",
+      "Completed last hour",
+      "Controls",
     ]) {
       await expect(
-        queueTable.getByRole("columnheader", { name: header, exact: true })
+        queueTable.getByRole("columnheader", { name: header, exact: true }),
       ).toBeVisible();
     }
 
@@ -47,34 +47,33 @@ test.describe("Queues page", () => {
     await expect(queueTable.getByText("E2E Queue")).toBeVisible();
     await expect(queueTable.getByText("e2e_test")).toBeVisible();
     await expect(
-      queueTable.getByRole("link", { name: "legacy_queue", exact: true })
+      queueTable.getByRole("link", { name: "legacy_queue", exact: true }),
     ).toBeVisible();
   });
 
   test("queue table shows descriptor description", async ({ page }) => {
     await loadQueuesPage(page);
 
-    const queueTable = page.getByRole("grid", { name: "Queues" });
+    const queueTable = page.getByRole("table", { name: "Queue pressure" });
     await expect(
-      queueTable.getByText("End-to-end queue used for UI coverage")
+      queueTable.getByText("End-to-end queue used for UI coverage"),
     ).toBeVisible();
   });
 
-  test("queue table surfaces consolidated capacity and actions columns", async ({ page }) => {
+  test("queue table surfaces available wait and controls", async ({ page }) => {
     await loadQueuesPage(page);
-
-    const queueTable = page.getByRole("grid", { name: "Queues" });
-    await expect(queueTable).toBeVisible();
-
-    // Mode / rate limit / waiting folded into the Capacity and Queue cells.
-    for (const header of ["Capacity", "Status", "Actions"]) {
-      await expect(
-        queueTable.getByRole("columnheader", { name: header, exact: true })
-      ).toBeVisible();
-    }
+    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    await expect(
+      queueTable.getByRole("columnheader", { name: "Oldest available" }),
+    ).toBeVisible();
+    await expect(
+      queueTable.getByRole("columnheader", { name: "Controls" }),
+    ).toBeVisible();
   });
 
-  test("queue table surfaces DLQ policy from runtime config", async ({ page }) => {
+  test("queue table surfaces DLQ policy from runtime config", async ({
+    page,
+  }) => {
     await page.route("**/api/queues", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -136,38 +135,52 @@ test.describe("Queues page", () => {
 
     await page.goto("/queues");
 
-    const queueTable = page.getByRole("grid", { name: "Queues" });
-    await expect(queueTable.getByRole("rowheader", { name: /DLQ Off Queue/ })).toBeVisible();
-    await expect(queueTable.getByText("DLQ off", { exact: true })).toBeVisible();
+    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    await expect(
+      queueTable.getByRole("rowheader", { name: /DLQ Off Queue/ }),
+    ).toBeVisible();
+    await expect(
+      queueTable.getByText("DLQ off", { exact: true }),
+    ).toBeVisible();
   });
 
   test("click queue navigates to queue detail", async ({ page }) => {
     await loadQueuesPage(page);
 
-    const queueTable = page.getByRole("grid", { name: "Queues" });
+    const queueTable = page.getByRole("table", { name: "Queue pressure" });
     const queueLink = queueTable.getByRole("link", { name: "E2E Queue" });
     await expect(queueLink).toBeVisible();
 
     await queueLink.click();
 
     await page.waitForURL(/\/queues\/e2e_test/);
-    await expect(page.getByRole("heading", { name: "E2E Queue" })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "E2E Queue" }),
+    ).toBeVisible();
   });
 
   test("queue detail renders descriptor metadata", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => /\/api\/queues\/e2e_test$/.test(r.url()) && r.ok()),
+      page.waitForResponse(
+        (r) => /\/api\/queues\/e2e_test$/.test(r.url()) && r.ok(),
+      ),
       page.goto("/queues/e2e_test"),
     ]);
 
-    await expect(page.getByRole("heading", { name: "E2E Queue" })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "E2E Queue" }),
+    ).toBeVisible();
     await expect(page.getByText("e2e_test").first()).toBeVisible();
-    await expect(page.getByText("End-to-end queue used for UI coverage")).toBeVisible();
+    await expect(
+      page.getByText("End-to-end queue used for UI coverage"),
+    ).toBeVisible();
     await expect(page.getByText("qa-platform")).toBeVisible();
     await expect(page.getByText("critical")).toBeVisible();
   });
 
-  test("queue detail links to filtered DLQ rows when DLQ is enabled", async ({ page }) => {
+  test("queue detail links to filtered DLQ rows when DLQ is enabled", async ({
+    page,
+  }) => {
     await page.route("**/api/queues/payments", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -231,7 +244,10 @@ test.describe("Queues page", () => {
       });
     });
     await page.route("**/api/dlq**", async (route) => {
-      await route.fulfill({ contentType: "application/json", body: JSON.stringify([]) });
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify([]),
+      });
     });
 
     await page.goto("/queues/payments");
@@ -244,16 +260,22 @@ test.describe("Queues page", () => {
 
   test("legacy queue still renders without descriptors", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => /\/api\/queues\/legacy_queue$/.test(r.url()) && r.ok()),
+      page.waitForResponse(
+        (r) => /\/api\/queues\/legacy_queue$/.test(r.url()) && r.ok(),
+      ),
       page.goto("/queues/legacy_queue"),
     ]);
 
-    await expect(page.getByRole("heading", { name: "legacy_queue" })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "legacy_queue" }),
+    ).toBeVisible();
     await expect(page.getByText("Descriptor health")).toBeVisible();
     await expect(page.getByText("Not declared by a live worker")).toBeVisible();
   });
 
-  test("route-mocked descriptor stale and drift badges render", async ({ page }) => {
+  test("route-mocked descriptor stale and drift badges render", async ({
+    page,
+  }) => {
     await page.route("**/api/queues", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -291,111 +313,73 @@ test.describe("Queues page", () => {
     });
 
     await page.goto("/queues");
-    const queueTable = page.getByRole("grid", { name: "Queues" });
-    await expect(queueTable.getByText("Descriptor stale", { exact: true })).toBeVisible();
-    await expect(queueTable.getByText("Descriptor drift", { exact: true })).toBeVisible();
-    await expect(queueTable.getByText("Descriptor drift across live runtimes")).toBeVisible();
+    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    await expect(
+      queueTable.getByText("Descriptor stale", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      queueTable.getByText("Descriptor drift across live runtimes"),
+    ).toBeVisible();
   });
 
-  async function openActionsMenu(page: Page, queueName: string) {
-    const queueTable = page.getByRole("grid", { name: "Queues" });
-    const row = queueTable.getByRole("row", { name: new RegExp(queueName) });
-    await expect(row).toBeVisible();
-    await row
-      .getByRole("button", { name: new RegExp(`Actions for ${queueName}`) })
-      .click();
+  function queueRow(page: Page) {
+    return page
+      .getByRole("table", { name: "Queue pressure" })
+      .getByRole("row", { name: /E2E Queue/ });
   }
 
-  test("Pause/Resume and Drain appear in the Actions menu", async ({ page }) => {
+  test("Pause or Resume and Drain controls are available", async ({ page }) => {
     await loadQueuesPage(page);
-    await openActionsMenu(page, "e2e_test");
-
-    // Menu renders either "Pause queue" or "Resume queue" depending on state,
-    // plus Drain. We just need one of pause/resume visible.
-    const pauseItem = page.getByRole("menuitem", { name: "Pause queue" });
-    const resumeItem = page.getByRole("menuitem", { name: "Resume queue" });
-    const pauseVisible = await pauseItem.isVisible().catch(() => false);
-    const resumeVisible = await resumeItem.isVisible().catch(() => false);
-    expect(pauseVisible || resumeVisible).toBeTruthy();
-
-    await expect(page.getByRole("menuitem", { name: /^Drain queue/ })).toBeVisible();
+    await expect(
+      queueRow(page).getByRole("button", { name: /^(Pause|Resume)$/ }),
+    ).toBeVisible();
+    await expect(
+      queueRow(page).getByRole("button", { name: "Drain…" }),
+    ).toBeVisible();
   });
 
-  test("Pause executes mutation from the Actions menu", async ({ page }) => {
+  test("Pause and Resume execute mutations", async ({ page }) => {
     await loadQueuesPage(page);
-
-    // Ensure the queue is active so "Pause" is the available verb.
-    await openActionsMenu(page, "e2e_test");
-    const resumeItem = page.getByRole("menuitem", { name: "Resume queue" });
-    const isCurrentlyPaused = await resumeItem.isVisible().catch(() => false);
-    if (isCurrentlyPaused) {
-      await Promise.all([
-        page.waitForResponse(
-          (r) => r.url().includes("/resume") && r.request().method() === "POST"
-        ),
-        resumeItem.click(),
-      ]);
-      await page.waitForResponse(isQueuesListResponse);
-      await openActionsMenu(page, "e2e_test");
-    } else {
-      await page.keyboard.press("Escape");
-      await openActionsMenu(page, "e2e_test");
+    const row = queueRow(page);
+    if (
+      await row.getByRole("button", { name: "Resume", exact: true }).isVisible()
+    ) {
+      await row.getByRole("button", { name: "Resume", exact: true }).click();
     }
-
-    const pauseItem = page.getByRole("menuitem", { name: "Pause queue" });
-    await expect(pauseItem).toBeVisible();
+    await expect(
+      row.getByRole("button", { name: "Pause", exact: true }),
+    ).toBeVisible();
     const [pauseResponse] = await Promise.all([
       page.waitForResponse(
-        (r) => r.url().includes("/pause") && r.request().method() === "POST"
+        (response) =>
+          response.url().endsWith("/pause") &&
+          response.request().method() === "POST",
       ),
-      pauseItem.click(),
+      row.getByRole("button", { name: "Pause", exact: true }).click(),
     ]);
     expect(pauseResponse.ok()).toBeTruthy();
-  });
-
-  test("Resume executes mutation from the Actions menu", async ({ page }) => {
-    await loadQueuesPage(page);
-
-    await openActionsMenu(page, "e2e_test");
-    const pauseItem = page.getByRole("menuitem", { name: "Pause queue" });
-    const isCurrentlyActive = await pauseItem.isVisible().catch(() => false);
-    if (isCurrentlyActive) {
-      await Promise.all([
-        page.waitForResponse(
-          (r) => r.url().includes("/pause") && r.request().method() === "POST"
-        ),
-        pauseItem.click(),
-      ]);
-      await page.waitForResponse(isQueuesListResponse);
-      await openActionsMenu(page, "e2e_test");
-    } else {
-      await page.keyboard.press("Escape");
-      await openActionsMenu(page, "e2e_test");
-    }
-
-    const resumeItem = page.getByRole("menuitem", { name: "Resume queue" });
-    await expect(resumeItem).toBeVisible();
+    await expect(
+      row.getByRole("button", { name: "Resume", exact: true }),
+    ).toBeVisible();
     const [resumeResponse] = await Promise.all([
       page.waitForResponse(
-        (r) => r.url().includes("/resume") && r.request().method() === "POST"
+        (response) =>
+          response.url().endsWith("/resume") &&
+          response.request().method() === "POST",
       ),
-      resumeItem.click(),
+      row.getByRole("button", { name: "Resume", exact: true }).click(),
     ]);
     expect(resumeResponse.ok()).toBeTruthy();
-    await page.waitForResponse(isQueuesListResponse);
   });
 
-  test("Drain shows confirmation dialog from the Actions menu", async ({ page }) => {
+  test("Drain requires confirmation and can be cancelled", async ({ page }) => {
     await loadQueuesPage(page);
-    await openActionsMenu(page, "e2e_test");
-
-    await page.getByRole("menuitem", { name: /^Drain queue/ }).click();
-
+    await queueRow(page).getByRole("button", { name: "Drain…" }).click();
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible();
-    await expect(dialog.getByRole("heading", { name: /Drain queue/ })).toBeVisible();
-    await expect(dialog.getByText("Running jobs will not be affected")).toBeVisible();
-
+    await expect(
+      dialog.getByText(/Running jobs will not be affected/),
+    ).toBeVisible();
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(dialog).not.toBeVisible();
   });

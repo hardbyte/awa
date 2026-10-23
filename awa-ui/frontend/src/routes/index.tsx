@@ -1,586 +1,332 @@
-import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link } from "@tanstack/react-router";
 import {
   fetchStats,
   fetchQueues,
   fetchJobs,
   fetchRuntime,
-  fetchTimeseries,
+  fetchDlqDepth,
 } from "@/lib/api";
-import type {
-  StateCounts,
-  QueueStats,
-  JobRow,
-  RuntimeOverview,
-  TimeseriesBucket,
-} from "@/lib/api";
-import { StateBadge } from "@/components/StateBadge";
-import { Sparkline } from "@/components/Sparkline";
-import { Heading } from "@/components/ui/heading";
-import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
-import {
-  Table,
-  TableHeader,
-  TableBody,
-  TableRow,
-  TableCell,
-  TableColumn,
-} from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
-import { LagValue } from "@/components/LagValue";
+import { compareQueuePressure, runtimeConcern } from "@/lib/operations";
 import { timeAgo } from "@/lib/time";
-import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
 import { usePollInterval } from "@/hooks/use-poll-interval";
+import { QueuePressure } from "@/components/QueuePressure";
+import { SnapshotStatus } from "@/components/SnapshotStatus";
 
-/** Background tint per state for counter cards */
-const STATE_CARD_BG: Record<string, string> = {
-  available: "bg-info-subtle",
-  running: "bg-success-subtle",
-  failed: "bg-danger-subtle",
-  scheduled: "bg-secondary/50",
-  waiting_external: "bg-[oklch(0.87_0.07_280)]/30",
-};
-
-/** Headline metrics — includes deferred and callback-blocked work */
-const COUNTER_KEYS = ["available", "running", "failed", "scheduled", "waiting_external"] as const;
+const STATES = [
+  ["available", "Available", "Ready to be claimed"],
+  ["running", "Running", "Executing now"],
+  ["retryable", "Retryable", "Waiting for another attempt"],
+  ["failed", "Failed", "Requires review"],
+  ["scheduled", "Scheduled", "Deferred until run time"],
+  ["waiting_external", "Waiting external", "Awaiting a callback"],
+] as const;
 
 export function DashboardPage() {
-  const navigate = useNavigate();
   const poll = usePollInterval();
-
-  const statsQuery = useQuery<StateCounts>({
+  const polling = { refetchInterval: poll.interval, staleTime: poll.staleTime };
+  const stats = useQuery({
     queryKey: ["stats"],
     queryFn: fetchStats,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
+    ...polling,
   });
-
-  // Timeseries powers the inline sparklines on the state counter cards.
-  // Returns an empty array on pre-v10 deployments / seed-free databases, in
-  // which case Sparkline renders an empty slot of its reserved size so the
-  // card layout doesn't jump.
-  const timeseriesQuery = useQuery<TimeseriesBucket[]>({
-    queryKey: ["stats", "timeseries", 60],
-    queryFn: () => fetchTimeseries(60),
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
-  });
-
-  /** Pivot the flat timeseries response into a per-state numeric series
-   * suitable for <Sparkline data={...} />. Missing buckets are filled as 0. */
-  const seriesByState = useMemo(() => {
-    const buckets = timeseriesQuery.data ?? [];
-    const byBucket = new Map<string, Map<string, number>>();
-    const ordered: string[] = [];
-    for (const point of buckets) {
-      if (!byBucket.has(point.bucket)) {
-        byBucket.set(point.bucket, new Map());
-        ordered.push(point.bucket);
-      }
-      byBucket.get(point.bucket)!.set(point.state, point.count);
-    }
-    ordered.sort();
-    const result: Record<string, number[]> = {};
-    for (const bucket of ordered) {
-      const stateMap = byBucket.get(bucket)!;
-      for (const state of stateMap.keys()) {
-        if (!result[state]) result[state] = [];
-      }
-    }
-    for (const bucket of ordered) {
-      const stateMap = byBucket.get(bucket)!;
-      for (const state of Object.keys(result)) {
-        const series = result[state];
-        if (series) series.push(stateMap.get(state) ?? 0);
-      }
-    }
-    return result;
-  }, [timeseriesQuery.data]);
-
-  const queuesQuery = useQuery<QueueStats[]>({
+  const queues = useQuery({
     queryKey: ["queues"],
     queryFn: fetchQueues,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
+    ...polling,
   });
-
-  const failedQuery = useQuery<JobRow[]>({
-    queryKey: ["jobs", { state: "failed", limit: 10 }],
-    queryFn: () => fetchJobs({ state: "failed", limit: 10 }),
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
-  });
-
-  const runtimeQuery = useQuery<RuntimeOverview>({
+  const runtime = useQuery({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
+    ...polling,
   });
-
-  const completedPerHour = queuesQuery.data
-    ? queuesQuery.data.reduce((sum, q) => sum + q.completed_last_hour, 0)
-    : null;
-
-  const totalJobs = statsQuery.data
-    ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
-    : null;
-
-  // Sort queues by visible workload so deferred-heavy queues stay prominent.
-  const topQueues = queuesQuery.data
-    ? [...queuesQuery.data]
-        .sort(
-          (a, b) => b.total_queued + b.failed - (a.total_queued + a.failed)
-        )
-        .slice(0, DASHBOARD_QUEUE_LIMIT)
-    : [];
-
-  const hasMoreQueues =
-    queuesQuery.data && queuesQuery.data.length > DASHBOARD_QUEUE_LIMIT;
+  const failures = useQuery({
+    queryKey: ["jobs", { state: "failed", limit: 5 }],
+    queryFn: () => fetchJobs({ state: "failed", limit: 5 }),
+    ...polling,
+  });
+  const dlq = useQuery({
+    queryKey: ["dlq-depth"],
+    queryFn: fetchDlqDepth,
+    refetchInterval: Math.max(poll.interval, 60_000),
+    staleTime: Math.max(poll.staleTime, 60_000),
+  });
+  const topQueues = [...(queues.data ?? [])]
+    .sort(compareQueuePressure)
+    .slice(0, 6);
+  const workers = [...(runtime.data?.instances ?? [])]
+    .sort(
+      (left, right) =>
+        Number(right.stale || !right.healthy) -
+        Number(left.stale || !left.healthy),
+    )
+    .slice(0, 4);
+  const completed = queues.data?.reduce(
+    (sum, queue) => sum + queue.completed_last_hour,
+    0,
+  );
+  const paused = queues.data?.filter((queue) => queue.paused).length;
+  const degraded = runtime.data?.instances.filter(
+    (instance) => !instance.stale && !instance.healthy,
+  ).length;
+  const sources = [stats, queues, runtime, failures, dlq];
+  const errors = [
+    "Job counts",
+    "Queues",
+    "Workers",
+    "Failed jobs",
+    "Dead letter queue",
+  ].filter((_, index) => sources[index]?.isError);
 
   return (
-    <div className="space-y-6">
-      <Heading level={2}>Dashboard</Heading>
-
-      {/* Headline counter cards */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        {COUNTER_KEYS.map((key) => {
-          const count = statsQuery.data?.[key];
-          const bg = STATE_CARD_BG[key] ?? "";
-          const series = seriesByState[key] ?? [];
-          return (
-            <Link
-              key={key}
-              to="/jobs"
-              search={{ state: key }}
-              className="no-underline"
-            >
-              <Card
-                className={`text-center transition-colors hover:opacity-80 ${bg}`}
-              >
-                <CardContent className="py-4">
-                  <div className="text-3xl font-bold tabular-nums">
-                    {statsQuery.isLoading ? (
-                      <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
-                    ) : (
-                      (count ?? 0).toLocaleString()
-                    )}
-                  </div>
-                  <div className="mt-1.5 flex items-center justify-center gap-2">
-                    <StateBadge state={key} />
-                    <Sparkline
-                      data={series}
-                      width={48}
-                      height={14}
-                      className="text-primary/70"
-                      label={`${key} trend over the last hour`}
-                    />
-                  </div>
-                </CardContent>
-              </Card>
-            </Link>
-          );
-        })}
-        <Link to="/jobs" search={{ state: "completed" }} className="no-underline">
-          <Card className="bg-success-subtle/50 text-center transition-colors hover:opacity-80">
-            <CardContent className="py-4">
-              <div className="text-3xl font-bold tabular-nums">
-                {queuesQuery.isLoading ? (
-                  <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
-                ) : completedPerHour != null ? (
-                  completedPerHour.toLocaleString()
-                ) : (
-                  "—"
-                )}
-              </div>
-              <div className="mt-1.5 text-xs text-muted-fg">completed/hr</div>
-            </CardContent>
-          </Card>
+    <div className="operations-overview">
+      <div className="page-intro">
+        <div>
+          <p className="eyebrow">Operations / overview</p>
+          <h1>Work in motion</h1>
+          <p>Queue pressure, worker health, and work that needs attention.</p>
+        </div>
+        <Link to="/jobs" className="operator-link">
+          Explore jobs ↗
         </Link>
       </div>
-
-      {/* Total jobs count */}
-      {totalJobs != null && (
-        <p className="text-sm text-muted-fg">
-          {totalJobs.toLocaleString()} total jobs across{" "}
-          {queuesQuery.data?.length ?? 0} queues
-        </p>
+      <SnapshotStatus sources={[stats, queues, runtime, failures]} />
+      {errors.length > 0 && (
+        <div className="source-error" role="alert">
+          Could not refresh: {errors.join(", ")}. Previous values remain visible
+          where available. Use Refresh data to retry.
+        </div>
       )}
 
-      <Card>
-        <CardHeader
-          title="Runtime"
-          description={
-            runtimeQuery.data && runtimeQuery.data.instances.length > 0
-              ? `${runtimeQuery.data.instances.length} instance(s) · snapshots every ${
-                  (runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 10000) >= 1000
-                    ? `${Math.round((runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 10000) / 1000)}s`
-                    : `${runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 0}ms`
-                }`
-              : "Worker instances, leader health, and current runtime topology"
-          }
-        >
-          <CardAction>
-            <Link to="/runtime" className="text-sm text-primary no-underline hover:underline">
-              Open runtime
+      <div className="flow-summary">
+        <div className="completion-summary">
+          <p className="eyebrow">Completed · last 60 minutes</p>
+          <Link
+            to="/jobs"
+            search={{ state: "completed" }}
+            className="completion-value"
+          >
+            {completed?.toLocaleString() ?? "—"}
+            <span> jobs</span>
+          </Link>
+          <p>
+            Completions retained from a rolling hour. Current counts below are
+            snapshots.
+          </p>
+        </div>
+        <div className="attention-summary">
+          <p className="eyebrow">Review & intervene</p>
+          <Link to="/queues">
+            <strong>{paused ?? "—"}</strong>
+            <span>paused queues</span>
+            <span aria-hidden="true">↗</span>
+          </Link>
+          <Link to="/runtime" search={{ lifecycle: "all" }}>
+            <strong>
+              {runtime.data
+                ? (
+                    runtime.data.stale_instances + (degraded ?? 0)
+                  ).toLocaleString()
+                : "—"}
+            </strong>
+            <span>stale or degraded instances</span>
+            <span aria-hidden="true">↗</span>
+          </Link>
+          <Link to="/dlq">
+            <strong>{dlq.data?.total.toLocaleString() ?? "—"}</strong>
+            <span>
+              dead letter jobs
+              <span className="block text-xs text-muted-fg">
+                refresh every {Math.max(poll.interval, 60_000) / 1000}s
+              </span>
+            </span>
+            <span aria-hidden="true">↗</span>
+          </Link>
+        </div>
+      </div>
+
+      <section aria-labelledby="current-work">
+        <div className="section-label">
+          <h2 id="current-work">Current work</h2>
+          <span>Counts now · may lag behind execution</span>
+        </div>
+        <div className="work-counters">
+          {STATES.map(([state, label, description]) => (
+            <Link
+              key={state}
+              to="/jobs"
+              search={{ state }}
+              className={`work-counter counter-${state}`}
+            >
+              <span>{label}</span>
+              <strong>
+                {stats.data ? (stats.data[state] ?? 0).toLocaleString() : "—"}
+              </strong>
+              <small>{description}</small>
             </Link>
-          </CardAction>
-        </CardHeader>
-        <CardContent>
-          <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Live</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.live_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Healthy</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.healthy_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Leader</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.leader_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Stale</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtimeQuery.data?.stale_instances ?? "—"}
-              </div>
-            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="operations-panel" aria-labelledby="queue-pressure">
+        <div className="panel-heading">
+          <div>
+            <h2 id="queue-pressure">Where work is waiting</h2>
+            <p>
+              Top {topQueues.length} of {queues.data?.length ?? "—"} queues ·
+              longest available wait first
+            </p>
           </div>
+          <Link to="/queues" className="operator-link">
+            All queues ↗
+          </Link>
+        </div>
+        {topQueues.length ? (
+          <QueuePressure queues={topQueues} />
+        ) : (
+          <p className="panel-empty">
+            {queues.isPending
+              ? "Loading queue snapshots…"
+              : queues.isError
+                ? "Queue data unavailable."
+                : "No queues yet. Queues appear when registered or used."}
+          </p>
+        )}
+        <p className="panel-footnote">
+          Oldest available = time since the earliest available job’s run time.
+          Scheduled, retryable, and external waits are separate; a single
+          snapshot does not show whether a backlog is growing.
+        </p>
+      </section>
 
-          {/* Mobile runtime cards */}
-          {(runtimeQuery.data?.instances.length ?? 0) === 0 ? (
-            <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
-            >
-              {runtimeQuery.isLoading
-                ? "Loading runtime…"
-                : runtimeQuery.isError
-                  ? "Failed to load runtime data."
-                  : "No runtime snapshots yet. Start a worker to populate this view."}
+      <div className="overview-details">
+        <section className="operations-panel" aria-labelledby="worker-health">
+          <div className="panel-heading">
+            <div>
+              <h2 id="worker-health">Worker health</h2>
+              <p>
+                {runtime.data
+                  ? `${runtime.data.healthy_instances} healthy · ${runtime.data.live_instances} live · ${runtime.data.stale_instances} stale · ${runtime.data.leader_instances} leader`
+                  : "Runtime snapshots"}
+              </p>
             </div>
-          ) : (
-            <div className="space-y-2 sm:hidden">
-              {runtimeQuery.data!.instances.map((instance) => {
-                const label = instance.hostname ?? `pid ${instance.pid}`;
-                const healthLabel = instance.stale
-                  ? "Stale"
-                  : instance.healthy
-                    ? "Healthy"
-                    : "Degraded";
-                const healthIntent = instance.stale
-                  ? ("warning" as const)
-                  : instance.healthy
-                    ? ("success" as const)
-                    : ("danger" as const);
-                return (
-                  <div key={instance.instance_id} className="rounded-lg border p-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <span className="font-medium">{label}</span>
-                        <span className="ml-2 text-xs text-muted-fg">
-                          {instance.version}
-                        </span>
-                      </div>
-                      <Badge intent={healthIntent}>{healthLabel}</Badge>
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      <Badge intent={instance.poll_loop_alive ? "success" : "danger"}>
-                        poll
-                      </Badge>
-                      <Badge intent={instance.heartbeat_alive ? "success" : "danger"}>
-                        hb
-                      </Badge>
-                      <Badge intent={instance.maintenance_alive ? "success" : "danger"}>
-                        maint
-                      </Badge>
-                      {instance.leader && (
-                        <Badge intent="primary">Leader</Badge>
-                      )}
-                    </div>
-                    <div className="mt-1 text-xs text-muted-fg">
-                      {instance.queues.length} queue(s) · seen {timeAgo(instance.last_seen_at)}
-                    </div>
+            <Link
+              to="/runtime"
+              search={{ lifecycle: "all" }}
+              className="operator-link"
+            >
+              All workers ↗
+            </Link>
+          </div>
+          <div className="worker-preview">
+            {workers.length ? (
+              workers.map((instance) => (
+                <Link
+                  key={instance.instance_id}
+                  to="/runtime/$instanceId"
+                  params={{ instanceId: instance.instance_id }}
+                  className="worker-preview-row"
+                >
+                  <div>
+                    <strong>
+                      {instance.hostname || `pid ${instance.pid}`}
+                    </strong>
+                    <span
+                      className={
+                        instance.stale || !instance.healthy
+                          ? "concern-text"
+                          : "healthy-text"
+                      }
+                    >
+                      {runtimeConcern(instance)}
+                    </span>
                   </div>
+                  <span>
+                    Seen {timeAgo(instance.last_seen_at)}
+                    <span className="worker-role">
+                      {instance.leader ? "Leader" : "Worker"} ·{" "}
+                      {instance.version}
+                    </span>
+                  </span>
+                </Link>
+              ))
+            ) : (
+              <p className="panel-empty">
+                {runtime.isPending
+                  ? "Loading workers…"
+                  : runtime.isError
+                    ? "Worker data unavailable."
+                    : "No runtime snapshots. Start a worker to report health."}
+              </p>
+            )}
+          </div>
+          <p className="panel-footnote">
+            Showing up to 4 instances, stale and degraded first. Stale snapshots
+            cannot establish current worker health.
+          </p>
+        </section>
+        <section className="operations-panel" aria-labelledby="recent-failures">
+          <div className="panel-heading">
+            <div>
+              <h2 id="recent-failures">Failed jobs to inspect</h2>
+              <p>Latest 5 retained failed jobs · not a failure rate</p>
+            </div>
+            <Link
+              to="/jobs"
+              search={{ state: "failed" }}
+              className="operator-link"
+            >
+              All failed ↗
+            </Link>
+          </div>
+          <div className="failure-preview">
+            {failures.data?.length ? (
+              failures.data.map((job) => {
+                const last = job.errors?.[job.errors.length - 1];
+                const message =
+                  typeof last === "object" && last && "error" in last
+                    ? String(last.error)
+                    : last
+                      ? JSON.stringify(last)
+                      : "No error details recorded";
+                return (
+                  <Link
+                    key={job.id}
+                    to="/jobs/$id"
+                    params={{ id: String(job.id) }}
+                    className="failure-preview-row"
+                  >
+                    <div>
+                      <strong>
+                        {job.kind_descriptor?.display_name?.trim() || job.kind}
+                      </strong>
+                      <span>
+                        #{job.id} · {job.queue} · attempt {job.attempt}/
+                        {job.max_attempts}
+                      </span>
+                    </div>
+                    <p>{message}</p>
+                    <span>
+                      {job.finalized_at
+                        ? `Finalized ${timeAgo(job.finalized_at)}`
+                        : "Finalization time unavailable"}{" "}
+                      ↗
+                    </span>
+                  </Link>
                 );
-              })}
-            </div>
-          )}
-
-          {/* Desktop runtime table */}
-          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
-            <TableHeader>
-              <TableColumn isRowHeader>Instance</TableColumn>
-              <TableColumn>Health</TableColumn>
-              <TableColumn>Loops</TableColumn>
-              <TableColumn>Role</TableColumn>
-              <TableColumn className="text-right">Queues</TableColumn>
-              <TableColumn>Seen</TableColumn>
-            </TableHeader>
-            <TableBody
-              renderEmptyState={() => (
-                <div className="p-6 text-center text-sm text-muted-fg">
-                  {runtimeQuery.isLoading
-                    ? "Loading runtime…"
-                    : runtimeQuery.isError
-                      ? "Failed to load runtime data."
-                      : "No runtime snapshots yet. Start a worker to populate this view."}
-                </div>
-              )}
-            >
-              {(runtimeQuery.data?.instances ?? []).map((instance) => {
-                  const label = instance.hostname ?? `pid ${instance.pid}`;
-                  const healthLabel = instance.stale
-                    ? "Stale"
-                    : instance.healthy
-                      ? "Healthy"
-                      : "Degraded";
-                  const healthIntent = instance.stale
-                    ? "warning"
-                    : instance.healthy
-                      ? "success"
-                      : "danger";
-                  return (
-                    <TableRow key={instance.instance_id} id={instance.instance_id}>
-                      <TableCell className="font-medium">
-                        <div>{label}</div>
-                        <div className="text-xs text-muted-fg">
-                          {instance.version} · pid {instance.pid}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <Badge intent={healthIntent}>{healthLabel}</Badge>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-wrap gap-1">
-                          <Badge intent={instance.poll_loop_alive ? "success" : "danger"}>
-                            poll
-                          </Badge>
-                          <Badge intent={instance.heartbeat_alive ? "success" : "danger"}>
-                            heartbeat
-                          </Badge>
-                          <Badge intent={instance.maintenance_alive ? "success" : "danger"}>
-                            maintenance
-                          </Badge>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        {instance.leader ? (
-                          <Badge intent="primary">Leader</Badge>
-                        ) : (
-                          <span className="text-sm text-muted-fg">Worker</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {instance.queues.length}
-                      </TableCell>
-                      <TableCell>{timeAgo(instance.last_seen_at)}</TableCell>
-                    </TableRow>
-                  );
-                })}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-
-      {/* Queue summary — top N by activity */}
-      <Card>
-        <CardHeader
-          title="Queues"
-          description={
-            hasMoreQueues
-              ? `Showing top ${DASHBOARD_QUEUE_LIMIT} by activity`
-              : undefined
-          }
-        />
-        <CardContent>
-          <Table bleed aria-label="Queue summary">
-            <TableHeader>
-              <TableColumn isRowHeader>Queue</TableColumn>
-              <TableColumn className="text-right">Total queued</TableColumn>
-              <TableColumn className="text-right">Scheduled</TableColumn>
-              <TableColumn className="text-right">Available</TableColumn>
-              <TableColumn className="text-right">Retryable</TableColumn>
-              <TableColumn className="text-right">Running</TableColumn>
-              <TableColumn className="text-right">Failed</TableColumn>
-              <TableColumn className="text-right">Waiting</TableColumn>
-              <TableColumn className="text-right">Completed/hr</TableColumn>
-              <TableColumn className="text-right">Lag (s)</TableColumn>
-              <TableColumn>Status</TableColumn>
-            </TableHeader>
-            <TableBody
-              renderEmptyState={() => (
-                <div
-                  className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
-                >
-                  {queuesQuery.isLoading
-                    ? "Loading queues…"
-                    : queuesQuery.isError
-                      ? "Failed to load queues."
-                      : "No queues found."}
-                </div>
-              )}
-            >
-              {topQueues.map((q) => (
-                    <TableRow
-                      key={q.queue}
-                      id={q.queue}
-                      className="cursor-pointer"
-                      onAction={() =>
-                        void navigate({
-                          to: "/jobs",
-                          search: { q: `queue:${q.queue}` },
-                        })
-                      }
-                    >
-                      <TableCell className="font-medium">
-                        <div>
-                          <Link
-                            to="/queues/$name"
-                            params={{ name: q.queue }}
-                            className="text-primary no-underline hover:underline"
-                          >
-                            {q.display_name ?? q.queue}
-                          </Link>
-                          {q.display_name && (
-                            <div className="text-xs font-normal text-muted-fg">
-                              {q.queue}
-                            </div>
-                          )}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.total_queued.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.scheduled.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.available.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.retryable.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.running.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        <span className={q.failed > 0 ? "text-danger" : ""}>
-                          {q.failed.toLocaleString()}
-                        </span>
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.waiting_external > 0
-                          ? q.waiting_external.toLocaleString()
-                          : "-"}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {q.completed_last_hour.toLocaleString()}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        <LagValue seconds={q.lag_seconds} />
-                      </TableCell>
-                      <TableCell>
-                        {q.paused ? (
-                          <Badge intent="warning">Paused</Badge>
-                        ) : (
-                          <Badge intent="success">Active</Badge>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-            </TableBody>
-          </Table>
-          {hasMoreQueues && topQueues.length > 0 && (
-            <div className="px-4 py-3">
-              <Link
-                to="/queues"
-                className="text-sm text-primary no-underline hover:underline"
-              >
-                View all {queuesQuery.data?.length} queues &rarr;
-              </Link>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Recent failures */}
-      <Card>
-        <CardHeader title="Recent Failures" />
-        <CardContent>
-          <Table bleed aria-label="Recent failures">
-            <TableHeader>
-              <TableColumn isRowHeader>ID</TableColumn>
-              <TableColumn>Kind</TableColumn>
-              <TableColumn>Queue</TableColumn>
-              <TableColumn className="text-right">Attempt</TableColumn>
-              <TableColumn>Failed</TableColumn>
-              <TableColumn>Error</TableColumn>
-            </TableHeader>
-            <TableBody
-              renderEmptyState={() => (
-                <div
-                  className={`p-6 text-center text-sm ${failedQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
-                >
-                  {failedQuery.isLoading
-                    ? "Loading failures…"
-                    : failedQuery.isError
-                      ? "Failed to load recent failures."
-                      : "No recent failures."}
-                </div>
-              )}
-            >
-              {(failedQuery.data ?? []).map((job) => {
-                  const lastErr =
-                    job.errors && job.errors.length > 0
-                      ? job.errors[job.errors.length - 1]
-                      : null;
-                  const errMsg =
-                    lastErr &&
-                    typeof lastErr === "object" &&
-                    lastErr !== null
-                      ? String(
-                          (lastErr as Record<string, unknown>)["error"] ?? ""
-                        )
-                      : "";
-                  return (
-                    <TableRow
-                      key={job.id}
-                      id={job.id}
-                      className="cursor-pointer"
-                      onAction={() =>
-                        void navigate({
-                          to: "/jobs/$id",
-                          params: { id: String(job.id) },
-                        })
-                      }
-                    >
-                      <TableCell className="font-mono text-primary">
-                        {job.id}
-                      </TableCell>
-                      <TableCell>{job.kind}</TableCell>
-                      <TableCell>{job.queue}</TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {job.attempt}/{job.max_attempts}
-                      </TableCell>
-                      <TableCell>
-                        {job.finalized_at
-                          ? timeAgo(job.finalized_at)
-                          : "-"}
-                      </TableCell>
-                      <TableCell className="max-w-[300px] truncate text-danger">
-                        {errMsg || "-"}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+              })
+            ) : (
+              <p className="panel-empty">
+                {failures.isPending
+                  ? "Loading failed jobs…"
+                  : failures.isError
+                    ? "Failed-job data unavailable."
+                    : "No failed jobs in retained data."}
+              </p>
+            )}
+          </div>
+        </section>
+      </div>
     </div>
   );
 }

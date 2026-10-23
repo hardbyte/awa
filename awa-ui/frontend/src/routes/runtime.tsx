@@ -1,3 +1,4 @@
+import { SnapshotStatus } from "@/components/SnapshotStatus";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
@@ -123,7 +124,9 @@ export function RuntimePage() {
 
   const runtime = runtimeQuery.data;
   const queues = queueRuntimeQuery.data ?? [];
-  const allInstances = runtime?.instances ?? [];
+  const allInstances = [...(runtime?.instances ?? [])].sort(
+    (left, right) => Number(right.stale || !right.healthy) - Number(left.stale || !left.healthy),
+  );
   const staleInstances = allInstances.filter((instance) => instance.stale);
   const liveInstances = allInstances.filter((instance) => !instance.stale);
   const degradedInstances =
@@ -162,7 +165,8 @@ export function RuntimePage() {
 
   return (
     <div className="space-y-6">
-      <Heading level={2}>Runtime</Heading>
+      <Heading level={2}>Workers</Heading>
+      <SnapshotStatus sources={[runtimeQuery, queueRuntimeQuery]} />
 
       {hasAttention && (
         <Card>
@@ -341,7 +345,7 @@ export function RuntimePage() {
         <CardContent>
           {visibleInstances.length === 0 ? (
             <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`rounded-lg border p-6 text-center text-sm lg:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
             >
               {runtimeQuery.isLoading
                 ? "Loading instances…"
@@ -352,7 +356,7 @@ export function RuntimePage() {
                     : "No worker instances recorded."}
             </div>
           ) : (
-            <div className="space-y-3 sm:hidden">
+            <div className="space-y-3 lg:hidden">
               {visibleInstances.map((instance) => (
                 <button
                   key={instance.instance_id}
@@ -398,7 +402,7 @@ export function RuntimePage() {
               ))}
             </div>
           )}
-          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
+          <Table bleed aria-label="Runtime instances" className="hidden lg:block">
             <TableHeader>
               <TableColumn isRowHeader>Instance</TableColumn>
               <TableColumn>Health</TableColumn>
@@ -542,7 +546,7 @@ export function RuntimePage() {
         <CardContent>
           {queues.length === 0 ? (
             <div
-              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queueRuntimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+              className={`rounded-lg border p-6 text-center text-sm lg:hidden ${queueRuntimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
             >
               {queueRuntimeQuery.isLoading
                 ? "Loading queue runtime…"
@@ -551,7 +555,7 @@ export function RuntimePage() {
                   : "No queue runtime snapshots yet."}
             </div>
           ) : (
-            <div className="space-y-3 sm:hidden">
+            <div className="space-y-3 lg:hidden">
               {queues.map((queue) => (
                 <div key={queue.queue} className="rounded-lg border p-4">
                   <div className="flex items-center justify-between gap-3">
@@ -614,7 +618,7 @@ export function RuntimePage() {
               ))}
             </div>
           )}
-          <Table bleed aria-label="Queue runtime summary" className="hidden sm:table">
+          <Table bleed aria-label="Queue runtime summary" className="hidden lg:block">
             <TableHeader>
               <TableColumn isRowHeader>Queue</TableColumn>
               <TableColumn>Mode</TableColumn>

@@ -11,6 +11,7 @@ const databaseUrl =
 export default defineConfig({
   globalSetup: "./e2e/seed.ts",
   testDir: "./e2e",
+  testIgnore: "**/operations.spec.ts",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
