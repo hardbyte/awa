@@ -50,7 +50,7 @@ export function KindsPage() {
 
       {kinds.length === 0 ? (
         <div
-          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+          className={`rounded-lg border p-6 text-center text-sm lg:hidden ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
         >
           {kindsQuery.isLoading
             ? "Loading job kinds…"
@@ -59,7 +59,7 @@ export function KindsPage() {
               : "No job kinds found."}
         </div>
       ) : (
-        <div className="space-y-3 sm:hidden">
+        <div className="space-y-3 lg:hidden">
           {kinds.map((kind) => (
             <div key={kind.kind} className="rounded-lg border p-4">
               <div className="flex items-start justify-between gap-3">
@@ -125,7 +125,7 @@ export function KindsPage() {
         </div>
       )}
 
-      <Table aria-label="Job kinds" className="hidden sm:table">
+      <Table aria-label="Job kinds" className="hidden lg:block">
         <TableHeader>
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn className="text-right">Jobs</TableColumn>

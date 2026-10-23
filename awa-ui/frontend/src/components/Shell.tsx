@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Outlet, useRouterState, useNavigate } from "@tanstack/react-router";
 import {
   Link as AriaLink,
@@ -228,13 +228,13 @@ function useSidebarOpenState(): [boolean, (value: boolean) => void] {
 
 // Closes the mobile sidebar sheet on route change. No-op on desktop.
 function CloseMobileOnNavigate({ path }: { path: string }) {
-  const { isMobile, isOpenOnMobile, setIsOpenOnMobile } = useSidebar();
-  useEffect(() => {
-    if (isMobile && isOpenOnMobile) {
-      setIsOpenOnMobile(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
+  const { isMobile, setIsOpenOnMobile } = useSidebar();
+  const previousPath = useRef(path);
+  useLayoutEffect(() => {
+    if (previousPath.current === path) return;
+    previousPath.current = path;
+    if (isMobile) setIsOpenOnMobile(false);
+  }, [path, isMobile, setIsOpenOnMobile]);
   return null;
 }
 
@@ -341,11 +341,12 @@ const IconBatchOps = () => (
 );
 
 const NAV_ITEMS = [
-  { to: "/", label: "Dashboard", Icon: IconDashboard },
+  { to: "/", label: "Overview", Icon: IconDashboard },
   { to: "/jobs", label: "Jobs", Icon: IconJobs },
-  { to: "/kinds", label: "Kinds", Icon: IconKinds },
   { to: "/queues", label: "Queues", Icon: IconQueues },
-  { to: "/runtime", label: "Runtime", Icon: IconRuntime },
+  { to: "/dlq", label: "Dead letters", Icon: IconJobs },
+  { to: "/kinds", label: "Kinds", Icon: IconKinds },
+  { to: "/runtime", label: "Workers", Icon: IconRuntime },
   { to: "/cron", label: "Cron", Icon: IconCron },
   { to: "/batch-ops", label: "Batch Ops", Icon: IconBatchOps },
 ] as const;
@@ -419,6 +420,7 @@ export function Shell() {
       onOpenChange={setSidebarOpen}
       style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}
     >
+      <CloseMobileOnNavigate path={currentPath} />
       <Sidebar collapsible="dock">
         <SidebarHeader>
           <AriaLink
@@ -456,19 +458,21 @@ export function Shell() {
             />
           </div>
         </SidebarFooter>
-        <CloseMobileOnNavigate path={currentPath} />
       </Sidebar>
 
-      <SidebarInset>
+      <SidebarInset className="min-w-0">
+        <a href="#main-content" className="sr-only focus:not-sr-only focus:p-3">
+          Skip to content
+        </a>
         {/* Opaque: any translucency lets scrolled table text ghost through
             the sticky bar and fight the header content for legibility. */}
         <header className="sticky top-0 z-10 flex items-center gap-2 border-b bg-bg px-4 py-2.5 sm:px-6">
           <SidebarTrigger className="-ml-1" />
           {instanceName && (
             <span
-              className="ml-1 inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs/none font-medium text-fg"
+              className="ml-1 inline-flex min-w-0 max-w-[60vw] items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs/none font-medium text-fg"
               style={instanceColor ? { borderColor: instanceColor } : undefined}
-              title="Awa instance"
+              title={`Awa instance: ${instanceName}`}
             >
               <span
                 className="size-2 shrink-0 rounded-full bg-primary"
@@ -476,7 +480,7 @@ export function Shell() {
                   instanceColor ? { backgroundColor: instanceColor } : undefined
                 }
               />
-              {instanceName}
+              <span className="truncate">{instanceName}</span>
             </span>
           )}
           {peers.length > 0 && (
@@ -504,14 +508,18 @@ export function Shell() {
           </div>
         </header>
 
-        <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+        <section
+          tabIndex={-1}
+          id="main-content"
+          className="mx-auto min-w-0 w-full max-w-[1600px] px-4 py-6 sm:px-6 lg:px-8"
+        >
           {showReadOnlyBanner && (
-            <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-fg">
-              Connected to a read-only database. Dashboard queries work, but admin actions are disabled.
+            <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-subtle-fg">
+              Connected to a read-only database. Live queries work; admin actions are disabled.
             </div>
           )}
           <Outlet />
-        </main>
+        </section>
       </SidebarInset>
     </SidebarProvider>
     </AriaRouterProvider>

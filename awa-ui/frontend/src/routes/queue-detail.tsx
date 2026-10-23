@@ -24,8 +24,10 @@ import {
   DescriptionTerm,
 } from "@/components/ui/description-list";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { LagValue } from "@/components/LagValue";
+import { availableWait } from "@/lib/operations";
 import type { QueueRuntimeSummary } from "@/lib/api";
+import { usePollInterval } from "@/hooks/use-poll-interval";
+import { SnapshotStatus } from "@/components/SnapshotStatus";
 import { timeAgo } from "@/lib/time";
 import {
   dlqPolicyIntent,
@@ -40,18 +42,21 @@ export function QueueDetailPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
+  const poll = usePollInterval();
   const [showDrainConfirm, setShowDrainConfirm] = useState(false);
 
   const queueQuery = useQuery({
     queryKey: ["queue", queueName],
     queryFn: () => fetchQueue(queueName),
     enabled: !!queueName,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
     enabled: !!queueName,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const pauseMutation = useMutation({
@@ -129,7 +134,7 @@ export function QueueDetailPage() {
         {queue.paused ? (
           <Badge intent="warning">Paused</Badge>
         ) : (
-          <Badge intent="success">Active</Badge>
+          <Badge intent="success">Claims enabled</Badge>
         )}
         {runtime?.config && (
           <Badge intent={dlqPolicyIntent(runtime.config)}>
@@ -139,6 +144,8 @@ export function QueueDetailPage() {
         {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
         {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
       </div>
+
+      <SnapshotStatus sources={[queueQuery, runtimeQuery]} />
 
       {queue.description && (
         <p className="max-w-3xl text-sm text-muted-fg">{queue.description}</p>
@@ -190,6 +197,42 @@ export function QueueDetailPage() {
           Drain
         </Button>
       </div>
+
+      <Card>
+        <CardHeader title="Queue stats" />
+        <CardContent>
+          <DescriptionList>
+            <DescriptionTerm>Total queued</DescriptionTerm>
+            <DescriptionDetails>{queue.total_queued.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Scheduled</DescriptionTerm>
+            <DescriptionDetails>{queue.scheduled.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Available</DescriptionTerm>
+            <DescriptionDetails>{queue.available.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Retryable</DescriptionTerm>
+            <DescriptionDetails>{queue.retryable.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Running</DescriptionTerm>
+            <DescriptionDetails>{queue.running.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Waiting external</DescriptionTerm>
+            <DescriptionDetails>{queue.waiting_external.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Failed</DescriptionTerm>
+            <DescriptionDetails>{queue.failed.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Completed last hour</DescriptionTerm>
+            <DescriptionDetails>{queue.completed_last_hour.toLocaleString()}</DescriptionDetails>
+
+            <DescriptionTerm>Oldest available wait</DescriptionTerm>
+            <DescriptionDetails>
+              {availableWait(queue.lag_seconds)}
+            </DescriptionDetails>
+          </DescriptionList>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader title="Descriptor" />
@@ -252,42 +295,6 @@ export function QueueDetailPage() {
                 </DescriptionDetails>
               </>
             )}
-          </DescriptionList>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader title="Queue stats" />
-        <CardContent>
-          <DescriptionList>
-            <DescriptionTerm>Total queued</DescriptionTerm>
-            <DescriptionDetails>{queue.total_queued.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Scheduled</DescriptionTerm>
-            <DescriptionDetails>{queue.scheduled.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Available</DescriptionTerm>
-            <DescriptionDetails>{queue.available.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Retryable</DescriptionTerm>
-            <DescriptionDetails>{queue.retryable.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Running</DescriptionTerm>
-            <DescriptionDetails>{queue.running.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Waiting external</DescriptionTerm>
-            <DescriptionDetails>{queue.waiting_external.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Failed</DescriptionTerm>
-            <DescriptionDetails>{queue.failed.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Completed last hour</DescriptionTerm>
-            <DescriptionDetails>{queue.completed_last_hour.toLocaleString()}</DescriptionDetails>
-
-            <DescriptionTerm>Lag</DescriptionTerm>
-            <DescriptionDetails>
-              <LagValue seconds={queue.lag_seconds} /> s
-            </DescriptionDetails>
           </DescriptionList>
         </CardContent>
       </Card>
