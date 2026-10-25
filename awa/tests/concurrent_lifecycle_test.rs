@@ -1,5 +1,8 @@
 //! Concurrent multi-queue lifecycle benchmark.
 //!
+//! Each benchmark owns a disposable database; `DATABASE_URL` selects the
+//! PostgreSQL server and its role must have `CREATEDB`.
+//!
 //! Measures system throughput when multiple producers insert into multiple
 //! queues while workers consume across all of them simultaneously. This is
 //! the "system under realistic load" benchmark — closer to production
@@ -15,31 +18,15 @@
 mod bench_output;
 
 use async_trait::async_trait;
-use awa::model::{insert_many, migrations};
+use awa::model::insert_many;
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa_testing::setup::TestDatabase;
 use bench_output::{BenchMetrics, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-async fn setup(max_conns: u32) -> sqlx::PgPool {
-    let pool = PgPoolOptions::new()
-        .max_connections(max_conns)
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database");
-    migrations::run(&pool).await.expect("Failed to migrate");
-    awa_testing::setup::reset_to_canonical(&pool).await;
-    pool
-}
 
 async fn reset_runtime_state(pool: &sqlx::PgPool) {
     sqlx::query(
@@ -399,7 +386,8 @@ async fn run_lifecycle_benchmark(pool: &sqlx::PgPool, config: &LifecycleConfig) 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_concurrent_lifecycle_10k() {
-    let pool = setup(50).await;
+    let db = TestDatabase::with_max_connections(50).await;
+    let pool = db.pool().clone();
     run_lifecycle_benchmark(
         &pool,
         &LifecycleConfig {
@@ -419,7 +407,8 @@ async fn test_concurrent_lifecycle_10k() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_concurrent_drain_20k() {
-    let pool = setup(50).await;
+    let db = TestDatabase::with_max_connections(50).await;
+    let pool = db.pool().clone();
     reset_runtime_state(&pool).await;
 
     let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
@@ -685,7 +674,8 @@ async fn test_concurrent_drain_20k() {
 async fn test_concurrent_queue_sweep() {
     // 1 queue × 128 workers
     {
-        let pool = setup(50).await;
+        let db = TestDatabase::with_max_connections(50).await;
+        let pool = db.pool().clone();
         reset_runtime_state(&pool).await;
 
         let total: i64 = 20_000;
@@ -746,7 +736,8 @@ async fn test_concurrent_queue_sweep() {
 
     // 2 queues × 64 workers
     {
-        let pool = setup(50).await;
+        let db = TestDatabase::with_max_connections(50).await;
+        let pool = db.pool().clone();
         reset_runtime_state(&pool).await;
 
         let per_queue: i64 = 10_000;
@@ -826,7 +817,8 @@ async fn test_concurrent_queue_sweep() {
 
     // 4 queues × 32 workers
     {
-        let pool = setup(50).await;
+        let db = TestDatabase::with_max_connections(50).await;
+        let pool = db.pool().clone();
         reset_runtime_state(&pool).await;
 
         let per_queue: i64 = 5_000;
@@ -916,7 +908,8 @@ async fn test_concurrent_queue_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_concurrent_lifecycle_40k() {
-    let pool = setup(50).await;
+    let db = TestDatabase::with_max_connections(50).await;
+    let pool = db.pool().clone();
     run_lifecycle_benchmark(
         &pool,
         &LifecycleConfig {
@@ -935,7 +928,8 @@ async fn test_concurrent_lifecycle_40k() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_concurrent_lifecycle_100k() {
-    let pool = setup(50).await;
+    let db = TestDatabase::with_max_connections(50).await;
+    let pool = db.pool().clone();
     run_lifecycle_benchmark(
         &pool,
         &LifecycleConfig {

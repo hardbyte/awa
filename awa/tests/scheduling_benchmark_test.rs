@@ -1,14 +1,18 @@
 //! Local benchmark tests for throughput and scheduling behavior.
 //!
+//! Each benchmark owns a disposable database; `DATABASE_URL` selects the
+//! PostgreSQL server and its role must have `CREATEDB`.
+//!
 //! Run with:
 //! `DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test scheduling_benchmark_test -- --ignored --nocapture`
 
 mod bench_output;
 
-use awa::model::{insert_many, migrations};
+use awa::model::insert_many;
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, PeriodicJob, QueueConfig, Worker,
 };
+use awa_testing::setup::TestDatabase;
 use bench_output::{BenchMetrics, BenchmarkResult, SCHEMA_VERSION};
 use chrono::{DateTime, Utc};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -22,26 +26,6 @@ use std::time::{Duration, Instant};
 
 mod ci_timing;
 use ci_timing::{contention_floor, scaled_timeout};
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-async fn pool_with(max_conns: u32) -> sqlx::PgPool {
-    PgPoolOptions::new()
-        .max_connections(max_conns)
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database")
-}
-
-async fn setup(max_conns: u32) -> sqlx::PgPool {
-    let pool = pool_with(max_conns).await;
-    migrations::run(&pool).await.expect("Failed to migrate");
-    awa_testing::setup::reset_to_canonical(&pool).await;
-    pool
-}
 
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
     sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = $1")
@@ -693,7 +677,8 @@ async fn recv_until(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_runtime_throughput_worker_sweep() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     let queue = "bench_worker_sweep";
     clean_queue(&pool, queue).await;
 
@@ -759,7 +744,8 @@ async fn test_runtime_throughput_worker_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_runtime_completion_gap() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     let queue = "bench_completion_gap";
     clean_queue(&pool, queue).await;
 
@@ -873,12 +859,16 @@ async fn test_mvcc_horizon_planetscale_soak() {
 
 async fn run_mvcc_horizon_benchmark(defaults: MvccBenchmarkDefaults) {
     let max_conns = env_u32("AWA_MVCC_POOL_MAX", defaults.max_conns);
-    let pool = setup(max_conns).await;
-    let analytics_pool = pool_with(env_u32(
-        "AWA_MVCC_ANALYTICS_POOL_MAX",
-        defaults.analytics_pool_max,
-    ))
-    .await;
+    let db = TestDatabase::with_max_connections(max_conns).await;
+    let pool = db.pool().clone();
+    let analytics_pool = PgPoolOptions::new()
+        .max_connections(env_u32(
+            "AWA_MVCC_ANALYTICS_POOL_MAX",
+            defaults.analytics_pool_max,
+        ))
+        .connect(&db.url())
+        .await
+        .expect("Failed to connect analytics pool to benchmark database");
     let queue = defaults.queue;
     reset_runtime_state(&pool).await;
     clean_queue(&pool, queue).await;
@@ -1119,7 +1109,8 @@ async fn run_mvcc_horizon_benchmark(defaults: MvccBenchmarkDefaults) {
 }
 
 async fn run_runtime_sustained_hot_path(max_conns: u32) {
-    let pool = setup(max_conns).await;
+    let db = TestDatabase::with_max_connections(max_conns).await;
+    let pool = db.pool().clone();
     let queue = if max_conns == 20 {
         "bench_hot_steady"
     } else {
@@ -1231,7 +1222,8 @@ async fn run_runtime_sustained_hot_path(max_conns: u32) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_scheduled_delay_jitter_sweep() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     let queue = "bench_scheduled_jitter";
     clean_queue(&pool, queue).await;
 
@@ -1310,7 +1302,8 @@ async fn test_scheduled_delay_jitter_sweep() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_cron_seconds_timing_and_miss_rate() {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     let queue = "bench_cron_seconds";
     clean_queue(&pool, queue).await;
 
@@ -1444,7 +1437,8 @@ async fn test_scheduled_steady_10m_due_6k_per_sec() {
 }
 
 async fn run_scheduled_frontier_benchmark(queue: &str, total_jobs: i64, due_now: i64) {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     clean_queue(&pool, queue).await;
 
     let seed_start = Instant::now();
@@ -1578,7 +1572,8 @@ async fn run_scheduled_steady_benchmark(
     due_rate: i64,
     window_secs: i64,
 ) {
-    let pool = setup(20).await;
+    let db = TestDatabase::with_max_connections(20).await;
+    let pool = db.pool().clone();
     // This benchmark measures one deferred frontier at scale. Reset the whole
     // runtime state so global promotion work from earlier tests does not skew
     // the result.
