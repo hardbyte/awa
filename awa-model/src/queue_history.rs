@@ -7,13 +7,16 @@
 //!
 //! Counter deltas are `None` ("unknown") rather than a guess whenever the
 //! leader cannot account for every live runtime serving a queue: on its first
-//! sample, for a runtime it has not seen before that started earlier, and for
-//! runtimes that predate the counters. A runtime that dies between samples
-//! loses at most its last snapshot interval of counts.
+//! sample, for a runtime it has not seen before that started earlier, for
+//! runtimes that predate the counters, and when the interval since the last
+//! sample is not about a minute. Completed, failed and retried counts are also
+//! unknown wherever a callback may have resolved a parked job, since that can
+//! happen in any process. A runtime that dies between samples loses at most
+//! its last snapshot interval of counts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -30,7 +33,14 @@ pub struct QueueFlow {
     pub retried: i64,
     pub rate_limited: i64,
     pub claim_wait_ms: i64,
+    pub parked: i64,
 }
+
+/// How far a sample interval may stray from a minute and still be stored as
+/// one. Workers publish counters on their own snapshot cadence, so some jitter
+/// is inherent; an interval well off a minute (the first one after taking
+/// leadership, or a delayed sample) would misstate a per-minute rate.
+const MINUTE_TOLERANCE: TimeDelta = TimeDelta::seconds(15);
 
 impl QueueFlow {
     fn between(previous: Option<&QueueOutcomeCounters>, current: &QueueOutcomeCounters) -> Self {
@@ -44,7 +54,8 @@ impl QueueFlow {
                     && current.failed >= prev.failed
                     && current.retried >= prev.retried
                     && current.rate_limited >= prev.rate_limited
-                    && current.claim_wait_ms >= prev.claim_wait_ms =>
+                    && current.claim_wait_ms >= prev.claim_wait_ms
+                    && current.parked >= prev.parked =>
             {
                 Self {
                     claimed: delta(current.claimed, prev.claimed),
@@ -53,6 +64,7 @@ impl QueueFlow {
                     retried: delta(current.retried, prev.retried),
                     rate_limited: delta(current.rate_limited, prev.rate_limited),
                     claim_wait_ms: delta(current.claim_wait_ms, prev.claim_wait_ms),
+                    parked: delta(current.parked, prev.parked),
                 }
             }
             _ => Self::between(Some(&QueueOutcomeCounters::default()), current),
@@ -66,6 +78,7 @@ impl QueueFlow {
         self.retried = self.retried.saturating_add(other.retried);
         self.rate_limited = self.rate_limited.saturating_add(other.rate_limited);
         self.claim_wait_ms = self.claim_wait_ms.saturating_add(other.claim_wait_ms);
+        self.parked = self.parked.saturating_add(other.parked);
     }
 }
 
@@ -75,6 +88,7 @@ impl QueueFlow {
 pub struct CounterBaseline {
     sampled_at: Option<DateTime<Utc>>,
     readings: HashMap<(Uuid, String), QueueOutcomeCounters>,
+    waiting_external: HashMap<String, i64>,
 }
 
 /// Per-queue runtime coverage for one sample.
@@ -98,6 +112,9 @@ impl CounterBaseline {
     ) -> HashMap<String, QueueCoverage> {
         let mut coverage: HashMap<String, QueueCoverage> = HashMap::new();
         let mut unknown: BTreeSet<String> = BTreeSet::new();
+        let about_a_minute = self.sampled_at.is_none_or(|sampled_at| {
+            ((now - sampled_at) - TimeDelta::minutes(1)).abs() <= MINUTE_TOLERANCE
+        });
         let mut readings = HashMap::new();
 
         for instance in instances.iter().filter(|instance| !instance.stale) {
@@ -127,7 +144,7 @@ impl CounterBaseline {
                 let started_since_last_sample = self
                     .sampled_at
                     .is_some_and(|sampled_at| instance.started_at >= sampled_at);
-                if previous.is_none() && !started_since_last_sample {
+                if !about_a_minute || (previous.is_none() && !started_since_last_sample) {
                     // Counts from before our baseline: we cannot tell how many
                     // fall in this interval.
                     unknown.insert(snapshot.queue.clone());
@@ -145,6 +162,42 @@ impl CounterBaseline {
         self.sampled_at = Some(now);
         self.readings = readings;
         coverage
+    }
+
+    /// Queues where a callback may have completed, failed or retried a job
+    /// since the last sample: a job was parked during the interval, or one was
+    /// already waiting at its start. Callbacks resolve from any process (an
+    /// HTTP receiver, an admin call), which no runtime counts.
+    pub fn callback_queues(
+        &mut self,
+        queues: &[QueueOverview],
+        coverage: &HashMap<String, QueueCoverage>,
+    ) -> BTreeSet<String> {
+        let waiting: HashMap<String, i64> = queues
+            .iter()
+            .map(|queue| (queue.queue.clone(), queue.waiting_external))
+            .collect();
+        let affected = queues
+            .iter()
+            .filter(|queue| {
+                // With no earlier reading, assume what is waiting now was
+                // waiting all interval.
+                let waited = self
+                    .waiting_external
+                    .get(&queue.queue)
+                    .copied()
+                    .unwrap_or(queue.waiting_external)
+                    > 0;
+                let parked = coverage
+                    .get(&queue.queue)
+                    .and_then(|c| c.flow)
+                    .is_some_and(|flow| flow.parked > 0);
+                waited || parked
+            })
+            .map(|queue| queue.queue.clone())
+            .collect();
+        self.waiting_external = waiting;
+        affected
     }
 }
 
@@ -187,6 +240,7 @@ pub fn build_sample(
     bucket: DateTime<Utc>,
     queues: &[QueueOverview],
     coverage: &HashMap<String, QueueCoverage>,
+    callback_queues: &BTreeSet<String>,
     instances: &[RuntimeInstance],
 ) -> (Vec<QueueHistoryRow>, FleetHistoryRow) {
     let rows = queues
@@ -224,6 +278,11 @@ pub fn build_sample(
                 row.retried = Some(0);
                 row.rate_limited = Some(0);
                 row.claim_wait_ms = Some(0);
+            }
+            if callback_queues.contains(&row.queue) {
+                row.completed = None;
+                row.failed_attempts = None;
+                row.retried = None;
             }
             row
         })
@@ -591,10 +650,9 @@ mod tests {
         assert_eq!(coverage["email"].capacity, None);
     }
 
-    #[test]
-    fn unserved_queues_record_zero_flow() {
-        let queue = QueueOverview {
-            queue: "orphan".into(),
+    fn overview(name: &str, available: i64, waiting_external: i64) -> QueueOverview {
+        QueueOverview {
+            queue: name.into(),
             display_name: None,
             description: None,
             owner: None,
@@ -604,18 +662,96 @@ mod tests {
             descriptor_last_seen_at: None,
             descriptor_stale: false,
             descriptor_mismatch: false,
-            total_queued: 4,
+            total_queued: available + waiting_external,
             scheduled: 0,
-            available: 4,
+            available,
             retryable: 0,
             running: 0,
             failed: 0,
-            waiting_external: 0,
+            waiting_external,
             completed_last_hour: 0,
             lag_seconds: Some(120.0),
             paused: false,
+        }
+    }
+
+    #[test]
+    fn intervals_well_off_a_minute_are_unknown() {
+        let mut baseline = CounterBaseline::default();
+        let worker = |claimed| {
+            [instance(
+                1,
+                at(0),
+                vec![("email", Some(counters(claimed, claimed)), HARD)],
+            )]
         };
-        let (rows, fleet) = build_sample(at(60), &[queue], &HashMap::new(), &[]);
+        baseline.advance(at(57), &worker(10));
+        // Leadership taken at :57, next sample just after the minute: three
+        // seconds of counts must not be stored as a minute's worth.
+        assert_eq!(baseline.advance(at(62), &worker(11))["email"].flow, None);
+        let on_time = baseline.advance(at(121), &worker(71));
+        assert_eq!(on_time["email"].flow.unwrap().claimed, 60);
+        // A sample delayed well past the minute is unknown too.
+        assert_eq!(baseline.advance(at(230), &worker(171))["email"].flow, None);
+    }
+
+    #[test]
+    fn callbacks_make_outcomes_unknown_but_not_claims() {
+        let mut baseline = CounterBaseline::default();
+        let worker = |claimed, parked| {
+            [instance(
+                1,
+                at(0),
+                vec![(
+                    "hooks",
+                    Some(QueueOutcomeCounters {
+                        parked,
+                        ..counters(claimed, 0)
+                    }),
+                    HARD,
+                )],
+            )]
+        };
+        let quiet = [overview("hooks", 0, 0), overview("plain", 3, 0)];
+        let coverage = baseline.advance(at(60), &worker(5, 0));
+        assert!(baseline.callback_queues(&quiet, &coverage).is_empty());
+
+        // Parked during the interval: whatever resolves it is not counted.
+        let coverage = baseline.advance(at(120), &worker(9, 4));
+        let parked = baseline.callback_queues(&[overview("hooks", 0, 4)], &coverage);
+        assert!(parked.contains("hooks"));
+        let (rows, _) = build_sample(at(120), &[overview("hooks", 0, 4)], &coverage, &parked, &[]);
+        assert_eq!(rows[0].claimed, Some(4));
+        assert_eq!(rows[0].completed, None);
+        assert_eq!(rows[0].failed_attempts, None);
+        assert_eq!(rows[0].retried, None);
+
+        // Nothing parked this minute, but jobs were waiting at its start.
+        let coverage = baseline.advance(at(180), &worker(9, 4));
+        let resolved = baseline.callback_queues(&[overview("hooks", 0, 0)], &coverage);
+        assert!(resolved.contains("hooks"));
+
+        // Once nothing waited at the start and nothing parked, counts return.
+        let coverage = baseline.advance(at(240), &worker(9, 4));
+        assert!(baseline
+            .callback_queues(&[overview("hooks", 0, 0)], &coverage)
+            .is_empty());
+    }
+
+    #[test]
+    fn unserved_callback_queues_are_unknown_not_zero() {
+        // No worker serves the queue, yet callbacks can still finish its jobs.
+        let queue = overview("receiver_only", 0, 2);
+        let callback = BTreeSet::from(["receiver_only".to_string()]);
+        let (rows, _) = build_sample(at(60), &[queue], &HashMap::new(), &callback, &[]);
+        assert_eq!(rows[0].claimed, Some(0));
+        assert_eq!(rows[0].completed, None);
+    }
+
+    #[test]
+    fn unserved_queues_record_zero_flow() {
+        let queue = overview("orphan", 4, 0);
+        let (rows, fleet) = build_sample(at(60), &[queue], &HashMap::new(), &BTreeSet::new(), &[]);
         assert_eq!(rows[0].live_workers, 0);
         assert_eq!(rows[0].claimed, Some(0));
         assert_eq!(fleet.live_instances, 0);

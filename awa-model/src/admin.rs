@@ -1716,6 +1716,11 @@ pub struct QueueOutcomeCounters {
     /// Sum over claimed jobs of the time between becoming runnable and
     /// being claimed, in milliseconds. Divide by `claimed` for a mean.
     pub claim_wait_ms: u64,
+    /// Attempts that parked waiting for an external callback. Whatever
+    /// resolves the callback may run in another process, so the eventual
+    /// outcome is not counted here.
+    #[serde(default)]
+    pub parked: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

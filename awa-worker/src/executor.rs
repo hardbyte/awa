@@ -521,6 +521,7 @@ impl JobExecutor {
                                             metrics.record_job_failed(&job_kind, &job_queue, true);
                                             if let Some(counters) = counters { counters.record_failed(); }
                                         } else {
+                                            if let Some(counters) = counters { counters.record_parked(); }
                                             metrics.jobs_waiting_external.add(
                                                 1,
                                                 &[

@@ -790,9 +790,14 @@ so a slow read cannot delay rescue or promotion.
 Claim, completion and failure rates come from per-queue counters each runtime
 publishes with its snapshot. The leader differences consecutive readings, so
 a minute's counts are unknown (shown as gaps, never as zero) after a leader
-change, for runtimes older than these counters, and for a runtime it first
-sees that started earlier. A runtime that dies between samples loses at most
-its last snapshot interval of counts.
+change, for runtimes older than these counters, for a runtime it first
+sees that started earlier, and when a sample lands well off the minute (more
+than 15 seconds early or late). Completion, failure and retry counts are also
+unknown for a minute in which a callback could have resolved one of the
+queue's jobs (a job parked for a callback during it, or was already waiting
+at its start), because callbacks resolve in whichever process receives them;
+the UI then shows the hourly completion average instead. A runtime that dies
+between samples loses at most its last snapshot interval of counts.
 
 `awa serve` reads the tables, so every UI replica shows the same history and
 history survives UI restarts. On a schema before v051, or until a current

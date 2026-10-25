@@ -20,6 +20,7 @@ pub(crate) struct QueueCounters {
     retried: AtomicU64,
     rate_limited: AtomicU64,
     claim_wait_ms: AtomicU64,
+    parked: AtomicU64,
 }
 
 /// Shared by the dispatchers, the executor and the snapshot reporter. Built
@@ -59,6 +60,10 @@ impl QueueCounters {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_parked(&self) {
+        self.parked.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self) -> QueueOutcomeCounters {
         QueueOutcomeCounters {
             claimed: self.claimed.load(Ordering::Relaxed),
@@ -67,6 +72,7 @@ impl QueueCounters {
             retried: self.retried.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             claim_wait_ms: self.claim_wait_ms.load(Ordering::Relaxed),
+            parked: self.parked.load(Ordering::Relaxed),
         }
     }
 }
@@ -85,6 +91,7 @@ mod tests {
         counters.record_failed();
         counters.record_retried();
         counters.record_rate_limited();
+        counters.record_parked();
         assert_eq!(
             counters.snapshot(),
             QueueOutcomeCounters {
@@ -94,6 +101,7 @@ mod tests {
                 retried: 1,
                 rate_limited: 1,
                 claim_wait_ms: 450,
+                parked: 1,
             }
         );
     }

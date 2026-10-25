@@ -1322,7 +1322,9 @@ impl MaintenanceService {
         let queues = awa_model::admin::queue_overviews(pool).await?;
         let instances = awa_model::admin::list_runtime_instances(pool).await?;
         let coverage = baseline.advance(now, &instances);
-        let (rows, fleet) = queue_history::build_sample(bucket, &queues, &coverage, &instances);
+        let callback_queues = baseline.callback_queues(&queues, &coverage);
+        let (rows, fleet) =
+            queue_history::build_sample(bucket, &queues, &coverage, &callback_queues, &instances);
         queue_history::record_sample(pool, &rows, &fleet).await?;
         queue_history::prune_history(pool, retention).await?;
         Ok(())

@@ -186,10 +186,21 @@ async fn test_maintenance_leader_writes_queue_and_fleet_history() {
     };
     assert_eq!(row.available, 2);
     assert!(row.paused);
-    let fleet = queue_history::fleet_history_since(&pool, since)
-        .await
-        .unwrap();
-    assert!(fleet.iter().any(|row| row.live_instances >= 1));
+    // The first sample can land before this runtime's own snapshot does, so
+    // its fleet row may count no one; the next minute's sample will not.
+    loop {
+        let fleet = queue_history::fleet_history_since(&pool, since)
+            .await
+            .unwrap();
+        if fleet.iter().any(|row| row.live_instances >= 1) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no fleet history row with a live instance"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     runtime.shutdown(Duration::from_secs(2)).await;
     admin::resume_queue(&pool, queue).await.unwrap();
