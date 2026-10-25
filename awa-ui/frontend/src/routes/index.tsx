@@ -14,10 +14,10 @@ import type { HealthReport, QueueHistory } from "@/lib/api";
 import {
   eventIndexes,
   formatCount,
-  formatDuration,
   formatRate,
   groupFailures,
   joinQueues,
+  healthOf,
   needsAttention,
   runtimeConcern,
   totalBacklog,
@@ -46,17 +46,15 @@ const VERDICT_TONE: Record<HealthReport["status"], string> = {
   ok: "border-l-success",
 };
 
-/** Where the trend data comes from, in one line. */
-function historyCoverage(history: QueueHistory | undefined): string {
-  if (!history) return "Loading queue history…";
+/** Shown only when trends are missing, so the page explains a gap rather
+ * than narrating what it shows. */
+function historyGap(history: QueueHistory | undefined): string | null {
+  if (!history) return null;
   if (!history.installed)
-    return "Queue history needs schema v051; run awa migrate to enable trends.";
+    return "No trends: queue history needs schema v053 (run awa migrate).";
   if (!history.observed_since)
-    return "No queue history yet: the maintenance leader writes one sample a minute.";
-  const minutes = Math.round(
-    (Date.now() - new Date(history.observed_since).getTime()) / 60_000,
-  );
-  return `Per-minute history from the maintenance leader, covering the last ${formatDuration(Math.min(minutes, history.minutes) * 60)}.`;
+    return "No trends yet: the maintenance leader records one sample a minute.";
+  return null;
 }
 
 export function DashboardPage() {
@@ -104,7 +102,12 @@ export function DashboardPage() {
   const report = health.data;
   const assessed = joinQueues(queues.data ?? [], report, history.data);
   const attention = assessed.filter(needsAttention);
-  const rest = assessed.filter((row) => !needsAttention(row));
+  // Draining queues stay in view so recovery is visible, not just declared.
+  const focus = assessed.filter(
+    (row) => needsAttention(row) || healthOf(row) === "draining",
+  );
+  const draining = focus.length - attention.length;
+  const rest = assessed.filter((row) => !focus.includes(row));
 
   const backlogSeries = totalBacklog(history.data);
   const markers = eventIndexes(history.data);
@@ -173,7 +176,9 @@ export function DashboardPage() {
       <div className="space-y-1">
         <Heading level={2}>Overview</Heading>
         <SnapshotStatus sources={[stats, queues, health, runtime, failures]} />
-        <p className="text-xs text-muted-fg">{historyCoverage(history.data)}</p>
+        {historyGap(history.data) && (
+          <p className="text-xs text-muted-fg">{historyGap(history.data)}</p>
+        )}
       </div>
 
       {errors.length > 0 && (
@@ -192,9 +197,6 @@ export function DashboardPage() {
         <CardContent className="@container">
           <div className="grid gap-6 @3xl:grid-cols-[minmax(0,1fr)_auto] @3xl:items-center">
             <div className="min-w-0 space-y-1">
-              <p className="text-xs font-medium tracking-wide text-muted-fg uppercase">
-                Is it keeping up?
-              </p>
               <h2
                 className="text-xl font-semibold tracking-tight text-fg sm:text-2xl"
                 data-testid="verdict"
@@ -222,7 +224,11 @@ export function DashboardPage() {
                 </Link>
                 <p className="text-xs text-muted-fg tabular-nums">
                   {report?.history_available && backlogTrend !== null
-                    ? `${formatRate(backlogTrend, true)} over 5m`
+                    ? // Same noise floor the server applies per queue.
+                      Math.abs(backlogTrend) * 5 <
+                      Math.max(20, (backlog ?? 0) * 0.05)
+                      ? "flat over 5m"
+                      : `${formatRate(backlogTrend, true)} over 5m`
                     : "No trend yet"}
                 </p>
               </div>
@@ -300,12 +306,9 @@ export function DashboardPage() {
           title={
             attention.length
               ? `Needs attention (${attention.length})`
-              : "Queues"
-          }
-          description={
-            attention.length
-              ? "Stalled, falling behind, waiting long, or paused with work. Worst first."
-              : `${assessed.length} queues, none stalled, falling behind, or waiting long.`
+              : draining
+                ? `Recovering (${draining})`
+                : "Queues"
           }
         >
           <CardAction>
@@ -328,9 +331,9 @@ export function DashboardPage() {
             </p>
           ) : (
             <>
-              {(attention.length > 0 || showAll) && (
+              {(focus.length > 0 || showAll) && (
                 <QueueFlowTable
-                  rows={showAll ? assessed : attention}
+                  rows={showAll ? assessed : focus}
                   label={
                     showAll ? "All queues by risk" : "Queues needing attention"
                   }
@@ -344,7 +347,7 @@ export function DashboardPage() {
                     onPress={() => setShowAll((value) => !value)}
                   >
                     {showAll
-                      ? "Show only queues needing attention"
+                      ? "Show only queues needing attention or draining"
                       : `Show ${rest.length} queue${rest.length === 1 ? "" : "s"} keeping up`}
                   </Button>
                 </div>
@@ -358,7 +361,7 @@ export function DashboardPage() {
         <Card>
           <CardHeader
             title="Recurring failures"
-            description={`Latest ${FAILURE_SAMPLE} retained failed jobs, grouped by kind, queue, and error.`}
+            description={`From the latest ${FAILURE_SAMPLE} failed jobs`}
           >
             <CardAction>
               <Link

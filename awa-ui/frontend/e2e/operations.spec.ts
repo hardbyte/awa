@@ -3,7 +3,7 @@ import { mockOperations } from "./operations-fixture";
 
 const artifacts =
   process.env.AWA_REVIEW_ARTIFACT_DIR ?? "test-results/operations-review";
-test("busy overview communicates current work and opens targeted drilldowns", async ({
+test("incident overview leads with the problem and opens targeted drilldowns", async ({
   page,
 }) => {
   const fixture = await mockOperations(page);
@@ -19,7 +19,8 @@ test("busy overview communicates current work and opens targeted drilldowns", as
   const attention = page
     .getByRole("table", { name: "Queues needing attention" })
     .locator("tbody tr");
-  await expect(attention).toHaveCount(3);
+  // Three queues need attention; the draining one stays in view.
+  await expect(attention).toHaveCount(4);
   await expect(attention.nth(0)).toContainText("image-processing");
   await expect(attention.nth(0)).toContainText("Not being worked");
   await expect(attention.nth(1)).toContainText("email-delivery");
@@ -35,7 +36,9 @@ test("busy overview communicates current work and opens targeted drilldowns", as
   await expect(page.locator("[data-marker]")).toHaveCount(3);
   await expect(page.getByText(/arriving .*\/min · last 5m/)).toBeVisible();
   await expect(attention.nth(2)).toContainText("Paused");
-  await page.getByRole("button", { name: "Show 21 queues keeping up" }).click();
+  await expect(attention.nth(3)).toContainText("search-index");
+  await expect(attention.nth(3)).toContainText("Draining");
+  await page.getByRole("button", { name: "Show 20 queues keeping up" }).click();
   const everything = page
     .getByRole("table", { name: "All queues by risk" })
     .locator("tbody tr");
@@ -303,7 +306,7 @@ test("failed refresh retains known values and labels them out of date", async ({
 test("read-only controls remain disabled and dark mode stays legible", async ({
   page,
 }) => {
-  const fixture = await mockOperations(page, "busy", true);
+  const fixture = await mockOperations(page, "incident", true);
   await page.addInitScript(() => localStorage.setItem("theme", "dark"));
   await page.setViewportSize({ width: 1440, height: 1050 });
   await page.goto("/");
@@ -357,4 +360,76 @@ test("mobile drawer closes promptly with both motion preferences", async ({
       page.getByRole("button", { name: "Toggle Sidebar" }),
     ).toBeFocused();
   }
+});
+
+test("normal operations, an incident, and the recovery each read at a glance", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+
+  await mockOperations(page, "normal");
+  await page.goto("/");
+  await expect(page.getByTestId("verdict")).toHaveText("Keeping up");
+  await expect(
+    page.getByRole("table", { name: "Queues needing attention" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Show 24 queues keeping up" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("All 48 reporting instances are healthy."),
+  ).toBeVisible();
+  await expect(page.getByRole("list", { name: "Fleet changes" })).toHaveCount(
+    0,
+  );
+  await page.screenshot({ path: `${artifacts}/phase-normal-desktop.png` });
+
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await mockOperations(page, "incident");
+  await page.goto("/");
+  await expect(page.getByTestId("verdict")).toHaveText(
+    "1 queue not being worked",
+  );
+  await expect(
+    page
+      .getByRole("table", { name: "Queues needing attention" })
+      .locator("tbody tr")
+      .first(),
+  ).toContainText("image-processing");
+  await page.screenshot({ path: `${artifacts}/phase-incident-desktop.png` });
+  await page.goto("/queues/email-delivery");
+  await expect(page.getByText("Limited by: Rate limit")).toBeVisible();
+  await page.screenshot({
+    path: `${artifacts}/phase-incident-queue-desktop.png`,
+  });
+
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await mockOperations(page, "recovery");
+  await page.goto("/");
+  await expect(page.getByTestId("verdict")).toHaveText("Recovering");
+  await expect(page.getByText(/all clear in about 7m/)).toBeVisible();
+  await expect(page.getByText("Recovering (3)", { exact: true })).toBeVisible();
+  const draining = page
+    .getByRole("table", { name: "Queues needing attention" })
+    .locator("tbody tr");
+  await expect(draining).toHaveCount(3);
+  await expect(draining.first()).toContainText("email-delivery");
+  await expect(draining.first()).toContainText("−8,700/min");
+  await expect(
+    page.getByRole("list", { name: "Fleet changes" }).getByRole("listitem"),
+  ).toHaveCount(5);
+  await expect(page.getByText("Versions 0.7.1, 0.7.2 → 0.7.2")).toBeVisible();
+  await page.screenshot({ path: `${artifacts}/phase-recovery-desktop.png` });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+  await mockOperations(page, "incident");
+  await page.goto("/");
+  await expect(page.getByTestId("verdict")).toHaveText(
+    "1 queue not being worked",
+  );
+  await page.screenshot({
+    path: `${artifacts}/phase-incident-mobile.png`,
+    fullPage: true,
+  });
 });

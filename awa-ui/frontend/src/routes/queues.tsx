@@ -273,11 +273,6 @@ export function QueuesPage() {
           )}
         </CardContent>
       </Card>
-      <p className="text-xs text-muted-fg">
-        Waiting counts claimable jobs only; scheduled, retrying, and
-        callback-blocked jobs are excluded. Trend is the fitted change over the
-        last 5 minutes. Pause stops new claims; running jobs continue.
-      </p>
 
       <ConfirmDialog
         isOpen={drainTarget !== null}

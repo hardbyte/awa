@@ -1312,7 +1312,7 @@ impl MaintenanceService {
         use awa_model::queue_history;
         use chrono::DurationRound;
         if !queue_history::history_installed(pool).await? {
-            // Schema predates v051; nothing to write until it is migrated.
+            // Schema predates v053; nothing to write until it is migrated.
             return Ok(());
         }
         let now = chrono::Utc::now();

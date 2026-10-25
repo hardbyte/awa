@@ -17,16 +17,13 @@ test.describe("Operations overview", () => {
   test("answers whether the system is keeping up", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
-    await expect(page.getByText("Is it keeping up?")).toBeVisible();
     await expect(page.getByTestId("verdict")).not.toHaveText(
       "Checking queues…",
     );
     await expect(page.getByText("Waiting across all queues")).toBeVisible();
-    await expect(
-      page.getByText(
-        /Per-minute history from the maintenance leader|No queue history yet/,
-      ),
-    ).toBeVisible();
+    // The e2e server runs no workers, so no leader has recorded history;
+    // the page says why trends are missing instead of inventing them.
+    await expect(page.getByText(/No trends( yet)?:/)).toBeVisible();
   });
 
   test("queue table includes trend columns and state drilldowns", async ({

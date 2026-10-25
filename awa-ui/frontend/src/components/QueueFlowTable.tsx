@@ -70,11 +70,7 @@ function JobsLink({
   );
 }
 
-function Capacity({
-  summary,
-}: {
-  summary: QueueRuntimeSummary | undefined;
-}) {
+function Capacity({ summary }: { summary: QueueRuntimeSummary | undefined }) {
   if (summary && summary.live_instances === 0) {
     return <span className="text-danger-subtle-fg">No live workers</span>;
   }
@@ -208,7 +204,11 @@ export function QueueFlowTable({
                 Queue
               </th>
               <th scope="col">Status</th>
-              <th scope="col" className="text-right">
+              <th
+                scope="col"
+                className="text-right"
+                title="Claimable now; scheduled, retrying and callback-blocked jobs are not counted"
+              >
                 Waiting
               </th>
               <th scope="col">Last hour</th>

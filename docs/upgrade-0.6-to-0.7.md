@@ -131,18 +131,18 @@ For example, extract with `awa migrate --pending --extract-to ./pending-migratio
 into a new directory. Execute complete generated bundles; individual discovery
 tail files in the repository do not include their bootstrap prerequisites.
 
-## v051: queue and fleet history
+## v053: queue and fleet history
 
-v051 creates two new tables, `awa.queue_history` and `awa.fleet_history`, that
+v053 creates two new tables, `awa.queue_history` and `awa.fleet_history`, that
 the maintenance leader fills once a minute for the admin overview. No existing
 table is touched and the migration takes effect instantly; nothing needs to
-stop. Older binaries ignore the tables, so they keep working against a v051
+stop. Older binaries ignore the tables, so they keep working against a v053
 schema; history simply does not appear until a current binary holds
 leadership, and claim/completion rates stay blank for queues still served by
 older runtimes. The runtime role writes and prunes these tables: the default
 privileges in [Database roles](security/database-roles.md) cover them, but a
 role granted table by table needs `SELECT, INSERT, DELETE` on both. External
-runners apply `v051_queue_history.sql` from a regenerated pending bundle like
+runners apply `v053_queue_history.sql` from a regenerated pending bundle like
 any other migration.
 
 ## v050: one lane index per ready partition

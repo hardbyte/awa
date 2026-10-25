@@ -153,7 +153,7 @@ pub struct FleetEvent {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueHistoryResponse {
-    /// False on a schema before v051.
+    /// False on a schema before v053.
     pub installed: bool,
     pub bucket_secs: u32,
     pub minutes: u32,

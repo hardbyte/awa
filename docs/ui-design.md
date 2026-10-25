@@ -115,7 +115,7 @@ For queues needing attention, **Limited by** says what holds the work back: the 
 
 #### Queue history
 
-Job tables record current state, not how a backlog moved, so the maintenance leader records it once a minute in `awa.queue_history` and `awa.fleet_history` (v051), keeping 48 hours by default. Runtimes publish cumulative per-queue counters (claimed, completed, failed, retried, rate-limited polls, claim wait) in their snapshots and the leader differences them into per-minute counts. `/api/stats/queue-history` returns one-minute buckets with `null` where nothing was recorded or a count was unknown, plus fleet events (version changes, leader changes, lost instances). See [configuration](configuration.md#queue-history) for what makes a minute unknown and what sampling costs.
+Job tables record current state, not how a backlog moved, so the maintenance leader records it once a minute in `awa.queue_history` and `awa.fleet_history` (v053), keeping 48 hours by default. Runtimes publish cumulative per-queue counters (claimed, completed, failed, retried, rate-limited polls, claim wait) in their snapshots and the leader differences them into per-minute counts. `/api/stats/queue-history` returns one-minute buckets with `null` where nothing was recorded or a count was unknown, plus fleet events (version changes, leader changes, lost instances). See [configuration](configuration.md#queue-history) for what makes a minute unknown and what sampling costs.
 
 ### Jobs (`/jobs`)
 

@@ -606,9 +606,9 @@ export function fetchTimeseries(
   return apiFetch(`/stats/timeseries${qs}`);
 }
 
-/** Per-minute history written by the maintenance leader (v051). */
+/** Per-minute history written by the maintenance leader (v053). */
 export interface QueueHistory {
-  /** False on a schema before v051. */
+  /** False on a schema before v053. */
   installed: boolean;
   bucket_secs: number;
   minutes: number;

@@ -3,7 +3,7 @@
 //! One source of truth for the overview, the Queues page and
 //! `/api/health/queues`, so an alert and the screen an operator opens after
 //! it never disagree. Inputs are the current queue snapshot, the leader's
-//! per-minute history (`awa.queue_history`, v051) and live runtime summaries.
+//! per-minute history (`awa.queue_history`, v053) and live runtime summaries.
 
 use std::collections::BTreeMap;
 
@@ -21,6 +21,8 @@ pub const SLOW_WAIT_SECONDS: f64 = 300.0;
 /// Depth only counts as growing or draining when the fitted change over the
 /// trend window exceeds this many jobs or this share of the backlog,
 /// whichever is larger; below that it is batching noise.
+/// A drain expected to take at least this long reads as "Recovering".
+const RECOVERING_MIN_SECONDS: f64 = 120.0;
 const MIN_TREND_JOBS: f64 = 20.0;
 const MIN_TREND_SHARE: f64 = 0.05;
 
@@ -123,7 +125,7 @@ pub struct HealthReport {
     pub title: String,
     pub detail: String,
     pub generated_at: DateTime<Utc>,
-    /// False when the schema predates v051 or the leader has not sampled
+    /// False when the schema predates v053 or the leader has not sampled
     /// yet: only stalls and long waits can be detected.
     pub history_available: bool,
     pub history_since: Option<DateTime<Utc>>,
@@ -345,7 +347,7 @@ pub fn assess_queue(
             if history_available {
                 "Needs a few minutes of history".to_string()
             } else {
-                "No queue history yet; run v051 and a current maintenance leader".to_string()
+                "No queue history yet; run v053 and a current maintenance leader".to_string()
             },
             None,
         )
@@ -441,6 +443,15 @@ pub fn build_report(
         .iter()
         .filter(|a| a.health == QueueHealth::Paused && a.needs_attention)
         .count();
+    // Draining that takes a couple of minutes or more is an operator-visible
+    // recovery; shorter drains are ordinary burst absorption.
+    let recovering: Vec<&QueueAssessment> = assessed
+        .iter()
+        .filter(|a| {
+            a.health == QueueHealth::Draining
+                && a.clear_seconds.is_some_and(|s| s >= RECOVERING_MIN_SECONDS)
+        })
+        .collect();
     let mut others: Vec<String> = Vec::new();
     if count(QueueHealth::Behind) > 0 {
         others.push(format!(
@@ -526,6 +537,26 @@ pub fn build_report(
             } else {
                 "No queue history yet, so only stalls and long waits are detected.".to_string()
             },
+        )
+    } else if let Some(longest) = recovering
+        .iter()
+        .filter_map(|a| a.clear_seconds)
+        .reduce(f64::max)
+    {
+        let names: Vec<&str> = recovering
+            .iter()
+            .take(3)
+            .map(|a| a.queue.as_str())
+            .collect();
+        (
+            OverallStatus::Ok,
+            "Recovering".to_string(),
+            format!(
+                "{} draining a backlog ({}); all clear in about {} at this pace.",
+                plural(recovering.len(), "queue"),
+                names.join(", "),
+                format_duration(longest)
+            ),
         )
     } else {
         (
@@ -832,6 +863,87 @@ mod tests {
             true,
         );
         assert_eq!(report.status, OverallStatus::Ok);
+        assert_eq!(report.title, "Keeping up");
+    }
+
+    #[test]
+    fn verdict_through_normal_incident_recovery_and_clear() {
+        let history = |depths: &[i64], claimed: i64| {
+            let mut map = BTreeMap::new();
+            map.insert("email".to_string(), rows("email", depths, Some(claimed)));
+            map
+        };
+        let live = [summary("email", 2, 4)];
+
+        let normal = build_report(
+            now(),
+            &[queue("email", 40)],
+            &history(&[40, 42, 38, 41], 300),
+            &live,
+            true,
+        );
+        assert_eq!(
+            (normal.status, normal.title.as_str()),
+            (OverallStatus::Ok, "Keeping up")
+        );
+
+        let mut down = queue("email", 2400);
+        down.lag_seconds = Some(180.0);
+        down.running = 0;
+        let incident = build_report(
+            now(),
+            &[down],
+            &history(&[400, 900, 1400, 1900], 0),
+            &[summary("email", 0, 0)],
+            true,
+        );
+        assert_eq!(incident.status, OverallStatus::Critical);
+        assert_eq!(incident.title, "1 queue not being worked");
+        assert_eq!(incident.queues[0].limited_by, Some(LimitedBy::NoWorkers));
+
+        let mut draining = queue("email", 1200);
+        draining.lag_seconds = Some(150.0);
+        let recovery = build_report(
+            now(),
+            &[draining],
+            &history(&[2400, 2100, 1800, 1500], 600),
+            &live,
+            true,
+        );
+        assert_eq!(
+            (recovery.status, recovery.title.as_str()),
+            (OverallStatus::Ok, "Recovering")
+        );
+        assert!(
+            recovery.detail.contains("all clear in about 4m 0s"),
+            "{}",
+            recovery.detail
+        );
+
+        let cleared = build_report(
+            now(),
+            &[queue("email", 0)],
+            &history(&[1200, 800, 400, 0], 400),
+            &live,
+            true,
+        );
+        assert_eq!(cleared.title, "Keeping up");
+    }
+
+    #[test]
+    fn short_drains_are_not_called_recovering() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "email".to_string(),
+            rows("email", &[300, 220, 150, 80], Some(80)),
+        );
+        let report = build_report(
+            now(),
+            &[queue("email", 20)],
+            &map,
+            &[summary("email", 1, 1)],
+            true,
+        );
         assert_eq!(report.title, "Keeping up");
     }
 

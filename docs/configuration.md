@@ -782,7 +782,7 @@ If you're connecting to a read replica, increase `--cache-ttl` to reduce load. T
 The overview judges whether each queue is keeping up from how its waiting
 (available) job count moves, which a single snapshot cannot show. The
 maintenance leader records it: once a minute it writes a row per queue to
-`awa.queue_history` and a fleet row to `awa.fleet_history` (schema v051). Each
+`awa.queue_history` and a fleet row to `awa.fleet_history` (schema v053). Each
 sample costs one queue overview read (the query behind the Queues page) and
 one insert per queue, issued by the leader only, beside the maintenance loop
 so a slow read cannot delay rescue or promotion.
@@ -795,7 +795,7 @@ sees that started earlier. A runtime that dies between samples loses at most
 its last snapshot interval of counts.
 
 `awa serve` reads the tables, so every UI replica shows the same history and
-history survives UI restarts. On a schema before v051, or until a current
+history survives UI restarts. On a schema before v053, or until a current
 leader has sampled, the overview says so and detects only stalls and long
 waits. `GET /api/health/queues` serves the same verdicts as JSON; add
 `?fail_on=critical` (or `warning`) to get a 503 at that level from a plain
