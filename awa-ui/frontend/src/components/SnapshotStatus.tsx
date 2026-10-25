@@ -22,11 +22,14 @@ export function SnapshotStatus({ sources }: { sources: SnapshotSource[] }) {
     age !== null && age * 1000 > Math.max(30000, poll.interval * 2);
   return (
     <div
-      className={`snapshot-status ${failed || delayed ? "snapshot-warning" : ""}`}
+      className={`flex items-center gap-2 text-xs ${failed || delayed ? "text-danger-subtle-fg" : "text-muted-fg"}`}
       role="status"
       aria-live="off"
     >
-      <span className="status-dot" aria-hidden="true" />
+      <span
+        className="size-1.5 shrink-0 rounded-full bg-current"
+        aria-hidden="true"
+      />
       <span>
         {failed
           ? "Refresh failed · some data unavailable or out of date"
@@ -35,7 +38,7 @@ export function SnapshotStatus({ sources }: { sources: SnapshotSource[] }) {
             : delayed
               ? `Snapshot received ${age}s ago · refresh delayed`
               : `Snapshots received ${age ?? 0}s ago`}
-        <span className="snapshot-cadence">
+        <span className="max-sm:block">
           {" "}
           · refresh every {poll.interval / 1000}s
         </span>

@@ -2,6 +2,7 @@ pub mod cache;
 pub mod callback_router;
 pub mod error;
 pub mod handlers;
+pub mod history;
 pub mod state;
 
 pub use callback_router::{
@@ -18,6 +19,7 @@ use rust_embed::Embed;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 
+use crate::history::QueueHistoryConfig;
 use crate::state::{AppState, InstanceIdentity, ReadOnlyMode};
 
 #[derive(Embed)]
@@ -81,9 +83,66 @@ pub async fn router_with_identity(
     read_only_mode: ReadOnlyMode,
     instance: InstanceIdentity,
 ) -> Result<Router, sqlx::Error> {
-    let read_only = read_only_mode.resolve(&pool).await?;
-    let state =
-        AppState::new(pool, read_only, cache_ttl, callback_hmac_secret).with_instance(instance);
+    router_with_config(
+        pool,
+        RouterConfig {
+            cache_ttl,
+            callback_hmac_secret,
+            read_only_mode,
+            instance,
+            queue_history: QueueHistoryConfig::default(),
+        },
+    )
+    .await
+}
+
+/// Every option `awa serve` exposes. The narrower `router*` helpers fill in
+/// defaults for the fields they do not take.
+///
+/// Deliberately not `Debug`: it carries the callback HMAC secret.
+#[derive(Clone)]
+pub struct RouterConfig {
+    pub cache_ttl: Duration,
+    pub callback_hmac_secret: Option<[u8; 32]>,
+    pub read_only_mode: ReadOnlyMode,
+    pub instance: InstanceIdentity,
+    /// In-memory queue depth history behind the overview's trends. The
+    /// default samples every 15s and keeps an hour; while enabled this costs
+    /// one queue overview read per interval even with no viewers.
+    pub queue_history: QueueHistoryConfig,
+}
+
+impl RouterConfig {
+    pub fn new(cache_ttl: Duration) -> Self {
+        Self {
+            cache_ttl,
+            callback_hmac_secret: None,
+            read_only_mode: ReadOnlyMode::Auto,
+            instance: InstanceIdentity::default(),
+            queue_history: QueueHistoryConfig::default(),
+        }
+    }
+}
+
+/// Create the awa-ui router from a full [`RouterConfig`].
+///
+/// Spawns the queue history sampler on the current Tokio runtime; it stops on
+/// its own once the returned router is dropped.
+pub async fn router_with_config(pool: PgPool, config: RouterConfig) -> Result<Router, sqlx::Error> {
+    let read_only = config.read_only_mode.resolve(&pool).await?;
+    let state = AppState::new(
+        pool,
+        read_only,
+        config.cache_ttl,
+        config.callback_hmac_secret,
+    )
+    .with_instance(config.instance)
+    .with_queue_history(config.queue_history);
+    history::spawn_sampler(
+        &state.queue_history,
+        state.pool.clone(),
+        state.cache.queues.clone(),
+    );
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
@@ -144,6 +203,10 @@ pub async fn router_with_identity(
         // Stats
         .route("/stats", get(handlers::stats::get_stats))
         .route("/stats/timeseries", get(handlers::stats::get_timeseries))
+        .route(
+            "/stats/queue-history",
+            get(handlers::stats::get_queue_history),
+        )
         .route("/stats/kinds", get(handlers::stats::get_distinct_kinds))
         .route("/stats/queues", get(handlers::stats::get_distinct_queues))
         .route("/capabilities", get(handlers::stats::get_capabilities))

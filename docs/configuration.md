@@ -769,12 +769,29 @@ Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 | `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Max connection lifetime (seconds) |
 | `--pool-acquire-timeout` | `AWA_POOL_ACQUIRE_TIMEOUT` | `10` | Connection acquire timeout (seconds) |
 | `--cache-ttl` | `AWA_CACHE_TTL` | `5` | Dashboard query cache TTL (seconds) |
+| `--queue-history-minutes` | `AWA_QUEUE_HISTORY_MINUTES` | `60` | Queue depth history kept in memory for overview trends; `0` disables sampling |
+| `--queue-history-interval` | `AWA_QUEUE_HISTORY_INTERVAL` | `15` | Seconds between queue depth samples |
 
 ### Dashboard cache
 
 The cache deduplicates repeated poll requests — multiple browser tabs or rapid refresh cycles within the TTL window hit memory rather than the database. The frontend polling interval is derived from the cache TTL (minimum 5s) and served via `/api/capabilities`, so clients automatically back off to match the server's refresh rate.
 
 If you're connecting to a read replica, increase `--cache-ttl` to reduce load. The dashboard will feel slightly less real-time but won't overwhelm the replica.
+
+### Queue history
+
+The overview judges whether each queue is keeping up from how its waiting
+(available) job count moves, which a single snapshot cannot show. `awa serve`
+samples the same queue overview read the Queues page uses every
+`--queue-history-interval` seconds and keeps `--queue-history-minutes` of it in
+memory. Samples go through the dashboard cache, so a sample taken while someone
+has the UI open is free; otherwise each one is a database read, whether or not
+anyone is watching.
+
+Because the history lives in the server process, it starts empty after a
+restart (trends appear after about three minutes), a failed sample shows as a
+gap, and each `awa serve` replica samples and keeps its own copy. For longer
+retention or fleet-wide trend alerting, use the OpenTelemetry metrics instead.
 
 ### Read-only mode
 

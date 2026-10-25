@@ -6,6 +6,7 @@ use sqlx::PgPool;
 
 use crate::cache::DashboardCache;
 use crate::error::ApiError;
+use crate::history::{QueueHistory, QueueHistoryConfig};
 
 /// Operator-assigned identity for this UI instance (#437).
 ///
@@ -47,6 +48,10 @@ pub struct AppState {
     /// Identity shown by the frontend; `Arc` keeps per-request state clones
     /// cheap.
     pub instance: std::sync::Arc<InstanceIdentity>,
+    /// Sampled queue depth backing the overview's trend view. The background
+    /// sampler holds only a weak reference, so dropping the last state clone
+    /// stops it.
+    pub queue_history: std::sync::Arc<QueueHistory>,
 }
 
 impl AppState {
@@ -65,7 +70,15 @@ impl AppState {
             poll_interval_ms,
             metrics: AwaMetrics::from_global(),
             instance: std::sync::Arc::new(InstanceIdentity::default()),
+            queue_history: std::sync::Arc::new(QueueHistory::new(QueueHistoryConfig::default())),
         }
+    }
+
+    /// Replace the queue history retention (#543). Call before the router
+    /// starts its sampler; samples already recorded are discarded.
+    pub fn with_queue_history(mut self, config: QueueHistoryConfig) -> Self {
+        self.queue_history = std::sync::Arc::new(QueueHistory::new(config));
+        self
     }
 
     /// Attach an operator-assigned instance identity (#437).

@@ -63,3 +63,12 @@ pub async fn get_capabilities(
         peers: state.instance.peers.clone(),
     }))
 }
+
+/// Bucketed queue depth sampled by this server process (#543). Unlike
+/// `/stats/timeseries`, these are real point-in-time depths, but they only
+/// reach back to when this process started sampling.
+pub async fn get_queue_history(
+    State(state): State<AppState>,
+) -> Json<crate::history::QueueHistorySnapshot> {
+    Json(state.queue_history.snapshot())
+}

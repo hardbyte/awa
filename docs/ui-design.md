@@ -29,6 +29,8 @@ let app = awa_ui::callback_router(
 .await?;
 ```
 
+Every `router*` constructor starts a background task that samples queue depth for the overview's trends (see [Queue history](#queue-history)); it stops when the router is dropped. To change or disable it when embedding, build the router with `awa_ui::router_with_config` and set `RouterConfig::queue_history` (for example `QueueHistoryConfig::disabled()`).
+
 The frontend is a React 19 SPA built with Vite and embedded into the binary via `rust-embed`. The axum handler serves `index.html` for all non-API routes (SPA fallback), and JSON REST endpoints under `/api/`.
 
 ### Frontend Stack
@@ -42,7 +44,8 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 
 ```
 GET  /api/stats                         Dashboard summary (state counts)
-GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
+GET  /api/stats/timeseries?minutes=60   Retained jobs by creation minute and current state
+GET  /api/stats/queue-history           Per-queue depth sampled by this server (see below)
 
 GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=
 GET  /api/jobs/:id
@@ -94,9 +97,26 @@ GET  /api/capabilities                  Feature flags / read-only detection
 
 ## Pages
 
-### Dashboard (`/`)
+### Overview (`/`)
 
-At-a-glance health check. Shows state counter cards (available, running, failed, scheduled, waiting_external, completed/hr), a runtime summary, a queue table, and recent failures. Counter cards link to the filtered jobs view. Skeleton loading states prevent false-zero flashes.
+Answers one question first: is every queue keeping up? A verdict names the worst problem ("1 queue not being worked", "2 queues falling behind", "Keeping up") above the total waiting count, its last hour, and the hourly completion rate. Below it, only the queues needing attention are listed, worst first, with the rest one click away. Compact state counters, recurring failures grouped by kind, queue and error, and workers that are stale or degraded follow.
+
+Each queue is classified from its current snapshot and sampled history:
+
+| Status | Meaning |
+| --- | --- |
+| Not being worked | Claimable jobs have waited over a minute and nothing is running |
+| Falling behind | Waiting jobs grew by more than 5% (and at least 20) over the last 5 minutes |
+| Long wait | The oldest claimable job has waited over 5 minutes |
+| Paused | Paused; needs attention only while work is waiting |
+| Draining | Waiting jobs shrank materially; shows the time to clear at that pace |
+| Steady / Idle | Neither, or nothing waiting |
+
+Only `available` jobs count: scheduled, retrying, and callback-blocked jobs cannot be claimed yet, so their growth is not falling behind.
+
+#### Queue history
+
+Job tables record current state, not how a backlog moved, so the server samples queue depth itself. `awa serve` reads queue overviews every 15 seconds (through the same cache as the Queues page) and keeps an hour in memory; `/api/stats/queue-history` returns it in one-minute buckets with `null` where nothing was sampled. History starts with the process and is per replica. The frontend says so on the page rather than inventing a trend. See [configuration](configuration.md#queue-history) for the flags.
 
 ### Jobs (`/jobs`)
 
@@ -110,9 +130,9 @@ Full inspection of a single job: state badge, queue (linked), priority, attempt 
 
 ### Queues (`/queues`)
 
-Per-queue stats table showing depth by state, completion rate, lag, concurrency mode, capacity, rate limits, runtime health, and status. Each queue has Pause and Drain action buttons. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
+One line per queue with the same status, waiting count, last-hour sparkline, trend, oldest wait, running, capacity (concurrency and rate limit from live runtimes), completion rate, and retrying/failed counts as the overview, plus Pause and Drain controls. Search, sort and the "needs attention" filter live in the URL. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
 
-Descriptor display name, owner, tags, and docs URL (when declared) appear inline; a stale or drifted descriptor shows a subdued status badge so operators can tell when the catalog diverged from any live runtime.
+A stale or drifted descriptor shows a badge next to the queue name so operators can tell when the catalog diverged from any live runtime; the description is the link's tooltip and is shown in full on the queue detail page.
 
 ### Queue Detail (`/queues/:name`)
 

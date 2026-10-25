@@ -73,6 +73,19 @@ for each step.
   `awa.migration_lock_key()` expose the runner's advisory lock key.
 - Python prints a diagnostic to stderr if native shutdown has stalled for five
   seconds.
+- **The admin overview answers "is it keeping up?"
+  ([#543](https://github.com/hardbyte/awa/pull/543)).** `awa serve` samples
+  queue depth every 15 seconds and keeps an hour in memory, served at
+  `/api/stats/queue-history`. The overview and Queues page classify each
+  queue as not being worked, falling behind, waiting long, paused, draining,
+  steady, or idle, list the ones needing attention first, and show an hour
+  of waiting-job history with a draining estimate. History starts when the
+  server starts and is per replica. Each sample is one queue overview read,
+  issued whether or not anyone has the UI open; tune it with
+  `--queue-history-minutes` and `--queue-history-interval`, or set
+  `--queue-history-minutes 0` to turn it off. Rust embedders get the same
+  default through every `awa_ui::router*` function, and can configure it
+  with `awa_ui::router_with_config`.
 
 ### Changed
 

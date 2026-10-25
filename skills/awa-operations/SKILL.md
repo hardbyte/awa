@@ -366,6 +366,14 @@ connection. Set `--callback-hmac-secret` to verify callback signatures; for
 externally reachable callbacks with a private admin surface, run
 `awa callbacks serve` instead, whose router has no admin routes.
 
+The overview's "keeping up" verdict and per-queue trends come from queue depth
+the server samples into memory (`--queue-history-minutes`, default 60;
+`--queue-history-interval`, default 15s). History is per process: it is empty
+for the first few minutes after a restart and differs between replicas. A queue
+flagged "Not being worked" has claimable jobs waiting over a minute with
+nothing running; check that some live worker serves that queue and that it is
+not rate limited or paused before anything else.
+
 ## Before You Finish A Change
 
 1. Confirm the resolved target and that you are on the intended context.

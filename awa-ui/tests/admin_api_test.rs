@@ -1134,3 +1134,71 @@ async fn test_batch_ops_api_preview_submit_and_cancel() {
         .expect("request should succeed");
     assert_eq!(patch_response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_queue_history_samples_in_background_and_on_queue_reads() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let queue = "api_queue_history";
+    clean_jobs(&pool, &[queue], &[]).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES
+            ('queue_history_available', $1, '{}'::jsonb, 'available', now() - interval '30 seconds'),
+            ('queue_history_available', $1, '{}'::jsonb, 'available', now() - interval '10 seconds')
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("fixture insert should succeed");
+    awa_model::admin::flush_dirty_admin_metadata(&pool)
+        .await
+        .unwrap();
+
+    let mut config = awa_ui::RouterConfig::new(Duration::ZERO);
+    config.queue_history = awa_ui::history::QueueHistoryConfig {
+        window: Duration::from_secs(600),
+        sample_interval: Duration::from_millis(500),
+    };
+    let app = awa_ui::router_with_config(pool.clone(), config)
+        .await
+        .expect("router should initialize");
+
+    let empty = get_json(&app, "/api/stats/queue-history").await;
+    assert_eq!(empty["enabled"], Value::Bool(true));
+    assert!(empty["observed_since"].is_null());
+
+    // Nobody reads /api/queues here: the sample must come from the sampler.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let history = loop {
+        let history = get_json(&app, "/api/stats/queue-history").await;
+        if history["queues"].get(queue).is_some() || Instant::now() > deadline {
+            break history;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let series = &history["queues"][queue];
+    let buckets = history["buckets"].as_array().expect("buckets").len();
+    assert_eq!(buckets, 10, "600s window in 60s buckets");
+    assert_eq!(history["bucket_secs"], Value::from(60));
+    let available = series["available"].as_array().expect("available series");
+    assert_eq!(available.len(), buckets);
+    assert_eq!(available.last(), Some(&Value::from(2)));
+    assert!(available[..buckets - 1].iter().all(Value::is_null));
+    assert!(series["lag_seconds"][buckets - 1].as_f64().unwrap_or(0.0) >= 30.0);
+
+    let disabled = awa_ui::router_with_config(pool.clone(), {
+        let mut config = awa_ui::RouterConfig::new(Duration::ZERO);
+        config.queue_history = awa_ui::history::QueueHistoryConfig::disabled();
+        config
+    })
+    .await
+    .expect("router should initialize");
+    get_json(&disabled, "/api/queues").await;
+    let history = get_json(&disabled, "/api/stats/queue-history").await;
+    assert_eq!(history["enabled"], Value::Bool(false));
+    assert_eq!(history["queues"], serde_json::json!({}));
+}

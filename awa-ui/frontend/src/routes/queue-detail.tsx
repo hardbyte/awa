@@ -9,6 +9,7 @@ import {
   drainQueue,
   fetchQueue,
   fetchQueueRuntime,
+  fetchQueueHistory,
   pauseQueue,
   resumeQueue,
 } from "@/lib/api";
@@ -24,7 +25,9 @@ import {
   DescriptionTerm,
 } from "@/components/ui/description-list";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { availableWait } from "@/lib/operations";
+import { assessQueue, formatDuration, formatRate } from "@/lib/operations";
+import { HEALTH_BADGE, SPARK_TONE } from "@/components/QueueFlowTable";
+import { HistorySpark } from "@/components/HistorySpark";
 import type { QueueRuntimeSummary } from "@/lib/api";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { SnapshotStatus } from "@/components/SnapshotStatus";
@@ -48,6 +51,13 @@ export function QueueDetailPage() {
   const queueQuery = useQuery({
     queryKey: ["queue", queueName],
     queryFn: () => fetchQueue(queueName),
+    enabled: !!queueName,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
+  });
+
+  const historyQuery = useQuery({
+    queryKey: ["queue-history"],
+    queryFn: fetchQueueHistory,
     enabled: !!queueName,
     refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
@@ -111,6 +121,13 @@ export function QueueDetailPage() {
   // Treat empty display_name as missing so a declared-but-blank row
   // doesn't render an empty page title.
   const title = queue.display_name?.trim() ? queue.display_name : queue.queue;
+  const series = historyQuery.data?.queues[queue.queue];
+  const assessment = assessQueue(
+    queue,
+    series,
+    historyQuery.data?.bucket_secs ?? 60,
+    historyQuery.data?.enabled ?? false,
+  );
   const descriptorSyncLabel = queue.descriptor_last_seen_at
     ? timeAgo(queue.descriptor_last_seen_at)
     : null;
@@ -131,11 +148,7 @@ export function QueueDetailPage() {
             {queue.queue}
           </code>
         )}
-        {queue.paused ? (
-          <Badge intent="warning">Paused</Badge>
-        ) : (
-          <Badge intent="success">Claims enabled</Badge>
-        )}
+        <Badge intent={HEALTH_BADGE[assessment.health]}>{assessment.label}</Badge>
         {runtime?.config && (
           <Badge intent={dlqPolicyIntent(runtime.config)}>
             {dlqPolicyLabel(runtime.config)}
@@ -145,7 +158,25 @@ export function QueueDetailPage() {
         {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
       </div>
 
-      <SnapshotStatus sources={[queueQuery, runtimeQuery]} />
+      <SnapshotStatus sources={[queueQuery, runtimeQuery, historyQuery]} />
+
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg border px-4 py-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{assessment.detail}</p>
+          <p className="text-xs text-muted-fg">
+            {queue.available.toLocaleString()} waiting
+            {queue.available > 0 && ` · oldest ${formatDuration(queue.lag_seconds)}`}
+            {` · ${formatRate(queue.completed_last_hour / 60)} finishing (hour average)`}
+          </p>
+        </div>
+        <HistorySpark
+          data={series?.available ?? []}
+          width={240}
+          height={32}
+          label={`${title} waiting jobs over the last hour`}
+          className={SPARK_TONE[assessment.health]}
+        />
+      </div>
 
       {queue.description && (
         <p className="max-w-3xl text-sm text-muted-fg">{queue.description}</p>
@@ -228,7 +259,7 @@ export function QueueDetailPage() {
 
             <DescriptionTerm>Oldest available wait</DescriptionTerm>
             <DescriptionDetails>
-              {availableWait(queue.lag_seconds)}
+              {formatDuration(queue.lag_seconds)}
             </DescriptionDetails>
           </DescriptionList>
         </CardContent>

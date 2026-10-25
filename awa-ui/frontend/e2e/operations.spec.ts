@@ -11,22 +11,38 @@ test("busy overview communicates current work and opens targeted drilldowns", as
   page.on("pageerror", (error) => errors.push(error.message));
   await page.setViewportSize({ width: 1440, height: 1050 });
   await page.goto("/");
-  await expect(
-    page.getByRole("heading", { name: "Work in motion" }),
-  ).toBeVisible();
-  await expect(
-    page.locator(".work-counter").filter({ hasText: "Available" }),
-  ).toContainText("237,192");
-  await expect(
-    page.locator(".work-counter").filter({ hasText: "Retryable" }),
-  ).toContainText("2,070");
-  await expect(page.locator(".worker-preview-row")).toHaveCount(4);
-  await expect(page.locator(".worker-preview-row").first()).toContainText(
-    "health unknown",
+  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+  await expect(page.getByTestId("verdict")).toHaveText(
+    "1 queue not being worked",
   );
-  await expect(page.locator(".pressure-table tbody tr").first()).toContainText(
-    "7m 38s",
-  );
+  await expect(page.getByText(/1 queue falling behind/)).toBeVisible();
+  const attention = page
+    .getByRole("table", { name: "Queues needing attention" })
+    .locator("tbody tr");
+  await expect(attention).toHaveCount(3);
+  await expect(attention.nth(0)).toContainText("image-processing");
+  await expect(attention.nth(0)).toContainText("Not being worked");
+  await expect(attention.nth(1)).toContainText("email-delivery");
+  await expect(attention.nth(1)).toContainText("Falling behind");
+  await expect(attention.nth(1)).toContainText("+2,500/min");
+  await expect(attention.nth(1)).toContainText("7m 38s");
+  await expect(attention.nth(2)).toContainText("Paused");
+  await page.getByRole("button", { name: "Show 21 queues keeping up" }).click();
+  const everything = page
+    .getByRole("table", { name: "All queues by risk" })
+    .locator("tbody tr");
+  await expect(everything).toHaveCount(24);
+  await expect(everything.nth(3)).toContainText("search-index");
+  await expect(everything.nth(3)).toContainText("Draining");
+  await expect(
+    page.getByRole("navigation", { name: "Job states" }),
+  ).toContainText("Retrying2,070");
+  const workers = page.getByRole("list", { name: "Workers needing attention" });
+  await expect(workers.getByRole("listitem")).toHaveCount(2);
+  await expect(workers).toContainText("health unknown");
+  const failures = page.getByRole("list", { name: "Failure groups" });
+  await expect(failures.getByRole("listitem")).toHaveCount(2);
+  await expect(failures.getByRole("listitem").first()).toContainText("×43");
   await page.screenshot({
     path: `${artifacts}/overview-desktop.png`,
     fullPage: true,
@@ -43,9 +59,7 @@ test("busy overview communicates current work and opens targeted drilldowns", as
     await page.getByRole("link", { name: "worker-eu-01" }).click();
     await expect(page).toHaveURL(/runtime\/00000000/);
     await page.goBack();
-    await expect(
-      page.getByRole("heading", { name: "Work in motion" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
   }
   expect(fixture.mutations).toEqual([]);
   expect(errors).toEqual([]);
@@ -57,7 +71,9 @@ test("queue filters and core controls use only the synthetic API", async ({
   const fixture = await mockOperations(page);
   await page.goto("/queues");
   await page.getByRole("searchbox", { name: "Find a queue" }).fill("invoice");
-  await expect(page.locator(".pressure-table tbody tr")).toHaveCount(1);
+  const rows = page.getByRole("table", { name: "Queues" }).locator("tbody tr");
+  await expect(rows).toHaveCount(1);
+  await expect(rows).toContainText("max 64");
   await page.getByRole("button", { name: "Resume", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Pause", exact: true }),
@@ -74,16 +90,24 @@ test("queue filters and core controls use only the synthetic API", async ({
   expect(fixture.mutations).toHaveLength(2);
   await page.getByRole("button", { name: "Drain…" }).click();
   await page.getByRole("button", { name: "Drain queue", exact: true }).click();
-  await expect(page.locator(".pressure-table tbody tr")).toContainText(
-    "0 scheduled",
-  );
+  await expect(rows.locator("td").nth(1)).toHaveText("0");
+  await expect(page).toHaveURL(/q=invoice/);
   expect(fixture.mutations).toContain("POST /queues/invoice-export/drain");
   await page.getByRole("searchbox").fill("not-a-real-queue");
   await expect(page.getByText("No queues match these filters.")).toBeVisible();
   await page.getByRole("searchbox").fill("");
-  await page.getByRole("combobox", { name: "Sort by" }).selectOption("failed");
-  await expect(page.locator(".pressure-table tbody tr").first()).toContainText(
-    "email-delivery",
+  await page
+    .getByRole("combobox", { name: "Sort queues" })
+    .selectOption("failed");
+  await expect(rows.first()).toContainText("email-delivery");
+  // The drain above emptied the paused queue, so only the stalled and the
+  // falling-behind queue still need attention.
+  await page.getByText("Needs attention only").click();
+  await expect(rows).toHaveCount(2);
+  await page.reload();
+  await expect(rows).toHaveCount(2);
+  await expect(page.getByRole("combobox", { name: "Sort queues" })).toHaveValue(
+    "failed",
   );
   await page.setViewportSize({ width: 1440, height: 1050 });
   await page.screenshot({
@@ -108,7 +132,9 @@ test("mobile navigation, controls, job drilldown and layout at narrow sizes", as
   await mockOperations(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
-  await expect(page.locator(".work-counter").first()).toContainText("237,192");
+  await expect(page.getByTestId("verdict")).toHaveText(
+    "1 queue not being worked",
+  );
   await page.screenshot({
     path: `${artifacts}/overview-mobile.png`,
     fullPage: true,
@@ -124,9 +150,7 @@ test("mobile navigation, controls, job drilldown and layout at narrow sizes", as
     await expect(page.getByRole("dialog")).toHaveCount(0);
     await page.getByRole("button", { name: "Toggle Sidebar" }).click();
     await page.getByRole("link", { name: "Overview", exact: true }).click();
-    await expect(
-      page.getByRole("heading", { name: "Work in motion" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(0);
   }
   await page.goto("/queues");
@@ -162,7 +186,7 @@ test("mobile navigation, controls, job drilldown and layout at narrow sizes", as
       await page.goto(route);
       const heading =
         route === "/"
-          ? "Work in motion"
+          ? "Overview"
           : route === "/queues"
             ? "Queues"
             : route === "/jobs"
@@ -192,8 +216,8 @@ test("mobile navigation, controls, job drilldown and layout at narrow sizes", as
           page.getByRole("link", { name: "email-delivery", exact: true }),
         ).toBeVisible();
       if (route === "/")
-        await expect(page.locator(".work-counter").first()).toContainText(
-          "237,192",
+        await expect(page.getByTestId("verdict")).toHaveText(
+          "1 queue not being worked",
         );
       await page.evaluate(() => document.fonts.ready);
       if (
@@ -233,7 +257,9 @@ for (const scenario of ["empty", "error", "loading"] as const) {
       ).toBeVisible();
     if (scenario === "error") {
       await expect(page.getByRole("alert")).toBeVisible({ timeout: 15000 });
-      await expect(page.locator(".work-counter").first()).toContainText("—");
+      await expect(
+        page.getByRole("navigation", { name: "Job states" }),
+      ).toContainText("Running—");
     }
     if (scenario === "loading")
       await expect(page.getByText("Loading snapshots…")).toBeVisible();
@@ -249,13 +275,14 @@ test("failed refresh retains known values and labels them out of date", async ({
 }) => {
   const fixture = await mockOperations(page);
   await page.goto("/");
-  await expect(page.locator(".work-counter").first()).toContainText("237,192");
+  const verdict = page.getByTestId("verdict");
+  await expect(verdict).toHaveText("1 queue not being worked");
   fixture.setReadFailure(true);
   await page.getByRole("button", { name: "Refresh data", exact: true }).click();
   await expect(page.getByText(/Refresh failed ·/)).toBeVisible({
     timeout: 15000,
   });
-  await expect(page.locator(".work-counter").first()).toContainText("237,192");
+  await expect(verdict).toHaveText("1 queue not being worked");
   await page.screenshot({
     path: `${artifacts}/stale-desktop.png`,
     fullPage: true,
@@ -310,7 +337,7 @@ test("mobile drawer closes promptly with both motion preferences", async ({
       );
       await expect(
         page.getByRole("heading", {
-          name: name === "Overview" ? "Work in motion" : name,
+          name,
           exact: true,
         }),
       ).toBeVisible();

@@ -28,14 +28,17 @@ export async function mockOperations(
     descriptor_stale: false,
     descriptor_mismatch: false,
     total_queued: 0,
-    available: index === 0 ? 184200 : 2100 + index * 17,
-    running: 40 + index,
+    // Story: email-delivery started falling behind 20 minutes ago,
+    // image-processing has no worker claiming it, search-index is draining a
+    // burst, and invoice-export is paused with work waiting.
+    available: index === 0 ? 184200 : index === 4 ? 12168 : 2100 + index * 17,
+    running: index === 3 ? 0 : 40 + index,
     retryable: index === 0 ? 1840 : 10,
     failed: index === 0 ? 236 : 0,
     scheduled: 850 + index,
     waiting_external: index === 2 ? 14400 : 0,
     completed_last_hour: 128400 + index * 211,
-    lag_seconds: index === 0 ? 458 : index === 1 ? 135 : 2.4,
+    lag_seconds: index === 0 ? 458 : index === 1 ? 135 : index === 3 ? 95 : 2.4,
     paused: index === 1,
   })).map((q) => ({
     ...q,
@@ -75,20 +78,69 @@ export async function mockOperations(
       shutting_down: false,
       leader: index === 2,
       global_max_workers: 64,
-      queues: queues
-        .slice(0, 6)
-        .map((q) => ({
-          queue: q.queue,
-          in_flight: 8,
-          overflow_held: 0,
-          config: config as RuntimeInstance["queues"][number]["config"],
-        })),
+      queues: queues.slice(0, 6).map((q) => ({
+        queue: q.queue,
+        in_flight: 8,
+        overflow_held: 0,
+        config: config as RuntimeInstance["queues"][number]["config"],
+      })),
     }),
   );
+  // Bucketed history the way the server reports it: an hour of one-minute
+  // buckets, a server that started 50 minutes ago, and a three-minute gap
+  // where sampling failed.
+  const BUCKETS = 60;
+  const depth = (index: number, minutesAgo: number): number => {
+    const current = queues[index]!.available;
+    if (index === 0)
+      return minutesAgo <= 20
+        ? current - minutesAgo * 2500
+        : 134200 + (minutesAgo % 3) * 300;
+    if (index === 1)
+      return minutesAgo <= 12 ? current : 40 + (minutesAgo % 4) * 5;
+    if (index === 3)
+      return minutesAgo <= 2
+        ? current - minutesAgo * 900
+        : 30 + (minutesAgo % 2) * 10;
+    if (index === 4)
+      return minutesAgo <= 15 ? current + minutesAgo * 2000 : 4000;
+    return current + ((minutesAgo * 7 + index) % 5) * 4;
+  };
+  const queueHistory = {
+    enabled: true,
+    window_secs: 3600,
+    sample_interval_secs: 15,
+    bucket_secs: 60,
+    observed_since: ago(50 * 60),
+    buckets: Array.from({ length: BUCKETS }, (_, bucket) =>
+      ago((BUCKETS - 1 - bucket) * 60),
+    ),
+    queues: Object.fromEntries(
+      queues.map((q, index) => {
+        const sampled = (bucket: number) =>
+          bucket >= 10 && ![33, 34, 35].includes(bucket);
+        const minutesAgo = (bucket: number) => BUCKETS - 1 - bucket;
+        return [
+          q.queue,
+          {
+            available: Array.from({ length: BUCKETS }, (_, bucket) =>
+              sampled(bucket) ? depth(index, minutesAgo(bucket)) : null,
+            ),
+            running: Array.from({ length: BUCKETS }, (_, bucket) =>
+              sampled(bucket) ? q.running : null,
+            ),
+            lag_seconds: Array.from({ length: BUCKETS }, (_, bucket) =>
+              sampled(bucket) ? q.lag_seconds : null,
+            ),
+          },
+        ];
+      }),
+    ),
+  };
   const jobs: JobRow[] = Array.from({ length: 60 }, (_, index) => ({
     id: 984213 - index,
-    queue: "email-delivery",
-    kind: "SendTransactionalEmail",
+    queue: index % 7 === 3 ? "image-processing" : "email-delivery",
+    kind: index % 7 === 3 ? "ResizeImage" : "SendTransactionalEmail",
     args: { template: "receipt", synthetic: true },
     state: "failed",
     priority: 2,
@@ -103,7 +155,10 @@ export async function mockOperations(
     created_at: ago(1000),
     errors: [
       {
-        error: "Provider request timed out after 30 seconds",
+        error:
+          index % 7 === 3
+            ? `Out of memory decoding upload ${7_310_000 + index}`
+            : "Provider request timed out after 30 seconds",
         attempt: 5,
         at: ago(8),
       },
@@ -160,7 +215,14 @@ export async function mockOperations(
       await new Promise((resolve) => setTimeout(resolve, 2500));
     if (
       failReads &&
-      ["/stats", "/queues", "/runtime", "/jobs", "/dlq/depth"].includes(path)
+      [
+        "/stats",
+        "/queues",
+        "/stats/queue-history",
+        "/runtime",
+        "/jobs",
+        "/dlq/depth",
+      ].includes(path)
     )
       return route.fulfill({
         status: 503,
@@ -181,6 +243,10 @@ export async function mockOperations(
             completed: 14820000,
           };
     else if (path === "/queues") data = empty ? [] : queues;
+    else if (path === "/stats/queue-history")
+      data = empty
+        ? { ...queueHistory, observed_since: null, buckets: [], queues: {} }
+        : queueHistory;
     else if (path === "/queues/runtime")
       data = empty
         ? []

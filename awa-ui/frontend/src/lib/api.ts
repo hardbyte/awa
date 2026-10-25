@@ -606,6 +606,39 @@ export function fetchTimeseries(
   return apiFetch(`/stats/timeseries${qs}`);
 }
 
+/** Queue depth sampled by the UI server (`/api/stats/queue-history`). */
+export interface QueueHistory {
+  enabled: boolean;
+  window_secs: number;
+  sample_interval_secs: number;
+  bucket_secs: number;
+  /** Oldest retained sample; never earlier than the server process start. */
+  observed_since: string | null;
+  /** End time of each bucket, oldest first. */
+  buckets: string[];
+  queues: Record<string, QueueSeries>;
+}
+
+/** Last observed value per bucket; `null` where nothing was sampled. */
+export interface QueueSeries {
+  available: (number | null)[];
+  running: (number | null)[];
+  lag_seconds: (number | null)[];
+}
+
+/** Resolves to null on servers that predate queue history (404). */
+export async function fetchQueueHistory(): Promise<QueueHistory | null> {
+  const res = await fetch("/api/stats/queue-history", {
+    headers: { "Content-Type": "application/json" },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((body as { error?: string }).error ?? res.statusText);
+  }
+  return res.json() as Promise<QueueHistory>;
+}
+
 export function fetchDistinctKinds(): Promise<string[]> {
   return apiFetch("/stats/kinds");
 }

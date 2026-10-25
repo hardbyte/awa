@@ -1,42 +1,96 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   fetchQueues,
+  fetchQueueHistory,
   fetchQueueRuntime,
   pauseQueue,
   resumeQueue,
   drainQueue,
 } from "@/lib/api";
 import type { QueueStats } from "@/lib/api";
-import { compareQueuePressure, queueNeedsReview } from "@/lib/operations";
+import { assessQueues, type AssessedQueue } from "@/lib/operations";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { toast } from "@/components/ui/toast";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Heading } from "@/components/ui/heading";
+import {
+  NativeSelect,
+  NativeSelectContent,
+} from "@/components/ui/native-select";
+import { SearchField, SearchInput } from "@/components/ui/search-field";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { QueuePressure } from "@/components/QueuePressure";
+import { QueueFlowTable } from "@/components/QueueFlowTable";
 import { SnapshotStatus } from "@/components/SnapshotStatus";
+
+const SORTS: Record<
+  string,
+  { label: string; compare?: (a: AssessedQueue, b: AssessedQueue) => number }
+> = {
+  risk: { label: "Risk" },
+  waiting: {
+    label: "Most waiting",
+    compare: (a, b) => b.queue.available - a.queue.available,
+  },
+  wait: {
+    label: "Longest wait",
+    compare: (a, b) =>
+      (b.queue.lag_seconds ?? -1) - (a.queue.lag_seconds ?? -1),
+  },
+  failed: {
+    label: "Most failed",
+    compare: (a, b) => b.queue.failed - a.queue.failed,
+  },
+  name: {
+    label: "Name",
+    compare: (a, b) => a.queue.queue.localeCompare(b.queue.queue),
+  },
+};
 
 export function QueuesPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const params = useSearch({ strict: false }) as Record<
+    string,
+    string | undefined
+  >;
+  const search = params.q ?? "";
+  const sort = params.sort && SORTS[params.sort] ? params.sort : "risk";
+  const attentionOnly = params.attention === "1";
+  const setParam = (key: string, value: string | undefined) =>
+    void navigate({
+      to: "/queues",
+      search: { ...params, [key]: value || undefined },
+      replace: true,
+    });
+
   const [drainTarget, setDrainTarget] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
-  const [reviewOnly, setReviewOnly] = useState(false);
-  const [sort, setSort] = useState("wait");
   const poll = usePollInterval();
   const readOnly = useReadOnly();
+  const polling = { refetchInterval: poll.interval, staleTime: poll.staleTime };
   const queuesQuery = useQuery({
     queryKey: ["queues"],
     queryFn: fetchQueues,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
+    ...polling,
+  });
+  const historyQuery = useQuery({
+    queryKey: ["queue-history"],
+    queryFn: fetchQueueHistory,
+    ...polling,
   });
   const runtimeQuery = useQuery({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
+    ...polling,
   });
+  const runtimeByQueue = new Map(
+    (runtimeQuery.data ?? []).map((summary) => [summary.queue, summary]),
+  );
+
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["queues"] });
     void queryClient.invalidateQueries({ queryKey: ["queue"] });
@@ -71,31 +125,25 @@ export function QueuesPage() {
     pauseMutation.isPending ||
     resumeMutation.isPending ||
     drainMutation.isPending;
-  const allQueues = queuesQuery.data ?? [];
-  const queues = allQueues
+
+  const assessed = assessQueues(queuesQuery.data ?? [], historyQuery.data);
+  const needle = search.trim().toLowerCase();
+  const compare = SORTS[sort]?.compare;
+  const rows = assessed
     .filter(
-      (queue) =>
-        (!reviewOnly || queueNeedsReview(queue)) &&
-        `${queue.queue} ${queue.display_name ?? ""} ${queue.owner ?? ""}`
+      (row) =>
+        (!attentionOnly || row.assessment.needsAttention) &&
+        `${row.queue.queue} ${row.queue.display_name ?? ""} ${row.queue.owner ?? ""}`
           .toLowerCase()
-          .includes(search.toLowerCase()),
+          .includes(needle),
     )
-    .sort((left, right) =>
-      sort === "name"
-        ? left.queue.localeCompare(right.queue)
-        : sort === "failed"
-          ? right.failed - left.failed || compareQueuePressure(left, right)
-          : sort === "available"
-            ? right.available - left.available ||
-              compareQueuePressure(left, right)
-            : compareQueuePressure(left, right),
+    .sort((a, b) =>
+      compare ? compare(a, b) || a.assessment.rank - b.assessment.rank : 0,
     );
-  const runtimeByQueue = new Map(
-    (runtimeQuery.data ?? []).map((summary) => [summary.queue, summary]),
-  );
+
   function controls(queue: QueueStats) {
     return (
-      <div className="queue-action-buttons">
+      <div className="flex justify-end gap-1 max-@4xl:justify-start">
         <Button
           intent="outline"
           size="sm"
@@ -120,86 +168,97 @@ export function QueuesPage() {
       </div>
     );
   }
+
   return (
-    <div className="operations-overview">
-      <div className="page-intro">
-        <div>
-          <p className="eyebrow">Operations / queues</p>
-          <h1>Queues</h1>
-          <p>Find waiting work, inspect failures, and control processing.</p>
-        </div>
+    <div className="space-y-6">
+      <div className="space-y-1">
+        <Heading level={2}>Queues</Heading>
+        <SnapshotStatus sources={[queuesQuery, historyQuery, runtimeQuery]} />
       </div>
-      <SnapshotStatus sources={[queuesQuery, runtimeQuery]} />
       {(queuesQuery.isError || runtimeQuery.isError) && (
-        <div role="alert" className="source-error">
+        <div
+          role="alert"
+          className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm text-danger-subtle-fg"
+        >
           {queuesQuery.isError
             ? "Queue snapshot unavailable or out of date. "
             : ""}
           {runtimeQuery.isError
-            ? "Worker coverage unavailable or out of date. "
+            ? "Worker capacity unavailable or out of date. "
             : ""}
           Use Refresh data to retry.
         </div>
       )}
-      <div className="queue-filters">
-        <label>
-          Find a queue
-          <input
-            type="search"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Name or owner"
-          />
-        </label>
-        <label>
-          Sort by
-          <select
+
+      <div className="flex flex-wrap items-end gap-3">
+        <SearchField
+          aria-label="Find a queue"
+          value={search}
+          onChange={(value) => setParam("q", value)}
+          className="w-full sm:w-72"
+        >
+          <SearchInput placeholder="Find by name or owner" />
+        </SearchField>
+        <NativeSelect className="w-auto">
+          <NativeSelectContent
+            aria-label="Sort queues"
             value={sort}
-            onChange={(event) => setSort(event.target.value)}
+            onChange={(event) =>
+              setParam(
+                "sort",
+                event.target.value === "risk" ? undefined : event.target.value,
+              )
+            }
           >
-            <option value="wait">Longest available wait</option>
-            <option value="available">Most available jobs</option>
-            <option value="failed">Most failed jobs</option>
-            <option value="name">Queue name</option>
-          </select>
-        </label>
-        <label className="review-toggle">
-          <input
-            type="checkbox"
-            checked={reviewOnly}
-            onChange={(event) => setReviewOnly(event.target.checked)}
-          />
-          Needs review
-        </label>
+            {Object.entries(SORTS).map(([value, option]) => (
+              <option key={value} value={value}>
+                Sort: {option.label}
+              </option>
+            ))}
+          </NativeSelectContent>
+        </NativeSelect>
+        <Checkbox
+          isSelected={attentionOnly}
+          onChange={(selected) =>
+            setParam("attention", selected ? "1" : undefined)
+          }
+          className="py-2"
+        >
+          Needs attention only
+        </Checkbox>
+        <span className="text-sm text-muted-fg sm:ml-auto">
+          {rows.length} of {assessed.length} queues
+        </span>
       </div>
-      <p className="text-sm text-muted-fg">
-        {queues.length} of {allQueues.length} queues · Needs review includes
-        paused, retryable, failed, and descriptor issues.
+
+      <Card className="py-0">
+        <CardContent className="px-0 sm:px-0">
+          {rows.length ? (
+            <QueueFlowTable
+              rows={rows}
+              controls={controls}
+              runtime={runtimeByQueue}
+              label="Queues"
+            />
+          ) : (
+            <p className="px-4 py-6 text-sm text-muted-fg sm:px-6">
+              {queuesQuery.isPending
+                ? "Loading queues…"
+                : queuesQuery.isError
+                  ? "Queue data unavailable."
+                  : assessed.length
+                    ? "No queues match these filters."
+                    : "No queues yet. Queues appear when registered or used."}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+      <p className="text-xs text-muted-fg">
+        Waiting counts claimable jobs only; scheduled, retrying, and
+        callback-blocked jobs are excluded. Trend is the fitted change over the
+        last 5 minutes. Pause stops new claims; running jobs continue.
       </p>
-      <section className="operations-panel">
-        {queues.length ? (
-          <QueuePressure
-            queues={queues}
-            runtime={runtimeByQueue}
-            actions={controls}
-          />
-        ) : (
-          <p className="panel-empty">
-            {queuesQuery.isPending
-              ? "Loading queues…"
-              : queuesQuery.isError
-                ? "Queue data unavailable."
-                : allQueues.length
-                  ? "No queues match these filters."
-                  : "No queues yet. Queues appear when registered or used."}
-          </p>
-        )}
-        <p className="panel-footnote">
-          Available wait excludes scheduled, retryable, running, and external
-          waits. Completions cover the last 60 minutes. Pause stops new claims;
-          running jobs continue.
-        </p>
-      </section>
+
       <ConfirmDialog
         isOpen={drainTarget !== null}
         onOpenChange={(open) => {
