@@ -37,6 +37,7 @@ async fn setup(max_conns: u32) -> sqlx::PgPool {
         .await
         .expect("Failed to connect to database");
     migrations::run(&pool).await.expect("Failed to migrate");
+    awa_testing::setup::reset_to_canonical(&pool).await;
     pool
 }
 

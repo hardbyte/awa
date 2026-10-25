@@ -39,6 +39,7 @@ async fn pool_with(max_conns: u32) -> sqlx::PgPool {
 async fn setup(max_conns: u32) -> sqlx::PgPool {
     let pool = pool_with(max_conns).await;
     migrations::run(&pool).await.expect("Failed to migrate");
+    awa_testing::setup::reset_to_canonical(&pool).await;
     pool
 }
 

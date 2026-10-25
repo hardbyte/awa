@@ -9,44 +9,12 @@
 
 use awa::audited_sql;
 use awa::model::{
-    admin, insert, migrations, storage, PruneOutcome, QueueStorage, QueueStorageConfig,
-    RotateOutcome,
+    admin, insert, storage, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome,
 };
 use awa::{InsertOpts, JobState};
+use awa_testing::setup::TestDatabase;
 use chrono::Utc;
-use sqlx::postgres::PgPoolOptions;
-use std::sync::LazyLock;
 use std::time::Duration;
-use tokio::sync::Mutex;
-
-static QUEUE_STORAGE_RUNTIME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-async fn setup_pool(max_connections: u32) -> sqlx::PgPool {
-    let url = database_url();
-    let reset_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connect for schema reset");
-    sqlx::raw_sql("DROP SCHEMA IF EXISTS awa CASCADE")
-        .execute(&reset_pool)
-        .await
-        .expect("drop awa schema");
-    reset_pool.close().await;
-
-    let pool = PgPoolOptions::new()
-        .max_connections(max_connections)
-        .connect(&url)
-        .await
-        .expect("connect");
-    migrations::run(&pool).await.expect("migrate");
-    pool
-}
 
 async fn insert_gate_runtime(pool: &sqlx::PgPool) -> uuid::Uuid {
     let instance_id = uuid::Uuid::new_v4();
@@ -273,8 +241,8 @@ async fn insert_synthetic_claim_with_ready_row(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_receipt_rescue_makes_progress_under_overload() {
-    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
-    let pool = setup_pool(10).await;
+    let db = TestDatabase::with_max_connections(10).await;
+    let pool = db.pool().clone();
     let schema = "awa_qs_chaos_rescue_overload";
     let store = create_store(&pool, schema, 4).await;
 
@@ -336,15 +304,15 @@ async fn test_receipt_rescue_makes_progress_under_overload() {
 // ────────────────────────────────────────────────────────────────────
 
 /// Concurrent prune attempts against a partition with a live open
-/// claim must all return `SkippedActive`; none may succeed. The static
+/// claim must return `SkippedActive` or `Blocked`; none may succeed. The static
 /// `test_prune_oldest_claims_refuses_to_truncate_open_claim` covers
 /// the single-call case; this test confirms the safety predicate
 /// holds under real concurrency.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_prune_skips_active_under_concurrent_traffic() {
-    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
-    let pool = setup_pool(10).await;
+    let db = TestDatabase::with_max_connections(10).await;
+    let pool = db.pool().clone();
     let schema = "awa_qs_chaos_prune_concurrent";
     let store = create_store(&pool, schema, 4).await;
 
@@ -391,6 +359,7 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
     for handle in handles {
         match handle.await.expect("prune task") {
             PruneOutcome::SkippedActive { slot: 0, .. } => skipped_count += 1,
+            PruneOutcome::Blocked { slot: 0 } => {}
             PruneOutcome::Pruned { .. } => pruned_count += 1,
             other => panic!("unexpected prune outcome: {other:?}"),
         }
@@ -413,7 +382,7 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
     .expect("count survivor");
     assert_eq!(
         survived, 1,
-        "open claim must survive 50 concurrent SkippedActive prunes"
+        "open claim must survive 50 concurrent prune attempts"
     );
 }
 
@@ -430,8 +399,8 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_prune_claims_blocked_by_concurrent_reader() {
-    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
-    let pool = setup_pool(10).await;
+    let db = TestDatabase::with_max_connections(10).await;
+    let pool = db.pool().clone();
     let schema = "awa_qs_chaos_prune_nowait";
     let store = create_store(&pool, schema, 4).await;
 
@@ -527,8 +496,8 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_admin_cancel_during_materialize_no_orphan_lease() {
-    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
-    let pool = setup_pool(10).await;
+    let db = TestDatabase::with_max_connections(10).await;
+    let pool = db.pool().clone();
     let schema = "awa_qs_chaos_cancel_orphan";
     let queue = "qs_chaos_cancel_orphan";
     let store = create_store(&pool, schema, 4).await;
