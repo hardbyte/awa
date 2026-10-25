@@ -83,21 +83,41 @@ function Capacity({ summary }: { summary: QueueRuntimeSummary | undefined }) {
       className={summary?.config_mismatch ? "text-warning-subtle-fg" : ""}
     >
       {capacityLabel(summary)}
-      {summary?.config_mismatch && " · mismatch"}
-      {summary?.config?.dlq_enabled === false && (
-        <>
-          {" · "}
-          <span>DLQ off</span>
-        </>
-      )}
     </span>
   );
 }
 
-/** Descriptor problems are rare and worth seeing without opening the queue. */
-function DescriptorFlags({ queue }: { queue: QueueStats }) {
+/**
+ * Rare conditions worth seeing without opening the queue. They sit by the
+ * name rather than in a column so they survive when narrow tables drop one.
+ */
+function QueueFlags({
+  queue,
+  summary,
+}: {
+  queue: QueueStats;
+  summary: QueueRuntimeSummary | undefined;
+}) {
   return (
     <>
+      {summary?.config_mismatch && (
+        <Badge
+          intent="warning"
+          className="ml-2"
+          title="Live instances run this queue with different settings"
+        >
+          Config mismatch
+        </Badge>
+      )}
+      {summary?.config?.dlq_enabled === false && (
+        <Badge
+          intent="secondary"
+          className="ml-2"
+          title="Exhausted jobs stay failed instead of moving to the dead-letter queue"
+        >
+          DLQ off
+        </Badge>
+      )}
       {queue.descriptor_stale && (
         <Badge
           intent="warning"
@@ -196,10 +216,10 @@ export function QueueFlowTable({
 }) {
   return (
     <div className="@container">
-      <div className="hidden overflow-x-auto @4xl:block">
+      <div className="relative hidden overflow-x-auto @4xl:block">
         <table className="w-full text-sm" aria-label={label}>
           <thead>
-            <tr className="border-b text-left text-xs text-muted-fg [&>th]:px-2.5 [&>th]:py-2 [&>th]:font-medium [&>th]:whitespace-nowrap">
+            <tr className="border-b text-left text-xs text-muted-fg [&>th]:px-2 [&>th]:py-2 [&>th]:font-medium [&>th]:whitespace-nowrap">
               <th scope="col" className="pl-4">
                 Queue
               </th>
@@ -228,7 +248,11 @@ export function QueueFlowTable({
               <th scope="col" title="What is holding waiting work back">
                 Limited by
               </th>
-              {runtime && <th scope="col">Capacity</th>}
+              {runtime && (
+                <th scope="col" className="hidden @7xl:table-cell">
+                  Capacity
+                </th>
+              )}
               <th scope="col" className="text-right">
                 Done/min
               </th>
@@ -239,7 +263,7 @@ export function QueueFlowTable({
                 Retrying / failed
               </th>
               {controls && (
-                <th scope="col" className="pr-4">
+                <th scope="col" className="sticky right-0 bg-bg pr-4">
                   <span className="sr-only">Controls</span>
                 </th>
               )}
@@ -252,11 +276,11 @@ export function QueueFlowTable({
               return (
                 <tr
                   key={queue.queue}
-                  className="border-b last:border-b-0 hover:bg-muted/50 [&>td]:px-2.5 [&>td]:py-2 [&>td]:whitespace-nowrap"
+                  className="border-b last:border-b-0 hover:bg-muted/50 [&>td]:px-2 [&>td]:py-2 [&>td]:whitespace-nowrap"
                 >
                   <th
                     scope="row"
-                    className="max-w-64 truncate py-2 pr-2.5 pl-4 text-left font-medium"
+                    className="max-w-64 truncate py-2 pr-2 pl-4 text-left font-medium"
                   >
                     <Link
                       to="/queues/$name"
@@ -271,7 +295,10 @@ export function QueueFlowTable({
                         {queue.queue}
                       </span>
                     )}
-                    <DescriptorFlags queue={queue} />
+                    <QueueFlags
+                      queue={queue}
+                      summary={runtime?.get(queue.queue)}
+                    />
                   </th>
                   <td>
                     <Badge
@@ -291,7 +318,7 @@ export function QueueFlowTable({
                   <td className={SPARK_TONE[health]}>
                     <HistorySpark
                       data={row.series?.available ?? []}
-                      width={96}
+                      width={72}
                       height={20}
                       label={`${queueName(queue)} waiting jobs over the last hour`}
                     />
@@ -317,7 +344,7 @@ export function QueueFlowTable({
                     <LimitedBy row={row} />
                   </td>
                   {runtime && (
-                    <td>
+                    <td className="hidden @7xl:table-cell">
                       <Capacity summary={runtime.get(queue.queue)} />
                     </td>
                   )}
@@ -343,7 +370,9 @@ export function QueueFlowTable({
                     />
                   </td>
                   {controls && (
-                    <td className="pr-4 text-right">{controls(queue)}</td>
+                    <td className="sticky right-0 bg-bg pr-4 text-right">
+                      {controls(queue)}
+                    </td>
                   )}
                 </tr>
               );
@@ -370,7 +399,10 @@ export function QueueFlowTable({
                   <p className="text-xs text-muted-fg">{assessment?.reason}</p>
                   {(queue.descriptor_stale || queue.descriptor_mismatch) && (
                     <div className="mt-1 -ml-2">
-                      <DescriptorFlags queue={queue} />
+                      <QueueFlags
+                        queue={queue}
+                        summary={runtime?.get(queue.queue)}
+                      />
                     </div>
                   )}
                 </div>

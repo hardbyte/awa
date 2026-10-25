@@ -36,7 +36,6 @@ test.describe("Queues page", () => {
       "Trend",
       "Oldest wait",
       "Running",
-      "Capacity",
       "Done/min",
       "Retrying / failed",
       "Controls",
@@ -45,6 +44,16 @@ test.describe("Queues page", () => {
         queueTable.getByRole("columnheader", { name: header, exact: true }),
       ).toBeVisible();
     }
+
+    // Capacity joins the table only where there is room for it.
+    const capacity = queueTable.getByRole("columnheader", {
+      name: "Capacity",
+      exact: true,
+    });
+    await expect(capacity).toBeHidden();
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await expect(capacity).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 720 });
 
     // Descriptor-backed queue shows display name and raw key
     await expect(queueTable.getByText("E2E Queue")).toBeVisible();

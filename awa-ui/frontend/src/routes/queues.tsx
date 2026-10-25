@@ -19,6 +19,7 @@ import {
 import { useReadOnly } from "@/hooks/use-read-only";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { toast } from "@/components/ui/toast";
+import { NoSymbolIcon, PauseIcon, PlayIcon } from "@heroicons/react/20/solid";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -28,6 +29,7 @@ import {
   NativeSelectContent,
 } from "@/components/ui/native-select";
 import { SearchField, SearchInput } from "@/components/ui/search-field";
+import { Tooltip, TooltipContent } from "@/components/ui/tooltip";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { QueueFlowTable } from "@/components/QueueFlowTable";
 import { SnapshotStatus } from "@/components/SnapshotStatus";
@@ -159,30 +161,42 @@ export function QueuesPage() {
         : 0,
     );
 
+  // Icon-only in the table, where width is scarce; the label stays the
+  // accessible name and reappears in the narrow card layout.
   function controls(queue: QueueStats) {
+    const toggle = queue.paused ? "Resume" : "Pause";
+    const ToggleIcon = queue.paused ? PlayIcon : PauseIcon;
     return (
       <div className="flex justify-end gap-1 max-@4xl:justify-start">
-        <Button
-          intent="outline"
-          size="sm"
-          isDisabled={readOnly || pending}
-          onPress={() =>
-            queue.paused
-              ? resumeMutation.mutate(queue.queue)
-              : pauseMutation.mutate(queue.queue)
-          }
-        >
-          {queue.paused ? "Resume" : "Pause"}
-        </Button>
-        <Button
-          intent="plain"
-          size="sm"
-          className="text-danger"
-          isDisabled={readOnly || pending}
-          onPress={() => setDrainTarget(queue.queue)}
-        >
-          Drain…
-        </Button>
+        <Tooltip>
+          <Button
+            intent="outline"
+            size="sm"
+            isDisabled={readOnly || pending}
+            onPress={() =>
+              queue.paused
+                ? resumeMutation.mutate(queue.queue)
+                : pauseMutation.mutate(queue.queue)
+            }
+          >
+            <ToggleIcon data-slot="icon" />
+            <span className="@4xl:sr-only">{toggle}</span>
+          </Button>
+          <TooltipContent>{toggle}</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <Button
+            intent="plain"
+            size="sm"
+            className="text-danger"
+            isDisabled={readOnly || pending}
+            onPress={() => setDrainTarget(queue.queue)}
+          >
+            <NoSymbolIcon data-slot="icon" />
+            <span className="@4xl:sr-only">Drain…</span>
+          </Button>
+          <TooltipContent>Drain: cancel all pending jobs</TooltipContent>
+        </Tooltip>
       </div>
     );
   }
