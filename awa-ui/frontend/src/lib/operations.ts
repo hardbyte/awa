@@ -76,7 +76,7 @@ export const LIMITED_BY_LABEL: Record<LimitedBy, string> = {
   no_workers: "No workers",
   rate_limit: "Rate limit",
   worker_capacity: "Worker capacity",
-  nothing: "Spare capacity",
+  nothing: "No visible limit",
 };
 
 export const LIMITED_BY_HINT: Record<LimitedBy, string> = {

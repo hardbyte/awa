@@ -28,7 +28,7 @@ test("incident overview leads with the problem and opens targeted drilldowns", a
   await expect(attention.nth(1)).toContainText("+2,500/min");
   await expect(attention.nth(1)).toContainText("7m 38s");
   await expect(attention.nth(1)).toContainText("Rate limit");
-  await expect(attention.nth(0)).toContainText("Spare capacity");
+  await expect(attention.nth(0)).toContainText("No visible limit");
   // Fleet changes are listed and marked on the total-backlog chart.
   await expect(
     page.getByRole("list", { name: "Fleet changes" }).getByRole("listitem"),

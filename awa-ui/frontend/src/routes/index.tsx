@@ -305,7 +305,8 @@ export function DashboardPage() {
         <CardHeader
           title={
             attention.length
-              ? `Needs attention (${attention.length})`
+              ? `Needs attention (${attention.length})` +
+                (draining ? ` · recovering (${draining})` : "")
               : draining
                 ? `Recovering (${draining})`
                 : "Queues"
