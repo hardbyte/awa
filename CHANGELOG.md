@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v053. Run `awa migrate` as the migrator
+This release adds migrations v044 to v051. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 
@@ -73,7 +73,7 @@ for each step.
   `awa.migration_lock_key()` expose the runner's advisory lock key.
 - Python prints a diagnostic to stderr if native shutdown has stalled for five
   seconds.
-- **The admin overview answers "is it keeping up?" (v053,
+- **The admin overview answers "is it keeping up?" (v051,
   [#543](https://github.com/hardbyte/awa/pull/543)).** The maintenance leader
   writes one row per queue per minute to `awa.queue_history` (depth by state,
   oldest wait, and claimed/completed/failed/retried/rate-limited counts) and

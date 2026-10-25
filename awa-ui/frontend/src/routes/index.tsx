@@ -51,7 +51,7 @@ const VERDICT_TONE: Record<HealthReport["status"], string> = {
 function historyGap(history: QueueHistory | undefined): string | null {
   if (!history) return null;
   if (!history.installed)
-    return "No trends: queue history needs schema v053 (run awa migrate).";
+    return "No trends: queue history needs schema v051 (run awa migrate).";
   if (!history.observed_since)
     return "No trends yet: the maintenance leader records one sample a minute.";
   return null;

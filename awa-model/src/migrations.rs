@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 53;
+pub const CURRENT_VERSION: i32 = 51;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -290,10 +290,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Drop the redundant lane index on ready_entries partitions",
         &[V23_UP, V50_UP],
     ),
-    // v051 and v052 are reserved for open PRs #515 (per-slot claim functions)
-    // and #538 (enqueue fold); the runner applies only versions above the
-    // current one, so this must merge after both or be renumbered.
-    (53, "Per-minute queue and fleet history", &[V53_UP]),
+    (51, "Per-minute queue and fleet history", &[V51_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -352,7 +349,7 @@ const V47_UP: &str = include_str!("../migrations/v047_replica_identity.sql");
 const V48_UP: &str = include_str!("../migrations/v048_claim_cursor_catch_up.sql");
 const V49_UP: &str = include_str!("../migrations/v049_prepared_lane_sequences.sql");
 const V50_UP: &str = include_str!("../migrations/v050_drop_ready_lane_shard_index.sql");
-const V53_UP: &str = include_str!("../migrations/v053_queue_history.sql");
+const V51_UP: &str = include_str!("../migrations/v051_queue_history.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

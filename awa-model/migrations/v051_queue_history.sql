@@ -1,4 +1,4 @@
--- v053: per-minute queue and fleet history for the admin overview
+-- v051: per-minute queue and fleet history for the admin overview
 --
 -- Job tables record current state, not how a backlog moved, so the admin UI
 -- could not tell a queue that is draining from one falling behind. The
@@ -62,5 +62,5 @@ CREATE TABLE IF NOT EXISTS awa.fleet_history (
 );
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (53, 'Per-minute queue and fleet history')
+VALUES (51, 'Per-minute queue and fleet history')
 ON CONFLICT (version) DO NOTHING;

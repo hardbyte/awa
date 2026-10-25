@@ -1,4 +1,4 @@
-//! Per-minute queue and fleet history (v053, #543).
+//! Per-minute queue and fleet history (v051, #543).
 //!
 //! The elected maintenance leader samples queue depth and differences the
 //! cumulative per-queue counters runtimes publish in their snapshots
@@ -242,7 +242,7 @@ pub fn build_sample(
     (rows, fleet)
 }
 
-/// Whether v053 is applied. Lets callers report "no history" on an older
+/// Whether v051 is applied. Lets callers report "no history" on an older
 /// schema instead of failing.
 pub async fn history_installed(pool: &PgPool) -> Result<bool, AwaError> {
     let installed: bool = sqlx::query_scalar(

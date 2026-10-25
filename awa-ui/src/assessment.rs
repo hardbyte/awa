@@ -3,7 +3,7 @@
 //! One source of truth for the overview, the Queues page and
 //! `/api/health/queues`, so an alert and the screen an operator opens after
 //! it never disagree. Inputs are the current queue snapshot, the leader's
-//! per-minute history (`awa.queue_history`, v053) and live runtime summaries.
+//! per-minute history (`awa.queue_history`, v051) and live runtime summaries.
 
 use std::collections::BTreeMap;
 
@@ -125,7 +125,7 @@ pub struct HealthReport {
     pub title: String,
     pub detail: String,
     pub generated_at: DateTime<Utc>,
-    /// False when the schema predates v053 or the leader has not sampled
+    /// False when the schema predates v051 or the leader has not sampled
     /// yet: only stalls and long waits can be detected.
     pub history_available: bool,
     pub history_since: Option<DateTime<Utc>>,
@@ -347,7 +347,7 @@ pub fn assess_queue(
             if history_available {
                 "Needs a few minutes of history".to_string()
             } else {
-                "No queue history yet; run v053 and a current maintenance leader".to_string()
+                "No queue history yet; run v051 and a current maintenance leader".to_string()
             },
             None,
         )
