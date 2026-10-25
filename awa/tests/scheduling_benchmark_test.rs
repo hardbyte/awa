@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod ci_timing;
-use ci_timing::scaled_timeout;
+use ci_timing::{contention_floor, scaled_timeout};
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -906,6 +906,7 @@ async fn run_mvcc_horizon_benchmark(defaults: MvccBenchmarkDefaults) {
     let seeded = Arc::new(AtomicU64::new(0));
 
     let client = Client::builder(pool.clone())
+        .canonical_storage()
         .queue(
             queue,
             QueueConfig {
@@ -1021,6 +1022,17 @@ async fn run_mvcc_horizon_benchmark(defaults: MvccBenchmarkDefaults) {
     let baseline_rate = average_handler_rate(baseline_window);
     let overlap_rate = average_handler_rate(overlap_window);
     let cooldown_rate = average_handler_rate(cooldown_window);
+    for (phase, window) in [
+        ("baseline", baseline_window),
+        ("overlap", overlap_window),
+        ("cooldown", cooldown_window),
+    ] {
+        let handled: u64 = window.iter().map(|sample| sample.handler_delta).sum();
+        assert!(
+            handled >= contention_floor(1) as u64,
+            "MVCC benchmark must handle jobs during {phase}, got {handled}"
+        );
+    }
     let max_available = samples
         .iter()
         .map(|sample| sample.available)
