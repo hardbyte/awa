@@ -26,6 +26,14 @@ test("busy overview communicates current work and opens targeted drilldowns", as
   await expect(attention.nth(1)).toContainText("Falling behind");
   await expect(attention.nth(1)).toContainText("+2,500/min");
   await expect(attention.nth(1)).toContainText("7m 38s");
+  await expect(attention.nth(1)).toContainText("Rate limit");
+  await expect(attention.nth(0)).toContainText("Spare capacity");
+  // Fleet changes are listed and marked on the total-backlog chart.
+  await expect(
+    page.getByRole("list", { name: "Fleet changes" }).getByRole("listitem"),
+  ).toHaveCount(3);
+  await expect(page.locator("[data-marker]")).toHaveCount(3);
+  await expect(page.getByText(/arriving .*\/min · last 5m/)).toBeVisible();
   await expect(attention.nth(2)).toContainText("Paused");
   await page.getByRole("button", { name: "Show 21 queues keeping up" }).click();
   const everything = page

@@ -502,6 +502,7 @@ DLQ rows are different: `dlq_entries` is a separate hold table and the maintenan
 | `failed_retention` | `72h` | Both engines: a non-DLQ `failed` terminal row stays retryable for at least this long past failure. Canonical enforces it by leaving recent failed rows in place; queue storage enforces it by carry-forward at prune time. Does not apply to `cancelled` rows or to the DLQ. |
 | `dlq_retention` | `30d` | How long DLQ rows stay in `dlq_entries` before bounded cleanup deletes them. |
 | `descriptor_retention` | `30d` | How long stale queue/kind descriptor catalog rows survive. |
+| `queue_history_retention` | `48h` | How long the leader keeps per-minute queue and fleet history for the admin UI (Python: `queue_history_retention_hours`). Zero stops sampling; existing rows are left in place. |
 | `cleanup_interval` | `60s` | How often the cleanup pass runs. |
 | `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
 | `dlq_cleanup_batch_size` | `1000` | DLQ-specific batch size. |
@@ -769,8 +770,6 @@ Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 | `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Max connection lifetime (seconds) |
 | `--pool-acquire-timeout` | `AWA_POOL_ACQUIRE_TIMEOUT` | `10` | Connection acquire timeout (seconds) |
 | `--cache-ttl` | `AWA_CACHE_TTL` | `5` | Dashboard query cache TTL (seconds) |
-| `--queue-history-minutes` | `AWA_QUEUE_HISTORY_MINUTES` | `60` | Queue depth history kept in memory for overview trends; `0` disables sampling |
-| `--queue-history-interval` | `AWA_QUEUE_HISTORY_INTERVAL` | `15` | Seconds between queue depth samples |
 
 ### Dashboard cache
 
@@ -781,17 +780,26 @@ If you're connecting to a read replica, increase `--cache-ttl` to reduce load. T
 ### Queue history
 
 The overview judges whether each queue is keeping up from how its waiting
-(available) job count moves, which a single snapshot cannot show. `awa serve`
-samples the same queue overview read the Queues page uses every
-`--queue-history-interval` seconds and keeps `--queue-history-minutes` of it in
-memory. Samples go through the dashboard cache, so a sample taken while someone
-has the UI open is free; otherwise each one is a database read, whether or not
-anyone is watching.
+(available) job count moves, which a single snapshot cannot show. The
+maintenance leader records it: once a minute it writes a row per queue to
+`awa.queue_history` and a fleet row to `awa.fleet_history` (schema v051). Each
+sample costs one queue overview read (the query behind the Queues page) and
+one insert per queue, issued by the leader only, beside the maintenance loop
+so a slow read cannot delay rescue or promotion.
 
-Because the history lives in the server process, it starts empty after a
-restart (trends appear after about three minutes), a failed sample shows as a
-gap, and each `awa serve` replica samples and keeps its own copy. For longer
-retention or fleet-wide trend alerting, use the OpenTelemetry metrics instead.
+Claim, completion and failure rates come from per-queue counters each runtime
+publishes with its snapshot. The leader differences consecutive readings, so
+a minute's counts are unknown (shown as gaps, never as zero) after a leader
+change, for runtimes older than these counters, and for a runtime it first
+sees that started earlier. A runtime that dies between samples loses at most
+its last snapshot interval of counts.
+
+`awa serve` reads the tables, so every UI replica shows the same history and
+history survives UI restarts. On a schema before v051, or until a current
+leader has sampled, the overview says so and detects only stalls and long
+waits. `GET /api/health/queues` serves the same verdicts as JSON; add
+`?fail_on=critical` (or `warning`) to get a 503 at that level from a plain
+HTTP check.
 
 ### Read-only mode
 

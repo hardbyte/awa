@@ -161,20 +161,6 @@ enum Commands {
         /// `--peer alloydb=https://awa-alloydb.internal`.
         #[arg(long = "peer", value_name = "NAME=URL")]
         peer: Vec<String>,
-        /// Minutes of queue depth history kept in memory for the overview's
-        /// trends. 0 disables sampling. History starts when this process
-        /// starts and is not shared between replicas.
-        #[arg(long, default_value = "60", env = "AWA_QUEUE_HISTORY_MINUTES")]
-        queue_history_minutes: u64,
-        /// Seconds between queue depth samples. Each sample is one queue
-        /// overview read, issued whether or not anyone has the UI open.
-        #[arg(
-            long,
-            default_value = "15",
-            env = "AWA_QUEUE_HISTORY_INTERVAL",
-            value_parser = clap::value_parser!(u64).range(1..)
-        )]
-        queue_history_interval: u64,
     },
     /// Callback receiver subcommands
     Callbacks {
@@ -1209,8 +1195,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             instance_name,
             instance_color,
             peer,
-            queue_history_minutes,
-            queue_history_interval,
         } => {
             // Validate identity flags before touching the database so a
             // typo'd color or peer spec fails fast.
@@ -1248,18 +1232,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 awa_ui::state::ReadOnlyMode::Auto
             };
-            let app = awa_ui::router_with_config(
+            let app = awa_ui::router_with_identity(
                 pool,
-                awa_ui::RouterConfig {
-                    cache_ttl: cache_duration,
-                    callback_hmac_secret,
-                    read_only_mode,
-                    instance,
-                    queue_history: awa_ui::history::QueueHistoryConfig {
-                        window: Duration::from_secs(queue_history_minutes.saturating_mul(60)),
-                        sample_interval: Duration::from_secs(queue_history_interval),
-                    },
-                },
+                cache_duration,
+                callback_hmac_secret,
+                read_only_mode,
+                instance,
             )
             .await?;
             let addr = format!("{host}:{port}");

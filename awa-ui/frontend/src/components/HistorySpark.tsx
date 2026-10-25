@@ -10,12 +10,15 @@ export function HistorySpark({
   height = 24,
   label,
   className,
+  markers = [],
 }: {
   data: ReadonlyArray<number | null>;
   width?: number;
   height?: number;
   label: string;
   className?: string;
+  /** Bucket indexes to mark with a vertical tick, e.g. fleet changes. */
+  markers?: ReadonlyArray<number>;
 }) {
   const values = data.filter((value): value is number => value !== null);
   if (values.length === 0) {
@@ -64,6 +67,20 @@ export function HistorySpark({
         strokeOpacity={0.15}
         vectorEffect="non-scaling-stroke"
       />
+      {markers.map((index) => (
+        <line
+          key={`marker-${index}`}
+          data-marker
+          x1={index * step}
+          x2={index * step}
+          y1={0}
+          y2={height}
+          stroke="currentColor"
+          strokeOpacity={0.45}
+          strokeDasharray="2 2"
+          vectorEffect="non-scaling-stroke"
+        />
+      ))}
       {segments.map((points, index) =>
         points.length === 1 ? (
           <circle

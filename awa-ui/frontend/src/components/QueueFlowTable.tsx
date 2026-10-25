@@ -1,6 +1,10 @@
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
-import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
+import type {
+  QueueHealthKind,
+  QueueRuntimeSummary,
+  QueueStats,
+} from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { HistorySpark } from "@/components/HistorySpark";
 import {
@@ -8,12 +12,14 @@ import {
   formatCount,
   formatDuration,
   formatRate,
+  healthOf,
+  LIMITED_BY_HINT,
+  LIMITED_BY_LABEL,
   type AssessedQueue,
-  type QueueHealth,
 } from "@/lib/operations";
 
 export const HEALTH_BADGE: Record<
-  QueueHealth,
+  QueueHealthKind,
   "danger" | "warning" | "info" | "secondary" | "outline"
 > = {
   stalled: "danger",
@@ -27,7 +33,7 @@ export const HEALTH_BADGE: Record<
 };
 
 /** Text tint for the backlog sparkline, so the trend reads at a glance. */
-export const SPARK_TONE: Record<QueueHealth, string> = {
+export const SPARK_TONE: Record<QueueHealthKind, string> = {
   stalled: "text-danger",
   behind: "text-warning",
   slow: "text-warning",
@@ -64,7 +70,11 @@ function JobsLink({
   );
 }
 
-function Capacity({ summary }: { summary: QueueRuntimeSummary | undefined }) {
+function Capacity({
+  summary,
+}: {
+  summary: QueueRuntimeSummary | undefined;
+}) {
   if (summary && summary.live_instances === 0) {
     return <span className="text-danger-subtle-fg">No live workers</span>;
   }
@@ -115,22 +125,58 @@ function DescriptorFlags({ queue }: { queue: QueueStats }) {
 }
 
 function TrendText({ row }: { row: AssessedQueue }) {
-  const { trend, clearSeconds, health } = row.assessment;
+  const trend = row.assessment?.trend;
   if (!trend) return <span className="text-muted-fg">—</span>;
   // Below the noise threshold the fitted slope is batching jitter; printing
   // "-0.6/min" would invite reading meaning into it.
+  const health = healthOf(row);
   if (health === "steady" || health === "idle" || health === "paused") {
     return <span className="text-muted-fg">flat</span>;
   }
+  const clear = row.assessment?.clear_seconds ?? null;
   return (
     <span className="tabular-nums">
-      {formatRate(trend.perMinute, true)}
-      {clearSeconds !== null && (
-        <span className="text-muted-fg">
-          {" "}
-          · ~{formatDuration(clearSeconds)}
-        </span>
+      {formatRate(trend.per_minute, true)}
+      {clear !== null && (
+        <span className="text-muted-fg"> · ~{formatDuration(clear)}</span>
       )}
+    </span>
+  );
+}
+
+function LimitedBy({ row }: { row: AssessedQueue }) {
+  const limited = row.assessment?.limited_by;
+  if (!limited) return <span className="text-muted-fg">—</span>;
+  const tone =
+    limited === "no_workers"
+      ? "text-danger-subtle-fg"
+      : limited === "rate_limit" || limited === "worker_capacity"
+        ? "text-warning-subtle-fg"
+        : "";
+  return (
+    <span className={tone} title={LIMITED_BY_HINT[limited]}>
+      {LIMITED_BY_LABEL[limited]}
+    </span>
+  );
+}
+
+/** Measured completions per minute over the last 5 minutes, or the last
+ * hour's average when the runtimes have not reported counters. */
+function DoneRate({ row }: { row: AssessedQueue }) {
+  const measured = row.assessment?.flow.completed_per_minute;
+  if (measured !== null && measured !== undefined) {
+    return (
+      <span className="tabular-nums" title="Measured over the last 5 minutes">
+        {formatCount(Math.round(measured))}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="tabular-nums text-muted-fg"
+      title="Average over the last hour; runtimes have not reported counters"
+    >
+      {formatCount(Math.round(row.queue.completed_last_hour / 60))}
     </span>
   );
 }
@@ -179,12 +225,11 @@ export function QueueFlowTable({
               <th scope="col" className="text-right">
                 Running
               </th>
+              <th scope="col" title="What is holding waiting work back">
+                Limited by
+              </th>
               {runtime && <th scope="col">Capacity</th>}
-              <th
-                scope="col"
-                className="text-right"
-                title="Average over the last hour"
-              >
+              <th scope="col" className="text-right">
                 Done/min
               </th>
               <th
@@ -203,6 +248,7 @@ export function QueueFlowTable({
           <tbody>
             {rows.map((row) => {
               const { queue, assessment } = row;
+              const health = healthOf(row);
               return (
                 <tr
                   key={queue.queue}
@@ -229,10 +275,10 @@ export function QueueFlowTable({
                   </th>
                   <td>
                     <Badge
-                      intent={HEALTH_BADGE[assessment.health]}
-                      title={assessment.detail}
+                      intent={HEALTH_BADGE[health]}
+                      title={assessment?.reason}
                     >
-                      {assessment.label}
+                      {assessment?.label ?? "…"}
                     </Badge>
                   </td>
                   <td className="text-right">
@@ -242,7 +288,7 @@ export function QueueFlowTable({
                       value={queue.available}
                     />
                   </td>
-                  <td className={SPARK_TONE[assessment.health]}>
+                  <td className={SPARK_TONE[health]}>
                     <HistorySpark
                       data={row.series?.available ?? []}
                       width={96}
@@ -267,13 +313,16 @@ export function QueueFlowTable({
                       value={queue.running}
                     />
                   </td>
+                  <td>
+                    <LimitedBy row={row} />
+                  </td>
                   {runtime && (
                     <td>
                       <Capacity summary={runtime.get(queue.queue)} />
                     </td>
                   )}
-                  <td className="text-right tabular-nums">
-                    {formatCount(Math.round(queue.completed_last_hour / 60))}
+                  <td className="text-right">
+                    <DoneRate row={row} />
                   </td>
                   <td className={controls ? "text-right" : "pr-4 text-right"}>
                     <JobsLink
@@ -306,6 +355,7 @@ export function QueueFlowTable({
       <ul className="divide-y @4xl:hidden" aria-label={label}>
         {rows.map((row) => {
           const { queue, assessment } = row;
+          const health = healthOf(row);
           return (
             <li key={queue.queue} className="space-y-2 px-4 py-3">
               <div className="flex items-start justify-between gap-3">
@@ -317,23 +367,18 @@ export function QueueFlowTable({
                   >
                     {queueName(queue)}
                   </Link>
-                  <p className="text-xs text-muted-fg">{assessment.detail}</p>
+                  <p className="text-xs text-muted-fg">{assessment?.reason}</p>
                   {(queue.descriptor_stale || queue.descriptor_mismatch) && (
-                    <div className="-ml-2 mt-1">
+                    <div className="mt-1 -ml-2">
                       <DescriptorFlags queue={queue} />
                     </div>
                   )}
                 </div>
-                <Badge
-                  intent={HEALTH_BADGE[assessment.health]}
-                  className="shrink-0"
-                >
-                  {assessment.label}
+                <Badge intent={HEALTH_BADGE[health]} className="shrink-0">
+                  {assessment?.label ?? "…"}
                 </Badge>
               </div>
-              <div
-                className={`flex items-center gap-3 ${SPARK_TONE[assessment.health]}`}
-              >
+              <div className={`flex items-center gap-3 ${SPARK_TONE[health]}`}>
                 <HistorySpark
                   data={row.series?.available ?? []}
                   width={160}
@@ -377,7 +422,7 @@ export function QueueFlowTable({
                 <div>
                   <dt>Done/min</dt>
                   <dd>
-                    {formatCount(Math.round(queue.completed_last_hour / 60))}
+                    <DoneRate row={row} />
                   </dd>
                 </div>
                 <div>
@@ -400,6 +445,12 @@ export function QueueFlowTable({
                       value={queue.failed}
                       className="text-danger-subtle-fg"
                     />
+                  </dd>
+                </div>
+                <div className="col-span-3">
+                  <dt>Limited by</dt>
+                  <dd>
+                    <LimitedBy row={row} />
                   </dd>
                 </div>
                 {runtime && (

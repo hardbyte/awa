@@ -24,7 +24,7 @@ test.describe("Operations overview", () => {
     await expect(page.getByText("Waiting across all queues")).toBeVisible();
     await expect(
       page.getByText(
-        /Trends from samples every|Queue history starts with the first sample/,
+        /Per-minute history from the maintenance leader|No queue history yet/,
       ),
     ).toBeVisible();
   });
@@ -42,6 +42,7 @@ test.describe("Operations overview", () => {
       "Last hour",
       "Trend",
       "Oldest wait",
+      "Limited by",
     ]) {
       await expect(
         table.getByRole("columnheader", { name: header, exact: true }),

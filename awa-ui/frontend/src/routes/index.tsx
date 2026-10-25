@@ -4,23 +4,24 @@ import { Link } from "@tanstack/react-router";
 import {
   fetchStats,
   fetchQueues,
+  fetchQueueHealth,
   fetchQueueHistory,
   fetchJobs,
   fetchRuntime,
   fetchDlqDepth,
 } from "@/lib/api";
-import type { QueueHistory } from "@/lib/api";
+import type { HealthReport, QueueHistory } from "@/lib/api";
 import {
-  assessQueues,
+  eventIndexes,
   formatCount,
   formatDuration,
   formatRate,
   groupFailures,
-  overallVerdict,
+  joinQueues,
+  needsAttention,
   runtimeConcern,
   totalBacklog,
-  trailingTrend,
-  type Verdict,
+  totalRate,
 } from "@/lib/operations";
 import { timeAgo } from "@/lib/time";
 import { usePollInterval } from "@/hooks/use-poll-interval";
@@ -38,26 +39,24 @@ import { SnapshotStatus } from "@/components/SnapshotStatus";
 
 const FAILURE_SAMPLE = 50;
 
-const VERDICT_TONE: Record<Verdict["tone"], string> = {
-  danger: "border-l-danger",
+const VERDICT_TONE: Record<HealthReport["status"], string> = {
+  critical: "border-l-danger",
   warning: "border-l-warning",
-  info: "border-l-info",
-  success: "border-l-success",
-  muted: "border-l-border",
+  unknown: "border-l-border",
+  ok: "border-l-success",
 };
 
 /** Where the trend data comes from, in one line. */
-function historyCoverage(history: QueueHistory | null | undefined): string {
-  if (history === null)
-    return "This server predates queue history; only current depth is shown.";
+function historyCoverage(history: QueueHistory | undefined): string {
   if (!history) return "Loading queue history…";
-  if (!history.enabled)
-    return "Queue history is disabled on this server (--queue-history-minutes 0).";
+  if (!history.installed)
+    return "Queue history needs schema v051; run awa migrate to enable trends.";
   if (!history.observed_since)
-    return "Queue history starts with the first sample.";
-  const seconds =
-    (Date.now() - new Date(history.observed_since).getTime()) / 1000;
-  return `Trends from samples every ${history.sample_interval_secs}s by this server, covering the last ${formatDuration(Math.min(seconds, history.window_secs))}.`;
+    return "No queue history yet: the maintenance leader writes one sample a minute.";
+  const minutes = Math.round(
+    (Date.now() - new Date(history.observed_since).getTime()) / 60_000,
+  );
+  return `Per-minute history from the maintenance leader, covering the last ${formatDuration(Math.min(minutes, history.minutes) * 60)}.`;
 }
 
 export function DashboardPage() {
@@ -76,8 +75,13 @@ export function DashboardPage() {
     ...polling,
   });
   const history = useQuery({
-    queryKey: ["queue-history"],
-    queryFn: fetchQueueHistory,
+    queryKey: ["queue-history", 60],
+    queryFn: () => fetchQueueHistory(60),
+    ...polling,
+  });
+  const health = useQuery({
+    queryKey: ["queue-health"],
+    queryFn: fetchQueueHealth,
     ...polling,
   });
   const runtime = useQuery({
@@ -97,22 +101,32 @@ export function DashboardPage() {
     staleTime: Math.max(poll.staleTime, 60_000),
   });
 
-  const historyEnabled = history.data?.enabled ?? false;
-  const assessed = assessQueues(queues.data ?? [], history.data);
-  const attention = assessed.filter((row) => row.assessment.needsAttention);
-  const rest = assessed.filter((row) => !row.assessment.needsAttention);
-  const verdict = queues.data ? overallVerdict(assessed, historyEnabled) : null;
+  const report = health.data;
+  const assessed = joinQueues(queues.data ?? [], report, history.data);
+  const attention = assessed.filter(needsAttention);
+  const rest = assessed.filter((row) => !needsAttention(row));
 
   const backlogSeries = totalBacklog(history.data);
-  const backlogTrend = trailingTrend(
-    backlogSeries,
-    history.data?.bucket_secs ?? 60,
-  );
+  const markers = eventIndexes(history.data);
   const backlog = queues.data?.reduce((sum, queue) => sum + queue.available, 0);
-  const completedPerMinute = queues.data
-    ? queues.data.reduce((sum, queue) => sum + queue.completed_last_hour, 0) /
-      60
-    : undefined;
+  // Measured rates when every served queue has counters, otherwise the
+  // completed-last-hour average so the number never silently drops.
+  const measuredCompleted = totalRate(report, (f) => f.completed_per_minute);
+  const completedPerMinute =
+    measuredCompleted ??
+    (queues.data
+      ? queues.data.reduce((sum, queue) => sum + queue.completed_last_hour, 0) /
+        60
+      : undefined);
+  const arrivalsPerMinute = totalRate(report, (f) => f.arrivals_per_minute);
+  const backlogTrend = report
+    ? report.queues.reduce<number | null>(
+        (sum, queue) =>
+          queue.trend && sum !== null ? sum + queue.trend.per_minute : sum,
+        0,
+      )
+    : null;
+  const recentEvents = [...(history.data?.events ?? [])].reverse().slice(0, 5);
 
   const instances = runtime.data?.instances ?? [];
   const troubled = instances.filter(
@@ -124,6 +138,7 @@ export function DashboardPage() {
     ["Job counts", stats],
     ["Queues", queues],
     ["Queue history", history],
+    ["Queue health", health],
     ["Workers", runtime],
     ["Failed jobs", failures],
     ["Dead letter queue", dlq],
@@ -157,7 +172,7 @@ export function DashboardPage() {
     <div className="space-y-6">
       <div className="space-y-1">
         <Heading level={2}>Overview</Heading>
-        <SnapshotStatus sources={[stats, queues, runtime, failures]} />
+        <SnapshotStatus sources={[stats, queues, health, runtime, failures]} />
         <p className="text-xs text-muted-fg">{historyCoverage(history.data)}</p>
       </div>
 
@@ -172,7 +187,7 @@ export function DashboardPage() {
       )}
 
       <Card
-        className={`border-l-4 ${verdict ? VERDICT_TONE[verdict.tone] : "border-l-border"}`}
+        className={`border-l-4 ${report ? VERDICT_TONE[report.status] : "border-l-border"}`}
       >
         <CardContent className="@container">
           <div className="grid gap-6 @3xl:grid-cols-[minmax(0,1fr)_auto] @3xl:items-center">
@@ -184,13 +199,13 @@ export function DashboardPage() {
                 className="text-xl font-semibold tracking-tight text-fg sm:text-2xl"
                 data-testid="verdict"
               >
-                {verdict?.title ??
-                  (queues.isError
-                    ? "Queue data unavailable"
+                {report?.title ??
+                  (health.isError
+                    ? "Queue health unavailable"
                     : "Checking queues…")}
               </h2>
-              {verdict && (
-                <p className="text-sm text-muted-fg">{verdict.detail}</p>
+              {report && (
+                <p className="text-sm text-muted-fg">{report.detail}</p>
               )}
             </div>
             <div className="flex flex-wrap items-end gap-x-8 gap-y-3">
@@ -206,8 +221,8 @@ export function DashboardPage() {
                   {backlog?.toLocaleString() ?? "—"}
                 </Link>
                 <p className="text-xs text-muted-fg tabular-nums">
-                  {backlogTrend
-                    ? `${formatRate(backlogTrend.perMinute, true)} over ${Math.round(backlogTrend.minutes)}m`
+                  {report?.history_available && backlogTrend !== null
+                    ? `${formatRate(backlogTrend, true)} over 5m`
                     : "No trend yet"}
                 </p>
               </div>
@@ -215,8 +230,9 @@ export function DashboardPage() {
                 data={backlogSeries}
                 width={200}
                 height={44}
-                label="Jobs waiting across all queues over the last hour"
+                label="Jobs waiting across all queues over the last hour; dashed lines mark fleet changes"
                 className="text-primary"
+                markers={markers}
               />
               <div>
                 <p className="text-xs text-muted-fg">Finishing</p>
@@ -225,7 +241,13 @@ export function DashboardPage() {
                     ? "—"
                     : formatRate(completedPerMinute)}
                 </p>
-                <p className="text-xs text-muted-fg">average, last hour</p>
+                <p className="text-xs text-muted-fg">
+                  {measuredCompleted !== null
+                    ? arrivalsPerMinute !== null
+                      ? `arriving ${formatRate(arrivalsPerMinute)} · last 5m`
+                      : "measured, last 5m"
+                    : "average, last hour"}
+                </p>
               </div>
             </div>
           </div>
@@ -455,6 +477,26 @@ export function DashboardPage() {
                       ? `All ${instances.length} reporting instances are healthy.`
                       : "No runtime snapshots. Start a worker to report health."}
               </p>
+            )}
+            {recentEvents.length > 0 && (
+              <div className="border-t px-4 pt-3 sm:px-6">
+                <p className="text-xs font-medium text-muted-fg">
+                  Fleet changes, last hour
+                </p>
+                <ul className="mt-1 space-y-1" aria-label="Fleet changes">
+                  {recentEvents.map((event) => (
+                    <li
+                      key={`${event.at}-${event.kind}`}
+                      className="flex justify-between gap-3 text-sm"
+                    >
+                      <span className="min-w-0 truncate">{event.detail}</span>
+                      <span className="shrink-0 text-xs text-muted-fg">
+                        {timeAgo(event.at)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
           </CardContent>
         </Card>

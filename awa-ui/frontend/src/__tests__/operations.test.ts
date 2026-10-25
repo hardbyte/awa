@@ -1,19 +1,24 @@
 import { describe, it, expect } from "vitest";
-import type { JobRow, QueueHistory, QueueSeries, QueueStats } from "@/lib/api";
+import type {
+  HealthReport,
+  JobRow,
+  QueueAssessment,
+  QueueHistory,
+  QueueStats,
+} from "@/lib/api";
 import {
-  assessQueue,
-  assessQueues,
+  eventIndexes,
   formatDuration,
   formatRate,
   groupFailures,
-  overallVerdict,
+  joinQueues,
   totalBacklog,
-  trailingTrend,
+  totalRate,
 } from "@/lib/operations";
 
-function queue(overrides: Partial<QueueStats> = {}): QueueStats {
+function queue(name: string, available = 10): QueueStats {
   return {
-    queue: "email",
+    queue: name,
     display_name: null,
     description: null,
     owner: null,
@@ -23,194 +28,107 @@ function queue(overrides: Partial<QueueStats> = {}): QueueStats {
     descriptor_last_seen_at: null,
     descriptor_stale: false,
     descriptor_mismatch: false,
-    total_queued: 0,
+    total_queued: available,
     scheduled: 0,
-    available: 1000,
+    available,
     retryable: 0,
-    running: 10,
+    running: 1,
     failed: 0,
     waiting_external: 0,
     completed_last_hour: 600,
     lag_seconds: 5,
     paused: false,
-    ...overrides,
   };
 }
 
-function series(available: (number | null)[]): QueueSeries {
+function assessment(
+  name: string,
+  rank: number,
+  flow: Partial<QueueAssessment["flow"]> = {},
+  liveWorkers = 1,
+): QueueAssessment {
   return {
-    available,
-    running: available.map(() => 10),
-    lag_seconds: available.map(() => 5),
+    queue: name,
+    health: "steady",
+    label: "Steady",
+    reason: "Backlog holding level",
+    needs_attention: false,
+    rank,
+    limited_by: null,
+    trend: null,
+    clear_seconds: null,
+    flow: {
+      claimed_per_minute: null,
+      completed_per_minute: null,
+      failed_per_minute: null,
+      retried_per_minute: null,
+      arrivals_per_minute: null,
+      mean_claim_wait_seconds: null,
+      rate_limited: false,
+      ...flow,
+    },
+    live_workers: liveWorkers,
+    in_flight: 0,
+    capacity: null,
+  };
+}
+
+function report(queues: QueueAssessment[]): HealthReport {
+  return {
+    status: "ok",
+    title: "Keeping up",
+    detail: "",
+    generated_at: "2026-10-25T00:00:00Z",
+    history_available: true,
+    history_since: null,
+    queues,
   };
 }
 
 function history(
   queues: Record<string, (number | null)[]>,
-  enabled = true,
+  events: QueueHistory["events"] = [],
 ): QueueHistory {
-  const length = Object.values(queues)[0]?.length ?? 0;
+  const length = Object.values(queues)[0]?.length ?? 3;
+  const empty = () => Array.from({ length }, () => null);
   return {
-    enabled,
-    window_secs: 3600,
-    sample_interval_secs: 15,
+    installed: true,
     bucket_secs: 60,
-    observed_since: "2026-10-25T00:00:00Z",
+    minutes: length,
+    observed_since: null,
     buckets: Array.from(
       { length },
-      (_, index) => `2026-10-25T00:${String(index).padStart(2, "0")}:00Z`,
+      (_, index) => `2026-10-25T00:0${index}:00Z`,
     ),
     queues: Object.fromEntries(
-      Object.entries(queues).map(([name, values]) => [name, series(values)]),
+      Object.entries(queues).map(([name, available]) => [
+        name,
+        {
+          available,
+          running: empty(),
+          lag_seconds: empty(),
+          claimed: empty(),
+          completed: empty(),
+          failed_attempts: empty(),
+          rate_limited: empty(),
+        },
+      ]),
     ),
+    fleet: { live_instances: empty(), healthy_instances: empty() },
+    events,
   };
 }
 
-describe("trailingTrend", () => {
-  it("needs three samples spanning two minutes", () => {
-    expect(trailingTrend([null, null, 10, 20], 60)).toBeNull();
-    expect(trailingTrend([10, 20, 30], 30)).toBeNull();
-    expect(trailingTrend([10, 20, 30], 60)).not.toBeNull();
-  });
-
-  it("fits the slope per minute over the trailing window only", () => {
-    // An old spike outside the 5 minute window must not affect the fit.
-    const trend = trailingTrend([9000, 0, 100, 200, 300, 400, 500], 60)!;
-    expect(trend.perMinute).toBeCloseTo(100);
-    expect(trend.minutes).toBe(5);
-    expect(trend.change).toBeCloseTo(500);
-  });
-
-  it("skips gaps instead of treating them as zero", () => {
-    const trend = trailingTrend([100, null, 300, null, 500, 600], 60)!;
-    expect(trend.perMinute).toBeCloseTo(100);
-  });
-});
-
-describe("assessQueue", () => {
-  it("flags waiting work with nothing running as stalled before anything else", () => {
-    const result = assessQueue(
-      queue({ running: 0, lag_seconds: 90 }),
-      series([100, 200, 300, 400, 500, 600]),
-      60,
+describe("joinQueues", () => {
+  it("follows the report's risk order and appends queues it does not know", () => {
+    const rows = joinQueues(
+      [queue("a"), queue("new"), queue("b")],
+      report([assessment("b", 0), assessment("a", 6)]),
+      history({ a: [1, 2, 3] }),
     );
-    expect(result.health).toBe("stalled");
-    expect(result.needsAttention).toBe(true);
-  });
-
-  it("does not call a fresh queue stalled before the wait threshold", () => {
-    const result = assessQueue(
-      queue({ running: 0, lag_seconds: 10 }),
-      undefined,
-      60,
-    );
-    expect(result.health).toBe("unknown");
-  });
-
-  it("reports a materially growing backlog as falling behind", () => {
-    const result = assessQueue(
-      queue({ available: 1500 }),
-      series([1000, 1100, 1200, 1300, 1400, 1500]),
-      60,
-    );
-    expect(result.health).toBe("behind");
-    expect(result.detail).toContain("+100/min");
-  });
-
-  it("treats small wobble on a large backlog as steady", () => {
-    const result = assessQueue(
-      queue({ available: 184_000 }),
-      series([184_000, 184_400, 183_900, 184_300, 184_100, 184_000]),
-      60,
-    );
-    expect(result.health).toBe("steady");
-    expect(result.needsAttention).toBe(false);
-  });
-
-  it("estimates time to clear a draining backlog", () => {
-    const result = assessQueue(
-      queue({ available: 600 }),
-      series([1600, 1400, 1200, 1000, 800, 600]),
-      60,
-    );
-    expect(result.health).toBe("draining");
-    expect(result.clearSeconds).toBeCloseTo(180);
-    expect(result.detail).toBe("Clears in about 3m 0s at this pace");
-  });
-
-  it("flags a long wait even when depth holds", () => {
-    const result = assessQueue(
-      queue({ lag_seconds: 900 }),
-      series([1000, 1000, 1000, 1000]),
-      60,
-    );
-    expect(result.health).toBe("slow");
-  });
-
-  it("only asks for attention on paused queues holding work", () => {
-    expect(
-      assessQueue(queue({ paused: true }), undefined, 60).needsAttention,
-    ).toBe(true);
-    const empty = assessQueue(
-      queue({ paused: true, available: 0 }),
-      undefined,
-      60,
-    );
-    expect(empty.needsAttention).toBe(false);
-    expect(empty.rank).toBeGreaterThan(
-      assessQueue(queue(), undefined, 60).rank,
-    );
-  });
-
-  it("says why there is no trend when history is disabled", () => {
-    expect(assessQueue(queue(), undefined, 60, false).detail).toMatch(
-      /disabled/,
-    );
-  });
-});
-
-describe("assessQueues and overallVerdict", () => {
-  it("orders by risk, then backlog", () => {
-    const rows = assessQueues(
-      [
-        queue({ queue: "steady", available: 9000 }),
-        queue({ queue: "stalled", running: 0, lag_seconds: 120 }),
-        queue({ queue: "idle", available: 0 }),
-        queue({ queue: "behind", available: 500 }),
-      ],
-      history({
-        steady: [9000, 9000, 9000, 9000],
-        stalled: [1000, 1000, 1000, 1000],
-        idle: [0, 0, 0, 0],
-        behind: [100, 200, 300, 400, 500],
-      }),
-    );
-    expect(rows.map((row) => row.queue.queue)).toEqual([
-      "stalled",
-      "behind",
-      "steady",
-      "idle",
-    ]);
-    const verdict = overallVerdict(rows, true);
-    expect(verdict.tone).toBe("danger");
-    expect(verdict.title).toBe("1 queue not being worked");
-    expect(verdict.detail).toContain("1 queue falling behind");
-  });
-
-  it("is honest when there is not enough history to judge", () => {
-    const rows = assessQueues([queue()], null);
-    expect(overallVerdict(rows, false).title).toBe("Not enough history yet");
-  });
-
-  it("reports keeping up when nothing is wrong", () => {
-    const rows = assessQueues(
-      [queue({ available: 0 })],
-      history({ email: [0, 0, 0] }),
-    );
-    expect(overallVerdict(rows, true)).toMatchObject({
-      tone: "success",
-      title: "Keeping up",
-    });
+    expect(rows.map((row) => row.queue.queue)).toEqual(["b", "a", "new"]);
+    expect(rows[1]?.series?.available).toEqual([1, 2, 3]);
+    expect(rows[2]?.assessment).toBeUndefined();
   });
 });
 
@@ -219,6 +137,53 @@ describe("totalBacklog", () => {
     expect(
       totalBacklog(history({ a: [null, 1, 2], b: [null, null, 3] })),
     ).toEqual([null, 1, 5]);
+  });
+});
+
+describe("totalRate", () => {
+  it("sums known rates", () => {
+    const total = totalRate(
+      report([
+        assessment("a", 0, { completed_per_minute: 10 }),
+        assessment("b", 0, { completed_per_minute: 5 }),
+      ]),
+      (flow) => flow.completed_per_minute,
+    );
+    expect(total).toBe(15);
+  });
+
+  it("refuses a partial total while a served queue is unknown", () => {
+    const total = totalRate(
+      report([
+        assessment("a", 0, { completed_per_minute: 10 }),
+        assessment("b", 0, {}, 2),
+      ]),
+      (flow) => flow.completed_per_minute,
+    );
+    expect(total).toBeNull();
+  });
+
+  it("ignores unknown rates on queues nobody serves", () => {
+    const total = totalRate(
+      report([
+        assessment("a", 0, { completed_per_minute: 10 }),
+        assessment("orphan", 0, {}, 0),
+      ]),
+      (flow) => flow.completed_per_minute,
+    );
+    expect(total).toBe(10);
+  });
+});
+
+describe("eventIndexes", () => {
+  it("maps fleet events onto bucket positions", () => {
+    const indexes = eventIndexes(
+      history({ a: [1, 2, 3] }, [
+        { at: "2026-10-25T00:02:00Z", kind: "version_change", detail: "" },
+        { at: "2026-10-24T23:00:00Z", kind: "leader_change", detail: "" },
+      ]),
+    );
+    expect(indexes).toEqual([2]);
   });
 });
 

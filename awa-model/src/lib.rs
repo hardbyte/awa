@@ -13,6 +13,7 @@ pub mod job;
 pub mod kind;
 pub mod migrations;
 pub mod partitioned_queue;
+pub mod queue_history;
 pub mod queue_storage;
 pub mod reschedule;
 pub mod storage;

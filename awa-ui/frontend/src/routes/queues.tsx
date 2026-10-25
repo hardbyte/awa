@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   fetchQueues,
+  fetchQueueHealth,
   fetchQueueHistory,
   fetchQueueRuntime,
   pauseQueue,
@@ -10,7 +11,11 @@ import {
   drainQueue,
 } from "@/lib/api";
 import type { QueueStats } from "@/lib/api";
-import { assessQueues, type AssessedQueue } from "@/lib/operations";
+import {
+  joinQueues,
+  needsAttention,
+  type AssessedQueue,
+} from "@/lib/operations";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { toast } from "@/components/ui/toast";
@@ -78,8 +83,13 @@ export function QueuesPage() {
     ...polling,
   });
   const historyQuery = useQuery({
-    queryKey: ["queue-history"],
-    queryFn: fetchQueueHistory,
+    queryKey: ["queue-history", 60],
+    queryFn: () => fetchQueueHistory(60),
+    ...polling,
+  });
+  const healthQuery = useQuery({
+    queryKey: ["queue-health"],
+    queryFn: fetchQueueHealth,
     ...polling,
   });
   const runtimeQuery = useQuery({
@@ -93,6 +103,7 @@ export function QueuesPage() {
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["queues"] });
+    void queryClient.invalidateQueries({ queryKey: ["queue-health"] });
     void queryClient.invalidateQueries({ queryKey: ["queue"] });
   };
   const pauseMutation = useMutation({
@@ -126,19 +137,26 @@ export function QueuesPage() {
     resumeMutation.isPending ||
     drainMutation.isPending;
 
-  const assessed = assessQueues(queuesQuery.data ?? [], historyQuery.data);
+  const assessed = joinQueues(
+    queuesQuery.data ?? [],
+    healthQuery.data,
+    historyQuery.data,
+  );
   const needle = search.trim().toLowerCase();
   const compare = SORTS[sort]?.compare;
   const rows = assessed
     .filter(
       (row) =>
-        (!attentionOnly || row.assessment.needsAttention) &&
+        (!attentionOnly || needsAttention(row)) &&
         `${row.queue.queue} ${row.queue.display_name ?? ""} ${row.queue.owner ?? ""}`
           .toLowerCase()
           .includes(needle),
     )
     .sort((a, b) =>
-      compare ? compare(a, b) || a.assessment.rank - b.assessment.rank : 0,
+      compare
+        ? compare(a, b) ||
+          (a.assessment?.rank ?? 99) - (b.assessment?.rank ?? 99)
+        : 0,
     );
 
   function controls(queue: QueueStats) {
@@ -173,7 +191,9 @@ export function QueuesPage() {
     <div className="space-y-6">
       <div className="space-y-1">
         <Heading level={2}>Queues</Heading>
-        <SnapshotStatus sources={[queuesQuery, historyQuery, runtimeQuery]} />
+        <SnapshotStatus
+          sources={[queuesQuery, healthQuery, historyQuery, runtimeQuery]}
+        />
       </div>
       {(queuesQuery.isError || runtimeQuery.isError) && (
         <div

@@ -573,6 +573,7 @@ class Client:
         completed_retention_hours: float | None = None,
         failed_retention_hours: float | None = None,
         descriptor_retention_days: float | None = None,
+        queue_history_retention_hours: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
         heartbeat_interval_ms: int | None = None,

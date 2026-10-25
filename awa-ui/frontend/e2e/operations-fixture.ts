@@ -86,10 +86,13 @@ export async function mockOperations(
       })),
     }),
   );
-  // Bucketed history the way the server reports it: an hour of one-minute
-  // buckets, a server that started 50 minutes ago, and a three-minute gap
-  // where sampling failed.
+  // Per-minute history the way the leader records it: an hour of buckets,
+  // a leader that started 50 minutes ago, and a three-minute gap where
+  // sampling failed. A rollout 0.7.0 -> 0.7.1 happens 18 to 15 minutes ago.
   const BUCKETS = 60;
+  const minuteStart = Math.floor(now / 60_000) * 60_000;
+  const bucketAt = (bucket: number) =>
+    new Date(minuteStart - (BUCKETS - 1 - bucket) * 60_000).toISOString();
   const depth = (index: number, minutesAgo: number): number => {
     const current = queues[index]!.available;
     if (index === 0)
@@ -106,36 +109,177 @@ export async function mockOperations(
       return minutesAgo <= 15 ? current + minutesAgo * 2000 : 4000;
     return current + ((minutesAgo * 7 + index) % 5) * 4;
   };
+  const sampled = (bucket: number) =>
+    bucket >= 10 && ![33, 34, 35].includes(bucket);
+  const series = <T>(value: (bucket: number) => T) =>
+    Array.from({ length: BUCKETS }, (_, bucket) =>
+      sampled(bucket) ? value(bucket) : null,
+    );
   const queueHistory = {
-    enabled: true,
-    window_secs: 3600,
-    sample_interval_secs: 15,
+    installed: true,
     bucket_secs: 60,
-    observed_since: ago(50 * 60),
-    buckets: Array.from({ length: BUCKETS }, (_, bucket) =>
-      ago((BUCKETS - 1 - bucket) * 60),
-    ),
+    minutes: BUCKETS,
+    observed_since: bucketAt(10),
+    buckets: Array.from({ length: BUCKETS }, (_, bucket) => bucketAt(bucket)),
     queues: Object.fromEntries(
-      queues.map((q, index) => {
-        const sampled = (bucket: number) =>
-          bucket >= 10 && ![33, 34, 35].includes(bucket);
-        const minutesAgo = (bucket: number) => BUCKETS - 1 - bucket;
-        return [
-          q.queue,
-          {
-            available: Array.from({ length: BUCKETS }, (_, bucket) =>
-              sampled(bucket) ? depth(index, minutesAgo(bucket)) : null,
-            ),
-            running: Array.from({ length: BUCKETS }, (_, bucket) =>
-              sampled(bucket) ? q.running : null,
-            ),
-            lag_seconds: Array.from({ length: BUCKETS }, (_, bucket) =>
-              sampled(bucket) ? q.lag_seconds : null,
-            ),
-          },
-        ];
-      }),
+      queues.map((q, index) => [
+        q.queue,
+        {
+          available: series((b) => depth(index, BUCKETS - 1 - b)),
+          running: series(() => q.running),
+          lag_seconds: series(() => q.lag_seconds),
+          claimed: series(() => (index === 3 ? 0 : 2140)),
+          completed: series(() => (index === 3 ? 0 : 2140)),
+          failed_attempts: series(() => (index === 0 ? 4 : 0)),
+          rate_limited: series(() => (index === 0 ? 30 : 0)),
+        },
+      ]),
     ),
+    fleet: {
+      live_instances: series((b) => (b >= 41 && b < 47 ? 48 : 47)),
+      healthy_instances: series(() => 46),
+    },
+    events: [
+      {
+        at: bucketAt(41),
+        kind: "version_change",
+        detail: "Versions 0.7.0 → 0.7.0, 0.7.1",
+      },
+      {
+        at: bucketAt(44),
+        kind: "version_change",
+        detail: "Versions 0.7.0, 0.7.1 → 0.7.1",
+      },
+      {
+        at: bucketAt(47),
+        kind: "instances_lost",
+        detail: "1 instance stopped reporting (48 → 47 live)",
+      },
+    ],
+  };
+  // The server classifies queues (awa-ui/src/assessment.rs); the fixture
+  // reproduces its verdicts for this story from the live queue state, so
+  // pause, resume and drain change the report as they would for real.
+  const flow = (index: number) => ({
+    claimed_per_minute: index === 3 ? 0 : 2140,
+    completed_per_minute: index === 3 ? 0 : 2140,
+    failed_per_minute: index === 0 ? 4 : 0,
+    retried_per_minute: 0,
+    arrivals_per_minute: index === 0 ? 4640 : index === 4 ? 140 : 2140,
+    mean_claim_wait_seconds: index === 0 ? 410 : 2,
+    rate_limited: index === 0,
+  });
+  const assess = (q: QueueStats, index: number) => {
+    const base = {
+      queue: q.queue,
+      flow: flow(index),
+      live_workers: 47,
+      in_flight: q.running,
+      capacity: 64 * 47,
+      clear_seconds: null as number | null,
+      trend: { per_minute: 0, change: 0, minutes: 5 },
+      limited_by: null as string | null,
+    };
+    if (q.paused)
+      return {
+        ...base,
+        health: "paused",
+        label: "Paused",
+        reason: q.available
+          ? `${q.available} waiting while paused`
+          : "Nothing waiting",
+        needs_attention: q.available > 0,
+        rank: q.available > 0 ? 3 : 7,
+        limited_by: q.available > 0 ? "paused" : null,
+      };
+    if (index === 3 && q.available > 0)
+      return {
+        ...base,
+        health: "stalled",
+        label: "Not being worked",
+        reason: "Nothing running or claimed; oldest has waited 1m 35s",
+        needs_attention: true,
+        rank: 0,
+        limited_by: "nothing",
+        trend: { per_minute: 415, change: 830, minutes: 2 },
+      };
+    if (index === 0 && q.available > 0)
+      return {
+        ...base,
+        health: "behind",
+        label: "Falling behind",
+        reason: "Backlog +2,500/min over 5m",
+        needs_attention: true,
+        rank: 1,
+        limited_by: "rate_limit",
+        trend: { per_minute: 2500, change: 12500, minutes: 5 },
+      };
+    if (index === 4 && q.available > 0)
+      return {
+        ...base,
+        health: "draining",
+        label: "Draining",
+        reason: "Clears in about 6m 5s at this pace",
+        needs_attention: false,
+        rank: 4,
+        trend: { per_minute: -2000, change: -10000, minutes: 5 },
+        clear_seconds: 365,
+      };
+    return q.available > 0
+      ? {
+          ...base,
+          health: "steady",
+          label: "Steady",
+          reason: "Backlog holding level",
+          needs_attention: false,
+          rank: 6,
+        }
+      : {
+          ...base,
+          health: "idle",
+          label: "Idle",
+          reason: "Nothing waiting",
+          needs_attention: false,
+          rank: 7,
+        };
+  };
+  const healthReport = () => {
+    const assessed = queues
+      .map((q, index) => assess(q, index))
+      .sort(
+        (a, b) =>
+          a.rank - b.rank ||
+          queues.find((q) => q.queue === b.queue)!.available -
+            queues.find((q) => q.queue === a.queue)!.available ||
+          a.queue.localeCompare(b.queue),
+      );
+    const stalled = assessed.filter((a) => a.health === "stalled");
+    const behind = assessed.filter((a) => a.health === "behind").length;
+    const paused = assessed.filter(
+      (a) => a.health === "paused" && a.needs_attention,
+    ).length;
+    const extra = [
+      behind && `${behind} queue${behind === 1 ? "" : "s"} falling behind`,
+      paused && `${paused} paused queue${paused === 1 ? "" : "s"} holding work`,
+    ].filter(Boolean);
+    return {
+      status: stalled.length ? "critical" : behind ? "warning" : "ok",
+      title: stalled.length
+        ? `${stalled.length} queue${stalled.length === 1 ? "" : "s"} not being worked`
+        : behind
+          ? `${behind} queue${behind === 1 ? "" : "s"} falling behind`
+          : "Keeping up",
+      detail: stalled.length
+        ? [
+            `Waiting work nobody is claiming: ${stalled.map((a) => a.queue).join(", ")}.`,
+            ...extra,
+          ].join(" · ")
+        : `${assessed.length} queues steady, draining, or idle.`,
+      generated_at: new Date(now).toISOString(),
+      history_available: true,
+      history_since: bucketAt(10),
+      queues: assessed,
+    };
   };
   const jobs: JobRow[] = Array.from({ length: 60 }, (_, index) => ({
     id: 984213 - index,
@@ -219,6 +363,7 @@ export async function mockOperations(
         "/stats",
         "/queues",
         "/stats/queue-history",
+        "/health/queues",
         "/runtime",
         "/jobs",
         "/dlq/depth",
@@ -243,9 +388,13 @@ export async function mockOperations(
             completed: 14820000,
           };
     else if (path === "/queues") data = empty ? [] : queues;
+    else if (path === "/health/queues")
+      data = empty
+        ? { ...healthReport(), status: "ok", title: "Keeping up", queues: [] }
+        : healthReport();
     else if (path === "/stats/queue-history")
       data = empty
-        ? { ...queueHistory, observed_since: null, buckets: [], queues: {} }
+        ? { ...queueHistory, observed_since: null, queues: {}, events: [] }
         : queueHistory;
     else if (path === "/queues/runtime")
       data = empty

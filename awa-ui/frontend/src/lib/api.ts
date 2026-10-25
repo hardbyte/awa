@@ -606,37 +606,99 @@ export function fetchTimeseries(
   return apiFetch(`/stats/timeseries${qs}`);
 }
 
-/** Queue depth sampled by the UI server (`/api/stats/queue-history`). */
+/** Per-minute history written by the maintenance leader (v051). */
 export interface QueueHistory {
-  enabled: boolean;
-  window_secs: number;
-  sample_interval_secs: number;
+  /** False on a schema before v051. */
+  installed: boolean;
   bucket_secs: number;
-  /** Oldest retained sample; never earlier than the server process start. */
+  minutes: number;
   observed_since: string | null;
-  /** End time of each bucket, oldest first. */
+  /** Start of each one-minute bucket, oldest first. */
   buckets: string[];
   queues: Record<string, QueueSeries>;
+  fleet: {
+    live_instances: (number | null)[];
+    healthy_instances: (number | null)[];
+  };
+  events: FleetEvent[];
 }
 
-/** Last observed value per bucket; `null` where nothing was sampled. */
+/** Aligned to `QueueHistory.buckets`; `null` where nothing was recorded or a
+ * counter was unknown. Counter series are per-minute deltas. */
 export interface QueueSeries {
   available: (number | null)[];
   running: (number | null)[];
   lag_seconds: (number | null)[];
+  claimed: (number | null)[];
+  completed: (number | null)[];
+  failed_attempts: (number | null)[];
+  rate_limited: (number | null)[];
 }
 
-/** Resolves to null on servers that predate queue history (404). */
-export async function fetchQueueHistory(): Promise<QueueHistory | null> {
-  const res = await fetch("/api/stats/queue-history", {
-    headers: { "Content-Type": "application/json" },
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((body as { error?: string }).error ?? res.statusText);
-  }
-  return res.json() as Promise<QueueHistory>;
+export interface FleetEvent {
+  at: string;
+  kind: "version_change" | "leader_change" | "no_leader" | "instances_lost";
+  detail: string;
+}
+
+export type QueueHealthKind =
+  | "stalled"
+  | "behind"
+  | "slow"
+  | "paused"
+  | "draining"
+  | "unknown"
+  | "steady"
+  | "idle";
+
+export type LimitedBy =
+  | "paused"
+  | "no_workers"
+  | "rate_limit"
+  | "worker_capacity"
+  | "nothing";
+
+export interface QueueAssessment {
+  queue: string;
+  health: QueueHealthKind;
+  label: string;
+  reason: string;
+  needs_attention: boolean;
+  rank: number;
+  limited_by: LimitedBy | null;
+  trend: { per_minute: number; change: number; minutes: number } | null;
+  clear_seconds: number | null;
+  flow: {
+    claimed_per_minute: number | null;
+    completed_per_minute: number | null;
+    failed_per_minute: number | null;
+    retried_per_minute: number | null;
+    arrivals_per_minute: number | null;
+    mean_claim_wait_seconds: number | null;
+    rate_limited: boolean;
+  };
+  live_workers: number;
+  in_flight: number;
+  capacity: number | null;
+}
+
+/** `/api/health/queues`: is every queue keeping up, worst first. */
+export interface HealthReport {
+  status: "ok" | "unknown" | "warning" | "critical";
+  title: string;
+  detail: string;
+  generated_at: string;
+  history_available: boolean;
+  history_since: string | null;
+  queues: QueueAssessment[];
+}
+
+export function fetchQueueHistory(minutes = 60): Promise<QueueHistory> {
+  return apiFetch(`/stats/queue-history?minutes=${minutes}`);
+}
+
+export function fetchQueueHealth(): Promise<HealthReport> {
+  return apiFetch("/health/queues");
 }
 
 export function fetchDistinctKinds(): Promise<string[]> {
