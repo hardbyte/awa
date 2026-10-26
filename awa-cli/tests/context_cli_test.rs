@@ -6,11 +6,11 @@
 //! `production = true` confirmation gate. Pure resolution/redaction logic
 //! is unit-tested in `src/context.rs`; these tests pin the wiring.
 //!
-//! Only the `--yes` success path touches the database (a queue
-//! pause/resume pair). Set
+//! Database-backed cases use isolated migrated databases. Set
 //! DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use assert_cmd::Command;
+use awa_testing::setup::TestDatabase;
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -38,7 +38,7 @@ fn awa(config_path: &std::path::Path) -> Command {
     command
 }
 
-fn two_context_config(test_name: &str) -> std::path::PathBuf {
+fn two_context_config(test_name: &str, url: &str) -> std::path::PathBuf {
     write_config(
         test_name,
         &format!(
@@ -52,14 +52,13 @@ fn two_context_config(test_name: &str) -> std::path::PathBuf {
             url = "{url}"
             production = true
             "#,
-            url = database_url(),
         ),
     )
 }
 
 #[test]
 fn context_list_shows_contexts_with_redacted_targets() {
-    let config = two_context_config("list");
+    let config = two_context_config("list", &database_url());
     let assert = awa(&config).args(["context", "list"]).assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
     assert!(stdout.contains("local"), "{stdout}");
@@ -71,7 +70,7 @@ fn context_list_shows_contexts_with_redacted_targets() {
 
 #[test]
 fn context_show_defaults_to_default_context() {
-    let config = two_context_config("show");
+    let config = two_context_config("show", &database_url());
     let assert = awa(&config).args(["context", "show"]).assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
     assert!(stdout.contains("name:        local"), "{stdout}");
@@ -79,7 +78,7 @@ fn context_show_defaults_to_default_context() {
 
 #[test]
 fn mutation_refuses_env_fallback_with_multiple_contexts() {
-    let config = two_context_config("env-fallback");
+    let config = two_context_config("env-fallback", &database_url());
     // DATABASE_URL alone must not satisfy a mutating command once several
     // contexts exist — that stale-shell-variable path is the foot-gun.
     let assert = awa(&config)
@@ -91,15 +90,16 @@ fn mutation_refuses_env_fallback_with_multiple_contexts() {
     assert!(stderr.contains("--context"), "{stderr}");
 }
 
-#[test]
-fn read_only_command_may_use_default_context() {
-    let config = two_context_config("read-only");
+#[tokio::test]
+async fn read_only_command_may_use_default_context() {
+    let db = TestDatabase::canonical().await;
+    let config = two_context_config("read-only", &db.url());
     awa(&config).args(["queue", "stats"]).assert().success();
 }
 
 #[test]
 fn production_context_refuses_mutation_without_yes_when_non_interactive() {
-    let config = two_context_config("prod-gate");
+    let config = two_context_config("prod-gate", &database_url());
     let assert = awa(&config)
         .args(["--context", "prod", "queue", "pause", "ctx-test-prod-gate"])
         .write_stdin("") // stdin is a pipe, not a tty
@@ -110,9 +110,10 @@ fn production_context_refuses_mutation_without_yes_when_non_interactive() {
     assert!(stderr.contains("--yes"), "{stderr}");
 }
 
-#[test]
-fn production_context_with_yes_proceeds_and_echoes_target() {
-    let config = two_context_config("prod-yes");
+#[tokio::test]
+async fn production_context_with_yes_proceeds_and_echoes_target() {
+    let db = TestDatabase::canonical().await;
+    let config = two_context_config("prod-yes", &db.url());
     let assert = awa(&config)
         .args([
             "--context",
@@ -146,14 +147,15 @@ fn production_context_with_yes_proceeds_and_echoes_target() {
         .success();
 }
 
-#[test]
-fn broken_config_with_explicit_database_url_still_works() {
+#[tokio::test]
+async fn broken_config_with_explicit_database_url_still_works() {
+    let db = TestDatabase::canonical().await;
     // The documented escape hatch: a typo or permission problem in the
     // context config must not lock the operator out when --database-url
     // is given explicitly. The load failure downgrades to a warning.
     let config = write_config("broken-escape", "default_context = [not; valid toml");
     let assert = awa(&config)
-        .args(["--database-url", &database_url(), "queue", "stats"])
+        .args(["--database-url", &db.url(), "queue", "stats"])
         .assert()
         .success();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();

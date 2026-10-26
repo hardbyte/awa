@@ -17,6 +17,7 @@ use awa_model::admin::{
 use awa_model::audited_sql;
 use awa_model::{
     storage as transition, JobArgs, PartitionedQueue, PeriodicJob, QueueStorageConfig,
+    RingRotationCadence,
 };
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -30,6 +31,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -164,11 +166,14 @@ pub struct ClientBuilder {
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     runtime_snapshot_interval: Duration,
     queue_stats_interval: Option<Duration>,
+    max_concurrent_claims: Option<usize>,
     dlq_enabled_by_default: bool,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
     dlq_overrides: HashMap<String, bool>,
     storage: RuntimeStorage,
+    ring_rotation_cadence: RingRotationCadence,
+    claim_rotate_interval: Option<Duration>,
     transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
     health_addr: Option<SocketAddr>,
@@ -223,11 +228,14 @@ impl ClientBuilder {
             queue_retention_overrides: HashMap::new(),
             runtime_snapshot_interval: Duration::from_secs(10),
             queue_stats_interval: None,
+            max_concurrent_claims: None,
             dlq_enabled_by_default: false,
             dlq_retention: None,
             dlq_cleanup_batch_size: None,
             dlq_overrides: HashMap::new(),
             storage,
+            ring_rotation_cadence: RingRotationCadence::DEFAULT,
+            claim_rotate_interval: None,
             transition_role: TransitionWorkerRole::Auto,
             storage_error,
             health_addr: None,
@@ -863,6 +871,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound the number of claim round-trips this runtime runs concurrently
+    /// across all queues and claimers. Defaults to a quarter of the pool,
+    /// clamped to `4..=64`.
+    pub fn max_concurrent_claims(mut self, limit: usize) -> Self {
+        self.max_concurrent_claims = Some(limit.max(1));
+        self
+    }
+
     /// Enable or disable DLQ routing by default.
     pub fn dlq_enabled_by_default(mut self, enabled: bool) -> Self {
         self.dlq_enabled_by_default = enabled;
@@ -915,13 +931,27 @@ impl ClientBuilder {
     ///
     /// Defaults to `queue_rotate_interval` so claim partitions age out in
     /// step with the ready / done partitions they reference. Only takes
-    /// effect when queue storage is active; no-op on the canonical engine.
+    /// effect when queue storage is active. May be set before or after
+    /// [`Self::queue_storage`]; retained across storage configuration changes.
     pub fn claim_rotate_interval(mut self, claim_rotate_interval: Duration) -> Self {
-        if let RuntimeStorage::QueueStorage(runtime) = self.storage {
-            self.storage = RuntimeStorage::QueueStorage(
-                runtime.with_claim_rotate_interval(claim_rotate_interval),
-            );
-        }
+        self.claim_rotate_interval = Some(claim_rotate_interval);
+        self
+    }
+
+    /// Override when a maintenance tick may seal the current slot of the
+    /// queue, lease and claim rings (default
+    /// [`RingRotationCadence::DEFAULT`]: five seconds of observed filling
+    /// once the slot holds 256 rows, a 2 MiB physical-size target, or 60
+    /// seconds regardless of rows). With queue storage, a row floor needs a
+    /// size target or an age ceiling, or [`Self::build`] fails: lease rows are deleted as
+    /// attempts finish, so a lease slot may never reach the floor. The rotate
+    /// intervals set how often the decision is made; the cadence decides
+    /// whether a slot that holds rows is sealed on that tick. Use
+    /// [`RingRotationCadence::EAGER`] to seal on every tick. Only takes
+    /// effect when queue storage is active. May be set before or after
+    /// [`Self::queue_storage`]; retained across storage configuration changes.
+    pub fn ring_rotation_cadence(mut self, cadence: RingRotationCadence) -> Self {
+        self.ring_rotation_cadence = cadence;
         self
     }
 
@@ -969,7 +999,7 @@ impl ClientBuilder {
     }
 
     /// Build the client.
-    pub fn build(self) -> Result<Client, BuildError> {
+    pub fn build(mut self) -> Result<Client, BuildError> {
         let periodic_manifest = if let Some(config) = &self.periodic_reconciliation {
             config
                 .validate()
@@ -987,6 +1017,40 @@ impl ClientBuilder {
 
         if let Some(err) = self.storage_error.clone() {
             return Err(err);
+        }
+
+        if let RuntimeStorage::QueueStorage(runtime) = &mut self.storage {
+            let cadence = self.ring_rotation_cadence;
+            if !cadence.min_slot_age.is_zero()
+                && cadence.min_slot_rows > 0
+                && cadence.max_slot_age.is_zero()
+                && cadence.target_slot_bytes == 0
+            {
+                return Err(BuildError::InvalidQueueStorage(
+                    "ring_rotation_cadence: min_slot_rows needs max_slot_age or target_slot_bytes, \
+                     otherwise a slot whose rows are deleted may never seal"
+                        .into(),
+                ));
+            }
+            if cadence.min_slot_age.is_zero() && cadence.min_slot_rows > 0 {
+                tracing::warn!(
+                    min_slot_rows = cadence.min_slot_rows,
+                    "ring_rotation_cadence: min_slot_age is zero, so slots seal on every tick and \
+                     min_slot_rows has no effect"
+                );
+            }
+            if !cadence.max_slot_age.is_zero() && cadence.max_slot_age < cadence.min_slot_age {
+                tracing::warn!(
+                    max_slot_age_ms = cadence.max_slot_age.as_millis() as u64,
+                    min_slot_age_ms = cadence.min_slot_age.as_millis() as u64,
+                    "ring_rotation_cadence: max_slot_age is below min_slot_age, so slots seal at \
+                     max_slot_age"
+                );
+            }
+            runtime.rotation_cadence = cadence;
+            if let Some(interval) = self.claim_rotate_interval {
+                runtime.claim_rotate_interval = interval;
+            }
         }
 
         let mut queue_names = HashSet::with_capacity(self.queues.len());
@@ -1128,6 +1192,7 @@ impl ClientBuilder {
             dispatcher_handles: RwLock::new(Vec::new()),
             service_handles: RwLock::new(Vec::new()),
             job_set: Arc::new(Mutex::new(JoinSet::new())),
+            finalizers: TaskTracker::new(),
             in_flight: Arc::new(InFlightRegistry::default()),
             queue_in_flight,
             dispatcher_alive,
@@ -1147,6 +1212,7 @@ impl ClientBuilder {
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
             queue_stats_interval: self.queue_stats_interval,
+            max_concurrent_claims: self.max_concurrent_claims,
             dlq_policy,
             dlq_retention: self.dlq_retention,
             dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
@@ -1231,6 +1297,7 @@ pub struct Client {
     service_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
     /// JoinSet tracking in-flight job tasks for graceful drain.
     job_set: Arc<Mutex<JoinSet<()>>>,
+    finalizers: TaskTracker,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
@@ -1251,6 +1318,7 @@ pub struct Client {
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Option<Duration>,
+    max_concurrent_claims: Option<usize>,
     dlq_policy: DlqPolicy,
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
@@ -1709,6 +1777,9 @@ impl Client {
             completion_handle,
             effective_storage.clone(),
             self.dlq_policy.clone(),
+            self.finalizers.clone(),
+            self.service_cancel.clone(),
+            runtime_worker_capacity,
         ));
 
         // Admin cancellation listener: fires the in-flight cancel flag
@@ -1845,7 +1916,34 @@ impl Client {
 
         // Start dispatcher/claimer loops per queue (uses dispatch_cancel — stops claiming first).
         let mut dispatcher_handles = self.dispatcher_handles.write().await;
+        // One LISTEN connection for every queue; dispatchers wait on their
+        // queue's shared wake instead of holding a listener each.
+        let notify_wakes: HashMap<String, Arc<tokio::sync::Notify>> = self
+            .queues
+            .iter()
+            .map(|(queue, _)| (queue.clone(), Arc::new(tokio::sync::Notify::new())))
+            .collect();
+        let notify_hub = crate::notify_hub::QueueNotifyHub::new(
+            self.pool.clone(),
+            notify_wakes.clone(),
+            self.dispatch_cancel.clone(),
+        );
+        let claim_gate = Arc::new(tokio::sync::Semaphore::new(
+            self.max_concurrent_claims.unwrap_or_else(|| {
+                (self.pool.options().get_max_connections() as usize / 4).clamp(4, 64)
+            }),
+        ));
+        let notify_available = match notify_hub.spawn().await {
+            Some(handle) => {
+                dispatcher_handles.push(handle);
+                true
+            }
+            None => false,
+        };
         for (queue_name, config) in &self.queues {
+            let notify_wake = notify_available
+                .then(|| notify_wakes.get(queue_name).cloned())
+                .flatten();
             let alive = self
                 .dispatcher_alive
                 .get(queue_name)
@@ -1904,6 +2002,8 @@ impl Client {
                     concurrency,
                     rate_limiter.clone(),
                     capacity_wake.clone(),
+                    notify_wake.clone(),
+                    claim_gate.clone(),
                     claimer_owner_id,
                     effective_storage.clone(),
                 );
@@ -1945,13 +2045,33 @@ impl Client {
             flag.store(true, Ordering::SeqCst);
         }
 
+        // Claim queries can still be blocked in PostgreSQL after cancellation.
+        // Dispatcher exit and worker drain share the caller's time budget.
+        let drain_deadline = tokio::time::Instant::now() + timeout;
         // Phase 3: Wait for dispatchers to exit their poll loops
-        let dispatcher_handles: Vec<_> = {
+        let mut dispatcher_handles: Vec<_> = {
             let mut guard = self.dispatcher_handles.write().await;
             std::mem::take(&mut *guard)
         };
-        for handle in dispatcher_handles {
-            let _ = handle.await;
+        let stop_dispatchers = async {
+            for handle in &mut dispatcher_handles {
+                let _ = handle.await;
+            }
+        };
+        if tokio::time::timeout_at(drain_deadline, stop_dispatchers)
+            .await
+            .is_err()
+        {
+            warn!("Shutdown timeout waiting for dispatchers; aborting pending claims");
+            for handle in &dispatcher_handles {
+                handle.abort();
+            }
+            for handle in dispatcher_handles {
+                let _ = handle.await;
+            }
+        }
+        for flag in self.in_flight.flags() {
+            flag.store(true, Ordering::SeqCst);
         }
 
         // Phase 4: Drain in-flight jobs (heartbeat + maintenance still alive)
@@ -1959,11 +2079,22 @@ impl Client {
             let mut set = self.job_set.lock().await;
             while set.join_next().await.is_some() {}
         };
-        if tokio::time::timeout(timeout, drain).await.is_err() {
+        if tokio::time::timeout_at(drain_deadline, drain)
+            .await
+            .is_err()
+        {
             warn!(
                 timeout_secs = timeout.as_secs(),
                 "Shutdown drain timeout exceeded, some jobs may not have completed"
             );
+        }
+
+        self.finalizers.close();
+        if tokio::time::timeout_at(drain_deadline, self.finalizers.wait())
+            .await
+            .is_err()
+        {
+            warn!("Shutdown drain timeout exceeded waiting for durable finalization");
         }
 
         // Phase 5: Stop background services (heartbeat + maintenance)
@@ -2660,6 +2791,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotation_builder_options_are_independent_of_storage_call_order() {
+        let cadence = RingRotationCadence::EAGER
+            .with_min_slot_age(Duration::from_secs(13))
+            .with_target_slot_bytes(123_456)
+            .with_min_slot_rows(0)
+            .with_max_slot_age(Duration::ZERO);
+        let claim_interval = Duration::from_secs(17);
+        let config = QueueStorageConfig {
+            schema: "builder_rotation_options".into(),
+            ..Default::default()
+        };
+        for configure_first in [true, false] {
+            let mut builder = Client::builder(lazy_pool()).queue("q", QueueConfig::default());
+            if configure_first {
+                builder = builder
+                    .ring_rotation_cadence(cadence)
+                    .claim_rotate_interval(claim_interval);
+            }
+            builder = builder.queue_storage(
+                config.clone(),
+                Duration::from_secs(3),
+                Duration::from_secs(7),
+            );
+            if !configure_first {
+                builder = builder
+                    .ring_rotation_cadence(cadence)
+                    .claim_rotate_interval(claim_interval);
+            }
+            let client = builder.build().unwrap();
+            let runtime = client.storage.queue_storage().unwrap();
+            assert_eq!(runtime.store.schema(), config.schema);
+            assert_eq!(runtime.rotation_cadence, cadence);
+            assert_eq!(runtime.claim_rotate_interval, claim_interval);
+            assert_eq!(runtime.queue_rotate_interval, Duration::from_secs(3));
+            assert_eq!(runtime.lease_rotate_interval, Duration::from_secs(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_builder_options_survive_storage_reconfiguration() {
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .ring_rotation_cadence(RingRotationCadence::EAGER)
+            .claim_rotate_interval(Duration::from_secs(17))
+            .canonical_storage()
+            .queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(3),
+                Duration::from_secs(7),
+            )
+            .queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(19),
+                Duration::from_secs(11),
+            )
+            .build()
+            .unwrap();
+        let runtime = client.storage.queue_storage().unwrap();
+        assert_eq!(runtime.rotation_cadence, RingRotationCadence::EAGER);
+        assert_eq!(runtime.claim_rotate_interval, Duration::from_secs(17));
+        assert_eq!(runtime.queue_rotate_interval, Duration::from_secs(19));
+        assert_eq!(runtime.lease_rotate_interval, Duration::from_secs(11));
+
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .queue_storage(
+                QueueStorageConfig::default(),
+                Duration::from_secs(19),
+                Duration::from_secs(11),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .storage
+                .queue_storage()
+                .unwrap()
+                .claim_rotate_interval,
+            Duration::from_secs(19)
+        );
+
+        let client = Client::builder(lazy_pool())
+            .queue("q", QueueConfig::default())
+            .canonical_storage()
+            .ring_rotation_cadence(RingRotationCadence::EAGER)
+            .claim_rotate_interval(Duration::from_secs(17))
+            .build()
+            .unwrap();
+        assert!(client.storage.queue_storage().is_none());
+    }
+
+    #[tokio::test]
     async fn register_accepts_send_non_sync_handler_future() {
         #[derive(serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
         struct NonSyncFutureJob;
@@ -2989,6 +3212,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_waits_for_finalizers_after_handlers_have_returned() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.unwrap();
+        let client = force_canonical(
+            Client::builder(pool.clone()).queue("finalizer_drain", QueueConfig::default()),
+        )
+        .build()
+        .unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finalizer_finished = finished.clone();
+        client.finalizers.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            finalizer_finished.store(true, Ordering::SeqCst);
+        });
+        client.shutdown(Duration::from_secs(2)).await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "shutdown must wait for durable finalization after handlers return"
+        );
+        assert!(client.finalizers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_bounds_blocked_dispatcher_exit() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool).await.unwrap();
+        let client = force_canonical(
+            Client::builder(pool.clone()).queue("shutdown_bound", QueueConfig::default()),
+        )
+        .build()
+        .unwrap();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let abort = handle.abort_handle();
+        client.dispatcher_handles.write().await.push(handle);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.shutdown(Duration::from_millis(25)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            abort.is_finished(),
+            "blocked dispatcher must be aborted at the deadline"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn queue_storage_target_requires_prepared_schema() {
         let _guard = test_mutex().lock().await;
         let pool = setup_pool(4).await;
@@ -3139,6 +3414,47 @@ mod tests {
             .build();
 
         assert!(matches!(result, Err(BuildError::InvalidDlqBatchSize)));
+    }
+
+    #[tokio::test]
+    async fn rotation_row_floor_requires_a_ceiling_under_queue_storage() {
+        let unbounded = RingRotationCadence::DEFAULT
+            .with_max_slot_age(Duration::ZERO)
+            .with_target_slot_bytes(0);
+        let build = |cadence: RingRotationCadence, queue_storage: bool| {
+            let builder = Client::builder(lazy_pool())
+                .queue("default", QueueConfig::default())
+                .ring_rotation_cadence(cadence);
+            let builder = if queue_storage {
+                builder.queue_storage(
+                    QueueStorageConfig {
+                        schema: "builder_rotation_floor".into(),
+                        ..Default::default()
+                    },
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+            } else {
+                builder.canonical_storage()
+            };
+            builder.build()
+        };
+        assert!(matches!(
+            build(unbounded, true),
+            Err(BuildError::InvalidQueueStorage(_))
+        ));
+        assert!(
+            build(unbounded, false).is_ok(),
+            "canonical storage ignores the cadence"
+        );
+
+        for bounded in [
+            RingRotationCadence::DEFAULT.with_target_slot_bytes(0),
+            RingRotationCadence::DEFAULT.with_max_slot_age(Duration::ZERO),
+            unbounded.with_min_slot_rows(0),
+        ] {
+            assert!(build(bounded, true).is_ok());
+        }
     }
 
     #[tokio::test]

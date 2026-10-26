@@ -42,6 +42,10 @@ use uuid::Uuid;
 
 // ── Container management ──────────────────────────────────────────────
 
+fn postgres_image() -> String {
+    std::env::var("AWA_TEST_POSTGRES_IMAGE").unwrap_or_else(|_| "postgres:17-alpine".into())
+}
+
 /// A Postgres container scoped to one chaos test. Drop force-removes it.
 ///
 /// Container is launched without `--rm` because `docker restart` stops
@@ -71,6 +75,7 @@ impl PgContainer {
         // the realistic shape we want to exercise.
         let port = pick_free_port();
         let port_arg = format!("127.0.0.1:{port}:5432");
+        let image = postgres_image();
 
         // No `--rm` because `docker restart` stops the container
         // first, which fires `--rm` cleanup before the start half
@@ -88,7 +93,7 @@ impl PgContainer {
                 "POSTGRES_PASSWORD=test",
                 "-e",
                 "POSTGRES_USER=postgres",
-                "postgres:17.2-alpine",
+                &image,
             ])
             .status()
             .expect("docker run failed to invoke");
@@ -113,7 +118,7 @@ impl PgContainer {
     /// connection-loss exercise.
     fn restart(&self) {
         let status = Command::new("docker")
-            .args(["restart", "--timeout", "2", &self.name])
+            .args(["restart", "--time", "2", &self.name])
             .status()
             .expect("docker restart failed to invoke");
         assert!(status.success(), "docker restart {} failed", self.name);
@@ -158,6 +163,7 @@ fn pick_free_port() -> u16 {
 }
 
 fn wait_for_ready(name: &str, port: u16) {
+    let image = postgres_image();
     // Three-stage probe: container running, pg_isready inside, AND a
     // real `SELECT 1` query from the host. Without the last stage we
     // can race the postgres entrypoint's "ready" signal with its
@@ -195,7 +201,7 @@ fn wait_for_ready(name: &str, port: u16) {
                 "host",
                 "-e",
                 "PGPASSWORD=test",
-                "postgres:17.2-alpine",
+                &image,
                 "psql",
                 "-h",
                 "localhost",
@@ -228,6 +234,7 @@ fn wait_for_ready(name: &str, port: u16) {
 }
 
 fn bootstrap_db(port: u16) {
+    let image = postgres_image();
     // Use a fresh process (not sqlx — keeps the test's pool clean and
     // avoids racing migrations during pool warmup).
     let status = Command::new("docker")
@@ -238,7 +245,7 @@ fn bootstrap_db(port: u16) {
             "host",
             "-e",
             "PGPASSWORD=test",
-            "postgres:17.2-alpine",
+            &image,
             "psql",
             "-h",
             "localhost",

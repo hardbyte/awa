@@ -3,71 +3,21 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::audited_sql;
-use awa::model::queue_storage::{QueueStorage, QueueStorageConfig};
-use awa::model::{admin, migrations};
+use awa::model::admin;
 use awa::{
     Client, JobArgs, JobError, JobEvent, JobResult, JobState, QueueConfig, UntypedJobEvent, Worker,
 };
+use awa_testing::setup::TestDatabase;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-async fn setup_pool() -> sqlx::PgPool {
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(std::time::Duration::from_secs(10))
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database — is Postgres running?");
-    // Wipe and re-migrate so tests start from a known state regardless
-    // of what previous tests left behind (queue-storage tables, an
-    // advanced storage_transition_state, etc.).
-    sqlx::query("DROP SCHEMA IF EXISTS awa CASCADE")
-        .execute(&pool)
-        .await
-        .expect("Failed to drop awa schema");
-    migrations::run(&pool)
-        .await
-        .expect("Failed to run migrations");
-
-    QueueStorage::new(QueueStorageConfig::default())
-        .expect("Failed to build queue storage")
-        .install(&pool)
-        .await
-        .expect("Failed to install queue storage");
-    pool
-}
-
-async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue meta");
-}
+use tokio::sync::mpsc;
 
 async fn recv_event<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("Timed out waiting for lifecycle event")
         .expect("Lifecycle event channel closed")
-}
-
-fn test_gate() -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
 
 async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
@@ -116,6 +66,15 @@ async fn wait_for_job_state(pool: &sqlx::PgPool, job_id: i64, state: JobState) -
     }
 }
 
+// Queue rotation can prune terminal rows while lifecycle assertions still read them.
+fn lifecycle_client_builder(pool: sqlx::PgPool) -> awa::ClientBuilder {
+    Client::builder(pool).queue_storage(
+        Default::default(),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct HookJob {
     action: String,
@@ -129,16 +88,12 @@ struct RawHookJob {
 
 #[tokio::test]
 async fn test_typed_completed_event_handler_runs() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_completed";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -186,16 +141,12 @@ async fn test_typed_completed_event_handler_runs() {
 
 #[tokio::test]
 async fn test_typed_started_event_handler_runs() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_started";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -240,16 +191,12 @@ async fn test_typed_started_event_handler_runs() {
 
 #[tokio::test]
 async fn test_typed_retried_event_handler_runs() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_retried";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -326,16 +273,12 @@ async fn test_typed_retried_event_handler_runs() {
 
 #[tokio::test]
 async fn test_typed_exhausted_event_handler_runs() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_exhausted";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -397,18 +340,14 @@ async fn test_typed_exhausted_event_handler_runs() {
 /// `max_attempts` executions and then fails with an `Exhausted` event.
 #[tokio::test]
 async fn test_retry_after_on_final_attempt_exhausts() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_retry_after_exhaust";
-    clean_queue(&pool, queue).await;
 
     let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handler_executions = executions.clone();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -483,16 +422,12 @@ async fn test_retry_after_on_final_attempt_exhausts() {
 /// exhaustion.
 #[tokio::test]
 async fn test_retry_after_exhaustion_lands_in_dlq() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_retry_after_dlq";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -546,16 +481,12 @@ async fn test_retry_after_exhaustion_lands_in_dlq() {
 /// is rescheduled with a `Retried` event and the next attempt runs.
 #[tokio::test]
 async fn test_retry_after_below_bound_still_retries() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_retry_after_retries";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -616,16 +547,12 @@ async fn test_retry_after_below_bound_still_retries() {
 
 #[tokio::test]
 async fn test_typed_cancelled_event_handler_runs() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_cancelled";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -688,16 +615,12 @@ impl Worker for RawHookWorker {
 
 #[tokio::test]
 async fn test_untyped_event_handlers_stack_for_raw_workers() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_raw_stack";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -759,16 +682,12 @@ async fn test_untyped_event_handlers_stack_for_raw_workers() {
 
 #[tokio::test]
 async fn test_handler_panic_does_not_crash_executor() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_panic";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -821,16 +740,12 @@ async fn test_handler_panic_does_not_crash_executor() {
 
 #[tokio::test]
 async fn test_no_handlers_registered_still_completes() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_no_handlers";
-    clean_queue(&pool, queue).await;
 
     // No on_event registered — should work without any lifecycle overhead
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -867,16 +782,12 @@ async fn test_no_handlers_registered_still_completes() {
 
 #[tokio::test]
 async fn test_stale_completion_does_not_fire_event() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_stale";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -965,16 +876,12 @@ async fn test_stale_completion_does_not_fire_event() {
 
 #[tokio::test]
 async fn test_terminal_error_emits_exhausted() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_terminal";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -1030,16 +937,12 @@ async fn test_terminal_error_emits_exhausted() {
 
 #[tokio::test]
 async fn test_snooze_only_emits_started_event() {
-    let _permit = test_gate()
-        .acquire_owned()
-        .await
-        .expect("test gate should be available");
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_snooze";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let client = Client::builder(pool.clone())
+    let client = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -1107,26 +1010,6 @@ enum CbEvent {
     Exhausted(awa::JobRow, String),
 }
 
-/// Like [`setup_pool`] but leaves the runtime on canonical storage (queue
-/// storage is never installed), so tests can exercise the canonical executor
-/// path.
-async fn setup_pool_canonical() -> sqlx::PgPool {
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database — is Postgres running?");
-    sqlx::query("DROP SCHEMA IF EXISTS awa CASCADE")
-        .execute(&pool)
-        .await
-        .expect("Failed to drop awa schema");
-    migrations::run(&pool)
-        .await
-        .expect("Failed to run migrations");
-    pool
-}
-
 /// Worker that parks on an external callback. Uses a `Worker` impl rather than
 /// a closure because awaiting `ctx.register_callback()` borrows the context,
 /// which the `'static` closure-handler bound disallows.
@@ -1156,7 +1039,7 @@ fn parking_client(
     canonical: bool,
     tx: mpsc::UnboundedSender<CbEvent>,
 ) -> Client {
-    let mut builder = Client::builder(pool.clone())
+    let mut builder = lifecycle_client_builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
@@ -1209,10 +1092,9 @@ async fn insert_hook_job(pool: &sqlx::PgPool, queue: &str, value: &str) -> awa::
 
 #[tokio::test]
 async fn test_waiting_for_callback_event_fires_on_park() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_waiting";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = parking_client(&pool, queue, false, tx);
@@ -1234,10 +1116,9 @@ async fn test_waiting_for_callback_event_fires_on_park() {
 
 #[tokio::test]
 async fn test_client_complete_external_dispatches_completed_event() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_cb_complete";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = parking_client(&pool, queue, false, tx);
@@ -1277,10 +1158,9 @@ async fn test_client_complete_external_dispatches_completed_event() {
 
 #[tokio::test]
 async fn test_client_fail_external_dispatches_exhausted_event() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_cb_fail";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = parking_client(&pool, queue, false, tx);
@@ -1313,10 +1193,9 @@ async fn test_client_fail_external_dispatches_exhausted_event() {
 
 #[tokio::test]
 async fn test_client_resolve_callback_dispatches_completed_event() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_cb_resolve";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = parking_client(&pool, queue, false, tx);
@@ -1349,10 +1228,9 @@ async fn test_client_resolve_callback_dispatches_completed_event() {
 
 #[tokio::test]
 async fn test_client_retry_external_dispatches_retried_event() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_cb_retry";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = parking_client(&pool, queue, false, tx);
@@ -1393,10 +1271,9 @@ async fn test_client_retry_external_dispatches_retried_event() {
 
 #[tokio::test]
 async fn test_waiting_for_callback_event_fires_on_canonical_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_waiting_canonical";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = parking_client(&pool, queue, true, tx);
@@ -1418,10 +1295,9 @@ async fn test_waiting_for_callback_event_fires_on_canonical_storage() {
 
 #[tokio::test]
 async fn test_bare_admin_resolution_fires_no_hook() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "lifecycle_cb_bare_admin";
-    clean_queue(&pool, queue).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = parking_client(&pool, queue, false, tx);

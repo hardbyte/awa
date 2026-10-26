@@ -34,7 +34,197 @@
 --   non-partitioned shape, queue_count_snapshots drop) — these are
 --   one-shot upgrade fixups that don't belong in a forward-only DDL
 --   function. They remain in `prepare_schema()` for custom schemas; the
---   default `awa` migration path runs the `awa`-specific copy below.
+--   default `awa` migration step runs the `awa`-specific copy separately.
+
+CREATE OR REPLACE FUNCTION awa.refresh_lane_sequence_helpers(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $refresh$
+BEGIN
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.ensure_lane_sequences(
+            p_queue TEXT,
+            p_priority SMALLINT,
+            p_enqueue_shard SMALLINT
+        )
+        RETURNS VOID
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_enqueue_seq TEXT := %1$I.queue_lane_sequence_name(
+                'queue_enqueue_seq',
+                p_queue,
+                p_priority,
+                p_enqueue_shard
+            );
+            v_claim_seq TEXT := %1$I.queue_lane_sequence_name(
+                'queue_claim_seq',
+                p_queue,
+                p_priority,
+                p_enqueue_shard
+            );
+        BEGIN
+            IF to_regclass(format('%%I.%%I', %1$L, v_enqueue_seq)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_enqueue_seq
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_enqueue_seq
+                );
+            END IF;
+            IF to_regclass(format('%%I.%%I', %1$L, v_claim_seq)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_claim_seq
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_claim_seq
+                );
+            END IF;
+
+            UPDATE %1$I.queue_enqueue_heads
+            SET seq_name = v_enqueue_seq
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard
+              AND seq_name IS DISTINCT FROM v_enqueue_seq;
+
+            UPDATE %1$I.queue_claim_heads
+            SET seq_name = v_claim_seq
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard
+              AND seq_name IS DISTINCT FROM v_claim_seq;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.queue_enqueue_head_sequence_sync()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
+                'queue_enqueue_seq',
+                NEW.queue,
+                NEW.priority,
+                NEW.enqueue_shard
+            );
+            v_qualified_seq TEXT := format('%%I.%%I', %1$L, v_seq_name);
+            v_count BIGINT;
+            v_start BIGINT;
+        BEGIN
+            IF to_regclass(format('%%I.%%I', %1$L, v_seq_name)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_seq_name
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_seq_name
+                );
+            END IF;
+            NEW.seq_name := v_seq_name;
+
+            IF TG_OP = 'UPDATE'
+               AND NEW.next_seq IS DISTINCT FROM OLD.next_seq
+               AND NEW.next_seq > OLD.next_seq
+            THEN
+                v_count := NEW.next_seq - OLD.next_seq;
+                PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
+                BEGIN
+                    EXECUTE format(
+                        'SELECT nextval(%%L::regclass)::bigint',
+                        v_qualified_seq
+                    )
+                    INTO v_start;
+
+                    IF v_count > 1 THEN
+                        EXECUTE format(
+                            'SELECT setval(%%L::regclass, %%s, true)',
+                            v_qualified_seq,
+                            v_start + v_count - 1
+                        );
+                    END IF;
+                EXCEPTION WHEN OTHERS THEN
+                    PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                    RAISE;
+                END;
+                PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                NEW.next_seq := v_start + v_count;
+            ELSE
+                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
+            END IF;
+
+            RETURN NEW;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.queue_claim_head_sequence_sync()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
+                'queue_claim_seq',
+                NEW.queue,
+                NEW.priority,
+                NEW.enqueue_shard
+            );
+        BEGIN
+            IF to_regclass(format('%%I.%%I', %1$L, v_seq_name)) IS NULL THEN
+                IF NOT has_schema_privilege(current_user, %1$L, 'CREATE') THEN
+                    RAISE EXCEPTION 'lane sequence %%.%% has not been provisioned', %1$L, v_seq_name
+                        USING ERRCODE = '42501',
+                              HINT = 'Run awa storage prepare-queue as the migrator before starting producers or workers.';
+                END IF;
+                EXECUTE format(
+                    'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                    %1$L,
+                    v_seq_name
+                );
+            END IF;
+            NEW.seq_name := v_seq_name;
+
+            IF TG_OP = 'INSERT' THEN
+                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.claim_seq);
+            END IF;
+
+            RETURN NEW;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+END;
+$refresh$;
+
+REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
@@ -53,6 +243,7 @@ DECLARE
     v_ring           TEXT;
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
+    v_identity_rel   REGCLASS;
     -- #371 staged rolling upgrade: was this a FRESH install (the ring
     -- state did not exist before this call) or an UPGRADE of an existing
     -- schema? A fresh install has no old binaries that could still read
@@ -1057,60 +1248,7 @@ BEGIN
         p_schema
     );
 
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.ensure_lane_sequences(
-            p_queue TEXT,
-            p_priority SMALLINT,
-            p_enqueue_shard SMALLINT
-        )
-        RETURNS VOID
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_enqueue_seq TEXT := %1$I.queue_lane_sequence_name(
-                'queue_enqueue_seq',
-                p_queue,
-                p_priority,
-                p_enqueue_shard
-            );
-            v_claim_seq TEXT := %1$I.queue_lane_sequence_name(
-                'queue_claim_seq',
-                p_queue,
-                p_priority,
-                p_enqueue_shard
-            );
-        BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_enqueue_seq
-            );
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_claim_seq
-            );
-
-            UPDATE %1$I.queue_enqueue_heads
-            SET seq_name = v_enqueue_seq
-            WHERE queue = p_queue
-              AND priority = p_priority
-              AND enqueue_shard = p_enqueue_shard
-              AND seq_name IS DISTINCT FROM v_enqueue_seq;
-
-            UPDATE %1$I.queue_claim_heads
-            SET seq_name = v_claim_seq
-            WHERE queue = p_queue
-              AND priority = p_priority
-              AND enqueue_shard = p_enqueue_shard
-              AND seq_name IS DISTINCT FROM v_claim_seq;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
+    PERFORM awa.refresh_lane_sequence_helpers(p_schema);
 
     EXECUTE format(
         $ddl$
@@ -1179,101 +1317,6 @@ BEGIN
             END IF;
 
             RETURN v_start;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.queue_enqueue_head_sequence_sync()
-        RETURNS TRIGGER
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
-                'queue_enqueue_seq',
-                NEW.queue,
-                NEW.priority,
-                NEW.enqueue_shard
-            );
-            v_qualified_seq TEXT := format('%%I.%%I', %1$L, v_seq_name);
-            v_count BIGINT;
-            v_start BIGINT;
-        BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_seq_name
-            );
-            NEW.seq_name := v_seq_name;
-
-            IF TG_OP = 'UPDATE'
-               AND NEW.next_seq IS DISTINCT FROM OLD.next_seq
-               AND NEW.next_seq > OLD.next_seq
-            THEN
-                v_count := NEW.next_seq - OLD.next_seq;
-                PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
-                BEGIN
-                    EXECUTE format(
-                        'SELECT nextval(%%L::regclass)::bigint',
-                        v_qualified_seq
-                    )
-                    INTO v_start;
-
-                    IF v_count > 1 THEN
-                        EXECUTE format(
-                            'SELECT setval(%%L::regclass, %%s, true)',
-                            v_qualified_seq,
-                            v_start + v_count - 1
-                        );
-                    END IF;
-                EXCEPTION WHEN OTHERS THEN
-                    PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
-                    RAISE;
-                END;
-                PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
-                NEW.next_seq := v_start + v_count;
-            ELSE
-                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
-            END IF;
-
-            RETURN NEW;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.queue_claim_head_sequence_sync()
-        RETURNS TRIGGER
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        DECLARE
-            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
-                'queue_claim_seq',
-                NEW.queue,
-                NEW.priority,
-                NEW.enqueue_shard
-            );
-        BEGIN
-            EXECUTE format(
-                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
-                %1$L,
-                v_seq_name
-            );
-            NEW.seq_name := v_seq_name;
-
-            IF TG_OP = 'INSERT' THEN
-                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.claim_seq);
-            END IF;
-
-            RETURN NEW;
         END;
         $func$
         $ddl$,
@@ -2437,13 +2480,10 @@ BEGIN
             p_schema, format('ready_entries_%s', v_slot), p_schema, v_slot
         );
 
-        -- Shard-aware lane index (v021): includes enqueue_shard so
-        -- claim_ready_runtime's WHERE clause hits the index directly.
-        EXECUTE format(
-            'CREATE INDEX IF NOT EXISTS idx_%s_ready_%s_lane_shard ON %I.%I (queue, priority, enqueue_shard, lane_seq)',
-            p_schema, v_slot, p_schema, format('ready_entries_%s', v_slot)
-        );
-
+        -- Lane lookups on ready children always pin ready_slot, so the
+        -- partition primary key (ready_slot, queue, priority, enqueue_shard,
+        -- lane_seq) is the lane index; v050 dropped the separate lane_shard
+        -- copy.
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%s_ready_%s_job ON %I.%I (job_id)',
             p_schema, v_slot, p_schema, format('ready_entries_%s', v_slot)
@@ -3402,6 +3442,7 @@ BEGIN
            position('receipt_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0
            OR position('claim_batch_id' IN pg_get_function_result(v_claim_runtime::oid)) = 0
            OR position('claim_batch_index' IN pg_get_function_result(v_claim_runtime::oid)) = 0
+           OR position('lane_drained' IN pg_get_function_result(v_claim_runtime::oid)) = 0
        ) THEN
         EXECUTE format(
             'DROP FUNCTION %I.claim_ready_runtime(TEXT, BIGINT, DOUBLE PRECISION, DOUBLE PRECISION)',
@@ -3444,8 +3485,8 @@ BEGIN
             created_at TIMESTAMPTZ,
             unique_key BYTEA,
             unique_states TEXT,
-            payload JSONB
-        )
+            payload JSONB,
+            lane_drained BOOLEAN)
         LANGUAGE plpgsql
         SET search_path = pg_catalog, awa, public
         AS $func$
@@ -3467,6 +3508,7 @@ BEGIN
             v_deadline_at TIMESTAMPTZ;
             v_head_attempt_spent BOOLEAN;
             v_spent_next_seq BIGINT;
+            v_evidence_next_seq BIGINT;
         BEGIN
             SELECT
                 claims.priority,
@@ -3615,6 +3657,65 @@ BEGIN
                 RETURN;
             END IF;
 
+            -- Catch the lane cursor up over committed claim evidence. Every
+            -- attempt batch was emitted by a claim that started at a cursor
+            -- already covered by evidence and recorded the contiguous rows
+            -- it took, so the largest recorded next_lane_seq is a safe
+            -- cursor position whether or not the claiming runtime's
+            -- post-commit advance ever ran. Reading only committed rows
+            -- keeps an abort of this transaction from stranding live work.
+            SELECT max(attempts.next_lane_seq)
+            INTO v_evidence_next_seq
+            FROM %1$I.ready_claim_attempt_batches AS attempts
+            WHERE attempts.ready_slot = v_target_slot
+              AND attempts.ready_generation = v_target_generation
+              AND attempts.queue = p_queue
+              AND attempts.priority = v_lane_priority
+              AND attempts.enqueue_shard = v_lane_shard
+              AND attempts.next_lane_seq > v_lane_claim_seq;
+
+            IF v_evidence_next_seq IS NOT NULL THEN
+                PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_evidence_next_seq);
+                v_lane_claim_seq := v_evidence_next_seq;
+                v_target_slot := NULL;
+                SELECT
+                    segment.ready_slot,
+                    segment.ready_generation,
+                    slot_bound.next_lane_seq
+                INTO
+                    v_target_slot,
+                    v_target_generation,
+                    v_target_next_lane_seq
+                FROM (
+                    SELECT
+                        segment.ready_slot,
+                        segment.ready_generation,
+                        segment.first_lane_seq
+                    FROM %1$I.ready_segments AS segment
+                    WHERE segment.queue = p_queue
+                      AND segment.priority = v_lane_priority
+                      AND segment.enqueue_shard = v_lane_shard
+                      AND segment.next_lane_seq > v_lane_claim_seq
+                    -- Order by next_lane_seq (non-overlapping segments, so this
+                    -- is the next segment covering or after the cursor) for the
+                    -- index short-circuit; see the inline routing probe above.
+                    ORDER BY segment.next_lane_seq ASC
+                    LIMIT 1
+                ) AS segment
+                CROSS JOIN LATERAL (
+                    SELECT max(later_segment.next_lane_seq)::bigint AS next_lane_seq
+                    FROM %1$I.ready_segments AS later_segment
+                    WHERE later_segment.ready_slot = segment.ready_slot
+                      AND later_segment.ready_generation = segment.ready_generation
+                      AND later_segment.queue = p_queue
+                      AND later_segment.priority = v_lane_priority
+                      AND later_segment.enqueue_shard = v_lane_shard
+                ) AS slot_bound;
+                IF v_target_slot IS NULL THEN
+                    RETURN;
+                END IF;
+            END IF;
+
             SELECT
                 ready.job_id,
                 ready.run_lease,
@@ -3639,6 +3740,17 @@ BEGIN
                 -- upgrade or after manual catalog damage. Keep the claim
                 -- cursor conservative rather than advancing over unseen work.
                 RETURN;
+            END IF;
+
+            -- A later committed ready row proves earlier reservations are
+            -- permanently absent: reserve_enqueue_seq holds the per-lane
+            -- transaction advisory lock until commit/abort. Move TO the first
+            -- visible row, never past it, so this sequence change is safe even
+            -- if the claim aborts. Otherwise a gap before a tombstone can keep
+            -- the bounded spent-prefix window empty on every future poll.
+            IF v_head_lane_seq > v_lane_claim_seq THEN
+                PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_head_lane_seq);
+                v_lane_claim_seq := v_head_lane_seq;
             END IF;
 
             -- The claim head stays a cold lane registry: the ready
@@ -4033,7 +4145,8 @@ BEGIN
                 selected.created_at,
                 selected.unique_key,
                 selected.unique_states,
-                selected.payload
+                selected.payload,
+                (v_lane_claim_seq + v_claim_limit >= v_lane_next_seq) AS lane_drained
             FROM claimed
             CROSS JOIN lease_ring
             JOIN selected
@@ -4069,6 +4182,30 @@ BEGIN
     );
 
     --------------------------------------------------------------------
+    -- Replica identity for the append-only delta tables, which have no
+    -- primary key. PostgreSQL refuses UPDATE and DELETE on a published
+    -- table without a replica identity, so a `FOR ALL TABLES` or
+    -- `FOR TABLES IN SCHEMA` publication would break the rollup fold and
+    -- prune. FULL costs nothing on INSERT or TRUNCATE, which is all the
+    -- hot path does to these tables. Partitions never inherit the
+    -- parent's setting, so each child is set here as well; the parent is
+    -- set for `publish_via_partition_root` publications.
+    --------------------------------------------------------------------
+
+    FOR v_identity_rel IN
+        SELECT c.oid::regclass
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = p_schema
+          AND c.relkind IN ('r', 'p')
+          AND c.relreplident <> 'f'
+          AND c.relname ~ '^queue_terminal_(count_deltas(_[0-9]+)?|rollup_deltas)$'
+        ORDER BY c.relname
+    LOOP
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL', v_identity_rel);
+    END LOOP;
+
+    --------------------------------------------------------------------
     -- Seed ring-slot rows. These are row-lock targets (and, for the
     -- claim ring, rescue-cursor holders); per-slot generations are
     -- derived from the rotation ledger (#371).
@@ -4101,110 +4238,3 @@ COMMENT ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOO
     'Installs the queue-storage substrate (sequences, ring-state singletons, partitioned ready/tombstone/done/lease tables, lane indexes, claim_ready_runtime()) into the named schema. The default ''awa'' substrate is migration-owned and default-shaped: lease_claim_receipts=TRUE and (queue=16, lease=8, claim=8). Operators wanting non-default slot counts or lease_claim_receipts=FALSE must use a custom queue-storage schema. SECURITY INVOKER, takes a per-schema advisory xact lock. See #308.';
 
 REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) FROM PUBLIC;
-
--- Install the default `awa` substrate as part of migrate. Unlike the
--- reusable helper, this default-schema path also performs the one-shot
--- legacy fixups that let `awa migrate` upgrade a database where the
--- default `awa` queue-storage substrate was previously prepared by Rust.
--- Keep the whole cleanup -> helper -> copy-back path inside one statement
--- so the per-schema advisory xact lock serializes it with prepare_schema().
-DO $$
-DECLARE
-    v_open_receipt_claims_count BIGINT;
-    v_lease_claims_relkind TEXT;
-    v_closures_relkind TEXT;
-    v_legacy_claim_slot INT;
-BEGIN
-    PERFORM pg_advisory_xact_lock(
-        hashtextextended('awa.queue_storage.install:awa', 0)
-    );
-
-    IF to_regclass('awa.open_receipt_claims') IS NOT NULL THEN
-        SELECT count(*)::bigint
-        INTO v_open_receipt_claims_count
-        FROM awa.open_receipt_claims;
-
-        IF v_open_receipt_claims_count > 0 THEN
-            RAISE EXCEPTION 'awa.open_receipt_claims has % rows but the runtime no longer reads or writes this table',
-                v_open_receipt_claims_count
-                USING ERRCODE = '22023',
-                      HINT = 'Run the ADR-023 reverse migration (recreate from lease_claims minus durable closure evidence) to drain it, then re-run awa migrate.';
-        END IF;
-
-        DROP TABLE IF EXISTS awa.open_receipt_claims CASCADE;
-    END IF;
-
-    SELECT c.relkind::text
-    INTO v_lease_claims_relkind
-    FROM pg_class AS c
-    JOIN pg_namespace AS n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'awa'
-      AND c.relname = 'lease_claims';
-
-    SELECT c.relkind::text
-    INTO v_closures_relkind
-    FROM pg_class AS c
-    JOIN pg_namespace AS n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'awa'
-      AND c.relname = 'lease_claim_closures';
-
-    IF v_lease_claims_relkind = 'r' THEN
-        ALTER TABLE awa.lease_claims RENAME TO lease_claims_legacy;
-    END IF;
-    IF v_closures_relkind = 'r' THEN
-        ALTER TABLE awa.lease_claim_closures RENAME TO lease_claim_closures_legacy;
-    END IF;
-
-    DROP TABLE IF EXISTS awa.queue_count_snapshots;
-
-    PERFORM awa.install_queue_storage_substrate('awa');
-
-    IF to_regclass('awa.lease_claims_legacy') IS NOT NULL
-       OR to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
-        -- #371: the install above seeded both cursor representations and
-        -- the authority resolver; read the current claim cursor through it.
-        SELECT slot
-        INTO v_legacy_claim_slot
-        FROM awa.ring_cursor('claim');
-    END IF;
-
-    IF to_regclass('awa.lease_claims_legacy') IS NOT NULL THEN
-        ALTER TABLE awa.lease_claims_legacy
-            ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0;
-        ALTER TABLE awa.lease_claims_legacy
-            ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ;
-
-        INSERT INTO awa.lease_claims (
-            claim_slot, job_id, run_lease, ready_slot, ready_generation,
-            queue, priority, attempt, max_attempts, lane_seq,
-            enqueue_shard, claimed_at, materialized_at, deadline_at
-        )
-        SELECT
-            v_legacy_claim_slot,
-            job_id, run_lease, ready_slot, ready_generation,
-            queue, priority, attempt, max_attempts, lane_seq,
-            enqueue_shard, claimed_at, materialized_at, deadline_at
-        FROM awa.lease_claims_legacy
-        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING;
-
-        DROP TABLE awa.lease_claims_legacy;
-    END IF;
-
-    IF to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
-        INSERT INTO awa.lease_claim_closures (
-            claim_slot, job_id, run_lease, outcome, closed_at
-        )
-        SELECT
-            v_legacy_claim_slot,
-            job_id, run_lease, outcome, closed_at
-        FROM awa.lease_claim_closures_legacy
-        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING;
-
-        DROP TABLE awa.lease_claim_closures_legacy;
-    END IF;
-END
-$$;
-
-INSERT INTO awa.schema_version (version, description)
-VALUES (23, 'Install default awa queue-storage substrate via awa.install_queue_storage_substrate() helper (#308)')
-ON CONFLICT (version) DO NOTHING;

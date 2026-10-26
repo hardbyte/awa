@@ -6,6 +6,7 @@
 //! See `docs/queue-storage-substrate.md` for the contract.
 
 use assert_cmd::Command;
+use awa_testing::setup::TestDatabase;
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -51,17 +52,15 @@ fn reset_on_default_awa_schema_is_rejected() {
 async fn reset_on_default_awa_schema_does_not_touch_the_database() {
     // The guard fires before any SQL runs. Confirm by asserting that
     // `awa.schema_version` is still populated after a rejected reset.
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&database_url())
-        .await
-        .expect("connect");
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool();
     let version_before: i32 = sqlx::query_scalar("SELECT MAX(version) FROM awa.schema_version")
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .expect("schema_version exists pre-call");
 
-    tokio::task::spawn_blocking(|| {
+    let database_url = db.url();
+    tokio::task::spawn_blocking(move || {
         run_cli(&[
             "storage",
             "prepare-queue-storage-schema",
@@ -69,6 +68,7 @@ async fn reset_on_default_awa_schema_does_not_touch_the_database() {
             "awa",
             "--reset",
         ])
+        .env("DATABASE_URL", database_url)
         .assert()
         .failure();
     })
@@ -76,7 +76,7 @@ async fn reset_on_default_awa_schema_does_not_touch_the_database() {
     .expect("blocking task");
 
     let version_after: i32 = sqlx::query_scalar("SELECT MAX(version) FROM awa.schema_version")
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .expect("schema_version still exists after rejected reset");
     assert_eq!(

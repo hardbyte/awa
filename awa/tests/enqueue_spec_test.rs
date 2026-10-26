@@ -3,38 +3,12 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::model::{admin, migrations};
+use awa::model::admin;
 use awa::{Client, EnqueueRequest, JobArgs, JobResult, JobState, QueueConfig};
+use awa_testing::setup::TestDatabase;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-async fn setup_pool_canonical() -> sqlx::PgPool {
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(&database_url())
-        .await
-        .expect("connect to test database");
-    sqlx::query("DROP SCHEMA IF EXISTS awa CASCADE")
-        .execute(&pool)
-        .await
-        .expect("drop awa schema");
-    migrations::run(&pool).await.expect("run migrations");
-    pool
-}
-
-fn test_gate() -> Arc<Semaphore> {
-    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
-}
 
 async fn wait_for_state(pool: &sqlx::PgPool, job_id: i64, state: JobState) -> awa::JobRow {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -83,8 +57,8 @@ struct EnqueueFollowUp {
 
 #[tokio::test]
 async fn on_completed_enqueue_inserts_follow_up_atomically() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_trigger";
 
     let client = Client::builder(pool.clone())
@@ -143,8 +117,8 @@ async fn on_completed_enqueue_inserts_follow_up_atomically() {
 /// keeps draining other jobs.
 #[tokio::test]
 async fn panicking_on_completed_enqueue_closure_is_caught_and_rolls_back() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_panic_trigger";
 
     let client = Client::builder(pool.clone())
@@ -196,8 +170,8 @@ async fn panicking_on_completed_enqueue_closure_is_caught_and_rolls_back() {
 
 #[tokio::test]
 async fn on_completed_enqueue_routes_follow_up_to_custom_queue() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let trigger_queue = "enqueue_spec_custom_trigger";
     let follow_queue = "enqueue_spec_custom_follow";
 
@@ -245,21 +219,10 @@ async fn on_completed_enqueue_routes_follow_up_to_custom_queue() {
     assert_eq!(follow_up.priority, 1);
 }
 
-async fn setup_pool_queue_storage() -> sqlx::PgPool {
-    use awa::model::queue_storage::{QueueStorage, QueueStorageConfig};
-    let pool = setup_pool_canonical().await;
-    QueueStorage::new(QueueStorageConfig::default())
-        .expect("build queue storage")
-        .install(&pool)
-        .await
-        .expect("install queue storage");
-    pool
-}
-
 #[tokio::test]
 async fn on_cancelled_enqueue_inserts_follow_up_atomically() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_cancel_trigger";
 
     let client = Client::builder(pool.clone())
@@ -313,8 +276,8 @@ struct ExhaustTrigger {
 
 #[tokio::test]
 async fn on_exhausted_enqueue_inserts_follow_up_atomically() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_exhaust_trigger";
 
     let client = Client::builder(pool.clone())
@@ -368,8 +331,8 @@ struct RetryTrigger {
 
 #[tokio::test]
 async fn on_retried_enqueue_inserts_follow_up_atomically() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_retry_trigger";
 
     let client = Client::builder(pool.clone())
@@ -444,8 +407,8 @@ impl awa::Worker for WaitWorker {
 
 #[tokio::test]
 async fn on_waiting_for_callback_enqueue_inserts_follow_up_atomically() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_wait_trigger";
 
     let seen_callback_id: Arc<std::sync::Mutex<Option<uuid::Uuid>>> =
@@ -503,8 +466,8 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_atomically() {
 
 #[tokio::test]
 async fn on_completed_enqueue_inserts_follow_up_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_trigger";
 
     let client = Client::builder(pool.clone())
@@ -549,8 +512,8 @@ async fn on_completed_enqueue_inserts_follow_up_under_queue_storage() {
 
 #[tokio::test]
 async fn on_cancelled_enqueue_inserts_follow_up_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_cancel_trigger";
 
     let client = Client::builder(pool.clone())
@@ -598,8 +561,8 @@ async fn on_cancelled_enqueue_inserts_follow_up_under_queue_storage() {
 
 #[tokio::test]
 async fn on_exhausted_enqueue_inserts_follow_up_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_exhaust_trigger";
 
     let client = Client::builder(pool.clone())
@@ -647,8 +610,8 @@ async fn on_exhausted_enqueue_inserts_follow_up_under_queue_storage() {
 
 #[tokio::test]
 async fn on_retried_enqueue_inserts_follow_up_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_retry_trigger";
 
     let client = Client::builder(pool.clone())
@@ -696,8 +659,8 @@ async fn on_retried_enqueue_inserts_follow_up_under_queue_storage() {
 
 #[tokio::test]
 async fn on_waiting_for_callback_enqueue_inserts_follow_up_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_wait_trigger";
 
     // Capture the parked JobRow the closure sees so we can assert that
@@ -763,8 +726,8 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_under_queue_storage()
 
 #[tokio::test]
 async fn complete_external_dispatches_completed_followup() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_cb_complete";
 
     let client = Client::builder(pool.clone())
@@ -816,8 +779,8 @@ async fn complete_external_dispatches_completed_followup() {
 
 #[tokio::test]
 async fn fail_external_dispatches_exhausted_followup() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_cb_fail";
 
     let client = Client::builder(pool.clone())
@@ -871,8 +834,8 @@ async fn fail_external_dispatches_exhausted_followup() {
 
 #[tokio::test]
 async fn retry_external_dispatches_retried_followup() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_cb_retry";
 
     let client = Client::builder(pool.clone())
@@ -948,8 +911,8 @@ impl awa::Worker for ShortCallbackWorker {
 
 #[tokio::test]
 async fn on_rescued_enqueue_dispatches_followup_on_expired_callback() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_rescued_trigger";
 
     let client = Client::builder(pool.clone())
@@ -1000,8 +963,8 @@ async fn on_rescued_enqueue_dispatches_followup_on_expired_callback() {
 /// sees a retryable failure and the next delivery can succeed.
 #[tokio::test]
 async fn complete_external_rolls_back_callback_on_followup_panic() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_canonical().await;
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_cb_complete_panic";
 
     let client = Client::builder(pool.clone())
@@ -1063,8 +1026,8 @@ async fn complete_external_rolls_back_callback_on_followup_panic() {
 /// and the external sender can retry.
 #[tokio::test]
 async fn complete_external_rolls_back_callback_on_followup_panic_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_cb_complete_panic";
 
     let client = Client::builder(pool.clone())
@@ -1118,8 +1081,8 @@ async fn complete_external_rolls_back_callback_on_followup_panic_under_queue_sto
 
 #[tokio::test]
 async fn complete_external_dispatches_completed_followup_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_cb_complete";
 
     let client = Client::builder(pool.clone())
@@ -1170,8 +1133,8 @@ async fn complete_external_dispatches_completed_followup_under_queue_storage() {
 
 #[tokio::test]
 async fn fail_external_dispatches_exhausted_followup_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_cb_fail";
 
     let client = Client::builder(pool.clone())
@@ -1224,8 +1187,8 @@ async fn fail_external_dispatches_exhausted_followup_under_queue_storage() {
 
 #[tokio::test]
 async fn retry_external_dispatches_retried_followup_under_queue_storage() {
-    let _permit = test_gate().acquire_owned().await.unwrap();
-    let pool = setup_pool_queue_storage().await;
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
     let queue = "enqueue_spec_qs_cb_retry";
 
     let client = Client::builder(pool.clone())

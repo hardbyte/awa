@@ -16,6 +16,7 @@ pub mod partitioned_queue;
 pub mod queue_storage;
 pub mod reschedule;
 pub mod storage;
+mod storage_footprint_sql;
 pub mod trace;
 pub mod unique;
 
@@ -49,7 +50,7 @@ pub use partitioned_queue::{
 };
 pub use queue_storage::{
     ClaimedEntry, ClaimedRuntimeJob, PruneDurations, PruneOutcome, QueueCounts, QueueStorage,
-    QueueStorageConfig, RingLedgerFoldOutcome, RotateOutcome, SkipReason,
+    QueueStorageConfig, RingLedgerFoldOutcome, RingRotationCadence, RotateOutcome, SkipReason,
     TerminalDeltaRollupOutcome, TerminalRollupFoldOutcome,
 };
 pub use storage::StorageStatus;

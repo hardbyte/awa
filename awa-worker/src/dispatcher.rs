@@ -178,6 +178,18 @@ impl Default for QueueConfig {
     }
 }
 
+/// Poll sleep after `idle_polls` consecutive empty polls: doubles from
+/// `poll_interval` up to `idle_poll_interval` (never below `poll_interval`).
+fn idle_poll_sleep(
+    poll_interval: Duration,
+    idle_poll_interval: Duration,
+    idle_polls: u32,
+) -> Duration {
+    poll_interval
+        .saturating_mul(1u32 << idle_polls.min(16))
+        .min(idle_poll_interval.max(poll_interval))
+}
+
 /// Wraps permits so the correct resource is released on drop.
 /// The OwnedSemaphorePermit fields are held purely for their Drop behavior.
 #[allow(dead_code)]
@@ -348,6 +360,11 @@ pub struct Dispatcher {
     applied_overrides: awa_model::admin::QueueRuntimeOverrides,
     storage: RuntimeStorage,
     capacity_wake: Arc<Notify>,
+    /// Shared per-queue wake signalled by the runtime's notify hub.
+    /// `None` means notifications are unavailable and the loop polls only.
+    notify_wake: Option<Arc<Notify>>,
+    /// Runtime-wide bound on concurrent claim round-trips.
+    claim_gate: Arc<Semaphore>,
     claimer_owner_id: Uuid,
 }
 
@@ -368,6 +385,8 @@ impl Dispatcher {
         concurrency: ConcurrencyMode,
         rate_limiter: Option<Arc<StdMutex<TokenBucket>>>,
         capacity_wake: Arc<Notify>,
+        notify_wake: Option<Arc<Notify>>,
+        claim_gate: Arc<Semaphore>,
         claimer_owner_id: Uuid,
         storage: RuntimeStorage,
     ) -> Self {
@@ -392,6 +411,8 @@ impl Dispatcher {
             applied_overrides: awa_model::admin::QueueRuntimeOverrides::default(),
             storage,
             capacity_wake,
+            notify_wake,
+            claim_gate,
             claimer_owner_id,
         }
     }
@@ -408,70 +429,29 @@ impl Dispatcher {
             "Dispatcher started"
         );
 
-        // Set up LISTEN/NOTIFY for this queue
-        let notify_channel = format!("awa:{}", self.queue);
-        let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                // warn, not error: poll-only still works, and a
-                // transaction-mode pooler makes this the expected path
-                // (#374). Matches the LISTEN fallback below.
-                warn!(
-                    queue = %self.queue,
-                    messaging.destination.name = %self.queue,
-                    error = %err,
-                    "Failed to create PG listener, falling back to polling only"
-                );
-                // Fall back to poll-only mode
-                self.poll_loop_only().await;
-                self.alive.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        if let Err(err) = listener.listen(&notify_channel).await {
-            warn!(
-                queue = %self.queue,
-                messaging.destination.name = %self.queue,
-                error = %err,
-                channel = %notify_channel,
-                "Failed to LISTEN, falling back to polling"
-            );
-            self.poll_loop_only().await;
-            self.alive.store(false, Ordering::SeqCst);
-            return;
-        }
-
-        debug!(
-            queue = %self.queue,
-            messaging.destination.name = %self.queue,
-            channel = %notify_channel,
-            "Listening for job notifications"
-        );
-
+        let notify_wake = self.notify_wake.clone();
+        let mut idle_polls: u32 = 0;
         loop {
+            let sleep_for = idle_poll_sleep(
+                self.config.poll_interval,
+                Duration::from_secs(2),
+                idle_polls,
+            )
+            .min(override_refresh_interval());
             tokio::select! {
                 _ = self.cancel.cancelled() => {
                     debug!(queue = %self.queue, messaging.destination.name = %self.queue, "Dispatcher shutting down");
                     break;
                 }
-                // Wait for either a notification or the poll interval
-                notification = listener.recv() => {
-                    match notification {
-                        Ok(_) => {
-                            debug!(queue = %self.queue, messaging.destination.name = %self.queue, "Woken by NOTIFY");
-                            self.drain_ready(WakeReason::Notify, Instant::now()).await;
-                        }
-                        Err(err) => {
-                            warn!(
-                                queue = %self.queue,
-                                messaging.destination.name = %self.queue,
-                                error = %err,
-                                "PG listener error, will retry"
-                            );
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
+                _ = async {
+                    match &notify_wake {
+                        Some(wake) => wake.notified().await,
+                        None => std::future::pending::<()>().await,
                     }
+                } => {
+                    debug!(queue = %self.queue, messaging.destination.name = %self.queue, "Woken by NOTIFY");
+                    idle_polls = 0;
+                    self.drain_ready(WakeReason::Notify, Instant::now()).await;
                 }
                 _ = self.capacity_wake.notified() => {
                     self.drain_ready(WakeReason::Capacity, Instant::now()).await;
@@ -481,31 +461,18 @@ impl Dispatcher {
                 // interval must not delay picking up the next change
                 // (ADR-038). An idle extra wake per cadence costs one claim
                 // round-trip — what short-poll queues do constantly anyway.
-                _ = tokio::time::sleep(self.config.poll_interval.min(override_refresh_interval())) => {
-                    self.drain_ready(WakeReason::Poll, Instant::now()).await;
+                _ = tokio::time::sleep(sleep_for) => {
+                    let claimed = self.drain_ready(WakeReason::Poll, Instant::now()).await;
+                    if claimed || notify_wake.is_none() {
+                        idle_polls = 0;
+                    } else {
+                        idle_polls = idle_polls.saturating_add(1);
+                    }
                 }
             }
         }
 
         self.alive.store(false, Ordering::SeqCst);
-    }
-
-    /// Poll-only fallback (no LISTEN/NOTIFY).
-    async fn poll_loop_only(&mut self) {
-        loop {
-            tokio::select! {
-                _ = self.cancel.cancelled() => {
-                    debug!(queue = %self.queue, messaging.destination.name = %self.queue, "Dispatcher (poll-only) shutting down");
-                    break;
-                }
-                _ = self.capacity_wake.notified() => {
-                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
-                }
-                _ = tokio::time::sleep(self.config.poll_interval.min(override_refresh_interval())) => {
-                    self.drain_ready(WakeReason::Poll, Instant::now()).await;
-                }
-            }
-        }
     }
 
     /// Pre-acquire permits (non-blocking). Returns a vec of permits.
@@ -650,18 +617,22 @@ impl Dispatcher {
         self.applied_overrides = overrides;
     }
 
-    async fn drain_ready(&mut self, wake_reason: WakeReason, woke_at: Instant) {
+    /// Returns whether any job was claimed.
+    async fn drain_ready(&mut self, wake_reason: WakeReason, woke_at: Instant) -> bool {
         self.refresh_runtime_overrides().await;
         self.metrics
             .record_dispatch_wake(&self.queue, wake_reason.as_str());
         let mut first_iteration = true;
+        let mut claimed_any = false;
         while !self.cancel.is_cancelled() {
             let wake_context = first_iteration.then_some((wake_reason, woke_at));
             if !self.poll_once(wake_context).await {
                 break;
             }
+            claimed_any = true;
             first_iteration = false;
         }
+        claimed_any
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
@@ -794,40 +765,57 @@ impl Dispatcher {
                     return false;
                 }
             },
-            RuntimeStorage::QueueStorage(runtime) => match runtime
-                .store
-                .claim_runtime_batch_with_aging_for_instance(
-                    &self.pool,
-                    &self.queue,
-                    batch_size as i64,
-                    self.config.deadline_duration,
-                    self.config.priority_aging_interval,
-                    self.claimer_owner_id,
-                    max_claimers_per_queue().max(self.config.claimers as i16),
-                    CLAIMER_LEASE_TTL,
-                    CLAIMER_IDLE_THRESHOLD,
-                )
-                .await
-            {
-                Ok(jobs) => jobs
-                    .into_iter()
-                    .map(|claimed| DispatchedJob {
-                        job: claimed.job,
-                        queue_storage_claim: Some(claimed.claim),
-                        queue_storage_unique_states: claimed.unique_states,
-                    })
-                    .collect(),
-                Err(err) => {
-                    warn!(
-                        queue = %self.queue,
-                        messaging.destination.name = %self.queue,
-                        error = %err,
-                        "Failed to claim queue storage jobs"
-                    );
-                    self.refund_rate_limit(batch_size);
-                    return false;
+            RuntimeStorage::QueueStorage(runtime) => {
+                let claim_slot = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        self.refund_rate_limit(batch_size);
+                        return false;
+                    }
+                    permit = self.claim_gate.acquire() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            self.refund_rate_limit(batch_size);
+                            return false;
+                        }
+                    }
+                };
+                let claimed = runtime
+                    .store
+                    .claim_runtime_batch_with_aging_for_instance(
+                        &self.pool,
+                        &self.queue,
+                        batch_size as i64,
+                        self.config.deadline_duration,
+                        self.config.priority_aging_interval,
+                        self.claimer_owner_id,
+                        max_claimers_per_queue().max(self.config.claimers as i16),
+                        CLAIMER_LEASE_TTL,
+                        CLAIMER_IDLE_THRESHOLD,
+                    )
+                    .await;
+                drop(claim_slot);
+                match claimed {
+                    Ok(jobs) => jobs
+                        .into_iter()
+                        .map(|claimed| DispatchedJob {
+                            job: claimed.job,
+                            queue_storage_claim: Some(claimed.claim),
+                            queue_storage_unique_states: claimed.unique_states,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        warn!(
+                            queue = %self.queue,
+                            messaging.destination.name = %self.queue,
+                            error = %err,
+                            "Failed to claim queue storage jobs"
+                        );
+                        self.refund_rate_limit(batch_size);
+                        return false;
+                    }
                 }
-            },
+            }
         };
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
@@ -919,15 +907,211 @@ impl Dispatcher {
         while set.try_join_next().is_some() {}
         for (job, permit) in jobs.into_iter().zip(permits) {
             let cancel_flag = Arc::new(AtomicBool::new(false));
-            let task = self.executor.execute_task(job, cancel_flag);
+            let task = self.executor.execute_task(job, cancel_flag.clone());
+            let dispatch_cancel = self.cancel.clone();
             let capacity_wake = self.capacity_wake.clone();
             set.spawn(async move {
-                task.await;
+                run_with_dispatch_cancellation(task, cancel_flag, dispatch_cancel).await;
                 drop(permit);
                 capacity_wake.notify_one();
             });
         }
 
         true
+    }
+}
+
+// A claim can finish while shutdown signals the current in-flight map.
+// Carry cancellation into execution even before the task registers itself.
+async fn run_with_dispatch_cancellation(
+    task: impl std::future::Future<Output = ()>,
+    cancel_flag: Arc<AtomicBool>,
+    dispatch_cancel: CancellationToken,
+) {
+    tokio::pin!(task);
+    tokio::select! {
+        biased;
+        _ = dispatch_cancel.cancelled() => {
+            cancel_flag.store(true, Ordering::SeqCst);
+            task.await;
+        }
+        _ = &mut task => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocked_dispatcher() -> (Dispatcher, Arc<Semaphore>, CancellationToken) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:test@localhost/awa_test")
+            .unwrap();
+        let metrics =
+            crate::metrics::AwaMetrics::new(&opentelemetry::global::meter("dispatcher-test"));
+        let storage = RuntimeStorage::QueueStorage(
+            crate::storage::QueueStorageRuntime::new(
+                awa_model::QueueStorageConfig::default(),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let in_flight = Arc::new(crate::runtime::InFlightRegistry::default());
+        let (_, completion) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            storage.clone(),
+            1,
+        );
+        let executor = Arc::new(JobExecutor::new(
+            pool.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            in_flight.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            metrics.clone(),
+            completion,
+            storage.clone(),
+            crate::executor::DlqPolicy::default(),
+            tokio_util::task::TaskTracker::new(),
+            CancellationToken::new(),
+            1,
+        ));
+        let config = QueueConfig {
+            max_workers: 1,
+            rate_limit: Some(RateLimit {
+                max_rate: 0.0,
+                burst: 1,
+            }),
+            ..Default::default()
+        };
+        let rate_limiter = shared_rate_limiter(&config);
+        let capacity = Arc::new(Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        let dispatcher = Dispatcher::with_concurrency(
+            "blocked".into(),
+            Uuid::new_v4(),
+            config,
+            pool,
+            executor,
+            metrics,
+            in_flight,
+            Arc::new(AtomicBool::new(false)),
+            cancel.clone(),
+            Arc::new(Mutex::new(JoinSet::new())),
+            ConcurrencyMode::HardReserved {
+                semaphore: capacity.clone(),
+            },
+            rate_limiter,
+            Arc::new(Notify::new()),
+            None,
+            Arc::new(Semaphore::new(0)),
+            Uuid::new_v4(),
+            storage,
+        );
+        (dispatcher, capacity, cancel)
+    }
+
+    #[tokio::test]
+    async fn saturated_claim_gate_cancellation_releases_capacity_and_rate_tokens() {
+        let (mut dispatcher, capacity, cancel) = blocked_dispatcher();
+        {
+            let poll = dispatcher.poll_once(None);
+            tokio::pin!(poll);
+            tokio::select! {
+                biased;
+                _ = &mut poll => panic!("a saturated gate must block before SQL"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert_eq!(capacity.available_permits(), 0);
+            cancel.cancel();
+            assert!(!tokio::time::timeout(Duration::from_secs(1), poll)
+                .await
+                .unwrap());
+        }
+        assert_eq!(capacity.available_permits(), 1);
+        assert_eq!(
+            dispatcher
+                .rate_limiter
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .available(),
+            1
+        );
+        assert!(dispatcher.job_set.lock().await.is_empty());
+        // Cancellation wins even if a gate permit becomes available concurrently.
+        dispatcher.claim_gate.add_permits(1);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), dispatcher.poll_once(None))
+                .await
+                .unwrap()
+        );
+        assert_eq!(dispatcher.claim_gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn claim_finishing_during_shutdown_starts_with_cancelled_context() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let observed = flag.clone();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        run_with_dispatch_cancellation(
+            async move {
+                assert!(
+                    observed.load(Ordering::SeqCst),
+                    "late registration must see shutdown"
+                );
+            },
+            flag,
+            shutdown,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_task_that_has_not_registered_in_flight() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let observed = flag.clone();
+        let shutdown = CancellationToken::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_with_dispatch_cancellation(
+            async move {
+                entered_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                assert!(observed.load(Ordering::SeqCst));
+            },
+            flag.clone(),
+            shutdown.clone(),
+        ));
+        entered_rx.await.unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        finish_tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn idle_poll_sleep_doubles_up_to_the_idle_cap() {
+        let poll = Duration::from_millis(200);
+        let cap = Duration::from_secs(2);
+        assert_eq!(idle_poll_sleep(poll, cap, 0), poll);
+        assert_eq!(idle_poll_sleep(poll, cap, 1), Duration::from_millis(400));
+        assert_eq!(idle_poll_sleep(poll, cap, 3), Duration::from_millis(1600));
+        assert_eq!(idle_poll_sleep(poll, cap, 4), cap);
+        assert_eq!(idle_poll_sleep(poll, cap, 40), cap);
+        assert_eq!(idle_poll_sleep(poll, Duration::from_millis(50), 5), poll);
     }
 }

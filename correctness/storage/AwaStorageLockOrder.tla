@@ -34,7 +34,9 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* model conservatively lets transactions WAIT on that resource instead;
 \* every waits-for edge the model admits is therefore a superset of what
 \* the try-lock implementation can produce, so NoDeadlock over the model
-\* covers the implementation.
+\* covers the implementation. The one exception is a tick promoted to ledger
+\* while it already holds the ring-state singleton (see BeginRingTx), whose
+\* try-lock is modelled as one.
 \*
 \* ADR-023/026 extends the locked resources with the claim ring
 \* (the claim-ring rotation lock, claim_ring_slots, lease_claims /
@@ -150,6 +152,9 @@ ReceiptBatchChildResource(s) == [k |-> "receipt_batch_child", s |-> s]
 ReceiptTombstoneChildResource(s) == [k |-> "receipt_tombstone_child", s |-> s]
 TerminalDeltaChildResource(s) == [k |-> "terminal_delta_child", s |-> s]
 LeasesParentResource == [k |-> "leases_parent"]
+DoneParentResource == [k |-> "done_parent"]
+TerminalDeltaParentResource == [k |-> "terminal_delta_parent"]
+TerminalLiveCountsResource == [k |-> "terminal_live_counts"]
 ClaimProofResource == [k |-> "claim_proof_children"]
 ClosureProofResource == [k |-> "closure_proof_children"]
 ClosureBatchProofResource == [k |-> "closure_batch_proof_children"]
@@ -197,6 +202,9 @@ Resources ==
     ReceiptTombstoneChildResources \cup
     TerminalDeltaChildResources \cup
     {LeasesParentResource} \cup
+    {DoneParentResource} \cup
+    {TerminalDeltaParentResource} \cup
+    {TerminalLiveCountsResource} \cup
     {ClaimProofResource} \cup
     {ClosureProofResource} \cup
     {ClosureBatchProofResource} \cup
@@ -207,8 +215,9 @@ Resources ==
     ClosureChildResources \cup
     ClosureBatchChildResources
 
-\* A plan step is [res, mode].
-Step(res, mode) == [res |-> res, mode |-> mode]
+\* A plan step names a resource, mode, and whether contention waits.
+Step(res, mode) == [res |-> res, mode |-> mode, wait |-> TRUE]
+TryStep(res, mode) == [res |-> res, mode |-> mode, wait |-> FALSE]
 
 \* A small, explicit two-stripe shape for the hot logical queue case.
 \* `StripeA` / `StripeB` are physical queue names such as `queue#0`
@@ -239,6 +248,13 @@ EnqueueTwoStripePlan(p) ==
     << Step(LaneResource(StripeA, p), ModeExclusive),
        Step(LaneResource(StripeB, p), ModeExclusive) >>
 
+\* prepare_queue visits physical queues in the same lexical order as the
+\* producer's BTreeMap<(queue, priority, shard)> grouping.
+PrepareTwoStripePlan(p) == EnqueueTwoStripePlan(p)
+PrepareNumericStripePlan(p) ==
+    << Step(LaneResource(StripeB, p), ModeExclusive),
+       Step(LaneResource(StripeA, p), ModeExclusive) >>
+
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
 \*   FOR UPDATE OF queue_claim_heads SKIP LOCKED (per-(queue,priority) row)
@@ -249,7 +265,8 @@ EnqueueTwoStripePlan(p) ==
 \*     serialisation against rotate is via the rotator's ledger-insert
 \*     CAS on the generation PK, not a row lock here, so these reads
 \*     are NOT modelled as plan steps.
-\*   plain SELECT of ready_entries_<slot> (implicit AccessShare on child)
+\*   read ready_segments, then attempt evidence and ready entries
+\*     (implicit AccessShare on child partitions)
 \*   INSERT INTO ready_claim_attempt_batches_<ready_slot> (receipts mode)
 \*   INSERT INTO lease_claim_batches_<claim_slot> or
 \*     lease_claims_<claim_slot> (receipts mode) OR
@@ -265,13 +282,16 @@ EnqueueTwoStripePlan(p) ==
 \* queue_claim_heads` on the same lane row really does serialise.
 ClaimReceiptsPlan(q, p, readySlot, claimSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
-       Step(ReadyChildResource(readySlot), ModeShared),
+       Step(ReadySegmentChildResource(readySlot), ModeShared),
        Step(ReadyClaimAttemptBatchChildResource(readySlot), ModeShared),
+       Step(ReadyChildResource(readySlot), ModeShared),
        Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClaimBatchChildResource(claimSlot), ModeShared) >>
 
 ClaimLegacyPlan(q, p, readySlot, leaseSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
+       Step(ReadySegmentChildResource(readySlot), ModeShared),
+       Step(ReadyClaimAttemptBatchChildResource(readySlot), ModeShared),
        Step(ReadyChildResource(readySlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
@@ -322,7 +342,7 @@ CompletePlan(claimSlot, readySlot) ==
 \* close_receipt_tx (called from cancel_job_tx)
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first
 \*   WITH locked_claim AS (SELECT ... FROM lease_claims /
-\*     lease_claim_batches FOR UPDATE)
+\*     lease_claim_batches by immutable batch/index identity; no batch row lock)
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
 CloseReceiptPlan(claimSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
@@ -437,16 +457,12 @@ BatchReadyLaneMovePlan(srcQ, srcP, dstQ, dstP, readySlot) ==
        Step(LaneResource(dstQ, dstP), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared) >>
 
-\* rotate_leases (ledger authority)
-\*   #371 staged upgrade: the lease-ring-state singleton FOR UPDATE is the
-\*     universal outer gate (taken before the authority is read), so a
-\*     rotator serializes against the flip; then the advisory lock.
+\* rotate_leases (ledger authority; see BeginRingTx for the compat head)
 \*   pg_try_advisory_xact_lock on the lease-ring rotation lock
 \*   SELECT EXISTS FROM lease_child[next_slot] (AccessShare on child)
 \*   INSERT INTO lease_ring_rotations (ledger CAS; RowExclusive, elided)
 RotateLeasesPlan(nextSlot) ==
-    << Step(LeaseRingStateResource, ModeExclusive),
-       Step(LeaseRingRotationLockResource, ModeExclusive),
+    << Step(LeaseRingRotationLockResource, ModeExclusive),
        Step(LeaseChildResource(nextSlot), ModeShared) >>
 
 \* prune_oldest_leases
@@ -454,8 +470,7 @@ RotateLeasesPlan(nextSlot) ==
 \*   SELECT ... FROM lease_ring_slots[slot] FOR UPDATE
 \*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE with bounded lock_timeout
 PruneLeasesPlan(slot) ==
-    << Step(LeaseRingStateResource, ModeExclusive),
-       Step(LeaseRingRotationLockResource, ModeExclusive),
+    << Step(LeaseRingRotationLockResource, ModeExclusive),
        Step(LeaseRingSlotResource(slot), ModeExclusive),
        Step(LeaseChildResource(slot), ModeExclusive) >>
 
@@ -463,8 +478,7 @@ PruneLeasesPlan(slot) ==
 \* probes on the next and current children, then the ledger CAS insert
 \* (RowExclusive, elided).
 RotateReadyPlan(nextSlot) ==
-    << Step(QueueRingStateResource, ModeExclusive),
-       Step(QueueRingRotationLockResource, ModeExclusive),
+    << Step(QueueRingRotationLockResource, ModeExclusive),
        Step(ReadyChildResource(nextSlot), ModeShared),
        Step(ReadyClaimAttemptBatchChildResource(nextSlot), ModeShared),
        Step(ReadyTombstoneChildResource(nextSlot), ModeShared),
@@ -482,12 +496,38 @@ RotateReadyPlan(nextSlot) ==
 \*     active leases (leases parent), unclosed receipt claims
 \*     (claim/closure proof resources), and pending retained ready rows
 \*     at or beyond the lane cursor
-\*   LOCK TABLE ready/claim-attempt/done/tombstone/segment/compact/delta children ACCESS EXCLUSIVE with bounded lock_timeout
+\*   bounded ACCESS EXCLUSIVE wait on the routing segment child
+\*   NOWAIT ACCESS EXCLUSIVE on every other child; rollback on contention
 \*   repeat the active/pending/unclosed proofs after the exclusive child
 \*     locks before TRUNCATE
 PruneReadyPlan(slot) ==
-    << Step(QueueRingStateResource, ModeExclusive),
-       Step(QueueRingRotationLockResource, ModeExclusive),
+    << Step(QueueRingRotationLockResource, ModeExclusive),
+       Step(QueueRingSlotResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared),
+       Step(ReadySegmentChildResource(slot), ModeExclusive),
+       TryStep(ReadyChildResource(slot), ModeExclusive),
+       TryStep(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
+       TryStep(DoneChildResource(slot), ModeExclusive),
+       TryStep(ReadyTombstoneChildResource(slot), ModeExclusive),
+       TryStep(ReceiptBatchChildResource(slot), ModeExclusive),
+       TryStep(ReceiptTombstoneChildResource(slot), ModeExclusive),
+       TryStep(TerminalDeltaChildResource(slot), ModeExclusive),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClaimProofResource, ModeShared),
+       Step(ClosureProofResource, ModeShared),
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(ReadyChildResource(slot), ModeShared),
+       Step(DoneParentResource, ModeShared),
+       Step(TerminalDeltaParentResource, ModeShared),
+       Step(TerminalLiveCountsResource, ModeShared) >>
+
+\* Historical body-first blocking tail, retained as a negative witness.
+PruneReadyBlockingPlan(slot) ==
+    << Step(QueueRingRotationLockResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
        Step(LeasesParentResource, ModeShared),
        Step(ClaimProofResource, ModeShared),
@@ -506,7 +546,10 @@ PruneReadyPlan(slot) ==
        Step(ClaimProofResource, ModeShared),
        Step(ClosureProofResource, ModeShared),
        Step(ClosureBatchProofResource, ModeShared),
-       Step(ReadyChildResource(slot), ModeShared) >>
+       Step(ReadyChildResource(slot), ModeShared),
+       Step(DoneParentResource, ModeShared),
+       Step(TerminalDeltaParentResource, ModeShared),
+       Step(TerminalLiveCountsResource, ModeShared) >>
 
 \* rollup_terminal_count_delta_slot (#290 / #371)
 \*   pg_try_advisory_xact_lock on the queue-ring rotation lock
@@ -520,15 +563,15 @@ PruneReadyPlan(slot) ==
 \*   fold into queue_terminal_live_counts (RowExclusive, elided) and
 \*     TRUNCATE terminal_delta_child[slot] (already held exclusive)
 RollupTerminalDeltasPlan(slot) ==
-    << Step(QueueRingStateResource, ModeExclusive),
-       Step(QueueRingRotationLockResource, ModeExclusive),
+    << Step(QueueRingRotationLockResource, ModeExclusive),
        Step(QueueRingSlotResource(slot), ModeExclusive),
        Step(ReadyChildResource(slot), ModeShared),
        Step(TerminalDeltaChildResource(slot), ModeExclusive),
        Step(LeasesParentResource, ModeShared),
        Step(ClaimProofResource, ModeShared),
        Step(ClosureProofResource, ModeShared),
-       Step(ClosureBatchProofResource, ModeShared) >>
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(TerminalLiveCountsResource, ModeShared) >>
 
 \* rotate_claims (ADR-023)
 \*   pg_try_advisory_xact_lock on the claim-ring rotation lock
@@ -538,8 +581,7 @@ RollupTerminalDeltasPlan(slot) ==
 \*   SELECT EXISTS FROM closure_batch_child[next_slot]
 \*   INSERT INTO claim_ring_rotations (ledger CAS; RowExclusive, elided)
 RotateClaimsPlan(nextSlot) ==
-    << Step(ClaimRingStateResource, ModeExclusive),
-       Step(ClaimRingRotationLockResource, ModeExclusive),
+    << Step(ClaimRingRotationLockResource, ModeExclusive),
        Step(ClaimChildResource(nextSlot), ModeShared),
        Step(ClaimBatchChildResource(nextSlot), ModeShared),
        Step(ClosureChildResource(nextSlot), ModeShared),
@@ -562,8 +604,7 @@ RotateClaimsPlan(nextSlot) ==
 \*   TRUNCATE claim_child[slot] + claim_batch_child[slot] +
 \*     closure_child[slot] + closure_batch_child[slot]
 PruneClaimsPlan(slot) ==
-    << Step(ClaimRingStateResource, ModeExclusive),
-       Step(ClaimRingRotationLockResource, ModeExclusive),
+    << Step(ClaimRingRotationLockResource, ModeExclusive),
        Step(ClaimRingSlotResource(slot), ModeExclusive),
        Step(ClaimChildResource(slot), ModeShared),
        Step(ClaimBatchChildResource(slot), ModeShared),
@@ -615,21 +656,8 @@ CompatRotateClaimsPlan(nextSlot) ==
        Step(ClaimRingSlotResource(nextSlot), ModeExclusive) >>
 
 CompatPruneReadyPlan(slot) ==
-    << Step(QueueRingStateResource, ModeExclusive),
-       Step(QueueRingSlotResource(slot), ModeExclusive),
-       Step(LeasesParentResource, ModeShared),
-       Step(ClaimProofResource, ModeShared),
-       Step(ClosureProofResource, ModeShared),
-       Step(ClosureBatchProofResource, ModeShared),
-       Step(ReadyChildResource(slot), ModeShared),
-       Step(ReadyChildResource(slot), ModeExclusive),
-       Step(ReadyClaimAttemptBatchChildResource(slot), ModeExclusive),
-       Step(DoneChildResource(slot), ModeExclusive),
-       Step(ReadyTombstoneChildResource(slot), ModeExclusive),
-       Step(ReadySegmentChildResource(slot), ModeExclusive),
-       Step(ReceiptBatchChildResource(slot), ModeExclusive),
-       Step(ReceiptTombstoneChildResource(slot), ModeExclusive),
-       Step(TerminalDeltaChildResource(slot), ModeExclusive) >>
+    << Step(QueueRingStateResource, ModeExclusive) >>
+    \o SubSeq(PruneReadyPlan(slot), 2, Len(PruneReadyPlan(slot)))
 
 CompatPruneLeasesPlan(slot) ==
     << Step(LeaseRingStateResource, ModeExclusive),
@@ -652,7 +680,8 @@ CompatRollupTerminalDeltasPlan(slot) ==
        Step(LeasesParentResource, ModeShared),
        Step(ClaimProofResource, ModeShared),
        Step(ClosureProofResource, ModeShared),
-       Step(ClosureBatchProofResource, ModeShared) >>
+       Step(ClosureBatchProofResource, ModeShared),
+       Step(TerminalLiveCountsResource, ModeShared) >>
 
 \* The one-way authority flip (`awa.flip_ring_authority`): takes all three
 \* ring-state singletons FOR UPDATE (so it serializes against every in-
@@ -743,6 +772,24 @@ StartEnqueueTwoStripe(t, p) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
+StartPrepareTwoStripe(t, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = PrepareTwoStripePlan(p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+StartPrepareNumericStripe(t, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = PrepareNumericStripePlan(p)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
 StartComplete(t, claimSlot, readySlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
@@ -753,34 +800,49 @@ StartComplete(t, claimSlot, readySlot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
-\* #371 staged upgrade: a ring maintenance tx ATOMICALLY takes its ring-
-\* state singleton (the universal outer gate) as it starts, and picks its
-\* mode by the authority observed AT THAT MOMENT — faithfully modelling the
-\* implementation, which takes the singleton FOR UPDATE before reading the
-\* authority (`acquire_ring_serializer_tx`). Because the acquisition is
-\* atomic with the mode choice, the flip cannot slip between "decide compat"
-\* and "hold the singleton": the flip needs the same singleton exclusively,
-\* so whoever takes it first wins, and a rotator that loses reads `ledger`
-\* and runs the ledger plan. The plan's first step is the singleton (already
-\* reflected in every *Plan above); the tx starts at step 2 with the
-\* singleton already held.
+\* #371 staged upgrade. `acquire_ring_serializer_tx` reads the authority
+\* first.
+\*
+\* - Compat (`columns`): it takes the ring-state singleton FOR UPDATE and
+\*   re-reads the authority under it. The model makes that atomic: the tx
+\*   starts only when the singleton is free, pre-acquires it, and picks its
+\*   plan by the authority at that moment, starting at step 2 of a compat
+\*   plan whose step 1 is the singleton. The flip needs the same singleton
+\*   exclusively, so it cannot slip between "decide compat" and "hold the
+\*   singleton".
+\* - Ledger: no singleton. The tx starts at step 1, the rotation lock.
+\* - Promoted: a tx that read `columns`, queued on the singleton behind the
+\*   flip, and re-read `ledger` under it. It holds the singleton and then
+\*   runs the ledger plan. Its rotation lock is a real try-lock (a skipped
+\*   tick), modelled as TryStep: a whole-schema operation waits for the
+\*   rotation lock before the singleton, so a waiting edge here would be a
+\*   cycle the implementation cannot produce.
 
-\* A ring tx may start only if its singleton is currently free (no holder).
-\* Modelled by requiring no held lock on the singleton resource.
+\* A compat ring tx may start only if its singleton is currently free.
 Blocked_(res) == \E u \in TxIds : \E m \in Modes : <<u, m>> \in heldLocks[res]
 
-\* Begin a ring maintenance tx `t` holding `singletonRes` (step 1 pre-
-\* acquired), running the mode-specific `plan` chosen by current authority,
-\* starting execution at step 2.
+TryHead(plan) == [plan EXCEPT ![1] = TryStep(plan[1].res, plan[1].mode)]
+
 BeginRingTx(t, singletonRes, plan) ==
     /\ txState[t] = "idle"
-    /\ ~ Blocked_(singletonRes)
     /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = plan]
-    /\ txNextStep' = [txNextStep EXCEPT ![t] = 2]
     /\ txMode' = [txMode EXCEPT ![t] = authority]
-    /\ heldLocks' = [heldLocks EXCEPT
-                        ![singletonRes] = heldLocks[singletonRes] \cup {<<t, ModeExclusive>>}]
+    /\ \/ /\ authority = "columns"
+          /\ ~ Blocked_(singletonRes)
+          /\ txPlan' = [txPlan EXCEPT ![t] = plan]
+          /\ txNextStep' = [txNextStep EXCEPT ![t] = 2]
+          /\ heldLocks' = [heldLocks EXCEPT
+                ![singletonRes] = heldLocks[singletonRes] \cup {<<t, ModeExclusive>>}]
+       \/ /\ authority = "ledger"
+          /\ txPlan' = [txPlan EXCEPT ![t] = plan]
+          /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+          /\ UNCHANGED heldLocks
+       \/ /\ authority = "ledger"
+          /\ ~ Blocked_(singletonRes)
+          /\ txPlan' = [txPlan EXCEPT ![t] = TryHead(plan)]
+          /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+          /\ heldLocks' = [heldLocks EXCEPT
+                ![singletonRes] = heldLocks[singletonRes] \cup {<<t, ModeExclusive>>}]
     /\ UNCHANGED authority
 
 StartRotateLeases(t, nextSlot) ==
@@ -941,6 +1003,22 @@ AcquireNext(t) ==
        /\ txNextStep' = [txNextStep EXCEPT ![t] = txNextStep[t] + 1]
     /\ UNCHANGED <<txState, txPlan, authority, txMode>>
 
+\* NOWAIT failure rolls the entire prune transaction back, including
+\* its segment lock and all previously acquired tail locks.
+AbortUnavailable(t) ==
+    /\ txState[t] = "running"
+    /\ txNextStep[t] > 0
+    /\ txNextStep[t] <= Len(txPlan[t])
+    /\ LET step == txPlan[t][txNextStep[t]]
+       IN /\ ~step.wait
+          /\ Blocked(t, step.res, step.mode)
+    /\ heldLocks' = [r \in Resources |-> {<<u, m>> \in heldLocks[r] : u # t}]
+    /\ txState' = [txState EXCEPT ![t] = "committed"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = EmptyPlan]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 0]
+    /\ txMode' = [txMode EXCEPT ![t] = "none"]
+    /\ UNCHANGED authority
+
 \* Commit once all plan steps have been acquired. Release everything. The
 \* flip tx (see FlipAuthority) promotes the authority as it commits; every
 \* other tx leaves it unchanged.
@@ -968,6 +1046,7 @@ Stutter == /\ UNCHANGED vars
 
 Next ==
     \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, p \in Priorities : StartPrepareTwoStripe(t, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
          rs \in ReadySlots, cs \in ClaimSlots :
           StartClaimReceipts(t, q, p, rs, cs)
@@ -1000,12 +1079,35 @@ Next ==
          srcP \in Priorities, dstP \in Priorities, rs \in ReadySlots :
           StartBatchReadyLaneMove(t, srcQ, srcP, dstQ, dstP, rs)
     \/ \E t \in TxIds : StartFlipAuthority(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
     \/ Stutter
 
 Spec == ConfigOK /\ Init /\ [][Next]_vars
+
+NextPrepareQueue ==
+    \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, p \in Priorities : StartPrepareTwoStripe(t, p)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecPrepareQueue == ConfigOK /\ Init /\ [][NextPrepareQueue]_vars
+
+NextPrepareQueueNumeric ==
+    \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, p \in Priorities : StartPrepareNumericStripe(t, p)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecPrepareQueueNumeric == ConfigOK /\ Init /\ [][NextPrepareQueueNumeric]_vars
 
 \* ---- Sanity check for the deadlock detector ----
 \*
@@ -1040,6 +1142,7 @@ StartCycleB(t) ==
 NextDeadlockDemo ==
     \/ \E t \in TxIds : StartCycleA(t)
     \/ \E t \in TxIds : StartCycleB(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -1072,6 +1175,7 @@ NextOldStripedClaimDeadlockDemo ==
     \/ \E t \in TxIds, p \in Priorities, rs \in ReadySlots,
          cs \in ClaimSlots :
           StartOldClaimTwoStripeReceipts(t, p, rs, cs)
+    \/ \E t \in TxIds : AbortUnavailable(t)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -1101,6 +1205,8 @@ TypeOK ==
 \* #371: a ring maintenance tx has taken its serialization lock once it has
 \* acquired its first plan step (the singleton in compat mode, the advisory
 \* rotation lock in ledger mode). `txNextStep > 1` means step 1 is held.
+\* A promoted ledger tx that also holds the singleton does not count until it
+\* has the rotation lock.
 HoldsRingSerializer(t) ==
     /\ txState[t] = "running"
     /\ txMode[t] \in {"columns", "ledger"}
@@ -1125,7 +1231,7 @@ IsBlocked(t) ==
     /\ txNextStep[t] > 0
     /\ txNextStep[t] <= Len(txPlan[t])
     /\ LET step == txPlan[t][txNextStep[t]]
-       IN Blocked(t, step.res, step.mode)
+       IN step.wait /\ Blocked(t, step.res, step.mode)
 
 \* Direct waits-for: tx t waits for tx u.
 WaitsFor(t, u) ==
@@ -1154,6 +1260,145 @@ NoDeadlock ==
 NoGlobalStall ==
     \/ \A t \in TxIds : txState[t] # "running"
     \/ \E t \in TxIds : txState[t] = "running" /\ ~ IsBlocked(t)
+
+\* A producer writes entries before routing segments, the inverse of
+\* the claimer. The focused configs include both reader shapes.
+StartQueueChildWriter(t, slot) ==
+    /\ txState[t] = "idle"
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] =
+        <<Step(ReadyChildResource(slot), ModeShared),
+          Step(ReadySegmentChildResource(slot), ModeShared)>>]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+StartPruneReadyBlocking(t, slot) ==
+    BeginRingTx(t, QueueRingStateResource,
+        IF authority = "ledger" THEN PruneReadyBlockingPlan(slot)
+        ELSE <<Step(QueueRingStateResource, ModeExclusive)>>
+             \o SubSeq(PruneReadyBlockingPlan(slot), 2, Len(PruneReadyBlockingPlan(slot))))
+
+NextQueuePrune(blocking) ==
+    \/ \E t \in TxIds : StartFlipAuthority(t)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities,
+         rs \in ReadySlots, cs \in ClaimSlots : StartClaimReceipts(t, q, p, rs, cs)
+    \/ \E t \in TxIds, rs \in ReadySlots : StartQueueChildWriter(t, rs)
+    \/ \E t \in TxIds, rs \in ReadySlots :
+         IF blocking THEN StartPruneReadyBlocking(t, rs) ELSE StartPruneReady(t, rs)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecQueuePrune == ConfigOK /\ Init /\ [][NextQueuePrune(FALSE)]_vars
+SpecQueuePruneBlocking == ConfigOK /\ Init /\ [][NextQueuePrune(TRUE)]_vars
+
+\* ---- Whole-schema operations: counter rebuild and reset ----
+\*
+\* rebuild_terminal_counters and reset wait for the per-ring rotation
+\* locks (blocking pg_advisory_xact_lock, fixed ring order) before the
+\* ring-state singletons and the table locks. In ledger authority the
+\* rotation lock is the only thing a rotate, prune or rollup holds before
+\* its child locks, so a whole-schema operation must queue on it rather
+\* than interleave table locks with an in-flight tick: a ledger prune holds
+\* a done child exclusively and then inserts its carry-forward through the
+\* done parent, while LOCK TABLE / TRUNCATE on the parent takes the parent
+\* first and then each child. The `ordered = FALSE` plans drop the rotation
+\* locks and are the negative witness for that cycle.
+RECURSIVE SortedSeq(_)
+SortedSeq(S) ==
+    IF S = {} THEN << >>
+    ELSE LET m == CHOOSE x \in S : \A y \in S : x <= y
+         IN <<m>> \o SortedSeq(S \ {m})
+
+ChildSteps(F(_), slots) ==
+    LET order == SortedSeq(slots)
+    IN [i \in 1..Len(order) |-> Step(F(order[i]), ModeExclusive)]
+
+X(res) == << Step(res, ModeExclusive) >>
+
+\* LOCK TABLE done_entries, receipt_completion_batches,
+\*   receipt_completion_tombstones, queue_terminal_count_deltas,
+\*   queue_terminal_live_counts IN ACCESS EXCLUSIVE MODE
+RebuildTablesPlan ==
+    X(DoneParentResource)
+    \o ChildSteps(DoneChildResource, ReadySlots)
+    \o ChildSteps(ReceiptBatchChildResource, ReadySlots)
+    \o ChildSteps(ReceiptTombstoneChildResource, ReadySlots)
+    \o X(TerminalDeltaParentResource)
+    \o ChildSteps(TerminalDeltaChildResource, ReadySlots)
+    \o X(TerminalLiveCountsResource)
+
+RebuildCountersPlan(ordered) ==
+    (IF ordered THEN X(QueueRingRotationLockResource) ELSE << >>)
+    \o X(QueueRingStateResource)
+    \o RebuildTablesPlan
+
+\* TRUNCATE of every queue-storage table, in statement order.
+ResetTablesPlan ==
+    ChildSteps(ReadyChildResource, ReadySlots)
+    \o ChildSteps(ReadyClaimAttemptBatchChildResource, ReadySlots)
+    \o ChildSteps(ReadyTombstoneChildResource, ReadySlots)
+    \o ChildSteps(ReadySegmentChildResource, ReadySlots)
+    \o X(DoneParentResource)
+    \o ChildSteps(DoneChildResource, ReadySlots)
+    \o ChildSteps(ReceiptBatchChildResource, ReadySlots)
+    \o ChildSteps(ReceiptTombstoneChildResource, ReadySlots)
+    \o X(LeasesParentResource)
+    \o ChildSteps(LeaseChildResource, LeaseSlots)
+    \o X(ClaimProofResource)
+    \o ChildSteps(ClaimChildResource, ClaimSlots)
+    \o ChildSteps(ClaimBatchChildResource, ClaimSlots)
+    \o X(ClosureProofResource)
+    \o ChildSteps(ClosureChildResource, ClaimSlots)
+    \o X(ClosureBatchProofResource)
+    \o ChildSteps(ClosureBatchChildResource, ClaimSlots)
+    \o X(TerminalLiveCountsResource)
+    \o X(TerminalDeltaParentResource)
+    \o ChildSteps(TerminalDeltaChildResource, ReadySlots)
+    \o ChildSteps(QueueRingSlotResource, ReadySlots)
+    \o ChildSteps(LeaseRingSlotResource, LeaseSlots)
+    \o ChildSteps(ClaimRingSlotResource, ClaimSlots)
+
+ResetPlan(ordered) ==
+    (IF ordered
+     THEN X(QueueRingRotationLockResource)
+          \o X(LeaseRingRotationLockResource)
+          \o X(ClaimRingRotationLockResource)
+     ELSE << >>)
+    \o X(QueueRingStateResource)
+    \o X(LeaseRingStateResource)
+    \o X(ClaimRingStateResource)
+    \o ResetTablesPlan
+
+StartWholeSchema(t, plan) ==
+    /\ txState[t] = "idle"
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = plan]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED <<heldLocks, authority, txMode>>
+
+NextWholeSchema(rebuildOrdered, resetOrdered) ==
+    \/ \E t \in TxIds : StartFlipAuthority(t)
+    \/ \E t \in TxIds : StartWholeSchema(t, RebuildCountersPlan(rebuildOrdered))
+    \/ \E t \in TxIds : StartWholeSchema(t, ResetPlan(resetOrdered))
+    \/ \E t \in TxIds, rs \in ReadySlots : StartRotateReady(t, rs)
+    \/ \E t \in TxIds, rs \in ReadySlots : StartPruneReady(t, rs)
+    \/ \E t \in TxIds, rs \in ReadySlots : StartRollupTerminalDeltas(t, rs)
+    \/ \E t \in TxIds, ls \in LeaseSlots : StartRotateLeases(t, ls)
+    \/ \E t \in TxIds, ls \in LeaseSlots : StartPruneLeases(t, ls)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartRotateClaims(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : AbortUnavailable(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecWholeSchema == ConfigOK /\ Init /\ [][NextWholeSchema(TRUE, TRUE)]_vars
+SpecRebuildUnordered == ConfigOK /\ Init /\ [][NextWholeSchema(FALSE, TRUE)]_vars
+SpecResetUnordered == ConfigOK /\ Init /\ [][NextWholeSchema(TRUE, FALSE)]_vars
 
 \* #371 MixedFleet safety. A single ring must never be advanced under BOTH
 \* disciplines at once: no state where one ring maintenance tx holds its

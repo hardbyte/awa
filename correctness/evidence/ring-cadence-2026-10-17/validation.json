@@ -1,0 +1,23 @@
+{
+  "runs": 12,
+  "all_active_runs_completed_two_wraps": true,
+  "retry_recovery_retryable_depth_zero": true,
+  "logical_pause_output_stopped_and_wal_xmin_pinned": true,
+  "logical_catchup_active_lag_reduced_no_process_exits": true,
+  "logical_consumer_counters": {
+    "eager": {
+      "errors": 1.0,
+      "disconnects": 1.0,
+      "process_exits": 0
+    },
+    "cadence": {
+      "errors": 1.0,
+      "disconnects": 1.0,
+      "process_exits": 0
+    }
+  },
+  "selected_sample_rows": 36176,
+  "excluded_sample_rows": 78,
+  "monotonic_counter_groups": 444,
+  "single_executable_sha256": "ed6656893cb7b669dc0e0e7877952e1585652d2b1a279836f2f8d5c994b1b68a"
+}

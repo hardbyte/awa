@@ -187,6 +187,54 @@ async fn test_copy_pathological_tags() {
     assert_eq!(result[0].tags, pathological_tags);
 }
 
+// Batches at or above the COPY threshold take the CSV path; smaller ones are
+// staged with an `unnest` INSERT. This one crosses the threshold so the CSV
+// encoder still sees the pathological values covered above.
+#[tokio::test]
+async fn test_copy_large_batch_round_trips_special_values() {
+    let pool = setup().await;
+    let queue = "copy_large_special";
+    clean_queue(&pool, queue).await;
+
+    let special_args = serde_json::json!({
+        "quotes": "he said \"hello\"",
+        "newlines": "line1\nline2",
+        "commas": "a,b,c",
+        "backslashes": "path\\to\\file",
+        "null_str": "NULL",
+        "sentinel": "__AWA_NULL__",
+    });
+    let pathological_tags = vec![
+        "with,comma".to_string(),
+        "with\"quote".to_string(),
+        "with{brace}".to_string(),
+        "with\\backslash".to_string(),
+        "NULL".to_string(),
+        String::new(),
+    ];
+    let mut jobs = vec![InsertParams {
+        kind: "copy_large_special".to_string(),
+        args: special_args.clone(),
+        opts: InsertOpts {
+            queue: queue.to_string(),
+            tags: pathological_tags.clone(),
+            metadata: serde_json::json!({"note": "comma, \"quote\" and\nnewline"}),
+            ..Default::default()
+        },
+    }];
+    jobs.extend((1..2048).map(|i| make_job(i, queue)));
+
+    let result = insert_many_copy_from_pool(&pool, &jobs).await.unwrap();
+    assert_eq!(result.len(), 2048);
+    let special = result
+        .iter()
+        .find(|row| row.kind == "copy_large_special")
+        .expect("special row inserted");
+    assert_eq!(special.args, special_args);
+    assert_eq!(special.tags, pathological_tags);
+    assert_eq!(special.metadata["note"], "comma, \"quote\" and\nnewline");
+}
+
 // ── Test 6: Unique constraint jobs ──────────────────────────────────
 
 #[tokio::test]

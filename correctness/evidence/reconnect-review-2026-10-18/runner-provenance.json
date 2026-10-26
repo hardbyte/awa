@@ -1,0 +1,6 @@
+{
+  "runner_sha256": "8f79ff13af03fdc82ff90d7bc0f61b4f3cff3053eecce8690ed6b98f715f6756",
+  "harness_head": "0e512e709fe928a43fa8edbb45a2a2c96bcea3db",
+  "harness_status": "M awa-bench/Cargo.lock",
+  "priorities": "1"
+}

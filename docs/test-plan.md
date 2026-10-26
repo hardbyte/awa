@@ -202,6 +202,8 @@ _HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not 
 | --- | ------------------------------------------------------------ | ---- |
 | AM1 | Heartbeat/progress-only UPDATEs do not dirty queues or kinds | ✓    |
 | AM2 | flush_dirty_admin_metadata() drains backlog > 100 keys       | ✓    |
+| AM3 | Enqueues inside application transactions never deadlock through dirty marks; ADR-045 lock contract over every trigger on `jobs_hot`/`scheduled_jobs`: allowlisted write targets only, no `ON CONFLICT`/`LOCK`/row locks, mark tables unconstrained, maintenance never `TRUNCATE`s | ✓    |
+| AM4 | Drain leaves marks of uncommitted transitions for the next pass (exact counts); concurrent re-schedules with drain + refresh never fail | ✓    |
 
 ### Benchmarks
 
@@ -244,6 +246,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA12 | AwaStorageLockOrder | Postgres lock ordering across claim, complete, cancel, rescue, rotate, and prune |
 | TLA13 | AwaStorageTransition | Storage-transition prepare, mixed-entry, finalize, and abort gates |
 | TLA14 | AwaDeadTupleContract | Hot-table reclaim-kind and partition-truncate contract |
+| TLA15 | AwaCanonicalDirtyMarks | Canonical dirty-key triggers never block a job transition and cannot close a waits-for cycle; `OnConflict` and `Incident` configs keep the v006 deadlock (including the 2026-09-12 production re-schedule pair) as expected counterexamples |
 
 The formal suite includes passing configs and expected-counterexample configs. The expected-counterexample configs keep historical bugs executable: old dispatch claim, old view trigger, naive segment race, old storage-transition gate, shard-ignorant prune, and deliberate lock-order cycles. Trace configs use a `TraceIncomplete` invariant as a positive witness: a valid trace violates that invariant after TLC consumes every event.
 

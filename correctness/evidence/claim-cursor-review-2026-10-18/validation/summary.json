@@ -1,0 +1,21 @@
+{
+  "runtime_head": "720b3b339a67811e644bc2c400e770c734342872",
+  "baseline_runtime_head": "a8a5eb8cdc751439065815751cf446d9b339e10d",
+  "source_ci": "https://github.com/hardbyte/awa/actions/runs/39079102590",
+  "local_final_gates": {
+    "fmt_clippy_build_focused_sql_regressions": 0,
+    "focused_sql_regressions_passed": 3
+  },
+  "negative_baseline": {
+    "baseline": "88f9a6906eb9a42f9ad8283ac1389ca64615d59f",
+    "expected_receipt_failures": 2,
+    "legacy_passed": true,
+    "cursor_observed": 1,
+    "cursor_expected": 3,
+    "isolated_build_target": "/home/brian/dev/awa-review-baseline-target"
+  },
+  "tlc_expected_checks": 53,
+  "discarded_exploratory_suite": "Parallel source variants collided in SQLx template cleanup and shared build output. Accepted local comparison isolates build output and serializes DB runs; full source CI is the full-suite gate.",
+  "source_ci_conclusion": "success",
+  "final_benchmark_driver_exit": 0
+}

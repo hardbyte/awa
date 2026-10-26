@@ -154,6 +154,64 @@ The queue-storage substrate ships aggressive per-table autovacuum storage parame
 
 Note that no autovacuum setting helps while a horizon is pinned — vacuum cannot reclaim what an open snapshot can still see. Rules 1–3 prevent the pin; rule 4 makes recovery fast after it releases.
 
+## Logical replication and CDC
+
+If the queue database is also a change-data-capture source (Debezium, a native
+`CREATE SUBSCRIPTION`, a managed CDC service), keep the awa schema out of the
+publication. awa's tables are a queue, not application state: every enqueue,
+claim, heartbeat and completion is a write, and a slot that decodes all of them
+retains WAL on the primary and ships traffic no consumer wants.
+
+**Recommended: publish only the application's tables.**
+
+```sql
+-- Native logical replication: list the tables or schemas you want.
+CREATE PUBLICATION app_changes FOR TABLES IN SCHEMA public;
+```
+
+With Debezium, `publication.autocreate.mode=all_tables` (the default) creates a
+`FOR ALL TABLES` publication; set `publication.autocreate.mode=filtered` and
+`schema.exclude.list=awa` (plus any custom queue-storage schema) so the
+connector creates a publication from its own include/exclude filters, or create
+the publication yourself and point the connector at it with `publication.name`.
+
+**If the awa schema does end up in a publication, awa still works.** Since
+schema v047 every awa table has a replica identity, so PostgreSQL accepts the
+UPDATE and DELETE statements the maintenance leader runs; earlier releases fail
+every maintenance tick with `cannot delete from table
+"queue_terminal_rollup_deltas" because it does not have a replica identity and
+publishes deletes` (see
+[Troubleshooting](troubleshooting.md#cannot-delete-from-table-because-it-does-not-have-a-replica-identity)).
+Tables with a primary key use it; `awa.job_unique_claims` uses its uniqueness
+index; the rest use `REPLICA IDENTITY FULL`:
+
+| Table | Why FULL | Cost |
+| --- | --- | --- |
+| `awa.admin_dirty_queue_marks`, `awa.admin_dirty_kind_marks` | ADR-045 forbids any index or constraint on them | A ~40-byte old-row image per mark the drain deletes |
+| `{schema}.queue_terminal_count_deltas` and its partitions | Append-only; reclaimed by `TRUNCATE`, never updated or deleted | None — identity only affects UPDATE/DELETE WAL |
+| `{schema}.queue_terminal_rollup_deltas` | Append-only; folded by a periodic `DELETE ... RETURNING` of a handful of rows | Negligible |
+
+What to expect when the queue is published:
+
+- **WAL volume and slot lag are driven by the queue traffic itself**, not by
+  the identity choice. `wal_level = logical` already logs old-row images for
+  FULL tables and extra transaction metadata for everything; the slot then has
+  to decode every job transition. Budget WAL retention (`max_slot_wal_keep_size`)
+  for the consumer's worst-case outage and alert on
+  `pg_replication_slots.confirmed_flush_lsn` lag — a stalled consumer pins WAL
+  on the primary and, once the slot's restart LSN falls behind, pins the MVCC
+  horizon the same way a long transaction does (see the section above).
+- **Prune is a `TRUNCATE`, and publications publish truncate by default.** Ring
+  prune reclaims a whole partition (`ready_entries_N`, `done_entries_N`,
+  `leases_N`, `lease_claims_N`, `queue_terminal_count_deltas_N`, ...) with
+  `TRUNCATE`, so a native subscriber truncates its copy of that partition and a
+  Debezium stream sees a truncate event unless `skipped.operations` includes
+  `t` (the default). Terminal job rows are never deleted row by row, so a
+  consumer that wants per-job delete events will not get them; a consumer that
+  mirrors the tables must also create the partitions.
+- Everything else behaves as without a publication: completion, unique jobs,
+  cron, the DLQ, batch operations and the admin UI are unaffected.
+
 ## Things that broke for us in staging — worth pre-empting
 
 These all eventually have fixes or workarounds, but each one cost hours the first time:

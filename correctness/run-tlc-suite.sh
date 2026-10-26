@@ -17,6 +17,15 @@ set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 SUITE='
+AwaClaimCursorFold.tla         ;; -                                      ;; pass ;; mixed-version cursor folding and prefix ranges
+AwaClaimCursorFold.tla         ;; AwaClaimCursorFoldNonPrefix.cfg         ;; NoSkippedLive is violated ;; non-prefix evidence cannot justify max cursor
+AwaClaimLaneScheduling.tla     ;; -                                      ;; pass ;; committed claim advances before next lane selection
+AwaClaimLaneScheduling.tla     ;; AwaClaimLaneSchedulingSkip.cfg          ;; NoEmptyWithEligibleLow is violated ;; skipped advance shadows another ready lane
+AwaAsyncClaimCursor.tla        ;; -                                      ;; pass ;; evidence-guarded async claim replay
+AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; NoSkippedJob is violated ;; lost claim on promoted standby witness
+AwaFinalizeReconnect.tla      ;; -                                      ;; pass ;; saved finalize replay after unknown commit acknowledgement
+AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectUnfenced.cfg        ;; NewerLeaseUnaffected is violated ;; old finalize changes a rescued and reclaimed attempt
+AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectSeparateFollowup.cfg ;; ResolvedFinalizeHasFollowup is violated ;; lost commit acknowledgement strands a separate follow-up
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
@@ -31,7 +40,22 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqRetry.cfg    ;; Dlq
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqPurge.cfg    ;; DlqPurgeTraceIncomplete is violated ;; DLQ purge trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Deadlock reached ;; broken trace rejected
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
+AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrder.cfg              ;; pass ;; segment-first queue prune with NOWAIT tail
+AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrderBlocking.cfg      ;; NoDeadlock is violated ;; old queue prune versus segment-first claim witness
+AwaStorageLockOrder.tla        ;; AwaWholeSchemaLockOrder.cfg             ;; pass ;; counter rebuild and reset take rotation locks before tables
+AwaStorageLockOrder.tla        ;; AwaWholeSchemaLockOrderRebuildUnordered.cfg ;; NoDeadlock is violated ;; rebuild without rotation lock versus ledger prune witness
+AwaStorageLockOrder.tla        ;; AwaWholeSchemaLockOrderResetUnordered.cfg ;; NoDeadlock is violated ;; reset without rotation locks versus ledger prune witness
+AwaRotationCadence.tla        ;; AwaRotationCadence.cfg                 ;; pass ;; observed fill age and eventual drain under stable leadership
+AwaRotationCadence.tla        ;; AwaRotationCadencePhysicalEmpty.cfg    ;; EmptyNeverWaits is violated ;; allocated empty lease heap witness
+AwaRotationCadence.tla        ;; AwaRotationCadenceOldClock.cfg         ;; YoungSmallSlotStaysOpen is violated ;; old slot timestamp witness
+AwaRotationCadence.tla        ;; AwaRotationCadenceHardCap.cfg          ;; TargetIsHardCap is violated ;; sampled size target permits batch overshoot
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueue.cfg     ;; pass ;; prepared lanes and producer lock order
+AwaStorageLockOrder.tla        ;; AwaStorageLockOrderPrepareQueueNumeric.cfg ;; NoDeadlock is violated ;; numeric stripe order inversion witness
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrderDeadlockDemo.cfg     ;; NoDeadlock is violated ;; deadlock detector witness
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrder.cfg            ;; pass ;; unique claim before enqueue lane
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimLockOrderBroken.cfg      ;; NoDeadlock is violated ;; old retry lane-before-claim witness
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKey.cfg             ;; pass ;; unique claims in key order
+AwaUniqueClaimLockOrder.tla    ;; AwaUniqueClaimMultiKeyBroken.cfg       ;; NoDeadlock is violated ;; reversed batch key-order witness
 AwaDeadTupleContract.tla       ;; AwaDeadTupleContract.cfg                ;; pass ;; architectural reclaim contract
 AwaStorageTransition.tla       ;; -                                       ;; pass ;; transition control plane + 0.7 migrate gate
 AwaQuiescedTransition.tla      ;; -                                       ;; pass ;; quiesced routing flip serializes snapshot evidence
@@ -43,6 +67,10 @@ AwaMigratedRescheduleUnique.tla ;; -                                      ;; pas
 AwaMigratedRescheduleUnique.tla ;; AwaMigratedRescheduleUniqueBroken.cfg  ;; NoUnclaimedExecutable is violated ;; old lost-claim successor witness
 AwaCanonicalUniqueRescue.tla   ;; -                                       ;; pass ;; per-row rescue fallback converges
 AwaCanonicalUniqueRescue.tla   ;; AwaCanonicalUniqueRescueBatchOnly.cfg   ;; Temporal property Convergence was violated ;; batch-only rescue starvation witness
+AwaCanonicalDirtyMarks.tla     ;; -                                       ;; pass ;; wait-free dirty marks: no hot-path wait, no cycle
+AwaCanonicalDirtyMarks.tla     ;; AwaCanonicalDirtyMarksOnConflict.cfg     ;; NoDeadlock is violated ;; v006 ON CONFLICT dirty-row deadlock witness
+AwaCanonicalDirtyMarks.tla     ;; AwaCanonicalDirtyMarksIncident.cfg       ;; NoDeadlock is violated ;; 2026-09-12 production re-schedule deadlock witness
+AwaCanonicalDirtyMarks.tla     ;; AwaCanonicalDirtyMarksIncidentWaitFree.cfg ;; pass ;; production interleavings under wait-free marks
 '
 
 failures=0

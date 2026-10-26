@@ -112,11 +112,15 @@ The key `QueueConfig` fields:
 
 Defaults intentionally favor the smallest blast radius: `enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise `enqueue_shards` only when the queue can accept partitioned FIFO semantics. For a single hot queue, a larger claim batch usually helps before extra claimers: it reduces claim round-trips without adding more concurrent head coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot keep worker permits full.
 
+A runtime with many queues or claimers also bounds how many claim round-trips it runs at once: `ClientBuilder::max_concurrent_claims` (default: a quarter of the pool, clamped to `4..=64`). Claims that find the gate full wait for a slot rather than opening another transaction, which keeps a large pool from turning hundreds of concurrently polling queues into Postgres lock-manager contention.
+
+With LISTEN available, consecutive empty polls back off to a 2 s cap (or `poll_interval` when larger). Notifications reset the backoff; periodic polling still recovers lost notifications. Poll-only runtimes retain `poll_interval`. The cap is internal, preserving existing `QueueConfig` struct literals. Shutdown bounds dispatcher exit and worker drain by the same timeout; a claim interrupted at expiry is recovered through the normal lease-rescue path.
+
 ### Partitioned Queues
 
 A logical queue is the application concept: for example `email` or `customer-updates`. A physical queue is the queue name Awa stores in Postgres and workers claim from. Most applications use one physical queue per logical queue.
 
-Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent durable claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
+Very hot workloads can partition one logical queue over multiple physical queues when the ordering contract allows it. This creates independent claim and completion streams. It is the most direct way to reduce hot-head coordination without weakening durability: each job is still written, claimed, leased, completed, retried, and rescued through the normal Awa tables.
 
 Rust producers and workers can share `PartitionedQueue`:
 
@@ -448,6 +452,17 @@ Pick them in this order:
 
 For a 5-second crash detection target: `heartbeat_interval=1s`, `heartbeat_staleness=4s`, `heartbeat_rescue_interval=1s`. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.
 
+A finished handler retains its result and retries durable finalization for up to 120 s
+from the first finalize attempt when database writes are unavailable. This includes
+pool-acquire timeouts and read-only-session errors during failover, as well as
+connection errors. A writable endpoint and usable pooled connections are required
+for recovery; changing DNS alone does not redirect existing read-only sessions.
+The retry budget is independent of heartbeat staleness. Rescue uses the last
+heartbeat or claim stamp, so it can become eligible before the 120 s expires;
+the next rescue sweep or an attempt deadline may claim a newer lease first.
+Keep handlers idempotent. Monitor `awa.completion.reconnect_retry` alongside
+pool waits and database errors; a retry count does not prove recovery.
+
 ### Deadline — bounding a single attempt
 
 Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
@@ -498,7 +513,7 @@ Queue storage is the runtime engine in `0.6`, and most deployments can keep the 
 
 ### Producer path choice
 
-For bulk producers on queue storage, prefer direct queue-storage COPY: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Those paths stream rows straight into `ready_entries` / `deferred_jobs` and use the queue-storage enqueue heads directly.
+For bulk producers on queue storage, prefer direct queue-storage COPY: Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`. Those paths write straight into `ready_entries` / `deferred_jobs` and use the queue-storage enqueue heads directly. In 0.7, each ready or deferred write group uses array-backed INSERT below 2,048 rows and CSV COPY at or above that cutoff; the API and transactional enqueue semantics are unchanged.
 
 Direct-copy producers must use the same queue-storage routing config as the worker fleet. This matters most for `queue_stripe_count` / `queue_storage_queue_stripe_count`: a producer using the default unstriped config can write to `queue` while striped workers claim from `queue#0`, `queue#1`, etc. Rust producers should construct `QueueStorage` with the same `QueueStorageConfig` used by workers. Python producers should pass the same `queue_storage_queue_stripe_count` to `enqueue_many_copy()` when the fleet uses non-default striping.
 
@@ -562,8 +577,13 @@ await client.start(
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `1000ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions. |
+| `ring_rotation_cadence` | 5 s / 2 MiB target / 256 rows / 60 s | A non-empty slot becomes eligible after `min_slot_age` since the first non-empty observation once it holds `min_slot_rows`, when `target_slot_bytes` is reached, or after `max_slot_age` regardless of rows (so a trickle of writes neither seals a nearly empty slot every window nor keeps one open indefinitely). Python: `queue_storage_rotate_min_slot_rows`, `queue_storage_rotate_max_slot_age_ms`. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. The minimum age uses a monotonic clock and resets on an empty observation or leader change; `max_slot_age` also counts from when the slot opened on the database clock, so a leader change does not restart it, except under compat (pre-flip) authority when an older rotator left no ledger row for the slot. `max_slot_age` makes a slot eligible to seal; the busy and reuse checks still decide when it is reclaimed. Configure with `ClientBuilder::ring_rotation_cadence` (Rust) or `queue_storage_rotate_min_slot_age_ms` / `queue_storage_rotate_target_slot_bytes` (Python). A zero byte target disables the size trigger, a zero `min_slot_rows` disables the row floor, and a zero `max_slot_age` disables the ceiling. A row floor needs a size target or a ceiling, and a queue-storage client refuses to build without one, because lease rows are deleted as attempts finish and a lease slot may never reach the floor. A zero `min_slot_age`, or `RingRotationCadence::EAGER`, permits sealing on every tick whatever the other settings. The target is sampled and does not bound retained storage. |
 
 The benchmark harness in [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking) reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.
+
+Rust builder overrides for cadence and claim rotation interval may be set before
+or after `queue_storage`; reconfiguring storage preserves those overrides. With
+no claim interval override, the claim ring uses the queue decision interval.
 
 Use the defaults unless you have a reason not to:
 
@@ -598,7 +618,7 @@ Lowering the value is safe at any time. See [ADR-025](adr/025-sharded-enqueue-he
 
 ### Hot-Queue Claim Control
 
-Queue storage also uses a bounded-claimer control plane (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a hot queue's claim path at once. For a single hot queue, raising `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's `max_workers` / `min_workers` permits.
+Queue storage also uses a bounded-claimer control plane (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a hot queue's claim path at once. In 0.7, each instance may reuse its claimer lease and target check for up to 250 ms, bypassing the cache within one second of lease expiry. Target reductions constrain new acquisition; existing owned slots remain valid. These are coordination hints: job ownership still comes from the database claim transaction. Reset clears the local cache after truncating the coordination leases. For a single hot queue, raising `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops while still sharing the queue's `max_workers` / `min_workers` permits.
 
 Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4` is the change that turns overload into bounded end-to-end throughput; raising `claimers` to `4` increases transaction pressure and worsens tail latency in that shape. For extreme single-queue workloads, raise `enqueue_shards` first when the ordering contract allows partitioned FIFO. Benchmark `claimers = 2` or `4` only for a workload-specific reason, and judge the result by durable completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed job, transaction commits per completed job, and dead tuples. Lower `claim_batch_size` from `512` for small or latency-sensitive queues; raise claimers only with workload-specific evidence.
 

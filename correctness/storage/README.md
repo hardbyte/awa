@@ -136,9 +136,17 @@ Run the broken correlated-hash witness with:
 ./correctness/run-tlc.sh storage/AwaPartitionedQueueRouting.tla storage/AwaPartitionedQueueRoutingBroken.cfg
 ```
 
+## Rotation cadence
+
+[`AwaRotationCadence.tla`](./AwaRotationCadence.tla) covers scheduling separately from lifecycle safety. Rows and allocated bytes are distinct: DELETE can empty a lease heap while physical storage remains. Observed age starts at the first non-empty decision and resets on an empty observation, generation change or leader change. The passing configuration checks that empty slots never wait for fill age, young small slots stay open, and already-prunable storage eventually drains after writes and leader changes stop. That progress claim assumes continuing ticks and eventual successful prune opportunities; it does not cover permanently blocked jobs or locks. The model retains the Rust oldest-slot selection during initial ring fill and after wrap.
+
+Three negative configurations reproduce using allocated bytes as row presence, using an old slot timestamp for new traffic, and interpreting a sampled byte target as a hard cap. These complement PostgreSQL regressions and the existing storage model's closure and reuse invariants. The model uses three slots and abstract byte units and makes no wall-clock latency or total-storage guarantee.
+
 ## Lock-order companion spec
 
-[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each storage-engine transaction (claim, rotate-leases, prune-leases, rotate-ready, prune-ready) as an ordered sequence of Postgres lock acquisitions, with a simplified shared/exclusive compatibility matrix that captures the cases relevant to deadlock analysis. Invariants:
+[`AwaUniqueClaimLockOrder.tla`](./AwaUniqueClaimLockOrder.tla) checks three row-level lock orders omitted by the partition-level model below. Its passing configurations cover a producer and DLQ retry acquiring a unique claim before the enqueue lane, two batches acquiring unique claims in key order, and pruning versus counter rebuild or reset acquiring the queue-ring singleton before the done child. The corresponding `*Broken.cfg` configurations reproduce a waits-for cycle for each old inverse order. Each scenario has two transactions and two exclusive resources; it checks ordering, while PostgreSQL integration tests cover the actual SQL paths.
+
+[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models storage transactions, including queue preparation, enqueue, claim, rotate, and prune, as ordered Postgres lock acquisitions with a simplified shared/exclusive compatibility matrix. Invariants:
 
 - `NoDeadlock`: the waits-for graph is acyclic
 - `LockCompatibility`: no two incompatible locks on the same resource
@@ -147,13 +155,21 @@ Run the broken correlated-hash witness with:
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. This is the positive artifact saying the current SQL lock ordering is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. It checks the represented lock plans; implicit resources absent from a plan are outside the proof.
+- [`AwaQueuePruneLockOrder.cfg`](./AwaQueuePruneLockOrder.cfg): segment-first claim readers and entry-first producers versus queue pruning. Prune waits on routing first and aborts the entire transaction if any later `NOWAIT` lock conflicts. Both authority modes use that tail. This proves cycle avoidance at the represented lock level, not successful pruning under perpetual contention.
+- [`AwaQueuePruneLockOrderBlocking.cfg`](./AwaQueuePruneLockOrderBlocking.cfg): old body-first blocking prune versus the segment-first reader; TLC must find the cycle captured during the saturation benchmark. The main claim plans now include the previously omitted routing-child read.
+- [`AwaWholeSchemaLockOrder.cfg`](./AwaWholeSchemaLockOrder.cfg): counter rebuild and reset versus every ring's rotate, prune and rollup, across the authority flip. Both whole-schema operations wait for the per-ring rotation locks before the ring-state singletons and their table locks. A ledger tick holds only the rotation lock before its child locks, and a tick promoted to ledger while queued on the singleton try-locks it.
+- [`AwaWholeSchemaLockOrderRebuildUnordered.cfg`](./AwaWholeSchemaLockOrderRebuildUnordered.cfg) and [`AwaWholeSchemaLockOrderResetUnordered.cfg`](./AwaWholeSchemaLockOrderResetUnordered.cfg): the same operations without the rotation locks. TLC finds the cycle against a ledger prune, which holds a done child and then inserts its carry-forward through the done parent. The configuration checks two transactions and one slot per ring against the maintenance ticks and the flip; it is evidence for this ordering, not a proof against deadlocks with foreground work or migrations, which it does not model.
+- [`AwaStorageLockOrderPrepareQueue.cfg`](./AwaStorageLockOrderPrepareQueue.cfg): producer and preparer both lock `q#10` before `q#2`, matching the string order of the batched Rust producer path.
+- [`AwaStorageLockOrderPrepareQueueNumeric.cfg`](./AwaStorageLockOrderPrepareQueueNumeric.cfg): numeric preparation order locks `q#2` before `q#10`; TLC finds a waits-for cycle against a producer.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg): sanity harness using a deliberately cycle-creating pair of plans — **NoDeadlock tripped in 5 steps** (confirms the checker works).
 
 Run:
 
 ```bash
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderPrepareQueue.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderPrepareQueueNumeric.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ```
 
@@ -265,6 +281,14 @@ Expected outcomes:
 
 See [`MAPPING.md`](./MAPPING.md#trace-validation) for the full description of how to transcribe and add a new trace.
 
+## Finalize replay after reconnect
+
+[`AwaFinalizeReconnect.tla`](./AwaFinalizeReconnect.tla) separates committing a saved handler outcome from receiving its acknowledgement. A connection failure may occur before commit or after the database committed. The same saved request can then be replayed while rescue and a new claim advance the job's lease. Completion, retry, snooze, cancellation, terminal failure and callback parking abstract to their resulting database states; the handler is never re-executed by a replay.
+
+The model includes one registered follow-up for each eventful outcome and none for snooze, matching the public outcome registry. The passing configuration checks at most one accepted finalize and its transactional follow-up, rejection of an old request against a newer lease, and acknowledgement consistency. `AwaFinalizeReconnectUnfenced.cfg` demonstrates the stale-worker mutation when only the running state is checked. `AwaFinalizeReconnectSeparateFollowup.cfg` demonstrates why a follow-up cannot depend on receiving the finalize acknowledgement: a committed finalize with a lost response is stale on replay, leaving the separate follow-up absent.
+
+This is a safety model with two lease identities and one saved handler result. It assumes committed transactions persist across reconnects; it does not model failover data loss, callback payload/token protocols, lifecycle-event delivery, resource capacity, shutdown, elapsed time or eventual database recovery. Rescue's separate best-effort follow-ups are outside the model. SQL and runtime regressions remain necessary for the concrete implementation; the model makes no liveness or retry-window guarantee.
+
 ## Known modelling gaps
 
 See [`../README.md`](../README.md) for the full Known Divergences list. Specific to this spec:
@@ -273,3 +297,7 @@ See [`../README.md`](../README.md) for the full Known Divergences list. Specific
 - **Enqueue-shard routing is split across specs.** The base storage model uses one `(queue, priority, enqueue_shard)` lane. Cross-shard `lane_seq` collisions are checked by `AwaShardedPrune`, but the producer shard chooser, per-queue `enqueue_shards` changes, and projection exactness across shards remain code-tested rather than represented in a single unified TLA+ state.
 - **DLQ bulk ops are modelled as quantified single-row actions.** The Rust `bulk_retry_from_dlq` / `purge_dlq` paths are transactionally atomic across the matching rows; the spec explores arbitrary interleavings of individual `RetryFromDlq(j)` / `PurgeDlq(j)` which is a strictly weaker claim. Safety invariants hold under both framings; a refinement with a `BulkScope` set variable could tighten this.
 - **Unique-claim conflicts on `retry_from_dlq`.** The Rust contract says retry-from-dlq returns `UniqueConflict` and leaves the DLQ row intact when a replacement owns the unique slot. The model doesn't have unique keys, so TLC simply explores `RetryFromDlq(j)` whenever the precondition holds. Preserving-the-DLQ-row-on-conflict is enforced in SQL (`awa-model/src/queue_storage.rs::sync_unique_claim`).
+
+`AwaAsyncClaimCursor.tla` refines async claim acknowledgment, WAL durability, standby promotion and post-commit sequence replay. Its safe config checks no skipped jobs; `AwaAsyncClaimCursorUnguarded.cfg` preserves the lost-claim cursor-skip counterexample.
+
+`AwaClaimCursorFold` covers v048's prefix/range proof, post-commit advances for every claim, and in-claim recovery when an advance is lost, including gaps, tombstones, legacy leases and segment changes. Its non-prefix config is an expected counterexample. `AwaClaimLaneScheduling` checks the two-lane dispatch case: the fixed policy reaches the lower-priority ready lane on the next poll, while the old skip policy produces an empty poll. See `MAPPING.md` for SQL premises and the separate asynchronous durability boundary.

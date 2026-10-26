@@ -1,0 +1,78 @@
+{
+  "measurements": [
+    {
+      "build": "baseline",
+      "cell": "reference",
+      "handler_returns_per_second": 800.0447016383941,
+      "handler_window_p99_median_ms": 73.023,
+      "handler_window_p99_worst_ms": 150.015,
+      "pg_class_updates_per_second": 9.251063829787235,
+      "queue_depth_mean": 13.375,
+      "queue_depth_maximum": 40.0,
+      "ring_mib_mean": 41.077962239583336,
+      "queue_warmup_generations": 79.0,
+      "claim_warmup_generations": 36.0
+    },
+    {
+      "build": "baseline",
+      "cell": "saturation",
+      "handler_returns_per_second": 3690.7335422876727,
+      "handler_window_p99_median_ms": 943.103,
+      "handler_window_p99_worst_ms": 1789.951,
+      "pg_class_updates_per_second": 5.804255319148937,
+      "queue_depth_mean": 1860.0208333333333,
+      "queue_depth_maximum": 3232.0,
+      "ring_mib_mean": 273.1097005208333,
+      "queue_warmup_generations": 57.0,
+      "claim_warmup_generations": 40.0
+    },
+    {
+      "build": "candidate",
+      "cell": "reference",
+      "handler_returns_per_second": 800.0168174770303,
+      "handler_window_p99_median_ms": 69.535,
+      "handler_window_p99_worst_ms": 182.015,
+      "pg_class_updates_per_second": 9.485106382978723,
+      "queue_depth_mean": 12.104166666666666,
+      "queue_depth_maximum": 21.0,
+      "ring_mib_mean": 40.449381510416664,
+      "queue_warmup_generations": 78.0,
+      "claim_warmup_generations": 35.0
+    },
+    {
+      "build": "candidate",
+      "cell": "saturation",
+      "handler_returns_per_second": 2022.6019049058166,
+      "handler_window_p99_median_ms": 2707.455,
+      "handler_window_p99_worst_ms": 8970.239,
+      "pg_class_updates_per_second": 4.591489361702127,
+      "queue_depth_mean": 3564.0833333333335,
+      "queue_depth_maximum": 3998.0,
+      "ring_mib_mean": 199.84244791666666,
+      "queue_warmup_generations": 53.0,
+      "claim_warmup_generations": 37.0
+    }
+  ],
+  "host_load": {
+    "load1": {
+      "median": 10.614999999999998,
+      "maximum": 20.68
+    },
+    "cpu_some_avg10_pct": {
+      "median": 1.03,
+      "maximum": 33.52
+    },
+    "io_some_avg10_pct": {
+      "median": 32.945,
+      "maximum": 46.06
+    },
+    "io_full_avg10_pct": {
+      "median": 22.27,
+      "maximum": 36.17
+    },
+    "memory_full_avg10_pct": {
+      "median": 0.0,
+      "maximum": 0.53
+    }
+  }
+}

@@ -77,6 +77,40 @@ pub enum AwaError {
     TokioPg(#[source] tokio_postgres::Error),
 }
 
+impl AwaError {
+    /// Postgres aborted this transaction to break a lock cycle (SQLSTATE
+    /// `40P01`). Nothing the transaction did was applied, so a caller whose
+    /// statements are idempotent may simply run it again.
+    pub fn is_deadlock(&self) -> bool {
+        matches!(
+            self,
+            AwaError::Database(sqlx::Error::Database(database))
+                if database.code().as_deref() == Some("40P01")
+        )
+    }
+
+    /// Database writes are unavailable because of a transport, TLS, protocol,
+    /// pool-acquire, server-availability or read-only-session error.
+    ///
+    /// A retry may recover, but the transaction may already have committed:
+    /// callers must establish replay safety independently before retrying it.
+    pub fn is_connection_lost(&self) -> bool {
+        match self {
+            AwaError::Database(sqlx::Error::Io(_))
+            | AwaError::Database(sqlx::Error::PoolTimedOut)
+            | AwaError::Database(sqlx::Error::Protocol(_))
+            | AwaError::Database(sqlx::Error::Tls(_)) => true,
+            AwaError::Database(sqlx::Error::Database(database)) => {
+                database.code().is_some_and(|code| {
+                    code.starts_with("08")
+                        || matches!(code.as_ref(), "57P01" | "57P02" | "57P03" | "25006")
+                })
+            }
+            _ => false,
+        }
+    }
+}
+
 impl From<sqlx::Error> for AwaError {
     fn from(err: sqlx::Error) -> Self {
         AwaError::Database(err)
@@ -101,4 +135,84 @@ pub fn map_sqlx_error(err: sqlx::Error) -> AwaError {
         }
     }
     AwaError::Database(err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AwaError;
+    use std::borrow::Cow;
+
+    #[derive(Debug)]
+    struct StubDatabaseError(&'static str);
+
+    impl std::fmt::Display for StubDatabaseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "sqlstate {}", self.0)
+        }
+    }
+
+    impl std::error::Error for StubDatabaseError {}
+
+    impl sqlx::error::DatabaseError for StubDatabaseError {
+        fn message(&self) -> &str {
+            "stub"
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.0))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn sqlstate(code: &'static str) -> AwaError {
+        AwaError::Database(sqlx::Error::Database(Box::new(StubDatabaseError(code))))
+    }
+
+    #[test]
+    fn connection_lost_covers_transport_pool_and_server_shutdown_errors() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(AwaError::Database(sqlx::Error::Io(io)).is_connection_lost());
+        assert!(AwaError::Database(sqlx::Error::PoolTimedOut).is_connection_lost());
+        assert!(
+            AwaError::Database(sqlx::Error::Tls(Box::new(std::io::Error::other(
+                "TLS failure"
+            ))))
+            .is_connection_lost()
+        );
+        assert!(
+            AwaError::Database(sqlx::Error::Protocol("unexpected response".into()))
+                .is_connection_lost()
+        );
+        for code in [
+            "08000", "08003", "08006", "57P01", "57P02", "57P03", "25006",
+        ] {
+            assert!(sqlstate(code).is_connection_lost(), "{code}");
+        }
+    }
+
+    #[test]
+    fn connection_lost_excludes_statement_and_pool_shutdown_errors() {
+        assert!(!AwaError::Database(sqlx::Error::PoolClosed).is_connection_lost());
+        assert!(!AwaError::Database(sqlx::Error::RowNotFound).is_connection_lost());
+        assert!(!AwaError::Validation("completion batch flush failed".into()).is_connection_lost());
+        for code in ["40P01", "23505", "42P01", "57014"] {
+            assert!(!sqlstate(code).is_connection_lost(), "{code}");
+        }
+        assert!(sqlstate("40P01").is_deadlock());
+    }
 }

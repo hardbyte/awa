@@ -5,7 +5,7 @@ use sqlx::{Connection, PgPool};
 use tracing::{info, warn};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 45;
+pub const CURRENT_VERSION: i32 = 50;
 
 /// Migrations that require an exclusive (no-live-runtime) upgrade window.
 ///
@@ -65,6 +65,13 @@ pub struct MigrateOptions {
 /// This ensures running workers are not broken by a schema upgrade.
 /// Representation changes require a release-specific compatibility and
 /// authority-transition procedure.
+///
+/// A step that loops over queue-storage schemas selects them with
+/// `awa.queue_storage_schemas()`. Its discovery bootstrap is included in
+/// `V23_UP` and prepended to standalone discovery steps, including SQL exports.
+/// This hardens pending historical steps before they can evaluate untrusted
+/// objects; an appended migration would run too late. Applied versions are
+/// never replayed automatically, and the runner does not store checksums.
 ///
 /// **v043 (#371) stays additive.** The ring cursors move to append-only
 /// `{ring}_ring_rotations` ledgers, but v043 is the *expand* phase of a
@@ -162,17 +169,17 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         23,
         "Install default awa queue-storage substrate via SQL helper",
-        &[V23_UP],
+        &[V23_UP, V23_DEFAULT_UP],
     ),
     (
         24,
         "Lower fillfactor to 50 on leases and lease_claims partitions",
-        &[V24_UP],
+        &[SCHEMA_DISCOVERY_UP, V24_UP],
     ),
     (
         25,
         "Drop idx_<schema>_leases_<slot>_state_hb on all AWA substrates",
-        &[V25_UP],
+        &[SCHEMA_DISCOVERY_UP, V25_UP],
     ),
     (
         26,
@@ -182,33 +189,33 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         27,
         "Move lane cursors to sequences and stripe terminal counters",
-        &[V23_UP, V22_UP, V27_UP],
+        &[V23_UP, V23_DEFAULT_UP, V22_UP, V27_UP],
     ),
     (
         28,
         "Add ready_tombstones ledger and compatibility filters (#295)",
-        &[V23_UP, V22_UP, V28_UP],
+        &[V23_UP, V23_DEFAULT_UP, V22_UP, V28_UP],
     ),
     (29, "Add durable batch operations control table", &[V29_UP]),
     (
         30,
         "Add terminal-count delta ledger and async rollup",
-        &[V23_UP, V30_UP],
+        &[V23_UP, V23_DEFAULT_UP, V30_UP],
     ),
     (
         31,
         "Backfill failed done-entry metric indexes for queue storage",
-        &[V31_UP],
+        &[SCHEMA_DISCOVERY_UP, V31_UP],
     ),
     (
         32,
         "Add pruned_failed_count to queue_terminal_rollups for the failed terminal retention floor",
-        &[V32_UP],
+        &[SCHEMA_DISCOVERY_UP, V32_UP],
     ),
     (
         33,
         "Add per-slot receipt-rescue cursors for queue storage",
-        &[V23_UP, V33_UP],
+        &[V23_UP, V23_DEFAULT_UP, V33_UP],
     ),
     (
         34,
@@ -218,27 +225,27 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         35,
         "Add per-slot receipt deadline-rescue cursors for queue storage",
-        &[V35_UP],
+        &[SCHEMA_DISCOVERY_UP, V35_UP],
     ),
     (
         36,
         "Compact successful receipt completions into batch terminal history",
-        &[V18_UP, V23_UP, V36_UP],
+        &[V18_UP, V23_UP, V23_DEFAULT_UP, V36_UP],
     ),
     (
         37,
         "Add ready_segments claim-routing ledger for queue storage",
-        &[V18_UP, V23_UP, V37_UP],
+        &[V18_UP, V23_UP, V23_DEFAULT_UP, V37_UP],
     ),
     (
         38,
         "Add compact receipt claim batch ledger for queue storage",
-        &[V23_UP, V38_UP],
+        &[V23_UP, V23_DEFAULT_UP, V38_UP],
     ),
     (
         39,
         "Refresh claim_ready_runtime to cache-free ready-segment routing",
-        &[V23_UP, V39_UP],
+        &[V23_UP, V23_DEFAULT_UP, V39_UP],
     ),
     (
         40,
@@ -249,12 +256,12 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         42,
         "Compact deadline receipt claims and batch deadline-rescue cursors (#246)",
-        &[V23_UP, V42_UP],
+        &[V23_UP, V23_DEFAULT_UP, V42_UP],
     ),
     (
         43,
         "Append-only ring-rotation ledgers and terminal-rollup deltas (#371)",
-        &[V18_UP, V23_UP, V43_UP],
+        &[V18_UP, V23_UP, V23_DEFAULT_UP, V43_UP],
     ),
     (
         44,
@@ -262,6 +269,27 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         &[V44_UP],
     ),
     (45, "Owner-scoped periodic reconciliation (#481)", &[V45_UP]),
+    (46, "Wait-free admin dirty-key marks", &[V46_UP]),
+    (
+        47,
+        "Replica identity for tables without a primary key",
+        &[V23_UP, V23_DEFAULT_UP, V47_UP],
+    ),
+    (
+        48,
+        "Claim cursor catch-up inside the claim",
+        &[V23_UP, V23_DEFAULT_UP, V48_UP],
+    ),
+    (
+        49,
+        "Use provisioned lane sequences without runtime DDL",
+        &[V23_UP, V49_UP],
+    ),
+    (
+        50,
+        "Drop the redundant lane index on ready_entries partitions",
+        &[V23_UP, V50_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -285,7 +313,14 @@ const V19_UP: &str = include_str!("../migrations/v019_queue_storage_jobs_compat_
 const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schema_fallback.sql");
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
-const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
+const SCHEMA_DISCOVERY_UP: &str = include_str!("../migrations/queue_storage_schema_discovery.sql");
+const V23_UP: &str = concat!(
+    include_str!("../migrations/queue_storage_schema_discovery.sql"),
+    "\n",
+    include_str!("../migrations/v023_install_queue_storage_substrate.sql"),
+);
+const V23_DEFAULT_UP: &str =
+    include_str!("../migrations/v023_install_default_queue_storage_substrate.sql");
 const V24_UP: &str = include_str!("../migrations/v024_receipt_plane_fillfactor.sql");
 const V25_UP: &str = include_str!("../migrations/v025_drop_leases_state_hb_index.sql");
 const V26_UP: &str = include_str!("../migrations/v026_cron_jobs_pause.sql");
@@ -308,6 +343,11 @@ const V42_UP: &str = include_str!("../migrations/v042_compact_deadline_claims.sq
 const V43_UP: &str = include_str!("../migrations/v043_ring_rotation_ledger.sql");
 const V44_UP: &str = include_str!("../migrations/v044_jobs_compat_receipt_running.sql");
 const V45_UP: &str = include_str!("../migrations/v045_cron_reconciliation.sql");
+const V46_UP: &str = include_str!("../migrations/v046_wait_free_dirty_marks.sql");
+const V47_UP: &str = include_str!("../migrations/v047_replica_identity.sql");
+const V48_UP: &str = include_str!("../migrations/v048_claim_cursor_catch_up.sql");
+const V49_UP: &str = include_str!("../migrations/v049_prepared_lane_sequences.sql");
+const V50_UP: &str = include_str!("../migrations/v050_drop_ready_lane_shard_index.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
@@ -415,11 +455,7 @@ async fn run_migration_transaction(
 }
 
 fn is_migration_deadlock(error: &AwaError) -> bool {
-    matches!(
-        error,
-        AwaError::Database(sqlx::Error::Database(database))
-            if database.code().as_deref() == Some("40P01")
-    )
+    error.is_deadlock()
 }
 
 async fn apply_migrations(
@@ -1056,6 +1092,26 @@ pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_bundles_bootstrap_before_discovery_and_default_installation() {
+        for (version, _, sql) in migration_sql() {
+            let Some(discovery) = sql.find("FROM awa.queue_storage_schemas() AS discovered") else {
+                continue;
+            };
+            let bootstrap = sql
+                .find("CREATE OR REPLACE FUNCTION awa.queue_storage_schemas()")
+                .unwrap_or_else(|| panic!("migration {version} needs its discovery bootstrap"));
+            let preflight = sql.find("DO $preflight$").unwrap_or_else(|| {
+                panic!("migration {version} needs its default-schema preflight")
+            });
+            assert!(bootstrap < discovery, "migration {version}");
+            assert!(preflight < discovery, "migration {version}");
+            if let Some(default_install) = sql.find("SELECT awa.install_queue_storage_substrate(") {
+                assert!(preflight < default_install, "migration {version}");
+            }
+        }
+    }
 
     /// Strip SQL line comments, block comments, single-quoted literals, and
     /// dollar-quoted bodies, leaving only top-level statement text.

@@ -1492,12 +1492,12 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM awa.admin_dirty_queues WHERE queue = ANY($1)")
+    sqlx::query("DELETE FROM awa.admin_dirty_queue_marks WHERE queue = ANY($1)")
         .bind(our_queues)
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM awa.admin_dirty_kinds WHERE kind = ANY($1)")
+    sqlx::query("DELETE FROM awa.admin_dirty_kind_marks WHERE kind = ANY($1)")
         .bind(our_kinds)
         .execute(&mut *tx)
         .await
@@ -1654,8 +1654,8 @@ async fn drain_dirty_for(
             .await
             .unwrap();
         let remaining: i64 = sqlx::query_scalar(
-            "SELECT (SELECT count(*) FROM awa.admin_dirty_queues WHERE queue = ANY($1))
-                  + (SELECT count(*) FROM awa.admin_dirty_kinds WHERE kind = ANY($2))",
+            "SELECT (SELECT count(*) FROM awa.admin_dirty_queue_marks WHERE queue = ANY($1))
+                  + (SELECT count(*) FROM awa.admin_dirty_kind_marks WHERE kind = ANY($2))",
         )
         .bind(queues)
         .bind(kinds)
@@ -1817,15 +1817,20 @@ async fn test_heartbeat_progress_updates_do_not_dirty_admin_metadata() {
         .await
         .unwrap();
 
-    // Clear the dirty tables completely
-    sqlx::query("DELETE FROM awa.admin_dirty_queues")
+    // Clear this test's own marks. Other test binaries share the database,
+    // and a whole-table delete would swallow marks their transitions rely on.
+    sqlx::query("DELETE FROM awa.admin_dirty_queue_marks WHERE queue = $1")
+        .bind(queue)
         .execute(client.pool())
         .await
         .unwrap();
-    sqlx::query("DELETE FROM awa.admin_dirty_kinds")
-        .execute(client.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "DELETE FROM awa.admin_dirty_kind_marks WHERE kind IN (SELECT kind FROM awa.jobs WHERE queue = $1)",
+    )
+    .bind(queue)
+    .execute(client.pool())
+    .await
+    .unwrap();
 
     // Heartbeat-only update (no state/queue/kind change)
     sqlx::query("UPDATE awa.jobs_hot SET heartbeat_at = now() WHERE queue = $1")
@@ -1845,7 +1850,7 @@ async fn test_heartbeat_progress_updates_do_not_dirty_admin_metadata() {
     // We check by queue name (unique to this test) rather than count(*)
     // because concurrent parallel tests may dirty other queues/kinds.
     let dirty_for_queue: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues WHERE queue = $1")
+        sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queue_marks WHERE queue = $1")
             .bind(queue)
             .fetch_one(client.pool())
             .await
@@ -1904,7 +1909,7 @@ async fn test_flush_dirty_admin_metadata_drains_full_backlog() {
     // binaries share the database and can write fresh dirty markers between
     // our flush and this assertion, so a global count(*) is racy.
     let dirty_after: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM awa.admin_dirty_queues WHERE queue LIKE 'integ_flush_backlog_%'",
+        "SELECT count(*) FROM awa.admin_dirty_queue_marks WHERE queue LIKE 'integ_flush_backlog_%'",
     )
     .fetch_one(client.pool())
     .await

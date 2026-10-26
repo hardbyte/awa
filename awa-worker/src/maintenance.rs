@@ -503,13 +503,13 @@ impl MaintenanceBranchTracker {
 /// lease / claim ring-rotation branches. The rotate step is always
 /// cheap (cursor advance under an advisory lock); the prune step is
 /// what hurts under pinned MVCC: every tick attempts a best-effort child
-/// `ACCESS EXCLUSIVE NOWAIT` lock followed by a bounded liveness check.
+/// exclusive child lock and liveness checks.
 /// Under a pinned snapshot the child can't be reclaimed, so prune
-/// returns `SkippedActive` or `Blocked` repeatedly. This tracker skips
-/// the next 2^level ticks (capped at 32) after a `SkippedActive` or
-/// `Blocked` outcome, doubling on each repeat. A successful `Pruned`
-/// resets to no backoff. `Noop` (ring empty / nothing to consider)
-/// leaves state unchanged — backoff is for "I tried and couldn't",
+/// returns `SkippedActive` repeatedly. This tracker skips the next
+/// 2^level ticks (capped at 32) after `SkippedActive`, doubling on each
+/// repeat. `Blocked` is transient lock contention and retries next tick;
+/// it and a successful `Pruned` reset to no backoff. `Noop` (nothing to
+/// consider) leaves state unchanged — backoff is for "I tried and couldn't",
 /// not "there's nothing to do."
 #[derive(Default)]
 struct PruneBackoffTracker {
@@ -556,8 +556,8 @@ impl PruneBackoffTracker {
         }
     }
 
-    /// Update backoff state for a completed prune call. `Pruned` resets;
-    /// `SkippedActive` / `Blocked` doubles; no-work outcomes are neutral.
+    /// Update backoff state: active data backs off, lock contention retries
+    /// next tick, successful pruning resets, and no-work outcomes are neutral.
     fn record_outcome(&self, branch: &'static str, outcome: &PruneOutcome) {
         let mut branches = self.branches.lock().expect("prune backoff tracker mutex");
         let state = branches.entry(branch).or_default();
@@ -569,7 +569,11 @@ impl PruneBackoffTracker {
                 state.backoff_level = 0;
                 state.last_pruned = Some((*slot, *generation));
             }
-            PruneOutcome::SkippedActive { .. } | PruneOutcome::Blocked { .. } => {
+            PruneOutcome::Blocked { .. } => {
+                state.skip_remaining = 0;
+                state.backoff_level = 0;
+            }
+            PruneOutcome::SkippedActive { .. } => {
                 state.backoff_level = state
                     .backoff_level
                     .saturating_add(1)
@@ -963,6 +967,9 @@ impl MaintenanceService {
 
             debug!("Elected as maintenance leader");
             self.leader.store(true, Ordering::SeqCst);
+            if let Some(runtime) = self.storage.queue_storage() {
+                runtime.store.reset_rotation_observations();
+            }
 
             // Run maintenance tasks as leader
             let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);
@@ -2653,7 +2660,11 @@ impl MaintenanceService {
             return;
         };
 
-        let idle_cursor = match runtime.store.rotate(&self.pool).await {
+        let idle_cursor = match runtime
+            .store
+            .rotate_with_cadence(&self.pool, runtime.rotation_cadence)
+            .await
+        {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("queue", &outcome);
                 let idle_cursor = match &outcome {
@@ -2679,6 +2690,12 @@ impl MaintenanceService {
                     }
                     RotateOutcome::SkippedIdle { slot, generation } => {
                         debug!(slot, generation, "Skipped idle queue storage queue segment");
+                    }
+                    RotateOutcome::SkippedFilling { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage queue segment still filling"
+                        );
                     }
                 }
                 idle_cursor
@@ -2764,7 +2781,11 @@ impl MaintenanceService {
             return;
         };
 
-        let idle_cursor = match runtime.store.rotate_leases(&self.pool).await {
+        let idle_cursor = match runtime
+            .store
+            .rotate_leases_with_cadence(&self.pool, runtime.rotation_cadence)
+            .await
+        {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("lease", &outcome);
                 let idle_cursor = match &outcome {
@@ -2784,6 +2805,12 @@ impl MaintenanceService {
                     }
                     RotateOutcome::SkippedIdle { slot, generation } => {
                         debug!(slot, generation, "Skipped idle queue storage lease segment");
+                    }
+                    RotateOutcome::SkippedFilling { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage lease segment still filling"
+                        );
                     }
                 }
                 idle_cursor
@@ -2855,7 +2882,11 @@ impl MaintenanceService {
             return;
         };
 
-        let idle_cursor = match runtime.store.rotate_claims(&self.pool).await {
+        let idle_cursor = match runtime
+            .store
+            .rotate_claims_with_cadence(&self.pool, runtime.rotation_cadence)
+            .await
+        {
             Ok(outcome) => {
                 self.metrics.record_rotate_outcome("claim", &outcome);
                 let idle_cursor = match &outcome {
@@ -2877,6 +2908,12 @@ impl MaintenanceService {
                     }
                     RotateOutcome::SkippedIdle { slot, generation } => {
                         debug!(slot, generation, "Skipped idle queue storage claim segment");
+                    }
+                    RotateOutcome::SkippedFilling { slot, generation } => {
+                        debug!(
+                            slot,
+                            generation, "Queue storage claim segment still filling"
+                        );
                     }
                 }
                 idle_cursor
@@ -3495,23 +3532,36 @@ impl MaintenanceService {
                         AS lag_seconds
                 FROM head_signal
                 JOIN LATERAL (
-                    SELECT ready.run_at
-                    FROM {schema}.ready_entries AS ready
-                    WHERE ready.queue = head_signal.queue
-                      AND ready.priority = head_signal.priority
-                      AND ready.enqueue_shard = head_signal.enqueue_shard
-                      AND ready.lane_seq >= head_signal.claim_seq
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {schema}.ready_tombstones AS tomb
-                          WHERE tomb.ready_slot = ready.ready_slot
-                            AND tomb.ready_generation = ready.ready_generation
-                            AND tomb.queue = ready.queue
-                            AND tomb.priority = ready.priority
-                            AND tomb.enqueue_shard = ready.enqueue_shard
-                            AND tomb.lane_seq = ready.lane_seq
-                      )
-                    ORDER BY ready.lane_seq
+                    SELECT next_in_segment.run_at
+                    FROM {schema}.ready_segments AS segment
+                    CROSS JOIN LATERAL (
+                        SELECT ready.run_at
+                        FROM {schema}.ready_entries AS ready
+                        WHERE ready.ready_slot = segment.ready_slot
+                          AND ready.ready_generation = segment.ready_generation
+                          AND ready.queue = segment.queue
+                          AND ready.priority = segment.priority
+                          AND ready.enqueue_shard = segment.enqueue_shard
+                          AND ready.lane_seq >= GREATEST(segment.first_lane_seq, head_signal.claim_seq)
+                          AND ready.lane_seq < segment.next_lane_seq
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.ready_tombstones AS tomb
+                              WHERE tomb.ready_slot = ready.ready_slot
+                                AND tomb.ready_generation = ready.ready_generation
+                                AND tomb.queue = ready.queue
+                                AND tomb.priority = ready.priority
+                                AND tomb.enqueue_shard = ready.enqueue_shard
+                                AND tomb.lane_seq = ready.lane_seq
+                          )
+                        ORDER BY ready.lane_seq
+                        LIMIT 1
+                    ) AS next_in_segment
+                    WHERE segment.queue = head_signal.queue
+                      AND segment.priority = head_signal.priority
+                      AND segment.enqueue_shard = head_signal.enqueue_shard
+                      AND segment.next_lane_seq > head_signal.claim_seq
+                    ORDER BY segment.next_lane_seq
                     LIMIT 1
                 ) AS next_ready ON TRUE
                 GROUP BY head_signal.queue
@@ -4524,12 +4574,18 @@ mod tests {
     }
 
     #[test]
-    fn prune_backoff_blocked_increases_level_same_as_skipped_active() {
+    fn prune_backoff_lock_contention_retries_next_tick() {
         let tracker = PruneBackoffTracker::new();
-        tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Blocked { slot: 0 });
-        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((2, 1)));
-        tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Blocked { slot: 0 });
-        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((4, 2)));
+        tracker.record_outcome(PRUNE_BRANCH_QUEUE, &skip_active(0));
+        tracker.record_outcome(PRUNE_BRANCH_QUEUE, &skip_active(0));
+        assert!(tracker.should_skip(PRUNE_BRANCH_QUEUE));
+        for _ in 0..64 {
+            tracker.record_outcome(PRUNE_BRANCH_QUEUE, &PruneOutcome::Blocked { slot: 0 });
+            assert_eq!(tracker.snapshot(PRUNE_BRANCH_QUEUE), Some((0, 0)));
+            assert!(!tracker.should_skip(PRUNE_BRANCH_QUEUE));
+        }
+        tracker.record_outcome(PRUNE_BRANCH_QUEUE, &skip_active(0));
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_QUEUE), Some((2, 1)));
     }
 
     #[test]

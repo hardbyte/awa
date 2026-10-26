@@ -2,13 +2,13 @@
 # CI sharding for the `Rust tests` job (#335).
 #
 # The suite is split into parallel CI shards so wall-clock cost is the
-# slowest shard, not the sum. Timing basis (main run 28783383104):
-# migration_test alone was 1339s of the ~31-minute job, so it is
-# partitioned per-test with cargo-nextest (each test in its own process;
-# the suite's Postgres advisory locks already serialize schema access
-# across processes). The other named binaries form the `heavy` shard;
-# EVERYTHING ELSE is the `rest` shard, computed by subtraction — a new
-# test file lands in `rest` automatically and can never be forgotten.
+# slowest shard, not the sum. migration_test is partitioned per-test with
+# cargo-nextest (each test in its own process; the suite's Postgres
+# advisory locks already serialize schema access across processes). The
+# other named awa binaries form the `heavy` shard; EVERY OTHER awa test
+# binary is the `rest` shard, computed by subtraction — a new test file
+# lands in `rest` automatically and can never be forgotten. The remaining
+# workspace crates and the doctests form the `workspace` shard.
 #
 # `check` mode (run by the lint job) fails when a named binary disappears,
 # so renames can't silently drop coverage.
@@ -65,7 +65,7 @@ check() {
     "${#ASSIGNED_ELSEWHERE[@]} explicitly assigned, rest-shard covers the remainder"
 }
 
-shard="${1:?usage: ci-test-shard.sh <check|migrations-K|heavy|rest>}"
+shard="${1:?usage: ci-test-shard.sh <check|migrations-K|heavy|rest|workspace>}"
 
 case "$shard" in
   check)
@@ -82,11 +82,13 @@ case "$shard" in
     cargo test -p awa "${args[@]}"
     ;;
   rest)
-    # awa unit tests + every test binary not assigned elsewhere, then the
-    # rest of the workspace (tests + doctests), then awa's own doctests.
-    # Together with the other shards this mirrors `cargo test --workspace`.
+    # awa unit tests + every awa test binary not assigned elsewhere.
     # shellcheck disable=SC2046
     cargo test -p awa --lib --bins $(rest_test_args)
+    ;;
+  workspace)
+    # The rest of the workspace (tests + doctests), then awa's own doctests.
+    # Together with the other shards this mirrors `cargo test --workspace`.
     cargo test --workspace --exclude awa
     cargo test -p awa --doc
     ;;

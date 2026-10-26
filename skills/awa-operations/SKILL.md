@@ -36,6 +36,19 @@ file. Never print database URLs or passwords in logs or issues.
 Migrations are forward-only; there are no down migrations. Roll back with a
 database snapshot or reverse SQL, not with the CLI.
 
+Use an updated binary to generate pending upgrade SQL. The runner records
+versions, not checksums; applied steps are not rerun. Preserve already-applied
+files in checksum-based external runners rather than replacing their history.
+
+Migration discovery skips unregistered custom schemas with foreign-owned objects,
+untrusted `CREATE`/`TRIGGER` grants, or any trigger awa did not install. Unsafe
+registered/prepared substrates block the bundle before version advancement.
+The error names up to five offending objects; the upgrade guide gives fixes for
+`GRANT ALL` table grants, a 0.6 runtime's schema `CREATE` grant, and schemas
+prepared by another role. Sequences owned by another role are accepted. The same condition in `awa` aborts before
+installation, including for superuser migrators. Use a consistent dedicated owner
+role and review ownership and grants before retrying; see the upgrade guide.
+
 One `awa migrate` applies the whole pending range in a single transaction under
 an advisory lock, so a failed or interrupted run commits nothing and concurrent
 runners converge on one application. Every migration is re-runnable, so a retry
@@ -75,6 +88,14 @@ pauses until commit; the lock prevents a released enqueue from deadlocking with
 earlier storage DDL. See the 0.6→0.7 upgrade guide for the rollout boundary.
 
 Do not skip a major version. 0.5 → 0.7 is unsupported; step through 0.6.
+
+## Restricted Database Roles
+
+When deploying a runtime without schema CREATE, apply v049 and provision every
+queue with `awa storage prepare-queue` as the migrator before starting producers
+or workers. Match shard/stripe counts; provision additional lanes before changing
+routing. Use the sequence grants and owner defaults in
+[Database roles](../../docs/security/database-roles.md#provision-queues-before-starting-restricted-runtimes).
 
 ## Rolling Upgrades
 
@@ -124,6 +145,21 @@ Late completions from a rescued attempt lose against the newer attempt via the
 `run_lease` guard, so rescue never double-commits. Set `heartbeat_staleness`
 (default 90s) to at least 3× the heartbeat interval; detection latency is
 roughly `heartbeat_staleness + heartbeat_rescue_interval`.
+
+Finished handlers retry durable finalization for up to 120s from the first
+finalize attempt when database writes are unavailable, including connection,
+pool-acquire and read-only-session errors. Recovery requires a writable endpoint
+and usable pooled connections; a DNS change alone does not redirect existing
+read-only sessions. Monitor
+`awa.completion.reconnect_retry` for outages or pool pressure. Pending durable
+finalizers are bounded by the larger of worker capacity and twice the configured
+completion batch size times completion shards (one flushing and one queued batch
+per shard). A full budget backpressures returning handlers, retaining at most one
+additional saved result per worker. Shutdown drains finalizers with handlers until the drain
+deadline. Rescue can still win first, and expired/cancelled finalization falls
+back to rescue, so keep handlers idempotent. A stale reply after an availability
+error may mean the first finalize committed or another actor closed the lease;
+completion metrics and lifecycle hooks are best effort in that case.
 
 Health signals:
 
@@ -248,6 +284,29 @@ Rings rotate only when active — a frozen generation on an idle queue is health
 The condition to alert on is a frozen generation *with* accumulating rows
 (`skipped_busy`): a pinned ring, almost always caused by a long-held snapshot.
 
+## Ring Rotation Cadence
+
+For queue storage, `ClientBuilder::ring_rotation_cadence` seals a slot after a
+five-second observed fill window once it holds 256 rows, at a 2 MiB total
+physical-size target, or after 60 seconds regardless of rows, by default. Python
+exposes `queue_storage_rotate_min_slot_age_ms` and
+`queue_storage_rotate_target_slot_bytes`, plus `queue_storage_rotate_min_slot_rows`
+and `queue_storage_rotate_max_slot_age_ms` (row floor before the age window seals,
+and the ceiling that seals regardless). A zero byte target disables the size
+trigger, a zero row floor disables the floor, and a zero maximum age disables the
+ceiling. A row floor needs a size target or a ceiling, and a queue-storage client
+refuses to build without one: lease rows are deleted as attempts finish, so a lease slot may
+never reach the floor. A zero minimum age, or Rust `RingRotationCadence::EAGER`,
+permits sealing each tick whatever the other settings.
+Rust cadence and claim-interval overrides survive `queue_storage` calls in either order.
+Empty slots bypass the fill window so reclamation can continue after drain.
+Leader changes reset the local monotonic fill timers; the 60-second ceiling counts from when the slot opened on the database clock, so it still applies. The size is sampled and
+can be exceeded by bursts or blocked reuse; use actual retained storage and
+blocked-prune metrics for capacity planning. It is not a retention policy or
+storage limit. Queue prune lock contention retries on the next decision tick;
+active-data gates retain exponential backoff. Persistent contention can still
+stall reclamation. See `docs/configuration.md` for the scheduling contract.
+
 ## Managed Postgres
 
 Prefer PostgreSQL 18 where available; PG17 on some managed platforms caps
@@ -269,6 +328,28 @@ lock. Size for steady-state completion rate, not burst.
 - **Role model.** `awa_owner` owns the schema (NOLOGIN); `awa_migrator` runs
   `awa migrate`; `awa_runtime` (least privilege, cannot alter schema) runs
   workers, producers, `awa serve`, and CLI admin.
+- **v047+ migration bundles.** Use `awa migrate` or its generated `--sql`
+  bundle rather than an isolated migration tail. Installer replay replaces
+  triggers on ring state and queue heads and takes table locks through commit;
+  schedule a quiet window, bound `lock_timeout`, and retry the whole transaction
+  after a timeout. DDL credentials need ownership of all installed substrates.
+- **CDC / logical replication.** Keep the awa schema (and any custom
+  queue-storage schema) out of publications: list application tables, or with
+  Debezium use `publication.autocreate.mode=filtered` plus
+  `schema.exclude.list=awa,custom_queue_schema`, adding every installed custom
+  queue-storage schema (replace the example name). Debezium matches each schema
+  regex against the complete name; escape regex metacharacters in literal names.
+  Alternatively, use `schema.include.list` for application schemas instead of an
+  exclusion list; do not set both. See the [Debezium PostgreSQL filter reference](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-schema-exclude-list).
+  If Awa is published anyway, schema v047+ works (every table has a replica
+  identity); older schemas fail maintenance with
+  `cannot delete from table ... does not have a replica identity`. Ring prune
+  is a `TRUNCATE`, which publications publish by default. Slot lag can retain
+  required WAL; lag alone does not establish an ordinary-table MVCC horizon pin.
+  Inspect [`pg_replication_slots`](https://www.postgresql.org/docs/17/view-pg-replication-slots.html):
+  `xmin` prevents vacuum from removing affected ordinary-table tuples, while
+  `catalog_xmin` protects catalog tuples. Diagnose those horizons separately
+  from WAL retention (`restart_lsn`) and consumer progress (`confirmed_flush_lsn`).
 
 ## Web Admin UI
 
