@@ -2101,7 +2101,7 @@
 <div class="awa-failure-launch">
 <p><strong>Try the crash window yourself.</strong> Send a receipt, then stop the worker before saving completion. Recover the job and start a replacement. Does the mailbox change?</p>
 <p>Then repeat with the provider remembering a stable operation key. Compare the handler starts, external requests and delivered receipts from your own runs.</p>
-<p><a class="md-button md-button--primary" href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive model →</a></p>
+<p><a class="md-button md-button--primary" href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive model <span aria-hidden="true">→</span></a></p>
 </div>
 <p>The model starts with a committed order and job. It is an Awa-specific teaching model, not a live system or a benchmark. No email is sent. Source links and technical assumptions are available inside it.</p>
 <details class="awa-failure-desktop">
@@ -2114,6 +2114,7 @@
   title="Interactive Awa job, worker and receipt model"
   loading="lazy"
   referrerpolicy="no-referrer"
+  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
 >
   <p><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive Awa model.</a></p>
 </iframe>
@@ -2121,7 +2122,7 @@
 
 <details class="note">
 <summary>What the model assumes</summary>
-<p>The worker really stops and its database claim survives. “Recover for retry” compresses rescue, backoff and due-job promotion; it assumes healthy maintenance and sufficient retry budget. Clicks do not predict recovery latency. Database crashes, standby failover, live stale workers and retry exhaustion are outside this example.</p>
+<p>The worker really stops and its database claim survives. “Recover for retry” compresses rescue, backoff and due-job promotion; it assumes healthy maintenance and sufficient retry budget. Clicks do not predict recovery latency. Database crashes, standby failover, live stale workers and retry exhaustion are outside this example. If the stopped attempt was the job's last, recovery fails the job instead of retrying it, even though its receipt may already have been delivered; see <a href="../job-lifecycle/#poison-jobs">poison jobs</a>.</p>
 <p>The provider-key option assumes an external provider atomically deduplicates a stable operation key across attempts. Awa does not supply that external guarantee, and enqueue uniqueness is a different boundary. The component identifies the development source revision it describes, rather than promising behavior across every release.</p>
 </details>
 <p>Continue with <a href="../transactional-enqueue/">transactional enqueue</a>, <a href="../job-lifecycle/">job lifecycle and recovery</a>, or <a href="../../architecture/">queue-storage architecture</a>.</p>

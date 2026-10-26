@@ -3703,7 +3703,7 @@
 <h2 id="reliability-timings-heartbeat-deadline-rescue">Reliability timings: heartbeat, deadline, rescue<a class="headerlink" href="#reliability-timings-heartbeat-deadline-rescue" title="Permanent link">&para;</a></h2>
 <p>These knobs control <strong>how fast a stuck or crashed handler is noticed and rescued</strong>. They live on <code>ClientBuilder</code> (Rust) and <code>client.start()</code> kwargs (Python). All of them have <code>_ms</code>-suffixed kwargs on the Python side (e.g. <code>heartbeat_interval_ms=15000</code>).</p>
 <h3 id="heartbeat-detecting-crashed-workers">Heartbeat — detecting crashed workers<a class="headerlink" href="#heartbeat-detecting-crashed-workers" title="Permanent link">&para;</a></h3>
-<p>A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:</p>
+<p>A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job. The rescued attempt counts against <code>max_attempts</code>: the job is re-enqueued while attempts remain, and otherwise fails or moves to the DLQ (<a href="../concepts/job-lifecycle/#poison-jobs">Poison jobs</a>). Three knobs participate:</p>
 <table>
 <thead>
 <tr>
@@ -3748,7 +3748,8 @@ the next rescue sweep or an attempt deadline may claim a newer lease first.
 Keep handlers idempotent. Monitor <code>awa.completion.reconnect_retry</code> alongside
 pool waits and database errors; a retry count does not prove recovery.</p>
 <h3 id="deadline-bounding-a-single-attempt">Deadline — bounding a single attempt<a class="headerlink" href="#deadline-bounding-a-single-attempt" title="Permanent link">&para;</a></h3>
-<p>Each queue has a <code>deadline_duration</code> (default <code>5m</code> on <code>QueueConfig</code>). At claim time the runtime stamps <code>now() + deadline_duration</code> onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.</p>
+<p>Each queue has a <code>deadline_duration</code> (default <code>5m</code> on <code>QueueConfig</code>). At claim time the runtime stamps <code>now() + deadline_duration</code> onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against <code>max_attempts</code> like a failed one, so a job that hangs every time ends in <code>failed</code> or the DLQ (<a href="../concepts/job-lifecycle/#poison-jobs">Poison jobs</a>).</p>
+<p>A handler that ignores cancellation and is still running two <code>deadline_rescue_interval</code>s (one minute by default) past its deadline is dropped at its next <code>.await</code>, which returns its worker slot so the rescued retry can run. Code that never yields, such as a blocking call or a CPU loop on the async runtime, cannot be dropped and keeps its slot until it returns. A Python coroutine stops being awaited but keeps running on its event loop until it finishes.</p>
 <table>
 <thead>
 <tr>

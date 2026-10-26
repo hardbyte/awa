@@ -837,6 +837,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#poison-jobs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Poison jobs
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Poison jobs">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#designing-for-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Designing for it
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-one-turns-up-in-production" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When one turns up in production
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#where-to-go-next" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2167,6 +2206,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#poison-jobs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Poison jobs
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Poison jobs">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#designing-for-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Designing for it
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-one-turns-up-in-production" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When one turns up in production
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#where-to-go-next" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2233,6 +2311,65 @@
 </dl>
 <h2 id="what-crash-recovery-means">What crash recovery means<a class="headerlink" href="#what-crash-recovery-means" title="Permanent link">&para;</a></h2>
 <p>A running job is owned only for as long as its claim remains live. Heartbeats extend that claim. If the process stops, another worker can rescue the job after the claim expires. The original worker may still finish late, so completion writes are guarded by ownership and handlers must tolerate duplicate execution.</p>
+<h2 id="poison-jobs">Poison jobs<a class="headerlink" href="#poison-jobs" title="Permanent link">&para;</a></h2>
+<p>A poison job fails the same way on every attempt: bad input that crashes a parser, a payload that exhausts memory, a call that never returns. Every way an attempt can end counts against the job's <code>max_attempts</code>, so a poison job stops instead of cycling forever:</p>
+<table>
+<thead>
+<tr>
+<th>The attempt ends because</th>
+<th>Error recorded on the job</th>
+<th>Once attempts are spent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>the handler returns an error or raises an exception</td>
+<td>the error</td>
+<td><code>failed</code>, or DLQ reason <code>max_attempts_exhausted</code></td>
+</tr>
+<tr>
+<td>the handler panics (Rust)</td>
+<td><code>handler panicked: &lt;message&gt;</code></td>
+<td><code>failed</code>, or DLQ reason <code>max_attempts_exhausted</code></td>
+</tr>
+<tr>
+<td>the worker stops heartbeating: crash, OOM kill, eviction, a native extension segfault</td>
+<td><code>heartbeat stale: worker presumed dead</code> (<code>receipt claim stale: …</code> on the receipt path)</td>
+<td><code>failed</code>, or DLQ reason <code>heartbeat_stale</code></td>
+</tr>
+<tr>
+<td>the attempt outlives the queue's <code>deadline_duration</code></td>
+<td><code>hard deadline exceeded</code></td>
+<td><code>failed</code>, or DLQ reason <code>deadline_exceeded</code></td>
+</tr>
+<tr>
+<td>a callback wait times out</td>
+<td><code>callback timed out</code></td>
+<td><code>failed</code>, or DLQ reason <code>callback_timeout</code></td>
+</tr>
+<tr>
+<td>a terminal error, arguments that do not deserialize, or a kind no worker handles</td>
+<td>the error</td>
+<td><code>failed</code> at once, or DLQ reason <code>terminal_error</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>failed</code> jobs move to the <a href="../../dead-letter-queue/">dead-letter queue</a> when the queue has it enabled. <code>Snooze</code> never spends an attempt.</p>
+<p>A crash ends every attempt running in that process, not just the poison one, so jobs that only shared the worker spend an attempt too. Keep <code>max_attempts</code> above one for work that should survive losing a node: with one attempt, any crash fails the job.</p>
+<h3 id="designing-for-it">Designing for it<a class="headerlink" href="#designing-for-it" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Raise a terminal error (<code>JobError::terminal</code>, <code>awa.TerminalError</code>) for input that can never succeed, so it skips the retries.</li>
+<li>Enable the DLQ on queues whose failures someone should inspect and redrive.</li>
+<li>Set <code>deadline_duration</code> close to the slowest legitimate attempt. It bounds how long a hung handler holds a worker before its attempt is counted; shortly after the deadline the worker drops a handler that is still waiting, so a hang cannot hold its slot forever. Code that blocks without yielding cannot be dropped, so give blocking calls their own timeouts.</li>
+<li>Put kinds that call fragile native code or unbounded external work on their own queue and worker pool, so a crash only takes down work that shares the risk.</li>
+</ul>
+<h3 id="when-one-turns-up-in-production">When one turns up in production<a class="headerlink" href="#when-one-turns-up-in-production" title="Permanent link">&para;</a></h3>
+<ol>
+<li><strong>Recognise it.</strong> The job's error history repeats one message across attempts. <code>awa job dump &lt;id&gt;</code> shows each attempt; a run of <code>presumed dead</code> or <code>hard deadline exceeded</code> errors points at the process, not the handler's own error path.</li>
+<li><strong>Stop one job.</strong> <code>awa job cancel &lt;id&gt;</code>. A running handler is signalled to stop. One stuck in blocking or CPU-bound code keeps its worker slot until it returns, but the job stays cancelled: a late finish is ignored.</li>
+<li><strong>Stop a kind.</strong> <code>awa queue pause &lt;queue&gt;</code> holds everything on the queue while you deploy a fix. Until a fix ships, the bound above ends each poison job after <code>max_attempts</code>.</li>
+<li><strong>Redrive after the fix.</strong> <code>awa dlq retry-bulk --queue &lt;queue&gt; --kind &lt;kind&gt;</code> re-runs the dead-lettered jobs with a fresh attempt budget.</li>
+</ol>
 <h2 id="where-to-go-next">Where to go next<a class="headerlink" href="#where-to-go-next" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Configure attempts, delays, timeouts, and queue concurrency in <a href="../../configuration/">Configuration</a>.</li>
