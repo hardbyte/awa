@@ -6,15 +6,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v050. Run `awa migrate` as the migrator
-role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
-for each step.
+This release adds migrations v044 to v050 and v052. Run `awa migrate` as the
+migrator role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the
+details for each step.
 
 - **Rollout order.** Health-gated workers report ready only once the schema
   reaches their version, so migrate before rolling them out. Producers and
-  workers without a readiness gate can roll before v050. On PostgreSQL 17 and
-  earlier, pre-v050 binaries scan every ready partition during maintenance
-  once v050 is applied, so replace them promptly.
+  workers without a readiness gate can roll before v050 and v052. On
+  PostgreSQL 17 and earlier, pre-v050 binaries scan every ready partition
+  during maintenance once v050 is applied, so replace them promptly.
 - **Runtime roles no longer need `CREATE` (v049).** Provision lanes with
   `awa storage prepare-queue` as the migrator before deploying, and grant the
   runtime role `USAGE, SELECT, UPDATE` on the lane sequences. Existing
@@ -108,6 +108,19 @@ for each step.
   session sets no `lock_timeout`, each lock wait is capped at 2 s; on a
   timeout (`55P03`, usually behind a long `awa.jobs` read or a backup) the
   migration rolls back and can be re-run.
+- **Enqueueing a batch of ready jobs takes one round trip (v052,
+  [#522](https://github.com/hardbyte/awa/issues/522)).**
+  `QueueStorage::enqueue_params_batch`, and `enqueue_params_copy` below its
+  2,048-row COPY threshold, send a batch of ready jobs without uniqueness
+  claims as one call to the new `{schema}.enqueue_ready_rows` function instead
+  of ten round trips. Batches with uniqueness claims or scheduled jobs still
+  run in a transaction but use the function for most of the work, and
+  reserving a lane's sequence range now writes the sequence once instead of
+  twice. On an earlier revision, at 800 jobs/s in 20-job calls, producer call
+  p50 fell 19-62% and WAL per job by about 5 bytes, with throughput unchanged.
+  On a schema without the function, or without `EXECUTE` on it and on
+  `ring_cursor`, binaries keep using the multi-statement path, which is also
+  shorter now, and look for the function again after a minute.
 - **Retry-heavy workloads leave far fewer dead tuples.** After the ring
   authority flip, awa keeps one terminal-count row per lane in
   `queue_terminal_live_counts` instead of up to 256, and a batch of finished

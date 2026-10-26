@@ -147,6 +147,10 @@ async fn exercise(options: PgConnectOptions, owner: &str, runtime: &str) -> Test
         assert_eq!(before, after);
     }
     assert_no_head_table_ddl_locks(&owner_pool).await?;
+    for schema in SCHEMAS {
+        assert_enqueue_function_privileges_fall_back(&owner_pool, &runtime_pool, schema, runtime)
+            .await?;
+    }
     runtime_pool.close().await;
     owner_pool.close().await;
     Ok(())
@@ -275,5 +279,83 @@ async fn check_runtime(pool: &PgPool, schema: &str) -> TestResult {
         error.as_database_error().unwrap().code().as_deref(),
         Some("42501")
     );
+    Ok(())
+}
+
+/// The one-call enqueue needs EXECUTE on enqueue_ready_rows and on
+/// ring_cursor. Without either the store keeps the multi-statement path; a
+/// grant revoked after the store has used the function costs one failed
+/// enqueue, then the store probes again and falls back.
+async fn assert_enqueue_function_privileges_fall_back(
+    owner_pool: &PgPool,
+    runtime_pool: &PgPool,
+    schema: &str,
+    runtime: &str,
+) -> TestResult {
+    let enqueue = |pool: PgPool| async move {
+        QueueStorage::new(QueueStorageConfig {
+            schema: schema.into(),
+            ..Default::default()
+        })
+        .expect("store")
+        .enqueue_batch(&pool, "prepared_queue", 2, 1)
+        .await
+    };
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "REVOKE EXECUTE ON FUNCTION {schema}.ring_cursor(text) FROM {runtime}"
+        ))))
+        .await?;
+    assert_eq!(
+        enqueue(runtime_pool.clone()).await?,
+        1,
+        "without ring_cursor EXECUTE the store keeps the multi-statement path"
+    );
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "GRANT EXECUTE ON FUNCTION {schema}.ring_cursor(text) TO {runtime}"
+        ))))
+        .await?;
+
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: schema.into(),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        store
+            .enqueue_batch(runtime_pool, "prepared_queue", 2, 1)
+            .await?,
+        1
+    );
+    let signature: String = sqlx::query_scalar(awa_model::audited_sql(format!(
+        "SELECT oid::regprocedure::text FROM pg_proc \
+         WHERE pronamespace = '{schema}'::regnamespace AND proname = 'enqueue_ready_rows'"
+    )))
+    .fetch_one(owner_pool)
+    .await?;
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {runtime}"
+        ))))
+        .await?;
+    assert!(
+        store
+            .enqueue_batch(runtime_pool, "prepared_queue", 2, 1)
+            .await
+            .is_err(),
+        "the call that finds EXECUTE gone fails"
+    );
+    assert_eq!(
+        store
+            .enqueue_batch(runtime_pool, "prepared_queue", 2, 1)
+            .await?,
+        1,
+        "the next call probes again and uses the multi-statement path"
+    );
+    owner_pool
+        .execute(sqlx::raw_sql(awa_model::audited_sql(format!(
+            "GRANT EXECUTE ON FUNCTION {signature} TO {runtime}"
+        ))))
+        .await?;
     Ok(())
 }
