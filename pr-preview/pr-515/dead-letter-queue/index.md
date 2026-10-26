@@ -6,7 +6,7 @@ The Dead Letter Queue (DLQ) holds jobs that have exhausted all of their retry at
 
 ## When a job lands in the DLQ
 
-Per-queue policy controls DLQ behaviour. When `dlq_enabled = true` on a queue, a job that reaches its `max_attempts` ceiling without succeeding is moved into `dlq_entries` rather than left as a `failed` terminal row. The job's final error history, args, payload, and lifecycle metadata travel with it; the DLQ row is a faithful snapshot of the job at the moment it gave up.
+Per-queue policy controls DLQ behaviour. When `dlq_enabled = true` on a queue, a job that reaches its `max_attempts` ceiling without succeeding is moved into `dlq_entries` rather than left as a `failed` terminal row. Attempts that end in a crash, a missed deadline or a callback timeout count toward that ceiling too; see [Poison jobs](../concepts/job-lifecycle/index.md#poison-jobs). The job's final error history, args, payload, and lifecycle metadata travel with it; the DLQ row is a faithful snapshot of the job at the moment it gave up.
 
 A queue with `dlq_enabled = false` (the default before 0.6) leaves terminal failures as `failed` rows in the canonical / queue-storage tables. They can still be inspected and re-queued manually, but they do not flow through the DLQ-specific commands and dashboards.
 
@@ -29,7 +29,13 @@ The web UI's **DLQ** tab (the one served by `awa serve`) shows the same data wit
 
 Each DLQ row carries:
 
-- `dlq_reason` — short string identifying why the job was dead-lettered (e.g., `max_attempts`, `manual`, `deadline_expired`).
+- `dlq_reason` — why the job was dead-lettered:
+    - `max_attempts_exhausted`: the handler failed (an error or a panic) on its last attempt.
+    - `terminal_error`: the handler raised a terminal error, the arguments did not deserialize, or no worker handles the kind.
+    - `heartbeat_stale`: the worker stopped heartbeating during the last attempt.
+    - `deadline_exceeded`: the last attempt outlived the queue's `deadline_duration`.
+    - `callback_timeout`: the last attempt's callback wait timed out.
+    - Anything else is the reason an operator passed to `awa dlq move`.
 - `dlq_at` — when the job entered the DLQ.
 - `original_run_lease` — the run-lease the job held at the moment it failed.
 - The full error history from the `payload.errors[]` array.
