@@ -2330,7 +2330,7 @@
 <ul>
 <li>Raise a terminal error (<code>JobError::terminal</code>, <code>awa.TerminalError</code>) for input that can never succeed, so it skips the retries.</li>
 <li>Enable the DLQ on queues whose failures someone should inspect and redrive.</li>
-<li>Set <code>deadline_duration</code> close to the slowest legitimate attempt. It bounds how long a hung handler holds a worker before its attempt is counted.</li>
+<li>Set <code>deadline_duration</code> close to the slowest legitimate attempt. It bounds how long a hung handler holds a worker before its attempt is counted; shortly after the deadline the worker drops a handler that is still waiting, so a hang cannot hold its slot forever. Code that blocks without yielding cannot be dropped, so give blocking calls their own timeouts.</li>
 <li>Put kinds that call fragile native code or unbounded external work on their own queue and worker pool, so a crash only takes down work that shares the risk.</li>
 </ul>
 <h3 id="when-one-turns-up-in-production">When one turns up in production<a class="headerlink" href="#when-one-turns-up-in-production" title="Permanent link">&para;</a></h3>
