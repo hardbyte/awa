@@ -28,7 +28,6 @@ Claim(w, j) ==
     /\ shutdownPhase = "running"
     /\ jobState[j] = "available"
     /\ QueueOf[j] = WorkerQueue[w]
-    /\ lease[j] < MaxLease
     /\ jobState' = [jobState EXCEPT ![j] = "running"]
     /\ owner' = [owner EXCEPT ![j] = w]
     /\ lease' = [lease EXCEPT ![j] = @ + 1]
@@ -41,8 +40,11 @@ StartTask(w, j) ==
     /\ taskLease' = [taskLease EXCEPT ![w][j] = lease[j]]
     /\ UNCHANGED <<jobState, owner, lease, cancelFlag, shutdownPhase>>
 
+\* `lease` counts attempts and MaxLease is the attempt budget: a retryable
+\* outcome on the last attempt fails the job instead.
 FinalizeAccepted(w, j, toState) ==
     /\ toState \in FinalStates
+    /\ toState = "retryable" => lease[j] < MaxLease
     /\ jobState[j] = "running"
     /\ owner[j] = w
     /\ taskLease[w][j] = lease[j]
@@ -64,7 +66,9 @@ Rescue(j) ==
     LET w == owner[j] IN
     /\ jobState[j] = "running"
     /\ w \in Workers
-    /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
+    \* A rescued attempt spends the budget like a failed one (#546).
+    /\ jobState' = [jobState EXCEPT ![j] =
+          IF lease[j] < MaxLease THEN "retryable" ELSE "failed"]
     /\ owner' = [owner EXCEPT ![j] = NoOwner]
     /\ cancelFlag' = [x \in Workers |-> cancelFlag[x] \/ x = w]
     /\ UNCHANGED <<lease, taskLease, shutdownPhase>>
@@ -127,6 +131,12 @@ TypeOK ==
     /\ taskLease \in [Workers -> [Jobs -> 0..MaxLease]]
     /\ cancelFlag \in [Workers -> BOOLEAN]
     /\ shutdownPhase \in {"running", "stop_claim", "draining", "stopped"}
+
+\* The claim path checks no budget, so this is what keeps attempts bounded:
+\* a job waiting to run always has attempts left.
+RetryHasBudget ==
+    \A j \in Jobs :
+        jobState[j] \in {"available", "retryable"} => lease[j] < MaxLease
 
 RunningOwned ==
     \A j \in Jobs : jobState[j] = "running" => owner[j] \in Workers

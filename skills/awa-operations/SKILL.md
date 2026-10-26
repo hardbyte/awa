@@ -180,7 +180,13 @@ timeout (e.g. 40s for a 30s drain) so a leader finishes draining before SIGKILL.
 The DLQ is a separate physical table, not a job state; a DLQ'd job cannot be
 claimed until retried out. It is per-queue opt-in (`dlq_enabled`) with a
 default 30-day retention pruned by the maintenance leader. `dlq_reason` is
-`max_attempts`, `manual`, or `deadline_expired`.
+`max_attempts_exhausted`, `terminal_error`, `heartbeat_stale`,
+`deadline_exceeded`, `callback_timeout`, or the reason passed to `awa dlq move`.
+
+A poison job (one that crashes, hangs or panics on every attempt) stops after
+`max_attempts`: crash and deadline rescues spend attempts like handler errors.
+To contain one, `awa job cancel <id>` it or `awa queue pause` its queue, ship
+the fix, then `awa dlq retry-bulk --queue <q> --kind <kind>`.
 
 ```bash
 awa dlq depth --queue emails

@@ -2038,6 +2038,11 @@ impl Client {
                     claim_gate.clone(),
                     claimer_owner_id,
                     effective_storage.clone(),
+                )
+                .abandon_grace(
+                    2 * self
+                        .deadline_rescue_interval
+                        .unwrap_or(crate::maintenance::DEFAULT_DEADLINE_RESCUE_INTERVAL),
                 );
                 dispatcher_handles.push(tokio::spawn(async move {
                     dispatcher.run().await;
