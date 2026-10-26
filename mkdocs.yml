@@ -105,6 +105,7 @@ nav:
       - How AWA works: concepts/index.md
       - Job lifecycle: concepts/job-lifecycle.md
       - Transactional enqueue: concepts/transactional-enqueue.md
+      - Interactive failure lab: concepts/failure-lab.md
       - Architecture: architecture.md
       - Queue storage: queue-storage-substrate.md
   - Guides:
@@ -151,6 +152,7 @@ exclude_docs: |
 
 not_in_nav: |
   /0.7-roadmap.md
+  /design/**
   /adr/[0-9]*.md
   /adr/bench/**
   /grafana/alerts/**

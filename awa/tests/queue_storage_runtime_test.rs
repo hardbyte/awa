@@ -9510,6 +9510,128 @@ async fn test_queue_storage_grid_heartbeats_keep_live_attempt_at_staleness_floor
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_per_slot_claims_preserve_custom_schema_identifiers() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    for variable in ["v_lane_shard", "v_claimed_at", "v_deadline_at"] {
+        for receipts in [false, true] {
+            let schema = format!("qs_{variable}_{}", u8::from(receipts));
+            let store = QueueStorage::new(QueueStorageConfig {
+                schema: schema.clone(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                claim_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: receipts,
+            })
+            .unwrap();
+            store.prepare_schema(&pool).await.unwrap();
+            let job_id = enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: 1 },
+                InsertOpts {
+                    queue: "schema_identifier".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let claimed = store
+                .claim_runtime_batch(&pool, "schema_identifier", 1, Duration::from_secs(30))
+                .await
+                .unwrap_or_else(|error| panic!("claim in {schema}: {error}"));
+            assert_eq!(claimed.len(), 1, "{schema}");
+            assert_eq!(claimed[0].job.id, job_id);
+            assert!(claimed[0].job.deadline_at.is_some(), "{schema}");
+            assert_eq!(
+                store
+                    .complete_runtime_batch(&pool, &claimed)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{schema}"
+            );
+        }
+    }
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_heartbeat_by_claim_identity_touches_only_open_claims() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_heartbeat_claim_identity";
+    let schema = "awa_qs_runtime_heartbeat_claim_identity";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    for id in 0..2 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(30))
+        .await
+        .expect("claim two receipt-backed jobs");
+    assert_eq!(claimed.len(), 2);
+    let refs: Vec<awa_model::queue_storage::ClaimHeartbeatRef> = claimed
+        .iter()
+        .map(|entry| {
+            awa_model::queue_storage::ClaimHeartbeatRef::from_claim(
+                entry.job.id,
+                entry.job.run_lease,
+                &entry.claim,
+            )
+            .expect("compact claims carry a heartbeat identity")
+        })
+        .collect();
+
+    let updated = store
+        .heartbeat_claims_batch(&pool, &refs)
+        .await
+        .expect("heartbeat by claim identity");
+    assert_eq!(updated, 2, "both open claims are heartbeated");
+    assert_eq!(attempt_state_count(&pool, &store).await, 2);
+
+    let first = claimed[0].clone();
+    store
+        .fail_retryable_with_claim(
+            &pool,
+            first.job.id,
+            first.job.run_lease,
+            "synthetic error",
+            None,
+            Some(&first.claim),
+        )
+        .await
+        .expect("fail one claim")
+        .expect("the claim is open");
+
+    let updated = store
+        .heartbeat_claims_batch(&pool, &refs)
+        .await
+        .expect("heartbeat after one closure");
+    assert_eq!(updated, 1, "a closed claim is not heartbeated");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heartbeat() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_lease_claim_attempt_rescue";
@@ -18687,6 +18809,22 @@ async fn binary_first_claim_shape_and_cursor_interoperation(receipts: bool) {
             .unwrap();
     old.replace_range(start..end, "");
     old = old.replace("selected.payload,\n                (v_lane_claim_seq + v_claim_limit >= v_lane_next_seq) AS lane_drained", "selected.payload");
+    // v051 moved the claim CTE into per-slot functions; the old shape then
+    // projects every result column but lane_drained out of the slot call.
+    let result_start = current.find("RETURNS TABLE(").unwrap() + "RETURNS TABLE(".len();
+    let result_end = result_start + current[result_start..].find(")\n").unwrap();
+    let old_columns: Vec<&str> = current[result_start..result_end]
+        .split(',')
+        .map(|column| column.split_whitespace().next().unwrap())
+        .filter(|column| *column != "lane_drained")
+        .collect();
+    old = old.replace(
+        "'SELECT * FROM %I.claim_ready_slot_%s(",
+        &format!(
+            "'SELECT {} FROM %I.claim_ready_slot_%s(",
+            old_columns.join(", ")
+        ),
+    );
     assert!(!old.contains("AS lane_drained"));
     sqlx::query(audited_sql(format!(
         "DROP FUNCTION {schema}.claim_ready_runtime(text,bigint,double precision,double precision)"
