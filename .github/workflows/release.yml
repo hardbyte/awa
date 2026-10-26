@@ -495,7 +495,7 @@ jobs:
             exit 0
           fi
           git fetch --tags --quiet
-          previous=$(git tag --sort=-v:refname | grep -vx "$tag" | grep "^v${version%.*}\." | head -1 || true)
+          previous=$(git tag --list | python3 scripts/previous-release-tag.py "$tag")
           if [ -n "$previous" ]; then
             printf '\n**Full changelog**: https://github.com/%s/compare/%s...%s\n' \
               "$GITHUB_REPOSITORY" "$previous" "$tag" >> release-notes.md
