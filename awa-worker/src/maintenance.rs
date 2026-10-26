@@ -679,6 +679,9 @@ pub struct MaintenanceService {
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
     descriptor_retention: Duration,
+    /// How long per-minute queue and fleet history is kept (#543). Zero stops
+    /// sampling. Default: 48 hours.
+    queue_history_retention: Duration,
     /// #371 staged upgrade: when true, the maintenance leader auto-flips the
     /// ring-cursor authority `columns -> ledger` once the whole fresh fleet
     /// has reported flip-aware (0.7+) continuously for
@@ -755,6 +758,7 @@ impl MaintenanceService {
             batch_operations_interval: Duration::from_secs(1),
             terminal_count_rollup_interval: Duration::from_secs(30),
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
+            queue_history_retention: Duration::from_secs(48 * 3600), // 48h
             ring_authority_auto_flip: true,
             ring_authority_auto_flip_stable_period: Duration::from_secs(600), // 10min
             ring_authority_flip_aware_since: std::sync::Mutex::new(None),
@@ -820,6 +824,14 @@ impl MaintenanceService {
     /// recreate the row from its declaration on the next snapshot tick.
     pub fn descriptor_retention(mut self, retention: Duration) -> Self {
         self.descriptor_retention = retention;
+        self
+    }
+
+    /// How long the leader keeps per-minute queue and fleet history for the
+    /// admin UI (default: 48h). `Duration::ZERO` stops sampling; existing rows
+    /// are left for an operator to remove.
+    pub fn queue_history_retention(mut self, retention: Duration) -> Self {
+        self.queue_history_retention = retention;
         self
     }
 
@@ -1058,6 +1070,13 @@ impl MaintenanceService {
                 cron_eval_cancel.clone(),
                 self.cron_eval_interval,
             ));
+            let history_task = (!self.queue_history_retention.is_zero()).then(|| {
+                tokio::spawn(Self::run_history_sampler(
+                    self.pool.clone(),
+                    cron_eval_cancel.clone(),
+                    self.queue_history_retention,
+                ))
+            });
 
             loop {
                 tokio::select! {
@@ -1065,6 +1084,9 @@ impl MaintenanceService {
                         debug!("Maintenance service shutting down");
                         self.leader.store(false, Ordering::SeqCst);
                         Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
+                        if let Some(task) = &history_task {
+                            task.abort();
+                        }
                         // Release leader lock on the same connection that acquired it.
                         // If this fails, dropping the connection will release the lock anyway.
                         let _ = Self::release_leader(&mut leader_conn).await;
@@ -1196,6 +1218,9 @@ impl MaintenanceService {
                             warn!("Leader connection lost, re-entering election loop");
                             self.leader.store(false, Ordering::SeqCst);
                             Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
+                            if let Some(task) = &history_task {
+                                task.abort();
+                            }
                             break;
                         }
                     }
@@ -1249,6 +1274,60 @@ impl MaintenanceService {
                 }
             }
         }
+    }
+
+    /// Write one queue and fleet history row per minute while leader (#543).
+    ///
+    /// Runs beside the maintenance loop rather than inside it: the depth read
+    /// is the same query the admin Queues page issues, and on a large backlog
+    /// it must not delay rescue or promotion. It shares the leader term's
+    /// cancellation token, so a lost lock stops it with the cron evaluator.
+    async fn run_history_sampler(pool: PgPool, cancel: CancellationToken, retention: Duration) {
+        let mut baseline = awa_model::queue_history::CounterBaseline::default();
+        loop {
+            // The first sample, on taking leadership, records depth at once
+            // and sets the counter baseline; its counter deltas are unknown.
+            if let Err(err) = Self::sample_history(&pool, &mut baseline, retention).await {
+                warn!(error = %err, "Queue history sample failed; the UI will show a gap");
+            }
+            // Then sample just after each minute boundary so one leader
+            // writes one row per bucket even as tick timing drifts.
+            let now = chrono::Utc::now();
+            let into_minute = Duration::from_millis(u64::from(now.timestamp_subsec_millis()))
+                + Duration::from_secs(now.timestamp().rem_euclid(60) as u64);
+            let wait = Duration::from_secs(62).saturating_sub(into_minute);
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    }
+
+    #[tracing::instrument(skip_all, name = "maintenance.queue_history")]
+    async fn sample_history(
+        pool: &PgPool,
+        baseline: &mut awa_model::queue_history::CounterBaseline,
+        retention: Duration,
+    ) -> Result<(), awa_model::AwaError> {
+        use awa_model::queue_history;
+        use chrono::DurationRound;
+        if !queue_history::history_installed(pool).await? {
+            // Schema predates v051; nothing to write until it is migrated.
+            return Ok(());
+        }
+        let now = chrono::Utc::now();
+        let bucket = now
+            .duration_trunc(chrono::TimeDelta::minutes(1))
+            .unwrap_or(now);
+        let queues = awa_model::admin::queue_overviews(pool).await?;
+        let instances = awa_model::admin::list_runtime_instances(pool).await?;
+        let coverage = baseline.advance(now, &instances);
+        let callback_queues = baseline.callback_queues(&queues, &coverage);
+        let (rows, fleet) =
+            queue_history::build_sample(bucket, &queues, &coverage, &callback_queues, &instances);
+        queue_history::record_sample(pool, &rows, &fleet).await?;
+        queue_history::prune_history(pool, retention).await?;
+        Ok(())
     }
 
     fn stop_cron_evaluator(cancel: &CancellationToken, task: &JoinHandle<()>) {

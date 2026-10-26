@@ -1134,3 +1134,136 @@ async fn test_batch_ops_api_preview_submit_and_cancel() {
         .expect("request should succeed");
     assert_eq!(patch_response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_queue_health_and_history_endpoints() {
+    use awa_model::queue_history::{self, FleetHistoryRow, QueueHistoryRow};
+    use chrono::{DurationRound, TimeDelta, Utc};
+
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let behind = "api_health_behind";
+    let stalled = "api_health_stalled";
+    clean_jobs(&pool, &[behind, stalled], &[]).await;
+    sqlx::query("DELETE FROM awa.queue_history WHERE queue = ANY($1)")
+        .bind(&[behind, stalled][..])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        SELECT 'health_probe', $1, '{}'::jsonb, 'available', now() - interval '20 seconds'
+        FROM generate_series(1, 500)
+        "#,
+    )
+    .bind(behind)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        SELECT 'health_probe', $1, '{}'::jsonb, 'available', now() - interval '5 minutes'
+        FROM generate_series(1, 3)
+        "#,
+    )
+    .bind(stalled)
+    .execute(&pool)
+    .await
+    .unwrap();
+    awa_model::admin::flush_dirty_admin_metadata(&pool)
+        .await
+        .unwrap();
+
+    // Four minutes of steady growth up to the current 500 waiting.
+    let minute = Utc::now().duration_trunc(TimeDelta::minutes(1)).unwrap();
+    let rows: Vec<QueueHistoryRow> = (1..=4)
+        .map(|ago| QueueHistoryRow {
+            queue: behind.into(),
+            bucket: minute - TimeDelta::minutes(ago),
+            available: 500 - ago * 100,
+            running: 0,
+            scheduled: 0,
+            retryable: 0,
+            failed: 0,
+            waiting_external: 0,
+            lag_seconds: Some(20.0),
+            paused: false,
+            claimed: Some(0),
+            completed: Some(0),
+            failed_attempts: Some(0),
+            retried: Some(0),
+            rate_limited: Some(0),
+            claim_wait_ms: Some(0),
+            live_workers: 0,
+            capacity: None,
+        })
+        .collect();
+    for row in &rows {
+        queue_history::record_sample(
+            &pool,
+            std::slice::from_ref(row),
+            &FleetHistoryRow {
+                bucket: row.bucket,
+                live_instances: 0,
+                healthy_instances: 0,
+                stale_instances: 0,
+                leader_instance_id: None,
+                versions: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let app = awa_ui::router(pool.clone(), Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let report = get_json(&app, "/api/health/queues").await;
+    assert_eq!(report["history_available"], Value::Bool(true));
+    assert_eq!(report["status"], Value::from("critical"));
+    let find = |name: &str| {
+        report["queues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|q| q["queue"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} missing from report"))
+    };
+    let growing = find(behind);
+    assert_eq!(growing["health"], Value::from("behind"));
+    // Rows sit at minute starts and the live point lands mid-minute, so the
+    // fitted slope is a little under the seeded 100/min.
+    assert!(growing["trend"]["per_minute"].as_f64().unwrap() > 50.0);
+    assert_eq!(growing["limited_by"], Value::from("no_workers"));
+    let stuck = find(stalled);
+    assert_eq!(stuck["health"], Value::from("stalled"));
+    assert_eq!(stuck["needs_attention"], Value::Bool(true));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/health/queues?fail_on=critical")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let history = get_json(&app, "/api/stats/queue-history?minutes=10").await;
+    assert_eq!(history["installed"], Value::Bool(true));
+    assert_eq!(history["buckets"].as_array().unwrap().len(), 10);
+    let available = history["queues"][behind]["available"].as_array().unwrap();
+    assert_eq!(available[5], Value::from(100));
+    assert_eq!(available[8], Value::from(400));
+    assert!(
+        available[9].is_null(),
+        "the current minute has no sample yet"
+    );
+}

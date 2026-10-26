@@ -3,7 +3,7 @@ import { test, expect } from "@playwright/test";
 test.describe("Runtime page", () => {
   test("navigate to /runtime, heading visible", async ({ page }) => {
     await page.goto("/runtime");
-    await expect(page.getByRole("heading", { name: "Runtime" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Workers" })).toBeVisible();
   });
 
   test("renders empty states when no runtime snapshots exist", async ({ page }) => {

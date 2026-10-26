@@ -25,9 +25,9 @@ test.describe("Shell navigation", () => {
     await expect(page.getByRole("heading", { name: "Queues" })).toBeVisible();
 
     // Click Runtime nav link
-    await nav.getByRole("link", { name: "Runtime" }).click();
+    await nav.getByRole("link", { name: "Workers" }).click();
     await expect(page).toHaveURL(/\/runtime/);
-    await expect(page.getByRole("heading", { name: "Runtime" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Workers" })).toBeVisible();
 
     // Click Cron nav link (use exact match to avoid matching queue names like "cron_...")
     await nav.getByRole("link", { name: "Cron", exact: true }).click();
@@ -37,10 +37,10 @@ test.describe("Shell navigation", () => {
     ).toBeVisible();
 
     // Click Dashboard nav link
-    await nav.getByRole("link", { name: "Dashboard" }).click();
+    await nav.getByRole("link", { name: "Overview" }).click();
     await expect(page).toHaveURL(/\/$/);
     await expect(
-      page.getByRole("heading", { name: "Dashboard" })
+      page.getByRole("heading", { name: "Overview" })
     ).toBeVisible();
   });
 
@@ -55,7 +55,7 @@ test.describe("Shell navigation", () => {
     await logoLink.click();
     await expect(page).toHaveURL(/\/$/);
     await expect(
-      page.getByRole("heading", { name: "Dashboard" })
+      page.getByRole("heading", { name: "Overview" })
     ).toBeVisible();
   });
 
@@ -69,7 +69,7 @@ test.describe("Shell navigation", () => {
 
     // Dashboard should NOT be marked as current
     const dashboardLink = page
-      .getByRole("link", { name: "Dashboard" })
+      .getByRole("link", { name: "Overview" })
       .first();
     await expect(dashboardLink).not.toHaveAttribute("aria-current", "page");
 

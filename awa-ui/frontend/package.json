@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "tsc --noEmit",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:operations": "playwright test --config playwright.operations.config.ts"
   },
   "dependencies": {
     "@heroicons/react": "^2",

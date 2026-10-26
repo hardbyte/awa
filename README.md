@@ -4,7 +4,7 @@
 
 Awa (Māori: river) fills the gap between Postgres event queues that are too narrow for real job-queue behavior and language-specific job frameworks (River, Oban, Sidekiq) that couple you to one ecosystem. If you run Rust or Python (or both) on Postgres and want priorities, cron, DLQ, and transactional enqueue without Redis or RabbitMQ, Awa is built for you.
 
-![AWA Web UI — Jobs (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
+![Awa admin overview during an incident: one queue is not being worked, another is falling behind its rate limit, with recurring failures and fleet changes alongside](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-overview-incident-dark.png)
 
 ## Core Concepts
 
@@ -49,7 +49,7 @@ Awa (Māori: river) fills the gap between Postgres event queues that are too nar
 - **Operator descriptors** — code-declared queue and job-kind names/descriptions with stale/drift visibility in the UI.
 - **Postgres-only** — one dependency you already have; no Redis, no RabbitMQ, no separate scheduler.
 
-![AWA Web UI — Queue detail (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-queue-detail-dark.png)
+![Awa admin overview during recovery: three queues draining their backlog with an estimate of when all will be clear, after a hotfix rollout shown in the fleet changes](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-overview-recovery-dark.png)
 
 ## Correctness
 
