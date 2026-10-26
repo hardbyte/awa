@@ -1449,6 +1449,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#custom-schema-discovery-during-migration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom-schema discovery during migration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Custom-schema discovery during migration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#existing-migration-history-and-external-runners" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Existing migration history and external runners
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v050-one-lane-index-per-ready-partition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v050: one lane index per ready partition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#terminal-live-counts-one-row-per-lane" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Terminal live counts: one row per lane
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v051-per-slot-claim-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2282,6 +2332,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#custom-schema-discovery-during-migration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Custom-schema discovery during migration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Custom-schema discovery during migration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#existing-migration-history-and-external-runners" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Existing migration history and external runners
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v050-one-lane-index-per-ready-partition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v050: one lane index per ready partition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#terminal-live-counts-one-row-per-lane" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Terminal live counts: one row per lane
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v051-per-slot-claim-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2505,6 +2605,168 @@ External migration runners must apply the complete generated
 <code>awa migrate --sql --from 48 --to 49</code> bundle: it refreshes the installer
 definition before replacing lane helpers in the installed schemas.
 See <a href="../security/database-roles/#provision-queues-before-starting-restricted-runtimes">Database roles</a>.</p>
+<h2 id="custom-schema-discovery-during-migration">Custom-schema discovery during migration<a class="headerlink" href="#custom-schema-discovery-during-migration" title="Permanent link">&para;</a></h2>
+<p>Migration bundles discover custom substrates using catalog metadata without
+evaluating their views or functions. Schemas, relations, routines and types
+must belong to the effective migration role or the owner of the <code>awa</code> schema.
+Sequences may belong to another role, because they run no code.
+The claim allocator signature must exist and ring-state relations must be
+ordinary tables. <code>public</code>, <code>information_schema</code> and <code>pg_*</code> are excluded.</p>
+<p>Only those same owners may hold schema <code>CREATE</code> or table <code>TRIGGER</code> privileges.
+Every trigger in the schema must be one awa installs, with exactly the
+definition awa gives it. A trigger needs only the <code>TRIGGER</code> privilege to
+create or replace, and its <code>WHEN</code> clause or arguments can run code that no
+catalog dependency records, so an added or altered trigger, including one of
+your own on an awa table, makes the schema untrusted. This prevents an
+outsider from planting another object in an otherwise owned substrate, or
+racing discovery with new objects. Role membership alone does not establish
+trust, and superusers do not bypass these checks.</p>
+<p>Unregistered unsafe custom schemas are skipped. Unsafe registered or prepared
+targets abort the pending bundle, so the global version cannot advance while
+leaving a configured substrate behind. Registry and transition references are
+checked separately; unnamed legacy prepared targets also check <code>awa_exp</code>.
+Use an explicit schema in transition metadata to disambiguate that legacy case.
+Unsafe ownership or privileges in the default <code>awa</code> schema abort before the
+installer runs. Use a dedicated owner role consistently, including <code>SET ROLE</code>
+when connecting through a different login.
+Review separately owned objects, remove triggers awa did not install, and remove untrusted creation/trigger grants
+before migrating; a blanket role grant is not a substitute for this review.</p>
+<p>A refused migration names the schema and up to five offending objects with the
+rule each breaks, for example <code>relation awa.jobs_hot TRIGGER granted to
+awa_runtime</code>. Nothing is applied. An unregistered schema that fails the check is
+reported as a warning (<code>skipping untrusted queue-storage schema</code>) and left at
+its current version. The common causes and their fixes, run as the <code>awa</code>
+schema owner:</p>
+<ul>
+<li><strong><code>GRANT ALL ON ALL TABLES</code> to the runtime role.</strong> <code>ALL</code> includes <code>TRIGGER</code>.
+  Grant the documented privileges instead, and fix default privileges the same
+  way:</li>
+</ul>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">REVOKE</span><span class="w"> </span><span class="k">TRIGGER</span><span class="p">,</span><span class="w"> </span><span class="k">REFERENCES</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">DEFAULT</span><span class="w"> </span><span class="k">PRIVILEGES</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="k">ROLE</span><span class="w"> </span><span class="n">awa_owner</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="k">REVOKE</span><span class="w"> </span><span class="k">TRIGGER</span><span class="p">,</span><span class="w"> </span><span class="k">REFERENCES</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span></code></pre></div>
+<ul>
+<li>
+<p><strong>A 0.6 split-role install whose runtime holds <code>CREATE</code> on the schema.</strong> 0.6
+  runtimes created lane sequences themselves, so they needed <code>CREATE</code>.
+  Sequences they own are accepted; the <code>CREATE</code> grant is not, because it lets
+  the runtime add objects while a migration runs. Until the migration refreshes
+  them, the 0.6 lane helpers and enqueue-head triggers run
+  <code>CREATE SEQUENCE IF NOT EXISTS</code> on every reservation, and that checks
+  <code>CREATE</code> even for a sequence that exists, so revoking the grant makes running
+  0.6 producers and workers fail with <code>42501</code> until the migration commits.
+  Provisioning lanes in advance does not avoid this. Take a short pause:</p>
+</li>
+<li>
+<p>Stop 0.6 producers and workers, or hold them at a maintenance gate, so no
+     enqueue or claim runs.</p>
+</li>
+<li>
+<p>Revoke the grant and commit:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">REVOKE</span><span class="w"> </span><span class="k">CREATE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">SCHEMA</span><span class="w"> </span><span class="n">awa</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">awa_runtime</span><span class="p">;</span>
+</span></code></pre></div>
+</li>
+<li>
+<p>Run <code>awa migrate</code> as the migrator. The bundle refreshes the lane helpers
+     to use provisioned sequences without <code>CREATE</code> (v049).</p>
+</li>
+<li>
+<p>Provision any lanes the 0.7 runtimes will need, as the migrator:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">PGOPTIONS</span><span class="o">=</span><span class="s1">'-c role=awa_owner'</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$AWA_MIGRATOR_DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>storage<span class="w"> </span>prepare-queue<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>--queue<span class="w"> </span>&lt;queue&gt;<span class="w"> </span>--enqueue-shards<span class="w"> </span>&lt;n&gt;
+</span></code></pre></div>
+</li>
+<li>
+<p>Start the 0.7 runtimes.</p>
+</li>
+</ul>
+<p>An uninterrupted path would need the revoke and the helper refresh to become
+  visible to every session at once; that has not been verified, so do not
+  combine them into one transaction as a substitute for the pause.</p>
+<ul>
+<li><strong>A custom schema prepared by a runtime or another role.</strong> A worker that
+  auto-prepares a schema, or a DBA who ran the preparation as another user,
+  leaves it owned by that role. Transfer the schema and every object the error
+  lists to the <code>awa</code> schema owner, for example
+  <code>ALTER SCHEMA tenant_qs OWNER TO awa_owner</code> and <code>ALTER TABLE ... OWNER TO</code>,
+  <code>ALTER FUNCTION ... OWNER TO</code> for each listed object. If the runtime and the
+  migrator are deliberately the same role, connect the migration as that role.</li>
+</ul>
+<h3 id="existing-migration-history-and-external-runners">Existing migration history and external runners<a class="headerlink" href="#existing-migration-history-and-external-runners" title="Permanent link">&para;</a></h3>
+<p>The built-in runner records migration versions, descriptions and application times;
+it does not store SQL checksums or automatically rerun applied steps. These security
+checks harden pending historical discovery loops, because an appended migration
+would execute after those loops had already inspected untrusted objects. Standalone
+steps receive only the small discovery bootstrap, without redefining the installer.</p>
+<p>An already-current database has no pending discovery loop and does not run this
+bootstrap; it need not receive the internal helper until a later bundle uses it. No new
+schema version or runtime capability is introduced. Older binaries and previously
+exported SQL retain the old behavior: use an updated binary and regenerate the
+<strong>pending</strong> SQL bundle for upgrades. For external runners that track checksums,
+preserve files already applied and generate a new pending bundle; do not overwrite
+their historical files or reset checksum records to accept changed contents.
+For example, extract with <code>awa migrate --pending --extract-to ./pending-migrations</code>
+into a new directory. Execute complete generated bundles; individual discovery
+tail files in the repository do not include their bootstrap prerequisites.</p>
+<h2 id="v050-one-lane-index-per-ready-partition">v050: one lane index per ready partition<a class="headerlink" href="#v050-one-lane-index-per-ready-partition" title="Permanent link">&para;</a></h2>
+<p>v050 drops <code>idx_&lt;schema&gt;_ready_&lt;slot&gt;_lane_shard</code> from every <code>ready_entries</code>
+partition in the default schema and in the custom schemas that
+<code>awa.queue_storage_schemas()</code> selects (see
+<a href="#custom-schema-discovery-during-migration">Custom-schema discovery</a>); other
+schemas keep their indexes. The partition primary
+key <code>(ready_slot, queue, priority, enqueue_shard, lane_seq)</code> serves every
+per-lane lookup because current binaries pin <code>ready_slot</code> in claims, in the
+queue prune and terminal-count fold gates, and in the maintenance lag gauge
+(through <code>ready_segments</code>).</p>
+<p>What the migration locks: it redefines <code>awa.install_queue_storage_substrate</code>
+(no schema is reinstalled) and then drops the indexes in slot order. Each
+<code>DROP INDEX</code> takes ACCESS EXCLUSIVE on its <code>ready_entries</code> partition and holds
+it until the migration transaction commits, so enqueues and claims touching
+that partition wait for the commit. No rows are scanned or rewritten; on a
+scratch PostgreSQL 17 database with 409,600 ready rows the whole 49 → 50 step
+took 27 ms. When the session has no <code>lock_timeout</code>, the migration sets a 2 s
+timeout for each lock acquisition. It bounds each wait, not the total
+migration time: every lock already taken is kept until commit, so a
+migration that waits on several partitions holds the earlier ones meanwhile.
+"Only ready partitions" describes the application tables it locks; the drop
+also locks the dropped indexes and the catalog rows it changes. If an
+acquisition times out (SQLSTATE <code>55P03</code>, typically behind a long-running read
+of <code>awa.jobs</code> or a backup) the error names the partition, the whole migration
+rolls back, and it can simply be re-run. Locks taken are held until commit,
+about 60 per 16-slot schema, so a database with hundreds of queue-storage
+schemas may need a larger <code>max_locks_per_transaction</code> for this step.
+<code>queue_counts_exact</code>, which filters ready rows by queue across every slot,
+seq-scans the ready partitions on PostgreSQL 17 without the index; at
+200,000 ready rows across 20 queues it measured 177 ms against 136 ms. External runners apply the complete
+generated <code>awa migrate --sql --from 49 --to 50</code> bundle.</p>
+<p>Rollout order: current binaries' SQL works with or without the index, so
+producers and workers without a readiness gate can roll before the
+migration. Health-gated workers cannot: <code>/readyz</code> reports a worker ready only
+once the schema reaches the binary's version, so a v050 worker on a v049
+schema stays unready and a readiness-gated rollout stalls before its
+migration step. For those, migrate first. Pre-v050 binaries keep working
+against a v050 schema, but on PostgreSQL 17 and earlier their maintenance lag
+gauge, queue prune gate and terminal-count fold gate fall back to sequential
+scans of every ready partition until they are replaced (PostgreSQL 18 can
+skip-scan the primary key), so keep that window short. Rolling back a binary is
+therefore safe for correctness; to restore the old binary's query plans,
+recreate the index per partition with
+<code>CREATE INDEX CONCURRENTLY idx_&lt;schema&gt;_ready_&lt;slot&gt;_lane_shard ON &lt;schema&gt;.ready_entries_&lt;slot&gt; (queue, priority, enqueue_shard, lane_seq)</code>.</p>
+<h2 id="terminal-live-counts-one-row-per-lane">Terminal live counts: one row per lane<a class="headerlink" href="#terminal-live-counts-one-row-per-lane" title="Permanent link">&para;</a></h2>
+<p>After the ring authority flip, runtimes fold sealed-slot terminal-count deltas
+into one <code>queue_terminal_live_counts</code> row per <code>(ready_slot, queue, priority,
+enqueue_shard)</code> with <code>counter_bucket = 0</code>, and <code>rebuild_terminal_counters</code>
+writes the same shape. The first fold after the flip collapses every bucket of a
+lane it touches and adds the signed delta, so rows left in per-job-id buckets by
+earlier folds, the installer backfill or the v027 rebuild stay exact. No
+migration is involved and readers sum every bucket either way.</p>
+<p>Before the flip, 0.6 runtimes can still hold the maintenance election and fold
+into job-id buckets, so this release keeps that shape in its own folds and
+rebuilds until the flip fences them. Exact terminal counts stay exact through a
+mixed-version rollout and through a rollback before the flip; no operator action
+is needed.</p>
 <h2 id="v051-per-slot-claim-functions">v051: per-slot claim functions<a class="headerlink" href="#v051-per-slot-claim-functions" title="Permanent link">&para;</a></h2>
 <p>v051 moves the claim query out of <code>claim_ready_runtime</code> into one
 <code>claim_ready_slot_&lt;N&gt;</code> function per queue-ring slot in the default and every
@@ -2550,9 +2812,9 @@ needs a canonical implementation, and gives operators one unambiguous instructio
 <h2 id="if-you-are-on-06-not-yet-finalized">If you are on 0.6, not yet finalized<a class="headerlink" href="#if-you-are-on-06-not-yet-finalized" title="Permanent link">&para;</a></h2>
 <p>Complete the staged transition <strong>on your 0.6 binaries</strong> first
 (full procedure: <a href="../upgrade-0.5-to-0.6/">Upgrade 0.5 to 0.6</a>):</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>awa<span class="w"> </span>storage<span class="w"> </span>prepare<span class="w"> </span>--engine<span class="w"> </span>queue_storage
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>awa<span class="w"> </span>storage<span class="w"> </span>enter-mixed-transition
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>awa<span class="w"> </span>storage<span class="w"> </span>finalize<span class="w"> </span>--wait
 </span></code></pre></div>
 <p>For a stopped fleet, a CLI containing #457 can replace the middle command
 with <code>awa storage enter-mixed-transition --quiesced</code>; follow the
@@ -2765,7 +3027,7 @@ During mixed-manifest rollouts, existing definitions retain their last agreed
 value; new names can be inserted immediately. Definition updates wait for fresh
 capable fleet agreement, while removals additionally wait through grace.</p>
 <h3 id="v048-claim-cursor-compatibility">v048 claim cursor compatibility<a class="headerlink" href="#v048-claim-cursor-compatibility" title="Permanent link">&para;</a></h3>
-<p>Current runtimes work against the pre-v048 claim result shape and continue guarded post-commit advances until migration. v048 adds <code>lane_drained</code> and same-lane committed-evidence catch-up; new receipt runtimes can then omit an advance for a non-drained lane. Existing runtimes can continue advancing after commit on the migrated schema. A store that cached the older capability keeps its safe fallback until recreated. Legacy materialized-lease claims always retain post-commit advances. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.</p>
+<p>Current runtimes work against both the pre-v048 and the v048 claim result shape and advance the lane cursor after every committed claim on either schema. <code>claim_ready_runtime</code> still returns <code>lane_drained</code>; current runtimes ignore it. v048 adds same-lane committed-evidence catch-up inside the claim, which covers an advance that never ran (for example a claimer that stopped between commit and advance). Legacy materialized-lease claims write no attempt evidence, so only their post-commit advance moves the cursor. Cursor folding uses committed evidence for the selected ready generation and re-routes before claiming a newer segment; it does not make asynchronous acknowledgments durable or change at-least-once delivery. See the correctness mapping for the bounded range and crash/promotion proof boundaries.</p>
 <p>For v048 use <code>awa migrate</code> or the complete generated
 <code>awa migrate --sql --from 47 --to 48</code> bundle. It includes the installer
 definition and default-substrate replay before the v048 tail reinstalls custom

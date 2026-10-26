@@ -454,6 +454,17 @@ Pick them in this order:
 
 For a 5-second crash detection target: `heartbeat_interval=1s`, `heartbeat_staleness=4s`, `heartbeat_rescue_interval=1s`. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.
 
+A finished handler retains its result and retries durable finalization for up to 120 s
+from the first finalize attempt when database writes are unavailable. This includes
+pool-acquire timeouts and read-only-session errors during failover, as well as
+connection errors. A writable endpoint and usable pooled connections are required
+for recovery; changing DNS alone does not redirect existing read-only sessions.
+The retry budget is independent of heartbeat staleness. Rescue uses the last
+heartbeat or claim stamp, so it can become eligible before the 120 s expires;
+the next rescue sweep or an attempt deadline may claim a newer lease first.
+Keep handlers idempotent. Monitor `awa.completion.reconnect_retry` alongside
+pool waits and database errors; a retry count does not prove recovery.
+
 ### Deadline — bounding a single attempt
 
 Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
@@ -568,7 +579,7 @@ await client.start(
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `1000ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions. |
-| `ring_rotation_cadence` | 5 s / 2 MiB target | A non-empty slot becomes eligible after `min_slot_age` since the first non-empty observation, or when `target_slot_bytes` is reached. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. Age uses a monotonic clock and resets on an empty observation or leader change. Configure with `ClientBuilder::ring_rotation_cadence` (Rust) or `queue_storage_rotate_min_slot_age_ms` / `queue_storage_rotate_target_slot_bytes` (Python). A zero byte target disables the size trigger; zero age or `RingRotationCadence::EAGER` permits sealing on every tick. The target is sampled and does not bound retained storage. |
+| `ring_rotation_cadence` | 5 s / 2 MiB target / 256 rows / 60 s | A non-empty slot becomes eligible after `min_slot_age` since the first non-empty observation once it holds `min_slot_rows`, when `target_slot_bytes` is reached, or after `max_slot_age` regardless of rows (so a trickle of writes neither seals a nearly empty slot every window nor keeps one open indefinitely). Python: `queue_storage_rotate_min_slot_rows`, `queue_storage_rotate_max_slot_age_ms`. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. The minimum age uses a monotonic clock and resets on an empty observation or leader change; `max_slot_age` also counts from when the slot opened on the database clock, so a leader change does not restart it, except under compat (pre-flip) authority when an older rotator left no ledger row for the slot. `max_slot_age` makes a slot eligible to seal; the busy and reuse checks still decide when it is reclaimed. Configure with `ClientBuilder::ring_rotation_cadence` (Rust) or `queue_storage_rotate_min_slot_age_ms` / `queue_storage_rotate_target_slot_bytes` (Python). A zero byte target disables the size trigger, a zero `min_slot_rows` disables the row floor, and a zero `max_slot_age` disables the ceiling. A row floor needs a size target or a ceiling, and a queue-storage client refuses to build without one, because lease rows are deleted as attempts finish and a lease slot may never reach the floor. A zero `min_slot_age`, or `RingRotationCadence::EAGER`, permits sealing on every tick whatever the other settings. The target is sampled and does not bound retained storage. |
 
 The benchmark harness in [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking) reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark configuration, not general worker-runtime configuration.
 

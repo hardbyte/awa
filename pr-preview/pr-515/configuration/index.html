@@ -3707,6 +3707,16 @@
 <li><strong><code>heartbeat_rescue_interval</code></strong> can match <code>heartbeat_interval</code> for low-latency rescue, or be higher to reduce maintenance load on big fleets.</li>
 </ol>
 <p>For a 5-second crash detection target: <code>heartbeat_interval=1s</code>, <code>heartbeat_staleness=4s</code>, <code>heartbeat_rescue_interval=1s</code>. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.</p>
+<p>A finished handler retains its result and retries durable finalization for up to 120 s
+from the first finalize attempt when database writes are unavailable. This includes
+pool-acquire timeouts and read-only-session errors during failover, as well as
+connection errors. A writable endpoint and usable pooled connections are required
+for recovery; changing DNS alone does not redirect existing read-only sessions.
+The retry budget is independent of heartbeat staleness. Rescue uses the last
+heartbeat or claim stamp, so it can become eligible before the 120 s expires;
+the next rescue sweep or an attempt deadline may claim a newer lease first.
+Keep handlers idempotent. Monitor <code>awa.completion.reconnect_retry</code> alongside
+pool waits and database errors; a retry count does not prove recovery.</p>
 <h3 id="deadline-bounding-a-single-attempt">Deadline — bounding a single attempt<a class="headerlink" href="#deadline-bounding-a-single-attempt" title="Permanent link">&para;</a></h3>
 <p>Each queue has a <code>deadline_duration</code> (default <code>5m</code> on <code>QueueConfig</code>). At claim time the runtime stamps <code>now() + deadline_duration</code> onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.</p>
 <table>
@@ -3900,8 +3910,8 @@
 </tr>
 <tr>
 <td><code>ring_rotation_cadence</code></td>
-<td>5 s / 2 MiB target</td>
-<td>A non-empty slot becomes eligible after <code>min_slot_age</code> since the first non-empty observation, or when <code>target_slot_bytes</code> is reached. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. Age uses a monotonic clock and resets on an empty observation or leader change. Configure with <code>ClientBuilder::ring_rotation_cadence</code> (Rust) or <code>queue_storage_rotate_min_slot_age_ms</code> / <code>queue_storage_rotate_target_slot_bytes</code> (Python). A zero byte target disables the size trigger; zero age or <code>RingRotationCadence::EAGER</code> permits sealing on every tick. The target is sampled and does not bound retained storage.</td>
+<td>5 s / 2 MiB target / 256 rows / 60 s</td>
+<td>A non-empty slot becomes eligible after <code>min_slot_age</code> since the first non-empty observation once it holds <code>min_slot_rows</code>, when <code>target_slot_bytes</code> is reached, or after <code>max_slot_age</code> regardless of rows (so a trickle of writes neither seals a nearly empty slot every window nor keeps one open indefinitely). Python: <code>queue_storage_rotate_min_slot_rows</code>, <code>queue_storage_rotate_max_slot_age_ms</code>. Counts total physical storage, including indexes and TOAST. Empty slots bypass the cadence. The minimum age uses a monotonic clock and resets on an empty observation or leader change; <code>max_slot_age</code> also counts from when the slot opened on the database clock, so a leader change does not restart it, except under compat (pre-flip) authority when an older rotator left no ledger row for the slot. <code>max_slot_age</code> makes a slot eligible to seal; the busy and reuse checks still decide when it is reclaimed. Configure with <code>ClientBuilder::ring_rotation_cadence</code> (Rust) or <code>queue_storage_rotate_min_slot_age_ms</code> / <code>queue_storage_rotate_target_slot_bytes</code> (Python). A zero byte target disables the size trigger, a zero <code>min_slot_rows</code> disables the row floor, and a zero <code>max_slot_age</code> disables the ceiling. A row floor needs a size target or a ceiling, and a queue-storage client refuses to build without one, because lease rows are deleted as attempts finish and a lease slot may never reach the floor. A zero <code>min_slot_age</code>, or <code>RingRotationCadence::EAGER</code>, permits sealing on every tick whatever the other settings. The target is sampled and does not bound retained storage.</td>
 </tr>
 </tbody>
 </table>

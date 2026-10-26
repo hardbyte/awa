@@ -54,7 +54,7 @@ Queue-ring prune reclaims retained ready bodies, ready tombstones, compact compl
 
 Exact terminal counts are part of this terminal-history contract. Awa keeps them exact with retained compact batches plus three derived stores:
 
-- `queue_terminal_live_counts`, keyed by `(ready_slot, queue, priority, enqueue_shard, counter_bucket)`, stores folded counts for retained queue segments.
+- `queue_terminal_live_counts`, keyed by `(ready_slot, queue, priority, enqueue_shard, counter_bucket)`, stores folded counts for retained queue segments. Once the ring authority flip has fenced 0.6 maintenance, the fold and the rebuild write one row per `(ready_slot, queue, priority, enqueue_shard)` with `counter_bucket = 0`; before it they keep the job-id bucket, because 0.6 folds apply each delta to the bucket of its original row. Readers sum every bucket.
 - `queue_terminal_count_deltas_*`, partitioned with the queue ring, stores pending signed deltas for `done_entries` terminal mutations that have not been folded yet.
 - `receipt_completion_batches_*` and `receipt_completion_tombstones_*` provide the retained compact completion count directly, without another hot-path derived write.
 - `queue_terminal_rollups` stores permanent counts for pruned queue segments.
@@ -65,7 +65,7 @@ Exact terminal counts are part of this terminal-history contract. Awa keeps them
 - retry, purge, discard, DLQ move, and compatibility delete of `done_entries` rows write a negative delta;
 - the delta key includes `ready_generation`, so reused `ready_slot` partitions cannot inherit stale deltas.
 
-Compact receipt completion batches do not append terminal-count deltas. A 512-job compact batch writes one compact terminal-history row for a queue/priority/shard group and is counted from its retained `completed_count` until queue prune folds that segment into permanent rollups. SQL compatibility delete of a compact completed row writes `receipt_completion_tombstones`, and exact counts subtract retained compact tombstones. Wide `done_entries` terminal rows keep job-id counter bucketing so later terminal deletes cancel their original positive bucket exactly.
+Compact receipt completion batches do not append terminal-count deltas. A 512-job compact batch writes one compact terminal-history row for a queue/priority/shard group and is counted from its retained `completed_count` until queue prune folds that segment into permanent rollups. SQL compatibility delete of a compact completed row writes `receipt_completion_tombstones`, and exact counts subtract retained compact tombstones. Before the flip, deltas for wide `done_entries` terminal rows keep the job-id bucket, so a 0.6 fold of a later terminal delete cancels the original positive bucket exactly. After it, each append writes one delta row per lane, since folds collapse lanes and readers sum every bucket.
 
 `queue_counts_exact` computes the live terminal component as `queue_terminal_live_counts + SUM(queue_terminal_count_deltas) + SUM(receipt_completion_batches.completed_count) - COUNT(receipt_completion_tombstones)`, then adds pruned rollups from `queue_terminal_rollups` / `queue_lanes`. The exact read remains honest while maintenance is behind. If the terminal-counter trust marker is not set, the read path falls back to scanning `{schema}.terminal_jobs` so rolling upgrades and recovery windows stay honest.
 
