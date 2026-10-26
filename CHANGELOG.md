@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v050. Run `awa migrate` as the migrator
+This release adds migrations v044 to v051. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 
@@ -73,6 +73,22 @@ for each step.
   `awa.migration_lock_key()` expose the runner's advisory lock key.
 - Python prints a diagnostic to stderr if native shutdown has stalled for five
   seconds.
+- **The admin overview answers "is it keeping up?" (v051,
+  [#543](https://github.com/hardbyte/awa/pull/543)).** The maintenance leader
+  writes one row per queue per minute to `awa.queue_history` (depth by state,
+  oldest wait, and claimed/completed/failed/retried/rate-limited counts) and
+  one fleet row to `awa.fleet_history` (live and healthy instances, leader,
+  running versions), keeping 48 hours by default. Runtimes publish the
+  per-queue outcome counters this needs in their existing snapshots. The
+  overview, Queues page and queue detail classify each queue as not being
+  worked, falling behind, waiting long, paused, draining, steady or idle,
+  say what is holding waiting work back (no workers, rate limit, worker
+  capacity), show measured completion and arrival rates and an hour of
+  history, and mark rollouts, leader changes and lost instances on the chart.
+  `GET /api/health/queues` returns the same verdicts for alerting
+  (`?fail_on=critical` or `warning` answers 503 at that level).
+  Configure retention with `ClientBuilder::queue_history_retention` or
+  Python's `queue_history_retention_hours`; zero stops sampling.
 
 ### Changed
 

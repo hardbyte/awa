@@ -1,3 +1,4 @@
+pub mod assessment;
 pub mod cache;
 pub mod callback_router;
 pub mod error;
@@ -144,6 +145,11 @@ pub async fn router_with_identity(
         // Stats
         .route("/stats", get(handlers::stats::get_stats))
         .route("/stats/timeseries", get(handlers::stats::get_timeseries))
+        .route(
+            "/stats/queue-history",
+            get(handlers::health::get_queue_history),
+        )
+        .route("/health/queues", get(handlers::health::get_queue_health))
         .route("/stats/kinds", get(handlers::stats::get_distinct_kinds))
         .route("/stats/queues", get(handlers::stats::get_distinct_queues))
         .route("/capabilities", get(handlers::stats::get_capabilities))

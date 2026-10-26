@@ -40,7 +40,7 @@ test.describe("Shell navigation", () => {
     await nav.getByRole("link", { name: "Overview" }).click();
     await expect(page).toHaveURL(/\/$/);
     await expect(
-      page.getByRole("heading", { name: "Work in motion" })
+      page.getByRole("heading", { name: "Overview" })
     ).toBeVisible();
   });
 
@@ -55,7 +55,7 @@ test.describe("Shell navigation", () => {
     await logoLink.click();
     await expect(page).toHaveURL(/\/$/);
     await expect(
-      page.getByRole("heading", { name: "Work in motion" })
+      page.getByRole("heading", { name: "Overview" })
     ).toBeVisible();
   });
 

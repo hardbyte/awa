@@ -366,6 +366,16 @@ connection. Set `--callback-hmac-secret` to verify callback signatures; for
 externally reachable callbacks with a private admin surface, run
 `awa callbacks serve` instead, whose router has no admin routes.
 
+The overview's "keeping up" verdict comes from per-minute history the
+maintenance leader writes (`awa.queue_history`, `awa.fleet_history`, schema
+v051; `queue_history_retention`, default 48h). `GET /api/health/queues` returns
+the same verdicts; `?fail_on=critical` answers 503 for a plain HTTP alert. With
+no history (pre-v051 schema, or no current leader yet) only stalls and long
+waits are detected. A queue flagged "Not being worked" has claimable jobs
+waiting over a minute with no live worker serving it, or nothing running or
+claimed; read its **Limited by** (no workers, rate limit, worker capacity,
+spare capacity) before changing anything.
+
 ## Before You Finish A Change
 
 1. Confirm the resolved target and that you are on the intended context.

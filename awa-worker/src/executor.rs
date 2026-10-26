@@ -1,6 +1,7 @@
 use crate::completion::CompletionBatcherHandle;
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
+use crate::queue_counters::{QueueCounterMap, QueueCounters};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::reschedule::{Reschedule, RescheduleOutcome};
@@ -226,6 +227,7 @@ pub struct JobExecutor {
     >,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
+    queue_counters: QueueCounterMap,
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
     metrics: crate::metrics::AwaMetrics,
     completion_batcher: CompletionBatcherHandle,
@@ -250,6 +252,7 @@ impl JobExecutor {
         >,
         in_flight: InFlightMap,
         queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
+        queue_counters: QueueCounterMap,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
         metrics: crate::metrics::AwaMetrics,
         completion_batcher: CompletionBatcherHandle,
@@ -269,6 +272,7 @@ impl JobExecutor {
             enqueue_specs,
             in_flight,
             queue_in_flight,
+            queue_counters,
             state,
             metrics,
             completion_batcher,
@@ -278,6 +282,11 @@ impl JobExecutor {
             finalize_cancel,
             finalize_capacity,
         }
+    }
+
+    /// Counters for `queue`, if it is one this runtime serves.
+    pub(crate) fn queue_counters(&self, queue: &str) -> Option<Arc<QueueCounters>> {
+        self.queue_counters.get(queue).cloned()
     }
 
     /// Build the future that executes a claimed job.
@@ -309,6 +318,7 @@ impl JobExecutor {
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
         let job_queue = job.queue.clone();
+        let counters = self.queue_counters(&job_queue);
 
         let span = info_span!(
             "job.execute",
@@ -475,15 +485,19 @@ impl JobExecutor {
                                 // State transition succeeded — record metrics. `terminal`
                                 // is the source of truth for retry-vs-failure because
                                 // JobError::Retryable can resolve to either path.
+                                let counters = counters.as_deref();
                                 match &result {
                                     Ok(JobResult::Completed) => {
                                         metrics.record_job_completed(&job_kind, &job_queue, duration);
+                                        if let Some(counters) = counters { counters.record_completed(); }
                                     }
                                     Ok(JobResult::RetryAfter(_)) => {
                                         if *terminal {
                                             metrics.record_job_failed(&job_kind, &job_queue, true);
+                                            if let Some(counters) = counters { counters.record_failed(); }
                                         } else {
                                             metrics.record_job_retried(&job_kind, &job_queue);
+                                            if let Some(counters) = counters { counters.record_retried(); }
                                         }
                                     }
                                     Ok(JobResult::Cancel(_)) => {
@@ -505,7 +519,9 @@ impl JobExecutor {
                                     Ok(JobResult::WaitForCallback(_)) => {
                                         if *terminal {
                                             metrics.record_job_failed(&job_kind, &job_queue, true);
+                                            if let Some(counters) = counters { counters.record_failed(); }
                                         } else {
+                                            if let Some(counters) = counters { counters.record_parked(); }
                                             metrics.jobs_waiting_external.add(
                                                 1,
                                                 &[
@@ -523,12 +539,15 @@ impl JobExecutor {
                                     }
                                     Err(JobError::Terminal(_)) => {
                                         metrics.record_job_failed(&job_kind, &job_queue, true);
+                                        if let Some(counters) = counters { counters.record_failed(); }
                                     }
                                     Err(JobError::Retryable(_)) => {
                                         if *terminal {
                                             metrics.record_job_failed(&job_kind, &job_queue, true);
+                                            if let Some(counters) = counters { counters.record_failed(); }
                                         } else {
                                             metrics.record_job_retried(&job_kind, &job_queue);
+                                            if let Some(counters) = counters { counters.record_retried(); }
                                         }
                                     }
                                 }
@@ -3529,6 +3548,7 @@ mod tests {
             Arc::new(crate::runtime::InFlightRegistry::default()),
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
             metrics,
             handle,
             RuntimeStorage::Canonical,
@@ -3604,6 +3624,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             in_flight.clone(),
+            Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             metrics,
@@ -3699,6 +3720,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             in_flight.clone(),
+            Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             metrics,

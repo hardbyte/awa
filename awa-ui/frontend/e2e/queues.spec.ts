@@ -26,22 +26,34 @@ test.describe("Queues page", () => {
     await loadQueuesPage(page);
 
     // Desktop table (visible at default viewport)
-    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    const queueTable = page.getByRole("table", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
     for (const header of [
       "Queue",
-      "Available",
-      "Oldest available",
+      "Status",
+      "Waiting",
+      "Trend",
+      "Oldest wait",
       "Running",
-      "Retryable / failed",
-      "Completed last hour",
+      "Done/min",
+      "Retrying / failed",
       "Controls",
     ]) {
       await expect(
         queueTable.getByRole("columnheader", { name: header, exact: true }),
       ).toBeVisible();
     }
+
+    // Capacity joins the table only where there is room for it.
+    const capacity = queueTable.getByRole("columnheader", {
+      name: "Capacity",
+      exact: true,
+    });
+    await expect(capacity).toBeHidden();
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await expect(capacity).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 720 });
 
     // Descriptor-backed queue shows display name and raw key
     await expect(queueTable.getByText("E2E Queue")).toBeVisible();
@@ -51,20 +63,20 @@ test.describe("Queues page", () => {
     ).toBeVisible();
   });
 
-  test("queue table shows descriptor description", async ({ page }) => {
+  test("queue table carries the descriptor description", async ({ page }) => {
     await loadQueuesPage(page);
 
-    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    const queueTable = page.getByRole("table", { name: "Queues" });
     await expect(
-      queueTable.getByText("End-to-end queue used for UI coverage"),
-    ).toBeVisible();
+      queueTable.getByRole("link", { name: "E2E Queue" }),
+    ).toHaveAttribute("title", "End-to-end queue used for UI coverage");
   });
 
   test("queue table surfaces available wait and controls", async ({ page }) => {
     await loadQueuesPage(page);
-    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    const queueTable = page.getByRole("table", { name: "Queues" });
     await expect(
-      queueTable.getByRole("columnheader", { name: "Oldest available" }),
+      queueTable.getByRole("columnheader", { name: "Oldest wait" }),
     ).toBeVisible();
     await expect(
       queueTable.getByRole("columnheader", { name: "Controls" }),
@@ -135,7 +147,7 @@ test.describe("Queues page", () => {
 
     await page.goto("/queues");
 
-    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    const queueTable = page.getByRole("table", { name: "Queues" });
     await expect(
       queueTable.getByRole("rowheader", { name: /DLQ Off Queue/ }),
     ).toBeVisible();
@@ -147,7 +159,7 @@ test.describe("Queues page", () => {
   test("click queue navigates to queue detail", async ({ page }) => {
     await loadQueuesPage(page);
 
-    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    const queueTable = page.getByRole("table", { name: "Queues" });
     const queueLink = queueTable.getByRole("link", { name: "E2E Queue" });
     await expect(queueLink).toBeVisible();
 
@@ -313,18 +325,18 @@ test.describe("Queues page", () => {
     });
 
     await page.goto("/queues");
-    const queueTable = page.getByRole("table", { name: "Queue pressure" });
+    const queueTable = page.getByRole("table", { name: "Queues" });
     await expect(
       queueTable.getByText("Descriptor stale", { exact: true }),
     ).toBeVisible();
     await expect(
-      queueTable.getByText("Descriptor drift across live runtimes"),
+      queueTable.getByText("Descriptor drift", { exact: true }),
     ).toBeVisible();
   });
 
   function queueRow(page: Page) {
     return page
-      .getByRole("table", { name: "Queue pressure" })
+      .getByRole("table", { name: "Queues" })
       .getByRole("row", { name: /E2E Queue/ });
   }
 

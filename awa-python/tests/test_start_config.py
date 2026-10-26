@@ -294,9 +294,22 @@ async def test_retention_kwargs_accepted(client):
         [(queue, 10)],
         completed_retention_hours=1.0,
         failed_retention_hours=168.0,
+        queue_history_retention_hours=24.0,
         cleanup_batch_size=500,
     )
     await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_negative_queue_history_retention_raises(client):
+    queue = "cfg_history"
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    with pytest.raises(ValueError, match="queue_history_retention_hours"):
+        await client.start([(queue, 1)], queue_history_retention_hours=-1.0)
 
 
 @pytest.mark.asyncio

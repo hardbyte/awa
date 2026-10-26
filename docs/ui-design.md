@@ -42,7 +42,9 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 
 ```
 GET  /api/stats                         Dashboard summary (state counts)
-GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
+GET  /api/stats/timeseries?minutes=60   Retained jobs by creation minute and current state
+GET  /api/stats/queue-history?minutes=60 Per-minute queue and fleet history (see below)
+GET  /api/health/queues?fail_on=        Whether each queue is keeping up, worst first
 
 GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=
 GET  /api/jobs/:id
@@ -94,9 +96,26 @@ GET  /api/capabilities                  Feature flags / read-only detection
 
 ## Pages
 
-### Dashboard (`/`)
+### Overview (`/`)
 
-At-a-glance health check. Shows state counter cards (available, running, failed, scheduled, waiting_external, completed/hr), a runtime summary, a queue table, and recent failures. Counter cards link to the filtered jobs view. Skeleton loading states prevent false-zero flashes.
+Answers one question first: is every queue keeping up? A verdict names the worst problem ("1 queue not being worked", "2 queues falling behind", "Keeping up") above the total waiting count with its last hour, and the measured completion and arrival rates. Dashed lines on that chart mark fleet changes. Below it, only the queues needing attention are listed, worst first, with the rest one click away. Compact state counters, recurring failures grouped by kind, queue and error, workers that are stale or degraded, and the last hour's fleet changes follow.
+
+The server classifies each queue (`awa-ui/src/assessment.rs`) from its current snapshot, the last few minutes of history and the live runtime summary, so the page and `/api/health/queues` always agree:
+
+| Status | Meaning |
+| --- | --- |
+| Not being worked | Claimable jobs have waited over a minute and no live worker serves the queue, or nothing is running or being claimed |
+| Falling behind | Waiting jobs grew by more than 5% (and at least 20) over the last 5 minutes |
+| Long wait | The oldest claimable job has waited over 5 minutes |
+| Paused | Paused; needs attention only while work is waiting |
+| Draining | Waiting jobs shrank materially; shows the time to clear at that pace |
+| Steady / Idle | Neither, or nothing waiting |
+
+For queues needing attention, **Limited by** says what holds the work back: the queue is paused, no live worker serves it, its rate limit skipped dispatch polls, every worker permit is in use, or none of these (spare capacity, which points at claim latency, the database or job duration). Only `available` jobs count as backlog: scheduled, retrying and callback-blocked jobs cannot be claimed yet, so their growth is not falling behind.
+
+#### Queue history
+
+Job tables record current state, not how a backlog moved, so the maintenance leader records it once a minute in `awa.queue_history` and `awa.fleet_history` (v051), keeping 48 hours by default. Runtimes publish cumulative per-queue counters (claimed, completed, failed, retried, rate-limited polls, claim wait) in their snapshots and the leader differences them into per-minute counts. `/api/stats/queue-history` returns one-minute buckets with `null` where nothing was recorded or a count was unknown, plus fleet events (version changes, leader changes, lost instances). See [configuration](configuration.md#queue-history) for what makes a minute unknown and what sampling costs.
 
 ### Jobs (`/jobs`)
 
@@ -110,9 +129,9 @@ Full inspection of a single job: state badge, queue (linked), priority, attempt 
 
 ### Queues (`/queues`)
 
-Per-queue stats table showing depth by state, completion rate, lag, concurrency mode, capacity, rate limits, runtime health, and status. Each queue has Pause and Drain action buttons. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
+One line per queue with the same status, waiting count, last-hour sparkline, trend, oldest wait, running, limited-by, capacity (concurrency and rate limit from live runtimes), completion rate, and retrying/failed counts as the overview, plus Pause and Drain controls. Search, sort and the "needs attention" filter live in the URL. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
 
-Descriptor display name, owner, tags, and docs URL (when declared) appear inline; a stale or drifted descriptor shows a subdued status badge so operators can tell when the catalog diverged from any live runtime.
+A stale or drifted descriptor shows a badge next to the queue name so operators can tell when the catalog diverged from any live runtime; the description is the link's tooltip and is shown in full on the queue detail page.
 
 ### Queue Detail (`/queues/:name`)
 

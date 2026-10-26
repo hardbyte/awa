@@ -502,6 +502,7 @@ DLQ rows are different: `dlq_entries` is a separate hold table and the maintenan
 | `failed_retention` | `72h` | Both engines: a non-DLQ `failed` terminal row stays retryable for at least this long past failure. Canonical enforces it by leaving recent failed rows in place; queue storage enforces it by carry-forward at prune time. Does not apply to `cancelled` rows or to the DLQ. |
 | `dlq_retention` | `30d` | How long DLQ rows stay in `dlq_entries` before bounded cleanup deletes them. |
 | `descriptor_retention` | `30d` | How long stale queue/kind descriptor catalog rows survive. |
+| `queue_history_retention` | `48h` | How long the leader keeps per-minute queue and fleet history for the admin UI (Python: `queue_history_retention_hours`). Zero stops sampling; existing rows are left in place. |
 | `cleanup_interval` | `60s` | How often the cleanup pass runs. |
 | `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
 | `dlq_cleanup_batch_size` | `1000` | DLQ-specific batch size. |
@@ -775,6 +776,35 @@ Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 The cache deduplicates repeated poll requests — multiple browser tabs or rapid refresh cycles within the TTL window hit memory rather than the database. The frontend polling interval is derived from the cache TTL (minimum 5s) and served via `/api/capabilities`, so clients automatically back off to match the server's refresh rate.
 
 If you're connecting to a read replica, increase `--cache-ttl` to reduce load. The dashboard will feel slightly less real-time but won't overwhelm the replica.
+
+### Queue history
+
+The overview judges whether each queue is keeping up from how its waiting
+(available) job count moves, which a single snapshot cannot show. The
+maintenance leader records it: once a minute it writes a row per queue to
+`awa.queue_history` and a fleet row to `awa.fleet_history` (schema v051). Each
+sample costs one queue overview read (the query behind the Queues page) and
+one insert per queue, issued by the leader only, beside the maintenance loop
+so a slow read cannot delay rescue or promotion.
+
+Claim, completion and failure rates come from per-queue counters each runtime
+publishes with its snapshot. The leader differences consecutive readings, so
+a minute's counts are unknown (shown as gaps, never as zero) after a leader
+change, for runtimes older than these counters, for a runtime it first
+sees that started earlier, and when a sample lands well off the minute (more
+than 15 seconds early or late). Completion, failure and retry counts are also
+unknown for a minute in which a callback could have resolved one of the
+queue's jobs (a job parked for a callback during it, or was already waiting
+at its start), because callbacks resolve in whichever process receives them;
+the UI then shows the hourly completion average instead. A runtime that dies
+between samples loses at most its last snapshot interval of counts.
+
+`awa serve` reads the tables, so every UI replica shows the same history and
+history survives UI restarts. On a schema before v051, or until a current
+leader has sampled, the overview says so and detects only stalls and long
+waits. `GET /api/health/queues` serves the same verdicts as JSON; add
+`?fail_on=critical` (or `warning`) to get a 503 at that level from a plain
+HTTP check.
 
 ### Read-only mode
 

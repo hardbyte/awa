@@ -2041,6 +2041,69 @@ async fn test_admin_runtime_observability_snapshot() {
 }
 
 #[tokio::test]
+async fn test_runtime_snapshot_publishes_queue_outcome_counters() {
+    let _guard = test_lock().lock().await;
+    let client = setup_with_connections(8).await;
+    let queue = "integ_runtime_outcome_counters";
+    clean_queue(client.pool(), queue).await;
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE queues @> $1::jsonb")
+        .bind(serde_json::json!([{"queue": queue}]))
+        .execute(client.pool())
+        .await
+        .expect("Failed to clean runtime_instances for test queue");
+
+    for index in 0..3 {
+        insert_with(
+            client.pool(),
+            &SendEmail {
+                to: format!("user{index}@example.com"),
+                subject: "Counters".into(),
+            },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let runtime = Client::builder(client.pool().clone())
+        .queue(queue, QueueConfig::default())
+        .register_worker(SendEmailWorker)
+        .runtime_snapshot_interval(Duration::from_millis(25))
+        .build()
+        .unwrap();
+    runtime.start().await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let counters = loop {
+        let overview = admin::runtime_overview(client.pool()).await.unwrap();
+        let counters = overview
+            .instances
+            .iter()
+            .flat_map(|instance| instance.queues.iter())
+            .find(|snapshot| snapshot.queue == queue)
+            .and_then(|snapshot| snapshot.counters);
+        if let Some(counters) = counters.filter(|c| c.completed >= 3) {
+            break counters;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for completed counters, last saw {counters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(counters.claimed, 3);
+    assert_eq!(counters.completed, 3);
+    assert_eq!(counters.failed, 0);
+    assert_eq!(counters.retried, 0);
+    assert_eq!(counters.rate_limited, 0);
+
+    runtime.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
 async fn test_runtime_overview_empty_state() {
     let client = setup().await;
     // Ensure a clean table for this test (scoped: delete only instances with no queues

@@ -690,6 +690,9 @@ impl Dispatcher {
         };
         if batch_size == 0 {
             // Drop all permits — rate limited
+            if let Some(counters) = self.executor.queue_counters(&self.queue) {
+                counters.record_rate_limited();
+            }
             if let Some((reason, _)) = wake_context {
                 self.metrics
                     .record_dispatch_rate_limited(&self.queue, reason.as_str());
@@ -856,12 +859,22 @@ impl Dispatcher {
             // claim") regardless of whether the receipt-plane
             // optimisation skipped the attempted_at write.
             let now = chrono::Utc::now();
+            // The snapshot counter measures from `run_at` rather than
+            // `created_at`: a job scheduled an hour ahead has not been
+            // waiting for a worker for that hour, and a retry becomes
+            // claimable at its backoff time.
+            let mut runnable_wait_ms: u64 = 0;
             for job in &jobs {
                 let claim_at = job.job.attempted_at.unwrap_or(now);
                 let wait_secs = (claim_at - job.job.created_at).num_milliseconds() as f64 / 1000.0;
                 if wait_secs >= 0.0 {
                     self.metrics.record_wait_duration(&self.queue, wait_secs);
                 }
+                let runnable_ms = (claim_at - job.job.run_at).num_milliseconds();
+                runnable_wait_ms = runnable_wait_ms.saturating_add(runnable_ms.max(0) as u64);
+            }
+            if let Some(counters) = self.executor.queue_counters(&self.queue) {
+                counters.record_claimed(jobs.len() as u64, runnable_wait_ms);
             }
         }
         if jobs.len() < batch_size {
@@ -971,6 +984,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             in_flight.clone(),
+            Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             metrics.clone(),

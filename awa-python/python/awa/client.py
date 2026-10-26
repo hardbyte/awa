@@ -870,6 +870,7 @@ class AsyncClient:
         completed_retention_hours: float | None = None,
         failed_retention_hours: float | None = None,
         descriptor_retention_days: float | None = None,
+        queue_history_retention_hours: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
         heartbeat_interval_ms: int | None = None,
@@ -902,6 +903,10 @@ class AsyncClient:
         leader deletes it from ``awa.queue_descriptors`` /
         ``awa.job_kind_descriptors``. Defaults to 30 days; pass ``0`` to
         disable retention (useful if you manage the catalog externally).
+
+        ``queue_history_retention_hours`` controls how long the maintenance
+        leader keeps the per-minute queue and fleet history behind the admin
+        UI's trends. Defaults to 48 hours; pass ``0`` to stop sampling.
 
         Workers are queue-storage-capable by default, but during a storage
         transition ``storage_transition_role`` controls how this runtime
@@ -936,6 +941,7 @@ class AsyncClient:
             completed_retention_hours=completed_retention_hours,
             failed_retention_hours=failed_retention_hours,
             descriptor_retention_days=descriptor_retention_days,
+            queue_history_retention_hours=queue_history_retention_hours,
             cleanup_batch_size=cleanup_batch_size,
             leader_election_interval_ms=leader_election_interval_ms,
             heartbeat_interval_ms=heartbeat_interval_ms,

@@ -1772,7 +1772,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, terminal_count_rollup_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_claim_slot_count=8, queue_storage_queue_stripe_count=1, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=1000, queue_storage_claim_rotate_interval_ms=None, queue_storage_rotate_min_slot_age_ms=None, queue_storage_rotate_target_slot_bytes=None, queue_storage_rotate_min_slot_rows=None, queue_storage_rotate_max_slot_age_ms=None, storage_transition_role=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, queue_history_retention_hours=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, terminal_count_rollup_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_claim_slot_count=8, queue_storage_queue_stripe_count=1, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=1000, queue_storage_claim_rotate_interval_ms=None, queue_storage_rotate_min_slot_age_ms=None, queue_storage_rotate_target_slot_bytes=None, queue_storage_rotate_min_slot_rows=None, queue_storage_rotate_max_slot_age_ms=None, storage_transition_role=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -1783,6 +1783,7 @@ impl PyClient {
         completed_retention_hours: Option<f64>,
         failed_retention_hours: Option<f64>,
         descriptor_retention_days: Option<f64>,
+        queue_history_retention_hours: Option<f64>,
         cleanup_batch_size: Option<i64>,
         leader_election_interval_ms: Option<u64>,
         heartbeat_interval_ms: Option<u64>,
@@ -1876,6 +1877,14 @@ impl PyClient {
                 ));
             }
             builder = builder.descriptor_retention(Duration::from_secs_f64(days * 86400.0));
+        }
+        if let Some(hours) = queue_history_retention_hours {
+            if !hours.is_finite() || hours < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "queue_history_retention_hours must be a non-negative finite number (0 disables)",
+                ));
+            }
+            builder = builder.queue_history_retention(Duration::from_secs_f64(hours * 3600.0));
         }
         if let Some(batch_size) = cleanup_batch_size {
             if batch_size <= 0 {

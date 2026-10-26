@@ -1691,6 +1691,36 @@ pub struct QueueRuntimeSnapshot {
     pub in_flight: u32,
     pub overflow_held: Option<u32>,
     pub config: QueueRuntimeConfigSnapshot,
+    /// Cumulative outcome counters since this instance started (#543).
+    /// `None` from runtimes that predate them, so readers can tell "not
+    /// reported" from zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counters: Option<QueueOutcomeCounters>,
+}
+
+/// Monotonic per-queue counters a runtime publishes with each snapshot.
+///
+/// They reset when the instance restarts; consumers difference consecutive
+/// readings of the same `instance_id` and treat a decrease as a reset.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueOutcomeCounters {
+    /// Jobs this instance claimed from the queue.
+    pub claimed: u64,
+    pub completed: u64,
+    /// Attempts that ended the job as failed (terminal).
+    pub failed: u64,
+    /// Attempts that failed and were scheduled for another try.
+    pub retried: u64,
+    /// Dispatch polls skipped because the queue's rate limit had no tokens.
+    pub rate_limited: u64,
+    /// Sum over claimed jobs of the time between becoming runnable and
+    /// being claimed, in milliseconds. Divide by `claimed` for a mean.
+    pub claim_wait_ms: u64,
+    /// Attempts that parked waiting for an external callback. Whatever
+    /// resolves the callback may run in another process, so the eventual
+    /// outcome is not counted here.
+    #[serde(default)]
+    pub parked: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

@@ -1,76 +1,91 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
+
+/** The overview lists only queues needing attention until expanded; seeded
+ * queues may or may not qualify depending on their age, so expand first. */
+async function showAllQueues(page: Page) {
+  await expect(page.getByTestId("verdict")).not.toHaveText("Checking queues…");
+  const expand = page.getByRole("button", {
+    name: /^Show \d+ queues? keeping up$/,
+  });
+  if (await expand.isVisible()) await expand.click();
+  return page.getByRole("table", {
+    name: /^(All queues by risk|Queues needing attention)$/,
+  });
+}
 
 test.describe("Operations overview", () => {
-  test("overview separates current work and last-hour completions", async ({
-    page,
-  }) => {
+  test("answers whether the system is keeping up", async ({ page }) => {
     await page.goto("/");
-    await expect(
-      page.getByRole("heading", { name: "Work in motion" }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("heading", { name: "Current work" }),
-    ).toBeVisible();
-    await expect(
-      page.getByText("Completed · last 60 minutes", { exact: true }),
-    ).toBeVisible();
-    await expect(page.locator(".work-counter")).toHaveCount(6);
+    await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+    await expect(page.getByTestId("verdict")).not.toHaveText(
+      "Checking queues…",
+    );
+    await expect(page.getByText("Waiting across all queues")).toBeVisible();
+    // The e2e server runs no workers, so no leader has recorded history;
+    // the page says why trends are missing instead of inventing them.
+    await expect(page.getByText(/No trends( yet)?:/)).toBeVisible();
   });
 
-  test("queue pressure includes available wait and state drilldowns", async ({
+  test("queue table includes trend columns and state drilldowns", async ({
     page,
   }) => {
     await page.goto("/");
-    const table = page.getByRole("table", { name: "Queue pressure" });
+    const table = await showAllQueues(page);
     await expect(table).toBeVisible();
     for (const header of [
       "Queue",
-      "Available",
-      "Oldest available",
-      "Running",
-      "Retryable / failed",
+      "Status",
+      "Waiting",
+      "Last hour",
+      "Trend",
+      "Oldest wait",
+      "Limited by",
     ]) {
       await expect(
         table.getByRole("columnheader", { name: header, exact: true }),
       ).toBeVisible();
     }
-    const row = table.getByRole("row", { name: /e2e_test/ });
+    const row = table.getByRole("row", { name: /E2E Queue/ });
     await row.locator('a[href*="state=available"]').click();
     await expect(page).toHaveURL(/state=available/);
     await expect(page).toHaveURL(/e2e_test/);
   });
 
-  for (const state of ["available", "retryable", "failed"]) {
-    test(`${state} counter links to its job state`, async ({ page }) => {
+  for (const [label, state] of [
+    ["Retrying", "retryable"],
+    ["Failed", "failed"],
+    ["Running", "running"],
+  ] as const) {
+    test(`${label} counter links to its job state`, async ({ page }) => {
       await page.goto("/");
-      await page.locator(`.work-counter[href*="state=${state}"]`).click();
+      await page
+        .getByRole("navigation", { name: "Job states" })
+        .getByRole("link", { name: new RegExp(`^${label}`) })
+        .click();
       await expect(page).toHaveURL(new RegExp(`state=${state}`));
       await expect(page.getByRole("heading", { name: "Jobs" })).toBeVisible();
     });
   }
 
-  test("worker summary reports health or explicit empty state", async ({
+  test("worker summary reports problems or an explicit healthy state", async ({
     page,
   }) => {
     await page.goto("/");
-    const section = page.getByRole("region", { name: "Worker health" });
+    await expect(page.getByRole("link", { name: "All workers" })).toBeVisible();
     await expect(
-      section.getByRole("link", { name: "All workers" }),
+      page
+        .getByText(
+          /Workers needing attention|reporting instances are healthy|No runtime snapshots/,
+        )
+        .or(page.getByRole("list", { name: "Workers needing attention" })),
     ).toBeVisible();
-    await expect(section).toContainText(
-      /healthy.*live.*stale.*leader|No runtime snapshots/,
-    );
   });
 
-  test("failed job drilldown opens the retained failure", async ({ page }) => {
+  test("failure group opens the latest retained failure", async ({ page }) => {
     await page.goto("/");
-    const section = page.getByRole("region", {
-      name: "Failed jobs to inspect",
-    });
-    await expect(
-      section.getByText(/Latest 5 retained failed jobs/),
-    ).toBeVisible();
-    await section.locator(".failure-preview-row").first().click();
+    const groups = page.getByRole("list", { name: "Failure groups" });
+    await expect(groups).toBeVisible();
+    await groups.getByRole("link").first().click();
     await expect(page).toHaveURL(/\/jobs\/\d+/);
     await expect(page.getByRole("heading", { name: /Job #\d+/ })).toBeVisible();
   });

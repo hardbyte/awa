@@ -23,6 +23,9 @@ pub struct DashboardCache {
     pub runtime: Cache<(), admin::RuntimeOverview>,
     pub queue_runtime: Cache<(), Vec<admin::QueueRuntimeSummary>>,
     pub storage: Cache<(), awa_model::storage::StorageStatusReport>,
+    pub queue_health: Cache<(), Arc<crate::assessment::HealthReport>>,
+    /// Keyed by the requested window in minutes.
+    pub queue_history: Cache<u32, Arc<crate::handlers::health::QueueHistoryResponse>>,
 }
 
 fn build_cache<V: Clone + Send + Sync + 'static>(ttl: Duration) -> Cache<(), V> {
@@ -37,6 +40,8 @@ impl DashboardCache {
             runtime: build_cache(ttl),
             queue_runtime: build_cache(ttl),
             storage: build_cache(ttl),
+            queue_health: build_cache(ttl),
+            queue_history: Cache::builder().time_to_live(ttl).max_capacity(8).build(),
         }
     }
 }
