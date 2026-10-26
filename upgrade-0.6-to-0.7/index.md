@@ -197,6 +197,34 @@ rebuilds until the flip fences them. Exact terminal counts stay exact through a
 mixed-version rollout and through a rollback before the flip; no operator action
 is needed.
 
+## v051: per-slot claim functions
+
+v051 moves the claim query out of `claim_ready_runtime` into one
+`claim_ready_slot_<N>` function per queue-ring slot in the default and every
+discovered custom queue-storage schema. Each function addresses that slot's
+ready, tombstone and attempt-batch children directly, so PostgreSQL keeps a
+cached plan for it across ring rotations. `claim_ready_runtime` keeps its
+signature and result and dispatches to the slot function, and the claim
+evidence it writes is unchanged, so binaries before v051 claim unchanged on the
+migrated schema and the migration adds no runtime version gate.
+
+This is an installer replay, not a function-only change. Reinstalling each
+substrate drops and recreates ring-state and queue-head triggers and takes
+ACCESS EXCLUSIVE table locks that are held until the whole pending range
+commits, so enqueue and claim in those schemas wait for the migration. Use a
+quiet window and a bounded `lock_timeout` (for example
+`PGOPTIONS='-c lock_timeout=5s' awa migrate`); on timeout nothing is applied,
+so retry the complete migration. Apply it with credentials that own every
+installed substrate.
+
+The runtime role needs `EXECUTE` on the new functions. The
+[default privileges](../security/database-roles/index.md#runtime-grants) granted to `awa_runtime`
+cover functions the migrator creates; if you granted `EXECUTE ON ALL FUNCTIONS`
+once instead, run that grant again after migrating. External migration runners
+apply the complete generated `awa migrate --sql --from 50 --to 51` bundle, which
+refreshes the installer definition before the tail reinstalls the custom
+substrates.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:
