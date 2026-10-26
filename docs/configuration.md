@@ -436,7 +436,7 @@ These knobs control **how fast a stuck or crashed handler is noticed and rescued
 
 ### Heartbeat — detecting crashed workers
 
-A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:
+A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job. The rescued attempt counts against `max_attempts`: the job is re-enqueued while attempts remain, and otherwise fails or moves to the DLQ ([Poison jobs](concepts/job-lifecycle.md#poison-jobs)). Three knobs participate:
 
 | Knob | Default | What it does |
 | --- | --- | --- |
