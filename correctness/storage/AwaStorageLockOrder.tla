@@ -395,9 +395,12 @@ RescueReceiptDeadlinesPlan(claimSlot) ==
 \*   hydrate_deleted_leases_tx: DELETE attempt_state, then close each
 \*     rescued attempt's own receipt, which can sit in a different claim
 \*     slot from the one the sweep visited
-\*   settle_rescued_attempt_tx: INSERT deferred_jobs while attempts remain
-\*     (unpartitioned, not a resource here), or INSERT done_entries and its
-\*     terminal-count delta once the rescued attempt was the last (#546)
+\*   settle_rescued_attempt_tx: INSERT deferred_jobs while attempts remain,
+\*     or INSERT dlq_entries for an exhausted attempt on a DLQ-enabled
+\*     queue (both unpartitioned, not resources here); otherwise INSERT
+\*     done_entries and its terminal-count delta once the rescued attempt
+\*     was the last. `exhausted` selects that last, done_entries branch;
+\*     the dead-letter branch takes the same locks as the retry branch.
 RescueHydratePlan(claimSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
        Step(ClaimBatchChildResource(claimSlot), ModeShared),

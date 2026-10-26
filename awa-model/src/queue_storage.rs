@@ -14557,11 +14557,17 @@ impl QueueStorage {
     /// attempts remain, `failed` once the rescued attempt was the last. A job
     /// that kills or hangs its worker every time therefore stops after
     /// `max_attempts`, like one whose handler returns an error.
+    ///
+    /// An exhausted attempt on a queue whose DLQ is enabled (`dlq_reason`
+    /// is `Some`) goes straight to `dlq_entries` in this transaction, as
+    /// `fail_to_dlq` does for a handler error, so there is no window in
+    /// which it sits `failed` outside the DLQ.
     async fn settle_rescued_attempt_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         row: LeaseTransitionRow,
         error: &str,
+        dlq_reason: Option<&str>,
     ) -> Result<JobRow, AwaError> {
         let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
             row.payload.clone(),
@@ -14571,9 +14577,21 @@ impl QueueStorage {
         payload.push_error(lifecycle_error(error, row.attempt, exhausted));
         let duplicate_error = "rescued as duplicate: unique claim held by a newer job";
         if exhausted {
-            let done = row
-                .clone()
-                .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
+            let finalized_at = Utc::now();
+            if let Some(dlq_reason) = dlq_reason {
+                let dlq = row.clone().into_dlq_row(
+                    finalized_at,
+                    payload.into_json(),
+                    dlq_reason.to_string(),
+                    finalized_at,
+                );
+                return self
+                    .insert_rescued_dlq_or_cancel_tx(tx, row, dlq, duplicate_error)
+                    .await;
+            }
+            let done =
+                row.clone()
+                    .into_done_row(JobState::Failed, finalized_at, payload.into_json());
             self.insert_rescued_done_or_cancel_tx(tx, row, done, duplicate_error)
                 .await
         } else {
@@ -14617,6 +14635,37 @@ impl QueueStorage {
             }
         }
         self.cancel_rescued_duplicate_tx(tx, row, done.payload, duplicate_error)
+            .await
+    }
+
+    /// The DLQ counterpart of [`Self::insert_rescued_done_or_cancel_tx`]: a
+    /// DLQ row holds its unique claim as `failed`, so it conflicts with a
+    /// newer duplicate exactly when the `failed` terminal row would.
+    async fn insert_rescued_dlq_or_cancel_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        row: LeaseTransitionRow,
+        dlq: DlqJobRow,
+        duplicate_error: &str,
+    ) -> Result<JobRow, AwaError> {
+        let old_state = row.state;
+        {
+            let mut savepoint = tx.begin().await.map_err(map_sqlx_error)?;
+            match self
+                .insert_dlq_rows_tx(&mut savepoint, std::slice::from_ref(&dlq), Some(old_state))
+                .await
+            {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(map_sqlx_error)?;
+                    return dlq.into_job_row();
+                }
+                Err(AwaError::UniqueConflict { .. }) => {
+                    savepoint.rollback().await.map_err(map_sqlx_error)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        self.cancel_rescued_duplicate_tx(tx, row, dlq.payload, duplicate_error)
             .await
     }
 
@@ -15362,11 +15411,30 @@ impl QueueStorage {
         Ok(Some(deferred.into_job_row()?))
     }
 
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.rescue_stale_heartbeats")]
+    /// Rescue attempts whose heartbeat went stale. Exhausted attempts fail
+    /// into `done_entries`; see [`Self::rescue_stale_heartbeats_with_dlq`]
+    /// to dead-letter them instead.
     pub async fn rescue_stale_heartbeats(
         &self,
         pool: &PgPool,
         staleness: Duration,
+    ) -> Result<Vec<JobRow>, AwaError> {
+        self.rescue_stale_heartbeats_with_dlq(pool, staleness, &|_| false)
+            .await
+    }
+
+    /// [`Self::rescue_stale_heartbeats`], moving an exhausted attempt into
+    /// `dlq_entries` (reason `heartbeat_stale`) in the rescue transaction
+    /// when `dlq_enabled` returns true for its queue.
+    #[tracing::instrument(
+        skip(self, pool, dlq_enabled),
+        name = "queue_storage.rescue_stale_heartbeats"
+    )]
+    pub async fn rescue_stale_heartbeats_with_dlq(
+        &self,
+        pool: &PgPool,
+        staleness: Duration,
+        dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
     ) -> Result<Vec<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -15457,21 +15525,25 @@ impl QueueStorage {
 
         let mut rescued = Vec::with_capacity(moved_leases.len() + moved_receipts.len());
         for row in moved_leases {
+            let dlq_reason = dlq_enabled(&row.queue).then_some("heartbeat_stale");
             rescued.push(
                 self.settle_rescued_attempt_tx(
                     &mut tx,
                     row,
                     "heartbeat stale: worker presumed dead",
+                    dlq_reason,
                 )
                 .await?,
             );
         }
         for row in moved_receipts {
+            let dlq_reason = dlq_enabled(&row.queue).then_some("heartbeat_stale");
             rescued.push(
                 self.settle_rescued_attempt_tx(
                     &mut tx,
                     row,
                     "receipt claim stale: worker presumed dead",
+                    dlq_reason,
                 )
                 .await?,
             );
@@ -15480,8 +15552,26 @@ impl QueueStorage {
         Ok(rescued)
     }
 
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.rescue_expired_deadlines")]
+    /// Rescue attempts past their hard deadline. Exhausted attempts fail
+    /// into `done_entries`; see [`Self::rescue_expired_deadlines_with_dlq`]
+    /// to dead-letter them instead.
     pub async fn rescue_expired_deadlines(&self, pool: &PgPool) -> Result<Vec<JobRow>, AwaError> {
+        self.rescue_expired_deadlines_with_dlq(pool, &|_| false)
+            .await
+    }
+
+    /// [`Self::rescue_expired_deadlines`], moving an exhausted attempt into
+    /// `dlq_entries` (reason `deadline_exceeded`) in the rescue transaction
+    /// when `dlq_enabled` returns true for its queue.
+    #[tracing::instrument(
+        skip(self, pool, dlq_enabled),
+        name = "queue_storage.rescue_expired_deadlines"
+    )]
+    pub async fn rescue_expired_deadlines_with_dlq(
+        &self,
+        pool: &PgPool,
+        dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Result<Vec<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
@@ -15547,8 +15637,9 @@ impl QueueStorage {
 
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
+            let dlq_reason = dlq_enabled(&row.queue).then_some("deadline_exceeded");
             rescued.push(
-                self.settle_rescued_attempt_tx(&mut tx, row, "hard deadline exceeded")
+                self.settle_rescued_attempt_tx(&mut tx, row, "hard deadline exceeded", dlq_reason)
                     .await?,
             );
         }
@@ -15556,8 +15647,26 @@ impl QueueStorage {
         Ok(rescued)
     }
 
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.rescue_expired_callbacks")]
+    /// Rescue attempts whose callback timed out. Exhausted attempts fail
+    /// into `done_entries`; see [`Self::rescue_expired_callbacks_with_dlq`]
+    /// to dead-letter them instead.
     pub async fn rescue_expired_callbacks(&self, pool: &PgPool) -> Result<Vec<JobRow>, AwaError> {
+        self.rescue_expired_callbacks_with_dlq(pool, &|_| false)
+            .await
+    }
+
+    /// [`Self::rescue_expired_callbacks`], moving an exhausted attempt into
+    /// `dlq_entries` (reason `callback_timeout`) in the rescue transaction
+    /// when `dlq_enabled` returns true for its queue.
+    #[tracing::instrument(
+        skip(self, pool, dlq_enabled),
+        name = "queue_storage.rescue_expired_callbacks"
+    )]
+    pub async fn rescue_expired_callbacks_with_dlq(
+        &self,
+        pool: &PgPool,
+        dlq_enabled: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Result<Vec<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(audited_sql(format!(
@@ -15607,8 +15716,9 @@ impl QueueStorage {
 
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
+            let dlq_reason = dlq_enabled(&row.queue).then_some("callback_timeout");
             rescued.push(
-                self.settle_rescued_attempt_tx(&mut tx, row, "callback timed out")
+                self.settle_rescued_attempt_tx(&mut tx, row, "callback timed out", dlq_reason)
                     .await?,
             );
         }
