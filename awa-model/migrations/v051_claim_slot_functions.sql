@@ -9,9 +9,10 @@
 --
 -- This file is the migration tail, not a standalone installer upgrade.
 -- `awa migrate` and `awa migrate --sql --from 50 --to 51` run V23_UP first:
--- it defines the current installer and replays the canonical substrate;
--- this tail reinstalls discovered custom substrates too. Executing only this
--- file against a stale installer does not install the slot functions.
+-- it bootstraps trusted discovery and defines the current installer;
+-- this tail reinstalls the canonical and trusted custom substrates.
+-- Executing only this file against a stale installer does not install the
+-- slot functions.
 --
 -- Reinstallation drops/recreates ring-state and queue-head triggers and can
 -- take ACCESS EXCLUSIVE table locks through transaction commit. Lock waits,
