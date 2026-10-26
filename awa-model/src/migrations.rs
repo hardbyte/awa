@@ -290,7 +290,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Drop the redundant lane index on ready_entries partitions",
         &[V23_UP, V50_UP],
     ),
-    (51, "Per-slot claim functions", &[V23_UP, V51_UP]),
+    (
+        51,
+        "Per-slot claim functions",
+        &[V23_UP, V23_DEFAULT_UP, V51_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");

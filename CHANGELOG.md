@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v050. Run `awa migrate` as the migrator
+This release adds migrations v044 to v051. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 

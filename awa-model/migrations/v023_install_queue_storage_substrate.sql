@@ -4178,6 +4178,10 @@ BEGIN
         LANGUAGE plpgsql
         SET search_path = pg_catalog, awa, public
         AS $func$
+        DECLARE
+            v_lane_shard SMALLINT := p_lane_shard;
+            v_claimed_at TIMESTAMPTZ := p_claimed_at;
+            v_deadline_at TIMESTAMPTZ := p_deadline_at;
         BEGIN
             RETURN QUERY
             WITH lease_ring AS MATERIALIZED (
@@ -4295,21 +4299,9 @@ BEGIN
             $create_slot$,
             p_schema,
             replace(
-                replace(
-                    replace(
-                        replace(
-                            v_claimed_cte,
-                            format('%I.ready_claim_attempt_batches', p_schema),
-                            format('%I.ready_claim_attempt_batches_%s', p_schema, v_slot)
-                        ),
-                        'v_lane_shard',
-                        'p_lane_shard'
-                    ),
-                    'v_claimed_at',
-                    'p_claimed_at'
-                ),
-                'v_deadline_at',
-                'p_deadline_at'
+                v_claimed_cte,
+                format('%I.ready_claim_attempt_batches', p_schema),
+                format('%I.ready_claim_attempt_batches_%s', p_schema, v_slot)
             ),
             p_lease_claim_receipts,
             v_slot

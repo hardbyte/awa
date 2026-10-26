@@ -9393,6 +9393,53 @@ async fn test_queue_storage_receipt_claim_hint_closes_compact_claim_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_per_slot_claims_preserve_custom_schema_identifiers() {
+    let (_db_guard, pool) = setup_pool(4).await;
+    for variable in ["v_lane_shard", "v_claimed_at", "v_deadline_at"] {
+        for receipts in [false, true] {
+            let schema = format!("qs_{variable}_{}", u8::from(receipts));
+            let store = QueueStorage::new(QueueStorageConfig {
+                schema: schema.clone(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                claim_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: receipts,
+            })
+            .unwrap();
+            store.prepare_schema(&pool).await.unwrap();
+            let job_id = enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob { id: 1 },
+                InsertOpts {
+                    queue: "schema_identifier".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let claimed = store
+                .claim_runtime_batch(&pool, "schema_identifier", 1, Duration::from_secs(30))
+                .await
+                .unwrap_or_else(|error| panic!("claim in {schema}: {error}"));
+            assert_eq!(claimed.len(), 1, "{schema}");
+            assert_eq!(claimed[0].job.id, job_id);
+            assert!(claimed[0].job.deadline_at.is_some(), "{schema}");
+            assert_eq!(
+                store
+                    .complete_runtime_batch(&pool, &claimed)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{schema}"
+            );
+        }
+    }
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_heartbeat_by_claim_identity_touches_only_open_claims() {
     let (_db_guard, pool) = setup_pool(10).await;
     let queue = "qs_heartbeat_claim_identity";
