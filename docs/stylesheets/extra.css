@@ -190,10 +190,6 @@ html {
   background: var(--awa-surface);
 }
 
-.md-typeset .awa-failure-launch li {
-  margin: 0.8rem 0;
-}
-
 .awa-failure-launch a {
   display: block;
   min-height: 44px;

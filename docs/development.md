@@ -72,7 +72,7 @@ Schema changes must follow [ADR-041's expand, capability-gated flip, and later c
 The [failure lab](concepts/failure-lab.md) launches the canonical interactive model hosted by
 [`hardbyte/postgresql-job-queue-benchmarking`](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
 Its source is `simulations/awa-failure-windows/index.html` there, and the
-comparison-site build copies it to `lab/awa.html`. Change and test the animation
+comparison-site build copies it to `lab/awa.html`. Change and test the model
 in that repository; do not add a second JavaScript/model copy to these docs.
 
 When Awa's enqueue, attempt ownership, recovery or claim-durability behavior
@@ -80,5 +80,8 @@ changes, review the lab's source links and assumptions against the new behavior.
 Update the lab's displayed revision with its model, rather than changing the
 version label alone. Its model and browser checks live beside the canonical
 source. The docs page uses an absolute HTTPS URL so project-site and preview
-base paths do not change the lesson target. Verify the launch, worker actions and return flow on phones, plus the optional
-wider-screen embed after a hosting-path change.
+base paths do not change the lesson target. After a hosting-path change, verify
+the launch, worker actions and return flow on phones, plus the optional
+wider-screen embed. The embed is sandboxed without `allow-same-origin`, because
+the lab and these docs share the `hardbyte.github.io` origin; keep the lab free
+of storage and parent-page access so it works inside that sandbox.
