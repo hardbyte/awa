@@ -6,6 +6,8 @@ These models cover larger runtime protocols that involve multiple services or in
 
 - `AwaExtended.tla` / `AwaExtended.cfg` Covers two-instance shutdown sequencing, split reserve/claim/execute stages, leader failover, permits, weighted overflow, rescue, abandonment, and bounded rate limiting.
 
+- `AwaExtendedHungHandlers.cfg` / `AwaExtendedHungHandlersNoDrop.cfg` One-job configs under `HungHandlerSpec`, where a rescued handler may never return. The first checks the worker gives the slot back by dropping such a handler (#546); the second turns dropping off and is the expected `RescuedSlotsReleased` counterexample.
+
 ## When To Use
 
 - use `AwaExtended` for shutdown, rescue, leader failover, and permit protocol questions

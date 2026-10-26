@@ -155,6 +155,12 @@ An uncaught error is retryable by default. Make it terminal with
 **The key gotcha:** use `Snooze` — not `RetryAfter` — for "not ready yet" polling
 or rate-limit waits, so `max_attempts` bounds genuine failures only.
 
+Every way an attempt can end spends an attempt: a Rust panic (recorded as
+`handler panicked: …`), a crashed or killed worker (stale heartbeat), and an
+attempt past the queue's `deadline_duration`. A crash also ends every other
+attempt in that process, so keep `max_attempts` above one for work that must
+survive a node loss.
+
 ## Cron / Periodic Jobs
 
 Declare the schedule in code. It is UPSERT-synced to the database and evaluated

@@ -14552,8 +14552,45 @@ impl QueueStorage {
             .await
     }
 
+    /// Settle one attempt that maintenance rescued (stale heartbeat, expired
+    /// deadline or callback timeout): back to `retryable` with backoff while
+    /// attempts remain, `failed` once the rescued attempt was the last. A job
+    /// that kills or hangs its worker every time therefore stops after
+    /// `max_attempts`, like one whose handler returns an error.
+    async fn settle_rescued_attempt_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        row: LeaseTransitionRow,
+        error: &str,
+    ) -> Result<JobRow, AwaError> {
+        let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+            row.payload.clone(),
+            row.progress.clone(),
+        )?)?;
+        let exhausted = row.attempt >= row.max_attempts;
+        payload.push_error(lifecycle_error(error, row.attempt, exhausted));
+        let duplicate_error = "rescued as duplicate: unique claim held by a newer job";
+        if exhausted {
+            let done = row
+                .clone()
+                .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
+            self.insert_rescued_done_or_cancel_tx(tx, row, done, duplicate_error)
+                .await
+        } else {
+            let deferred = row.clone().into_deferred_row(
+                JobState::Retryable,
+                self.backoff_at_tx(tx, row.attempt, row.max_attempts)
+                    .await?,
+                Some(Utc::now()),
+                payload.into_json(),
+            );
+            self.insert_rescued_deferred_or_cancel_tx(tx, row, deferred, duplicate_error)
+                .await
+        }
+    }
+
     /// Same fallback for rescue arms that write a terminal row directly
-    /// (callback timeout at max attempts): a `failed` insert that conflicts
+    /// (an exhausted rescued attempt): a `failed` insert that conflicts
     /// with a newer duplicate's claim becomes a cancellation instead.
     async fn insert_rescued_done_or_cancel_tx(
         &self,
@@ -15420,58 +15457,24 @@ impl QueueStorage {
 
         let mut rescued = Vec::with_capacity(moved_leases.len() + moved_receipts.len());
         for row in moved_leases {
-            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
-                row.payload.clone(),
-                row.progress.clone(),
-            )?)?;
-            payload.push_error(lifecycle_error(
-                "heartbeat stale: worker presumed dead",
-                row.attempt,
-                false,
-            ));
-            let deferred = row.clone().into_deferred_row(
-                JobState::Retryable,
-                self.backoff_at_tx(&mut tx, row.attempt, row.max_attempts)
-                    .await?,
-                Some(Utc::now()),
-                payload.into_json(),
-            );
-            let rescued_row = self
-                .insert_rescued_deferred_or_cancel_tx(
+            rescued.push(
+                self.settle_rescued_attempt_tx(
                     &mut tx,
                     row,
-                    deferred,
-                    "rescued as duplicate: unique claim held by a newer job",
+                    "heartbeat stale: worker presumed dead",
                 )
-                .await?;
-            rescued.push(rescued_row);
+                .await?,
+            );
         }
         for row in moved_receipts {
-            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
-                row.payload.clone(),
-                row.progress.clone(),
-            )?)?;
-            payload.push_error(lifecycle_error(
-                "receipt claim stale: worker presumed dead",
-                row.attempt,
-                false,
-            ));
-            let deferred = row.clone().into_deferred_row(
-                JobState::Retryable,
-                self.backoff_at_tx(&mut tx, row.attempt, row.max_attempts)
-                    .await?,
-                Some(Utc::now()),
-                payload.into_json(),
-            );
-            let rescued_row = self
-                .insert_rescued_deferred_or_cancel_tx(
+            rescued.push(
+                self.settle_rescued_attempt_tx(
                     &mut tx,
                     row,
-                    deferred,
-                    "rescued as duplicate: unique claim held by a newer job",
+                    "receipt claim stale: worker presumed dead",
                 )
-                .await?;
-            rescued.push(rescued_row);
+                .await?,
+            );
         }
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rescued)
@@ -15544,31 +15547,10 @@ impl QueueStorage {
 
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
-            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
-                row.payload.clone(),
-                row.progress.clone(),
-            )?)?;
-            payload.push_error(lifecycle_error(
-                "hard deadline exceeded",
-                row.attempt,
-                false,
-            ));
-            let deferred = row.clone().into_deferred_row(
-                JobState::Retryable,
-                self.backoff_at_tx(&mut tx, row.attempt, row.max_attempts)
+            rescued.push(
+                self.settle_rescued_attempt_tx(&mut tx, row, "hard deadline exceeded")
                     .await?,
-                Some(Utc::now()),
-                payload.into_json(),
             );
-            let rescued_row = self
-                .insert_rescued_deferred_or_cancel_tx(
-                    &mut tx,
-                    row,
-                    deferred,
-                    "rescued as duplicate: unique claim held by a newer job",
-                )
-                .await?;
-            rescued.push(rescued_row);
         }
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rescued)
@@ -15625,47 +15607,10 @@ impl QueueStorage {
 
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
-            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
-                row.payload.clone(),
-                row.progress.clone(),
-            )?)?;
-            let exhausted = row.attempt >= row.max_attempts;
-            payload.push_error(lifecycle_error(
-                "callback timed out",
-                row.attempt,
-                exhausted,
-            ));
-            if exhausted {
-                let done =
-                    row.clone()
-                        .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
-                let rescued_row = self
-                    .insert_rescued_done_or_cancel_tx(
-                        &mut tx,
-                        row,
-                        done,
-                        "rescued as duplicate: unique claim held by a newer job",
-                    )
-                    .await?;
-                rescued.push(rescued_row);
-            } else {
-                let deferred = row.clone().into_deferred_row(
-                    JobState::Retryable,
-                    self.backoff_at_tx(&mut tx, row.attempt, row.max_attempts)
-                        .await?,
-                    Some(Utc::now()),
-                    payload.into_json(),
-                );
-                let rescued_row = self
-                    .insert_rescued_deferred_or_cancel_tx(
-                        &mut tx,
-                        row,
-                        deferred,
-                        "rescued as duplicate: unique claim held by a newer job",
-                    )
-                    .await?;
-                rescued.push(rescued_row);
-            }
+            rescued.push(
+                self.settle_rescued_attempt_tx(&mut tx, row, "callback timed out")
+                    .await?,
+            );
         }
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(rescued)

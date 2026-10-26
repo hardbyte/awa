@@ -102,7 +102,6 @@ Init ==
 Claim(w, j) ==
     /\ shutdownPhase = "running"
     /\ jobState[j] = "available"
-    /\ lease[j] < MaxLease
     /\ handlerPhase[w][j] = "idle"
     /\ jobState' = [jobState EXCEPT ![j] = "running"]
     /\ owner' = [owner EXCEPT ![j] = w]
@@ -219,10 +218,14 @@ HandlerFail(w, j) ==
 (* ────────────────────────────────────────────────────────────────── *)
 (* Maintenance: rescue + promote                                     *)
 (* ────────────────────────────────────────────────────────────────── *)
+\* `lease` counts attempts and MaxLease is the attempt budget. A rescued
+\* attempt spends it like a failed one (#546): retry while attempts remain,
+\* fail on the last.
 Rescue(j) ==
     /\ jobState[j] = "running"
     /\ owner[j] \in Workers
-    /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
+    /\ jobState' = [jobState EXCEPT ![j] =
+          IF lease[j] < MaxLease THEN "retryable" ELSE "failed"]
     /\ owner' = [owner EXCEPT ![j] = NoOwner]
     /\ UNCHANGED <<lease, taskLease, handlerPhase, batcherPending,
                    shutdownPhase, dbCompletions>>
@@ -324,6 +327,11 @@ FairSpec == Spec
 (* ────────────────────────────────────────────────────────────────── *)
 (* Safety invariants                                                  *)
 (* ────────────────────────────────────────────────────────────────── *)
+
+\* The claim path checks no budget, so this is what keeps attempts bounded.
+RetryHasBudget ==
+    \A j \in Jobs :
+        jobState[j] \in {"available", "retryable"} => lease[j] < MaxLease
 
 TypeOK ==
     /\ jobState \in [Jobs -> JobStates]

@@ -362,10 +362,23 @@ HeartbeatTryLock(i) ==
     /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
                    taskLease, leader, resolved, callbackGen, blockedOps>>
 
-\* Phase 2: Execute (lock held). Clears callback_id.
+\* Phase 2: Execute (lock held). Clears callback_id. Like the timeout
+\* rescue, production yields retryable or failed depending on max_attempts
+\* (#546); model both outcomes.
 HeartbeatExecute ==
     /\ rowLock = "heartbeat_rescue"
     /\ jobState' = "retryable"
+    /\ callbackId' = NoCb
+    /\ callbackTimedOut' = FALSE
+    /\ heartbeatFresh' = FALSE
+    /\ owner' = NoInstance
+    /\ rowLock' = NoLock
+    /\ resolved' = resolved + 1
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
+
+HeartbeatFailExecute ==
+    /\ rowLock = "heartbeat_rescue"
+    /\ jobState' = "failed"
     /\ callbackId' = NoCb
     /\ callbackTimedOut' = FALSE
     /\ heartbeatFresh' = FALSE
@@ -398,6 +411,7 @@ Next ==
     \/ HeartbeatStale
     \/ \E i \in Instances : HeartbeatTryLock(i)
     \/ HeartbeatExecute
+    \/ HeartbeatFailExecute
     \/ PromoteRetryable
     \/ \E i \in Instances : AcquireLeader(i)
     \/ \E i \in Instances : LoseLeader(i)
@@ -424,6 +438,7 @@ StableNext ==
     \/ HeartbeatStale
     \/ \E i \in Instances : HeartbeatTryLock(i)
     \/ HeartbeatExecute
+    \/ HeartbeatFailExecute
     \/ PromoteRetryable
     \/ \E i \in Instances : AcquireLeader(i)
 
@@ -517,6 +532,7 @@ FairnessAssumptions ==
     /\ WF_vars(RetryExecute)
     /\ WF_vars(RetryNoOpRelease)
     /\ WF_vars(HeartbeatExecute)
+    /\ WF_vars(HeartbeatFailExecute)
     /\ \A op \in BlockingOps : WF_vars(BlockingReEvaluate(op))
 
 FairSpec ==

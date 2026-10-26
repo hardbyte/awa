@@ -77,9 +77,13 @@ EmitSeparateFollowup ==
     /\ UNCHANGED <<lease, state, savedOutcome, response, acknowledged,
                     commits, newerLeaseChanged>>
 
+\* Maintenance rescue of a stale, expired or timed-out attempt: back to
+\* `available` while attempts remain, `terminal` (failed or dead-lettered)
+\* once the rescued attempt was the last (#546). Either way the old lease's
+\* finalize must be refused.
 Rescue ==
     /\ state \in {"running", "waiting_external"}
-    /\ state' = "available"
+    /\ state' \in {"available", "terminal"}
     /\ UNCHANGED <<lease, savedOutcome, phase, response, acknowledged,
                     commits, followups, newerLeaseChanged>>
 
