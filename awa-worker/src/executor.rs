@@ -247,10 +247,6 @@ pub(crate) struct DispatchedJob {
     pub job: JobRow,
     pub queue_storage_claim: Option<ClaimedEntry>,
     pub queue_storage_unique_states: Option<String>,
-    /// When the dispatcher sent the claim request. The database stamp that
-    /// starts the rescue clock is taken after this, so an age measured from
-    /// here is never shorter than the age rescue sees.
-    pub claim_started_at: std::time::Instant,
     /// How long the handler may run before the executor drops it, set past
     /// the queue's deadline so maintenance has rescued the attempt by then.
     /// `None` when the queue has no deadline.
@@ -335,7 +331,6 @@ impl JobExecutor {
         let job = dispatched.job;
         let queue_storage_claim = dispatched.queue_storage_claim;
         let queue_storage_unique_states = dispatched.queue_storage_unique_states;
-        let claim_started_at = dispatched.claim_started_at;
         let abandon_after = dispatched.abandon_after;
         let pool = self.pool.clone();
         let workers = self.workers.clone();
@@ -407,7 +402,6 @@ impl JobExecutor {
             let in_flight_state = InFlightState {
                 cancel: cancel.clone(),
                 progress: progress_state.clone(),
-                claim_started_at,
             };
             in_flight.insert((job_id, job_run_lease), in_flight_state);
             if let Some(counter) = queue_in_flight.get(&job_queue) {
@@ -3618,7 +3612,6 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
-            claim_started_at: std::time::Instant::now(),
             abandon_after: None,
         };
         executor
@@ -3697,7 +3690,6 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
-            claim_started_at: std::time::Instant::now(),
             abandon_after: None,
         };
         executor
@@ -3793,7 +3785,6 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
-            claim_started_at: std::time::Instant::now(),
             abandon_after: None,
         };
         let mut jobs = jobs.into_iter();

@@ -43,14 +43,6 @@ for each step.
 
 ### Added
 
-- **`ClientBuilder::defer_first_heartbeat(true)`** (Python
-  `defer_first_heartbeat=True`, off by default) cuts heartbeat writes for
-  short jobs. An attempt's first heartbeat waits up to half a
-  `heartbeat_interval`, so attempts that finish sooner and report no progress
-  write no `attempt_state` row. It applies only when `heartbeat_staleness` is
-  at least three intervals. The cost is pause tolerance: at the 30 s / 90 s defaults, a
-  fresh attempt survives a stalled first heartbeat pass of about 45 s instead
-  of 60 s before rescue treats it as stale.
 - **Owner-scoped periodic schedules (opt-in, v045,
   [#481](https://github.com/hardbyte/awa/issues/481)).** A client can declare
   the complete set of periodic schedules it owns. awa then adds, updates and
@@ -86,10 +78,7 @@ for each step.
 
 - **Heartbeats tick on a fixed grid.** Ticks no longer drift by each pass's
   duration. A pass that outlasts the interval logs a warning with its duration
-  and is followed by a full interval of rest. A tick with nothing due issues
-  no statement, so `awa.heartbeat.batches` can read zero while only young
-  attempts run. Keep heartbeat settings the same across a fleet: rescue uses
-  the maintenance leader's `heartbeat_staleness`.
+  and is followed by a full interval of rest.
 - **Claims commit asynchronously.** Claims and claim-cursor advances run with
   `synchronous_commit = off`, so a lane's claim head is no longer held across
   a WAL flush. At 400 jobs/s on a disk with ~7 ms fsync, claim p99 fell from

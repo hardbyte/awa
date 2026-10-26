@@ -9417,14 +9417,14 @@ async fn test_queue_storage_receipt_claim_hint_closes_compact_claim_once() {
     assert_eq!(deferred, 1);
 }
 
-/// With `heartbeat_staleness` at exactly three intervals the first heartbeat
-/// is deferred, yet a handler running well past the staleness window is
-/// never rescued: the deferred first heartbeat still lands before the cutoff.
+/// With `heartbeat_staleness` at exactly three intervals, a handler running
+/// well past the staleness window is never rescued: fixed-grid heartbeat
+/// ticks keep a live attempt fresh at the documented floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_deferred_first_heartbeat_keeps_live_attempt_at_staleness_floor() {
+async fn test_queue_storage_grid_heartbeats_keep_live_attempt_at_staleness_floor() {
     let (_db_guard, pool) = setup_pool(10).await;
-    let queue = "qs_deferred_first_heartbeat";
-    let schema = "awa_qs_runtime_deferred_first_heartbeat";
+    let queue = "qs_grid_heartbeat_floor";
+    let schema = "awa_qs_runtime_grid_heartbeat_floor";
     let store = create_store_with_config(
         &pool,
         QueueStorageConfig {
@@ -9470,7 +9470,6 @@ async fn test_queue_storage_deferred_first_heartbeat_keeps_live_attempt_at_stale
         })
         .heartbeat_interval(interval)
         .heartbeat_staleness(staleness)
-        .defer_first_heartbeat(true)
         .heartbeat_rescue_interval(Duration::from_millis(50))
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))
@@ -9478,11 +9477,11 @@ async fn test_queue_storage_deferred_first_heartbeat_keeps_live_attempt_at_stale
         .deadline_rescue_interval(Duration::from_secs(10))
         .callback_rescue_interval(Duration::from_secs(10))
         .build()
-        .expect("Failed to build deferred-heartbeat client");
+        .expect("Failed to build grid-heartbeat client");
     client
         .start()
         .await
-        .expect("Failed to start deferred-heartbeat client");
+        .expect("Failed to start grid-heartbeat client");
 
     let job_id = enqueue_job(
         &pool,

@@ -4,7 +4,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
 
 const IN_FLIGHT_SHARDS: usize = 64;
 
@@ -18,9 +17,6 @@ type InFlightShard = RwLock<HashMap<InFlightKey, InFlightState>>;
 pub(crate) struct InFlightState {
     pub cancel: CancelFlag,
     pub progress: Arc<std::sync::Mutex<ProgressState>>,
-    /// When the dispatcher sent this attempt's claim request; ages measured
-    /// from here never undercount the age the rescue sweep sees.
-    pub claim_started_at: Instant,
 }
 
 /// Mutable progress buffer shared between handler and heartbeat service.
@@ -161,18 +157,11 @@ impl InFlightRegistry {
         guard.get(&key).map(|s| s.cancel.clone())
     }
 
-    /// Keys of attempts whose claim started at least `min_age` ago.
-    pub fn keys_older_than(&self, min_age: Duration) -> Vec<InFlightKey> {
-        let now = Instant::now();
+    pub fn keys(&self) -> Vec<InFlightKey> {
         let mut keys = Vec::new();
         for shard in &*self.shards {
             let guard = shard.read().expect("in_flight shard poisoned");
-            keys.extend(
-                guard
-                    .iter()
-                    .filter(|(_, state)| now.duration_since(state.claim_started_at) >= min_age)
-                    .map(|(key, _)| *key),
-            );
+            keys.extend(guard.keys().copied());
         }
         keys
     }
@@ -281,7 +270,6 @@ mod tests {
             InFlightState {
                 cancel: Arc::new(AtomicBool::new(false)),
                 progress: progress.clone(),
-                claim_started_at: Instant::now(),
             },
         );
 
@@ -290,37 +278,5 @@ mod tests {
         let state = progress.lock().expect("progress lock poisoned");
         assert_eq!(state.acked_generation, 2);
         assert!(state.in_flight.is_none());
-    }
-
-    #[test]
-    fn keys_older_than_filters_young_attempts() {
-        let registry = InFlightRegistry::default();
-        let fresh_progress = || Arc::new(std::sync::Mutex::new(ProgressState::new(None)));
-        let old_key = (1, 1);
-        let young_key = (2, 1);
-        registry.insert(
-            old_key,
-            InFlightState {
-                cancel: Arc::new(AtomicBool::new(false)),
-                progress: fresh_progress(),
-                claim_started_at: Instant::now() - Duration::from_secs(60),
-            },
-        );
-        registry.insert(
-            young_key,
-            InFlightState {
-                cancel: Arc::new(AtomicBool::new(false)),
-                progress: fresh_progress(),
-                claim_started_at: Instant::now(),
-            },
-        );
-
-        assert_eq!(
-            registry.keys_older_than(Duration::from_secs(30)),
-            vec![old_key]
-        );
-        let mut all = registry.keys_older_than(Duration::ZERO);
-        all.sort_unstable();
-        assert_eq!(all, vec![old_key, young_key]);
     }
 }

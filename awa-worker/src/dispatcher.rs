@@ -784,7 +784,6 @@ impl Dispatcher {
                         job,
                         queue_storage_claim: None,
                         queue_storage_unique_states: None,
-                        claim_started_at: claim_start,
                         abandon_after,
                     })
                     .collect(),
@@ -831,7 +830,6 @@ impl Dispatcher {
                             job: claimed.job,
                             queue_storage_claim: Some(claimed.claim),
                             queue_storage_unique_states: claimed.unique_states,
-                            claim_started_at: claim_start,
                             abandon_after,
                         })
                         .collect(),

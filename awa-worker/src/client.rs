@@ -148,7 +148,6 @@ pub struct ClientBuilder {
     >,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
-    defer_first_heartbeat: bool,
     promote_interval: Duration,
     heartbeat_rescue_interval: Option<Duration>,
     heartbeat_staleness: Option<Duration>,
@@ -211,7 +210,6 @@ impl ClientBuilder {
             enqueue_specs: HashMap::new(),
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
-            defer_first_heartbeat: false,
             promote_interval: Duration::from_millis(250),
             heartbeat_rescue_interval: None,
             heartbeat_staleness: None,
@@ -747,24 +745,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Defer an attempt's first heartbeat by up to half an interval from its
-    /// claim (default: off). The claim stamp covers the attempt until then,
-    /// so attempts shorter than the deferral write no heartbeat at all.
-    ///
-    /// The cost is pause tolerance for a fresh attempt: its first heartbeat
-    /// is tried up to `deferral + interval` after the claim instead of within
-    /// one interval, so a stalled first pass, for example one waiting for a
-    /// pool connection, is survived for about `staleness - interval -
-    /// deferral` instead of `staleness - interval` (45 s instead of 60 s at
-    /// 30 s / 90 s), less whatever earlier passes consume. Applies only when
-    /// `heartbeat_staleness` is at least three intervals, and shrinks as
-    /// recent passes slow down. Use the same heartbeat settings on every
-    /// runtime: rescue applies the elected leader's staleness.
-    pub fn defer_first_heartbeat(mut self, enabled: bool) -> Self {
-        self.defer_first_heartbeat = enabled;
-        self
-    }
-
     /// Set the scheduled/retryable promotion interval (default: 250ms).
     pub fn promote_interval(mut self, interval: Duration) -> Self {
         self.promote_interval = interval;
@@ -1204,7 +1184,6 @@ impl ClientBuilder {
             enqueue_specs: Arc::new(self.enqueue_specs),
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
-            defer_first_heartbeat: self.defer_first_heartbeat,
             promote_interval: self.promote_interval,
             heartbeat_rescue_interval: self.heartbeat_rescue_interval,
             heartbeat_staleness: self.heartbeat_staleness,
@@ -1305,7 +1284,6 @@ pub struct Client {
     >,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
-    defer_first_heartbeat: bool,
     promote_interval: Duration,
     heartbeat_rescue_interval: Option<Duration>,
     heartbeat_staleness: Option<Duration>,
@@ -1845,12 +1823,7 @@ impl Client {
             self.pool.clone(),
             self.storage.clone(),
             self.in_flight.clone(),
-            crate::heartbeat::HeartbeatCadence::new(
-                self.heartbeat_interval,
-                self.heartbeat_staleness
-                    .unwrap_or(crate::maintenance::DEFAULT_HEARTBEAT_STALENESS),
-            )
-            .with_first_heartbeat_deferral(self.defer_first_heartbeat),
+            self.heartbeat_interval,
             self.heartbeat_alive.clone(),
             self.service_cancel.clone(),
             self.metrics.clone(),
