@@ -182,3 +182,42 @@ html {
     min-height: auto;
   }
 }
+
+.awa-failure-launch {
+  padding: 1rem 1.2rem;
+  border: 1px solid var(--awa-border);
+  border-radius: 0.6rem;
+  background: var(--awa-surface);
+}
+
+.awa-failure-launch a {
+  display: block;
+  min-height: 44px;
+  padding: 0.4rem 0;
+  font-weight: 600;
+}
+
+.awa-failure-desktop {
+  margin: 1.5rem 0;
+}
+
+.awa-failure-desktop > summary {
+  padding: 0.7rem;
+  cursor: pointer;
+}
+
+.awa-failure-lab {
+  display: block;
+  width: 100%;
+  height: 1100px;
+  margin-top: 1rem;
+  border: 1px solid var(--awa-border);
+  border-radius: 0.6rem;
+  background: var(--awa-surface);
+}
+
+@media screen and (max-width: 760px), screen and (max-height: 500px) and (max-width: 1000px) {
+  .md-typeset .awa-failure-desktop {
+    display: none;
+  }
+}
