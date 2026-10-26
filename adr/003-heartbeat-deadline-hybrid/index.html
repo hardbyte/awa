@@ -2238,6 +2238,7 @@
 </span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">jobs</span><span class="p">.</span><span class="k">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'running'</span>
 </span></code></pre></div></li>
 <li>Batches are chunked at 500 in-flight attempts to avoid oversized queries.</li>
+<li>Ticks run on a fixed grid, and a pass that outlasts the interval is followed by a full interval of rest and logs a warning.</li>
 <li>The maintenance leader scans every 30 seconds for running jobs with <code>heartbeat_at &lt; now() - 90s</code> and transitions them to <code>retryable</code>.</li>
 <li><strong>Catches:</strong> Process crash, OOM kill, network partition, pod eviction -- any failure where the worker process stops entirely.</li>
 </ul>
