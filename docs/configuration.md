@@ -436,7 +436,7 @@ These knobs control **how fast a stuck or crashed handler is noticed and rescued
 
 ### Heartbeat — detecting crashed workers
 
-A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:
+A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job. The rescued attempt counts against `max_attempts`: the job is re-enqueued while attempts remain, and otherwise fails or moves to the DLQ ([Poison jobs](concepts/job-lifecycle.md#poison-jobs)). Three knobs participate:
 
 | Knob | Default | What it does |
 | --- | --- | --- |
@@ -465,7 +465,9 @@ pool waits and database errors; a retry count does not prove recovery.
 
 ### Deadline — bounding a single attempt
 
-Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
+Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against `max_attempts` like a failed one, so a job that hangs every time ends in `failed` or the DLQ ([Poison jobs](concepts/job-lifecycle.md#poison-jobs)).
+
+A handler that ignores cancellation and is still running two `deadline_rescue_interval`s (one minute by default) past its deadline is dropped at its next `.await`, which returns its worker slot so the rescued retry can run. Code that never yields, such as a blocking call or a CPU loop on the async runtime, cannot be dropped and keeps its slot until it returns. A Python coroutine stops being awaited but keeps running on its event loop until it finishes.
 
 | Knob | Default | What it does |
 | --- | --- | --- |

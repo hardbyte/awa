@@ -822,6 +822,38 @@ RescueToReady(j) ==
                    readyTombstones>>
     /\ UnchangedSegmentState
 
+\* Rescue of an attempt that was the job's last (#546): the same stale
+\* lease and receipt closure as RescueToReady, but the attempt has spent
+\* `max_attempts`, so the job fails instead of re-entering the ready lane.
+\* Like TimeoutWaitingToDlq and FailToDlq, the spec collapses `failed` and
+\* its DLQ move into `dlqEntries`.
+RescueToDlq(j) ==
+    /\ j \in activeLeases
+    /\ j \notin waitingLeases
+    /\ j \notin heartbeatFresh
+    /\ activeLeases' = activeLeases \ {j}
+    /\ dlqEntries' = dlqEntries \cup {j}
+    /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
+    /\ attemptState' = attemptState \ {j}
+    /\ progressTouched' = progressTouched \ {j}
+    /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
+    /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingLeases,
+                   terminalEntries,
+                   runLease,
+                   taskLease,
+                   heartbeatFresh,
+                   laneSeq,
+                   readySegmentOf,
+                   terminalSegmentOf,
+                   claimSegmentOf,
+                   readyTombstones>>
+    /\ UnchangedSegmentState
+
 \* ADR-023 Tier-A rescue: force-close a straggling receipt whose
 \* attempt is no longer alive on this (j, run_lease). The action takes
 \* the explicit key so the spec can model rescue firing on an old
@@ -1454,6 +1486,7 @@ Next ==
     \/ \E w \in Workers, j \in Jobs : FailToDlq(w, j)
     \/ \E w \in Workers, j \in Jobs : RetryToDeferred(w, j)
     \/ \E j \in Jobs : RescueToReady(j)
+    \/ \E j \in Jobs : RescueToDlq(j)
     \/ \E j \in Jobs, r \in RunLeaseValues : RescueStaleReceipt(j, r)
     \/ \E j \in Jobs : CancelWaitingToTerminal(j)
     \/ \E j \in Jobs : CancelRunningToTerminal(j)
