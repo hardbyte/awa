@@ -237,6 +237,7 @@ RETURNS VOID
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, awa, public
+SET quote_all_identifiers = off
 AS $install$
 DECLARE
     v_slot           INT;
@@ -244,6 +245,7 @@ DECLARE
     v_claimed_cte    TEXT;
     v_claim_runtime  REGPROCEDURE;
     v_identity_rel   REGCLASS;
+    v_claimer_owner_index REGCLASS;
     -- #371 staged rolling upgrade: was this a FRESH install (the ring
     -- state did not exist before this call) or an UPGRADE of an existing
     -- schema? A fresh install has no old binaries that could still read
@@ -1422,12 +1424,28 @@ BEGIN
         p_schema
     );
 
-    -- Drop the old expires_at-inclusive index shape (see queue_storage.rs
-    -- for the HOT-update rationale) and replace with the narrower shape.
-    EXECUTE format(
-        'DROP INDEX IF EXISTS %I.idx_%s_queue_claimer_leases_owner',
-        p_schema, p_schema
-    );
+    -- Retain the current index: dropping it on every replay retains locks
+    -- on each obsolete index OID until the whole migration range commits.
+    v_claimer_owner_index := to_regclass(format(
+        '%I.%I', p_schema, format('idx_%s_queue_claimer_leases_owner', p_schema)
+    ));
+    IF v_claimer_owner_index IS NOT NULL AND NOT EXISTS (
+        SELECT 1
+        FROM pg_index AS idx
+        JOIN pg_class AS rel ON rel.oid = idx.indexrelid
+        JOIN pg_am AS am ON am.oid = rel.relam
+        WHERE idx.indexrelid = v_claimer_owner_index
+          AND idx.indrelid = to_regclass(format('%I.queue_claimer_leases', p_schema))
+          AND idx.indisvalid AND idx.indisready AND idx.indislive
+          AND NOT idx.indisunique AND NOT idx.indisexclusion
+          AND idx.indnkeyatts = 2 AND idx.indnatts = 2
+          AND idx.indpred IS NULL AND idx.indexprs IS NULL
+          AND am.amname = 'btree'
+          AND pg_get_indexdef(idx.indexrelid, 1, false) = 'queue'
+          AND pg_get_indexdef(idx.indexrelid, 2, false) = 'owner_instance_id'
+    ) THEN
+        EXECUTE format('DROP INDEX %s', v_claimer_owner_index);
+    END IF;
 
     EXECUTE format(
         'CREATE INDEX IF NOT EXISTS idx_%s_queue_claimer_leases_owner ON %I.queue_claimer_leases (queue, owner_instance_id)',
