@@ -14552,9 +14552,6 @@ impl QueueStorage {
             .await
     }
 
-    /// Same fallback for rescue arms that write a terminal row directly
-    /// (callback timeout at max attempts): a `failed` insert that conflicts
-    /// with a newer duplicate's claim becomes a cancellation instead.
     /// Settle one attempt that maintenance rescued (stale heartbeat, expired
     /// deadline or callback timeout): back to `retryable` with backoff while
     /// attempts remain, `failed` once the rescued attempt was the last. A job
@@ -14592,6 +14589,9 @@ impl QueueStorage {
         }
     }
 
+    /// Same fallback for rescue arms that write a terminal row directly
+    /// (an exhausted rescued attempt): a `failed` insert that conflicts
+    /// with a newer duplicate's claim becomes a cancellation instead.
     async fn insert_rescued_done_or_cancel_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

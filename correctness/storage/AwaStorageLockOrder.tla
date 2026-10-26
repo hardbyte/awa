@@ -388,6 +388,40 @@ RescueReceiptDeadlinesPlan(claimSlot) ==
        Step(ClosureChildResource(claimSlot), ModeShared),
        Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
 
+\* The whole maintenance rescue transaction around those receipt sweeps
+\* (rescue_stale_heartbeats / rescue_expired_deadlines):
+\*   DELETE FROM leases ... RETURNING (stale or expired attempts)
+\*   the receipt sweep above, in the same transaction
+\*   hydrate_deleted_leases_tx: DELETE attempt_state, then close each
+\*     rescued attempt's own receipt, which can sit in a different claim
+\*     slot from the one the sweep visited
+\*   settle_rescued_attempt_tx: INSERT deferred_jobs while attempts remain
+\*     (unpartitioned, not a resource here), or INSERT done_entries and its
+\*     terminal-count delta once the rescued attempt was the last (#546)
+RescueHydratePlan(claimSlot) ==
+    << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClaimBatchChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(ClosureBatchChildResource(claimSlot), ModeShared) >>
+
+RescueSettlePlan(readySlot, exhausted) ==
+    IF exhausted
+    THEN << Step(DoneChildResource(readySlot), ModeShared),
+            Step(TerminalDeltaChildResource(readySlot), ModeShared) >>
+    ELSE << >>
+
+RescueStaleHeartbeatsPlan(leaseSlot, sweepSlot, attemptSlot, readySlot, exhausted) ==
+    << Step(LeaseChildResource(leaseSlot), ModeShared) >>
+    \o RescueReceiptsPlan(sweepSlot)
+    \o RescueHydratePlan(attemptSlot)
+    \o RescueSettlePlan(readySlot, exhausted)
+
+RescueExpiredDeadlinesPlan(leaseSlot, sweepSlot, attemptSlot, readySlot, exhausted) ==
+    << Step(LeaseChildResource(leaseSlot), ModeShared) >>
+    \o RescueReceiptDeadlinesPlan(sweepSlot)
+    \o RescueHydratePlan(attemptSlot)
+    \o RescueSettlePlan(readySlot, exhausted)
+
 \* ensure_running_leases_from_receipts_tx
 \*   transaction-scoped per-(job_id, run_lease) advisory lock first
 \*   CTE claim_refs: SELECT ... FROM lease_claims FOR UPDATE OF claims
@@ -913,21 +947,23 @@ StartCloseReceipt(t, claimSlot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
-StartRescueReceipts(t, claimSlot) ==
+StartRescueReceipts(t, leaseSlot, claimSlot, attemptSlot, readySlot, exhausted) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
     /\ claimSlot \in ClaimSlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = RescueReceiptsPlan(claimSlot)]
+    /\ txPlan' = [txPlan EXCEPT ![t] =
+          RescueStaleHeartbeatsPlan(leaseSlot, claimSlot, attemptSlot, readySlot, exhausted)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
-StartRescueReceiptDeadlines(t, claimSlot) ==
+StartRescueReceiptDeadlines(t, leaseSlot, claimSlot, attemptSlot, readySlot, exhausted) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
     /\ claimSlot \in ClaimSlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = RescueReceiptDeadlinesPlan(claimSlot)]
+    /\ txPlan' = [txPlan EXCEPT ![t] =
+          RescueExpiredDeadlinesPlan(leaseSlot, claimSlot, attemptSlot, readySlot, exhausted)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED <<heldLocks, authority, txMode>>
 
@@ -1063,8 +1099,12 @@ Next ==
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRotateClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartCloseReceipt(t, cs)
-    \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceipts(t, cs)
-    \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceiptDeadlines(t, cs)
+    \/ \E t \in TxIds, ls \in LeaseSlots, cs \in ClaimSlots, acs \in ClaimSlots,
+         rs \in ReadySlots, exhausted \in BOOLEAN :
+          StartRescueReceipts(t, ls, cs, acs, rs, exhausted)
+    \/ \E t \in TxIds, ls \in LeaseSlots, cs \in ClaimSlots, acs \in ClaimSlots,
+         rs \in ReadySlots, exhausted \in BOOLEAN :
+          StartRescueReceiptDeadlines(t, ls, cs, acs, rs, exhausted)
     \/ \E t \in TxIds, cs \in ClaimSlots, ls \in LeaseSlots :
           StartEnsureRunning(t, cs, ls)
     \/ \E t \in TxIds, cs \in ClaimSlots, rs \in ReadySlots,

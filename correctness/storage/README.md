@@ -27,6 +27,7 @@ What it models:
 - callback resume from `waiting_external` back to `running` on the same lease
 - callback timeout rescue from a waiting lease back to `ready_entries`
 - callback-timeout rescue on exhausted attempts landing directly in `dlq_entries`
+- stale-heartbeat and deadline rescue of a job's last attempt landing in `dlq_entries` instead of the ready lane (`RescueToDlq`, #546)
 - claim into `leases`
 - explicit `lane_state` append/claim cursors with gap-skipping claim advancement
 - ready tombstones for unclaimed ready cancellation and priority aging
@@ -86,6 +87,7 @@ Action coverage from a `-coverage 1` run of the base config confirms each DLQ tr
 | `FailToDlq`           |
 | `TimeoutWaitingToDlq` |
 | `RescueToReady`       |
+| `RescueToDlq`         |
 | `PurgeDlq`            |
 | `MoveFailedToDlq`     |
 | `RetryFromDlq`        |
@@ -155,7 +157,7 @@ Three negative configurations reproduce using allocated bytes as row presence, u
 
 Configs:
 
-- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, stale receipt rescue, receipt deadline rescue, ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. It checks the represented lock plans; implicit resources absent from a plan are outside the proof.
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run against the real Rust lock plans. Models claim (receipts and legacy modes), complete, close-receipt, the whole stale-heartbeat and deadline rescue transactions (lease delete, receipt sweep, closing the rescued attempt's own receipt, and the `done_entries` insert when the attempt was the last), ensure-running, terminal-delete closure materialization, the two cancel branches, plus rotate / prune for the queue, lease, and claim rings. It checks the represented lock plans; implicit resources absent from a plan are outside the proof.
 - [`AwaQueuePruneLockOrder.cfg`](./AwaQueuePruneLockOrder.cfg): segment-first claim readers and entry-first producers versus queue pruning. Prune waits on routing first and aborts the entire transaction if any later `NOWAIT` lock conflicts. Both authority modes use that tail. This proves cycle avoidance at the represented lock level, not successful pruning under perpetual contention.
 - [`AwaQueuePruneLockOrderBlocking.cfg`](./AwaQueuePruneLockOrderBlocking.cfg): old body-first blocking prune versus the segment-first reader; TLC must find the cycle captured during the saturation benchmark. The main claim plans now include the previously omitted routing-child read.
 - [`AwaWholeSchemaLockOrder.cfg`](./AwaWholeSchemaLockOrder.cfg): counter rebuild and reset versus every ring's rotate, prune and rollup, across the authority flip. Both whole-schema operations wait for the per-ring rotation locks before the ring-state singletons and their table locks. A ledger tick holds only the rotation lock before its child locks, and a tick promoted to ledger while queued on the singleton try-locks it.
@@ -189,7 +191,7 @@ What this proves: the race is real at the data-spec abstraction level. The safe 
 
 ## Storage-transition companion spec
 
-[`AwaCanonicalUniqueRescue.tla`](./AwaCanonicalUniqueRescue.tla) models the interaction between the canonical batched rescue sweeps and the `sync_job_unique_claims` trigger: a pending-only unique-states mask releases the claim while a job runs, a duplicate takes it, and the `running -> retryable` rescue transition is refused. [`AwaCanonicalUniqueRescueBatchOnly.cfg`](./AwaCanonicalUniqueRescueBatchOnly.cfg) is the expected-counterexample witness (the batched sweep starves the innocent stuck job — TLC reports the `Convergence` liveness property violated); [`AwaCanonicalUniqueRescue.cfg`](./AwaCanonicalUniqueRescue.cfg) checks the per-row fallback shipped in 0.6.1 (innocent job rescued, conflicted job cancelled, `ClaimConsistency` preserved).
+[`AwaCanonicalUniqueRescue.tla`](./AwaCanonicalUniqueRescue.tla) models the interaction between the canonical batched rescue sweeps and the `sync_job_unique_claims` trigger: a pending-only unique-states mask releases the claim while a job runs, a duplicate takes it, and the `running -> retryable` rescue transition is refused. Whether each stuck job is on its last attempt is chosen at Init: since #546 such a job fails in place instead (`ExhaustedRescueFails`), which this mask never refuses. [`AwaCanonicalUniqueRescueBatchOnly.cfg`](./AwaCanonicalUniqueRescueBatchOnly.cfg) is the expected-counterexample witness (the batched sweep starves the innocent stuck job — TLC reports the `Convergence` liveness property violated); [`AwaCanonicalUniqueRescue.cfg`](./AwaCanonicalUniqueRescue.cfg) checks the per-row fallback shipped in 0.6.1 (innocent job rescued, conflicted job cancelled, `ClaimConsistency` preserved).
 
 [`AwaStorageTransition.tla`](./AwaStorageTransition.tla) models the `0.5.x canonical -> 0.6 queue_storage` control plane from #180. It is deliberately smaller than the segmented-storage data model: it tracks the transition singleton, prepared schema readiness, runtime capability reports, effective queue executors, canonical backlog count, queue-storage row count, producer routing, finalize, and abort interlocks.
 
@@ -258,6 +260,7 @@ This spec models the **architectural contract** for dead tuples. For partitioned
 [`AwaSegmentedStorageTrace.tla`](./AwaSegmentedStorageTrace.tla) extends the base spec with a replay harness that verifies a concrete sequence of events transcribed from a real queue-storage runtime test is accepted by the spec. The current checked-in traces:
 
 - `SnoozeTrace` (6 events: enqueue → claim → retry-to-deferred → promote → claim → fast-complete) — accepted cleanly, 7 states. Transcribed from `test_queue_storage_runtime_snooze`.
+- `RescueToDlqTrace` (4 events: enqueue → claim → lose heartbeat → rescue to DLQ) — accepted cleanly, 5 states. A worker that dies on the job's last attempt is rescued into the DLQ rather than the ready lane.
 - `ReceiptRescueTrace` (3 events: enqueue → seed receipt-only claim → rescue stale receipt) — accepted cleanly, 4 states. The seed action is trace-only scaffolding because the base spec's `Claim` action materializes a lease immediately while the implementation has a short receipt-only window before materialization.
 - `RunningCancelTrace` (3 events: enqueue → claim → running admin cancel) — accepted cleanly, 4 states.
 - `DlqRetryTrace` (6 events: enqueue → claim → fail-to-DLQ → retry-from-DLQ → claim → fast-complete) — accepted cleanly, 7 states.
