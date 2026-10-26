@@ -40,6 +40,7 @@ AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqRetry.cfg    ;; Dlq
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceDlqPurge.cfg    ;; DlqPurgeTraceIncomplete is violated ;; DLQ purge trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceRescueToDlq.cfg ;; RescueToDlqTraceIncomplete is violated ;; exhausted rescue dead-letters trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceRescueToTerminal.cfg ;; RescueToTerminalTraceIncomplete is violated ;; exhausted rescue without a DLQ fails trace consumed
+AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceCallbackTimeoutToTerminal.cfg ;; CallbackTimeoutToTerminalTraceIncomplete is violated ;; exhausted callback timeout without a DLQ fails trace consumed
 AwaSegmentedStorageTrace.tla   ;; AwaSegmentedStorageTraceBroken.cfg      ;; Deadlock reached ;; broken trace rejected
 AwaStorageLockOrder.tla        ;; AwaStorageLockOrder.cfg                 ;; pass ;; lock ordering
 AwaStorageLockOrder.tla        ;; AwaQueuePruneLockOrder.cfg              ;; pass ;; segment-first queue prune with NOWAIT tail

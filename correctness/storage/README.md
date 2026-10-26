@@ -26,7 +26,7 @@ What it models:
 - parking into `waiting_external` as a state on the live lease row
 - callback resume from `waiting_external` back to `running` on the same lease
 - callback timeout rescue from a waiting lease back to `ready_entries`
-- callback-timeout rescue on exhausted attempts landing directly in `dlq_entries`
+- callback-timeout rescue on exhausted attempts landing directly in `dlq_entries` on a DLQ-enabled queue (`TimeoutWaitingToDlq`), or in the terminal family otherwise (`TimeoutWaitingToTerminal`)
 - stale-heartbeat and deadline rescue of a job's last attempt landing in `dlq_entries` in the rescue transaction on a DLQ-enabled queue (`RescueToDlq`), or in the terminal family otherwise (`RescueToTerminal`)
 - claim into `leases`
 - explicit `lane_state` append/claim cursors with gap-skipping claim advancement
@@ -262,6 +262,7 @@ This spec models the **architectural contract** for dead tuples. For partitioned
 - `SnoozeTrace` (6 events: enqueue → claim → retry-to-deferred → promote → claim → fast-complete) — accepted cleanly, 7 states. Transcribed from `test_queue_storage_runtime_snooze`.
 - `RescueToDlqTrace` (4 events: enqueue → claim → lose heartbeat → rescue to DLQ) — accepted cleanly, 5 states. A worker that dies on the job's last attempt is rescued into the DLQ rather than the ready lane.
 - `RescueToTerminalTrace` (4 events: enqueue → claim → lose heartbeat → rescue to terminal) — the same exhausted rescue on a queue without a DLQ.
+- `CallbackTimeoutToTerminalTrace` (5 events: enqueue → claim → materialize attempt state → park → callback timeout to terminal) — an exhausted callback timeout on a queue without a DLQ.
 - `ReceiptRescueTrace` (3 events: enqueue → seed receipt-only claim → rescue stale receipt) — accepted cleanly, 4 states. The seed action is trace-only scaffolding because the base spec's `Claim` action materializes a lease immediately while the implementation has a short receipt-only window before materialization.
 - `RunningCancelTrace` (3 events: enqueue → claim → running admin cancel) — accepted cleanly, 4 states.
 - `DlqRetryTrace` (6 events: enqueue → claim → fail-to-DLQ → retry-from-DLQ → claim → fast-complete) — accepted cleanly, 7 states.

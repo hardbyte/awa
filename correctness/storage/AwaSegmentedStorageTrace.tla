@@ -132,6 +132,16 @@ CallbackWaitTrace == <<
     [action |-> "StatefulComplete",        worker |-> "w1", job |-> "j1"]
 >>
 
+\* Exhausted callback timeout on a queue without a DLQ: the waiting entry
+\* fails into the terminal family instead of the DLQ.
+CallbackTimeoutToTerminalTrace == <<
+    [action |-> "EnqueueReady",             job |-> "j1"],
+    [action |-> "Claim",                    worker |-> "w1", job |-> "j1"],
+    [action |-> "MaterializeAttemptState",  job |-> "j1"],
+    [action |-> "ParkToWaiting",            worker |-> "w1", job |-> "j1"],
+    [action |-> "TimeoutWaitingToTerminal", job |-> "j1"]
+>>
+
 \* DLQ purge trace: an executor terminal failure moves the row into
 \* dlq_entries, then an operator-initiated purge removes it. Validates
 \* that PurgeDlq fires from a real DLQ-entry state and leaves the rest
@@ -256,6 +266,7 @@ TraceStep(trace, n) ==
        \/ (ev.action = "ResumeWaitingToRunning" /\ ResumeWaitingToRunning(ev.job))
        \/ (ev.action = "TimeoutWaitingToReady" /\ TimeoutWaitingToReady(ev.job))
        \/ (ev.action = "TimeoutWaitingToDlq" /\ TimeoutWaitingToDlq(ev.job))
+       \/ (ev.action = "TimeoutWaitingToTerminal" /\ TimeoutWaitingToTerminal(ev.job))
        \/ (ev.action = "FailToDlq" /\ FailToDlq(ev.worker, ev.job))
        \/ (ev.action = "RescueToReady" /\ RescueToReady(ev.job))
        \/ (ev.action = "RescueToDlq" /\ RescueToDlq(ev.job))
@@ -289,6 +300,7 @@ SpecRunningCancel == TraceInit /\ [][TraceNextFor(RunningCancelTrace)]_<<vars, t
 SpecDlqRetry == TraceInit /\ [][TraceNextFor(DlqRetryTrace)]_<<vars, traceIdx>>
 SpecReceiptOnlyCancel == TraceInit /\ [][TraceNextFor(ReceiptOnlyCancelTrace)]_<<vars, traceIdx>>
 SpecCallbackWait == TraceInit /\ [][TraceNextFor(CallbackWaitTrace)]_<<vars, traceIdx>>
+SpecCallbackTimeoutToTerminal == TraceInit /\ [][TraceNextFor(CallbackTimeoutToTerminalTrace)]_<<vars, traceIdx>>
 SpecDlqPurge == TraceInit /\ [][TraceNextFor(DlqPurgeTrace)]_<<vars, traceIdx>>
 SpecRescueToDlq == TraceInit /\ [][TraceNextFor(RescueToDlqTrace)]_<<vars, traceIdx>>
 SpecRescueToTerminal == TraceInit /\ [][TraceNextFor(RescueToTerminalTrace)]_<<vars, traceIdx>>
@@ -307,6 +319,7 @@ RunningCancelTraceIncomplete == traceIdx < Len(RunningCancelTrace)
 DlqRetryTraceIncomplete == traceIdx < Len(DlqRetryTrace)
 ReceiptOnlyCancelTraceIncomplete == traceIdx < Len(ReceiptOnlyCancelTrace)
 CallbackWaitTraceIncomplete == traceIdx < Len(CallbackWaitTrace)
+CallbackTimeoutToTerminalTraceIncomplete == traceIdx < Len(CallbackTimeoutToTerminalTrace)
 DlqPurgeTraceIncomplete == traceIdx < Len(DlqPurgeTrace)
 RescueToDlqTraceIncomplete == traceIdx < Len(RescueToDlqTrace)
 RescueToTerminalTraceIncomplete == traceIdx < Len(RescueToTerminalTrace)
