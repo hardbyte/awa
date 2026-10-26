@@ -139,6 +139,20 @@ for each step.
 
 ### Fixed
 
+- **Poison jobs no longer cycle forever.** A job whose worker crashed or hung
+  on every attempt was rescued back to `retryable` indefinitely: stale-heartbeat
+  and deadline rescue never checked `max_attempts`, so `attempt` climbed past
+  it. Those rescues now fail the job once its attempts are spent, as callback
+  timeouts already did, and dead-letter it with reason `heartbeat_stale` or
+  `deadline_exceeded` on DLQ-enabled queues. A job with `max_attempts = 1` that
+  loses its worker therefore fails instead of running again. Rescue runs on the
+  maintenance leader, so the new behaviour applies once the leader runs this
+  release.
+- **A panicking Rust handler is a failed attempt.** A panic used to escape the
+  job task: the job stayed registered in flight, kept heartbeating until its
+  deadline rescued it (5 minutes by default), and its message was lost. The
+  executor now catches the panic and records `handler panicked: <message>` as
+  a retryable failure.
 - **A running job could be both finished and retried.** If a job completed,
   failed or was retried while stale-heartbeat or deadline rescue was examining
   it, rescue could miss that outcome and also send the job back for a retry,

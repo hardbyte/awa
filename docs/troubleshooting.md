@@ -397,8 +397,12 @@ awa --database-url "$DATABASE_URL" dlq list --queue email
 
 - `terminal_error`
 - `max_attempts_exhausted`
+- `heartbeat_stale`
+- `deadline_exceeded`
 - `callback_timeout`
 - an operator-supplied reason from `awa dlq move`
+
+A burst of `heartbeat_stale` or `deadline_exceeded` from one kind usually means a poison job: one that crashes or hangs its worker on every attempt. See [Poison jobs](concepts/job-lifecycle.md#poison-jobs).
 
 Useful actions:
 

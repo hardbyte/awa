@@ -465,7 +465,7 @@ pool waits and database errors; a retry count does not prove recovery.
 
 ### Deadline — bounding a single attempt
 
-Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
+Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against `max_attempts` like a failed one, so a job that hangs every time ends in `failed` or the DLQ ([Poison jobs](concepts/job-lifecycle.md#poison-jobs)).
 
 | Knob | Default | What it does |
 | --- | --- | --- |

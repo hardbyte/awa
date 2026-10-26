@@ -112,6 +112,42 @@ impl JobError {
     }
 }
 
+/// Polls a handler future, turning a panic into an `Err` with its payload.
+///
+/// Without this a panicking handler unwinds out of the job task before
+/// finalization: the job stays registered in-flight, heartbeats keep it
+/// looking alive until its deadline, the attempt is never counted, and the
+/// panic message is lost. Caught, a panic is an ordinary retryable failure.
+struct CatchUnwind<F>(F);
+
+impl<F: std::future::Future + Unpin> std::future::Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // Unwind safety: the handler future is dropped after a panic and
+        // never polled again, so no broken invariant inside it is observed.
+        let inner = &mut self.0;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::pin::Pin::new(inner).poll(cx)
+        })) {
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 /// Per-queue DLQ policy resolved at `Client::start`.
 #[derive(Debug, Clone, Default)]
 pub struct DlqPolicy {
@@ -394,7 +430,16 @@ impl JobExecutor {
                             .await;
                         });
                     }
-                    worker.perform(&ctx).await
+                    match CatchUnwind(worker.perform(&ctx)).await {
+                        Ok(result) => result,
+                        Err(panic) => {
+                            let message = panic_message(panic.as_ref());
+                            error!(kind = %job.kind, job_id, panic = %message, "Job handler panicked");
+                            Err(JobError::retryable_msg(format!(
+                                "handler panicked: {message}"
+                            )))
+                        }
+                    }
                 }
                 None => {
                     error!(kind = %job.kind, job_id, "No worker registered for job kind");

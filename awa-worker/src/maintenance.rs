@@ -48,68 +48,116 @@ fn is_unique_claim_conflict(err: &awa_model::AwaError) -> bool {
 /// WHERE clause narrows to one id (re-checking the staleness predicate so a
 /// row that recovered between selection and update is left alone).
 const HEARTBEAT_RESCUE_PER_ROW_SQL: &str = r#"
-    WITH deleted AS (
-        DELETE FROM awa.jobs_hot
+    WITH candidates AS (
+        SELECT id, attempt, max_attempts FROM awa.jobs_hot
         WHERE id = $1
           AND state = 'running'
           AND heartbeat_at < now() - ($2 * interval '1 millisecond')
+        FOR UPDATE
+    ),
+    failed AS (
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            errors = errors || jsonb_build_object(
+                'error', 'heartbeat stale: worker presumed dead',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+        RETURNING *
+    ),
+    deleted AS (
+        DELETE FROM awa.jobs_hot
+        WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+        RETURNING *
+    ),
+    moved AS (
+        INSERT INTO awa.scheduled_jobs (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+            run_at, NULL, NULL, attempted_at, now(),
+            created_at,
+            errors || jsonb_build_object(
+                'error', 'heartbeat stale: worker presumed dead',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb,
+            metadata, tags, unique_key, unique_states,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            run_lease, progress
+        FROM deleted
         RETURNING *
     )
-    INSERT INTO awa.scheduled_jobs (
-        id, kind, queue, args, state, priority, attempt, max_attempts,
-        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-        created_at, errors, metadata, tags, unique_key, unique_states,
-        callback_id, callback_timeout_at, callback_filter,
-        callback_on_complete, callback_on_fail, callback_transform,
-        run_lease, progress
-    )
-    SELECT
-        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-        run_at, NULL, NULL, attempted_at, now(),
-        created_at,
-        errors || jsonb_build_object(
-            'error', 'heartbeat stale: worker presumed dead',
-            'attempt', attempt,
-            'at', now()
-        )::jsonb,
-        metadata, tags, unique_key, unique_states,
-        NULL, NULL, NULL, NULL, NULL, NULL,
-        run_lease, progress
-    FROM deleted
-    RETURNING *
+    SELECT * FROM failed
+    UNION ALL
+    SELECT * FROM moved
 "#;
 
 const DEADLINE_RESCUE_PER_ROW_SQL: &str = r#"
-    WITH deleted AS (
-        DELETE FROM awa.jobs_hot
+    WITH candidates AS (
+        SELECT id, attempt, max_attempts FROM awa.jobs_hot
         WHERE id = $1
           AND state = 'running'
           AND deadline_at IS NOT NULL
           AND deadline_at < now()
+        FOR UPDATE
+    ),
+    failed AS (
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            errors = errors || jsonb_build_object(
+                'error', 'hard deadline exceeded',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+        RETURNING *
+    ),
+    deleted AS (
+        DELETE FROM awa.jobs_hot
+        WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+        RETURNING *
+    ),
+    moved AS (
+        INSERT INTO awa.scheduled_jobs (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+            run_at, NULL, NULL, attempted_at, now(),
+            created_at,
+            errors || jsonb_build_object(
+                'error', 'hard deadline exceeded',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb,
+            metadata, tags, unique_key, unique_states,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            run_lease, progress
+        FROM deleted
         RETURNING *
     )
-    INSERT INTO awa.scheduled_jobs (
-        id, kind, queue, args, state, priority, attempt, max_attempts,
-        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-        created_at, errors, metadata, tags, unique_key, unique_states,
-        callback_id, callback_timeout_at, callback_filter,
-        callback_on_complete, callback_on_fail, callback_transform,
-        run_lease, progress
-    )
-    SELECT
-        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-        run_at, NULL, NULL, attempted_at, now(),
-        created_at,
-        errors || jsonb_build_object(
-            'error', 'hard deadline exceeded',
-            'attempt', attempt,
-            'at', now()
-        )::jsonb,
-        metadata, tags, unique_key, unique_states,
-        NULL, NULL, NULL, NULL, NULL, NULL,
-        run_lease, progress
-    FROM deleted
-    RETURNING *
+    SELECT * FROM failed
+    UNION ALL
+    SELECT * FROM moved
 "#;
 
 const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
@@ -1568,13 +1616,14 @@ impl MaintenanceService {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
-                self.process_heartbeat_rescues(outcome, true).await;
+                self.process_heartbeat_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
                     let outcome = runtime
                         .store
                         .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
                         .await;
-                    self.process_heartbeat_rescues(outcome, false).await;
+                    self.process_heartbeat_rescues(outcome, false, Some(runtime))
+                        .await;
                 }
             }
             RuntimeStorage::QueueStorage(runtime) => {
@@ -1582,52 +1631,76 @@ impl MaintenanceService {
                     .store
                     .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
                     .await;
-                self.process_heartbeat_rescues(outcome, true).await;
+                self.process_heartbeat_rescues(outcome, true, Some(runtime))
+                    .await;
                 let outcome = self.rescue_canonical_stale_heartbeats().await;
-                self.process_heartbeat_rescues(outcome, false).await;
+                self.process_heartbeat_rescues(outcome, false, None).await;
             }
         }
     }
 
     /// Batched canonical stale-heartbeat rescue with the #388 row-at-a-time
-    /// fallback on unique-claim conflict.
+    /// fallback on unique-claim conflict. Exhausted attempts fail in place,
+    /// as callback timeouts do, so a job that keeps killing or hanging its
+    /// worker stops at `max_attempts`; the rest move to `scheduled_jobs` as
+    /// `retryable`.
     async fn rescue_canonical_stale_heartbeats(&self) -> Result<Vec<JobRow>, awa_model::AwaError> {
         let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
         let outcome = sqlx::query_as::<_, JobRow>(
             r#"
-                WITH deleted AS (
+                WITH candidates AS (
+                    SELECT id, attempt, max_attempts FROM awa.jobs_hot
+                    WHERE state = 'running'
+                      AND heartbeat_at < now() - ($1 * interval '1 millisecond')
+                    LIMIT 500
+                    FOR UPDATE SKIP LOCKED
+                ),
+                failed AS (
+                    UPDATE awa.jobs_hot
+                    SET state = 'failed',
+                        finalized_at = now(),
+                        heartbeat_at = NULL,
+                        deadline_at = NULL,
+                        errors = errors || jsonb_build_object(
+                            'error', 'heartbeat stale: worker presumed dead',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+                    RETURNING *
+                ),
+                deleted AS (
                     DELETE FROM awa.jobs_hot
-                    WHERE id IN (
-                        SELECT id FROM awa.jobs_hot
-                        WHERE state = 'running'
-                          AND heartbeat_at < now() - ($1 * interval '1 millisecond')
-                        LIMIT 500
-                        FOR UPDATE SKIP LOCKED
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+                    RETURNING *
+                ),
+                moved AS (
+                    INSERT INTO awa.scheduled_jobs (
+                        id, kind, queue, args, state, priority, attempt, max_attempts,
+                        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                        created_at, errors, metadata, tags, unique_key, unique_states,
+                        callback_id, callback_timeout_at, callback_filter,
+                        callback_on_complete, callback_on_fail, callback_transform,
+                        run_lease, progress
                     )
+                    SELECT
+                        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+                        run_at, NULL, NULL, attempted_at, now(),
+                        created_at,
+                        errors || jsonb_build_object(
+                            'error', 'heartbeat stale: worker presumed dead',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb,
+                        metadata, tags, unique_key, unique_states,
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        run_lease, progress
+                    FROM deleted
                     RETURNING *
                 )
-                INSERT INTO awa.scheduled_jobs (
-                    id, kind, queue, args, state, priority, attempt, max_attempts,
-                    run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-                    created_at, errors, metadata, tags, unique_key, unique_states,
-                    callback_id, callback_timeout_at, callback_filter,
-                    callback_on_complete, callback_on_fail, callback_transform,
-                    run_lease, progress
-                )
-                SELECT
-                    id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-                    run_at, NULL, NULL, attempted_at, now(),
-                    created_at,
-                    errors || jsonb_build_object(
-                        'error', 'heartbeat stale: worker presumed dead',
-                        'attempt', attempt,
-                        'at', now()
-                    )::jsonb,
-                    metadata, tags, unique_key, unique_states,
-                    NULL, NULL, NULL, NULL, NULL, NULL,
-                    run_lease, progress
-                FROM deleted
-                RETURNING *
+                SELECT * FROM failed
+                UNION ALL
+                SELECT * FROM moved
                 "#,
         )
         .bind(staleness_ms)
@@ -1666,6 +1739,7 @@ impl MaintenanceService {
         &self,
         outcome: Result<Vec<JobRow>, awa_model::AwaError>,
         signal_local: bool,
+        dlq_runtime: Option<&QueueStorageRuntime>,
     ) {
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
@@ -1694,6 +1768,8 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::StaleHeartbeat)
                         .await;
                 }
+                self.move_rescued_failures_to_dlq(&rescued, dlq_runtime, "heartbeat_stale")
+                    .await;
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue stale heartbeat jobs");
@@ -1731,61 +1807,86 @@ impl MaintenanceService {
         match &self.storage {
             RuntimeStorage::Canonical => {
                 let outcome = self.rescue_canonical_expired_deadlines().await;
-                self.process_deadline_rescues(outcome, true).await;
+                self.process_deadline_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
                     let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
-                    self.process_deadline_rescues(outcome, false).await;
+                    self.process_deadline_rescues(outcome, false, Some(runtime))
+                        .await;
                 }
             }
             RuntimeStorage::QueueStorage(runtime) => {
                 let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
-                self.process_deadline_rescues(outcome, true).await;
+                self.process_deadline_rescues(outcome, true, Some(runtime))
+                    .await;
                 let outcome = self.rescue_canonical_expired_deadlines().await;
-                self.process_deadline_rescues(outcome, false).await;
+                self.process_deadline_rescues(outcome, false, None).await;
             }
         }
     }
 
     /// Batched canonical deadline rescue with the #388 row-at-a-time
-    /// fallback on unique-claim conflict.
+    /// fallback on unique-claim conflict. Exhausted attempts fail in place,
+    /// as callback timeouts do, so a job that keeps killing or hanging its
+    /// worker stops at `max_attempts`; the rest move to `scheduled_jobs` as
+    /// `retryable`.
     async fn rescue_canonical_expired_deadlines(&self) -> Result<Vec<JobRow>, awa_model::AwaError> {
         let outcome = sqlx::query_as::<_, JobRow>(
             r#"
-            WITH deleted AS (
-                DELETE FROM awa.jobs_hot
-                WHERE id IN (
-                    SELECT id FROM awa.jobs_hot
+                WITH candidates AS (
+                    SELECT id, attempt, max_attempts FROM awa.jobs_hot
                     WHERE state = 'running'
                       AND deadline_at IS NOT NULL
                       AND deadline_at < now()
                     LIMIT 500
                     FOR UPDATE SKIP LOCKED
+                ),
+                failed AS (
+                    UPDATE awa.jobs_hot
+                    SET state = 'failed',
+                        finalized_at = now(),
+                        heartbeat_at = NULL,
+                        deadline_at = NULL,
+                        errors = errors || jsonb_build_object(
+                            'error', 'hard deadline exceeded',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt >= max_attempts)
+                    RETURNING *
+                ),
+                deleted AS (
+                    DELETE FROM awa.jobs_hot
+                    WHERE id IN (SELECT id FROM candidates WHERE attempt < max_attempts)
+                    RETURNING *
+                ),
+                moved AS (
+                    INSERT INTO awa.scheduled_jobs (
+                        id, kind, queue, args, state, priority, attempt, max_attempts,
+                        run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                        created_at, errors, metadata, tags, unique_key, unique_states,
+                        callback_id, callback_timeout_at, callback_filter,
+                        callback_on_complete, callback_on_fail, callback_transform,
+                        run_lease, progress
+                    )
+                    SELECT
+                        id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
+                        run_at, NULL, NULL, attempted_at, now(),
+                        created_at,
+                        errors || jsonb_build_object(
+                            'error', 'hard deadline exceeded',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb,
+                        metadata, tags, unique_key, unique_states,
+                        NULL, NULL, NULL, NULL, NULL, NULL,
+                        run_lease, progress
+                    FROM deleted
+                    RETURNING *
                 )
-                RETURNING *
-            )
-            INSERT INTO awa.scheduled_jobs (
-                id, kind, queue, args, state, priority, attempt, max_attempts,
-                run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
-                created_at, errors, metadata, tags, unique_key, unique_states,
-                callback_id, callback_timeout_at, callback_filter,
-                callback_on_complete, callback_on_fail, callback_transform,
-                run_lease, progress
-            )
-            SELECT
-                id, kind, queue, args, 'retryable', priority, attempt, max_attempts,
-                run_at, NULL, NULL, attempted_at, now(),
-                created_at,
-                errors || jsonb_build_object(
-                    'error', 'hard deadline exceeded',
-                    'attempt', attempt,
-                    'at', now()
-                )::jsonb,
-                metadata, tags, unique_key, unique_states,
-                NULL, NULL, NULL, NULL, NULL, NULL,
-                run_lease, progress
-            FROM deleted
-            RETURNING *
-            "#,
+                SELECT * FROM failed
+                UNION ALL
+                SELECT * FROM moved
+                "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -1820,6 +1921,7 @@ impl MaintenanceService {
         &self,
         outcome: Result<Vec<JobRow>, awa_model::AwaError>,
         signal_local: bool,
+        dlq_runtime: Option<&QueueStorageRuntime>,
     ) {
         match outcome {
             Ok(rescued) if !rescued.is_empty() => {
@@ -1848,6 +1950,8 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::DeadlineExceeded)
                         .await;
                 }
+                self.move_rescued_failures_to_dlq(&rescued, dlq_runtime, "deadline_exceeded")
+                    .await;
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
@@ -2018,40 +2122,51 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::ExpiredCallback)
                         .await;
                 }
-                if let Some(runtime) = dlq_runtime {
-                    for job in &rescued {
-                        if job.state != JobState::Failed || !self.dlq_policy.enabled_for(&job.queue)
-                        {
-                            continue;
-                        }
-                        match runtime
-                            .store
-                            .move_failed_to_dlq(&self.pool, job.id, "callback_timeout")
-                            .await
-                        {
-                            Ok(Some(_)) => {
-                                self.metrics.record_dlq_moved(
-                                    &job.kind,
-                                    &job.queue,
-                                    "callback_timeout",
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                error!(
-                                    job_id = job.id,
-                                    error = %err,
-                                    "Failed to move rescued callback timeout into DLQ"
-                                );
-                            }
-                        }
-                    }
-                }
+                self.move_rescued_failures_to_dlq(&rescued, dlq_runtime, "callback_timeout")
+                    .await;
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
             }
             _ => {}
+        }
+    }
+
+    /// Move rescued attempts that exhausted their budget into the DLQ when the
+    /// queue's policy enables it. `runtime` is the queue-storage runtime that
+    /// owns the rows' plane; canonical rows have no DLQ (see
+    /// [`Self::process_callback_rescues`]).
+    async fn move_rescued_failures_to_dlq(
+        &self,
+        rescued: &[JobRow],
+        runtime: Option<&QueueStorageRuntime>,
+        reason: &str,
+    ) {
+        let Some(runtime) = runtime else {
+            return;
+        };
+        for job in rescued {
+            if job.state != JobState::Failed || !self.dlq_policy.enabled_for(&job.queue) {
+                continue;
+            }
+            match runtime
+                .store
+                .move_failed_to_dlq(&self.pool, job.id, reason)
+                .await
+            {
+                Ok(Some(_)) => {
+                    self.metrics.record_dlq_moved(&job.kind, &job.queue, reason);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    error!(
+                        job_id = job.id,
+                        reason,
+                        error = %err,
+                        "Failed to move exhausted rescued job into DLQ"
+                    );
+                }
+            }
         }
     }
 
