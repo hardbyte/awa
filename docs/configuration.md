@@ -467,6 +467,8 @@ pool waits and database errors; a retry count does not prove recovery.
 
 Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against `max_attempts` like a failed one, so a job that hangs every time ends in `failed` or the DLQ ([Poison jobs](concepts/job-lifecycle.md#poison-jobs)).
 
+A handler that ignores cancellation and is still running two `deadline_rescue_interval`s (one minute by default) past its deadline is dropped at its next `.await`, which returns its worker slot so the rescued retry can run. Code that never yields, such as a blocking call or a CPU loop on the async runtime, cannot be dropped and keeps its slot until it returns. A Python coroutine stops being awaited but keeps running on its event loop until it finishes.
+
 | Knob | Default | What it does |
 | --- | --- | --- |
 | `QueueConfig.deadline_duration` (Rust) / `deadline_duration_ms` (Python dict form) | `5m` | Per-queue hard upper bound on one attempt. `Duration::ZERO` / `0` skips deadline rescue for that queue. |

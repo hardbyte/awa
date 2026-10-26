@@ -247,6 +247,10 @@ pub(crate) struct DispatchedJob {
     pub job: JobRow,
     pub queue_storage_claim: Option<ClaimedEntry>,
     pub queue_storage_unique_states: Option<String>,
+    /// How long the handler may run before the executor drops it, set past
+    /// the queue's deadline so maintenance has rescued the attempt by then.
+    /// `None` when the queue has no deadline.
+    pub abandon_after: Option<Duration>,
 }
 
 /// Manages job execution — spawns worker futures and tracks in-flight jobs.
@@ -327,6 +331,7 @@ impl JobExecutor {
         let job = dispatched.job;
         let queue_storage_claim = dispatched.queue_storage_claim;
         let queue_storage_unique_states = dispatched.queue_storage_unique_states;
+        let abandon_after = dispatched.abandon_after;
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let lifecycle_handlers = self.lifecycle_handlers.clone();
@@ -430,23 +435,40 @@ impl JobExecutor {
                             .await;
                         });
                     }
-                    match CatchUnwind(worker.perform(&ctx)).await {
-                        Ok(result) => result,
-                        Err(panic) => {
+                    let perform = CatchUnwind(worker.perform(&ctx));
+                    let outcome = match abandon_after {
+                        Some(limit) => tokio::time::timeout(limit, perform).await.ok(),
+                        None => Some(perform.await),
+                    };
+                    match outcome {
+                        Some(Ok(result)) => Some(result),
+                        Some(Err(panic)) => {
                             let message = panic_message(panic.as_ref());
                             error!(kind = %job.kind, job_id, panic = %message, "Job handler panicked");
-                            Err(JobError::retryable_msg(format!(
+                            Some(Err(JobError::retryable_msg(format!(
                                 "handler panicked: {message}"
-                            )))
+                            ))))
+                        }
+                        // The deadline rescue has taken this attempt; a
+                        // handler that ignored the cancel signal would
+                        // otherwise hold its worker slot forever and starve
+                        // the retry. Drop it and leave the outcome to rescue.
+                        None => {
+                            warn!(
+                                kind = %job.kind,
+                                job_id,
+                                "Abandoned a handler still running well past its deadline"
+                            );
+                            None
                         }
                     }
                 }
                 None => {
                     error!(kind = %job.kind, job_id, "No worker registered for job kind");
-                    Err(JobError::Terminal(format!(
+                    Some(Err(JobError::Terminal(format!(
                         "unknown job kind: {}",
                         job.kind
-                    )))
+                    ))))
                 }
             };
 
@@ -459,9 +481,12 @@ impl JobExecutor {
             };
 
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
-            let finalize_permit = tokio::select! {
-                permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
-                _ = finalize_cancel.cancelled() => None,
+            let finalize_permit = match result {
+                Some(_) => tokio::select! {
+                    permit = finalize_capacity.acquire_owned() => Some(permit.expect("finalizer capacity is never closed")),
+                    _ = finalize_cancel.cancelled() => None,
+                },
+                None => None,
             };
 
             in_flight.remove((job_id, job_run_lease));
@@ -470,7 +495,7 @@ impl JobExecutor {
             }
             metrics.record_in_flight_change(&job_queue, -1);
 
-            let Some(finalize_permit) = finalize_permit else {
+            let (Some(result), Some(finalize_permit)) = (result, finalize_permit) else {
                 return;
             };
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
@@ -3587,6 +3612,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            abandon_after: None,
         };
         executor
             .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
@@ -3664,6 +3690,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            abandon_after: None,
         };
         executor
             .execute_task(dispatched(first), Arc::new(AtomicBool::new(false)))
@@ -3758,6 +3785,7 @@ mod tests {
             job,
             queue_storage_claim: None,
             queue_storage_unique_states: None,
+            abandon_after: None,
         };
         let mut jobs = jobs.into_iter();
         for job in jobs.by_ref().take(4) {

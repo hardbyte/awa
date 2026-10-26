@@ -62,7 +62,7 @@ A crash ends every attempt running in that process, not just the poison one, so 
 
 - Raise a terminal error (`JobError::terminal`, `awa.TerminalError`) for input that can never succeed, so it skips the retries.
 - Enable the DLQ on queues whose failures someone should inspect and redrive.
-- Set `deadline_duration` close to the slowest legitimate attempt. It bounds how long a hung handler holds a worker before its attempt is counted.
+- Set `deadline_duration` close to the slowest legitimate attempt. It bounds how long a hung handler holds a worker before its attempt is counted; shortly after the deadline the worker drops a handler that is still waiting, so a hang cannot hold its slot forever. Code that blocks without yielding cannot be dropped, so give blocking calls their own timeouts.
 - Put kinds that call fragile native code or unbounded external work on their own queue and worker pool, so a crash only takes down work that shares the risk.
 
 ### When one turns up in production

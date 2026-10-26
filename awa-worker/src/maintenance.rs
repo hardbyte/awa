@@ -222,6 +222,9 @@ const CALLBACK_RESCUE_PER_ROW_SQL: &str = r#"
     SELECT * FROM moved
 "#;
 
+/// How often the leader scans for attempts past their deadline by default.
+pub(crate) const DEFAULT_DEADLINE_RESCUE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Per-queue or global retention policy for completed and failed/cancelled jobs.
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
@@ -780,7 +783,7 @@ impl MaintenanceService {
             enqueue_specs,
             lifecycle_handlers,
             heartbeat_rescue_interval: Duration::from_secs(30),
-            deadline_rescue_interval: Duration::from_secs(30),
+            deadline_rescue_interval: DEFAULT_DEADLINE_RESCUE_INTERVAL,
             callback_rescue_interval: Duration::from_secs(30),
             promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),

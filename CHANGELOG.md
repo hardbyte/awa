@@ -148,6 +148,12 @@ for each step.
   loses its worker therefore fails instead of running again. Rescue runs on the
   maintenance leader, so the new behaviour applies once the leader runs this
   release.
+- **A hung handler no longer holds its worker slot forever.** Rescue only
+  signalled cancellation, so a handler awaiting something that never resolved
+  kept its permit: the rescued retry could not be claimed, and a one-worker
+  queue stopped. A handler still running two `deadline_rescue_interval`s past
+  its deadline is now dropped at its next `.await`. Blocking code that never
+  yields still keeps its slot.
 - **A panicking Rust handler is a failed attempt.** A panic used to escape the
   job task: the job stayed registered in flight, kept heartbeating until its
   deadline rescued it (5 minutes by default), and its message was lost. The

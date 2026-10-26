@@ -64,9 +64,9 @@ fn builder(pool: &sqlx::PgPool, engine: Engine) -> awa::ClientBuilder {
         .runtime_snapshot_interval(Duration::from_millis(100))
 }
 
-fn queue_config(deadline: Duration) -> QueueConfig {
+fn queue_config(max_workers: u32, deadline: Duration) -> QueueConfig {
     QueueConfig {
-        max_workers: 8,
+        max_workers,
         poll_interval: Duration::from_millis(25),
         deadline_duration: deadline,
         ..Default::default()
@@ -150,7 +150,7 @@ async fn assert_panics_fail_fast(engine: Engine) {
     let pool = db.pool().clone();
     let queue = "poison_panic";
     let client = builder(&pool, engine)
-        .queue(queue, queue_config(Duration::from_secs(300)))
+        .queue(queue, queue_config(1, Duration::from_secs(300)))
         .dlq_enabled_by_default(true)
         .register::<PanicJob, _, _>(|args, _ctx| async move {
             if args.n >= 0 {
@@ -214,10 +214,12 @@ async fn canonical_handler_panic_fails_fast() {
 }
 
 /// A worker that never heartbeats and never finishes: every attempt is
-/// rescued as a dead worker.
+/// rescued as a dead worker. The hung handlers stay alive here, where a dead
+/// process would have released their worker slots by dying, so the queue gets
+/// a slot per attempt.
 fn crash_looping_client(pool: &sqlx::PgPool, engine: Engine, queue: &str, dlq: bool) -> Client {
     builder(pool, engine)
-        .queue(queue, queue_config(Duration::from_secs(300)))
+        .queue(queue, queue_config(4, Duration::from_secs(300)))
         .dlq_enabled_by_default(dlq)
         .register::<HangJob, _, _>(|_args, _ctx| async move {
             std::future::pending::<()>().await;
@@ -291,11 +293,12 @@ async fn canonical_crash_loop_stops_at_max_attempts() {
     client.shutdown(Duration::from_millis(200)).await;
 }
 
-/// A handler that keeps heartbeating but never finishes: every attempt is
-/// rescued at its deadline.
+/// A handler that keeps heartbeating but never finishes and ignores
+/// cancellation: every attempt is rescued at its deadline. One worker slot, so
+/// the retry only runs if the executor gives up the hung attempt's slot.
 fn hanging_client(pool: &sqlx::PgPool, engine: Engine, queue: &str) -> Client {
     builder(pool, engine)
-        .queue(queue, queue_config(Duration::from_secs(1)))
+        .queue(queue, queue_config(1, Duration::from_secs(1)))
         .dlq_enabled_by_default(true)
         .register::<HangJob, _, _>(|_args, _ctx| async move {
             std::future::pending::<()>().await;
