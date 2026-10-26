@@ -685,6 +685,8 @@
       
         
       
+        
+      
     
     
     
@@ -782,6 +784,34 @@
     
   
     Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
   
 
     
@@ -2284,7 +2314,7 @@
 <h1 id="dead-letter-queue">Dead Letter Queue<a class="headerlink" href="#dead-letter-queue" title="Permanent link">&para;</a></h1>
 <p>The Dead Letter Queue (DLQ) holds jobs that have exhausted all of their retry attempts. It is the recovery surface for terminal failures: an operator can inspect what failed, decide whether the underlying problem has been fixed, and either retry or purge.</p>
 <h2 id="when-a-job-lands-in-the-dlq">When a job lands in the DLQ<a class="headerlink" href="#when-a-job-lands-in-the-dlq" title="Permanent link">&para;</a></h2>
-<p>Per-queue policy controls DLQ behaviour. When <code>dlq_enabled = true</code> on a queue, a job that reaches its <code>max_attempts</code> ceiling without succeeding is moved into <code>dlq_entries</code> rather than left as a <code>failed</code> terminal row. The job's final error history, args, payload, and lifecycle metadata travel with it; the DLQ row is a faithful snapshot of the job at the moment it gave up.</p>
+<p>Per-queue policy controls DLQ behaviour. When <code>dlq_enabled = true</code> on a queue, a job that reaches its <code>max_attempts</code> ceiling without succeeding is moved into <code>dlq_entries</code> rather than left as a <code>failed</code> terminal row. Attempts that end in a crash, a missed deadline or a callback timeout count toward that ceiling too; see <a href="../concepts/job-lifecycle/#poison-jobs">Poison jobs</a>. The job's final error history, args, payload, and lifecycle metadata travel with it; the DLQ row is a faithful snapshot of the job at the moment it gave up.</p>
 <p>A queue with <code>dlq_enabled = false</code> (the default before 0.6) leaves terminal failures as <code>failed</code> rows in the canonical / queue-storage tables. They can still be inspected and re-queued manually, but they do not flow through the DLQ-specific commands and dashboards.</p>
 <p>The DLQ is <strong>not</strong> a job state — it is a separate physical surface (<code>awa.dlq_entries</code> in the queue-storage schema). A job in the DLQ does not sit on the dispatchable path and cannot be claimed by a worker until it is retried out of the DLQ. See <a href="../adr/020-dead-letter-queue/">ADR-020</a> for the design rationale.</p>
 <h2 id="inspecting">Inspecting<a class="headerlink" href="#inspecting" title="Permanent link">&para;</a></h2>
@@ -2300,7 +2330,15 @@
 <p>The web UI's <strong>DLQ</strong> tab (the one served by <code>awa serve</code>) shows the same data with filters and per-row drill-down.</p>
 <p>Each DLQ row carries:</p>
 <ul>
-<li><code>dlq_reason</code> — short string identifying why the job was dead-lettered (e.g., <code>max_attempts</code>, <code>manual</code>, <code>deadline_expired</code>).</li>
+<li><code>dlq_reason</code> — why the job was dead-lettered:<ul>
+<li><code>max_attempts_exhausted</code>: the handler failed (an error or a panic) on its last attempt.</li>
+<li><code>terminal_error</code>: the handler raised a terminal error, the arguments did not deserialize, or no worker handles the kind.</li>
+<li><code>heartbeat_stale</code>: the worker stopped heartbeating during the last attempt.</li>
+<li><code>deadline_exceeded</code>: the last attempt outlived the queue's <code>deadline_duration</code>.</li>
+<li><code>callback_timeout</code>: the last attempt's callback wait timed out.</li>
+<li>Anything else is the reason an operator passed to <code>awa dlq move</code>.</li>
+</ul>
+</li>
 <li><code>dlq_at</code> — when the job entered the DLQ.</li>
 <li><code>original_run_lease</code> — the run-lease the job held at the moment it failed.</li>
 <li>The full error history from the <code>payload.errors[]</code> array.</li>

@@ -685,6 +685,8 @@
       
         
       
+        
+      
     
     
     
@@ -782,6 +784,34 @@
     
   
     Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
   
 
     
@@ -2051,6 +2081,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#maintaining-the-interactive-failure-lab" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Maintaining the interactive failure lab
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -2165,6 +2206,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#maintaining-the-interactive-failure-lab" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Maintaining the interactive failure lab
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -2273,6 +2325,22 @@
 <p>When a schema change affects users or operators, update the relevant upgrade guide and <a href="../stability/">stability policy</a>. Detailed migration implementation checklists belong beside the migration code and review process rather than in the public product guide — they live in <a href="https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations"><code>AGENTS.md</code></a>.</p>
 <h2 id="authoring-schema-migrations">Authoring schema migrations<a class="headerlink" href="#authoring-schema-migrations" title="Permanent link">&para;</a></h2>
 <p>Schema changes must follow <a href="../adr/041-rolling-upgrade-policy/">ADR-041's expand, capability-gated flip, and later contract policy</a>. The implementation checklist lives in <a href="https://github.com/hardbyte/awa/blob/main/AGENTS.md#schema-migrations"><code>AGENTS.md</code></a> alongside the migration tests that enforce it; upgrade guides document any action required from operators.</p>
+<h2 id="maintaining-the-interactive-failure-lab">Maintaining the interactive failure lab<a class="headerlink" href="#maintaining-the-interactive-failure-lab" title="Permanent link">&para;</a></h2>
+<p>The <a href="../concepts/failure-lab/">failure lab</a> launches the canonical interactive model hosted by
+<a href="https://github.com/hardbyte/postgresql-job-queue-benchmarking"><code>hardbyte/postgresql-job-queue-benchmarking</code></a>.
+Its source is <code>simulations/awa-failure-windows/index.html</code> there, and the
+comparison-site build copies it to <code>lab/awa.html</code>. Change and test the model
+in that repository; do not add a second JavaScript/model copy to these docs.</p>
+<p>When Awa's enqueue, attempt ownership, recovery or claim-durability behavior
+changes, review the lab's source links and assumptions against the new behavior.
+Update the lab's displayed revision with its model, rather than changing the
+version label alone. Its model and browser checks live beside the canonical
+source. The docs page uses an absolute HTTPS URL so project-site and preview
+base paths do not change the lesson target. After a hosting-path change, verify
+the launch, worker actions and return flow on phones, plus the optional
+wider-screen embed. The embed is sandboxed without <code>allow-same-origin</code>, because
+the lab and these docs share the <code>hardbyte.github.io</code> origin; keep the lab free
+of storage and parent-page access so it works inside that sandbox.</p>
 
 
 

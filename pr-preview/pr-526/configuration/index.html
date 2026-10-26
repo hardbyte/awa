@@ -685,6 +685,8 @@
       
         
       
+        
+      
     
     
     
@@ -782,6 +784,34 @@
     
   
     Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
   
 
     
@@ -3673,7 +3703,7 @@
 <h2 id="reliability-timings-heartbeat-deadline-rescue">Reliability timings: heartbeat, deadline, rescue<a class="headerlink" href="#reliability-timings-heartbeat-deadline-rescue" title="Permanent link">&para;</a></h2>
 <p>These knobs control <strong>how fast a stuck or crashed handler is noticed and rescued</strong>. They live on <code>ClientBuilder</code> (Rust) and <code>client.start()</code> kwargs (Python). All of them have <code>_ms</code>-suffixed kwargs on the Python side (e.g. <code>heartbeat_interval_ms=15000</code>).</p>
 <h3 id="heartbeat-detecting-crashed-workers">Heartbeat — detecting crashed workers<a class="headerlink" href="#heartbeat-detecting-crashed-workers" title="Permanent link">&para;</a></h3>
-<p>A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:</p>
+<p>A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job. The rescued attempt counts against <code>max_attempts</code>: the job is re-enqueued while attempts remain, and otherwise fails or moves to the DLQ (<a href="../concepts/job-lifecycle/#poison-jobs">Poison jobs</a>). Three knobs participate:</p>
 <table>
 <thead>
 <tr>
@@ -3703,9 +3733,8 @@
 <p>Pick them in this order:</p>
 <ol>
 <li><strong>Decide your detection target.</strong> "Crashes should be noticed within X seconds." That target is roughly <code>heartbeat_staleness + heartbeat_rescue_interval</code> in the worst case.</li>
-<li><strong>Set <code>heartbeat_staleness</code> to at least <code>3× heartbeat_interval</code>.</strong> The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it. With <code>defer_first_heartbeat</code> enabled (off by default) and 3× or more, a new attempt's first heartbeat is deferred by up to half an interval from its claim (step 4). The deferral is at most <code>staleness - 2 × interval - slowest recent pass</code>, so it shrinks when heartbeat passes are slow and, at the 3× floor, switches off when they take an interval. It also shortens how long a fresh attempt survives a stalled first heartbeat pass, from about <code>staleness - interval</code> to <code>staleness - interval - deferral</code> (60 s to 45 s at 30 s / 90 s), less whatever earlier passes consume. Leave it off, or use 4×, if your handlers, connection pool or database see pauses that long.</li>
+<li><strong>Set <code>heartbeat_staleness</code> to at least <code>3× heartbeat_interval</code>.</strong> The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it.</li>
 <li><strong><code>heartbeat_rescue_interval</code></strong> can match <code>heartbeat_interval</code> for low-latency rescue, or be higher to reduce maintenance load on big fleets.</li>
-<li><strong>Use the same three values on every runtime that shares a queue-storage schema.</strong> Rescue runs on whichever runtime holds the maintenance election and applies that runtime's <code>heartbeat_staleness</code>. Each runtime decides when to send heartbeats from its own settings: with <code>defer_first_heartbeat</code> enabled and its <code>heartbeat_staleness</code> at least <code>3× heartbeat_interval</code>, it skips an attempt's first heartbeat until the attempt's claim is up to half an interval old, because the claim time counts as the first heartbeat. A runtime whose interval is long relative to the leader's staleness can see its live attempts rescued.</li>
 </ol>
 <p>For a 5-second crash detection target: <code>heartbeat_interval=1s</code>, <code>heartbeat_staleness=4s</code>, <code>heartbeat_rescue_interval=1s</code>. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.</p>
 <p>A finished handler retains its result and retries durable finalization for up to 120 s
@@ -3719,7 +3748,8 @@ the next rescue sweep or an attempt deadline may claim a newer lease first.
 Keep handlers idempotent. Monitor <code>awa.completion.reconnect_retry</code> alongside
 pool waits and database errors; a retry count does not prove recovery.</p>
 <h3 id="deadline-bounding-a-single-attempt">Deadline — bounding a single attempt<a class="headerlink" href="#deadline-bounding-a-single-attempt" title="Permanent link">&para;</a></h3>
-<p>Each queue has a <code>deadline_duration</code> (default <code>5m</code> on <code>QueueConfig</code>). At claim time the runtime stamps <code>now() + deadline_duration</code> onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.</p>
+<p>Each queue has a <code>deadline_duration</code> (default <code>5m</code> on <code>QueueConfig</code>). At claim time the runtime stamps <code>now() + deadline_duration</code> onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against <code>max_attempts</code> like a failed one, so a job that hangs every time ends in <code>failed</code> or the DLQ (<a href="../concepts/job-lifecycle/#poison-jobs">Poison jobs</a>).</p>
+<p>A handler that ignores cancellation and is still running two <code>deadline_rescue_interval</code>s (one minute by default) past its deadline is dropped at its next <code>.await</code>, which returns its worker slot so the rescued retry can run. Code that never yields, such as a blocking call or a CPU loop on the async runtime, cannot be dropped and keeps its slot until it returns. A Python coroutine stops being awaited but keeps running on its event loop until it finishes.</p>
 <table>
 <thead>
 <tr>

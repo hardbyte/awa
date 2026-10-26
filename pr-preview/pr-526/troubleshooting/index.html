@@ -685,6 +685,8 @@
       
         
       
+        
+      
     
     
     
@@ -782,6 +784,34 @@
     
   
     Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
   
 
     
@@ -3040,7 +3070,6 @@
 <p>Interpretation:</p>
 <ul>
 <li>low <code>heartbeat_age_s</code>: the worker is still alive</li>
-<li>with <code>defer_first_heartbeat</code> enabled, an attempt that started less than about 1.5 <code>heartbeat_interval</code>s ago may still show its claim time as <code>heartbeat_at</code>, because its first heartbeat is deferred; an age up to 1.5 intervals is normal for a fresh attempt (less when heartbeat passes have been slow, since the deferral shrinks then)</li>
 <li><code>heartbeat_age_s</code> well above <code>heartbeat_staleness</code> (default <code>90s</code>): stale-heartbeat rescue should pick it up on the next scan</li>
 <li>very negative <code>deadline_remaining_s</code>: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)</li>
 </ul>
@@ -3299,9 +3328,12 @@ engine wedges identically but logs <code>error: unique conflict</code> instead):
 <ul>
 <li><code>terminal_error</code></li>
 <li><code>max_attempts_exhausted</code></li>
+<li><code>heartbeat_stale</code></li>
+<li><code>deadline_exceeded</code></li>
 <li><code>callback_timeout</code></li>
 <li>an operator-supplied reason from <code>awa dlq move</code></li>
 </ul>
+<p>A burst of <code>heartbeat_stale</code> or <code>deadline_exceeded</code> from one kind usually means a poison job: one that crashes or hangs its worker on every attempt. See <a href="../concepts/job-lifecycle/#poison-jobs">Poison jobs</a>.</p>
 <p>Useful actions:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>retry<span class="w"> </span>&lt;job-id&gt;
 </span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>awa<span class="w"> </span>--database-url<span class="w"> </span><span class="s2">"</span><span class="nv">$DATABASE_URL</span><span class="s2">"</span><span class="w"> </span>dlq<span class="w"> </span>retry-bulk<span class="w"> </span>--queue<span class="w"> </span>email

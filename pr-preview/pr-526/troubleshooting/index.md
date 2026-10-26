@@ -84,7 +84,6 @@ ORDER BY heartbeat_at ASC;
 Interpretation:
 
 - low `heartbeat_age_s`: the worker is still alive
-- with `defer_first_heartbeat` enabled, an attempt that started less than about 1.5 `heartbeat_interval`s ago may still show its claim time as `heartbeat_at`, because its first heartbeat is deferred; an age up to 1.5 intervals is normal for a fresh attempt (less when heartbeat passes have been slow, since the deferral shrinks then)
 - `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
 - very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
 
@@ -400,8 +399,12 @@ awa --database-url "$DATABASE_URL" dlq list --queue email
 
 - `terminal_error`
 - `max_attempts_exhausted`
+- `heartbeat_stale`
+- `deadline_exceeded`
 - `callback_timeout`
 - an operator-supplied reason from `awa dlq move`
+
+A burst of `heartbeat_stale` or `deadline_exceeded` from one kind usually means a poison job: one that crashes or hangs its worker on every attempt. See [Poison jobs](../concepts/job-lifecycle/index.md#poison-jobs).
 
 Useful actions:
 

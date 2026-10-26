@@ -438,7 +438,7 @@ These knobs control **how fast a stuck or crashed handler is noticed and rescued
 
 ### Heartbeat — detecting crashed workers
 
-A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job (re-enqueues it for another attempt). Three knobs participate:
+A running job updates a heartbeat row periodically while its handler is alive. If the heartbeat goes stale, the maintenance leader rescues the job. The rescued attempt counts against `max_attempts`: the job is re-enqueued while attempts remain, and otherwise fails or moves to the DLQ ([Poison jobs](../concepts/job-lifecycle/index.md#poison-jobs)). Three knobs participate:
 
 | Knob | Default | What it does |
 | --- | --- | --- |
@@ -449,9 +449,8 @@ A running job updates a heartbeat row periodically while its handler is alive. I
 Pick them in this order:
 
 1. **Decide your detection target.** "Crashes should be noticed within X seconds." That target is roughly `heartbeat_staleness + heartbeat_rescue_interval` in the worst case.
-2. **Set `heartbeat_staleness` to at least `3× heartbeat_interval`.** The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it. With `defer_first_heartbeat` enabled (off by default) and 3× or more, a new attempt's first heartbeat is deferred by up to half an interval from its claim (step 4). The deferral is at most `staleness - 2 × interval - slowest recent pass`, so it shrinks when heartbeat passes are slow and, at the 3× floor, switches off when they take an interval. It also shortens how long a fresh attempt survives a stalled first heartbeat pass, from about `staleness - interval` to `staleness - interval - deferral` (60 s to 45 s at 30 s / 90 s), less whatever earlier passes consume. Leave it off, or use 4×, if your handlers, connection pool or database see pauses that long.
+2. **Set `heartbeat_staleness` to at least `3× heartbeat_interval`.** The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue scan's own jitter; tighter ratios produce false rescues. The builder logs a warning if you violate it.
 3. **`heartbeat_rescue_interval`** can match `heartbeat_interval` for low-latency rescue, or be higher to reduce maintenance load on big fleets.
-4. **Use the same three values on every runtime that shares a queue-storage schema.** Rescue runs on whichever runtime holds the maintenance election and applies that runtime's `heartbeat_staleness`. Each runtime decides when to send heartbeats from its own settings: with `defer_first_heartbeat` enabled and its `heartbeat_staleness` at least `3× heartbeat_interval`, it skips an attempt's first heartbeat until the attempt's claim is up to half an interval old, because the claim time counts as the first heartbeat. A runtime whose interval is long relative to the leader's staleness can see its live attempts rescued.
 
 For a 5-second crash detection target: `heartbeat_interval=1s`, `heartbeat_staleness=4s`, `heartbeat_rescue_interval=1s`. For a 1-minute target with the cheapest possible maintenance: keep all the defaults.
 
@@ -468,7 +467,9 @@ pool waits and database errors; a retry count does not prove recovery.
 
 ### Deadline — bounding a single attempt
 
-Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh.
+Each queue has a `deadline_duration` (default `5m` on `QueueConfig`). At claim time the runtime stamps `now() + deadline_duration` onto the claim, and a maintenance scan force-closes attempts that pass it without completing. This bounds a single attempt's wall-clock time independently of heartbeats — if a handler is hanging, looping forever, or wedged in a sync wait, the deadline rescues it even if its heartbeat is fresh. A rescued attempt counts against `max_attempts` like a failed one, so a job that hangs every time ends in `failed` or the DLQ ([Poison jobs](../concepts/job-lifecycle/index.md#poison-jobs)).
+
+A handler that ignores cancellation and is still running two `deadline_rescue_interval`s (one minute by default) past its deadline is dropped at its next `.await`, which returns its worker slot so the rescued retry can run. Code that never yields, such as a blocking call or a CPU loop on the async runtime, cannot be dropped and keeps its slot until it returns. A Python coroutine stops being awaited but keeps running on its event loop until it finishes.
 
 | Knob | Default | What it does |
 | --- | --- | --- |
