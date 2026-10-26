@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v050. Run `awa migrate` as the migrator
+This release adds migrations v044 to v051. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 
@@ -75,6 +75,17 @@ for each step.
   seconds.
 
 ### Changed
+
+- Heartbeats no longer scan or lock every open claim batch. Each tick looks up
+  only the attempts the worker is running, so its cost follows in-flight work
+  rather than open claims, and failures, retries and slow completions no
+  longer wait for a heartbeat tick to release their claim batch.
+- v051 moves the claim query into one function per queue-ring slot, so
+  PostgreSQL keeps a cached plan across ring rotations instead of re-planning
+  most claims. Like other installer-replay migrations it holds table locks
+  until commit: apply it in a quiet window with a bounded `lock_timeout` (see
+  the 0.6 to 0.7 upgrade guide). Binaries before v051 run unchanged on the
+  migrated schema.
 
 - **Claims commit asynchronously.** Claims and claim-cursor advances run with
   `synchronous_commit = off`, so a lane's claim head is no longer held across
