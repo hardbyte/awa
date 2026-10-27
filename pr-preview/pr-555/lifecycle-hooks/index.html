@@ -2540,7 +2540,7 @@
 </tr>
 </tbody>
 </table>
-<p>The trigger transition and the follow-up <code>INSERT</code> either both commit or neither does — exactly-once <em>enqueue</em> per committed worker outcome or callback resolution. The follow-up itself, once enqueued, is delivered with Awa's usual at-least-once semantics, so the follow-up handler still needs to be safe under re-execution.</p>
+<p>The trigger transition and the follow-up <code>INSERT</code> either both commit or neither does — exactly-once <em>enqueue</em> per committed worker outcome or callback resolution. The one exception is a follow-up with unique options whose key already exists: that insert is skipped and the transition commits on its own (see <a href="#deduplicating-follow-ups">Deduplicating follow-ups</a>). The follow-up itself, once enqueued, is delivered with Awa's usual at-least-once semantics, so the follow-up handler still needs to be safe under re-execution.</p>
 <p>Rescue stays best-effort by design: making it atomic would couple rescue liveness to the correctness of user follow-up code (a panic in <code>on_rescued_enqueue</code> would roll back a stale-heartbeat rescue and leave the job stuck in <code>running</code>). Zero-loss rescue notifications belong in an outbox/sweeper, not inlined into the rescue tx.</p>
 <h3 id="when-to-choose-which-api">When to choose which API<a class="headerlink" href="#when-to-choose-which-api" title="Permanent link">&para;</a></h3>
 <ul>
