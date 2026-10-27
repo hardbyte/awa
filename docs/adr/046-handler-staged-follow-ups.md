@@ -85,7 +85,7 @@ client_builder.register::<StageA, _, _>(|args, ctx| {
 
 `register` closures return a `'static` future that cannot borrow the context, which is why the handle exists. A `Worker` impl can call `ctx.enqueue_on_completion` directly.
 
-Staging serializes the args, computes the unique key and checks the limits immediately, so nothing type-dependent happens inside the completion transaction. Every staging failure is deterministic for the given request, so `StageError` converts to `JobError::Terminal` by default; a handler whose fan-out size varies between attempts can map it to a retryable error instead.
+Staging serializes the args, computes the unique key, checks the limits and validates every rule the insert would otherwise enforce in the database (priority 1–4, `max_attempts` 1–1000, kind and queue names of at most 200 characters, at most 20 tags, no NUL bytes), so nothing type-dependent or predictably rejected reaches the completion transaction. Every staging failure is deterministic for the given request, so `StageError` converts to `JobError::Terminal` by default; a handler whose fan-out size varies between attempts can map it to a retryable error instead.
 
 A failed stage **poisons the attempt**. If any `enqueue_on_completion` call failed and the handler still returns `Completed`, the runtime fails the attempt terminally with the staging error, so the job goes to the DLQ when one is enabled and registered `on_exhausted_enqueue` specs fire. A swallowed error (`let _ = ...`, or `except Exception` in Python) therefore cannot let A complete without the follow-up it asked for.
 
@@ -99,7 +99,7 @@ async def handle(job):
     job.enqueue_on_completion(StageB(item_id=item_id), unique_opts={})
 ```
 
-The keyword arguments mirror `Transaction.insert`: `kind`, `queue`, `priority`, `max_attempts`, `tags`, `metadata`, `run_at`, `unique_opts` and `ordering_key`. `unique_opts={}` means the default options; `states` is an integer bitmask, as for `Transaction.insert`. A request that cannot be staged raises `awa.StagingError`, a subclass of `awa.TerminalError`, and poisons the attempt as in Rust.
+The keyword arguments mirror `Transaction.insert`: `kind`, `queue`, `priority`, `max_attempts`, `tags`, `metadata`, `run_at`, `unique_opts` and `ordering_key`. `unique_opts={}` means the default options; `states` is an integer bitmask, as for `Transaction.insert`. A request that cannot be staged, including args or options that do not convert, raises `awa.StagingError`, a subclass of `awa.TerminalError` chained from the original error, and poisons the attempt as in Rust.
 
 Args are converted to JSON when staged, while the handler holds the GIL, so the completion transaction is pure Rust and never calls back into Python. This is Python's first follow-up primitive: registered specs remain Rust-only (ADR-029, open extensions). Return values do not carry follow-ups, because Python already maps any unrecognised return value to `Completed`.
 
@@ -132,7 +132,7 @@ The guarantee covers the **handler's own `Completed` finalization**. Every other
 
 ### Limits
 
-Per attempt, at most **16 staged follow-ups** and **64 KiB of serialized requests** (args, metadata and tags) in total, across any number of `wait_for_callback` resumes. Both are constants in v1.
+Per attempt, at most **16 staged follow-ups** and **64 KiB of serialized requests** (kind, queue, args, metadata, tags and ordering key) in total, across any number of `wait_for_callback` resumes. Both are constants in v1.
 
 - **Count.** Each unique insert holds a released savepoint until the completion commits, and on canonical the unique-claim trigger's exception block adds a second subtransaction. A backend caches 64 subtransactions before overflowing into `pg_subtrans`, so 16 unique follow-ups use at most 32 and leave room for registered specs.
 - **Size.** Staged follow-ups stay in memory from staging until finalization, both in running handlers and in completions waiting for or holding a finalizer slot. Finalizer capacity is `max(batch_size × shards × 2, worker capacity)`: 1,024 or 4,096 with queue-storage defaults, 8,192 on canonical. The worst case is 64 KiB × (finalizer capacity + worker capacity), about 512 MiB on canonical, reached only if every such job is at the limit.
@@ -141,7 +141,7 @@ Larger fan-out belongs in a dedicated fan-out job or a bulk insert, not in one c
 
 ### Visibility and testing
 
-Staged follow-ups appear only as the inserted jobs: not in `UntypedJobEvent::Completed`, lifecycle hooks, spans or A's row. The value A computed is visible in B's args. Args are never logged.
+Staged follow-ups appear only as the inserted jobs: not in `UntypedJobEvent::Completed`, lifecycle hooks or A's row. Each insert opens the usual producer span inside the completion transaction, but B's trace context is captured when it is staged, so B joins the trace of A's handler. The value A computed is visible in B's args. Args are never logged.
 
 The test harnesses behave like the runtime. `awa-testing`'s `work_one` and Python's `AwaTestClient.work_one` insert staged follow-ups in the same transaction as their own completion, apply poisoning, and discard them on every other outcome. The `awa.testing.HandlerJob` stand-in gains `enqueue_on_completion`, which applies the same validation and limits and records each request in `job.staged`, for unit tests that never touch a database.
 
@@ -159,7 +159,7 @@ Not guaranteed:
 - **Handler side effects.** If an attempt creates an external resource and its completion does not commit, the resource is orphaned and the next attempt may create another. Awa guarantees only that no follow-up refers to it.
 - **Exactly-once handler execution.** A may run several times; only the committing attempt's follow-ups survive.
 - **Freedom from deadlock.** A completion that inserts several follow-ups holds each insert's locks until it commits: on queue storage the enqueue-lane lock, on both engines the unique claim. Two completions that take these in opposite orders can deadlock: two unique keys staged in opposite orders, or two lanes (different queues, or one queue with `enqueue_shards > 1`). Postgres aborts one transaction and `finalize_with_retry` retries it, up to three times, after which the job waits for stale-heartbeat rescue. A completion that inserts a single follow-up takes its unique claim before its lane lock, the order `AwaUniqueClaimLockOrder` checks, and cannot deadlock this way. Registered specs that insert several follow-ups share the same exposure today.
-- **Prompt failure on a non-retryable insert error.** Such an error rolls the completion back. Today `finalize_with_retry` returns it, the executor logs it, and the job stays `running` until stale-heartbeat rescue re-runs it, as it does for registered specs. Staging moves serialization and validation into the handler, so the remaining causes are rare database errors.
+- **Prompt failure on a non-retryable insert error.** Such an error rolls the completion back. Today `finalize_with_retry` returns it, the executor logs it, and the job stays `running` until stale-heartbeat rescue re-runs it, as it does for registered specs. Staging moves serialization and every validation the schema enforces into the handler, so the remaining causes are database errors that cannot be predicted when staging, such as a lost connection mid-insert or a trigger added outside Awa.
 
 Two consequences of deduplication need care:
 
