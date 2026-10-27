@@ -158,9 +158,9 @@ async fn test_rate_limit_throttles_dispatch() {
         .build()
         .unwrap();
 
+    let start = Instant::now();
     client.start().await.unwrap();
 
-    let start = Instant::now();
     loop {
         if completed.load(Ordering::SeqCst) >= 30 {
             break;
@@ -223,9 +223,9 @@ async fn test_rate_limit_burst_then_throttle() {
         .build()
         .unwrap();
 
+    let start = Instant::now();
     client.start().await.unwrap();
 
-    let start = Instant::now();
     loop {
         if completed.load(Ordering::SeqCst) >= 30 {
             break;
