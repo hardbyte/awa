@@ -4,7 +4,7 @@ use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::reschedule::{Reschedule, RescheduleOutcome};
-use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
+use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState, PreparedJobInsert};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
@@ -487,6 +487,16 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
+            // ADR-046: the handler has returned, so staging closes here.
+            let (result, staged_follow_ups) = settle_staged_follow_ups(
+                result,
+                ctx.follow_ups().seal(),
+                &job_kind,
+                job_id,
+                &job_queue,
+                &metrics,
+            );
+
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
             let finalize_permit = match result {
                 Some(_) => tokio::select! {
@@ -517,6 +527,7 @@ impl JobExecutor {
                                 queue_storage_claim.as_ref(),
                                 queue_storage_unique_states.as_deref(),
                                 &result,
+                                &staged_follow_ups,
                                 &completion_batcher,
                                 completion_path,
                                 progress_snapshot.clone(),
@@ -816,6 +827,7 @@ async fn complete_job(
     queue_storage_claim: Option<&ClaimedEntry>,
     queue_storage_unique_states: Option<&str>,
     result: &Result<JobResult, JobError>,
+    staged_follow_ups: &[PreparedJobInsert],
     completion_batcher: &CompletionBatcherHandle,
     completion_path: CompletionPath,
     progress_snapshot: Option<serde_json::Value>,
@@ -837,6 +849,7 @@ async fn complete_job(
                 pool,
                 job,
                 result,
+                staged_follow_ups,
                 completion_batcher,
                 completion_path,
                 progress_snapshot,
@@ -856,6 +869,7 @@ async fn complete_job(
                 queue_storage_claim,
                 queue_storage_unique_states,
                 result,
+                staged_follow_ups,
                 completion_batcher,
                 completion_path,
                 progress_snapshot,
@@ -867,6 +881,61 @@ async fn complete_job(
             )
             .await
         }
+    }
+}
+
+/// The registered `Completed` follow-up specs for `kind`, empty if none.
+fn completed_specs(
+    enqueue_specs: &EnqueueSpecsByOutcome,
+    kind: &str,
+) -> Vec<crate::enqueue_specs::BoxedEnqueueSpec> {
+    enqueue_specs
+        .get(&crate::enqueue_specs::Outcome::Completed)
+        .and_then(|by_kind| by_kind.get(kind))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Decide what a finished handler's staged follow-ups (ADR-046) become.
+///
+/// They ride only on `Completed`; every other outcome discards them. A
+/// `Completed` attempt that failed to stage fails terminally instead, so it
+/// cannot commit without the follow-up it asked for. `WaitForCallback`
+/// discards them too, but loudly: the job parks without completing and the
+/// context is gone by the time the callback resolves.
+fn settle_staged_follow_ups(
+    result: Option<Result<JobResult, JobError>>,
+    sealed: crate::follow_ups::SealedFollowUps,
+    kind: &str,
+    job_id: i64,
+    queue: &str,
+    metrics: &crate::metrics::AwaMetrics,
+) -> (Option<Result<JobResult, JobError>>, Vec<PreparedJobInsert>) {
+    match result {
+        Some(Ok(JobResult::Completed)) => match sealed.poisoned {
+            Some(err) => {
+                warn!(kind, job_id, error = %err, "Handler returned Completed after a follow-up failed to stage; failing the attempt");
+                (
+                    Some(Err(JobError::Terminal(format!(
+                        "a follow-up failed to stage: {err}"
+                    )))),
+                    Vec::new(),
+                )
+            }
+            None => (Some(Ok(JobResult::Completed)), sealed.rows),
+        },
+        Some(Ok(JobResult::WaitForCallback(guard))) if !sealed.rows.is_empty() => {
+            let discarded = sealed.rows.len();
+            warn!(
+                kind,
+                job_id,
+                discarded,
+                "Handler staged follow-ups and then returned WaitForCallback; discarding them"
+            );
+            metrics.record_staged_follow_ups_discarded(kind, queue, discarded as u64);
+            (Some(Ok(JobResult::WaitForCallback(guard))), Vec::new())
+        }
+        other => (other, Vec::new()),
     }
 }
 
@@ -1083,6 +1152,7 @@ async fn complete_job_canonical(
     pool: &PgPool,
     job: &JobRow,
     result: &Result<JobResult, JobError>,
+    staged_follow_ups: &[PreparedJobInsert],
     completion_batcher: &CompletionBatcherHandle,
     completion_path: CompletionPath,
     progress_snapshot: Option<serde_json::Value>,
@@ -1099,16 +1169,15 @@ async fn complete_job_canonical(
 ) -> Result<CompletionOutcome, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
-            // ADR-029: when this kind has follow-up specs registered, drive
-            // completion through a dedicated transaction so the UPDATE and
-            // the follow-up INSERTs commit atomically. The batched path
-            // can't carry per-job follow-ups, so we bypass it here.
-            let kind_specs = enqueue_specs
-                .get(&crate::enqueue_specs::Outcome::Completed)
-                .and_then(|by_kind| by_kind.get(&job.kind))
-                .cloned();
-            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
-                let outcome = complete_canonical_with_followups(pool, job, &specs).await?;
+            // ADR-029/046: when this kind has follow-up specs registered or
+            // the handler staged follow-ups, drive completion through a
+            // dedicated transaction so the UPDATE and the follow-up INSERTs
+            // commit atomically. The batched path can't carry per-job
+            // follow-ups, so we bypass it here.
+            let specs = completed_specs(enqueue_specs, &job.kind);
+            if !specs.is_empty() || !staged_follow_ups.is_empty() {
+                let outcome =
+                    complete_canonical_with_followups(pool, job, &specs, staged_follow_ups).await?;
                 return match outcome {
                     None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
@@ -1717,6 +1786,7 @@ async fn complete_job_queue_storage(
     queue_storage_claim: Option<&ClaimedEntry>,
     queue_storage_unique_states: Option<&str>,
     result: &Result<JobResult, JobError>,
+    staged_follow_ups: &[PreparedJobInsert],
     completion_batcher: &CompletionBatcherHandle,
     completion_path: CompletionPath,
     progress_snapshot: Option<serde_json::Value>,
@@ -1738,13 +1808,10 @@ async fn complete_job_queue_storage(
             // receipt-plane / lease cleanup + done_entries append +
             // follow-up `INSERT`s commit atomically. The receipt-plane
             // fast-complete (ADR-023) can't carry per-job follow-ups, so we
-            // bypass it for spec'd jobs and use the slow path's tx-aware
-            // variant.
-            let kind_specs = enqueue_specs
-                .get(&crate::enqueue_specs::Outcome::Completed)
-                .and_then(|by_kind| by_kind.get(&job.kind))
-                .cloned();
-            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+            // bypass it for spec'd jobs, and for jobs whose handler staged
+            // follow-ups (ADR-046), and use the slow path's tx-aware variant.
+            let specs = completed_specs(enqueue_specs, &job.kind);
+            if !specs.is_empty() || !staged_follow_ups.is_empty() {
                 let outcome = complete_queue_storage_with_followups(
                     runtime,
                     pool,
@@ -1752,6 +1819,7 @@ async fn complete_job_queue_storage(
                     queue_storage_claim,
                     queue_storage_unique_states,
                     &specs,
+                    staged_follow_ups,
                 )
                 .await?;
                 return match outcome {
@@ -2328,6 +2396,7 @@ async fn complete_queue_storage_with_followups(
     queue_storage_claim: Option<&ClaimedEntry>,
     queue_storage_unique_states: Option<&str>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+    staged_follow_ups: &[PreparedJobInsert],
 ) -> Result<Option<JobRow>, AwaError> {
     let Some(claim) = queue_storage_claim else {
         // The slow path is keyed on `ClaimedEntry` (it needs `lease_slot`,
@@ -2372,6 +2441,7 @@ async fn complete_queue_storage_with_followups(
     updated_job.progress = None;
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
+    crate::enqueue_specs::insert_staged_in_tx(&mut tx, &updated_job, staged_follow_ups).await?;
 
     tx.commit().await?;
     Ok(Some(updated_job))
@@ -2694,6 +2764,7 @@ async fn complete_canonical_with_followups(
     pool: &PgPool,
     job: &JobRow,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+    staged_follow_ups: &[PreparedJobInsert],
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
 
@@ -2726,6 +2797,7 @@ async fn complete_canonical_with_followups(
     };
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
+    crate::enqueue_specs::insert_staged_in_tx(&mut tx, &updated_job, staged_follow_ups).await?;
 
     tx.commit().await?;
     Ok(Some(updated_job))
@@ -3333,6 +3405,7 @@ mod tests {
                     claim.as_ref(),
                     None,
                     &Ok(JobResult::Completed),
+                    &[],
                     &handle,
                     CompletionPath::Direct,
                     None,
@@ -3448,6 +3521,7 @@ mod tests {
                             pool,
                             job,
                             result,
+                            &[],
                             batcher,
                             completion_path,
                             None,
@@ -3519,7 +3593,7 @@ mod tests {
                         return Err(connection_reset());
                     }
                     complete_job_canonical(
-                        pool, job, &Ok(JobResult::Completed), batcher, completion_path,
+                        pool, job, &Ok(JobResult::Completed), &[], batcher, completion_path,
                         None, Duration::ZERO, false, specs, false, metrics,
                     ).await
                 }
@@ -3539,6 +3613,137 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        assert_eq!(children, 0);
+    }
+
+    /// ADR-046: a finalize retry carries the same staged follow-ups, and a
+    /// replay after a lost acknowledgement is stale, so the follow-up is
+    /// inserted exactly once. With no registered specs the staged rows alone
+    /// must take the job off the batched path.
+    #[sqlx::test(migrations = false)]
+    async fn reconnect_replays_staged_follow_ups_once(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let metrics = test_metrics();
+        let no_specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let (_, batcher) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        let job = running_reconnect_job(&pool).await;
+        let staged = vec![awa_model::prepare_raw_job_insert(
+            "reconnect_child",
+            serde_json::json!({ "parent": job.id.to_string() }),
+            awa_model::InsertOpts::default(),
+        )
+        .unwrap()];
+        let calls = AtomicU32::new(0);
+        let outcome = finalize_with_retry(
+            |completion_path| {
+                let pool = &pool;
+                let job = &job;
+                let staged = &staged;
+                let batcher = &batcher;
+                let no_specs = &no_specs;
+                let metrics = &metrics;
+                let calls = &calls;
+                async move {
+                    let outcome = complete_job_canonical(
+                        pool,
+                        job,
+                        &Ok(JobResult::Completed),
+                        staged,
+                        batcher,
+                        completion_path,
+                        None,
+                        Duration::ZERO,
+                        false,
+                        no_specs,
+                        false,
+                        metrics,
+                    )
+                    .await?;
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert!(matches!(outcome, CompletionOutcome::Applied { .. }));
+                        Err(connection_reset())
+                    } else {
+                        Ok(outcome)
+                    }
+                }
+            },
+            &metrics,
+            job.id,
+            &job.kind,
+            &job.queue,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome.outcome, CompletionOutcome::IgnoredStale));
+        let children: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.jobs_hot WHERE kind = 'reconnect_child' AND args->>'parent' = $1",
+        )
+        .bind(job.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(children, 1);
+    }
+
+    /// ADR-046: staged follow-ups ride on the lease-guarded completion, so
+    /// a completion for a superseded lease inserts none of them.
+    #[sqlx::test(migrations = false)]
+    async fn stale_completion_inserts_no_staged_follow_ups(pool: PgPool) {
+        let _database_guard = RECONNECT_DB_LOCK.lock().await;
+        awa_model::migrations::run(&pool).await.unwrap();
+        let metrics = test_metrics();
+        let no_specs: Arc<EnqueueSpecsByOutcome> = Arc::new(HashMap::new());
+        let (_, batcher) = crate::completion::CompletionBatcher::new(
+            pool.clone(),
+            CancellationToken::new(),
+            metrics.clone(),
+            RuntimeStorage::Canonical,
+            1,
+        );
+        let job = running_reconnect_job(&pool).await;
+        sqlx::query("UPDATE awa.jobs_hot SET run_lease = run_lease + 1 WHERE id = $1")
+            .bind(job.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let staged = vec![awa_model::prepare_raw_job_insert(
+            "reconnect_child",
+            serde_json::json!({ "parent": job.id.to_string() }),
+            awa_model::InsertOpts::default(),
+        )
+        .unwrap()];
+        let outcome = complete_job_canonical(
+            &pool,
+            &job,
+            &Ok(JobResult::Completed),
+            &staged,
+            &batcher,
+            CompletionPath::Direct,
+            None,
+            Duration::ZERO,
+            false,
+            &no_specs,
+            false,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, CompletionOutcome::IgnoredStale));
+        let children: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.jobs_hot WHERE kind = 'reconnect_child' AND args->>'parent' = $1",
+        )
+        .bind(job.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(children, 0);
     }
 

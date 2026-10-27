@@ -18,7 +18,10 @@
 //! impls of [`EnqueueFollowUp`] and accumulate them in a two-level
 //! `outcome -> kind -> specs` registry.
 
-use awa_model::{insert_with, map_sqlx_error, AwaError, InsertOpts, JobArgs, JobRow};
+use awa_model::{
+    insert_prepared, insert_with, map_sqlx_error, AwaError, InsertOpts, JobArgs, JobRow,
+    PreparedJobInsert, UniqueOpts,
+};
 use serde::de::DeserializeOwned;
 use sqlx::{Connection, PgConnection};
 use std::future::Future;
@@ -61,6 +64,22 @@ impl<F: JobArgs> EnqueueRequest<F> {
     /// Override the follow-up's `max_attempts`.
     pub fn max_attempts(mut self, max_attempts: i16) -> Self {
         self.opts.max_attempts = max_attempts;
+        self
+    }
+
+    /// Set the follow-up's unique options without replacing the rest of its
+    /// [`InsertOpts`]. A follow-up whose unique key already exists is
+    /// skipped and its trigger still commits.
+    pub fn unique(mut self, unique: UniqueOpts) -> Self {
+        self.opts.unique = Some(unique);
+        self
+    }
+
+    /// Set the follow-up's metadata without replacing the rest of its
+    /// [`InsertOpts`]. Metadata is outside the unique key, so it can carry
+    /// context that must not affect deduplication.
+    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.opts.metadata = metadata;
         self
     }
 
@@ -199,15 +218,42 @@ async fn insert_follow_up<F: JobArgs>(
         return insert_with(&mut *conn, args, opts).await.map(|_| ());
     }
     let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
-    match insert_with(&mut *savepoint, args, opts).await {
-        Ok(_) => savepoint.commit().await.map_err(map_sqlx_error),
+    let inserted = insert_with(&mut *savepoint, args, opts).await.map(|_| ());
+    settle_follow_up_savepoint(savepoint, inserted, trigger_kind, F::kind()).await
+}
+
+/// Insert one handler-staged follow-up (ADR-046) inside the completion
+/// transaction, with the same duplicate handling as [`insert_follow_up`].
+async fn insert_staged_follow_up(
+    conn: &mut PgConnection,
+    trigger_kind: &str,
+    row: &PreparedJobInsert,
+) -> Result<(), AwaError> {
+    if row.unique_key().is_none() {
+        return insert_prepared(&mut *conn, row).await.map(|_| ());
+    }
+    let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
+    let inserted = insert_prepared(&mut *savepoint, row).await.map(|_| ());
+    settle_follow_up_savepoint(savepoint, inserted, trigger_kind, row.kind()).await
+}
+
+/// Release the savepoint around a unique follow-up insert, or roll it back
+/// and skip the follow-up when its key already exists.
+async fn settle_follow_up_savepoint(
+    savepoint: sqlx::Transaction<'_, sqlx::Postgres>,
+    inserted: Result<(), AwaError>,
+    trigger_kind: &str,
+    follow_up_kind: &str,
+) -> Result<(), AwaError> {
+    match inserted {
+        Ok(()) => savepoint.commit().await.map_err(map_sqlx_error),
         Err(AwaError::UniqueConflict { constraint })
             if is_duplicate_follow_up(constraint.as_deref()) =>
         {
             savepoint.rollback().await.map_err(map_sqlx_error)?;
             tracing::debug!(
                 trigger_kind,
-                follow_up_kind = F::kind(),
+                follow_up_kind,
                 constraint = constraint.as_deref().unwrap_or(""),
                 "Follow-up already enqueued; skipping the duplicate"
             );
@@ -450,6 +496,19 @@ pub(crate) async fn dispatch_specs_in_tx(
 ) -> Result<(), AwaError> {
     for spec in specs {
         spec.run(conn, job, outcome_context).await?;
+    }
+    Ok(())
+}
+
+/// Insert the follow-ups a handler staged (ADR-046), in staging order, inside
+/// the attempt's completion transaction. Runs after the registered specs.
+pub(crate) async fn insert_staged_in_tx(
+    conn: &mut PgConnection,
+    job: &JobRow,
+    staged: &[PreparedJobInsert],
+) -> Result<(), AwaError> {
+    for row in staged {
+        insert_staged_follow_up(conn, &job.kind, row).await?;
     }
     Ok(())
 }

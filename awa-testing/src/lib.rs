@@ -113,17 +113,20 @@ impl TestClient {
             None => return Ok(WorkResult::NoJob),
         };
 
-        let (result, progress_snapshot) = self.run_handler(&job, worker).await;
+        let (result, progress_snapshot, staged) = self.run_handler(&job, worker).await;
 
         // Update job state based on result
         match &result {
             Ok(JobResult::Completed) => {
+                let mut tx = self.pool.begin().await?;
                 sqlx::query(
                     "UPDATE awa.jobs SET state = 'completed', finalized_at = now(), progress = NULL WHERE id = $1",
                 )
                 .bind(job.id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+                awa_worker::insert_staged_follow_ups_in_tx(&mut tx, &job, &staged).await?;
+                tx.commit().await?;
                 Ok(WorkResult::Completed(job))
             }
             Ok(JobResult::Cancel(reason)) => {
@@ -224,7 +227,11 @@ impl TestClient {
         &self,
         job: &JobRow,
         worker: &W,
-    ) -> (Result<JobResult, JobError>, Option<serde_json::Value>) {
+    ) -> (
+        Result<JobResult, JobError>,
+        Option<serde_json::Value>,
+        Vec<awa_model::PreparedJobInsert>,
+    ) {
         let cancel = Arc::new(AtomicBool::new(false));
         let state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>> =
             Arc::new(HashMap::new());
@@ -243,7 +250,20 @@ impl TestClient {
             let guard = progress.lock().expect("progress lock poisoned");
             guard.clone_latest()
         };
-        (result, snapshot)
+        // ADR-046, as in the runtime: staged follow-ups ride only on
+        // `Completed`, and a `Completed` attempt that failed to stage fails
+        // terminally instead.
+        let (result, staged) = match (result, ctx.follow_ups().seal_for_testing()) {
+            (Ok(JobResult::Completed), Ok(staged)) => (Ok(JobResult::Completed), staged),
+            (Ok(JobResult::Completed), Err(err)) => (
+                Err(JobError::Terminal(format!(
+                    "a follow-up failed to stage: {err}"
+                ))),
+                Vec::new(),
+            ),
+            (result, _) => (result, Vec::new()),
+        };
+        (result, snapshot, staged)
     }
 
     /// Queue-storage variant of [`Self::work_one_in_queue`]: claim, run the
@@ -285,13 +305,22 @@ impl TestClient {
         };
         let job = claimed.job.clone();
 
-        let (result, progress_snapshot) = self.run_handler(&job, worker).await;
+        let (result, progress_snapshot, staged) = self.run_handler(&job, worker).await;
 
         match &result {
-            Ok(JobResult::Completed) => {
+            Ok(JobResult::Completed) if staged.is_empty() => {
                 store
                     .complete_runtime_batch(&self.pool, std::slice::from_ref(&claimed))
                     .await?;
+                Ok(WorkResult::Completed(job))
+            }
+            Ok(JobResult::Completed) => {
+                let mut tx = self.pool.begin().await?;
+                store
+                    .complete_runtime_batch_slow_in_tx(&mut tx, std::slice::from_ref(&claimed))
+                    .await?;
+                awa_worker::insert_staged_follow_ups_in_tx(&mut tx, &job, &staged).await?;
+                tx.commit().await?;
                 Ok(WorkResult::Completed(job))
             }
             Ok(JobResult::Cancel(reason)) => {

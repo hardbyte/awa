@@ -43,7 +43,9 @@ pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
 pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::{map_sqlx_error, AwaError};
-pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};
+pub use insert::{
+    insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_prepared, insert_with,
+};
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
 pub use partitioned_queue::{
     partition_for_ordering_key, partition_hash64, PartitionedQueue, PartitionedQueueError,

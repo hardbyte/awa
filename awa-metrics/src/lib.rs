@@ -34,6 +34,7 @@ pub mod names {
     pub const JOB_RETRIED: &str = "awa.job.retried";
     pub const COMPLETION_DEADLOCK_RETRY: &str = "awa.completion.deadlock_retry";
     pub const COMPLETION_RECONNECT_RETRY: &str = "awa.completion.reconnect_retry";
+    pub const STAGED_FOLLOW_UPS_DISCARDED: &str = "awa.job.staged_follow_ups_discarded";
     pub const JOB_CANCELLED: &str = "awa.job.cancelled";
     pub const JOB_CLAIMED: &str = "awa.job.claimed";
     pub const JOB_DURATION: &str = "awa.job.duration";
@@ -119,6 +120,9 @@ pub struct AwaMetrics {
     /// including connection failures, pool timeouts, and read-only failover.
     /// This counts retries, not successful recoveries.
     pub completion_reconnect_retries: Counter<u64>,
+    /// Follow-ups a handler staged (ADR-046) and then discarded by returning
+    /// `WaitForCallback`, which parks the job without completing it.
+    pub staged_follow_ups_discarded: Counter<u64>,
     /// Total jobs cancelled.
     pub jobs_cancelled: Counter<u64>,
     /// Total jobs claimed (dequeued) for execution.
@@ -308,6 +312,13 @@ impl AwaMetrics {
                     "Number of finalize retries started after database writes became unavailable",
                 )
                 .with_unit("{transaction}")
+                .build(),
+            staged_follow_ups_discarded: meter
+                .u64_counter(names::STAGED_FOLLOW_UPS_DISCARDED)
+                .with_description(
+                    "Number of staged follow-ups discarded because the handler parked the job with WaitForCallback",
+                )
+                .with_unit("{job}")
                 .build(),
             jobs_cancelled: meter
                 .u64_counter(names::JOB_CANCELLED)
@@ -597,6 +608,16 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
         ];
         self.completion_reconnect_retries.add(1, &attrs);
+    }
+
+    /// Record follow-ups discarded because the handler that staged them
+    /// returned `WaitForCallback`.
+    pub fn record_staged_follow_ups_discarded(&self, kind: &str, queue: &str, count: u64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+        ];
+        self.staged_follow_ups_discarded.add(count, &attrs);
     }
 
     pub fn record_job_retried(&self, kind: &str, queue: &str) {

@@ -23,9 +23,10 @@ pub use awa_model::{
 // Re-export worker runtime
 pub use awa_worker::{
     self as worker, context::ProgressState, BuildError, CallbackGuard, CallbackToken, Client,
-    ClientBuilder, CronMissedFirePolicy, EnqueueRequest, HealthCheck, JobContext, JobError,
-    JobEvent, JobResult, PeriodicJob, PeriodicJobBuilder, QueueCapacity, QueueConfig, QueueHealth,
-    RateLimit, RescueReason, RetentionPolicy, UntypedJobEvent, Worker,
+    ClientBuilder, CronMissedFirePolicy, EnqueueRequest, FollowUps, HealthCheck, JobContext,
+    JobError, JobEvent, JobResult, PeriodicJob, PeriodicJobBuilder, QueueCapacity, QueueConfig,
+    QueueHealth, RateLimit, RescueReason, RetentionPolicy, StageError, UntypedJobEvent, Worker,
+    MAX_STAGED_BYTES, MAX_STAGED_FOLLOW_UPS,
 };
 
 #[cfg(feature = "http-worker")]

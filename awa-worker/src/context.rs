@@ -1,6 +1,8 @@
+use crate::enqueue_specs::EnqueueRequest;
+use crate::follow_ups::{FollowUps, StageError};
 pub use crate::runtime::ProgressState;
 use crate::storage::RuntimeStorage;
-use awa_model::{AwaError, CallbackConfig, JobRow, QueueStorage};
+use awa_model::{AwaError, CallbackConfig, JobArgs, JobRow, QueueStorage};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
@@ -55,6 +57,8 @@ pub struct JobContext {
     storage: RuntimeStorage,
     /// Shared progress buffer — written by handler, read by heartbeat service.
     progress: Arc<std::sync::Mutex<ProgressState>>,
+    /// Follow-ups staged for this attempt's completion (ADR-046).
+    follow_ups: FollowUps,
 }
 
 impl JobContext {
@@ -73,6 +77,7 @@ impl JobContext {
             pool,
             storage,
             progress,
+            follow_ups: FollowUps::default(),
         }
     }
 
@@ -111,6 +116,42 @@ impl JobContext {
     /// context would make it a sibling.
     pub fn traceparent(&self) -> Option<&str> {
         awa_model::trace::traceparent_from_metadata(&self.job.metadata)
+    }
+
+    /// A cloneable handle for staging follow-up jobs on this attempt.
+    ///
+    /// Use it where the context cannot be borrowed, such as the `'static`
+    /// future returned by a `ClientBuilder::register` closure:
+    ///
+    /// ```ignore
+    /// .register::<StageA, _, _>(|args, ctx| {
+    ///     let follow_ups = ctx.follow_ups();
+    ///     async move {
+    ///         let item_id = resolve_item(&args).await?;
+    ///         follow_ups.enqueue_on_completion(
+    ///             EnqueueRequest::new(StageB { item_id }).unique(UniqueOpts::default()),
+    ///         )?;
+    ///         Ok(JobResult::Completed)
+    ///     }
+    /// })
+    /// ```
+    pub fn follow_ups(&self) -> FollowUps {
+        self.follow_ups.clone()
+    }
+
+    /// Stage a follow-up job that is enqueued in the same transaction as
+    /// this attempt's completion, and discarded if the attempt ends any other
+    /// way (ADR-046). Shorthand for `self.follow_ups().enqueue_on_completion(..)`.
+    ///
+    /// The args are serialized and the unique key computed now. A follow-up
+    /// with unique options whose key already exists is skipped when the
+    /// completion commits. A failed call poisons the attempt: returning
+    /// `JobResult::Completed` afterwards fails it terminally.
+    pub fn enqueue_on_completion<F: JobArgs>(
+        &self,
+        request: impl Into<EnqueueRequest<F>>,
+    ) -> Result<(), StageError> {
+        self.follow_ups.enqueue_on_completion(request)
     }
 
     /// Clone the shared cancellation flag for language bridges.

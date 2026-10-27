@@ -7,6 +7,7 @@ pub mod dispatcher;
 mod enqueue_specs;
 pub mod events;
 pub mod executor;
+mod follow_ups;
 mod health_server;
 pub mod heartbeat;
 #[cfg(feature = "http-worker")]
@@ -31,6 +32,9 @@ pub use dispatcher::{QueueConfig, RateLimit};
 pub use enqueue_specs::EnqueueRequest;
 pub use events::{JobEvent, RescueReason, UntypedJobEvent};
 pub use executor::{JobError, JobResult, Worker};
+#[doc(hidden)]
+pub use follow_ups::insert_staged_follow_ups_in_tx;
+pub use follow_ups::{FollowUps, StageError, MAX_STAGED_BYTES, MAX_STAGED_FOLLOW_UPS};
 pub use maintenance::RetentionPolicy;
 pub use metrics::AwaMetrics;
 
