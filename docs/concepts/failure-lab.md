@@ -29,7 +29,7 @@ The model starts with a committed order and job. It is an Awa-specific teaching 
   title="Interactive Awa job, worker and receipt model"
   loading="lazy"
   referrerpolicy="no-referrer"
-  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+  sandbox="allow-scripts allow-popups"
 >
   <p><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive Awa model.</a></p>
 </iframe>
