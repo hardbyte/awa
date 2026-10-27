@@ -187,12 +187,14 @@ async fn on_completed_enqueue_routes_follow_up_to_custom_queue() {
         )
         .register::<EnqueueTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
         .on_completed_enqueue_with::<EnqueueTrigger, EnqueueFollowUp, _>(move |args, job| {
-            EnqueueRequest::new(EnqueueFollowUp {
-                user_id: args.user_id,
-                triggered_by_job_id: job.id,
-            })
-            .queue(follow_queue_for_closure.clone())
-            .priority(1)
+            Some(
+                EnqueueRequest::new(EnqueueFollowUp {
+                    user_id: args.user_id,
+                    triggered_by_job_id: job.id,
+                })
+                .queue(follow_queue_for_closure.clone())
+                .priority(1),
+            )
         })
         .build()
         .unwrap();
@@ -1276,13 +1278,15 @@ async fn duplicate_unique_follow_up_is_skipped(db: TestDatabase, canonical: bool
         )
         .register::<DedupTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
         .on_completed_enqueue_with::<DedupTrigger, DedupFollowUp, _>(|args, _job| {
-            EnqueueRequest::new(DedupFollowUp {
-                shared_id: args.shared_id,
-            })
-            .with_opts(awa::InsertOpts {
-                unique: Some(awa::UniqueOpts::default()),
-                ..Default::default()
-            })
+            Some(
+                EnqueueRequest::new(DedupFollowUp {
+                    shared_id: args.shared_id,
+                })
+                .with_opts(awa::InsertOpts {
+                    unique: Some(awa::UniqueOpts::default()),
+                    ..Default::default()
+                }),
+            )
         })
         .build()
         .unwrap();
@@ -1327,4 +1331,177 @@ async fn duplicate_unique_follow_up_is_skipped_on_canonical() {
 #[tokio::test]
 async fn duplicate_unique_follow_up_is_skipped_under_queue_storage() {
     duplicate_unique_follow_up_is_skipped(TestDatabase::queue_storage().await, false).await;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct ConditionalTrigger {
+    user_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct ConditionalFollowUp {
+    user_id: i64,
+}
+
+async fn count_kind(pool: &sqlx::PgPool, kind: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE kind = $1")
+        .bind(kind)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A `_with` closure that returns `None` enqueues nothing for that trigger,
+/// and the trigger still completes.
+async fn none_from_a_spec_enqueues_nothing(db: TestDatabase, canonical: bool) {
+    let pool = db.pool().clone();
+    let queue = if canonical {
+        "enqueue_spec_conditional"
+    } else {
+        "enqueue_spec_conditional_qs"
+    };
+    let mut builder = Client::builder(pool.clone());
+    if canonical {
+        builder = builder.canonical_storage();
+    }
+    let client = builder
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<ConditionalTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_completed_enqueue_with::<ConditionalTrigger, ConditionalFollowUp, _>(|args, _job| {
+            (args.user_id % 2 == 0).then(|| {
+                EnqueueRequest::new(ConditionalFollowUp {
+                    user_id: args.user_id,
+                })
+            })
+        })
+        .build()
+        .unwrap();
+
+    let mut triggers = Vec::new();
+    for user_id in 1..=4 {
+        let job = awa::insert_with(
+            &pool,
+            &ConditionalTrigger { user_id },
+            awa::InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        triggers.push(job.id);
+    }
+
+    client.start().await.unwrap();
+    for id in &triggers {
+        wait_for_state(&pool, *id, JobState::Completed).await;
+    }
+    let mut enqueued: Vec<i64> =
+        sqlx::query_scalar("SELECT (args->>'user_id')::bigint FROM awa.jobs WHERE kind = $1")
+            .bind(ConditionalFollowUp::kind())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    client.shutdown(Duration::from_secs(2)).await;
+
+    enqueued.sort_unstable();
+    assert_eq!(
+        enqueued,
+        vec![2, 4],
+        "only the triggers whose spec returned Some"
+    );
+}
+
+#[tokio::test]
+async fn none_from_a_spec_enqueues_nothing_on_canonical() {
+    none_from_a_spec_enqueues_nothing(TestDatabase::canonical().await, true).await;
+}
+
+#[tokio::test]
+async fn none_from_a_spec_enqueues_nothing_under_queue_storage() {
+    none_from_a_spec_enqueues_nothing(TestDatabase::queue_storage().await, false).await;
+}
+
+/// A completion with no handler, `complete_external`, honours `None` too: the
+/// callback resolves and nothing is enqueued.
+async fn complete_external_honours_none(db: TestDatabase, canonical: bool) {
+    let pool = db.pool().clone();
+    let queue = if canonical {
+        "enqueue_spec_cb_conditional"
+    } else {
+        "enqueue_spec_cb_conditional_qs"
+    };
+    let mut builder = Client::builder(pool.clone());
+    if canonical {
+        builder = builder.canonical_storage();
+    }
+    let client = builder
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_completed_enqueue_with::<WaitTrigger, ConditionalFollowUp, _>(|args, _job| {
+            (args.user_id != 0).then(|| {
+                EnqueueRequest::new(ConditionalFollowUp {
+                    user_id: args.user_id,
+                })
+            })
+        })
+        .build()
+        .unwrap();
+
+    let mut parked_ids = Vec::new();
+    for user_id in [0, 9] {
+        let job = awa::insert_with(
+            &pool,
+            &WaitTrigger { user_id },
+            awa::InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        parked_ids.push(job.id);
+    }
+
+    client.start().await.unwrap();
+    for id in &parked_ids {
+        let parked = wait_for_state(&pool, *id, JobState::WaitingExternal).await;
+        client
+            .complete_external(parked.callback_id.expect("callback id"), None, None)
+            .await
+            .expect("complete_external");
+        wait_for_state(&pool, *id, JobState::Completed).await;
+    }
+    let enqueued: Vec<i64> =
+        sqlx::query_scalar("SELECT (args->>'user_id')::bigint FROM awa.jobs WHERE kind = $1")
+            .bind(ConditionalFollowUp::kind())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(enqueued, vec![9]);
+    assert_eq!(count_kind(&pool, ConditionalFollowUp::kind()).await, 1);
+}
+
+#[tokio::test]
+async fn complete_external_honours_none_on_canonical() {
+    complete_external_honours_none(TestDatabase::canonical().await, true).await;
+}
+
+#[tokio::test]
+async fn complete_external_honours_none_under_queue_storage() {
+    complete_external_honours_none(TestDatabase::queue_storage().await, false).await;
 }

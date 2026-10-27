@@ -225,6 +225,27 @@ async fn insert_follow_up<F: JobArgs>(
         .map(|_| ())
 }
 
+/// Insert the follow-up a registered spec's closure asked for, or nothing
+/// when it returned `None`.
+async fn insert_requested_follow_up<F: JobArgs>(
+    conn: &mut PgConnection,
+    trigger: &JobRow,
+    request: Option<EnqueueRequest<F>>,
+) -> Result<(), AwaError> {
+    match request {
+        Some(request) => insert_follow_up(conn, trigger, &request.args, request.opts).await,
+        None => {
+            tracing::debug!(
+                trigger_job_id = trigger.id,
+                trigger_kind = %trigger.kind,
+                follow_up_kind = F::kind(),
+                "Follow-up spec returned None; nothing to enqueue"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Insert one handler-staged follow-up (ADR-046) inside the completion
 /// transaction, with the same duplicate handling as [`insert_follow_up`].
 /// Returns whether the row was inserted rather than skipped as a duplicate.
@@ -294,7 +315,7 @@ impl<T, F, MakeFn> EnqueueFollowUp for CompletedFollowUp<T, F, MakeFn>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: JobArgs + Send + Sync + 'static,
-    MakeFn: Fn(T, &JobRow) -> EnqueueRequest<F> + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow) -> Option<EnqueueRequest<F>> + Send + Sync + 'static,
 {
     fn run<'a>(
         &'a self,
@@ -308,7 +329,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
             )?;
-            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
+            insert_requested_follow_up(&mut *conn, job, request).await?;
             Ok(())
         })
     }
@@ -324,7 +345,7 @@ impl<T, F, MakeFn> EnqueueFollowUp for RetriedFollowUp<T, F, MakeFn>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: JobArgs + Send + Sync + 'static,
-    MakeFn: Fn(T, &JobRow, &str, i16, chrono::DateTime<chrono::Utc>) -> EnqueueRequest<F>
+    MakeFn: Fn(T, &JobRow, &str, i16, chrono::DateTime<chrono::Utc>) -> Option<EnqueueRequest<F>>
         + Send
         + Sync
         + 'static,
@@ -353,7 +374,7 @@ where
                     (self.make)(args, job, error, *attempt, *next_run_at)
                 }),
             )?;
-            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
+            insert_requested_follow_up(&mut *conn, job, request).await?;
             Ok(())
         })
     }
@@ -369,7 +390,7 @@ impl<T, F, MakeFn> EnqueueFollowUp for ExhaustedFollowUp<T, F, MakeFn>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: JobArgs + Send + Sync + 'static,
-    MakeFn: Fn(T, &JobRow, &str, i16) -> EnqueueRequest<F> + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow, &str, i16) -> Option<EnqueueRequest<F>> + Send + Sync + 'static,
 {
     fn run<'a>(
         &'a self,
@@ -388,7 +409,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, error, *attempt)),
             )?;
-            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
+            insert_requested_follow_up(&mut *conn, job, request).await?;
             Ok(())
         })
     }
@@ -404,7 +425,7 @@ impl<T, F, MakeFn> EnqueueFollowUp for CancelledFollowUp<T, F, MakeFn>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: JobArgs + Send + Sync + 'static,
-    MakeFn: Fn(T, &JobRow, &str) -> EnqueueRequest<F> + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow, &str) -> Option<EnqueueRequest<F>> + Send + Sync + 'static,
 {
     fn run<'a>(
         &'a self,
@@ -423,7 +444,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, reason)),
             )?;
-            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
+            insert_requested_follow_up(&mut *conn, job, request).await?;
             Ok(())
         })
     }
@@ -439,7 +460,7 @@ impl<T, F, MakeFn> EnqueueFollowUp for WaitingForCallbackFollowUp<T, F, MakeFn>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: JobArgs + Send + Sync + 'static,
-    MakeFn: Fn(T, &JobRow) -> EnqueueRequest<F> + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow) -> Option<EnqueueRequest<F>> + Send + Sync + 'static,
 {
     fn run<'a>(
         &'a self,
@@ -453,7 +474,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
             )?;
-            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
+            insert_requested_follow_up(&mut *conn, job, request).await?;
             Ok(())
         })
     }
@@ -470,8 +491,10 @@ impl<T, F, MakeFn> EnqueueFollowUp for RescuedFollowUp<T, F, MakeFn>
 where
     T: JobArgs + DeserializeOwned + Send + Sync + 'static,
     F: JobArgs + Send + Sync + 'static,
-    MakeFn:
-        Fn(T, &JobRow, crate::events::RescueReason) -> EnqueueRequest<F> + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow, crate::events::RescueReason) -> Option<EnqueueRequest<F>>
+        + Send
+        + Sync
+        + 'static,
 {
     fn run<'a>(
         &'a self,
@@ -490,7 +513,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, *reason)),
             )?;
-            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
+            insert_requested_follow_up(&mut *conn, job, request).await?;
             Ok(())
         })
     }

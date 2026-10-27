@@ -278,6 +278,11 @@ Rust exposes two hook families on the client builder:
   the key covers the follow-up's kind and args, so keep only the deduplication
   key in its args; `by_args: false` leaves args out of the key entirely.
 
+  A `_with` closure returns `Option<EnqueueRequest<F>>`: return `None` to
+  enqueue nothing for that trigger (the transition still commits). This is the
+  way to make a follow-up conditional on paths with no handler, such as
+  `complete_external`. Closures written for 0.6 wrap their result in `Some(...)`.
+
   When the follow-up needs a value the handler computes, stage it from the
   handler instead (ADR-046): `ctx.enqueue_on_completion(request)` in a `Worker`,
   `ctx.follow_ups()` for a `register` closure's `'static` future, or
