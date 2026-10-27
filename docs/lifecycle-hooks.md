@@ -100,7 +100,7 @@ let client = Client::builder(pool)
     .build()?;
 ```
 
-There is one builder per outcome, plus a `_with` variant whose closure returns `EnqueueRequest<F>` so you can override `InsertOpts` on the follow-up (queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key):
+There is one builder per outcome, plus a `_with` variant whose closure returns `Option<EnqueueRequest<F>>` so you can override `InsertOpts` on the follow-up, or return `None` to enqueue nothing (queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key):
 
 | Builder | Fires when | Closure signature |
 | --- | --- | --- |
@@ -133,7 +133,7 @@ Return `None` from a `_with` closure to enqueue nothing for that trigger. The tr
 })
 ```
 
-The closure decides from the trigger's args, its job row and the outcome's context, inside the same transaction, so this works for every outcome, including callback resolutions (`complete_external`, `resolve_callback`) where no handler runs. A job whose kind has a registered `Completed` spec still takes the per-job completion transaction when the closure returns `None`. When the decision depends on something the handler computed, stage the follow-up from the handler instead (see [Handler-staged follow-ups](#handler-staged-follow-ups)).
+The closure decides from the trigger's args, its job row and the outcome's context. It runs wherever the follow-up insert runs, so this works for every outcome, including callback resolutions (`complete_external`, `resolve_callback`) where no handler runs. For worker-driven outcomes and callback resolutions that is inside the transition's transaction. For maintenance rescue it is the separate transaction opened after the rescue commits, so a conditional `on_rescued_enqueue_with` is no more atomic than any rescue follow-up (see [Atomicity guarantees](#atomicity-guarantees)). A job whose kind has a registered `Completed` spec still takes the per-job completion transaction when the closure returns `None`. When the decision depends on something the handler computed, stage the follow-up from the handler instead (see [Handler-staged follow-ups](#handler-staged-follow-ups)).
 
 ### Deduplicating follow-ups
 
