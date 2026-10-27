@@ -26,6 +26,12 @@ AwaAsyncClaimCursor.tla        ;; AwaAsyncClaimCursorUnguarded.cfg         ;; No
 AwaFinalizeReconnect.tla      ;; -                                      ;; pass ;; saved finalize replay after unknown commit acknowledgement
 AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectUnfenced.cfg        ;; NewerLeaseUnaffected is violated ;; old finalize changes a rescued and reclaimed attempt
 AwaFinalizeReconnect.tla      ;; AwaFinalizeReconnectSeparateFollowup.cfg ;; ResolvedFinalizeHasFollowup is violated ;; lost commit acknowledgement strands a separate follow-up
+AwaStagedFollowUps.tla        ;; -                                      ;; pass ;; handler-staged follow-ups commit with the guarded completion
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsEarlyInsert.cfg       ;; FollowupTracesToCommit is violated ;; handler inserts before its completion commits
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsSeparateTx.cfg        ;; ResolvedCompletionHasFollowup is violated ;; lost acknowledgement strands a separate staged insert
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsUnfenced.cfg          ;; CompletionByCurrentLease is violated ;; stale attempt completes a reclaimed job
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsDrainOnSend.cfg       ;; ResolvedCompletionHasFollowup is violated ;; retry after a drained first send loses the follow-up
+AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsBatchedPath.cfg       ;; ResolvedCompletionHasFollowup is violated ;; batched completion drops staged follow-ups
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
