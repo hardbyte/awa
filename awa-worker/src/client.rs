@@ -427,6 +427,13 @@ impl ClientBuilder {
     ///
     /// Multiple registrations for the same kind stack and all run in the
     /// same dispatch.
+    ///
+    /// # Deduplication
+    ///
+    /// A follow-up inserted with unique options (via
+    /// [`Self::on_completed_enqueue_with`]) that conflicts with an existing
+    /// job is skipped, not treated as an error: the trigger still commits and
+    /// the existing job stands. This applies to every `on_*_enqueue` outcome.
     pub fn on_completed_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,

@@ -158,6 +158,13 @@ for each step.
 
 ### Fixed
 
+- **A duplicate follow-up no longer fails its trigger.** A follow-up enqueued
+  with unique options that conflicted with an existing job aborted the
+  trigger's transaction: the trigger's completion (or other outcome) rolled
+  back, every retry hit the same conflict, and the trigger failed once its
+  attempts ran out. The conflict is now skipped under a savepoint, so the
+  trigger commits and the existing follow-up stands. Deduplicating downstream
+  work across several triggers now works as unique options imply.
 - **Poison jobs no longer cycle forever.** A job whose worker crashed or hung
   on every attempt was rescued back to `retryable` indefinitely: stale-heartbeat
   and deadline rescue never checked `max_attempts`, so `attempt` climbed past

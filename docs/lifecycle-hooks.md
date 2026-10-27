@@ -121,6 +121,19 @@ There is one builder per outcome, plus a `_with` variant whose closure returns `
 })
 ```
 
+### Deduplicating follow-ups
+
+Give the follow-up unique options to collapse duplicates. When several triggers produce a follow-up with the same unique key, the first insert wins and the later ones are skipped: each trigger's transition still commits, and exactly one follow-up job exists. With `UniqueOpts::default()` the key covers the follow-up's kind and args, so put only the deduplication key in the follow-up's args. Custom options can add the queue or a time period, or set `by_args: false` so the key leaves args out; then follow-ups of the same kind collapse whatever their args. `UniqueOpts::states` decides how long the deduplication lasts: the default includes `completed`, so a finished follow-up keeps blocking duplicates until its terminal row is pruned. Drop `completed` from the states to block duplicates only while the existing follow-up is still scheduled, available, running or retryable.
+
+```rust
+.on_completed_enqueue_with::<StageA, StageB, _>(|args, _job| {
+    EnqueueRequest::new(StageB { item_id: args.item_id }).with_opts(InsertOpts {
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    })
+})
+```
+
 ### Atomicity guarantees
 
 | Emission site | Atomic with state commit? |
@@ -129,7 +142,7 @@ There is one builder per outcome, plus a `_with` variant whose closure returns `
 | Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) on either storage engine | **yes** — one transaction, one commit. A spec INSERT failure (or a panic in the user-supplied closure) rolls the callback transition back together with the follow-up; `Client::*_external` returns `Err` and the external sender can retry. |
 | Maintenance rescue (stale heartbeat / deadline / expired callback) | **no — best-effort.** The rescue commits first, then specs dispatch in a separate tx. A spec failure leaves the rescue applied and is logged. |
 
-The trigger transition and the follow-up `INSERT` either both commit or neither does — exactly-once _enqueue_ per committed worker outcome or callback resolution. The follow-up itself, once enqueued, is delivered with Awa's usual at-least-once semantics, so the follow-up handler still needs to be safe under re-execution.
+The trigger transition and the follow-up `INSERT` either both commit or neither does — exactly-once _enqueue_ per committed worker outcome or callback resolution. The one exception is a follow-up with unique options whose key already exists: that insert is skipped and the transition commits on its own (see [Deduplicating follow-ups](#deduplicating-follow-ups)). The follow-up itself, once enqueued, is delivered with Awa's usual at-least-once semantics, so the follow-up handler still needs to be safe under re-execution.
 
 Rescue stays best-effort by design: making it atomic would couple rescue liveness to the correctness of user follow-up code (a panic in `on_rescued_enqueue` would roll back a stale-heartbeat rescue and leave the job stuck in `running`). Zero-loss rescue notifications belong in an outbox/sweeper, not inlined into the rescue tx.
 

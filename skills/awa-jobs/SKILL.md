@@ -260,7 +260,8 @@ Rust exposes two hook families on the client builder:
   - Worker-driven outcomes (a handler returning `Ok`/`Err`) and callback
     resolution on the `Client` (`complete_external`, `resolve_callback`, …) commit
     the follow-up in the **same transaction** as the transition — exactly-once per
-    committed outcome.
+    committed outcome, unless the follow-up has unique options and its key
+    already exists, in which case the insert is skipped (see below).
   - **`on_rescued_enqueue` is the exception: it is best-effort, not atomic.**
     Maintenance rescue (stale-heartbeat / deadline / expired-callback) commits the
     rescue first, then dispatches the follow-up in a separate transaction; a
@@ -270,6 +271,12 @@ Rust exposes two hook families on the client builder:
 
   Every follow-up, once enqueued, is delivered at-least-once, so its handler must
   be safe to re-run.
+
+  To collapse duplicates (several triggers producing the same downstream work),
+  give the follow-up unique options via `on_*_enqueue_with`. A conflicting
+  follow-up is skipped and the trigger still commits. With `UniqueOpts::default()`
+  the key covers the follow-up's kind and args, so keep only the deduplication
+  key in its args; `by_args: false` leaves args out of the key entirely.
 
 Enqueues capture the current trace span into reserved metadata
 (`awa:traceparent`) automatically; disable with `AWA_TRACE_CAPTURE=off`. To

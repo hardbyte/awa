@@ -1238,3 +1238,93 @@ async fn retry_external_dispatches_retried_followup_under_queue_storage() {
     assert_eq!(follow_args.user_id, 713);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct DedupTrigger {
+    source: i64,
+    shared_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct DedupFollowUp {
+    shared_id: i64,
+}
+
+/// Two triggers whose follow-up carries the same unique key: the second
+/// follow-up is a duplicate the caller asked to be deduplicated, so both
+/// triggers complete and exactly one follow-up exists. The duplicate must
+/// not roll back the second trigger's completion.
+async fn duplicate_unique_follow_up_is_skipped(db: TestDatabase, canonical: bool) {
+    let pool = db.pool().clone();
+    let queue = if canonical {
+        "enqueue_spec_dedup"
+    } else {
+        "enqueue_spec_dedup_qs"
+    };
+
+    let mut builder = Client::builder(pool.clone());
+    if canonical {
+        builder = builder.canonical_storage();
+    }
+    let client = builder
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<DedupTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_completed_enqueue_with::<DedupTrigger, DedupFollowUp, _>(|args, _job| {
+            EnqueueRequest::new(DedupFollowUp {
+                shared_id: args.shared_id,
+            })
+            .with_opts(awa::InsertOpts {
+                unique: Some(awa::UniqueOpts::default()),
+                ..Default::default()
+            })
+        })
+        .build()
+        .unwrap();
+
+    let mut triggers = Vec::new();
+    for source in [1, 2] {
+        let job = awa::insert_with(
+            &pool,
+            &DedupTrigger {
+                source,
+                shared_id: 7,
+            },
+            awa::InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        triggers.push(job.id);
+    }
+
+    client.start().await.unwrap();
+    for id in &triggers {
+        wait_for_state(&pool, *id, JobState::Completed).await;
+    }
+    let follow_ups: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE kind = $1")
+        .bind(DedupFollowUp::kind())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(follow_ups, 1, "the duplicate follow-up must be skipped");
+}
+
+#[tokio::test]
+async fn duplicate_unique_follow_up_is_skipped_on_canonical() {
+    duplicate_unique_follow_up_is_skipped(TestDatabase::canonical().await, true).await;
+}
+
+#[tokio::test]
+async fn duplicate_unique_follow_up_is_skipped_under_queue_storage() {
+    duplicate_unique_follow_up_is_skipped(TestDatabase::queue_storage().await, false).await;
+}
