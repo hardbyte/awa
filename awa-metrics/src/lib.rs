@@ -318,7 +318,7 @@ impl AwaMetrics {
                 .with_description(
                     "Number of staged follow-ups discarded because the handler parked the job with WaitForCallback",
                 )
-                .with_unit("{job}")
+                .with_unit("{follow_up}")
                 .build(),
             jobs_cancelled: meter
                 .u64_counter(names::JOB_CANCELLED)

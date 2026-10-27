@@ -136,6 +136,39 @@ async def test_failed_stage_poisons_and_other_outcomes_discard(client):
     assert await count_kind(client, "stage_process") == 0
 
 
+@dataclass
+class StageBadOptions:
+    mode: str
+
+
+@pytest.mark.asyncio
+async def test_conversion_failures_poison_like_any_staging_error(client):
+    queue = "staged_py_convert"
+
+    @client.task(StageBadOptions, queue=queue)
+    async def bad(job):
+        try:
+            if job.args.mode == "unique_opts":
+                job.enqueue_on_completion(StageProcess(item_id=1), unique_opts="nope")
+            elif job.args.mode == "args":
+                job.enqueue_on_completion({"s": {1, 2}}, kind="stage_process")
+            else:
+                job.enqueue_on_completion(StageProcess(item_id=1), priority=99)
+        except awa.StagingError as e:
+            assert e.__cause__ is not None or job.args.mode == "priority"
+        return None  # swallowed: the attempt must still fail
+
+    ids = []
+    for mode in ("unique_opts", "args", "priority"):
+        job = await client.insert(StageBadOptions(mode=mode), queue=queue, max_attempts=1)
+        ids.append(job.id)
+    await client.start([(queue, 3)], **RUNTIME_START_KWARGS)
+    for job_id in ids:
+        await wait_for_state(client, job_id, "failed")
+    await client.shutdown()
+    assert await count_kind(client, "stage_process") == 0
+
+
 @pytest.mark.asyncio
 async def test_staging_error_is_terminal():
     assert issubclass(awa.StagingError, awa.TerminalError)
@@ -190,6 +223,28 @@ async def test_test_client_inserts_staged_follow_ups(tc):
         result = await tc.work_one(StageResolve, handler=resolve)
         assert result.is_completed()
     assert await count_kind(tc.client, "stage_process") == 1
+
+
+def test_handler_job_matches_runtime_validation():
+    job = HandlerJob(
+        args=StageResolve(source=1, item_id=1),
+        id=1,
+        attempt=1,
+        max_attempts=25,
+        queue="default",
+        priority=2,
+        deadline=None,
+        metadata={},
+        tags=[],
+    )
+    with pytest.raises(awa.StagingError):
+        job.enqueue_on_completion(StageProcess(item_id=1), priority=99)
+    assert job.staging_error is not None
+
+    other = HandlerJob(**{**job.__dict__, "staged": [], "staging_error": None})
+    with pytest.raises(TypeError):
+        other.enqueue_on_completion(StageProcess(item_id=1), bogus=True)
+    assert other.staging_error is None, "a bad keyword is a TypeError, as at runtime"
 
 
 @pytest.mark.asyncio

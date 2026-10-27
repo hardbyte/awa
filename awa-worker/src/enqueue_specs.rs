@@ -84,8 +84,9 @@ impl<F: JobArgs> EnqueueRequest<F> {
     }
 
     /// Replace the follow-up's [`InsertOpts`] wholesale — useful for fields
-    /// without dedicated builder methods (`metadata`, `tags`, `unique`,
-    /// `run_at`, `deadline_duration`, `ordering_key`).
+    /// without dedicated builder methods (`tags`, `run_at`,
+    /// `deadline_duration`, `ordering_key`). It also replaces anything set
+    /// earlier with `.queue()`, `.unique()` and the other builders.
     pub fn with_opts(mut self, opts: InsertOpts) -> Self {
         self.opts = opts;
         self
@@ -210,7 +211,7 @@ fn catch_make_panic<R>(
 /// without unique options cannot conflict and skip the savepoint.
 async fn insert_follow_up<F: JobArgs>(
     conn: &mut PgConnection,
-    trigger_kind: &str,
+    trigger: &JobRow,
     args: &F,
     opts: InsertOpts,
 ) -> Result<(), AwaError> {
@@ -219,14 +220,14 @@ async fn insert_follow_up<F: JobArgs>(
     }
     let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
     let inserted = insert_with(&mut *savepoint, args, opts).await.map(|_| ());
-    settle_follow_up_savepoint(savepoint, inserted, trigger_kind, F::kind()).await
+    settle_follow_up_savepoint(savepoint, inserted, trigger, F::kind()).await
 }
 
 /// Insert one handler-staged follow-up (ADR-046) inside the completion
 /// transaction, with the same duplicate handling as [`insert_follow_up`].
 async fn insert_staged_follow_up(
     conn: &mut PgConnection,
-    trigger_kind: &str,
+    trigger: &JobRow,
     row: &PreparedJobInsert,
 ) -> Result<(), AwaError> {
     if row.unique_key().is_none() {
@@ -234,7 +235,7 @@ async fn insert_staged_follow_up(
     }
     let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
     let inserted = insert_prepared(&mut *savepoint, row).await.map(|_| ());
-    settle_follow_up_savepoint(savepoint, inserted, trigger_kind, row.kind()).await
+    settle_follow_up_savepoint(savepoint, inserted, trigger, row.kind()).await
 }
 
 /// Release the savepoint around a unique follow-up insert, or roll it back
@@ -242,7 +243,7 @@ async fn insert_staged_follow_up(
 async fn settle_follow_up_savepoint(
     savepoint: sqlx::Transaction<'_, sqlx::Postgres>,
     inserted: Result<(), AwaError>,
-    trigger_kind: &str,
+    trigger: &JobRow,
     follow_up_kind: &str,
 ) -> Result<(), AwaError> {
     match inserted {
@@ -252,7 +253,8 @@ async fn settle_follow_up_savepoint(
         {
             savepoint.rollback().await.map_err(map_sqlx_error)?;
             tracing::debug!(
-                trigger_kind,
+                trigger_job_id = trigger.id,
+                trigger_kind = %trigger.kind,
                 follow_up_kind,
                 constraint = constraint.as_deref().unwrap_or(""),
                 "Follow-up already enqueued; skipping the duplicate"
@@ -298,7 +300,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
             )?;
-            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -343,7 +345,7 @@ where
                     (self.make)(args, job, error, *attempt, *next_run_at)
                 }),
             )?;
-            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -378,7 +380,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, error, *attempt)),
             )?;
-            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -413,7 +415,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, reason)),
             )?;
-            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -443,7 +445,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
             )?;
-            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -480,7 +482,7 @@ where
                 &job.kind,
                 std::panic::AssertUnwindSafe(|| (self.make)(args, job, *reason)),
             )?;
-            insert_follow_up(&mut *conn, &job.kind, &request.args, request.opts).await?;
+            insert_follow_up(&mut *conn, job, &request.args, request.opts).await?;
             Ok(())
         })
     }
@@ -508,7 +510,7 @@ pub(crate) async fn insert_staged_in_tx(
     staged: &[PreparedJobInsert],
 ) -> Result<(), AwaError> {
     for row in staged {
-        insert_staged_follow_up(conn, &job.kind, row).await?;
+        insert_staged_follow_up(conn, job, row).await?;
     }
     Ok(())
 }

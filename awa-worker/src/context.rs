@@ -77,7 +77,7 @@ impl JobContext {
             pool,
             storage,
             progress,
-            follow_ups: FollowUps::default(),
+            follow_ups: FollowUps::new(),
         }
     }
 

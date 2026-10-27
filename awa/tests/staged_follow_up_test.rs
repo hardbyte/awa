@@ -94,11 +94,14 @@ async fn staged_follow_ups_commit_and_deduplicate(db: TestDatabase, canonical: b
             async move {
                 // The value comes from the handler, not from a registered spec.
                 let item_id = args.item_id * 10;
-                follow_ups.enqueue_on_completion(
-                    EnqueueRequest::new(Process { item_id })
-                        .unique(UniqueOpts::default())
-                        .metadata(serde_json::json!({ "source": args.source })),
-                )?;
+                // The same key twice in one attempt collapses to one row too.
+                for _ in 0..2 {
+                    follow_ups.enqueue_on_completion(
+                        EnqueueRequest::new(Process { item_id })
+                            .unique(UniqueOpts::default())
+                            .metadata(serde_json::json!({ "source": args.source })),
+                    )?;
+                }
                 Ok(JobResult::Completed)
             }
         })
@@ -373,12 +376,26 @@ async fn staged_and_registered_follow_ups_commit_together(db: TestDatabase, cano
     let id = insert_in(&pool, &Both { id: 4 }, queue).await;
     client.start().await.unwrap();
     wait_for_state(&pool, id, JobState::Completed).await;
-    let from_spec = count_kind(&pool, FromSpec::kind()).await;
-    let from_handler = count_kind(&pool, FromHandler::kind()).await;
+    let kinds: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM awa.jobs WHERE kind IN ($1, $2) ORDER BY id")
+            .bind(FromSpec::kind())
+            .bind(FromHandler::kind())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     client.shutdown(Duration::from_secs(2)).await;
 
-    assert_eq!(from_spec, 1);
-    assert_eq!(from_handler, 3, "fan-out stages one follow-up per call");
+    // Registered specs insert first, then the staged follow-ups in order.
+    assert_eq!(
+        kinds,
+        vec![
+            FromSpec::kind(),
+            FromHandler::kind(),
+            FromHandler::kind(),
+            FromHandler::kind()
+        ],
+        "fan-out stages one follow-up per call, after the registered spec"
+    );
 }
 
 #[tokio::test]
@@ -392,7 +409,7 @@ async fn staged_and_registered_follow_ups_commit_together_under_queue_storage() 
         .await;
 }
 
-// ── a non-duplicate insert error rolls the completion back ────────────────
+// ── what the insert would reject fails the stage, not the completion ────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct BadFollowUp {
@@ -404,23 +421,105 @@ struct Rejected {
     id: i64,
 }
 
-async fn rejected_insert_rolls_completion_back(db: TestDatabase, canonical: bool) {
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct Exhausted {
+    id: i64,
+}
+
+async fn invalid_follow_up_fails_the_stage(db: TestDatabase, canonical: bool) {
     let pool = db.pool().clone();
     let queue = if canonical {
-        "staged_rejected"
+        "staged_invalid"
     } else {
-        "staged_rejected_qs"
+        "staged_invalid_qs"
     };
     let client = client_builder(&pool, canonical)
         .queue(queue, queue_config())
         .register::<BadFollowUp, _, _>(|args, ctx| {
             let follow_ups = ctx.follow_ups();
             async move {
-                // Priority outside 1..=4 passes staging but violates the
-                // table's check constraint at insert time.
-                follow_ups.enqueue_on_completion(
+                // Priority outside 1..=4 would fail the insert's check
+                // constraint, so staging rejects it and poisons the attempt.
+                let _ = follow_ups.enqueue_on_completion(
                     EnqueueRequest::new(Rejected { id: args.id }).priority(9),
-                )?;
+                );
+                Ok(JobResult::Completed)
+            }
+        })
+        // A poisoned attempt fails terminally, so exhausted specs fire.
+        .on_exhausted_enqueue::<BadFollowUp, Exhausted, _>(|args, _job, _error, _attempt| {
+            Exhausted { id: args.id }
+        })
+        .build()
+        .unwrap();
+
+    let id = insert_in(&pool, &BadFollowUp { id: 1 }, queue).await;
+    client.start().await.unwrap();
+    let failed = wait_for_state(&pool, id, JobState::Failed).await;
+    let exhausted = count_kind(&pool, Exhausted::kind()).await;
+    let rejected = count_kind(&pool, Rejected::kind()).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let error = failed
+        .errors
+        .as_ref()
+        .and_then(|errors| errors.last())
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(error.contains("priority 9"), "got {error}");
+    assert_eq!(
+        exhausted, 1,
+        "the exhausted spec fires for a poisoned attempt"
+    );
+    assert_eq!(rejected, 0);
+}
+
+#[tokio::test]
+async fn invalid_follow_up_fails_the_stage_on_canonical() {
+    invalid_follow_up_fails_the_stage(TestDatabase::canonical().await, true).await;
+}
+
+#[tokio::test]
+async fn invalid_follow_up_fails_the_stage_under_queue_storage() {
+    invalid_follow_up_fails_the_stage(TestDatabase::queue_storage().await, false).await;
+}
+
+/// An insert error staging cannot foresee rolls the completion back with
+/// the follow-up. A test-only trigger stands in for it; canonical inserts
+/// land in `awa.jobs_hot`, so the trigger goes there.
+#[tokio::test]
+async fn unforeseen_insert_error_rolls_the_completion_back_on_canonical() {
+    let db = TestDatabase::canonical().await;
+    let pool = db.pool().clone();
+    let queue = "staged_rollback";
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION public.reject_staged() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.kind = 'rejected' THEN
+                RAISE EXCEPTION 'rejected by test trigger';
+            END IF;
+            RETURN NEW;
+        END $$
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_staged BEFORE INSERT ON awa.jobs_hot \
+         FOR EACH ROW EXECUTE FUNCTION public.reject_staged()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let client = client_builder(&pool, true)
+        .queue(queue, queue_config())
+        .register::<BadFollowUp, _, _>(|args, ctx| {
+            let follow_ups = ctx.follow_ups();
+            async move {
+                follow_ups.enqueue_on_completion(Rejected { id: args.id })?;
                 Ok(JobResult::Completed)
             }
         })
@@ -429,24 +528,108 @@ async fn rejected_insert_rolls_completion_back(db: TestDatabase, canonical: bool
 
     let id = insert_in(&pool, &BadFollowUp { id: 1 }, queue).await;
     client.start().await.unwrap();
-    // The completion cannot commit, so the job stays running until rescue.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_state(&pool, id, JobState::Running).await;
+    // The completion keeps failing; give it several finalize attempts.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let job = admin::get_job(&pool, id).await.unwrap();
     let rejected = count_kind(&pool, Rejected::kind()).await;
     client.shutdown(Duration::from_secs(2)).await;
 
     assert_eq!(job.state, JobState::Running, "the completion rolled back");
+    assert_eq!(job.attempt, 1);
     assert_eq!(rejected, 0);
 }
 
-#[tokio::test]
-async fn rejected_insert_rolls_completion_back_on_canonical() {
-    rejected_insert_rolls_completion_back(TestDatabase::canonical().await, true).await;
+// ── a callback wait keeps the buffer; an external completion discards it ──
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct AwaitsCallback {
+    id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct AfterCallback {
+    id: i64,
+}
+
+struct AwaitsCallbackWorker;
+
+#[async_trait::async_trait]
+impl awa::Worker for AwaitsCallbackWorker {
+    fn kind(&self) -> &'static str {
+        AwaitsCallback::kind()
+    }
+
+    async fn perform(&self, ctx: &awa::JobContext) -> Result<JobResult, JobError> {
+        let args: AwaitsCallback = serde_json::from_value(ctx.job.args.clone())
+            .map_err(|err| JobError::terminal(err.to_string()))?;
+        // Stage before waiting: only the handler's own completion inserts it.
+        ctx.enqueue_on_completion(AfterCallback { id: args.id })?;
+        let guard = ctx
+            .register_callback(Duration::from_secs(3600))
+            .await
+            .map_err(JobError::retryable)?;
+        ctx.wait_for_callback(guard)
+            .await
+            .map_err(JobError::retryable)?;
+        Ok(JobResult::Completed)
+    }
+}
+
+async fn callback_wait_keeps_staged_follow_ups(db: TestDatabase, canonical: bool) {
+    let pool = db.pool().clone();
+    let queue = if canonical {
+        "staged_callback"
+    } else {
+        "staged_callback_qs"
+    };
+    let client = client_builder(&pool, canonical)
+        .queue(queue, queue_config())
+        .register_worker(AwaitsCallbackWorker)
+        .build()
+        .unwrap();
+
+    let resumed = insert_in(&pool, &AwaitsCallback { id: 1 }, queue).await;
+    let completed_externally = insert_in(&pool, &AwaitsCallback { id: 2 }, queue).await;
+    client.start().await.unwrap();
+
+    let waiting = wait_for_state(&pool, resumed, JobState::WaitingExternal).await;
+    admin::resume_external(&pool, waiting.callback_id.unwrap(), None, None)
+        .await
+        .unwrap();
+    wait_for_state(&pool, resumed, JobState::Completed).await;
+
+    let waiting = wait_for_state(&pool, completed_externally, JobState::WaitingExternal).await;
+    client
+        .complete_external(waiting.callback_id.unwrap(), None, None)
+        .await
+        .unwrap();
+    wait_for_state(&pool, completed_externally, JobState::Completed).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT (args->>'id')::bigint FROM awa.jobs WHERE kind = $1 ORDER BY 1")
+            .bind(AfterCallback::kind())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        ids,
+        vec![1],
+        "resumed and completed by its handler inserts; completed externally does not"
+    );
 }
 
 #[tokio::test]
-async fn rejected_insert_rolls_completion_back_under_queue_storage() {
-    rejected_insert_rolls_completion_back(TestDatabase::queue_storage().await, false).await;
+async fn callback_wait_keeps_staged_follow_ups_on_canonical() {
+    callback_wait_keeps_staged_follow_ups(TestDatabase::canonical().await, true).await;
+}
+
+#[tokio::test]
+async fn callback_wait_keeps_staged_follow_ups_under_queue_storage() {
+    callback_wait_keeps_staged_follow_ups(TestDatabase::queue_storage().await, false).await;
 }
 
 // ── the test harness inserts staged follow-ups like the runtime ───────────

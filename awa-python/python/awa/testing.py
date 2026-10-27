@@ -101,6 +101,41 @@ _STAGING_KWARGS = frozenset(
 )
 
 
+def _compact_len(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
+
+
+def _validated_size(args: Any, kwargs: dict[str, Any]) -> int:
+    """Apply the runtime's staging rules and return the request's size."""
+    kind = kwargs.get("kind") or derive_kind(type(args).__name__)
+    queue = kwargs.get("queue", "default")
+    priority = kwargs.get("priority", 2)
+    max_attempts = kwargs.get("max_attempts", 25)
+    tags = kwargs.get("tags") or []
+    if not 1 <= priority <= 4:
+        raise awa.StagingError(f"priority {priority} is outside 1..=4")
+    if not 1 <= max_attempts <= 1000:
+        raise awa.StagingError(f"max_attempts {max_attempts} is outside 1..=1000")
+    for name, value in (("kind", kind), ("queue", queue)):
+        if len(value) > 200:
+            raise awa.StagingError(f"{name} is longer than 200 characters")
+    if len(tags) > 20:
+        raise awa.StagingError("more than 20 tags")
+    if any("\x00" in value for value in (kind, queue, *tags)):
+        raise awa.StagingError("kind, queue and tags must not contain NUL bytes")
+    ordering_key = kwargs.get("ordering_key") or b""
+    if isinstance(ordering_key, str):
+        ordering_key = ordering_key.encode()
+    return (
+        len(kind.encode())
+        + len(queue.encode())
+        + _compact_len(_args_to_json(args))
+        + _compact_len(kwargs.get("metadata") or {})
+        + sum(len(tag.encode()) for tag in tags)
+        + len(ordering_key)
+    )
+
+
 def _args_to_json(args: Any) -> Any:
     if hasattr(args, "model_dump"):
         return args.model_dump(mode="json")
@@ -144,21 +179,20 @@ class HandlerJob(Generic[T]):
         return False
 
     def enqueue_on_completion(self, args: Any, **kwargs: Any) -> None:
+        unknown = set(kwargs) - _STAGING_KWARGS
+        if unknown:
+            # As at runtime, a bad keyword is a plain TypeError from the call.
+            raise TypeError(f"unexpected keyword arguments: {sorted(unknown)}")
         if self._sealed:
             raise awa.StagingError(
                 "the handler already returned; follow-ups can no longer be staged"
             )
         try:
-            unknown = set(kwargs) - _STAGING_KWARGS
-            if unknown:
-                raise TypeError(f"unexpected keyword arguments: {sorted(unknown)}")
+            size = _validated_size(args, kwargs)
             if len(self.staged) >= awa.MAX_STAGED_FOLLOW_UPS:
                 raise awa.StagingError(
                     f"too many staged follow-ups (limit {awa.MAX_STAGED_FOLLOW_UPS})"
                 )
-            size = len(json.dumps(_args_to_json(args)).encode())
-            size += len(json.dumps(kwargs.get("metadata") or {}).encode())
-            size += sum(len(tag.encode()) for tag in kwargs.get("tags") or [])
             if self._staged_bytes + size > awa.MAX_STAGED_BYTES:
                 raise awa.StagingError(
                     f"staged follow-ups exceed {awa.MAX_STAGED_BYTES} bytes"
@@ -166,7 +200,7 @@ class HandlerJob(Generic[T]):
         except awa.StagingError as e:
             self.staging_error = self.staging_error or e
             raise
-        except (TypeError, ValueError) as e:
+        except Exception as e:
             error = awa.StagingError(f"follow-up could not be prepared: {e}")
             self.staging_error = self.staging_error or error
             raise error from e
@@ -406,7 +440,10 @@ class AwaTestClient:
                 await tx3.execute("SAVEPOINT awa_staged_follow_up")
                 try:
                     await tx3.insert(staged.args, **staged.kwargs)
-                except awa.UniqueConflict:
+                except awa.UniqueConflict as e:
+                    # Only the deduplication index means "already enqueued".
+                    if "idx_awa_jobs_unique" not in str(e):
+                        raise
                     await tx3.execute("ROLLBACK TO SAVEPOINT awa_staged_follow_up")
                 else:
                     await tx3.execute("RELEASE SAVEPOINT awa_staged_follow_up")

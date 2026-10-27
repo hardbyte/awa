@@ -163,9 +163,9 @@ async def resolve(job):
 Staged follow-ups are inserted in the same transaction as the attempt's completion, after any registered `Completed` specs, with the same [deduplication](#deduplicating-follow-ups). The rules:
 
 - **Only `Completed` inserts them.** `RetryAfter`, `Snooze`, `Cancel`, an error, a panic, a rescued or superseded attempt, and `Client::complete_external` all discard them. A retried attempt starts empty and stages again when its handler re-runs. `WaitForCallback` discards them with a warning and the `awa.job.staged_follow_ups_discarded` counter; to build a follow-up from a callback payload, wait with `ctx.wait_for_callback` inside the handler, then stage.
-- **A failed stage fails the attempt.** Staging serializes the args and checks the limits immediately, returning `StageError` (Python: `awa.StagingError`, a `TerminalError`). If the handler ignores the error and returns `Completed`, the attempt fails terminally instead of completing without its follow-up.
+- **A failed stage fails the attempt.** Staging serializes the args, checks the limits, and rejects anything the insert would reject (priority outside 1–4, `max_attempts` outside 1–1000, kind or queue names over 200 characters, more than 20 tags, NUL bytes), returning `StageError` (Python: `awa.StagingError`, a `TerminalError`, also raised when args or options do not convert). If the handler ignores the error and returns `Completed`, the attempt fails terminally instead of completing without its follow-up.
 - **Staging closes when the handler returns.** A task the handler spawned and did not await gets `StageError::Sealed`.
-- **Limits per attempt:** 16 follow-ups and 64 KiB of serialized args, metadata and tags (`MAX_STAGED_FOLLOW_UPS`, `MAX_STAGED_BYTES`). Larger fan-out belongs in a dedicated fan-out job.
+- **Limits per attempt:** 16 follow-ups and 64 KiB of serialized requests, counting kind, queue, args, metadata, tags and ordering key (`MAX_STAGED_FOLLOW_UPS`, `MAX_STAGED_BYTES`). Larger fan-out belongs in a dedicated fan-out job.
 - **Cost.** A job that stages takes a per-job completion transaction instead of the batched path; jobs that stage nothing are unaffected.
 - **Deploy order.** A worker that does not know the follow-up's kind fails it terminally. Deploy the workers that handle the follow-up first, or put it on a queue only they poll.
 

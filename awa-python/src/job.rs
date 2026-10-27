@@ -218,41 +218,54 @@ impl PyJob {
                 "follow-ups can only be staged on the job passed to a running handler",
             ));
         };
-        let args_bound = args.bind(py);
-        let kind = match kind {
-            Some(kind) => kind,
-            None => crate::args::derive_kind(&crate::args::get_type_class_name(
-                args_bound.get_type().as_any(),
-            )?),
-        };
-        let opts = InsertOpts {
-            queue,
-            priority,
-            max_attempts,
-            run_at: run_at
-                .as_ref()
-                .map(|value| crate::transaction::parse_run_at(py, value.bind(py)))
-                .transpose()?,
-            metadata: metadata
-                .as_ref()
-                .map(|value| py_to_json(py, value.bind(py)))
-                .transpose()?
-                .unwrap_or(serde_json::json!({})),
-            tags,
-            unique: unique_opts
-                .as_ref()
-                .map(|value| crate::transaction::parse_unique_opts(py, value.bind(py)))
-                .transpose()?,
-            ordering_key: ordering_key
-                .as_ref()
-                .map(|value| crate::transaction::parse_ordering_key(py, value.bind(py)))
-                .transpose()?,
-            ..InsertOpts::default()
-        };
-        let args_json = crate::args::serialize_args(py, args_bound)?;
-        follow_ups
-            .enqueue_raw_on_completion(kind, args_json, opts)
-            .map_err(|err| crate::StagingError::new_err(err.to_string()))
+        // Convert everything first; a conversion failure poisons the attempt
+        // like any other staging failure, so a handler that swallows it
+        // cannot complete without the follow-up it asked for.
+        let prepared = (|| -> PyResult<(String, serde_json::Value, InsertOpts)> {
+            let args_bound = args.bind(py);
+            let kind = match kind {
+                Some(kind) => kind,
+                None => crate::args::derive_kind(&crate::args::get_type_class_name(
+                    args_bound.get_type().as_any(),
+                )?),
+            };
+            let opts = InsertOpts {
+                queue,
+                priority,
+                max_attempts,
+                run_at: run_at
+                    .as_ref()
+                    .map(|value| crate::transaction::parse_run_at(py, value.bind(py)))
+                    .transpose()?,
+                metadata: metadata
+                    .as_ref()
+                    .map(|value| py_to_json(py, value.bind(py)))
+                    .transpose()?
+                    .unwrap_or(serde_json::json!({})),
+                tags,
+                unique: unique_opts
+                    .as_ref()
+                    .map(|value| crate::transaction::parse_unique_opts(py, value.bind(py)))
+                    .transpose()?,
+                ordering_key: ordering_key
+                    .as_ref()
+                    .map(|value| crate::transaction::parse_ordering_key(py, value.bind(py)))
+                    .transpose()?,
+                ..InsertOpts::default()
+            };
+            Ok((kind, crate::args::serialize_args(py, args_bound)?, opts))
+        })();
+        match prepared {
+            Ok((kind, args_json, opts)) => follow_ups
+                .enqueue_raw_on_completion(kind, args_json, opts)
+                .map_err(|err| crate::StagingError::new_err(err.to_string())),
+            Err(cause) => {
+                let err = follow_ups.poison(awa_worker::StageError::Invalid(cause.to_string()));
+                let staging = crate::StagingError::new_err(err.to_string());
+                staging.set_cause(py, Some(cause));
+                Err(staging)
+            }
+        }
     }
 
     fn is_cancelled(&self) -> bool {
