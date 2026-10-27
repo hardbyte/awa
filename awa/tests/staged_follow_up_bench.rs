@@ -1,7 +1,7 @@
 //! ADR-046 scale and throughput check for handler-staged follow-ups.
 //!
-//! Drains the same batch of trigger jobs under each staging pattern on queue
-//! storage and reports throughput, so the cost of staging can be compared
+//! Drains the same batch of trigger jobs under each staging pattern and
+//! reports throughput, so the cost of staging can be compared
 //! with no follow-ups and with a registered `Completed` spec. Ignored by
 //! default; run with:
 //!
@@ -10,11 +10,21 @@
 //!   cargo test -p awa --test staged_follow_up_bench -- --ignored --nocapture
 //! ```
 //!
-//! `STAGED_BENCH_JOBS` overrides the batch size (default 2000).
+//! `STAGED_BENCH_JOBS` overrides the batch size (default 2000),
+//! `STAGED_BENCH_ENGINE=canonical` runs on the canonical engine, and
+//! `STAGED_BENCH_SCENARIOS` picks scenarios by index (for example `0,2`).
+//!
+//! Progress is counted in process as handlers return, not by polling
+//! `awa.jobs`: on queue storage that count takes seconds and would swamp the
+//! measurement. A handler keeps its worker slot until a finalizer slot is
+//! free, so slow completions still throttle the count. One query at the end
+//! confirms every trigger committed.
 
 use awa::{Client, EnqueueRequest, JobArgs, JobResult, QueueConfig, UniqueOpts};
 use awa_testing::setup::TestDatabase;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
@@ -58,12 +68,22 @@ impl Scenario {
     }
 }
 
-async fn run(scenario: Scenario, jobs: i64) -> (Duration, i64) {
-    let db = TestDatabase::queue_storage().await;
+async fn run(scenario: Scenario, jobs: i64, canonical: bool) -> (Duration, i64) {
+    let db = if canonical {
+        TestDatabase::canonical().await
+    } else {
+        TestDatabase::queue_storage().await
+    };
     let pool = db.pool().clone();
     let queue = "staged_bench";
 
-    let mut builder = Client::builder(pool.clone()).queue(
+    let mut builder = Client::builder(pool.clone());
+    if canonical {
+        builder = builder.canonical_storage();
+    }
+    let returned = Arc::new(AtomicI64::new(0));
+    let handler_returned = returned.clone();
+    let mut builder = builder.queue(
         queue,
         QueueConfig {
             max_workers: 64,
@@ -73,7 +93,9 @@ async fn run(scenario: Scenario, jobs: i64) -> (Duration, i64) {
     );
     builder = builder.register::<BenchTrigger, _, _>(move |args, ctx| {
         let follow_ups = ctx.follow_ups();
+        let returned = handler_returned.clone();
         async move {
+            returned.fetch_add(1, Ordering::Relaxed);
             let staged = match scenario {
                 Scenario::Baseline | Scenario::RegisteredSpec => 0,
                 Scenario::StageOnePercent => i64::from(args.n % 100 == 0),
@@ -123,26 +145,29 @@ async fn run(scenario: Scenario, jobs: i64) -> (Duration, i64) {
 
     let started = Instant::now();
     client.start().await.unwrap();
-    loop {
-        let completed: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM awa.jobs WHERE kind = $1 AND state = 'completed'",
-        )
-        .bind(BenchTrigger::kind())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        if completed >= jobs {
-            break;
-        }
+    while returned.load(Ordering::Relaxed) < jobs {
         assert!(
             started.elapsed() < Duration::from_secs(600),
-            "{}: only {completed}/{jobs} completed",
-            scenario.name()
+            "{}: only {} of {jobs} handlers returned",
+            scenario.name(),
+            returned.load(Ordering::Relaxed)
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let elapsed = started.elapsed();
-    client.shutdown(Duration::from_secs(5)).await;
+    client.shutdown(Duration::from_secs(30)).await;
+    let completed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE kind = $1 AND state = 'completed'")
+            .bind(BenchTrigger::kind())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        completed,
+        jobs,
+        "{}: every trigger committed",
+        scenario.name()
+    );
     let follow_ups: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE kind = $1")
         .bind(BenchFollowUp::kind())
         .fetch_one(&pool)
@@ -158,7 +183,8 @@ async fn staged_follow_up_throughput() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(2000);
-    let scenarios = [
+    let canonical = std::env::var("STAGED_BENCH_ENGINE").as_deref() == Ok("canonical");
+    let all = [
         Scenario::Baseline,
         Scenario::RegisteredSpec,
         Scenario::StageOnePercent,
@@ -166,13 +192,26 @@ async fn staged_follow_up_throughput() {
         Scenario::StageUniqueHeavyDedup,
         Scenario::StageAtLimit,
     ];
-    println!("\n{jobs} trigger jobs per scenario, queue storage, 64 workers");
+    let scenarios: Vec<Scenario> = match std::env::var("STAGED_BENCH_SCENARIOS") {
+        Ok(picked) => picked
+            .split(',')
+            .filter_map(|index| index.trim().parse::<usize>().ok())
+            .filter_map(|index| all.get(index).copied())
+            .collect(),
+        Err(_) => all.to_vec(),
+    };
+    let engine = if canonical {
+        "canonical"
+    } else {
+        "queue storage"
+    };
+    println!("\n{jobs} trigger jobs per scenario, {engine}, 64 workers");
     println!(
         "{:<38} {:>10} {:>12} {:>12}",
         "scenario", "drain s", "jobs/s", "follow-ups"
     );
     for scenario in scenarios {
-        let (elapsed, follow_ups) = run(scenario, jobs).await;
+        let (elapsed, follow_ups) = run(scenario, jobs, canonical).await;
         println!(
             "{:<38} {:>10.2} {:>12.0} {:>12}",
             scenario.name(),
