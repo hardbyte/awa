@@ -1956,6 +1956,31 @@ impl Worker for ProgressRescueWorker {
     }
 }
 
+/// Runs for a fixed time unless cancelled, counting every execution.
+struct OutlivesHeartbeatWorker {
+    runtime: Duration,
+    runs: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl Worker for OutlivesHeartbeatWorker {
+    fn kind(&self) -> &'static str {
+        "heartbeat_rescue_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let started = Instant::now();
+        while started.elapsed() < self.runtime {
+            if ctx.is_cancelled() {
+                return Err(JobError::terminal("live attempt was rescued"));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok(JobResult::Completed)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct HeartbeatRescueJob {
     id: i64,
@@ -9390,6 +9415,98 @@ async fn test_queue_storage_receipt_claim_hint_closes_compact_claim_once() {
     .await
     .expect("Failed to count deferred rows");
     assert_eq!(deferred, 1);
+}
+
+/// With `heartbeat_staleness` at exactly three intervals, a handler running
+/// well past the staleness window is never rescued: fixed-grid heartbeat
+/// ticks keep a live attempt fresh at the documented floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_grid_heartbeats_keep_live_attempt_at_staleness_floor() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let queue = "qs_grid_heartbeat_floor";
+    let schema = "awa_qs_runtime_grid_heartbeat_floor";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let interval = Duration::from_secs(1);
+    let staleness = interval * 3;
+    let runs = Arc::new(AtomicU32::new(0));
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                queue_stripe_count: 1,
+                lease_claim_receipts: true,
+                claim_slot_count: 2,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(OutlivesHeartbeatWorker {
+            runtime: staleness + interval * 2,
+            runs: Arc::clone(&runs),
+        })
+        .heartbeat_interval(interval)
+        .heartbeat_staleness(staleness)
+        .heartbeat_rescue_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .deadline_rescue_interval(Duration::from_secs(10))
+        .callback_rescue_interval(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build grid-heartbeat client");
+    client
+        .start()
+        .await
+        .expect("Failed to start grid-heartbeat client");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &HeartbeatRescueJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed, JobState::Failed],
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed, "{completed:?}");
+    assert_eq!(completed.attempt, 1, "the live attempt must not be rescued");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

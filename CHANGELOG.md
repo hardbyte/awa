@@ -81,6 +81,9 @@ for each step.
 
 ### Changed
 
+- **Heartbeats tick on a fixed grid.** Ticks no longer drift by each pass's
+  duration. A pass that outlasts the interval logs a warning with its duration
+  and is followed by a full interval of rest.
 - Heartbeats no longer scan or lock every open claim batch. Each tick looks up
   only the attempts the worker is running, so its cost follows in-flight work
   rather than open claims, and failures, retries and slow completions no
@@ -179,6 +182,9 @@ for each step.
   deadline rescued it (5 minutes by default), and its message was lost. The
   executor now catches the panic and records `handler panicked: <message>` as
   a retryable failure.
+- **A zero `heartbeat_interval` is rejected when the client is built**
+  (Python: `ValueError`). Previously the heartbeat task reported itself alive
+  and then panicked.
 - **A running job could be both finished and retried.** If a job completed,
   failed or was retried while stale-heartbeat or deadline rescue was examining
   it, rescue could miss that outcome and also send the job back for a retry,

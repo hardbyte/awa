@@ -62,6 +62,8 @@ pub enum BuildError {
     InvalidDlqBatchSize,
     #[error("terminal_count_rollup_interval must be > 0")]
     InvalidTerminalCountRollupInterval,
+    #[error("heartbeat_interval must be > 0")]
+    InvalidHeartbeatInterval,
     #[error("invalid queue storage config: {0}")]
     InvalidQueueStorage(String),
     #[error("invalid AWA_HEALTH_ADDR '{0}': expected a socket address like 0.0.0.0:8321")]
@@ -737,7 +739,7 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the heartbeat interval (default: 30s).
+    /// Set the heartbeat interval (default: 30s). Must be greater than zero.
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
         self
@@ -1104,6 +1106,9 @@ impl ClientBuilder {
             .is_some_and(|interval| interval.is_zero())
         {
             return Err(BuildError::InvalidTerminalCountRollupInterval);
+        }
+        if self.heartbeat_interval.is_zero() {
+            return Err(BuildError::InvalidHeartbeatInterval);
         }
 
         // Validate weighted mode constraints
@@ -3419,6 +3424,15 @@ mod tests {
             .build();
 
         assert!(matches!(result, Err(BuildError::InvalidDlqBatchSize)));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_interval_must_be_positive() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .heartbeat_interval(Duration::ZERO)
+            .build();
+        assert!(matches!(result, Err(BuildError::InvalidHeartbeatInterval)));
     }
 
     #[tokio::test]

@@ -1896,6 +1896,11 @@ impl PyClient {
             builder = builder.leader_election_interval(Duration::from_millis(ms));
         }
         if let Some(ms) = heartbeat_interval_ms {
+            if ms == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "heartbeat_interval_ms must be > 0",
+                ));
+            }
             builder = builder.heartbeat_interval(Duration::from_millis(ms));
         }
         if let Some(ms) = promote_interval_ms {

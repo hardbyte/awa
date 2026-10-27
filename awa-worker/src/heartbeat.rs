@@ -3,8 +3,33 @@ use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+
+/// Run `pass` every `interval` on a fixed grid until `cancel` fires. A pass
+/// that outlasts the interval is followed by one full interval of rest, as
+/// a sleep after each pass would give, rather than by an immediate pass.
+pub(crate) async fn run_on_grid<F, Fut>(interval: Duration, cancel: &CancellationToken, mut pass: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = ticks.tick() => {
+                let started = tokio::time::Instant::now();
+                pass().await;
+                if started.elapsed() >= interval {
+                    ticks.reset();
+                }
+            }
+        }
+    }
+}
 
 /// Background heartbeat service that periodically updates heartbeat_at
 /// for all in-flight jobs, and flushes pending progress updates.
@@ -41,6 +66,20 @@ impl HeartbeatService {
         }
     }
 
+    async fn timed_pass(&self) {
+        let started = std::time::Instant::now();
+        self.heartbeat_once().await;
+        let elapsed = started.elapsed();
+        if elapsed > self.interval {
+            warn!(
+                pass_ms = elapsed.as_millis() as u64,
+                interval_ms = self.interval.as_millis() as u64,
+                "Heartbeat pass took longer than the heartbeat interval; attempts it covered \
+                 may be rescued as stale if this continues"
+            );
+        }
+    }
+
     /// Run the heartbeat loop. Returns when cancelled.
     pub async fn run(&self) {
         self.alive.store(true, Ordering::SeqCst);
@@ -49,19 +88,10 @@ impl HeartbeatService {
             "Heartbeat service started"
         );
 
-        loop {
-            tokio::select! {
-                _ = self.cancel.cancelled() => {
-                    debug!("Heartbeat service shutting down");
-                    // Final heartbeat before exit
-                    self.heartbeat_once().await;
-                    break;
-                }
-                _ = tokio::time::sleep(self.interval) => {
-                    self.heartbeat_once().await;
-                }
-            }
-        }
+        run_on_grid(self.interval, &self.cancel, || self.timed_pass()).await;
+        debug!("Heartbeat service shutting down");
+        // Final heartbeat before exit
+        self.heartbeat_once().await;
 
         self.alive.store(false, Ordering::SeqCst);
     }
@@ -297,5 +327,52 @@ impl HeartbeatService {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    async fn pass_starts(pass_duration: Duration, passes: usize) -> Vec<u64> {
+        use std::sync::{Arc, Mutex};
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let origin = tokio::time::Instant::now();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&starts);
+        let stopper = cancel.clone();
+        super::run_on_grid(30 * SECOND, &cancel, move || {
+            let recorder = Arc::clone(&recorder);
+            let stopper = stopper.clone();
+            async move {
+                let count = {
+                    let mut starts = recorder.lock().unwrap();
+                    starts.push(origin.elapsed().as_secs());
+                    starts.len()
+                };
+                tokio::time::sleep(pass_duration).await;
+                if count == passes {
+                    stopper.cancel();
+                }
+            }
+        })
+        .await;
+        let starts = starts.lock().unwrap().clone();
+        starts
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn passes_shorter_than_the_interval_keep_the_grid() {
+        assert_eq!(pass_starts(5 * SECOND, 4).await, vec![30, 60, 90, 120]);
+    }
+
+    /// A 45 s pass every 30 s would otherwise run back to back (30, 75, 120);
+    /// each overrun is followed by a full interval of rest, as the previous
+    /// sleep-after-pass loop gave.
+    #[tokio::test(start_paused = true)]
+    async fn an_overrunning_pass_is_followed_by_a_full_interval() {
+        assert_eq!(pass_starts(45 * SECOND, 4).await, vec![30, 105, 180, 255]);
     }
 }
