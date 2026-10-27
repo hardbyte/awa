@@ -2427,7 +2427,9 @@ mechanism: <code>InsertOpts::after(JobRef)</code> parks B in the deferred backlo
 A's guarded finalization transactionally promotes B (success) or applies B's declared
 <code>on_parent_failure</code> policy (<code>cancel</code> default | <code>enqueue_with_context</code> | <code>discard</code>). Exactly one
 parent. No fan-in, no fan-out, no DAG type, no workflow state — restated as a non-goal in the
-ADR.</p>
+ADR. Fan-out here means releasing a tracked group of dependents; independent follow-ups enqueued
+in one transaction (ADR-029 specs, ADR-046 staging) are not tracked as a group and are not
+fan-out in this sense.</p>
 <p><strong>Rationale:</strong> The promotion mechanism already exists (ADR-029 inserts follow-ups atomically
 with the finalize UPDATE); #14 is mostly a parking state and a policy enum. Single-parent A→B
 covers the dominant request ("after the PDF, send the email") while the #81 research issue
