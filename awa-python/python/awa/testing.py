@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import operator
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -105,13 +106,72 @@ def _compact_len(value: Any) -> int:
     return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
 
 
+def _str_option(kwargs: dict[str, Any], name: str, default: str) -> str:
+    value = kwargs.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise awa.StagingError(f"{name} must be a str, not {type(value).__name__}")
+    return value
+
+
+def _int_option(kwargs: dict[str, Any], name: str, default: int) -> int:
+    # Like the runtime's conversion: anything with __index__, but no floats.
+    value = kwargs.get(name)
+    if value is None:
+        return default
+    try:
+        value = operator.index(value)
+    except TypeError:
+        raise awa.StagingError(
+            f"{name} must be an int, not {type(value).__name__}"
+        ) from None
+    if not -(2**15) <= value < 2**15:
+        raise awa.StagingError(f"{name} {value} does not fit in 16 bits")
+    return value
+
+
+def _tags_option(kwargs: dict[str, Any]) -> list[str]:
+    # Like the runtime's conversion: a sequence of str, but not a str itself.
+    value = kwargs.get("tags")
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise awa.StagingError(
+            f"tags must be a list of str, not {type(value).__name__}"
+        )
+    if not all(isinstance(tag, str) for tag in value):
+        raise awa.StagingError("tags must be a list of str")
+    return list(value)
+
+
+def _check_json(value: Any, name: str) -> None:
+    """Reject what the runtime's JSON conversion or jsonb would reject."""
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise awa.StagingError(f"{name} must not contain NUL characters")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise awa.StagingError(f"{name} keys must be str, not {type(key).__name__}")
+            _check_json(key, name)
+            _check_json(item, name)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_json(item, name)
+
+
 def _validated_size(args: Any, kwargs: dict[str, Any]) -> int:
     """Apply the runtime's staging rules and return the request's size."""
-    kind = kwargs.get("kind") or derive_kind(type(args).__name__)
-    queue = kwargs.get("queue", "default")
-    priority = kwargs.get("priority", 2)
-    max_attempts = kwargs.get("max_attempts", 25)
-    tags = kwargs.get("tags") or []
+    kind = _str_option(kwargs, "kind", "") or derive_kind(type(args).__name__)
+    queue = _str_option(kwargs, "queue", "default")
+    priority = _int_option(kwargs, "priority", 2)
+    max_attempts = _int_option(kwargs, "max_attempts", 25)
+    tags = _tags_option(kwargs)
+    args_json = _args_to_json(args)
+    metadata = kwargs.get("metadata") or {}
+    _check_json(args_json, "args")
+    _check_json(metadata, "metadata")
     if not 1 <= priority <= 4:
         raise awa.StagingError(f"priority {priority} is outside 1..=4")
     if not 1 <= max_attempts <= 1000:
@@ -133,8 +193,8 @@ def _validated_size(args: Any, kwargs: dict[str, Any]) -> int:
     return (
         len(kind.encode())
         + len(queue.encode())
-        + _compact_len(_args_to_json(args))
-        + _compact_len(kwargs.get("metadata") or {})
+        + _compact_len(args_json)
+        + _compact_len(metadata)
         + sum(len(tag.encode()) for tag in tags)
         + len(ordering_key)
     )
@@ -150,8 +210,10 @@ def _check_unique_opts(unique_opts: Any) -> None:
         if key in unique_opts and not isinstance(unique_opts[key], bool):
             raise awa.StagingError(f"unique_opts[{key!r}] must be a bool")
     by_period = unique_opts.get("by_period")
-    if by_period is not None and not isinstance(by_period, int):
-        raise awa.StagingError("unique_opts['by_period'] must be an int")
+    if by_period is not None and not (
+        isinstance(by_period, int) and -(2**63) <= by_period < 2**63
+    ):
+        raise awa.StagingError("unique_opts['by_period'] must be a 64-bit int")
     states = unique_opts.get("states")
     if states is not None and not (isinstance(states, int) and 0 <= states <= 255):
         raise awa.StagingError("unique_opts['states'] must be an int in 0..=255")
