@@ -118,6 +118,7 @@ fn build_dispatch_job(
         ctx.pool().clone(),
         ctx.queue_storage_store(),
         ctx.progress_buffer(),
+        ctx.follow_ups(),
     );
     Ok(Py::new(py, job)?.into_bound(py).into_any().unbind())
 }

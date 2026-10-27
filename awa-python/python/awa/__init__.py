@@ -45,8 +45,12 @@ from awa._awa import (
     SerializationError,
     ValidationError,
     TerminalError,
+    StagingError,
     DatabaseError,
     CallbackNotFound,
+    # Follow-up staging limits (ADR-046)
+    MAX_STAGED_FOLLOW_UPS,
+    MAX_STAGED_BYTES,
 )
 
 from awa.client import (
@@ -112,6 +116,9 @@ __all__ = [
     "SerializationError",
     "ValidationError",
     "TerminalError",
+    "StagingError",
+    "MAX_STAGED_FOLLOW_UPS",
+    "MAX_STAGED_BYTES",
     "DatabaseError",
     "CallbackNotFound",
     # Callback receiver contract (for user-owned API layers)

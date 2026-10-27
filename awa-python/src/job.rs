@@ -1,5 +1,6 @@
-use awa_model::{JobRow, JobState, QueueStorage};
+use awa_model::{InsertOpts, JobRow, JobState, QueueStorage};
 use awa_worker::context::ProgressState;
+use awa_worker::FollowUps;
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use sqlx::PgPool;
@@ -103,6 +104,8 @@ pub struct PyJob {
     queue_storage: Option<Arc<QueueStorage>>,
     /// Shared progress buffer for in-flight reporting (only set during dispatch).
     progress_buffer: Option<Arc<std::sync::Mutex<ProgressState>>>,
+    /// The attempt's follow-up staging buffer (ADR-046; only set during dispatch).
+    follow_ups: Option<FollowUps>,
     /// Progress JSON from the job row (for queried jobs).
     progress_json: Option<serde_json::Value>,
     /// Error history from the job row (array of {error, attempt, at} objects).
@@ -132,6 +135,7 @@ impl Clone for PyJob {
             pool: self.pool.clone(),
             queue_storage: self.queue_storage.clone(),
             progress_buffer: self.progress_buffer.clone(),
+            follow_ups: self.follow_ups.clone(),
             progress_json: self.progress_json.clone(),
             errors_json: self.errors_json.clone(),
             run_at: self.run_at,
@@ -184,6 +188,71 @@ impl PyJob {
     #[getter]
     fn finalized_at(&self) -> Option<String> {
         self.finalized_at.map(|d| d.to_rfc3339())
+    }
+
+    /// Stage a follow-up job that is enqueued in the same transaction as this
+    /// attempt's completion, and discarded if the attempt ends any other way
+    /// (ADR-046). Takes the same keyword arguments as `Transaction.insert`.
+    ///
+    /// The args are converted to JSON now. A request that cannot be staged
+    /// raises `StagingError` and poisons the attempt: if the handler still
+    /// returns normally, the attempt fails terminally.
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_on_completion(
+        &self,
+        py: Python<'_>,
+        args: Py<PyAny>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let Some(follow_ups) = &self.follow_ups else {
+            return Err(crate::StagingError::new_err(
+                "follow-ups can only be staged on the job passed to a running handler",
+            ));
+        };
+        let args_bound = args.bind(py);
+        let kind = match kind {
+            Some(kind) => kind,
+            None => crate::args::derive_kind(&crate::args::get_type_class_name(
+                args_bound.get_type().as_any(),
+            )?),
+        };
+        let opts = InsertOpts {
+            queue,
+            priority,
+            max_attempts,
+            run_at: run_at
+                .as_ref()
+                .map(|value| crate::transaction::parse_run_at(py, value.bind(py)))
+                .transpose()?,
+            metadata: metadata
+                .as_ref()
+                .map(|value| py_to_json(py, value.bind(py)))
+                .transpose()?
+                .unwrap_or(serde_json::json!({})),
+            tags,
+            unique: unique_opts
+                .as_ref()
+                .map(|value| crate::transaction::parse_unique_opts(py, value.bind(py)))
+                .transpose()?,
+            ordering_key: ordering_key
+                .as_ref()
+                .map(|value| crate::transaction::parse_ordering_key(py, value.bind(py)))
+                .transpose()?,
+            ..InsertOpts::default()
+        };
+        let args_json = crate::args::serialize_args(py, args_bound)?;
+        follow_ups
+            .enqueue_raw_on_completion(kind, args_json, opts)
+            .map_err(|err| crate::StagingError::new_err(err.to_string()))
     }
 
     fn is_cancelled(&self) -> bool {
@@ -602,6 +671,7 @@ impl From<JobRow> for PyJob {
             pool: None,
             queue_storage: None,
             progress_buffer: None,
+            follow_ups: None,
             progress_json,
             errors_json,
             run_at: row.run_at,
@@ -620,6 +690,7 @@ impl PyJob {
         pool: PgPool,
         queue_storage: Option<Arc<QueueStorage>>,
         progress_buffer: Arc<std::sync::Mutex<ProgressState>>,
+        follow_ups: FollowUps,
     ) -> Self {
         let mut job = Self::from(row);
         job.args_override = Some(args_override);
@@ -627,6 +698,7 @@ impl PyJob {
         job.pool = Some(pool);
         job.queue_storage = queue_storage;
         job.progress_buffer = Some(progress_buffer);
+        job.follow_ups = Some(follow_ups);
         job
     }
 }

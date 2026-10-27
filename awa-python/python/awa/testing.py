@@ -16,8 +16,10 @@ Usage:
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
@@ -84,9 +86,45 @@ NoJob = _NoJob()
 T = TypeVar("T")
 
 
+_STAGING_KWARGS = frozenset(
+    {
+        "kind",
+        "queue",
+        "priority",
+        "max_attempts",
+        "tags",
+        "metadata",
+        "run_at",
+        "unique_opts",
+        "ordering_key",
+    }
+)
+
+
+def _args_to_json(args: Any) -> Any:
+    if hasattr(args, "model_dump"):
+        return args.model_dump(mode="json")
+    if dataclasses.is_dataclass(args) and not isinstance(args, type):
+        return dataclasses.asdict(args)
+    return args
+
+
+@dataclass
+class StagedFollowUp:
+    """A follow-up staged with ``HandlerJob.enqueue_on_completion``."""
+
+    args: Any
+    kwargs: dict[str, Any]
+
+
 @dataclass
 class HandlerJob(Generic[T]):
-    """Python-side stand-in for the runtime job wrapper used by workers."""
+    """Python-side stand-in for the runtime job wrapper used by workers.
+
+    ``enqueue_on_completion`` applies the runtime's validation and limits and
+    records each request in ``staged``, so handler unit tests can assert on
+    what a handler staged without a database.
+    """
 
     args: T
     id: int
@@ -97,9 +135,43 @@ class HandlerJob(Generic[T]):
     deadline: datetime | None
     metadata: dict[str, Any]
     tags: list[str]
+    staged: list[StagedFollowUp] = field(default_factory=list)
+    staging_error: awa.StagingError | None = None
+    _staged_bytes: int = 0
+    _sealed: bool = False
 
     def is_cancelled(self) -> bool:
         return False
+
+    def enqueue_on_completion(self, args: Any, **kwargs: Any) -> None:
+        if self._sealed:
+            raise awa.StagingError(
+                "the handler already returned; follow-ups can no longer be staged"
+            )
+        try:
+            unknown = set(kwargs) - _STAGING_KWARGS
+            if unknown:
+                raise TypeError(f"unexpected keyword arguments: {sorted(unknown)}")
+            if len(self.staged) >= awa.MAX_STAGED_FOLLOW_UPS:
+                raise awa.StagingError(
+                    f"too many staged follow-ups (limit {awa.MAX_STAGED_FOLLOW_UPS})"
+                )
+            size = len(json.dumps(_args_to_json(args)).encode())
+            size += len(json.dumps(kwargs.get("metadata") or {}).encode())
+            size += sum(len(tag.encode()) for tag in kwargs.get("tags") or [])
+            if self._staged_bytes + size > awa.MAX_STAGED_BYTES:
+                raise awa.StagingError(
+                    f"staged follow-ups exceed {awa.MAX_STAGED_BYTES} bytes"
+                )
+        except awa.StagingError as e:
+            self.staging_error = self.staging_error or e
+            raise
+        except (TypeError, ValueError) as e:
+            error = awa.StagingError(f"follow-up could not be prepared: {e}")
+            self.staging_error = self.staging_error or error
+            raise error from e
+        self._staged_bytes += size
+        self.staged.append(StagedFollowUp(args=args, kwargs=dict(kwargs)))
 
 
 @dataclass
@@ -305,6 +377,21 @@ class AwaTestClient:
             job = await _get_job(self._client, job_id)
             return WorkResult(job=job, outcome=new_state, error=str(e))
 
+        # ADR-046, as in the runtime: staging closes when the handler
+        # returns, staged follow-ups ride only on completion, and a
+        # completion after a failed stage fails the attempt terminally.
+        handler_job._sealed = True
+        if result is None and handler_job.staging_error is not None:
+            error = f"a follow-up failed to stage: {handler_job.staging_error}"
+            tx3 = await self._client.transaction()
+            await tx3.execute(
+                "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+                job_id,
+            )
+            await tx3.commit()
+            job = await _get_job(self._client, job_id)
+            return WorkResult(job=job, outcome="failed", error=error)
+
         # Handle return value
         tx3 = await self._client.transaction()
         if result is None:
@@ -313,6 +400,16 @@ class AwaTestClient:
                 "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1",
                 job_id,
             )
+            for staged in handler_job.staged:
+                # A savepoint per insert, so a duplicate unique key is
+                # skipped without aborting the completion.
+                await tx3.execute("SAVEPOINT awa_staged_follow_up")
+                try:
+                    await tx3.insert(staged.args, **staged.kwargs)
+                except awa.UniqueConflict:
+                    await tx3.execute("ROLLBACK TO SAVEPOINT awa_staged_follow_up")
+                else:
+                    await tx3.execute("RELEASE SAVEPOINT awa_staged_follow_up")
             await tx3.commit()
             job = await _get_job(self._client, job_id)
             return WorkResult(job=job, outcome="completed")
