@@ -1623,7 +1623,11 @@ impl MaintenanceService {
                 if let Some(runtime) = self.active_standby_queue_storage().await {
                     let outcome = runtime
                         .store
-                        .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
+                        .rescue_stale_heartbeats_with_dlq(
+                            &self.pool,
+                            self.heartbeat_staleness,
+                            &|queue| self.dlq_policy.enabled_for(queue),
+                        )
                         .await;
                     self.process_heartbeat_rescues(outcome, false, Some(runtime))
                         .await;
@@ -1632,7 +1636,11 @@ impl MaintenanceService {
             RuntimeStorage::QueueStorage(runtime) => {
                 let outcome = runtime
                     .store
-                    .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
+                    .rescue_stale_heartbeats_with_dlq(
+                        &self.pool,
+                        self.heartbeat_staleness,
+                        &|queue| self.dlq_policy.enabled_for(queue),
+                    )
                     .await;
                 self.process_heartbeat_rescues(outcome, true, Some(runtime))
                     .await;
@@ -1771,8 +1779,7 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::StaleHeartbeat)
                         .await;
                 }
-                self.move_rescued_failures_to_dlq(&rescued, dlq_runtime, "heartbeat_stale")
-                    .await;
+                self.record_rescued_dlq_moves(&rescued, dlq_runtime, "heartbeat_stale");
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue stale heartbeat jobs");
@@ -1812,13 +1819,23 @@ impl MaintenanceService {
                 let outcome = self.rescue_canonical_expired_deadlines().await;
                 self.process_deadline_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
+                    let outcome = runtime
+                        .store
+                        .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
+                            self.dlq_policy.enabled_for(queue)
+                        })
+                        .await;
                     self.process_deadline_rescues(outcome, false, Some(runtime))
                         .await;
                 }
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime.store.rescue_expired_deadlines(&self.pool).await;
+                let outcome = runtime
+                    .store
+                    .rescue_expired_deadlines_with_dlq(&self.pool, &|queue| {
+                        self.dlq_policy.enabled_for(queue)
+                    })
+                    .await;
                 self.process_deadline_rescues(outcome, true, Some(runtime))
                     .await;
                 let outcome = self.rescue_canonical_expired_deadlines().await;
@@ -1953,8 +1970,7 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::DeadlineExceeded)
                         .await;
                 }
-                self.move_rescued_failures_to_dlq(&rescued, dlq_runtime, "deadline_exceeded")
-                    .await;
+                self.record_rescued_dlq_moves(&rescued, dlq_runtime, "deadline_exceeded");
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
@@ -1976,13 +1992,23 @@ impl MaintenanceService {
                 let outcome = self.rescue_canonical_expired_callbacks().await;
                 self.process_callback_rescues(outcome, true, None).await;
                 if let Some(runtime) = self.active_standby_queue_storage().await {
-                    let outcome = runtime.store.rescue_expired_callbacks(&self.pool).await;
+                    let outcome = runtime
+                        .store
+                        .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
+                            self.dlq_policy.enabled_for(queue)
+                        })
+                        .await;
                     self.process_callback_rescues(outcome, false, Some(runtime))
                         .await;
                 }
             }
             RuntimeStorage::QueueStorage(runtime) => {
-                let outcome = runtime.store.rescue_expired_callbacks(&self.pool).await;
+                let outcome = runtime
+                    .store
+                    .rescue_expired_callbacks_with_dlq(&self.pool, &|queue| {
+                        self.dlq_policy.enabled_for(queue)
+                    })
+                    .await;
                 self.process_callback_rescues(outcome, true, Some(runtime))
                     .await;
                 let outcome = self.rescue_canonical_expired_callbacks().await;
@@ -2125,8 +2151,7 @@ impl MaintenanceService {
                     self.emit_rescued(job, crate::events::RescueReason::ExpiredCallback)
                         .await;
                 }
-                self.move_rescued_failures_to_dlq(&rescued, dlq_runtime, "callback_timeout")
-                    .await;
+                self.record_rescued_dlq_moves(&rescued, dlq_runtime, "callback_timeout");
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
@@ -2135,40 +2160,24 @@ impl MaintenanceService {
         }
     }
 
-    /// Move rescued attempts that exhausted their budget into the DLQ when the
-    /// queue's policy enables it. `runtime` is the queue-storage runtime that
-    /// owns the rows' plane; canonical rows have no DLQ (see
-    /// [`Self::process_callback_rescues`]).
-    async fn move_rescued_failures_to_dlq(
+    /// Count rescued attempts that the queue-storage rescue dead-lettered.
+    /// The store moves an exhausted attempt into the DLQ in the rescue
+    /// transaction whenever the queue's policy enables it, so every `failed`
+    /// row on a DLQ-enabled queue here is already in `dlq_entries`.
+    /// `runtime` is the queue-storage runtime that owns the rows' plane;
+    /// canonical rows have no DLQ (see [`Self::process_callback_rescues`]).
+    fn record_rescued_dlq_moves(
         &self,
         rescued: &[JobRow],
         runtime: Option<&QueueStorageRuntime>,
         reason: &str,
     ) {
-        let Some(runtime) = runtime else {
+        if runtime.is_none() {
             return;
-        };
+        }
         for job in rescued {
-            if job.state != JobState::Failed || !self.dlq_policy.enabled_for(&job.queue) {
-                continue;
-            }
-            match runtime
-                .store
-                .move_failed_to_dlq(&self.pool, job.id, reason)
-                .await
-            {
-                Ok(Some(_)) => {
-                    self.metrics.record_dlq_moved(&job.kind, &job.queue, reason);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    error!(
-                        job_id = job.id,
-                        reason,
-                        error = %err,
-                        "Failed to move exhausted rescued job into DLQ"
-                    );
-                }
+            if job.state == JobState::Failed && self.dlq_policy.enabled_for(&job.queue) {
+                self.metrics.record_dlq_moved(&job.kind, &job.queue, reason);
             }
         }
     }

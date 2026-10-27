@@ -73,6 +73,11 @@ for each step.
   `awa.migration_lock_key()` expose the runner's advisory lock key.
 - Python prints a diagnostic to stderr if native shutdown has stalled for five
   seconds.
+- **`QueueStorage::rescue_stale_heartbeats_with_dlq`,
+  `rescue_expired_deadlines_with_dlq` and `rescue_expired_callbacks_with_dlq`**
+  take a per-queue predicate and dead-letter exhausted attempts in the rescue
+  transaction. The existing methods keep their behaviour and fail exhausted
+  attempts into `done_entries`.
 
 ### Changed
 
@@ -158,7 +163,11 @@ for each step.
   and deadline rescue never checked `max_attempts`, so `attempt` climbed past
   it. Those rescues now fail the job once its attempts are spent, as callback
   timeouts already did, and dead-letter it with reason `heartbeat_stale` or
-  `deadline_exceeded` on DLQ-enabled queues. A job with `max_attempts = 1` that
+  `deadline_exceeded` on DLQ-enabled queues. On queue storage the DLQ row is
+  written in the rescue transaction for all three rescue reasons, including
+  `callback_timeout`; an exhausted callback timeout used to be moved in a
+  second transaction, so an error between the two left it `failed` outside the
+  DLQ. A job with `max_attempts = 1` that
   loses its worker therefore fails instead of running again. Rescue runs on the
   maintenance leader, so the new behaviour applies once the leader runs this
   release.

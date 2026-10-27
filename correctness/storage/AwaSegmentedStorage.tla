@@ -785,11 +785,49 @@ RetryToDeferred(w, j) ==
                    readyTombstones>>
     /\ UnchangedSegmentState
 
+\* Callback-timeout rescue on exhausted attempts on a queue without a DLQ:
+\* the waiting entry fails into the terminal family in the rescue
+\* transaction, closing the old receipt as TimeoutWaitingToDlq does.
+TimeoutWaitingToTerminal(j) ==
+    /\ j \in waitingLeases
+    /\ j \in attemptState
+    /\ terminalSegments[terminalSegmentCursor] = "open"
+    /\ activeLeases' = activeLeases \ {j}
+    /\ waitingLeases' = waitingLeases \ {j}
+    /\ terminalEntries' = terminalEntries \cup {j}
+    /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = terminalSegmentCursor]
+    /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
+    /\ taskLease' = [w \in Workers |-> [taskLease[w] EXCEPT ![j] = 0]]
+    /\ attemptState' = attemptState \ {j}
+    /\ progressTouched' = progressTouched \ {j}
+    /\ heartbeatFresh' = heartbeatFresh \ {j}
+    /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
+    /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   dlqEntries,
+                   runLease,
+                   laneSeq,
+                   readySegmentOf,
+                   claimSegmentOf,
+                   readyTombstones>>
+    /\ UnchangedSegmentState
+
 \* Heartbeat or deadline rescue. No longer requires attempt_state, so
 \* short jobs that claimed and immediately lost their heartbeat (e.g.
 \* worker crash before the first heartbeat publish) are reachable here.
 \* Rescue closes the old run_lease's receipt; the next Claim will open a
 \* fresh receipt in the current claim segment.
+\*
+\* This spec does not track the retry budget: RescueToReady, RescueToDlq
+\* and RescueToTerminal are all enabled for any stale attempt, as
+\* RetryToDeferred / FailToDlq are for a handler's outcome. MaxRunLease
+\* bounds exploration and is not `max_attempts`. Choosing the outcome
+\* nondeterministically over-approximates the Rust rule (retry only while
+\* `attempt < max_attempts`), which `RetryHasBudget` checks in the
+\* protocol and core models.
 RescueToReady(j) ==
     /\ j \in activeLeases
     /\ j \notin waitingLeases
@@ -822,11 +860,10 @@ RescueToReady(j) ==
                    readyTombstones>>
     /\ UnchangedSegmentState
 
-\* Rescue of an attempt that was the job's last (#546): the same stale
-\* lease and receipt closure as RescueToReady, but the attempt has spent
-\* `max_attempts`, so the job fails instead of re-entering the ready lane.
-\* Like TimeoutWaitingToDlq and FailToDlq, the spec collapses `failed` and
-\* its DLQ move into `dlqEntries`.
+\* Rescue of an attempt that was the job's last, on a queue whose DLQ is
+\* enabled: the same stale lease and receipt closure as RescueToReady, and
+\* `settle_rescued_attempt_tx` inserts the `dlq_entries` row in that same
+\* transaction, so the job never sits `failed` outside the DLQ.
 RescueToDlq(j) ==
     /\ j \in activeLeases
     /\ j \notin waitingLeases
@@ -850,6 +887,36 @@ RescueToDlq(j) ==
                    laneSeq,
                    readySegmentOf,
                    terminalSegmentOf,
+                   claimSegmentOf,
+                   readyTombstones>>
+    /\ UnchangedSegmentState
+
+\* Rescue of an attempt that was the job's last, on a queue without a DLQ:
+\* the attempt fails into `done_entries` in the rescue transaction.
+RescueToTerminal(j) ==
+    /\ j \in activeLeases
+    /\ j \notin waitingLeases
+    /\ j \notin heartbeatFresh
+    /\ terminalSegments[terminalSegmentCursor] = "open"
+    /\ activeLeases' = activeLeases \ {j}
+    /\ terminalEntries' = terminalEntries \cup {j}
+    /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = terminalSegmentCursor]
+    /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
+    /\ attemptState' = attemptState \ {j}
+    /\ progressTouched' = progressTouched \ {j}
+    /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
+    /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingLeases,
+                   dlqEntries,
+                   runLease,
+                   taskLease,
+                   heartbeatFresh,
+                   laneSeq,
+                   readySegmentOf,
                    claimSegmentOf,
                    readyTombstones>>
     /\ UnchangedSegmentState
@@ -1481,12 +1548,14 @@ Next ==
     \/ \E j \in Jobs : ResumeWaitingToRunning(j)
     \/ \E j \in Jobs : TimeoutWaitingToReady(j)
     \/ \E j \in Jobs : TimeoutWaitingToDlq(j)
+    \/ \E j \in Jobs : TimeoutWaitingToTerminal(j)
     \/ \E w \in Workers, j \in Jobs : FastComplete(w, j)
     \/ \E w \in Workers, j \in Jobs : StatefulComplete(w, j)
     \/ \E w \in Workers, j \in Jobs : FailToDlq(w, j)
     \/ \E w \in Workers, j \in Jobs : RetryToDeferred(w, j)
     \/ \E j \in Jobs : RescueToReady(j)
     \/ \E j \in Jobs : RescueToDlq(j)
+    \/ \E j \in Jobs : RescueToTerminal(j)
     \/ \E j \in Jobs, r \in RunLeaseValues : RescueStaleReceipt(j, r)
     \/ \E j \in Jobs : CancelWaitingToTerminal(j)
     \/ \E j \in Jobs : CancelRunningToTerminal(j)

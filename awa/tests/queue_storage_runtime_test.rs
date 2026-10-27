@@ -15523,6 +15523,84 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+/// An exhausted rescue on a DLQ-enabled queue dead-letters the job inside
+/// the rescue transaction itself, so the job is never `failed` outside the
+/// DLQ waiting on a second step. The predicate is per queue: the same sweep
+/// fails an exhausted job on a queue without a DLQ into `done_entries`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_exhausted_rescue_dead_letters_atomically() {
+    let (_db_guard, pool) = setup_pool(10).await;
+    let dlq_queue = "qs_rescue_atomic_dlq";
+    let plain_queue = "qs_rescue_atomic_plain";
+    let schema = "awa_qs_rescue_atomic_dlq";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let mut stale = Vec::new();
+    for (id, queue) in [(41, dlq_queue), (42, plain_queue)] {
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let claimed = store
+            .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+            .await
+            .expect("claim the job's only attempt");
+        assert_eq!(claimed.len(), 1);
+        age_receipt_claim(
+            &pool,
+            &store,
+            job_id,
+            claimed[0].job.run_lease,
+            Duration::from_secs(600),
+        )
+        .await;
+        stale.push(job_id);
+    }
+
+    let rescued = store
+        .rescue_stale_heartbeats_with_dlq(&pool, Duration::from_secs(60), &|queue| {
+            queue == dlq_queue
+        })
+        .await
+        .expect("rescue the stale claims");
+    let mut rescued_ids: Vec<i64> = rescued.iter().map(|job| job.id).collect();
+    rescued_ids.sort_unstable();
+    assert_eq!(rescued_ids, stale);
+    assert!(
+        rescued.iter().all(|job| job.state == JobState::Failed),
+        "both attempts were the job's last, so rescue must fail them: {rescued:?}"
+    );
+
+    // No maintenance pass has run: the DLQ row exists as soon as the
+    // rescue commits.
+    assert_eq!(dlq_count(&pool, &store, dlq_queue).await, 1);
+    assert_eq!(failed_done_count(&pool, &store, dlq_queue).await, 0);
+    assert_eq!(dlq_reason(&pool, &store, stale[0]).await, "heartbeat_stale");
+
+    assert_eq!(dlq_count(&pool, &store, plain_queue).await, 0);
+    assert_eq!(failed_done_count(&pool, &store, plain_queue).await, 1);
+
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_dlq_api_round_trip() {
     let (_db_guard, pool) = setup_pool(10).await;

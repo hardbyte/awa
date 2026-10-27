@@ -422,8 +422,8 @@ RescueToDeferredTx == <<
     Mut("Insert", "deferred_jobs")
 >>
 
-\* ... and once the rescued attempt was the last (#546) the job fails into
-\* done_entries instead, as an exhausted callback-timeout rescue does.
+\* ... once the rescued attempt was the last the job fails into done_entries
+\* instead, as an exhausted callback-timeout rescue does ...
 RescueToTerminalTx == <<
     Mut("Delete", "leases"),
     Mut("Delete", "attempt_state"),
@@ -432,6 +432,17 @@ RescueToTerminalTx == <<
     Mut("Update", "lease_claims"),
     Mut("Insert", "done_entries"),
     Mut("Insert", "queue_terminal_count_deltas")
+>>
+
+\* ... or, on a DLQ-enabled queue, straight into dlq_entries in the same
+\* transaction.
+RescueToDlqTx == <<
+    Mut("Delete", "leases"),
+    Mut("Delete", "attempt_state"),
+    Mut("Insert", "lease_claim_closures"),
+    Mut("Insert", "lease_claim_closure_batches"),
+    Mut("Update", "lease_claims"),
+    Mut("Insert", "dlq_entries")
 >>
 
 \* retry_after / snooze
@@ -661,7 +672,7 @@ Transactions == {
     CancelReceiptOnlyTx, CancelRunningTx, CancelReadyTx, DeleteReadyCompatTx,
     ReprioritizeReadyTx,
     FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,
-    RescueToDeferredTx, RescueToTerminalTx,
+    RescueToDeferredTx, RescueToTerminalTx, RescueToDlqTx,
     EnterCallbackWaitTx, ResumeWaitingTx, ResolveExternalTerminalTx,
     RetryExternalTx, MoveFailedToDlqTx, DiscardTerminalTx,
     DeleteTerminalCompatTx, DeleteCompactReceiptTerminalCompatTx,
