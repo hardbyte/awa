@@ -51,13 +51,17 @@ Workers load the enabled, unexpired rules on the same slow refresh as queue over
 
 The CEL environment is the job's `args`, `metadata`, `kind`, `queue`, `attempt`, `priority` and `tags`. It is evaluated on the worker with the CEL support that callback filters already use. A rule whose expression fails to compile is rejected when it is created.
 
-An expression that errors when evaluated (for example `args.width` on a job without a `width`) **does not match**. The job runs as it would have without the rule. The error is counted in `awa.job.skip_rule_errors{rule}` and recorded on the rule as `last_error`. The other choice, treating an error as a match, would let one malformed expression quarantine healthy jobs. CEL's `has()` lets a rule author handle absent fields explicitly.
+An expression that errors when evaluated (for example `args.width` on a job without a `width`) **does not match**. The job runs as it would have without the rule. The error is counted in `awa.job.skip_rule_errors{rule}`. Each worker also keeps a per-rule error count and the latest message in the runtime snapshot it already publishes on its heartbeat, so the CLI and admin UI can show them. The worker never writes to the rules table, however often an expression fails. The other choice, treating an error as a match, would let one malformed expression quarantine healthy jobs. CEL's `has()` lets a rule author handle absent fields explicitly.
 
 ### Actions
 
 Each action reuses an existing outcome path. None is a new kind of state transition.
 
-- **`hold`, the default.** The job is snoozed: rescheduled without spending an attempt, with the rule ID recorded under `metadata."awa:held_by"`. It is held until the rule's `expires_at` or for 24 hours, whichever is sooner, not for a short interval. A short interval would re-claim every held job each cycle, costing one claim and one snooze transaction per job per interval. When a rule is removed, `awa job skip remove` releases the jobs it held with one batch operation (ADR-030) that sets `run_at = now()` for scheduled jobs carrying that `awa:held_by`. A held job that reaches its horizon while the rule is still active is claimed and held again, at most once a day.
+- **`hold`, the default.** The job is snoozed: rescheduled without spending an attempt.
+  - **Duration.** It is held until the rule's `expires_at` or for 24 hours, whichever is sooner, not for a short interval. A short interval would re-claim every held job each cycle, costing one claim and one snooze transaction per job per interval. A held job that reaches its horizon while the rule is still active is claimed and held again, at most once a day.
+  - **Ownership.** The snooze's transaction also writes a row to a second small table, `awa.job_skip_holds (rule_id, job_id, held_at)`, with `ON CONFLICT DO NOTHING` for a re-hold. Ownership stays out of the job's metadata, which may be any JSON value, not only an object.
+  - **Release.** When a rule is removed, `awa job skip remove` releases its jobs with one batch operation (ADR-030). The operation sets `run_at = now()` for the scheduled jobs listed under that rule and deletes their rows.
+  - **Cleanup.** Maintenance deletes holds whose job is no longer scheduled, for example because an admin cancelled it.
 - **`dead_letter`.** The job moves to the dead-letter queue with reason `skipped`, keeping its args so a DLQ retry can re-run it after a fix. The attempt is spent: the job did not run, but it was not deferred either.
 - **`cancel`.** The job is cancelled with reason `skipped by rule <id>: <reason>`.
 
@@ -73,7 +77,7 @@ A rule never touches an attempt that is already running. To stop those as well, 
 - **Metrics:**
   - `awa.job.skipped{kind, queue, action, rule}`;
   - `awa.job.skip_rule_errors{rule}`;
-  - a held-jobs gauge per rule, so a hold nobody is watching shows up on a dashboard.
+  - a held-jobs gauge per rule, counted from `awa.job_skip_holds` on the rules refresh, so a hold nobody is watching shows up on a dashboard.
 
 ### Rollout
 
@@ -99,9 +103,10 @@ In a mixed fleet, workers older than the migration ignore rules. `awa job skip a
 
 ### Negative
 
-- A claim, then a finalize, for each skipped job. A rule that matches a large backlog churns through it once, and `hold` keeps that to once per held job per horizon.
+- Each skipped job costs a claim and a finalize, and a hold adds one row in `awa.job_skip_holds`, written in the snooze's own transaction. Jobs that match no rule write nothing.
+- A rule that matches a large backlog churns through it once, and `hold` keeps that to once per held job per horizon.
 - Up to 10 seconds between adding a rule and every worker applying it. Jobs claimed in that window run. An urgent stop is still a queue pause.
-- Another place where a job can go "missing". The held-jobs gauge and the `awa:held_by` metadata exist so that a hold is visible.
+- Another place where a job can go "missing". The held-jobs gauge and `awa.job_skip_holds` exist so that a hold is visible.
 - A forgotten hold delays jobs indefinitely. Expiry is optional because some fixes take longer than any default, but the CLI asks for confirmation when `--expires-in` is omitted.
 
 ## Alternatives considered
@@ -127,7 +132,7 @@ A handler can check a feature flag and return `Snooze`. That works today and nee
 
 ### Make skipped jobs a new state
 
-A `held` state would make holds visible without metadata. It was rejected because it touches every state machine, both engines, the admin UI and the TLA+ models, whereas a hold that is a snooze with a marker needs no new state.
+A `held` state would make holds visible without a side table. It was rejected because it touches every state machine, both engines, the admin UI and the TLA+ models, whereas a hold that is a snooze plus a row in `awa.job_skip_holds` needs no new state.
 
 ## Open questions
 
