@@ -166,6 +166,23 @@ Two consequences of deduplication need care:
 - A follow-up of A's own kind and args, with A's own unique options, collides with A itself, because A's row holds the key while it is running and, by default, once completed. It is skipped and the chain stops. Give a continuation different args or options.
 - Two follow-ups with the same key staged in one attempt collapse to one, as do different args when `by_args` is false.
 
+## Non-goals: this is not a workflow engine
+
+The [PRD](https://github.com/hardbyte/awa/blob/main/docs/archive/prd.md#35-non-goals) sets Awa's boundary: "No DAGs, no fan-out/fan-in, no saga orchestration. If you need Temporal, use Temporal." The 0.7 roadmap (D7) repeats it for job dependencies, and [#81](https://github.com/hardbyte/awa/issues/81) asks any proposal that moves values between jobs to restate it. Staging stays inside the boundary. This ADR does not provide, and must not grow into:
+
+- **A pipeline definition.** Awa stores no relation between A and B. No graph, step list or topology exists in the builder, the schema or the runtime; the only place the "pipeline" exists is the handler's code.
+- **Fan-in or joins.** Nothing waits for several jobs, or for B to finish. A is complete before B exists, and B's outcome never reaches A.
+- **Workflow state or step results.** A's value travels only in B's args. Nothing is recorded on A, and there is no result store (see [Persist the output](#persist-the-output-on-the-job-or-its-terminal-history)).
+- **Guarantees across steps.** B's failure does not affect A. There is no compensation, saga, rollback across jobs, or retry of a chain as a unit.
+- **Durable execution.** An attempt is never resumed or replayed. A retried attempt starts from the beginning with an empty staging buffer.
+- **Predicates in the engine.** A conditional follow-up is an `if` in the handler. The engine inserts the rows it is handed and evaluates no conditions.
+
+The PRD's "no fan-out" refers to a fan-out construct: a step that spawns children and tracks them as a group, usually paired with a fan-in. Staging several follow-ups is not that. It is the same as an application inserting several jobs in one transaction, which Awa has always supported ([ADR-006](006-awa-transaction.md)). The children are independent jobs and nothing tracks them as a set.
+
+The guarantee is scoped to one transaction of one attempt: B is enqueued if and only if A's completion commits. That is ADR-006's transactional enqueue applied to the completion transaction. Once the completion commits, Awa keeps no link between A and B.
+
+This gives a test for later proposals. A feature crosses into workflow-engine territory if it requires Awa to remember a relationship between jobs after the triggering transaction commits: a join, a step's result, a chain's status, or a compensation. Such a feature needs its own ADR under #81's rules, not an extension of this one. The provenance key in [Open extensions](#open-extensions) passes this test: it is a value written into B's metadata, not state the engine reads.
+
 ## Rollout
 
 No schema change. A stage-B kind is new code, and an older worker that claims a job of an unknown kind fails it terminally. Because A has already completed, nothing re-creates that B; it must be retried from the DLQ or the admin UI. So:
