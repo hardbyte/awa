@@ -21,6 +21,7 @@ The model starts with a committed order and job. It is an Awa-specific teaching 
 
 <details class="awa-failure-desktop">
 <summary>Explore inside this page on a wider screen</summary>
+<!-- The lab shares the hardbyte.github.io origin with these docs. Without allow-same-origin it runs in an opaque origin; allow-popups-to-escape-sandbox would let a popup drop that and reach this page through its opener. -->
 <iframe
   class="awa-failure-lab"
   src="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html"
@@ -29,7 +30,7 @@ The model starts with a committed order and job. It is an Awa-specific teaching 
   title="Interactive Awa job, worker and receipt model"
   loading="lazy"
   referrerpolicy="no-referrer"
-  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+  sandbox="allow-scripts allow-popups"
 >
   <p><a href="https://hardbyte.github.io/postgresql-job-queue-benchmarking/lab/awa.html">Open the interactive Awa model.</a></p>
 </iframe>
