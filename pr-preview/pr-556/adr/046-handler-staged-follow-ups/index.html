@@ -1,0 +1,2693 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/adr/046-handler-staged-follow-ups/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>ADR-046: Handler-staged follow-up jobs - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  
+  
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="ADR-046: Handler-staged follow-up jobs — AWA">
+  <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/adr/046-handler-staged-follow-ups/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#adr-046-handler-staged-follow-up-jobs" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              ADR-046: Handler-staged follow-up jobs
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../security/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Security
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Migrations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migration overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Status
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#context" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Decision">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rust-surface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rust surface
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#python-surface" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Python surface
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lifetime-of-the-staging-buffer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lifetime of the staging buffer
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-staged-follow-ups-commit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When staged follow-ups commit
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-they-are-inserted" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How they are inserted
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Limits
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#visibility-and-testing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Visibility and testing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#guarantees" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Guarantees
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rollout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rollout
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#relationship-to-other-adrs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Relationship to other ADRs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#consequences" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Consequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Consequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#positive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positive
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#negative" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Negative
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alternatives-considered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternatives considered
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Alternatives considered">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#handler-output-read-by-an-output-typed-spec" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Handler output read by an output-typed spec
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#an-attempt-scoped-output-slot-on-the-context-read-by-a-registered-spec" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        An attempt-scoped output slot on the context, read by a registered spec
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#persist-the-output-on-the-job-or-its-terminal-history" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persist the output on the job or its terminal history
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#insert-from-the-handler-with-ctxpool" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Insert from the handler with ctx.pool()
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#wait-for-caller-owned-completion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Wait for caller-owned completion
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#job-dependencies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Job dependencies
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#open-extensions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open extensions
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
+                  
+
+
+  
+  
+
+
+<h1 id="adr-046-handler-staged-follow-up-jobs">ADR-046: Handler-staged follow-up jobs<a class="headerlink" href="#adr-046-handler-staged-follow-up-jobs" title="Permanent link">&para;</a></h1>
+<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
+<p>Proposed. Extends <a href="../029-transactional-followup-jobs/">ADR-029</a> transactional follow-ups. No schema change.</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p>A two-stage pipeline: a stage-A handler computes a value at run time, such as the ID of the item it resolved, and stage B must run for that value, once per distinct value however many A jobs produce it. B should exist only if A completes.</p>
+<p>ADR-029 enqueues follow-ups transactionally, but its registered specs (<code>on_completed_enqueue_with::&lt;A, B, _&gt;(|args, job| ...)</code>) see only A's args and job row, not what A's handler computed. Unique options on a spec do deduplicate it: a follow-up whose key already exists is skipped under a savepoint and the trigger still commits (<a href="../../lifecycle-hooks/#deduplicating-follow-ups">Deduplicating follow-ups</a>). So the pipeline works only when B's value can be derived from A's args.</p>
+<p>The report that prompted this ADR asked for typed or untyped metadata on <code>JobResult</code> or <code>JobRow</code> that a registered spec could read. The alternatives below explain why that shape was not chosen. Today a handler has three ways to pass the value, none adequate:</p>
+<ul>
+<li><strong>Write it where a registered spec can read it.</strong> Completion clears the progress buffer before specs run, on both engines. Progress also survives retries by design (<a href="../014-structured-progress/">ADR-014</a>), so a value written by a failed attempt could reach a later attempt's follow-up.</li>
+<li><strong>Insert B from the handler</strong> with <code>insert_with(ctx.pool(), ...)</code> and unique options. B then exists before A commits, survives if A fails or is rescued, and a non-deterministic handler can insert a different B on each attempt.</li>
+<li><strong>Use caller-owned completion</strong> (<a href="../042-caller-owned-finalization-transactions/">ADR-042</a>). It is atomic, but it needs a distinct handler type, a dedicated finalization function and a per-job transaction. It is the right tool when A writes application rows, and far heavier than passing one value.</li>
+</ul>
+<p>The requirement:</p>
+<blockquote>
+<p>A handler can declare follow-up jobs built from values it computed. They are enqueued if and only if the handler's own completion of this attempt commits, and they are deduplicated by their own unique keys.</p>
+</blockquote>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p>The handler <strong>stages follow-ups</strong> on its context while it runs. A <em>staged follow-up</em> is an <code>EnqueueRequest</code> passed to <code>enqueue_on_completion</code>; once inserted it is an ordinary <em>follow-up job</em>, the same as one produced by a <em>registered spec</em>. The runtime inserts staged follow-ups in the transaction that completes the attempt and discards them on every other outcome. <code>JobResult</code> and the <code>Worker</code> trait do not change, no <code>on_*_enqueue*</code> builder is added, and nothing is persisted on A's row.</p>
+<h3 id="rust-surface">Rust surface<a class="headerlink" href="#rust-surface" title="Permanent link">&para;</a></h3>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">impl</span><span class="w"> </span><span class="n">JobContext</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="sd">/// A cloneable handle for staging follow-ups, usable from futures that</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="sd">/// cannot borrow the context.</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">follow_ups</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">FollowUps</span><span class="p">;</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="sd">/// Shorthand for `self.follow_ups().enqueue_on_completion(request)`.</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">enqueue_on_completion</span><span class="o">&lt;</span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="nc">JobArgs</span><span class="o">&gt;</span><span class="p">(</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">        </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="nb">Into</span><span class="o">&lt;</span><span class="n">EnqueueRequest</span><span class="o">&lt;</span><span class="n">F</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">StageError</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="p">}</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="cp">#[derive(Clone)]</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">FollowUps</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* Arc to the attempt's staging buffer */</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="k">impl</span><span class="w"> </span><span class="n">FollowUps</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">enqueue_on_completion</span><span class="o">&lt;</span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="nc">JobArgs</span><span class="o">&gt;</span><span class="p">(</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="w">        </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="nb">Into</span><span class="o">&lt;</span><span class="n">EnqueueRequest</span><span class="o">&lt;</span><span class="n">F</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">StageError</span><span class="o">&gt;</span><span class="p">;</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="p">}</span>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="sd">/// Why a follow-up could not be staged. Converts to `JobError::Terminal`.</span>
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="cp">#[non_exhaustive]</span>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">StageError</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="w">    </span><span class="sd">/// The args or metadata would not serialize or failed validation.</span>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="w">    </span><span class="n">Invalid</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="w">    </span><span class="n">TooMany</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">limit</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="w">    </span><span class="n">TooLarge</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">limit_bytes</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="w">    </span><span class="sd">/// The handler already returned.</span>
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="w">    </span><span class="n">Sealed</span><span class="p">,</span>
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="p">}</span>
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a>
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a><span class="k">impl</span><span class="o">&lt;</span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="nc">JobArgs</span><span class="o">&gt;</span><span class="w"> </span><span class="n">EnqueueRequest</span><span class="o">&lt;</span><span class="n">F</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a><span class="w">    </span><span class="sd">/// Set unique options without replacing the rest of the `InsertOpts`.</span>
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">unique</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">unique</span><span class="p">:</span><span class="w"> </span><span class="nc">UniqueOpts</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="p">;</span>
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="w">    </span><span class="sd">/// Set metadata without replacing the rest of the `InsertOpts`.</span>
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">metadata</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">metadata</span><span class="p">:</span><span class="w"> </span><span class="nc">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="p">;</span>
+</span><span id="__span-0-39"><a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The pipeline, as a typed handler:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">client_builder</span><span class="p">.</span><span class="n">register</span><span class="p">::</span><span class="o">&lt;</span><span class="n">StageA</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">args</span><span class="p">,</span><span class="w"> </span><span class="n">ctx</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">follow_ups</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ctx</span><span class="p">.</span><span class="n">follow_ups</span><span class="p">();</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">item_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">resolve_item</span><span class="p">(</span><span class="o">&amp;</span><span class="n">args</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">        </span><span class="n">follow_ups</span><span class="p">.</span><span class="n">enqueue_on_completion</span><span class="p">(</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">            </span><span class="n">EnqueueRequest</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">StageB</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">item_id</span><span class="w"> </span><span class="p">}).</span><span class="n">unique</span><span class="p">(</span><span class="n">UniqueOpts</span><span class="p">::</span><span class="n">default</span><span class="p">()),</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">        </span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">JobResult</span><span class="p">::</span><span class="n">Completed</span><span class="p">)</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="p">})</span>
+</span></code></pre></div>
+<p><code>register</code> closures return a <code>'static</code> future that cannot borrow the context, which is why the handle exists. A <code>Worker</code> impl can call <code>ctx.enqueue_on_completion</code> directly.</p>
+<p>Staging serializes the args, computes the unique key and checks the limits immediately, so nothing type-dependent happens inside the completion transaction. Every staging failure is deterministic for the given request, so <code>StageError</code> converts to <code>JobError::Terminal</code> by default; a handler whose fan-out size varies between attempts can map it to a retryable error instead.</p>
+<p>A failed stage <strong>poisons the attempt</strong>. If any <code>enqueue_on_completion</code> call failed and the handler still returns <code>Completed</code>, the runtime fails the attempt terminally with the staging error, so the job goes to the DLQ when one is enabled and registered <code>on_exhausted_enqueue</code> specs fire. A swallowed error (<code>let _ = ...</code>, or <code>except Exception</code> in Python) therefore cannot let A complete without the follow-up it asked for.</p>
+<p><code>EnqueueRequest::unique</code> and <code>::metadata</code> exist because <code>with_opts</code> replaces the whole <code>InsertOpts</code>, silently discarding an earlier <code>.queue()</code> or <code>.priority()</code>. Metadata matters here: the unique key covers B's kind and all of its args (with <code>UniqueOpts::default()</code>), so context that must not affect deduplication, such as A's ID, belongs in metadata.</p>
+<h3 id="python-surface">Python surface<a class="headerlink" href="#python-surface" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">handle</span><span class="p">(</span><span class="n">job</span><span class="p">):</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">item_id</span> <span class="o">=</span> <span class="k">await</span> <span class="n">resolve_item</span><span class="p">(</span><span class="n">job</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">job</span><span class="o">.</span><span class="n">enqueue_on_completion</span><span class="p">(</span><span class="n">StageB</span><span class="p">(</span><span class="n">item_id</span><span class="o">=</span><span class="n">item_id</span><span class="p">),</span> <span class="n">unique_opts</span><span class="o">=</span><span class="p">{})</span>
+</span></code></pre></div>
+<p>The keyword arguments mirror <code>Transaction.insert</code>: <code>kind</code>, <code>queue</code>, <code>priority</code>, <code>max_attempts</code>, <code>tags</code>, <code>metadata</code>, <code>run_at</code>, <code>unique_opts</code> and <code>ordering_key</code>. <code>unique_opts={}</code> means the default options; <code>states</code> is an integer bitmask, as for <code>Transaction.insert</code>. A request that cannot be staged raises <code>awa.StagingError</code>, a subclass of <code>awa.TerminalError</code>, and poisons the attempt as in Rust.</p>
+<p>Args are converted to JSON when staged, while the handler holds the GIL, so the completion transaction is pure Rust and never calls back into Python. This is Python's first follow-up primitive: registered specs remain Rust-only (ADR-029, open extensions). Return values do not carry follow-ups, because Python already maps any unrecognised return value to <code>Completed</code>.</p>
+<h3 id="lifetime-of-the-staging-buffer">Lifetime of the staging buffer<a class="headerlink" href="#lifetime-of-the-staging-buffer" title="Permanent link">&para;</a></h3>
+<p>The buffer belongs to one attempt. It is created with the attempt's context and <strong>sealed when the handler returns</strong>: the executor takes its contents at that point, and later calls, for example from a task the handler spawned and did not await, return <code>StageError::Sealed</code> (<code>awa.StagingError</code> in Python). A retried attempt starts with an empty buffer and stages again when its handler re-runs.</p>
+<h3 id="when-staged-follow-ups-commit">When staged follow-ups commit<a class="headerlink" href="#when-staged-follow-ups-commit" title="Permanent link">&para;</a></h3>
+<p>The guarantee covers the <strong>handler's own <code>Completed</code> finalization</strong>. Every other way an attempt can end discards the buffer.</p>
+<table>
+<thead>
+<tr>
+<th>Attempt ends with</th>
+<th>Staged follow-ups</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Completed</code>, and the lease-guarded completion commits</td>
+<td>Inserted in the completion transaction</td>
+</tr>
+<tr>
+<td><code>Completed</code>, but the guard matches no row (rescued, cancelled or taken over first)</td>
+<td>Discarded with the rolled-back transaction</td>
+</tr>
+<tr>
+<td><code>Completed</code> after a failed stage</td>
+<td>Discarded; the attempt fails terminally with the staging error</td>
+</tr>
+<tr>
+<td><code>RetryAfter</code>, <code>Snooze</code>, <code>Cancel</code>, <code>Err</code>, panic</td>
+<td>Discarded</td>
+</tr>
+<tr>
+<td><code>WaitForCallback</code> (the handler returns and parks the job)</td>
+<td>Discarded. The context is gone before the callback resolves. Logged at <code>warn</code> with kind, job ID and count, never args, and counted in a metric, because it is almost always a mistake</td>
+</tr>
+<tr>
+<td><code>ctx.wait_for_callback(...)</code> inside the handler (<a href="../021-enhanced-external-wait/">ADR-021</a>), resumed, then <code>Completed</code></td>
+<td>Inserted: the handler and its buffer stay alive across the wait</td>
+</tr>
+<tr>
+<td><code>ctx.wait_for_callback(...)</code> inside the handler, but <code>Client::complete_external</code> completes the job</td>
+<td>Discarded. The external completion finalizes the job from a process with no handler context; registered specs fire there, staged follow-ups cannot. The waiting handler then gets an error from <code>wait_for_callback</code>, and even a <code>Completed</code> from it would find no running row</td>
+</tr>
+<tr>
+<td>Deadline expiry abandons the handler, or shutdown cancels it before finalization</td>
+<td>Discarded; rescue re-runs the handler if attempts remain</td>
+</tr>
+<tr>
+<td>Shutdown cancels finalization, or the finalize deadline expires</td>
+<td>Committed with the completion if the commit landed, otherwise not; rescue re-runs the handler if attempts remain</td>
+</tr>
+</tbody>
+</table>
+<h3 id="how-they-are-inserted">How they are inserted<a class="headerlink" href="#how-they-are-inserted" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>One transaction.</strong> The completion transaction runs registered <code>Completed</code> specs first, then the staged follow-ups in staging order. Either all of it commits with the completion or none of it does.</li>
+<li><strong>Deduplication.</strong> A staged follow-up with unique options is inserted under a savepoint; a conflict on the deduplication index (<code>idx_awa_jobs_unique</code>) is skipped and the completion still commits, exactly as for registered specs. Any other error rolls the completion back. Skips are logged at <code>debug</code> with kinds and job IDs, never args.</li>
+<li><strong>Path selection is per job.</strong> A job that staged nothing keeps the batched and receipt-plane completion paths. A job that staged something takes the per-job completion transaction, as every job of a kind with registered <code>Completed</code> specs already does.</li>
+<li><strong>Finalize retries reuse the same follow-ups.</strong> On a deadlock or lost connection, <code>finalize_with_retry</code> runs the completion again in a new transaction. The sealed contents are owned by the finalizer and borrowed by each attempt, never drained, so a retry carries them. A commit whose acknowledgement was lost replays as stale and inserts nothing.</li>
+</ul>
+<h3 id="limits">Limits<a class="headerlink" href="#limits" title="Permanent link">&para;</a></h3>
+<p>Per attempt, at most <strong>16 staged follow-ups</strong> and <strong>64 KiB of serialized requests</strong> (args, metadata and tags) in total, across any number of <code>wait_for_callback</code> resumes. Both are constants in v1.</p>
+<ul>
+<li><strong>Count.</strong> Each unique insert holds a released savepoint until the completion commits, and on canonical the unique-claim trigger's exception block adds a second subtransaction. A backend caches 64 subtransactions before overflowing into <code>pg_subtrans</code>, so 16 unique follow-ups use at most 32 and leave room for registered specs.</li>
+<li><strong>Size.</strong> Staged follow-ups stay in memory from staging until finalization, both in running handlers and in completions waiting for or holding a finalizer slot. Finalizer capacity is <code>max(batch_size × shards × 2, worker capacity)</code>: 1,024 or 4,096 with queue-storage defaults, 8,192 on canonical. The worst case is 64 KiB × (finalizer capacity + worker capacity), about 512 MiB on canonical, reached only if every such job is at the limit.</li>
+</ul>
+<p>Larger fan-out belongs in a dedicated fan-out job or a bulk insert, not in one completion transaction.</p>
+<h3 id="visibility-and-testing">Visibility and testing<a class="headerlink" href="#visibility-and-testing" title="Permanent link">&para;</a></h3>
+<p>Staged follow-ups appear only as the inserted jobs: not in <code>UntypedJobEvent::Completed</code>, lifecycle hooks, spans or A's row. The value A computed is visible in B's args. Args are never logged.</p>
+<p>The test harnesses behave like the runtime. <code>awa-testing</code>'s <code>work_one</code> and Python's <code>AwaTestClient.work_one</code> insert staged follow-ups in the same transaction as their own completion, apply poisoning, and discard them on every other outcome. The <code>awa.testing.HandlerJob</code> stand-in gains <code>enqueue_on_completion</code>, which applies the same validation and limits and records each request in <code>job.staged</code>, for unit tests that never touch a database.</p>
+<h2 id="guarantees">Guarantees<a class="headerlink" href="#guarantees" title="Permanent link">&para;</a></h2>
+<p>For a job A whose handler staged follow-ups R:</p>
+<ul>
+<li><strong>Committed together or not at all.</strong> R's inserts run, and either commit or are skipped as duplicates, if and only if the handler's own <code>Completed</code> finalization of that attempt committed under its run lease. No row comes from an attempt that was rescued, cancelled, superseded or completed externally, or whose completion rolled back.</li>
+<li><strong>One attempt's follow-ups.</strong> A job row completes at most once (admin retry does not reopen completed jobs), so at most one attempt's staged follow-ups are inserted, even when a rescued attempt and its replacement staged different values.</li>
+<li><strong>Deduplication.</strong> For a follow-up with unique options, A's completion commits with either a new row or an existing row holding the same key in one of its <code>UniqueOpts::states</code>. The default states include <code>completed</code>, so a finished B blocks duplicates until its row is pruned, which ties the window to terminal retention. Removing <code>completed</code> limits it to Bs still scheduled, available, running or retryable. Either way this is "at most one B per key in those states", not "at most one B ever".</li>
+<li><strong>Delivery.</strong> Each inserted follow-up is an ordinary job, delivered at least once.</li>
+</ul>
+<p>Not guaranteed:</p>
+<ul>
+<li><strong>Handler side effects.</strong> If an attempt creates an external resource and its completion does not commit, the resource is orphaned and the next attempt may create another. Awa guarantees only that no follow-up refers to it.</li>
+<li><strong>Exactly-once handler execution.</strong> A may run several times; only the committing attempt's follow-ups survive.</li>
+<li><strong>Freedom from deadlock.</strong> A completion that inserts several follow-ups holds each insert's locks until it commits: on queue storage the enqueue-lane lock, on both engines the unique claim. Two completions that take these in opposite orders can deadlock: two unique keys staged in opposite orders, or two lanes (different queues, or one queue with <code>enqueue_shards &gt; 1</code>). Postgres aborts one transaction and <code>finalize_with_retry</code> retries it, up to three times, after which the job waits for stale-heartbeat rescue. A completion that inserts a single follow-up takes its unique claim before its lane lock, the order <code>AwaUniqueClaimLockOrder</code> checks, and cannot deadlock this way. Registered specs that insert several follow-ups share the same exposure today.</li>
+<li><strong>Prompt failure on a non-retryable insert error.</strong> Such an error rolls the completion back. Today <code>finalize_with_retry</code> returns it, the executor logs it, and the job stays <code>running</code> until stale-heartbeat rescue re-runs it, as it does for registered specs. Staging moves serialization and validation into the handler, so the remaining causes are rare database errors.</li>
+</ul>
+<p>Two consequences of deduplication need care:</p>
+<ul>
+<li>A follow-up of A's own kind and args, with A's own unique options, collides with A itself, because A's row holds the key while it is running and, by default, once completed. It is skipped and the chain stops. Give a continuation different args or options.</li>
+<li>Two follow-ups with the same key staged in one attempt collapse to one, as do different args when <code>by_args</code> is false.</li>
+</ul>
+<h2 id="rollout">Rollout<a class="headerlink" href="#rollout" title="Permanent link">&para;</a></h2>
+<p>No schema change. A stage-B kind is new code, and an older worker that claims a job of an unknown kind fails it terminally. Because A has already completed, nothing re-creates that B; it must be retried from the DLQ or the admin UI. So:</p>
+<ol>
+<li>Deploy workers that handle B everywhere B's queue is polled, or put B on a new queue that only those workers poll.</li>
+<li>Then deploy the stage-A code that stages B.</li>
+</ol>
+<h2 id="relationship-to-other-adrs">Relationship to other ADRs<a class="headerlink" href="#relationship-to-other-adrs" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>ADR-029.</strong> Registered specs keep their role for unconditional follow-ups derived from args. Both run in the same completion transaction. This ADR does not change ADR-029's atomicity matrix; it adds a source of follow-ups to the worker-driven <code>Completed</code> row.</li>
+<li><strong>ADR-042.</strong> Caller-owned handlers insert follow-ups in their own transaction, as ADR-042 specifies, and staging is not offered on the caller-owned context. Moving a handler from staging to caller-owned completion swaps <code>enqueue_on_completion</code> for an insert in its transaction; no follow-up spec wiring changes.</li>
+<li><strong>ADR-026.</strong> A job that stages completes through the general terminal path, not the compact one.</li>
+<li><strong>ADR-034 (proposed).</strong> A dependent child exists before its parent runs, so it cannot carry a value the parent computes. Staging is complementary.</li>
+<li><strong>ADR-041.</strong> No schema change; the rollout order above covers the new kinds.</li>
+</ul>
+<h2 id="validation">Validation<a class="headerlink" href="#validation" title="Permanent link">&para;</a></h2>
+<p>The implementation adds:</p>
+<ul>
+<li><strong>A TLA+ model</strong>, <code>correctness/storage/AwaStagedFollowUps.tla</code>. Two jobs whose attempts stage a nondeterministic key, lease-guarded completion with the staged inserts in one step, lost acknowledgements and finalize retries, rescue and reclaim under a new lease, external completion, and release of a key's unique claim. Invariants: every follow-up traces to a committed handler completion of the attempt that staged it; at most one row per key; every committed completion has its follow-up or a row holding its key; only the current lease completes a job. Negative configs, each expected to fail, insert before completion, insert after it in a separate transaction, complete without the lease guard, drain the staged follow-ups on the first finalize attempt, and send a staging job down the batched path.</li>
+<li><strong>Tests on both engines.</strong> Insertion with completion; discard on each non-<code>Completed</code> outcome; poisoning after a failed stage; sealing after return; a stale completion inserts nothing; deduplication across concurrent A jobs; a non-dedup unique violation rolls the completion back; a finalize retry inserts once; a job that stages nothing still completes through the batcher; limits; registered specs and staged follow-ups together; the <code>awa-testing</code> harness; Python staging, <code>AwaTestClient.work_one</code> and the <code>HandlerJob</code> stand-in.</li>
+</ul>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
+<ul>
+<li>The handler states, in one place, what it produced and what should happen next, with the atomicity ADR-029 gives registered specs.</li>
+<li>No public type changes shape. The additions are new methods and types.</li>
+<li>Fan-out is staging more than once; a conditional follow-up is an <code>if</code> in the handler.</li>
+<li>Unlike a registered <code>Completed</code> spec, which sends every job of its kind through the per-job transaction, staging sends only the jobs that stage.</li>
+<li>Python gets transactional follow-ups without running Python code inside a database transaction.</li>
+</ul>
+<h3 id="negative">Negative<a class="headerlink" href="#negative" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Pipeline topology is no longer fully visible in the client builder; a reader must look in handlers for staged follow-ups. A handler that should stay reusable across pipelines can take its request from an injected factory (<code>ctx.extract</code>).</li>
+<li>The staged value is transient. Debugging relies on B's args, and a deduplication skip leaves no trace on A beyond a debug log.</li>
+<li>A job that stages pays a per-job completion transaction and loses the compact completion path.</li>
+</ul>
+<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="handler-output-read-by-an-output-typed-spec">Handler output read by an output-typed spec<a class="headerlink" href="#handler-output-read-by-an-output-typed-spec" title="Permanent link">&para;</a></h3>
+<p><code>JobResult::completed_with(value)</code> plus <code>on_completed_enqueue_with_output::&lt;A, O, B, _&gt;(|args, &amp;output, job| ...)</code>. Rejected. <code>JobResult</code> is not <code>#[non_exhaustive]</code>, so the new variant is breaking today; the reasons below hold even after that is fixed.</p>
+<h3 id="an-attempt-scoped-output-slot-on-the-context-read-by-a-registered-spec">An attempt-scoped output slot on the context, read by a registered spec<a class="headerlink" href="#an-attempt-scoped-output-slot-on-the-context-read-by-a-registered-spec" title="Permanent link">&para;</a></h3>
+<p><code>ctx.set_output(value)</code> and a spec that reads it. No <code>JobResult</code> change and no leakage across retries. Rejected:</p>
+<ul>
+<li>The output type meets the spec's expected type only at run time, inside the completion transaction. A mismatch rolls the completion back, which today leaves the job running until rescue, which then repeats the failure.</li>
+<li><code>Client::complete_external</code> has no output, so output-reading specs need conditional dispatch, which ADR-029 keeps out of the registry.</li>
+<li>It adds a 13th <code>on_*_enqueue*</code> builder and invites siblings for every outcome.</li>
+<li>Python would have to run a Python callable inside the completion transaction.</li>
+<li>Staging is strictly more direct: the handler that has the value builds the request, and the type is checked at compile time.</li>
+</ul>
+<h3 id="persist-the-output-on-the-job-or-its-terminal-history">Persist the output on the job or its terminal history<a class="headerlink" href="#persist-the-output-on-the-job-or-its-terminal-history" title="Permanent link">&para;</a></h3>
+<p>Rejected. Custom metadata takes completion off the compact path of <a href="../026-narrow-terminal-history/">ADR-026</a>, it widens a stable read surface, the value vanishes when terminal rows are pruned, and it starts turning Awa into a results store.</p>
+<h3 id="insert-from-the-handler-with-ctxpool">Insert from the handler with <code>ctx.pool()</code><a class="headerlink" href="#insert-from-the-handler-with-ctxpool" title="Permanent link">&para;</a></h3>
+<p>Kept as a documented workaround, rejected as the pattern: B exists before A commits and survives A's failure, and a non-deterministic handler can insert a different B on each attempt.</p>
+<h3 id="wait-for-caller-owned-completion">Wait for caller-owned completion<a class="headerlink" href="#wait-for-caller-owned-completion" title="Permanent link">&para;</a></h3>
+<p>Rejected as the only answer. ADR-042 remains the tool when A also writes application rows. Passing a value to a follow-up should not require a distinct handler type and a dedicated finalization function.</p>
+<h3 id="job-dependencies">Job dependencies<a class="headerlink" href="#job-dependencies" title="Permanent link">&para;</a></h3>
+<p>Rejected for this problem: the child is created before the parent runs, so it cannot carry or deduplicate on a value the parent computes.</p>
+<h2 id="open-extensions">Open extensions<a class="headerlink" href="#open-extensions" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Mark <code>JobResult</code> <code>#[non_exhaustive]</code></strong> before 0.7.0 is stable, independent of this decision.</li>
+<li><strong>Prompt failure for non-retryable finalize errors.</strong> Record a lease-guarded failure with the error instead of waiting for heartbeat rescue, for registered specs and staged follow-ups alike.</li>
+<li><strong>Deadlock-free multi-insert completion.</strong> Acquire every unique claim and enqueue-lane lock a completion needs, registered and staged, in one global order before inserting.</li>
+<li><strong>A deduplication metric</strong> counting follow-ups skipped on an existing key, and <strong>provenance</strong>: stamp each follow-up with the triggering job ID under the reserved <code>awa:</code> metadata namespace so B can be traced to A. Both help answer "why is there no B for this value?"</li>
+<li><strong>Staging for other outcomes</strong>, such as a follow-up on <code>RetryAfter</code>, if a use case appears.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../javascripts/language-switch.js"></script>
+      
+        <script src="../../javascripts/agent-docs.js"></script>
+      
+    
+  </body>
+</html>
