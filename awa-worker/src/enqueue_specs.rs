@@ -201,7 +201,9 @@ async fn insert_follow_up<F: JobArgs>(
     let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
     match insert_with(&mut *savepoint, args, opts).await {
         Ok(_) => savepoint.commit().await.map_err(map_sqlx_error),
-        Err(AwaError::UniqueConflict { constraint }) => {
+        Err(AwaError::UniqueConflict { constraint })
+            if is_duplicate_follow_up(constraint.as_deref()) =>
+        {
             savepoint.rollback().await.map_err(map_sqlx_error)?;
             tracing::debug!(
                 trigger_kind,
@@ -213,6 +215,15 @@ async fn insert_follow_up<F: JobArgs>(
         }
         Err(err) => Err(err),
     }
+}
+
+/// The constraint a unique-key conflict reports on both storage engines.
+/// Any other unique violation (a primary-key collision, say) is not a
+/// duplicate of the follow-up and must still fail the dispatch.
+const JOB_UNIQUE_KEY_CONSTRAINT: &str = "idx_awa_jobs_unique";
+
+fn is_duplicate_follow_up(constraint: Option<&str>) -> bool {
+    constraint == Some(JOB_UNIQUE_KEY_CONSTRAINT)
 }
 
 /// Spec for the `Completed` outcome. Captures a typed closure that maps the
@@ -441,4 +452,16 @@ pub(crate) async fn dispatch_specs_in_tx(
         spec.run(conn, job, outcome_context).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_duplicate_follow_up;
+
+    #[test]
+    fn only_the_unique_key_constraint_counts_as_a_duplicate() {
+        assert!(is_duplicate_follow_up(Some("idx_awa_jobs_unique")));
+        assert!(!is_duplicate_follow_up(Some("jobs_hot_pkey")));
+        assert!(!is_duplicate_follow_up(None));
+    }
 }
