@@ -52,8 +52,9 @@ marker's key is the job name plus a digest of the git tree hashes of the paths
 the job reads, so a push that touches only `docs/` or `CHANGELOG.md` re-runs
 nothing. Markers from `main` serve every pull request; markers from a pull
 request serve only that pull request. Pushes to `main` and release branches,
-and manual runs (`workflow_dispatch`), never skip. To re-run a job that a
-marker skipped, run the workflow manually on the branch. The paths each job
+and manual runs (`workflow_dispatch`), never skip. The `Select PR checks` step
+summary lists the jobs a run skipped. To re-run a job that a marker skipped,
+run the workflow manually on the branch. The paths each job
 reads are listed in the `changes` job in `.github/workflows/ci.yml`. If a job
 starts reading a new top-level path, check that the path is not in
 `not_code`.
