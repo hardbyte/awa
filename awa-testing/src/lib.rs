@@ -117,14 +117,31 @@ impl TestClient {
 
         // Update job state based on result
         match &result {
-            Ok(JobResult::Completed) => {
-                let mut tx = self.pool.begin().await?;
+            Ok(JobResult::Completed) if staged.is_empty() => {
                 sqlx::query(
                     "UPDATE awa.jobs SET state = 'completed', finalized_at = now(), progress = NULL WHERE id = $1",
                 )
                 .bind(job.id)
-                .execute(&mut *tx)
+                .execute(&self.pool)
                 .await?;
+                Ok(WorkResult::Completed(job))
+            }
+            Ok(JobResult::Completed) => {
+                // As in the runtime, staged follow-ups commit only with a
+                // completion that still holds this attempt's lease.
+                let mut tx = self.pool.begin().await?;
+                let completed = sqlx::query(
+                    "UPDATE awa.jobs SET state = 'completed', finalized_at = now(), progress = NULL \
+                     WHERE id = $1 AND state = 'running' AND run_lease = $2",
+                )
+                .bind(job.id)
+                .bind(job.run_lease)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if completed == 0 {
+                    return Err(stale_completion(&job));
+                }
                 awa_worker::insert_staged_follow_ups_in_tx(&mut tx, &job, &staged).await?;
                 tx.commit().await?;
                 Ok(WorkResult::Completed(job))
@@ -316,9 +333,12 @@ impl TestClient {
             }
             Ok(JobResult::Completed) => {
                 let mut tx = self.pool.begin().await?;
-                store
+                let completed = store
                     .complete_runtime_batch_slow_in_tx(&mut tx, std::slice::from_ref(&claimed))
                     .await?;
+                if completed.is_empty() {
+                    return Err(stale_completion(&job));
+                }
                 awa_worker::insert_staged_follow_ups_in_tx(&mut tx, &job, &staged).await?;
                 tx.commit().await?;
                 Ok(WorkResult::Completed(job))
@@ -436,6 +456,16 @@ impl TestClient {
     pub async fn get_job(&self, job_id: i64) -> Result<JobRow, AwaError> {
         awa_model::admin::get_job(&self.pool, job_id).await
     }
+}
+
+/// The attempt lost its lease while the handler ran (rescued, cancelled or
+/// completed elsewhere), so its completion and staged follow-ups were rolled
+/// back.
+fn stale_completion(job: &JobRow) -> AwaError {
+    AwaError::Validation(format!(
+        "job {} is no longer running under attempt {}'s lease; its completion and staged follow-ups were not applied",
+        job.id, job.attempt
+    ))
 }
 
 /// Result of `work_one`.

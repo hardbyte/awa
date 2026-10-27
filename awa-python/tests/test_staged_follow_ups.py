@@ -144,6 +144,7 @@ class StageBadOptions:
 @pytest.mark.asyncio
 async def test_conversion_failures_poison_like_any_staging_error(client):
     queue = "staged_py_convert"
+    raised = {}
 
     @client.task(StageBadOptions, queue=queue)
     async def bad(job):
@@ -152,21 +153,33 @@ async def test_conversion_failures_poison_like_any_staging_error(client):
                 job.enqueue_on_completion(StageProcess(item_id=1), unique_opts="nope")
             elif job.args.mode == "args":
                 job.enqueue_on_completion({"s": {1, 2}}, kind="stage_process")
+            elif job.args.mode == "priority_overflow":
+                # Out of i16 range: fails extraction, not the 1..=4 check.
+                job.enqueue_on_completion(StageProcess(item_id=1), priority=100_000)
+            elif job.args.mode == "queue_type":
+                job.enqueue_on_completion(StageProcess(item_id=1), queue=1)
+            elif job.args.mode == "tags_type":
+                job.enqueue_on_completion(StageProcess(item_id=1), tags="not-a-list")
             else:
                 job.enqueue_on_completion(StageProcess(item_id=1), priority=99)
-        except awa.StagingError as e:
-            assert e.__cause__ is not None or job.args.mode == "priority"
-        return None  # swallowed: the attempt must still fail
+        except Exception as e:  # swallowed: the attempt must still fail
+            raised[job.args.mode] = e
+        return None
 
     ids = []
-    for mode in ("unique_opts", "args", "priority"):
+    modes = ("unique_opts", "args", "priority_overflow", "queue_type", "tags_type", "priority")
+    for mode in modes:
         job = await client.insert(StageBadOptions(mode=mode), queue=queue, max_attempts=1)
         ids.append(job.id)
-    await client.start([(queue, 3)], **RUNTIME_START_KWARGS)
+    await client.start([(queue, len(modes))], **RUNTIME_START_KWARGS)
     for job_id in ids:
         await wait_for_state(client, job_id, "failed")
     await client.shutdown()
     assert await count_kind(client, "stage_process") == 0
+    for mode in modes:
+        assert isinstance(raised[mode], awa.StagingError), (mode, raised[mode])
+        # A conversion failure keeps the original error as the cause.
+        assert raised[mode].__cause__ is not None or mode == "priority", mode
 
 
 @pytest.mark.asyncio
@@ -240,6 +253,17 @@ def test_handler_job_matches_runtime_validation():
     with pytest.raises(awa.StagingError):
         job.enqueue_on_completion(StageProcess(item_id=1), priority=99)
     assert job.staging_error is not None
+
+    for bad in (
+        {"unique_opts": "nope"},
+        {"unique_opts": {"states": 300}},
+        {"run_at": "not-a-time"},
+        {"ordering_key": 123},
+    ):
+        fresh = HandlerJob(**{**job.__dict__, "staged": [], "staging_error": None})
+        with pytest.raises(awa.StagingError):
+            fresh.enqueue_on_completion(StageProcess(item_id=1), **bad)
+        assert fresh.staging_error is not None, bad
 
     other = HandlerJob(**{**job.__dict__, "staged": [], "staging_error": None})
     with pytest.raises(TypeError):

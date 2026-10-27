@@ -126,6 +126,10 @@ def _validated_size(args: Any, kwargs: dict[str, Any]) -> int:
     ordering_key = kwargs.get("ordering_key") or b""
     if isinstance(ordering_key, str):
         ordering_key = ordering_key.encode()
+    if not isinstance(ordering_key, (bytes, bytearray, memoryview)):
+        raise awa.StagingError("ordering_key must be bytes-like or str")
+    _check_unique_opts(kwargs.get("unique_opts"))
+    _check_run_at(kwargs.get("run_at"))
     return (
         len(kind.encode())
         + len(queue.encode())
@@ -134,6 +138,38 @@ def _validated_size(args: Any, kwargs: dict[str, Any]) -> int:
         + sum(len(tag.encode()) for tag in tags)
         + len(ordering_key)
     )
+
+
+def _check_unique_opts(unique_opts: Any) -> None:
+    """Mirror the runtime's ``unique_opts`` parsing."""
+    if unique_opts is None:
+        return
+    if not isinstance(unique_opts, dict):
+        raise awa.StagingError("unique_opts must be a dict")
+    for key in ("by_queue", "by_args"):
+        if key in unique_opts and not isinstance(unique_opts[key], bool):
+            raise awa.StagingError(f"unique_opts[{key!r}] must be a bool")
+    by_period = unique_opts.get("by_period")
+    if by_period is not None and not isinstance(by_period, int):
+        raise awa.StagingError("unique_opts['by_period'] must be an int")
+    states = unique_opts.get("states")
+    if states is not None and not (isinstance(states, int) and 0 <= states <= 255):
+        raise awa.StagingError("unique_opts['states'] must be an int in 0..=255")
+
+
+def _check_run_at(run_at: Any) -> None:
+    """Mirror the runtime's ``run_at`` parsing: a datetime or an RFC 3339 string."""
+    if run_at is None:
+        return
+    text = run_at if isinstance(run_at, str) else getattr(run_at, "isoformat", None)
+    if callable(text):
+        text = text()
+    if not isinstance(text, str):
+        raise awa.StagingError("run_at must be a datetime or RFC3339 string")
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise awa.StagingError(f"run_at is not a valid timestamp: {e}") from e
 
 
 def _args_to_json(args: Any) -> Any:

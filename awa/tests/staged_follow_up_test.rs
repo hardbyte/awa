@@ -680,3 +680,57 @@ async fn test_client_inserts_staged_follow_ups_on_canonical() {
 async fn test_client_inserts_staged_follow_ups_under_queue_storage() {
     test_client_inserts_staged_follow_ups(TestDatabase::queue_storage().await).await;
 }
+
+/// Cancels its own job mid-handler, then stages and completes anyway.
+struct CancelledMidHandler {
+    pool: sqlx::PgPool,
+}
+
+#[async_trait::async_trait]
+impl awa::Worker for CancelledMidHandler {
+    fn kind(&self) -> &'static str {
+        Resolve::kind()
+    }
+
+    async fn perform(&self, ctx: &awa::JobContext) -> Result<JobResult, JobError> {
+        admin::cancel(&self.pool, ctx.job.id)
+            .await
+            .map_err(JobError::retryable)?;
+        ctx.enqueue_on_completion(
+            EnqueueRequest::new(Process { item_id: 9 }).queue("staged_harness_process"),
+        )?;
+        Ok(JobResult::Completed)
+    }
+}
+
+async fn test_client_drops_staged_follow_ups_of_a_lost_attempt(db: TestDatabase) {
+    let pool = db.pool().clone();
+    let harness = awa_testing::TestClient::from_pool(pool.clone()).await;
+    let job = awa::insert(
+        &pool,
+        &Resolve {
+            source: 1,
+            item_id: 9,
+        },
+    )
+    .await
+    .unwrap();
+    let result = harness
+        .work_one(&CancelledMidHandler { pool: pool.clone() })
+        .await;
+    assert!(result.is_err(), "the completion lost its lease: {result:?}");
+    assert_eq!(count_kind(&pool, Process::kind()).await, 0);
+    let job = admin::get_job(&pool, job.id).await.unwrap();
+    assert_eq!(job.state, JobState::Cancelled);
+}
+
+#[tokio::test]
+async fn test_client_drops_staged_follow_ups_of_a_lost_attempt_on_canonical() {
+    test_client_drops_staged_follow_ups_of_a_lost_attempt(TestDatabase::canonical().await).await;
+}
+
+#[tokio::test]
+async fn test_client_drops_staged_follow_ups_of_a_lost_attempt_under_queue_storage() {
+    test_client_drops_staged_follow_ups_of_a_lost_attempt(TestDatabase::queue_storage().await)
+        .await;
+}

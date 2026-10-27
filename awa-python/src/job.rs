@@ -197,17 +197,19 @@ impl PyJob {
     /// The args are converted to JSON now. A request that cannot be staged
     /// raises `StagingError` and poisons the attempt: if the handler still
     /// returns normally, the attempt fails terminally.
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
+    // Options are taken untyped and extracted below, so a value of the wrong
+    // type or range poisons the attempt instead of raising before staging.
+    #[pyo3(signature = (args, *, kind=None, queue=None, priority=None, max_attempts=None, tags=None, metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue_on_completion(
         &self,
         py: Python<'_>,
         args: Py<PyAny>,
-        kind: Option<String>,
-        queue: String,
-        priority: i16,
-        max_attempts: i16,
-        tags: Vec<String>,
+        kind: Option<Py<PyAny>>,
+        queue: Option<Py<PyAny>>,
+        priority: Option<Py<PyAny>>,
+        max_attempts: Option<Py<PyAny>>,
+        tags: Option<Py<PyAny>>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
@@ -224,15 +226,28 @@ impl PyJob {
         let prepared = (|| -> PyResult<(String, serde_json::Value, InsertOpts)> {
             let args_bound = args.bind(py);
             let kind = match kind {
-                Some(kind) => kind,
+                Some(kind) => kind.extract::<String>(py)?,
                 None => crate::args::derive_kind(&crate::args::get_type_class_name(
                     args_bound.get_type().as_any(),
                 )?),
             };
             let opts = InsertOpts {
-                queue,
-                priority,
-                max_attempts,
+                queue: queue
+                    .map(|value| value.extract::<String>(py))
+                    .transpose()?
+                    .unwrap_or_else(|| "default".to_string()),
+                priority: priority
+                    .map(|value| value.extract::<i16>(py))
+                    .transpose()?
+                    .unwrap_or(2),
+                max_attempts: max_attempts
+                    .map(|value| value.extract::<i16>(py))
+                    .transpose()?
+                    .unwrap_or(25),
+                tags: tags
+                    .map(|value| value.extract::<Vec<String>>(py))
+                    .transpose()?
+                    .unwrap_or_default(),
                 run_at: run_at
                     .as_ref()
                     .map(|value| crate::transaction::parse_run_at(py, value.bind(py)))
@@ -242,7 +257,6 @@ impl PyJob {
                     .map(|value| py_to_json(py, value.bind(py)))
                     .transpose()?
                     .unwrap_or(serde_json::json!({})),
-                tags,
                 unique: unique_opts
                     .as_ref()
                     .map(|value| crate::transaction::parse_unique_opts(py, value.bind(py)))
