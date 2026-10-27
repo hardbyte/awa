@@ -171,13 +171,13 @@ Two consequences of deduplication need care:
 The [PRD](https://github.com/hardbyte/awa/blob/main/docs/archive/prd.md#35-non-goals) sets Awa's boundary: "No DAGs, no fan-out/fan-in, no saga orchestration. If you need Temporal, use Temporal." The 0.7 roadmap (D7) repeats it for job dependencies, and [#81](https://github.com/hardbyte/awa/issues/81) asks any proposal that moves values between jobs to restate it. Staging stays inside the boundary. This ADR does not provide, and must not grow into:
 
 - **A pipeline definition.** Awa stores no relation between A and B. No graph, step list or topology exists in the builder, the schema or the runtime; the only place the "pipeline" exists is the handler's code.
-- **Fan-in or joins.** Nothing waits for several jobs, or for B to finish. A is complete before B exists, and B's outcome never reaches A.
+- **Fan-in or joins.** Nothing waits for several jobs, or for B to finish. A's handler has returned before B is inserted; A's completion and B's row then become visible together, in one transaction. B's outcome never reaches A.
 - **Workflow state or step results.** A's value travels only in B's args. Nothing is recorded on A, and there is no result store (see [Persist the output](#persist-the-output-on-the-job-or-its-terminal-history)).
-- **Guarantees across steps.** B's failure does not affect A. There is no compensation, saga, rollback across jobs, or retry of a chain as a unit.
-- **Durable execution.** An attempt is never resumed or replayed. A retried attempt starts from the beginning with an empty staging buffer.
+- **Guarantees across steps.** Inserting B is part of A's completion: an insert error other than a duplicate key rolls A's completion back (see [Guarantees](#guarantees)). Once both have committed, nothing B does affects A. There is no compensation, saga, rollback across jobs, or retry of a chain as a unit.
+- **Durable execution.** A handler body is never resumed or replayed. A finalize retry repeats the completion transaction for the same attempt with the same sealed follow-ups. A retried attempt runs the handler from the beginning with an empty staging buffer.
 - **Predicates in the engine.** A conditional follow-up is an `if` in the handler. The engine inserts the rows it is handed and evaluates no conditions.
 
-The PRD's "no fan-out" refers to a fan-out construct: a step that spawns children and tracks them as a group, usually paired with a fan-in. Staging several follow-ups is not that. It is the same as an application inserting several jobs in one transaction, which Awa has always supported ([ADR-006](006-awa-transaction.md)). The children are independent jobs and nothing tracks them as a set.
+The PRD's "no fan-out", and the same words in roadmap D7 and [ADR-034](034-job-dependencies.md), refer to a fan-out construct: a step that spawns or releases children and tracks them as a group, usually paired with a fan-in. ADR-034 and D7 now say so explicitly. Staging several follow-ups, at most 16, is not that. It is the same as an application inserting several jobs in one transaction, which Awa has always supported ([ADR-006](006-awa-transaction.md)). The children are independent jobs and nothing tracks them as a set.
 
 The guarantee is scoped to one transaction of one attempt: B is enqueued if and only if A's completion commits. That is ADR-006's transactional enqueue applied to the completion transaction. Once the completion commits, Awa keeps no link between A and B.
 
