@@ -2405,11 +2405,15 @@
 <li><strong>A rule matches.</strong> Its <code>queue</code> is <code>NULL</code> or equal to the job's queue, and its expression is absent or evaluates to <code>true</code>. The worker applies the rule's action instead of running the handler. If several rules match, the most restrictive action wins: <code>cancel</code> over <code>dead_letter</code> over <code>hold</code>.</li>
 </ol>
 <p>The CEL environment is the job's <code>args</code>, <code>metadata</code>, <code>kind</code>, <code>queue</code>, <code>attempt</code>, <code>priority</code> and <code>tags</code>. It is evaluated on the worker with the CEL support that callback filters already use. A rule whose expression fails to compile is rejected when it is created.</p>
-<p>An expression that errors when evaluated (for example <code>args.width</code> on a job without a <code>width</code>) <strong>does not match</strong>. The job runs as it would have without the rule. The error is counted in <code>awa.job.skip_rule_errors{rule}</code> and recorded on the rule as <code>last_error</code>. The other choice, treating an error as a match, would let one malformed expression quarantine healthy jobs. CEL's <code>has()</code> lets a rule author handle absent fields explicitly.</p>
+<p>An expression that errors when evaluated (for example <code>args.width</code> on a job without a <code>width</code>) <strong>does not match</strong>. The job runs as it would have without the rule. The error is counted in <code>awa.job.skip_rule_errors{rule}</code>. Each worker also keeps a per-rule error count and the latest message in the runtime snapshot it already publishes on its heartbeat, so the CLI and admin UI can show them. The worker never writes to the rules table, however often an expression fails. The other choice, treating an error as a match, would let one malformed expression quarantine healthy jobs. CEL's <code>has()</code> lets a rule author handle absent fields explicitly.</p>
 <h3 id="actions">Actions<a class="headerlink" href="#actions" title="Permanent link">&para;</a></h3>
 <p>Each action reuses an existing outcome path. None is a new kind of state transition.</p>
 <ul>
-<li><strong><code>hold</code>, the default.</strong> The job is snoozed: rescheduled without spending an attempt, with the rule ID recorded under <code>metadata."awa:held_by"</code>. It is held until the rule's <code>expires_at</code> or for 24 hours, whichever is sooner, not for a short interval. A short interval would re-claim every held job each cycle, costing one claim and one snooze transaction per job per interval. When a rule is removed, <code>awa job skip remove</code> releases the jobs it held with one batch operation (ADR-030) that sets <code>run_at = now()</code> for scheduled jobs carrying that <code>awa:held_by</code>. A held job that reaches its horizon while the rule is still active is claimed and held again, at most once a day.</li>
+<li><strong><code>hold</code>, the default.</strong> The job is snoozed: rescheduled without spending an attempt.</li>
+<li><strong>Duration.</strong> It is held until the rule's <code>expires_at</code> or for 24 hours, whichever is sooner, not for a short interval. A short interval would re-claim every held job each cycle, costing one claim and one snooze transaction per job per interval. A held job that reaches its horizon while the rule is still active is claimed and held again, at most once a day.</li>
+<li><strong>Ownership.</strong> The snooze's transaction also writes a row to a second small table, <code>awa.job_skip_holds (rule_id, job_id, held_at)</code>, with <code>ON CONFLICT DO NOTHING</code> for a re-hold. Ownership stays out of the job's metadata, which may be any JSON value, not only an object.</li>
+<li><strong>Release.</strong> When a rule is removed, <code>awa job skip remove</code> releases its jobs with one batch operation (ADR-030). The operation sets <code>run_at = now()</code> for the scheduled jobs listed under that rule and deletes their rows.</li>
+<li><strong>Cleanup.</strong> Maintenance deletes holds whose job is no longer scheduled, for example because an admin cancelled it.</li>
 <li><strong><code>dead_letter</code>.</strong> The job moves to the dead-letter queue with reason <code>skipped</code>, keeping its args so a DLQ retry can re-run it after a fix. The attempt is spent: the job did not run, but it was not deferred either.</li>
 <li><strong><code>cancel</code>.</strong> The job is cancelled with reason <code>skipped by rule &lt;id&gt;: &lt;reason&gt;</code>.</li>
 </ul>
@@ -2423,7 +2427,7 @@
 <li><strong>Metrics:</strong></li>
 <li><code>awa.job.skipped{kind, queue, action, rule}</code>;</li>
 <li><code>awa.job.skip_rule_errors{rule}</code>;</li>
-<li>a held-jobs gauge per rule, so a hold nobody is watching shows up on a dashboard.</li>
+<li>a held-jobs gauge per rule, counted from <code>awa.job_skip_holds</code> on the rules refresh, so a hold nobody is watching shows up on a dashboard.</li>
 </ul>
 <h3 id="rollout">Rollout<a class="headerlink" href="#rollout" title="Permanent link">&para;</a></h3>
 <p>Phase 1 ships rules with <code>kind</code>, <code>queue</code> and an action, without expressions. That covers "stop this kind on a shared queue" with no CEL dependency. Phase 2 adds <code>expression</code>, gated by the <code>cel</code> feature that callback filters already use. A worker built without that feature does not match rules that have an expression, and it logs a warning once per rule.</p>
@@ -2445,9 +2449,10 @@
 </ul>
 <h3 id="negative">Negative<a class="headerlink" href="#negative" title="Permanent link">&para;</a></h3>
 <ul>
-<li>A claim, then a finalize, for each skipped job. A rule that matches a large backlog churns through it once, and <code>hold</code> keeps that to once per held job per horizon.</li>
+<li>Each skipped job costs a claim and a finalize, and a hold adds one row in <code>awa.job_skip_holds</code>, written in the snooze's own transaction. Jobs that match no rule write nothing.</li>
+<li>A rule that matches a large backlog churns through it once, and <code>hold</code> keeps that to once per held job per horizon.</li>
 <li>Up to 10 seconds between adding a rule and every worker applying it. Jobs claimed in that window run. An urgent stop is still a queue pause.</li>
-<li>Another place where a job can go "missing". The held-jobs gauge and the <code>awa:held_by</code> metadata exist so that a hold is visible.</li>
+<li>Another place where a job can go "missing". The held-jobs gauge and <code>awa.job_skip_holds</code> exist so that a hold is visible.</li>
 <li>A forgotten hold delays jobs indefinitely. Expiry is optional because some fixes take longer than any default, but the CLI asks for confirmation when <code>--expires-in</code> is omitted.</li>
 </ul>
 <h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
@@ -2463,7 +2468,7 @@
 <h3 id="a-skip-check-in-user-code">A skip check in user code<a class="headerlink" href="#a-skip-check-in-user-code" title="Permanent link">&para;</a></h3>
 <p>A handler can check a feature flag and return <code>Snooze</code>. That works today and needs no engine change. But every kind needs its own check and a deploy to add one, and it runs after argument decoding.</p>
 <h3 id="make-skipped-jobs-a-new-state">Make skipped jobs a new state<a class="headerlink" href="#make-skipped-jobs-a-new-state" title="Permanent link">&para;</a></h3>
-<p>A <code>held</code> state would make holds visible without metadata. It was rejected because it touches every state machine, both engines, the admin UI and the TLA+ models, whereas a hold that is a snooze with a marker needs no new state.</p>
+<p>A <code>held</code> state would make holds visible without a side table. It was rejected because it touches every state machine, both engines, the admin UI and the TLA+ models, whereas a hold that is a snooze plus a row in <code>awa.job_skip_holds</code> needs no new state.</p>
 <h2 id="open-questions">Open questions<a class="headerlink" href="#open-questions" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>Should <code>hold</code> be the default?</strong> It loses nothing, but a pile of held jobs is easy to ignore. The gauge and the expiry prompt are the mitigation; <code>dead_letter</code> makes the cost visible but spends an attempt.</li>
