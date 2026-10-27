@@ -278,6 +278,16 @@ Rust exposes two hook families on the client builder:
   the key covers the follow-up's kind and args, so keep only the deduplication
   key in its args; `by_args: false` leaves args out of the key entirely.
 
+  When the follow-up needs a value the handler computes, stage it from the
+  handler instead (ADR-046): `ctx.enqueue_on_completion(request)` in a `Worker`,
+  `ctx.follow_ups()` for a `register` closure's `'static` future, or
+  `job.enqueue_on_completion(args, **insert_opts)` in Python. Staged follow-ups
+  commit only with the attempt's own `Completed` finalization, deduplicate the
+  same way, and are discarded on every other outcome. A staging error
+  (`StageError` / `awa.StagingError`) fails the attempt if the handler still
+  returns `Completed`; at most 16 follow-ups and 64 KiB per attempt. Deploy the
+  follow-up kind's workers before the code that stages it.
+
 Enqueues capture the current trace span into reserved metadata
 (`awa:traceparent`) automatically; disable with `AWA_TRACE_CAPTURE=off`. To
 propagate a trace onward from inside a handler, use the current span
