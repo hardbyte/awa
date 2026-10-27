@@ -121,6 +121,19 @@ There is one builder per outcome, plus a `_with` variant whose closure returns `
 })
 ```
 
+### Deduplicating follow-ups
+
+Give the follow-up unique options to collapse duplicates. When several triggers produce a follow-up with the same unique key, the first insert wins and the later ones are skipped: each trigger's transition still commits, and exactly one follow-up job exists. The unique key covers the follow-up's kind and args (plus queue or period if `UniqueOpts` asks for them), so put only the deduplication key in the follow-up's args. `UniqueOpts::states` decides how long the deduplication lasts: the default includes `completed`, so a finished follow-up keeps blocking duplicates until its terminal row is pruned. Drop `completed` from the states to block only concurrent duplicates.
+
+```rust
+.on_completed_enqueue_with::<StageA, StageB, _>(|args, _job| {
+    EnqueueRequest::new(StageB { item_id: args.item_id }).with_opts(InsertOpts {
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    })
+})
+```
+
 ### Atomicity guarantees
 
 | Emission site | Atomic with state commit? |

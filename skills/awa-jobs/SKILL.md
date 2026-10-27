@@ -271,6 +271,11 @@ Rust exposes two hook families on the client builder:
   Every follow-up, once enqueued, is delivered at-least-once, so its handler must
   be safe to re-run.
 
+  To collapse duplicates (several triggers producing the same downstream work),
+  give the follow-up unique options via `on_*_enqueue_with`. A conflicting
+  follow-up is skipped and the trigger still commits. The unique key covers the
+  follow-up's kind and args, so keep only the deduplication key in its args.
+
 Enqueues capture the current trace span into reserved metadata
 (`awa:traceparent`) automatically; disable with `AWA_TRACE_CAPTURE=off`. To
 propagate a trace onward from inside a handler, use the current span
