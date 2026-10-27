@@ -11,6 +11,7 @@
 use crate::enqueue_specs::EnqueueRequest;
 use crate::executor::JobError;
 use awa_model::{prepare_raw_job_insert, AwaError, JobArgs, PreparedJobInsert};
+use chrono::Datelike;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Most follow-ups one attempt may stage. Each unique insert keeps a released
@@ -31,6 +32,9 @@ const PRIORITY_RANGE: std::ops::RangeInclusive<i16> = 1..=4;
 const MAX_ATTEMPTS_RANGE: std::ops::RangeInclusive<i16> = 1..=1000;
 const MAX_NAME_CHARS: usize = 200;
 const MAX_TAGS: usize = 20;
+/// Postgres rejects timestamps outside 4713 BC to 294276 AD; staging accepts
+/// the years a schedule can plausibly mean, well inside that.
+const RUN_AT_YEARS: std::ops::RangeInclusive<i32> = 1..=9999;
 
 /// Why a follow-up could not be staged.
 ///
@@ -103,6 +107,13 @@ impl FollowUps {
         Self {
             inner: Arc::new(Mutex::new(Staging::default())),
         }
+    }
+
+    /// A staging buffer with no attempt behind it, for tests that exercise
+    /// staging and insertion without running a handler.
+    #[doc(hidden)]
+    pub fn for_testing() -> Self {
+        Self::new()
     }
 
     // Nothing panics while holding the lock, and the executor must still
@@ -252,6 +263,15 @@ fn validate_row(row: &PreparedJobInsert) -> Result<(), StageError> {
             ));
         }
     }
+    if let Some(run_at) = row.run_at() {
+        if !RUN_AT_YEARS.contains(&run_at.year()) {
+            return invalid(format!(
+                "run_at {run_at} is outside the years {}..={}",
+                RUN_AT_YEARS.start(),
+                RUN_AT_YEARS.end()
+            ));
+        }
+    }
     if row.tags().len() > MAX_TAGS {
         return invalid(format!("more than {MAX_TAGS} tags"));
     }
@@ -365,6 +385,23 @@ mod tests {
         assert_eq!(follow_ups.seal().poisoned, Some(err));
     }
 
+    fn at_year(year: i32) -> EnqueueRequest<Next> {
+        use chrono::TimeZone;
+        EnqueueRequest::new(Next { item_id: 1 }).with_opts(awa_model::InsertOpts {
+            run_at: chrono::Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).single(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn run_at_is_bounded_to_plausible_years() {
+        for year in [*RUN_AT_YEARS.start(), *RUN_AT_YEARS.end()] {
+            FollowUps::new()
+                .enqueue_on_completion(at_year(year))
+                .unwrap_or_else(|err| panic!("year {year}: {err}"));
+        }
+    }
+
     #[test]
     fn rules_the_insert_enforces_are_rejected_when_staged() {
         let cases = [
@@ -376,6 +413,8 @@ mod tests {
                 ..Default::default()
             }),
             EnqueueRequest::new(Next { item_id: 1 }).queue("nul\u{0000}queue"),
+            at_year(0),
+            at_year(10_000),
         ];
         for request in cases {
             let follow_ups = FollowUps::new();
