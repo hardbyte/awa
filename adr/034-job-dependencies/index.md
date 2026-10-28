@@ -19,7 +19,10 @@ failure policy.
 - A's guarded finalization transactionally promotes B (success) or applies B's declared
   `on_parent_failure` policy: `Cancel` (default) | `EnqueueWithContext` | `Discard`.
 - Exactly one parent. Fan-in, fan-out, DAGs, and workflow state are **non-goals** (the PRD's
-  "not a workflow engine" boundary; #81 guards it).
+  "not a workflow engine" boundary; #81 guards it). Fan-out here means a parent releasing a
+  group of dependents that is tracked as a set. Independent follow-ups enqueued in one
+  transaction, by ADR-029 specs or ADR-046 staging, are not fan-out in this sense: nothing
+  tracks them as a group.
 - TLA+ witness required for the promote-on-finalize race (parent finalizes concurrently with
   child cancel).
 
