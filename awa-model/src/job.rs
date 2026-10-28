@@ -81,7 +81,12 @@ impl JobState {
 }
 
 /// A row from the `awa.jobs` table.
+///
+/// `#[non_exhaustive]` so that a new column is not a breaking change: code
+/// outside awa reads the fields but cannot build the struct literally or
+/// match it without `..`.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JobRow {
     pub id: i64,
     pub kind: String,

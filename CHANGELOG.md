@@ -38,6 +38,10 @@ for each step.
   `&'static str`, so wrap SQL you build at run time in `awa::audited_sql`, and
   only after validating anything interpolated into it.
   `storage::flip_ring_authority` now takes a `&PgPool`.
+- **Rust library users: `JobRow` is `#[non_exhaustive]`.** Code outside awa
+  can no longer build a `JobRow` with a struct literal or match it without
+  `..`. Reading its fields is unchanged. Later releases can then add columns
+  without breaking callers.
 - **Run `awa storage rebuild-terminal-counters` from an upgraded binary.** An
   older binary can deadlock with an upgraded runtime's rotation tick.
 
