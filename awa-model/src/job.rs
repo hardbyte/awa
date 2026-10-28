@@ -81,7 +81,13 @@ impl JobState {
 }
 
 /// A row from the `awa.jobs` table.
+///
+/// `#[non_exhaustive]` so that adding a field is not a Rust source break: code
+/// outside awa reads the fields but cannot build the struct literally or
+/// match it without `..`. A field added later also carries `#[sqlx(default)]`,
+/// so `query_as::<_, JobRow>` over an explicit column list keeps working.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JobRow {
     pub id: i64,
     pub kind: String,
