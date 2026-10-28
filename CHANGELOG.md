@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v051. Run `awa migrate` as the migrator
+This release adds migrations v044 to v052. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 
@@ -46,9 +46,36 @@ for each step.
   `query_as::<_, JobRow>` over an explicit column list break when one lands.
 - **Run `awa storage rebuild-terminal-counters` from an upgraded binary.** An
   older binary can deadlock with an upgraded runtime's rotation tick.
+- **v052 adds job output columns** (ADR-048). It adds two nullable columns per
+  queue-storage schema, a `NOT VALID` check and a final `output` column on
+  `terminal_jobs`, without replaying the installer or scanning rows. It takes
+  brief `ACCESS EXCLUSIVE` locks on the terminal tables, held until the
+  migration transaction commits, and waits at most 2 s for each when no
+  `lock_timeout` is set. Binaries without ADR-048 are unaffected; a new binary
+  running before the migration drops completion outputs and counts them as
+  `schema_missing`.
+- **Queue-storage failure transitions take `impl Into<AttemptError>`.** The
+  `error` argument of `fail_retryable*`, `fail_terminal*` and `fail_to_dlq*`,
+  and the `reason` of `cancel_running*`, accept `&str` and `String` as before.
+  Code that passes a function pointer or names the type may need a cast.
 
 ### Added
 
+- **Job output ([ADR-048](docs/adr/048-retained-job-output.md), [guide](docs/job-output.md)).**
+  A handler can record a JSON output of up to 4 KiB with `ctx.set_output`
+  (`ctx.output_slot()` for `register` closures) or `job.set_output` in Python.
+  It is published by the attempt's own transition: as `JobRow.output` when the
+  job completes, or under `output` in the error entry of a failure, where only
+  the latest entry to record one keeps it. It rides the compact completion
+  batch, is shown on the admin UI's job detail and in `terminal_jobs.output`,
+  and is never read by the engine; enqueue specs and the dispatch row do not
+  see it. A failed recording (`OutputError`, Python `awa.OutputError`) clears
+  the output without failing the attempt. External completions store one only
+  when given: `Client::complete_external_with` with `ExternalCompletion`,
+  Python `complete_external(..., output=...)`, or the HTTP callback body's
+  `output` field. Canonical storage discards outputs. New metrics:
+  `awa.job.output_recorded`, `awa.job.output_bytes` and
+  `awa.job.output_dropped`.
 - **Handler-staged follow-up jobs ([ADR-046](docs/adr/046-handler-staged-follow-ups.md)).**
   A handler can stage follow-up jobs built from values it computed:
   `ctx.enqueue_on_completion(request)`, `ctx.follow_ups()` for `register`
@@ -178,6 +205,11 @@ for each step.
 
 ### Fixed
 
+- **JSON floats read back from Postgres exactly.** Postgres prints `jsonb`
+  numbers in plain decimal, and serde_json's default parser could round a long
+  one to the neighbouring `f64`, so a value like `5.130112436774387e-96` in job
+  args read back one unit in the last place off. serde_json's
+  `float_roundtrip` feature is now enabled.
 - **A duplicate follow-up no longer fails its trigger.** A follow-up enqueued
   with unique options that conflicted with an existing job aborted the
   trigger's transaction: the trigger's completion (or other outcome) rolled

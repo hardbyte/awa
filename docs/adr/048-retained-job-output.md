@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. Builds on [ADR-046](046-handler-staged-follow-ups.md) staged follow-ups and [ADR-026](026-narrow-terminal-history.md) narrow terminal history. Depends on `JobRow` becoming `#[non_exhaustive]` ([#564](https://github.com/hardbyte/awa/pull/564)). Adds migration v052, for queue storage only.
+Accepted. Builds on [ADR-046](046-handler-staged-follow-ups.md) staged follow-ups and [ADR-026](026-narrow-terminal-history.md) narrow terminal history. Depends on `JobRow` becoming `#[non_exhaustive]` ([#564](https://github.com/hardbyte/awa/pull/564)). Adds migration v052, for queue storage only. Implemented by `awa-model/src/output.rs`, `awa-worker/src/output.rs`, the output path in `awa-worker/src/executor.rs`, migration v052, the `AwaJobOutput` TLA+ model and `awa/tests/job_output_test.rs`; user guide: [Job output](../job-output.md).
 
 ## Context
 

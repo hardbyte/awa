@@ -406,6 +406,24 @@ export function JobDetailPage() {
         </CardContent>
       </Card>
 
+      {/* Output (ADR-048) */}
+      {job.output !== undefined && job.output !== null && (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <span className="font-semibold">Output</span>
+              <CopyButton
+                value={JSON.stringify(job.output, null, 2)}
+                label="Copy output JSON"
+              />
+            </div>
+          </CardHeader>
+          <CardContent>
+            <JsonView data={job.output} />
+          </CardContent>
+        </Card>
+      )}
+
       {/* Metadata */}
       {hasMetadata(job) && (
         <Card>

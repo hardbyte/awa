@@ -288,6 +288,18 @@ Rust exposes two hook families on the client builder:
   returns `Completed`; at most 16 follow-ups and 64 KiB per attempt. Deploy the
   follow-up kind's workers before the code that stages it.
 
+To keep what a job produced for people to inspect, record an **output**
+(ADR-048): `ctx.set_output(&value)` (or `ctx.output_slot()` in a `register`
+closure) and `job.set_output(value)` in Python, at most 4 KiB of JSON. A
+completed job's output is `JobRow.output` / `job.output` from `get_job`; a
+failed attempt's is under `output` in its entry in `errors`, and only the
+latest entry keeps one. Outputs are queue-storage only, are pruned with the job,
+and are never read by Awa. Never have one job read another's output: pass
+values a follow-up needs in its args. A failed `set_output` clears the output
+and does not fail the attempt in Rust (`OutputError` has no `?` conversion);
+in Python the uncaught `awa.OutputError` is terminal, so record before side
+effects or catch it.
+
 Enqueues capture the current trace span into reserved metadata
 (`awa:traceparent`) automatically; disable with `AWA_TRACE_CAPTURE=off`. To
 propagate a trace onward from inside a handler, use the current span

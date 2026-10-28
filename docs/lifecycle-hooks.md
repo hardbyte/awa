@@ -171,6 +171,8 @@ Staged follow-ups are inserted in the same transaction as the attempt's completi
 
 The test harnesses behave the same way: `awa_testing::TestClient::work_one` and Python's `AwaTestClient.work_one` insert staged follow-ups when the handler completes, and `awa.testing.HandlerJob` records them in `job.staged` for unit tests without a database.
 
+A handler that also wants to leave a record of what it did for people to inspect can record a [job output](job-output.md) beside the follow-up. The follow-up still gets its value in its args: a job must not read another job's output, and registered specs receive the row without it. `Completed` events carry the output.
+
 ### Atomicity guarantees
 
 | Emission site | Atomic with state commit? |

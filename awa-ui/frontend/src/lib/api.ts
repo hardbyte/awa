@@ -19,6 +19,9 @@ export interface JobRow {
   metadata: unknown;
   tags: string[];
   progress: unknown | null;
+  /** The completed attempt's output (ADR-048). Null on list reads, which do
+   *  not load it, and for jobs that did not complete with one. */
+  output?: unknown | null;
   // Webhook callback fields
   callback_id: string | null;
   callback_timeout_at: string | null;

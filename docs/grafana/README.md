@@ -165,6 +165,9 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.completion.deadlock_retry` | Counter | kind, queue | Re-runs of a finalize transaction after Postgres aborted it as a deadlock victim (SQLSTATE 40P01); one increment per retry, up to three per completion. Any sustained rate means job transitions are waiting on each other |
 | `awa.completion.reconnect_retry` | Counter | kind, queue | Retries of a lease-guarded finalization after database unavailability, including transport/TLS/protocol errors, pool-acquire timeouts, SQLSTATE 08xxx, 57P01–57P03 and 25006. Counts retries that start, rather than recovered jobs. A burst can indicate an outage or pool pressure; correlate with pool wait and database errors |
 | `awa.job.staged_follow_ups_discarded` | Counter | kind, queue | Follow-ups a handler staged (ADR-046) and then discarded by returning `WaitForCallback`, which parks the job without completing it. Almost always a handler bug: stage after `ctx.wait_for_callback` instead |
+| `awa.job.output_recorded` | Counter | kind, queue, outcome | Job outputs (ADR-048) published: `completed` as the job's output, `failed` in an error entry |
+| `awa.job.output_bytes` | Histogram | kind, queue, outcome | Size of published job outputs, in bytes of JSON text |
+| `awa.job.output_dropped` | Counter | kind, queue, `awa.output.reason` | Recorded outputs that were not published: `canonical`, `schema_missing` (a binary ahead of migration v052), `outcome` (`Snooze` or `WaitForCallback`), `abandoned`, `no_claim` |
 | `awa.job.cancelled` | Counter | kind, queue | Jobs cancelled |
 | `awa.job.claimed` | Counter | queue | Jobs claimed from DB |
 | `awa.job.in_flight` | UpDownCounter | queue | Currently executing |
