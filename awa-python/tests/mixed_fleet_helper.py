@@ -44,7 +44,10 @@ async def main() -> None:
     mode = os.environ["MIXED_MODE"]
 
     client = awa.AsyncClient(database_url)
-    await client.migrate()
+    # A released artifact refuses to migrate a schema newer than it knows;
+    # the rehearsal sets this once the current migrations have run.
+    if not os.environ.get("MIXED_SKIP_MIGRATE"):
+        await client.migrate()
 
     if mode == "worker_chaos_probe":
         worker_count = int(os.environ.get("MIXED_QUEUE_WORKERS", "1"))

@@ -309,13 +309,14 @@ impl ReleasedWorker {
 }
 
 async fn spawn_released_worker(queue: &str) -> ReleasedWorker {
-    spawn_released_worker_with(queue, 80, None).await
+    spawn_released_worker_with(queue, 80, None, false).await
 }
 
 async fn spawn_released_worker_with(
     queue: &str,
     sleep_ms: u64,
     deadline_duration_ms: Option<u64>,
+    schema_already_current: bool,
 ) -> ReleasedWorker {
     let python = released_python();
     assert!(
@@ -338,6 +339,9 @@ async fn spawn_released_worker_with(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    if schema_already_current {
+        command.env("MIXED_SKIP_MIGRATE", "1");
+    }
     if let Some(deadline_duration_ms) = deadline_duration_ms {
         command.env(
             "MIXED_DEADLINE_DURATION_MS",
@@ -1059,7 +1063,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
 
     // Keep the released handler alive beyond its deadline. Its runtime
     // heartbeat and maintenance loops continue while the job is running.
-    let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300)).await;
+    let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300), false).await;
     assert_eq!(schema_version(&pool).await, 40);
 
     report.phase("released_v040_installed");
@@ -1756,6 +1760,7 @@ async fn run_released_admin(queue: &str, read_ids: &[i64], retry_ids: &[i64]) ->
             .env("DATABASE_URL", database_url())
             .env("MIXED_QUEUE", queue)
             .env("MIXED_MODE", "admin_read_and_retry")
+            .env("MIXED_SKIP_MIGRATE", "1")
             .env("MIXED_READ_IDS", join(read_ids))
             .env("MIXED_RETRY_IDS", join(retry_ids))
             .env("PYTHONUNBUFFERED", "1")
@@ -1978,7 +1983,7 @@ async fn test_migrate_first_mixed_fleet_job_output() {
 
     // Phase 4: a released worker runs the next attempt of every job whose
     // previous attempt recorded an output.
-    let mut old_worker = spawn_released_worker(&queue).await;
+    let mut old_worker = spawn_released_worker_with(&queue, 80, None, true).await;
     let mut resumed = retry_ids.clone();
     resumed.extend(&failed_ids);
     let resumed_rows = wait_for_job_states(
