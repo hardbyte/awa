@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. Builds on [ADR-046](046-handler-staged-follow-ups.md) staged follow-ups and [ADR-026](026-narrow-terminal-history.md) narrow terminal history. Depends on `JobRow` becoming `#[non_exhaustive]` ([#564](https://github.com/hardbyte/awa/pull/564)). Adds migration v052, for queue storage only.
+Accepted. Builds on [ADR-046](046-handler-staged-follow-ups.md) staged follow-ups and [ADR-026](026-narrow-terminal-history.md) narrow terminal history. Depends on `JobRow` becoming `#[non_exhaustive]` ([#564](https://github.com/hardbyte/awa/pull/564)). Adds migration v052: output columns for queue storage, and an output type on job-kind descriptors. Implemented by `awa-worker/src/output.rs`, the output paths in `awa-model/src/queue_storage.rs`, the `AwaJobOutput` TLA+ model and `awa/tests/job_output_test.rs`.
 
 ## Context
 
@@ -160,6 +160,46 @@ Sets, non-finite floats, non-string keys and integers outside 64 bits are reject
 
 **Return values are unchanged.** A worker that returns a dict today has it discarded, so making return values the output would change existing handlers. An opt-in is listed under [Open extensions](#open-extensions).
 
+### Typed outputs
+
+Storage and the wire stay JSON. A kind can declare the type its handler records, and the declaration types the API on top of the JSON core:
+
+```rust
+#[derive(Serialize, Deserialize, JobArgs)]
+#[awa(output = Thumbnail)]
+struct Resize { width: u32 }
+
+/// Implemented by `#[awa(output = T)]`.
+pub trait JobOutput: JobArgs {
+    type Output: Serialize + DeserializeOwned;
+}
+
+impl JobContext {
+    /// A slot that accepts only `T::Output`. On a job of another kind every
+    /// `set` fails with `OutputError::Invalid`.
+    pub fn typed_output<T: JobOutput>(&self) -> TypedOutputSlot<T::Output>;
+}
+
+impl JobRow {
+    /// Fails with `AwaError::Validation` on a job of another kind, and with
+    /// a decode error when the stored JSON does not fit `T::Output`.
+    pub fn output_as<T: JobOutput>(&self) -> Result<Option<T::Output>, AwaError>;
+    /// The same for the latest failed attempt that recorded an output.
+    pub fn error_output_as<T: JobOutput>(&self) -> Result<Option<T::Output>, AwaError>;
+}
+
+impl ExternalCompletion {
+    /// The completion then fails, writing nothing, if the job is not of kind `T`.
+    pub fn output_for<T: JobOutput>(self, output: &T::Output) -> Result<Self, OutputError>;
+}
+```
+
+In Python, `@client.task(Resize, output=Thumbnail)` makes `set_output` refuse an instance of another class. A type `isinstance` cannot check, such as `list[int]` or a `TypedDict`, is not enforced. `job.output_as(Thumbnail)` and `job.error_output_as(Thumbnail)` decode the way dispatch decodes args: `model_validate` for pydantic models, keyword construction for dataclasses, and an `isinstance` check for other classes.
+
+**The type is published, not enforced by the database.** Registering a kind with a declared output stores `{"type": name}` in a new `output` column of `awa.job_kind_descriptors`. A JSON Schema is added when the declaring runtime has one: Python adds it when pydantic can produce one, and Rust takes one passed explicitly in `JobKindDescriptor::output`. An explicit descriptor output wins over the declared name. The admin UI labels a job's output with its kind's type and lists each kind's type and schema. The column is `jsonb`, capped at 64 KiB, and the descriptor sync probes for it, so a binary ahead of v052 syncs the rest of the descriptor.
+
+**Why not typed storage.** A row read later may have been written by an older deployment of the handler, by another language, or before the kind declared a type. Decoding at the reader keeps every such row readable as JSON and makes a mismatch an error the reader handles, rather than a failed completion. Changing a declared output type is a schema change for readers, as changing args is; the descriptor shows the current one.
+
 ### Lifetime of the output slot
 
 The slot belongs to one attempt and is created with its context. It is **sealed when the handler returns**, at the same point as ADR-046's staging buffer. Later calls return `OutputError::Sealed`.
@@ -314,7 +354,7 @@ Not guaranteed:
 
 An output is a value on one job. People and tools read it; neither the engine nor another job does. Several rules follow:
 
-- **B must not read A's output.** A value B needs travels in B's args, through staging. A B that fetches A's output by ID recreates question 3: it fails once A is pruned, which is exactly the failure Celery and Oban Pro document. No API offers "the output of the job that enqueued me", there is no typed accessor, and the docs say so.
+- **B must not read A's output.** A value B needs travels in B's args, through staging. A B that fetches A's output by ID recreates question 3: it fails once A is pruned, which is exactly the failure Celery and Oban Pro document. No API offers "the output of the job that enqueued me": `output_as` decodes a row its caller already holds and looks nothing up. The docs say so.
 - **No output-driven follow-ups.** No `on_*_enqueue*` spec receives an output, and no predicate evaluates one. A seal-time mapper that derives follow-ups from the output can be written in user code on top of `OutputSlot` and staging. It is not core API.
 - **No checkpoints across attempts.** Handlers do not see failed outputs at dispatch, so an attempt cannot resume from the previous attempt's output. That is what progress is for, and progress is cleared on completion and on DLQ retry.
 - **Not on by default.** A job records an output only when its handler asks. Each open extension needs its own ADR that passes the test above.
@@ -451,6 +491,10 @@ Merge the output into metadata on read, as callback results are. Rejected:
 - `_awa_callback_result` is a handler *input*;
 - reads would differ between storage families.
 
+### Typed storage or a generic handler signature
+
+Making the slot generic (`JobContext<O>`) or the output part of the handler's return type would change every handler signature, including `Worker`, and would not type the rows readers get from the database, which is where a type is needed. Validating outputs against the published schema at write time would make a schema change fail completions after their side effects ran. Both were rejected for the opt-in declaration and reader-side decode above.
+
 ### `?` converts `OutputError` into a terminal job error
 
 This would match `StageError`. Rejected: a data-dependent size failure would send jobs to the DLQ after their side effects, for a value nothing depends on.
@@ -475,7 +519,7 @@ A's output would list the follow-ups it inserted, with their IDs or "duplicate",
 
 Each needs its own ADR that passes ADR-046's test.
 
-- **Python return values**: `@client.worker(..., output=True)` would make a handler's return value its output.
+- **Python return values**: an opt-in on `@client.task(...)` would make a handler's return value its output.
 - **Callback outputs**: a registration-time `store_output` option on the callback, covering `complete_external`, `resolve_callback` and its transformed payload, and the HTTP endpoint alike.
 - **Erasure on delete**: deleting a compact-completed job also sets its element of `outputs` to NULL.
 - **Larger outputs** in a side table, if a use case appears.
