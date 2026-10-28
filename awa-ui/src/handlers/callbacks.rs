@@ -61,7 +61,17 @@ pub async fn complete_callback(
     let uuid = uuid::Uuid::parse_str(&callback_id)
         .map_err(|e| ApiError::Awa(awa_model::AwaError::Validation(e.to_string())))?;
 
-    let job = awa_model::admin::complete_external(&state.pool, uuid, body.payload, None).await?;
+    let job = match body.output {
+        Some(output) => {
+            awa_model::admin::complete_external_with(
+                &state.pool,
+                uuid,
+                awa_model::ExternalCompletion::new().output(output),
+            )
+            .await?
+        }
+        None => awa_model::admin::complete_external(&state.pool, uuid, body.payload, None).await?,
+    };
     state.invalidate_dashboard_caches();
     Ok((
         StatusCode::OK,

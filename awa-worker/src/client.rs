@@ -2234,6 +2234,47 @@ impl Client {
         Ok(job)
     }
 
+    /// Complete a waiting job via its callback and store the output in
+    /// `opts` as the job's output (ADR-048), as
+    /// [`admin::complete_external_with`] does. Registered
+    /// `on_completed_enqueue` specs run in the same transaction, as for
+    /// [`Self::complete_external`], and receive the row without its output.
+    pub async fn complete_external_with(
+        &self,
+        callback_id: Uuid,
+        opts: awa_model::ExternalCompletion,
+    ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let requested_output = opts.output.as_ref().is_some_and(|output| !output.is_null());
+        let mut tx = self.pool.begin().await?;
+        let job = admin::complete_external_with_in_tx(&mut tx, callback_id, opts).await?;
+        self.dispatch_callback_followups_in_tx(
+            &mut tx,
+            &job,
+            crate::enqueue_specs::Outcome::Completed,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        if requested_output && job.output.is_none() {
+            let reason = match self.storage {
+                crate::storage::RuntimeStorage::Canonical => "canonical",
+                crate::storage::RuntimeStorage::QueueStorage(_) => "schema_missing",
+            };
+            self.metrics
+                .record_job_output_dropped(&job.kind, &job.queue, reason);
+        } else if let Some(output) = &job.output {
+            let bytes = awa_model::output::serialized_len(output).unwrap_or(0) as u64;
+            self.metrics
+                .record_job_output_recorded(&job.kind, &job.queue, "completed", bytes);
+        }
+        self.dispatch_callback_event(UntypedJobEvent::Completed {
+            job: job.clone(),
+            duration: Duration::ZERO,
+        })
+        .await;
+        Ok(job)
+    }
+
     /// Fail a waiting job via its callback. The callback failure and any
     /// registered `on_exhausted_enqueue` follow-up `INSERT`s commit
     /// atomically. A spec INSERT failure rolls the failure back and

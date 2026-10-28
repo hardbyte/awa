@@ -126,6 +126,12 @@ pub struct JobRow {
     pub callback_transform: Option<String>,
     /// Structured progress reported by the handler during execution.
     pub progress: Option<serde_json::Value>,
+    /// The completed attempt's output (ADR-048, queue storage). `None` for a
+    /// job that did not complete with one, and on list reads, which do not
+    /// load it. A failed attempt's output is in its entry in `errors`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
 }
 
 /// Options for inserting a job.

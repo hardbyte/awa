@@ -12,6 +12,7 @@ pub mod insert;
 pub mod job;
 pub mod kind;
 pub mod migrations;
+pub mod output;
 pub mod partitioned_queue;
 pub mod queue_storage;
 pub mod reschedule;
@@ -23,8 +24,8 @@ pub mod unique;
 // Re-exports for ergonomics
 pub use adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};
 pub use admin::{
-    CallbackConfig, DefaultAction, JobKindDescriptor, JobKindOverview, ListJobsFilter,
-    QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
+    CallbackConfig, DefaultAction, ExternalCompletion, JobKindDescriptor, JobKindOverview,
+    ListJobsFilter, QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
     QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome,
     RetryFailedOutcome, RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput,
     StateTimeseriesBucket, StorageCapability,
@@ -47,6 +48,7 @@ pub use insert::{
     insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_prepared, insert_with,
 };
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
+pub use output::{AttemptError, OutputError, MAX_OUTPUT_BYTES};
 pub use partitioned_queue::{
     partition_for_ordering_key, partition_hash64, PartitionedQueue, PartitionedQueueError,
 };

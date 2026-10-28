@@ -24,9 +24,9 @@ pub use awa_model::{
 pub use awa_worker::{
     self as worker, context::ProgressState, BuildError, CallbackGuard, CallbackToken, Client,
     ClientBuilder, CronMissedFirePolicy, EnqueueRequest, FollowUps, HealthCheck, JobContext,
-    JobError, JobEvent, JobResult, PeriodicJob, PeriodicJobBuilder, QueueCapacity, QueueConfig,
-    QueueHealth, RateLimit, RescueReason, RetentionPolicy, StageError, UntypedJobEvent, Worker,
-    MAX_STAGED_BYTES, MAX_STAGED_FOLLOW_UPS,
+    JobError, JobEvent, JobResult, OutputError, OutputSlot, PeriodicJob, PeriodicJobBuilder,
+    QueueCapacity, QueueConfig, QueueHealth, RateLimit, RescueReason, RetentionPolicy, StageError,
+    UntypedJobEvent, Worker, MAX_OUTPUT_BYTES, MAX_STAGED_BYTES, MAX_STAGED_FOLLOW_UPS,
 };
 
 #[cfg(feature = "http-worker")]

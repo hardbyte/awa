@@ -566,7 +566,7 @@ async fn list_queue_storage_jobs(
         }
 
         for job_id in &ids {
-            let Some(job) = store.load_job(pool, *job_id).await? else {
+            let Some(job) = store.load_job_without_output(pool, *job_id).await? else {
                 continue;
             };
 
@@ -3372,6 +3372,87 @@ pub async fn complete_external_in_tx(
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
     complete_external_in_tx_inner(tx, callback_id, payload, run_lease, false).await
+}
+
+/// Options for [`complete_external_with`]: what to store with an external
+/// completion. Build it with [`ExternalCompletion::new`] and its setters.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ExternalCompletion {
+    /// The job's output (ADR-048). Validated like a handler's: at most
+    /// [`MAX_OUTPUT_BYTES`](crate::MAX_OUTPUT_BYTES) of JSON text, no NUL
+    /// characters; JSON null stores none.
+    pub output: Option<serde_json::Value>,
+    /// Complete only the attempt with this run lease.
+    pub run_lease: Option<i64>,
+}
+
+impl ExternalCompletion {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store `output` as the job's output.
+    pub fn output(mut self, output: serde_json::Value) -> Self {
+        self.output = Some(output);
+        self
+    }
+
+    /// Complete only the attempt with this run lease.
+    pub fn run_lease(mut self, run_lease: i64) -> Self {
+        self.run_lease = Some(run_lease);
+        self
+    }
+}
+
+/// Complete a job waiting on `callback_id`, storing the output in `opts`.
+///
+/// Like [`complete_external`], which discards its payload. An invalid output
+/// fails the call before anything is written. A valid output that the engine
+/// cannot store (canonical, or a queue-storage schema before migration v052)
+/// is dropped and the completion goes ahead; the returned row's `output` is
+/// then `None`.
+pub async fn complete_external_with(
+    pool: &PgPool,
+    callback_id: Uuid,
+    opts: ExternalCompletion,
+) -> Result<JobRow, AwaError> {
+    let mut tx = pool.begin().await?;
+    let row = complete_external_with_in_tx(&mut tx, callback_id, opts).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Transaction-aware variant of [`complete_external_with`] (ADR-029).
+pub async fn complete_external_with_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+    opts: ExternalCompletion,
+) -> Result<JobRow, AwaError> {
+    let output = match opts.output {
+        Some(output) => crate::output::validate_output(output)
+            .map_err(|err| AwaError::Validation(err.to_string()))?,
+        None => None,
+    };
+    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
+        let row = store
+            .complete_external_with_output_in_tx(tx, callback_id, opts.run_lease, output.clone())
+            .await?;
+        if output.is_some() && row.output.is_none() {
+            tracing::warn!(
+                job_id = row.id,
+                "External completion output dropped: the queue-storage schema has no output columns (migration v052)"
+            );
+        }
+        return Ok(row);
+    }
+    if output.is_some() {
+        tracing::warn!(
+            %callback_id,
+            "External completion output dropped: canonical storage keeps no job outputs"
+        );
+    }
+    complete_external_in_tx_inner(tx, callback_id, None, opts.run_lease, false).await
 }
 
 /// Complete a waiting job and resume the handler with the callback payload.

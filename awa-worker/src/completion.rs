@@ -328,37 +328,56 @@ impl CompletionWorker {
                 .await
                 .map_err(AwaError::Database),
             RuntimeStorage::QueueStorage(runtime) => {
-                if let Some(runtime_jobs) = batch
+                // Requests that carry their runtime job take the path that
+                // keeps job outputs (ADR-048), even when another request in
+                // the same flush carries only a claim or an ID.
+                let (with_job, rest): (Vec<&CompletionRequest>, Vec<&CompletionRequest>) = batch
                     .iter()
-                    .map(|request| request.runtime_job.clone())
-                    .collect::<Option<Vec<ClaimedRuntimeJob>>>()
-                {
-                    runtime
+                    .partition(|request| request.runtime_job.is_some());
+                let runtime_jobs: Vec<ClaimedRuntimeJob> = with_job
+                    .iter()
+                    .filter_map(|request| request.runtime_job.clone())
+                    .collect();
+                let mut updated = Vec::with_capacity(batch.len());
+                let mut result = Ok(());
+                if !runtime_jobs.is_empty() {
+                    match runtime
                         .store
                         .complete_runtime_batch(&self.pool, &runtime_jobs)
                         .await
-                } else if let Some(claimed) = batch
-                    .iter()
-                    .map(|request| request.claim.clone())
-                    .collect::<Option<Vec<ClaimedEntry>>>()
-                {
-                    runtime
-                        .store
-                        .complete_claimed_batch(&self.pool, &claimed)
-                        .await
-                } else {
-                    runtime
-                        .store
-                        .complete_job_batch_by_id(
-                            &self.pool,
-                            &job_ids
-                                .iter()
-                                .copied()
-                                .zip(run_leases.iter().copied())
-                                .collect::<Vec<_>>(),
-                        )
-                        .await
+                    {
+                        Ok(rows) => updated.extend(rows),
+                        Err(err) => result = Err(err),
+                    }
                 }
+                if result.is_ok() && !rest.is_empty() {
+                    let rest_updated = if let Some(claimed) = rest
+                        .iter()
+                        .map(|request| request.claim.clone())
+                        .collect::<Option<Vec<ClaimedEntry>>>()
+                    {
+                        runtime
+                            .store
+                            .complete_claimed_batch(&self.pool, &claimed)
+                            .await
+                    } else {
+                        runtime
+                            .store
+                            .complete_job_batch_by_id(
+                                &self.pool,
+                                &rest
+                                    .iter()
+                                    .map(|request| (request.job_id, request.run_lease))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .await
+                    };
+                    match rest_updated {
+                        Ok(rows) => updated.extend(rows),
+                        Err(err) => result = Err(err),
+                    }
+                }
+                result.map(|()| updated)
             }
         };
 
