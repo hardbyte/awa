@@ -3095,35 +3095,24 @@ mod tests {
             })
         });
         let now = chrono::Utc::now();
-        let job = JobRow {
-            id: 1,
-            kind: "pending_hook".into(),
-            queue: "test".into(),
-            args: serde_json::json!({}),
-            state: JobState::Completed,
-            priority: 2,
-            attempt: 1,
-            run_lease: 1,
-            max_attempts: 5,
-            run_at: now,
-            heartbeat_at: None,
-            deadline_at: None,
-            attempted_at: Some(now),
-            finalized_at: Some(now),
-            created_at: now,
-            errors: None,
-            metadata: serde_json::json!({}),
-            tags: Vec::new(),
-            unique_key: None,
-            unique_states: None,
-            callback_id: None,
-            callback_timeout_at: None,
-            callback_filter: None,
-            callback_on_complete: None,
-            callback_on_fail: None,
-            callback_transform: None,
-            progress: None,
-        };
+        let job: JobRow = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "kind": "pending_hook",
+            "queue": "test",
+            "args": {},
+            "state": "completed",
+            "priority": 2,
+            "attempt": 1,
+            "run_lease": 1,
+            "max_attempts": 5,
+            "run_at": now,
+            "attempted_at": now,
+            "finalized_at": now,
+            "created_at": now,
+            "metadata": {},
+            "tags": [],
+        }))
+        .expect("job row");
         let handlers = HashMap::from([("pending_hook".into(), vec![hook])]);
         let dispatch = tokio::spawn(async move {
             dispatch_lifecycle_event(
