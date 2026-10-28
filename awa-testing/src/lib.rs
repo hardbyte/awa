@@ -409,7 +409,8 @@ impl TestClient {
                     .await?;
                 Ok(WorkResult::Retryable(job))
             }
-            Err(JobError::Retryable(_)) => {
+            Err(JobError::Retryable(err)) => {
+                let message = err.to_string();
                 // The final attempt exhausts the job, mirroring the real
                 // executor.
                 if job.attempt >= job.max_attempts {
@@ -433,14 +434,14 @@ impl TestClient {
                 // one rather than a near-immediate reschedule that would let the
                 // same job be re-claimed within a test or accumulate across runs.
                 store
-                    .retry_after_with_output(
+                    .fail_retryable_after_with_claim(
                         &self.pool,
                         job.id,
                         job.run_lease,
                         Duration::from_secs(3600),
+                        failure(&message),
                         progress_snapshot,
                         Some(&claimed.claim),
-                        output.clone(),
                     )
                     .await?;
                 Ok(WorkResult::Retryable(job))

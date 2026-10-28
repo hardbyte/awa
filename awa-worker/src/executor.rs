@@ -434,7 +434,7 @@ impl JobExecutor {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
                         let started_kind = job_kind.clone();
-                        let started_job = job.clone();
+                        let started_job = crate::output::without_outputs(&job).into_owned();
                         tokio::spawn(async move {
                             dispatch_lifecycle_event(
                                 &started_handlers,
@@ -523,8 +523,12 @@ impl JobExecutor {
             metrics.record_in_flight_change(&job_queue, -1);
 
             let (Some(result), Some(finalize_permit)) = (result, finalize_permit) else {
+                if sealed_output.is_some() {
+                    record_output_dropped(&metrics, &job_kind, &job_queue, "abandoned");
+                }
                 return;
             };
+            let had_output = sealed_output.is_some();
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
             // The finalizer's copy of the row carries the sealed output to
             // every transition, including each finalize retry (ADR-048).
@@ -533,6 +537,7 @@ impl JobExecutor {
             finalizers.spawn(
                 async move {
                     let event_kind = job_kind.clone();
+                    let abandon_output = had_output.then(|| (metrics.clone(), job_queue.clone()));
                     let finalize = async move {
                         if job.output.is_some() {
                             let dropped = match storage {
@@ -545,11 +550,6 @@ impl JobExecutor {
                                 {
                                     Some("no_claim")
                                 }
-                                RuntimeStorage::QueueStorage(_)
-                                    if !output_storable(&storage, &pool, &result).await =>
-                                {
-                                    Some("schema_missing")
-                                }
                                 RuntimeStorage::QueueStorage(_) => None,
                             };
                             if let Some(reason) = dropped {
@@ -557,30 +557,83 @@ impl JobExecutor {
                                 job.output = None;
                             }
                         }
-                        let outcome = finalize_with_retry(
-                            |completion_path| complete_job(
-                                &pool,
-                                &job,
-                                queue_storage_claim.as_ref(),
-                                queue_storage_unique_states.as_deref(),
-                                &result,
-                                &staged_follow_ups,
-                                &completion_batcher,
-                                completion_path,
-                                progress_snapshot.clone(),
-                                duration,
-                                has_lifecycle_handlers,
-                                &enqueue_specs,
-                                &storage,
-                                dlq_enabled,
-                                &metrics,
-                            ),
-                            &metrics,
-                            job_id,
-                            &job_kind,
-                            &job_queue,
-                            COMPLETION_RECONNECT_WINDOW,
-                        ).await;
+                        // Whether the schema can hold a completion output is
+                        // decided inside each finalize attempt, so a probe
+                        // that fails with the connection is retried with the
+                        // write rather than dropping the output.
+                        let stripped_job = job.output.is_some().then(|| {
+                            let mut stripped = job.clone();
+                            stripped.output = None;
+                            stripped
+                        });
+                        let output_kept = AtomicBool::new(true);
+                        let outcome = {
+                            let (job, stripped_job, output_kept) = (&job, &stripped_job, &output_kept);
+                            let (pool, result, storage) = (&pool, &result, &storage);
+                            let (staged_follow_ups, completion_batcher) =
+                                (&staged_follow_ups, &completion_batcher);
+                            let (enqueue_specs, metrics) = (&enqueue_specs, &metrics);
+                            let (claim, unique_states) =
+                                (queue_storage_claim.as_ref(), queue_storage_unique_states.as_deref());
+                            finalize_with_retry(
+                                |completion_path| {
+                                    let progress = progress_snapshot.clone();
+                                    async move {
+                                        let job = match stripped_job {
+                                            Some(stripped)
+                                                if !output_storable(storage, pool, result).await? =>
+                                            {
+                                                output_kept.store(false, Ordering::Relaxed);
+                                                stripped
+                                            }
+                                            _ => {
+                                                output_kept.store(true, Ordering::Relaxed);
+                                                job
+                                            }
+                                        };
+                                        complete_job(
+                                            pool,
+                                            job,
+                                            claim,
+                                            unique_states,
+                                            result,
+                                            staged_follow_ups,
+                                            completion_batcher,
+                                            completion_path,
+                                            progress,
+                                            duration,
+                                            has_lifecycle_handlers,
+                                            enqueue_specs,
+                                            storage,
+                                            dlq_enabled,
+                                            metrics,
+                                        )
+                                        .await
+                                        .inspect_err(|err| {
+                                            // The schema lost the output columns
+                                            // under this process; re-probe on retry.
+                                            if let (true, RuntimeStorage::QueueStorage(runtime)) =
+                                                (err.is_undefined_column(), storage)
+                                            {
+                                                runtime.store.forget_job_output_columns();
+                                            }
+                                        })
+                                    }
+                                },
+                                metrics,
+                                job_id,
+                                &job_kind,
+                                &job_queue,
+                                COMPLETION_RECONNECT_WINDOW,
+                            )
+                            .await
+                        };
+                        if !output_kept.into_inner() {
+                            if matches!(outcome, Ok(FinalizeAck { outcome: CompletionOutcome::Applied { .. }, .. })) {
+                                record_output_dropped(&metrics, &job.kind, &job.queue, "schema_missing");
+                            }
+                            job.output = None;
+                        }
 
                         match &outcome {
                             Ok(FinalizeAck {
@@ -692,6 +745,9 @@ impl JobExecutor {
                         event = finalize => event,
                         _ = finalize_cancel.cancelled() => {
                             warn!(job_id, "Finalization cancelled after runtime drain");
+                            if let Some((metrics, queue)) = &abandon_output {
+                                record_output_dropped(metrics, &event_kind, queue, "abandoned");
+                            }
                             None
                         },
                     };
@@ -758,6 +814,7 @@ where
     let deadline = started + window;
     let mut deadlock_retries = 0;
     let mut reconnect_retries = 0;
+    let mut schema_retried = false;
     let mut completion_path = CompletionPath::Batched;
     loop {
         let outcome = tokio::time::timeout_at(deadline, finalize(completion_path))
@@ -779,6 +836,11 @@ where
         } else if error.is_connection_lost() {
             reconnect_retries += 1;
             completion_reconnect_backoff(reconnect_retries)
+        } else if error.is_undefined_column() && !schema_retried {
+            // A completion named output columns the schema no longer has;
+            // the retry re-probes and writes without them (ADR-048).
+            schema_retried = true;
+            Duration::ZERO
         } else {
             return Err(error.into());
         };
@@ -970,17 +1032,11 @@ async fn output_storable(
     storage: &RuntimeStorage,
     pool: &PgPool,
     result: &Result<JobResult, JobError>,
-) -> bool {
+) -> Result<bool, AwaError> {
     match storage {
-        RuntimeStorage::Canonical => false,
-        RuntimeStorage::QueueStorage(runtime) => {
-            !matches!(result, Ok(JobResult::Completed))
-                || runtime
-                    .store
-                    .supports_job_output(pool)
-                    .await
-                    .unwrap_or(false)
-        }
+        RuntimeStorage::Canonical => Ok(false),
+        RuntimeStorage::QueueStorage(_) if !matches!(result, Ok(JobResult::Completed)) => Ok(true),
+        RuntimeStorage::QueueStorage(runtime) => runtime.store.supports_job_output(pool).await,
     }
 }
 

@@ -154,7 +154,8 @@ The `awa.output.reason` values:
 - `canonical`;
 - `schema_missing`, for a binary running ahead of migration v052;
 - `outcome`, for `Snooze` or `WaitForCallback`;
-- `abandoned`, for a handler cut off past its deadline;
+- `abandoned`, for a handler cut off past its deadline, or a shutdown that
+  ends before the attempt is finalized;
 - `no_claim`.
 
 Warnings about dropped outputs are logged at most once a minute for each kind

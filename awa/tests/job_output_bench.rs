@@ -175,13 +175,12 @@ async fn run(scenario: Scenario, jobs: i64) -> Measured {
     .unwrap();
 
     // Read back a spread of completed jobs, as the job detail view does.
-    let ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT job_id FROM awa.terminal_jobs WHERE kind = $1 ORDER BY job_id",
-    )
-    .bind(OutputBench::kind())
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT job_id FROM awa.terminal_jobs WHERE kind = $1 ORDER BY job_id")
+            .bind(OutputBench::kind())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     let step = (ids.len() / 50).max(1);
     let mut latencies = Vec::new();
     for id in ids.iter().step_by(step) {

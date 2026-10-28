@@ -1946,7 +1946,9 @@ const COMPACT_BATCH_OUTPUT_BUDGET: usize = 64 * 1024;
 
 /// Split a completion batch into contiguous runs whose recorded outputs stay
 /// within [`COMPACT_BATCH_OUTPUT_BUDGET`]; a run always holds at least one job.
-fn split_by_output_budget(claimed: &[ClaimedRuntimeJob]) -> Vec<&[ClaimedRuntimeJob]> {
+fn split_by_output_budget<'a>(
+    claimed: &'a [&'a ClaimedRuntimeJob],
+) -> Vec<&'a [&'a ClaimedRuntimeJob]> {
     let mut chunks = Vec::new();
     let (mut start, mut bytes) = (0, 0);
     for (index, entry) in claimed.iter().enumerate() {
@@ -3071,6 +3073,17 @@ impl QueueStorage {
     /// is re-checked at most every [`JOB_OUTPUT_PROBE_INTERVAL`]; until then
     /// writers drop outputs and readers project NULL instead of naming the
     /// missing columns.
+    /// Discard the cached [`Self::supports_job_output`] answer, after a
+    /// statement found the output columns missing, so the next call
+    /// probes the catalog again.
+    #[doc(hidden)]
+    pub fn forget_job_output_columns(&self) {
+        *self
+            .job_output_columns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     pub async fn supports_job_output<'e, E>(&self, executor: E) -> Result<bool, AwaError>
     where
         E: sqlx::PgExecutor<'e>,
@@ -7391,7 +7404,15 @@ impl QueueStorage {
         }
 
         let mut rows = Vec::with_capacity(claimed.len());
-        for (claim_slot_index, group) in by_partition {
+        // Outputs past the budget start another batch row in the same
+        // transaction, so the flush still commits or fails as a whole.
+        let mut groups = Vec::with_capacity(by_partition.len());
+        for (index, partition) in &by_partition {
+            for group in split_by_output_budget(partition) {
+                groups.push((*index, group));
+            }
+        }
+        for (claim_slot_index, group) in groups {
             let claim_rel = claim_child_name(schema, claim_slot_index);
             let claim_batch_rel = claim_batch_child_name(schema, claim_slot_index);
             let closure_rel = closure_child_name(schema, claim_slot_index);
@@ -7707,13 +7728,9 @@ impl QueueStorage {
 
         if self.lease_claim_receipts() && claimed.iter().all(Self::receipt_fast_complete_candidate)
         {
-            let mut updated = Vec::with_capacity(claimed.len());
-            for chunk in split_by_output_budget(claimed) {
-                updated.extend(
-                    self.complete_receipt_runtime_batch_fast(pool, chunk)
-                        .await?,
-                );
-            }
+            let mut updated = self
+                .complete_receipt_runtime_batch_fast(pool, claimed)
+                .await?;
             if updated.len() == claimed.len() {
                 return Ok(updated);
             }
@@ -12994,7 +13011,13 @@ impl QueueStorage {
     }
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        self.load_job_inner(pool, job_id, true).await
+        match self.load_job_inner(pool, job_id, true).await {
+            Err(err) if err.is_undefined_column() => {
+                self.forget_job_output_columns();
+                self.load_job_inner(pool, job_id, false).await
+            }
+            other => other,
+        }
     }
 
     /// [`Self::load_job`] without the job's output (ADR-048), for list
@@ -15773,6 +15796,52 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
         claim: Option<&ClaimedEntry>,
     ) -> Result<Option<JobRow>, AwaError> {
+        self.fail_retryable_at_tx(tx, job_id, run_lease, error.into(), progress, claim, None)
+            .await
+    }
+
+    /// [`Self::fail_retryable_with_claim`] with an explicit retry delay in
+    /// place of the backoff schedule, for test harnesses that must not see
+    /// the job become claimable again.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fail_retryable_after_with_claim(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        run_lease: i64,
+        delay: Duration,
+        error: impl Into<AttemptError>,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+    ) -> Result<Option<JobRow>, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .fail_retryable_at_tx(
+                &mut tx,
+                job_id,
+                run_lease,
+                error.into(),
+                progress,
+                claim,
+                Some(delay),
+            )
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_retryable_at_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        error: AttemptError,
+        progress: Option<serde_json::Value>,
+        claim: Option<&ClaimedEntry>,
+        delay: Option<Duration>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
             .take_running_attempt_tx(tx, job_id, run_lease, "retryable", claim)
             .await?
@@ -15785,7 +15854,7 @@ impl QueueStorage {
             progress.or(moved.progress.clone()),
         )?)?;
         let exhausted = moved.attempt >= moved.max_attempts;
-        payload.push_error(lifecycle_entry(error.into(), moved.attempt, exhausted));
+        payload.push_error(lifecycle_entry(error, moved.attempt, exhausted));
 
         if exhausted {
             let done =
@@ -15797,10 +15866,21 @@ impl QueueStorage {
             return Ok(Some(done.into_job_row()?));
         }
 
+        let run_at = match delay {
+            Some(delay) => {
+                Utc::now()
+                    + TimeDelta::from_std(delay).map_err(|err| {
+                        AwaError::Validation(format!("invalid retry delay: {err}"))
+                    })?
+            }
+            None => {
+                self.backoff_at_tx(tx, moved.attempt, moved.max_attempts)
+                    .await?
+            }
+        };
         let deferred = moved.clone().into_deferred_row(
             JobState::Retryable,
-            self.backoff_at_tx(tx, moved.attempt, moved.max_attempts)
-                .await?,
+            run_at,
             Some(Utc::now()),
             payload.into_json(),
         );

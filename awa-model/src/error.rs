@@ -89,6 +89,16 @@ impl AwaError {
         )
     }
 
+    /// The statement named a column the table does not have (SQLSTATE 42703),
+    /// as when a schema loses a migration's columns under a running process.
+    pub fn is_undefined_column(&self) -> bool {
+        matches!(
+            self,
+            AwaError::Database(sqlx::Error::Database(database))
+                if database.code().as_deref() == Some("42703")
+        )
+    }
+
     /// Database writes are unavailable because of a transport, TLS, protocol,
     /// pool-acquire, server-availability or read-only-session error.
     ///

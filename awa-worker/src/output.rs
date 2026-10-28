@@ -119,12 +119,13 @@ impl OutputSlot {
         self.lock().value.clone()
     }
 
-    /// Close the slot and take its value. Later calls to [`Self::set`]
-    /// return [`OutputError::Sealed`].
+    /// Close the slot and return its value, which [`Self::get`] keeps
+    /// reporting. Later calls to [`Self::set`] return
+    /// [`OutputError::Sealed`].
     pub(crate) fn seal(&self) -> Option<serde_json::Value> {
         let mut slot = self.lock();
         slot.sealed = true;
-        slot.value.take()
+        slot.value.clone()
     }
 
     /// Seal the slot for a test harness that finalizes the job itself.
@@ -200,13 +201,14 @@ mod tests {
     }
 
     #[test]
-    fn sealing_takes_the_value_and_closes_the_slot() {
+    fn sealing_returns_the_value_and_closes_the_slot() {
         let slot = OutputSlot::new();
         let handle = slot.clone();
         handle.set(&json!([1, 2])).unwrap();
         assert_eq!(slot.seal(), Some(json!([1, 2])));
         assert_eq!(handle.set(&json!(3)), Err(OutputError::Sealed));
+        assert_eq!(handle.set(&()), Err(OutputError::Sealed));
         handle.clear();
-        assert_eq!(handle.get(), None);
+        assert_eq!(handle.get(), Some(json!([1, 2])));
     }
 }
