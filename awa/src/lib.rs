@@ -14,19 +14,21 @@ pub use awa_model::{
     self as model, adapter, admin, audited_sql, bridge, callback_contract, insert, insert_many,
     insert_many_copy, insert_many_copy_from_pool, insert_with, map_sqlx_error, migrations,
     partition_for_ordering_key, partition_hash64, prepare_job_insert, prepare_raw_job_insert,
-    storage, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow, InsertOpts,
-    InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState, ListDlqFilter, PartitionedQueue,
-    PartitionedQueueError, PreparedJobInsert, QueueDescriptor, QueueStorage, QueueStorageConfig,
-    ResolveOutcome, RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
+    storage, AttemptError, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow,
+    ExternalCompletion, InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobOutput, JobRow,
+    JobState, ListDlqFilter, OutputDescriptor, PartitionedQueue, PartitionedQueueError,
+    PreparedJobInsert, QueueDescriptor, QueueStorage, QueueStorageConfig, ResolveOutcome,
+    RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
 };
 
 // Re-export worker runtime
 pub use awa_worker::{
     self as worker, context::ProgressState, BuildError, CallbackGuard, CallbackToken, Client,
     ClientBuilder, CronMissedFirePolicy, EnqueueRequest, FollowUps, HealthCheck, JobContext,
-    JobError, JobEvent, JobResult, PeriodicJob, PeriodicJobBuilder, QueueCapacity, QueueConfig,
-    QueueHealth, RateLimit, RescueReason, RetentionPolicy, StageError, UntypedJobEvent, Worker,
-    MAX_STAGED_BYTES, MAX_STAGED_FOLLOW_UPS,
+    JobError, JobEvent, JobResult, OutputError, OutputSlot, PeriodicJob, PeriodicJobBuilder,
+    QueueCapacity, QueueConfig, QueueHealth, RateLimit, RescueReason, RetentionPolicy, StageError,
+    TypedOutputSlot, UntypedJobEvent, Worker, MAX_OUTPUT_BYTES, MAX_STAGED_BYTES,
+    MAX_STAGED_FOLLOW_UPS,
 };
 
 #[cfg(feature = "http-worker")]

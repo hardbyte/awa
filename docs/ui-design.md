@@ -44,8 +44,8 @@ The frontend is a React 19 SPA built with Vite and embedded into the binary via 
 GET  /api/stats                         Dashboard summary (state counts)
 GET  /api/stats/timeseries?minutes=60   Bucketed counts for sparklines
 
-GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=
-GET  /api/jobs/:id
+GET  /api/jobs?state=&kind=&queue=&tag=&limit=&before_id=   (rows omit output)
+GET  /api/jobs/:id                      Includes the job's output (ADR-048)
 POST /api/jobs/:id/retry
 POST /api/jobs/:id/cancel
 POST /api/jobs/bulk-retry               { ids: [...] }
@@ -85,7 +85,7 @@ POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
 
-POST /api/callbacks/:callback_id/complete
+POST /api/callbacks/:callback_id/complete   { payload?, output? }
 POST /api/callbacks/:callback_id/fail
 POST /api/callbacks/:callback_id/heartbeat
 

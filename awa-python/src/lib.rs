@@ -24,6 +24,7 @@ pyo3::create_exception!(_awa, SerializationError, AwaError);
 pyo3::create_exception!(_awa, ValidationError, AwaError);
 pyo3::create_exception!(_awa, TerminalError, AwaError);
 pyo3::create_exception!(_awa, StagingError, TerminalError);
+pyo3::create_exception!(_awa, OutputError, TerminalError);
 pyo3::create_exception!(_awa, DatabaseError, AwaError);
 pyo3::create_exception!(_awa, CallbackNotFound, AwaError);
 
@@ -166,6 +167,10 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("StagingError", m.py().get_type::<StagingError>())?;
     m.add("MAX_STAGED_FOLLOW_UPS", awa_worker::MAX_STAGED_FOLLOW_UPS)?;
     m.add("MAX_STAGED_BYTES", awa_worker::MAX_STAGED_BYTES)?;
+    m.add("OutputError", m.py().get_type::<OutputError>())?;
+    m.add("MAX_OUTPUT_BYTES", awa_worker::MAX_OUTPUT_BYTES)?;
+    m.add_function(wrap_pyfunction!(job::validate_output, m)?)?;
+    m.add_function(wrap_pyfunction!(job::decode_output_py, m)?)?;
     m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
     m.add("CallbackNotFound", m.py().get_type::<CallbackNotFound>())?;
 

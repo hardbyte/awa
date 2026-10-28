@@ -504,8 +504,14 @@ pub(crate) async fn dispatch_specs_in_tx(
     specs: &[BoxedEnqueueSpec],
     outcome_context: Option<&OutcomeContext>,
 ) -> Result<(), AwaError> {
+    if specs.is_empty() {
+        return Ok(());
+    }
+    // ADR-048: a spec never sees an output, so no follow-up is derived from
+    // one. Values a follow-up needs travel in its args.
+    let job = crate::output::without_outputs(job);
     for spec in specs {
-        spec.run(conn, job, outcome_context).await?;
+        spec.run(conn, &job, outcome_context).await?;
     }
     Ok(())
 }

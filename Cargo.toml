@@ -40,7 +40,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: Postgres prints jsonb numbers in plain decimal, and the
+# default parser can round a long one to the neighbouring f64.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 semver = "1"
 
 # Async

@@ -418,8 +418,10 @@ impl JobExecutor {
             let has_lifecycle_handlers = lifecycle_handlers.contains_key(&job_kind);
 
             let start = std::time::Instant::now();
+            // ADR-048: the dispatch row carries no failed outputs, so an
+            // attempt cannot resume from the previous attempt's output.
             let ctx = JobContext::new(
-                job.clone(),
+                crate::output::without_outputs(&job).into_owned(),
                 cancel,
                 state,
                 pool.clone(),
@@ -432,7 +434,7 @@ impl JobExecutor {
                     if has_lifecycle_handlers {
                         let started_handlers = lifecycle_handlers.clone();
                         let started_kind = job_kind.clone();
-                        let started_job = job.clone();
+                        let started_job = crate::output::without_outputs(&job).into_owned();
                         tokio::spawn(async move {
                             dispatch_lifecycle_event(
                                 &started_handlers,
@@ -496,6 +498,21 @@ impl JobExecutor {
                 &job_queue,
                 &metrics,
             );
+            // ADR-048: the output closes with the staging buffer.
+            let sealed_output = settle_output(
+                result.as_ref(),
+                ctx.output_slot().seal(),
+                &job_kind,
+                &job_queue,
+                &metrics,
+            );
+            // A rejected recording clears the slot without failing the
+            // attempt, so it would otherwise go unseen.
+            for (reason, count) in ctx.output_slot().rejections() {
+                for _ in 0..count {
+                    record_output_dropped(&metrics, &job_kind, &job_queue, reason);
+                }
+            }
 
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
             let finalize_permit = match result {
@@ -513,37 +530,117 @@ impl JobExecutor {
             metrics.record_in_flight_change(&job_queue, -1);
 
             let (Some(result), Some(finalize_permit)) = (result, finalize_permit) else {
+                if sealed_output.is_some() {
+                    record_output_dropped(&metrics, &job_kind, &job_queue, "abandoned");
+                }
                 return;
             };
+            let had_output = sealed_output.is_some();
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
+            // The finalizer's copy of the row carries the sealed output to
+            // every transition, including each finalize retry (ADR-048).
+            let mut job = job;
+            job.output = sealed_output;
             finalizers.spawn(
                 async move {
                     let event_kind = job_kind.clone();
+                    let abandon_output = had_output.then(|| (metrics.clone(), job_queue.clone()));
                     let finalize = async move {
-                        let outcome = finalize_with_retry(
-                            |completion_path| complete_job(
-                                &pool,
-                                &job,
-                                queue_storage_claim.as_ref(),
-                                queue_storage_unique_states.as_deref(),
-                                &result,
-                                &staged_follow_ups,
-                                &completion_batcher,
-                                completion_path,
-                                progress_snapshot.clone(),
-                                duration,
-                                has_lifecycle_handlers,
-                                &enqueue_specs,
-                                &storage,
-                                dlq_enabled,
-                                &metrics,
-                            ),
-                            &metrics,
-                            job_id,
-                            &job_kind,
-                            &job_queue,
-                            COMPLETION_RECONNECT_WINDOW,
-                        ).await;
+                        if job.output.is_some() {
+                            let dropped = match storage {
+                                RuntimeStorage::Canonical => Some("canonical"),
+                                // Only the claim-keyed completion paths carry
+                                // outputs; dispatch always passes a claim.
+                                RuntimeStorage::QueueStorage(_)
+                                    if queue_storage_claim.is_none()
+                                        && matches!(result, Ok(JobResult::Completed)) =>
+                                {
+                                    Some("no_claim")
+                                }
+                                RuntimeStorage::QueueStorage(_) => None,
+                            };
+                            if let Some(reason) = dropped {
+                                record_output_dropped(&metrics, &job.kind, &job.queue, reason);
+                                job.output = None;
+                            }
+                        }
+                        // Whether the schema can hold a completion output is
+                        // decided inside each finalize attempt, so a probe
+                        // that fails with the connection is retried with the
+                        // write rather than dropping the output.
+                        let stripped_job = job.output.is_some().then(|| {
+                            let mut stripped = job.clone();
+                            stripped.output = None;
+                            stripped
+                        });
+                        let output_kept = AtomicBool::new(true);
+                        let outcome = {
+                            let (job, stripped_job, output_kept) = (&job, &stripped_job, &output_kept);
+                            let (pool, result, storage) = (&pool, &result, &storage);
+                            let (staged_follow_ups, completion_batcher) =
+                                (&staged_follow_ups, &completion_batcher);
+                            let (enqueue_specs, metrics) = (&enqueue_specs, &metrics);
+                            let (claim, unique_states) =
+                                (queue_storage_claim.as_ref(), queue_storage_unique_states.as_deref());
+                            finalize_with_retry(
+                                |completion_path| {
+                                    let progress = progress_snapshot.clone();
+                                    async move {
+                                        let job = match stripped_job {
+                                            Some(stripped)
+                                                if !output_storable(storage, pool, result).await? =>
+                                            {
+                                                output_kept.store(false, Ordering::Relaxed);
+                                                stripped
+                                            }
+                                            _ => {
+                                                output_kept.store(true, Ordering::Relaxed);
+                                                job
+                                            }
+                                        };
+                                        complete_job(
+                                            pool,
+                                            job,
+                                            claim,
+                                            unique_states,
+                                            result,
+                                            staged_follow_ups,
+                                            completion_batcher,
+                                            completion_path,
+                                            progress,
+                                            duration,
+                                            has_lifecycle_handlers,
+                                            enqueue_specs,
+                                            storage,
+                                            dlq_enabled,
+                                            metrics,
+                                        )
+                                        .await
+                                        .inspect_err(|err| {
+                                            // The schema lost the output columns
+                                            // under this process; re-probe on retry.
+                                            if let (true, RuntimeStorage::QueueStorage(runtime)) =
+                                                (err.is_undefined_column(), storage)
+                                            {
+                                                runtime.store.forget_job_output_columns();
+                                            }
+                                        })
+                                    }
+                                },
+                                metrics,
+                                job_id,
+                                &job_kind,
+                                &job_queue,
+                                COMPLETION_RECONNECT_WINDOW,
+                            )
+                            .await
+                        };
+                        if !output_kept.into_inner() {
+                            if matches!(outcome, Ok(FinalizeAck { outcome: CompletionOutcome::Applied { .. }, .. })) {
+                                record_output_dropped(&metrics, &job.kind, &job.queue, "schema_missing");
+                            }
+                            job.output = None;
+                        }
 
                         match &outcome {
                             Ok(FinalizeAck {
@@ -552,6 +649,7 @@ impl JobExecutor {
                                 elapsed,
                             }) => {
                                 log_applied_outcome(&job, &result, *terminal);
+                                record_output_published(&metrics, &job, &result, *terminal);
                                 if *reconnect_retries > 0 {
                                     info!(
                                         job_id,
@@ -654,6 +752,9 @@ impl JobExecutor {
                         event = finalize => event,
                         _ = finalize_cancel.cancelled() => {
                             warn!(job_id, "Finalization cancelled after runtime drain");
+                            if let Some((metrics, queue)) = &abandon_output {
+                                record_output_dropped(metrics, &event_kind, queue, "abandoned");
+                            }
                             None
                         },
                     };
@@ -720,6 +821,7 @@ where
     let deadline = started + window;
     let mut deadlock_retries = 0;
     let mut reconnect_retries = 0;
+    let mut schema_retried = false;
     let mut completion_path = CompletionPath::Batched;
     loop {
         let outcome = tokio::time::timeout_at(deadline, finalize(completion_path))
@@ -741,6 +843,11 @@ where
         } else if error.is_connection_lost() {
             reconnect_retries += 1;
             completion_reconnect_backoff(reconnect_retries)
+        } else if error.is_undefined_column() && !schema_retried {
+            // A completion named output columns the schema no longer has;
+            // the retry re-probes and writes without them (ADR-048).
+            schema_retried = true;
+            Duration::ZERO
         } else {
             return Err(error.into());
         };
@@ -894,6 +1001,100 @@ fn completed_specs(
         .and_then(|by_kind| by_kind.get(kind))
         .cloned()
         .unwrap_or_default()
+}
+
+/// A failed attempt's error message with the output it recorded, for the
+/// attempt's error entry (ADR-048). The finalizer's row carries the sealed
+/// output.
+fn attempt_error(message: impl Into<String>, job: &JobRow) -> awa_model::AttemptError {
+    awa_model::AttemptError::new(message).with_output(job.output.clone())
+}
+
+/// What becomes of an attempt's sealed output (ADR-048). `Snooze` ends the
+/// attempt with no record to keep it in, and an abandoned handler leaves the
+/// outcome to rescue, which never saw the value; both are counted. Every
+/// other outcome carries it to its transition.
+fn settle_output(
+    result: Option<&Result<JobResult, JobError>>,
+    sealed: Option<serde_json::Value>,
+    kind: &str,
+    queue: &str,
+    metrics: &crate::metrics::AwaMetrics,
+) -> Option<serde_json::Value> {
+    let output = sealed?;
+    let reason = match result {
+        None => "abandoned",
+        Some(Ok(JobResult::Snooze(_))) => "outcome",
+        Some(_) => return Some(output),
+    };
+    record_output_dropped(metrics, kind, queue, reason);
+    None
+}
+
+/// Whether the transition this result leads to can keep an output.
+/// Canonical stores none; queue storage stores a completion's output only
+/// once migration v052 added the columns, while failed outputs live in the
+/// error entry and need no schema change.
+async fn output_storable(
+    storage: &RuntimeStorage,
+    pool: &PgPool,
+    result: &Result<JobResult, JobError>,
+) -> Result<bool, AwaError> {
+    match storage {
+        RuntimeStorage::Canonical => Ok(false),
+        RuntimeStorage::QueueStorage(_) if !matches!(result, Ok(JobResult::Completed)) => Ok(true),
+        RuntimeStorage::QueueStorage(runtime) => runtime.store.supports_job_output(pool).await,
+    }
+}
+
+/// Count a dropped output, and warn at most once a minute per kind and
+/// reason. The value is never logged.
+fn record_output_dropped(
+    metrics: &crate::metrics::AwaMetrics,
+    kind: &str,
+    queue: &str,
+    reason: &'static str,
+) {
+    static LAST_WARNED: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<(String, &'static str), std::time::Instant>>,
+    > = std::sync::LazyLock::new(Default::default);
+    metrics.record_job_output_dropped(kind, queue, reason);
+    let mut last_warned = LAST_WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    let due = last_warned
+        .get(&(kind.to_string(), reason))
+        .is_none_or(|at| now.duration_since(*at) >= Duration::from_secs(60));
+    if due {
+        last_warned.insert((kind.to_string(), reason), now);
+        warn!(kind, queue, reason, "Job output dropped (ADR-048); further drops of this kind and reason are counted but not logged for a minute");
+    }
+}
+
+/// Count an output its transition published: as the job's output on
+/// completion, or in the error entry of a failure. A job parked by
+/// `WaitForCallback` publishes none.
+fn record_output_published(
+    metrics: &crate::metrics::AwaMetrics,
+    job: &JobRow,
+    result: &Result<JobResult, JobError>,
+    terminal: bool,
+) {
+    let Some(output) = &job.output else {
+        return;
+    };
+    let outcome = match result {
+        Ok(JobResult::Completed) => "completed",
+        Ok(JobResult::WaitForCallback(_)) if !terminal => {
+            record_output_dropped(metrics, &job.kind, &job.queue, "outcome");
+            return;
+        }
+        Ok(JobResult::Snooze(_)) => return,
+        _ => "failed",
+    };
+    let bytes = awa_model::output::serialized_len(output).unwrap_or(0) as u64;
+    metrics.record_job_output_recorded(&job.kind, &job.queue, outcome, bytes);
 }
 
 /// Decide what a finished handler's staged follow-ups (ADR-046) become.
@@ -1105,7 +1306,7 @@ async fn exhaust_queue_storage(
                 job.id,
                 job.run_lease,
                 "max_attempts_exhausted",
-                &error_msg,
+                attempt_error(&error_msg, job),
                 progress_snapshot.clone(),
                 queue_storage_claim,
             )
@@ -1121,7 +1322,7 @@ async fn exhaust_queue_storage(
                 pool,
                 job.id,
                 job.run_lease,
-                &error_msg,
+                attempt_error(&error_msg, job),
                 progress_snapshot.clone(),
                 queue_storage_claim,
             )
@@ -1889,18 +2090,20 @@ async fn complete_job_queue_storage(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             if needs_event {
-                let updated_job =
-                    runtime
-                        .store
-                        .load_job(pool, job.id)
-                        .await?
-                        .unwrap_or_else(|| {
-                            let mut completed_job = job.clone();
-                            completed_job.state = JobState::Completed;
-                            completed_job.finalized_at = Some(chrono::Utc::now());
-                            completed_job.progress = None;
-                            completed_job
-                        });
+                // The output is set from the sealed value rather than re-read,
+                // which would detoast its compact batch's whole output array.
+                let mut updated_job = runtime
+                    .store
+                    .load_job_without_output(pool, job.id)
+                    .await?
+                    .unwrap_or_else(|| {
+                        let mut completed_job = job.clone();
+                        completed_job.state = JobState::Completed;
+                        completed_job.finalized_at = Some(chrono::Utc::now());
+                        completed_job.progress = None;
+                        completed_job
+                    });
+                updated_job.output = job.output.clone();
                 Ok(CompletionOutcome::Applied {
                     event: Some(UntypedJobEvent::Completed {
                         job: updated_job,
@@ -1978,13 +2181,14 @@ async fn complete_job_queue_storage(
 
             let Some(updated_job) = runtime
                 .store
-                .retry_after_with_claim(
+                .retry_after_with_output(
                     pool,
                     job.id,
                     job.run_lease,
                     *retry_duration,
                     progress_snapshot.clone(),
                     queue_storage_claim,
+                    job.output.clone(),
                 )
                 .await?
             else {
@@ -2070,7 +2274,7 @@ async fn complete_job_queue_storage(
                     pool,
                     job.id,
                     job.run_lease,
-                    reason,
+                    attempt_error(reason, job),
                     progress_snapshot.clone(),
                 )
                 .await?
@@ -2135,37 +2339,36 @@ async fn complete_job_queue_storage(
                     Some(current)
                         if current.state == JobState::Running && current.callback_id.is_none() =>
                     {
-                        let failed =
-                            if dlq_enabled {
-                                let failed = runtime
+                        let failed = if dlq_enabled {
+                            let failed = runtime
                                 .store
                                 .fail_to_dlq_with_claim(
                                     pool,
                                     job.id,
                                     job.run_lease,
                                     "wait_for_callback_contract_violation",
-                                    "WaitForCallback returned without calling register_callback",
+                                    attempt_error("WaitForCallback returned without calling register_callback", job),
                                     progress_snapshot.clone(), queue_storage_claim)
                                 .await?;
-                                if failed.is_some() {
-                                    metrics.record_dlq_moved(
-                                        &job.kind,
-                                        &job.queue,
-                                        "wait_for_callback_contract_violation",
-                                    );
-                                }
-                                failed
-                            } else {
-                                runtime
+                            if failed.is_some() {
+                                metrics.record_dlq_moved(
+                                    &job.kind,
+                                    &job.queue,
+                                    "wait_for_callback_contract_violation",
+                                );
+                            }
+                            failed
+                        } else {
+                            runtime
                                 .store
                                 .fail_terminal_with_claim(
                                     pool,
                                     job.id,
                                     job.run_lease,
-                                    "WaitForCallback returned without calling register_callback",
+                                    attempt_error("WaitForCallback returned without calling register_callback", job),
                                     progress_snapshot.clone(), queue_storage_claim)
                                 .await?
-                            };
+                        };
                         if failed.is_none() {
                             return Ok(CompletionOutcome::IgnoredStale);
                         }
@@ -2247,7 +2450,7 @@ async fn complete_job_queue_storage(
                         job.id,
                         job.run_lease,
                         "terminal_error",
-                        msg,
+                        attempt_error(msg, job),
                         progress_snapshot.clone(),
                         queue_storage_claim,
                     )
@@ -2263,7 +2466,7 @@ async fn complete_job_queue_storage(
                         pool,
                         job.id,
                         job.run_lease,
-                        msg,
+                        attempt_error(msg, job),
                         progress_snapshot.clone(),
                         queue_storage_claim,
                     )
@@ -2349,7 +2552,7 @@ async fn complete_job_queue_storage(
                         pool,
                         job.id,
                         job.run_lease,
-                        &error_msg,
+                        attempt_error(&error_msg, job),
                         progress_snapshot.clone(),
                         queue_storage_claim,
                     )
@@ -2476,7 +2679,13 @@ async fn cancel_queue_storage_with_followups(
     let mut tx = pool.begin().await?;
     let Some(updated_job) = runtime
         .store
-        .cancel_running_in_tx(&mut tx, job.id, job.run_lease, reason, progress_snapshot)
+        .cancel_running_in_tx(
+            &mut tx,
+            job.id,
+            job.run_lease,
+            attempt_error(reason, job),
+            progress_snapshot,
+        )
         .await?
     else {
         tx.rollback().await?;
@@ -2504,13 +2713,14 @@ async fn retry_after_queue_storage_with_followups(
     let mut tx = pool.begin().await?;
     let Some(updated_job) = runtime
         .store
-        .retry_after_in_tx_with_claim(
+        .retry_after_with_output_in_tx(
             &mut tx,
             job.id,
             job.run_lease,
             retry_duration,
             progress_snapshot,
             queue_storage_claim,
+            job.output.clone(),
         )
         .await?
     else {
@@ -2547,7 +2757,7 @@ async fn retry_backoff_queue_storage_with_followups(
             &mut tx,
             job.id,
             job.run_lease,
-            error_msg,
+            attempt_error(error_msg, job),
             progress_snapshot,
             queue_storage_claim,
         )
@@ -2595,7 +2805,7 @@ async fn fail_queue_storage_with_followups(
                 job.id,
                 job.run_lease,
                 dlq_reason,
-                error_msg,
+                attempt_error(error_msg, job),
                 progress_snapshot,
                 queue_storage_claim,
             )
@@ -2609,7 +2819,7 @@ async fn fail_queue_storage_with_followups(
                 &mut tx,
                 job.id,
                 job.run_lease,
-                error_msg,
+                attempt_error(error_msg, job),
                 progress_snapshot,
                 queue_storage_claim,
             )

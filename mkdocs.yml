@@ -112,6 +112,7 @@ nav:
       - Guide index: guides/index.md
       - Bridge adapters: bridge-adapters.md
       - Lifecycle hooks: lifecycle-hooks.md
+      - Job output: job-output.md
       - HTTP callbacks: http-callbacks.md
       - Callback receivers: callback-receivers.md
       - Dead-letter queue: dead-letter-queue.md

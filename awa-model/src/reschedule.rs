@@ -352,6 +352,7 @@ async fn migrate_to_queue_storage(
         callback_on_fail: None,
         callback_transform: None,
         progress: progress.cloned(),
+        output: None,
     };
     let inserted = QueueStorage::from_existing_schema(schema)?
         .insert_migrated_deferred_or_cancel_duplicate_tx(

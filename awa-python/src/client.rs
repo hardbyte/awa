@@ -399,6 +399,11 @@ pub struct WorkerEntry {
     pub kind: String,
     pub handler: Py<PyAny>,
     pub args_type: Py<PyAny>,
+    /// The output type given to `task(..., output=...)`, which `set_output`
+    /// checks values against.
+    pub output_type: Option<Py<PyAny>>,
+    /// Published as the kind descriptor's output.
+    pub output_descriptor: Option<awa_model::OutputDescriptor>,
     pub queue: String,
     pub task_locals: pyo3_async_runtimes::TaskLocals,
 }
@@ -409,6 +414,8 @@ impl Clone for WorkerEntry {
             kind: self.kind.clone(),
             handler: self.handler.clone_ref(py),
             args_type: self.args_type.clone_ref(py),
+            output_type: self.output_type.as_ref().map(|tp| tp.clone_ref(py)),
+            output_descriptor: self.output_descriptor.clone(),
             queue: self.queue.clone(),
             task_locals: self.task_locals.clone(),
         })
@@ -709,14 +716,25 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (args_type, *, kind=None, queue="default".to_string()))]
+    #[pyo3(signature = (args_type, *, kind=None, queue="default".to_string(), output=None, output_descriptor=None))]
     fn worker(
         &self,
         py: Python<'_>,
         args_type: Py<PyAny>,
         kind: Option<String>,
         queue: String,
+        output: Option<Py<PyAny>>,
+        output_descriptor: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        let output_descriptor = output_descriptor
+            .map(|descriptor| {
+                serde_json::from_value::<awa_model::OutputDescriptor>(py_to_json(
+                    py,
+                    descriptor.bind(py),
+                )?)
+                .map_err(|err| validation_error(format!("invalid output descriptor: {err}")))
+            })
+            .transpose()?;
         let workers = self.workers.clone();
         let kind_str = kind.unwrap_or_else(|| {
             Python::attach(|py| {
@@ -741,6 +759,8 @@ impl PyClient {
                     kind: kind_str.clone(),
                     handler: handler_py.clone_ref(py),
                     args_type: args_type.clone_ref(py),
+                    output_type: output.as_ref().map(|tp| tp.clone_ref(py)),
+                    output_descriptor: output_descriptor.clone(),
                     queue: queue.clone(),
                     task_locals: crate::async_bridge::get_current_locals(py)?,
                 };
@@ -2046,11 +2066,19 @@ impl PyClient {
         for (queue, descriptor) in queue_descriptors {
             builder = builder.queue_descriptor(queue, descriptor);
         }
-        let job_kind_descriptors = self
+        let mut job_kind_descriptors = self
             .job_kind_descriptors
             .lock()
             .expect("job_kind_descriptors mutex poisoned")
             .clone();
+        for entry in &entries {
+            if let Some(output) = &entry.output_descriptor {
+                let descriptor = job_kind_descriptors.entry(entry.kind.clone()).or_default();
+                if descriptor.output.is_none() {
+                    descriptor.output = Some(output.clone());
+                }
+            }
+        }
         for (kind, descriptor) in job_kind_descriptors {
             builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
@@ -2094,22 +2122,29 @@ impl PyClient {
 
     // ── External callback completion (async + sync) ─────────────────
 
-    #[pyo3(signature = (callback_id, payload=None))]
+    #[pyo3(signature = (callback_id, payload=None, *, output=None))]
     fn complete_external<'py>(
         &self,
         py: Python<'py>,
         callback_id: String,
         payload: Option<Py<PyAny>>,
+        output: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let payload_json = payload
             .as_ref()
             .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
             .transpose()?;
+        let output_json = output
+            .as_ref()
+            .map(|value| crate::job::output_json(py, value.bind(py)))
+            .transpose()?
+            .flatten();
         crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let row = awa_model::admin::complete_external(&pool, uuid, payload_json, None)
+            let row = complete_external_row(&pool, &metrics, uuid, payload_json, output_json)
                 .await
                 .map_err(map_awa_error)?;
             Ok(PyJob::from(row))
@@ -2239,23 +2274,30 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (callback_id, payload=None))]
+    #[pyo3(signature = (callback_id, payload=None, *, output=None))]
     fn complete_external_sync(
         &self,
         py: Python<'_>,
         callback_id: String,
         payload: Option<Py<PyAny>>,
+        output: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let payload_json = payload
             .as_ref()
             .map(|value| py_to_json(py, value.bind(py)))
             .transpose()?;
+        let output_json = output
+            .as_ref()
+            .map(|value| crate::job::output_json(py, value.bind(py)))
+            .transpose()?
+            .flatten();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let row = awa_model::admin::complete_external(&pool, uuid, payload_json, None)
+                let row = complete_external_row(&pool, &metrics, uuid, payload_json, output_json)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(PyJob::from(row))
@@ -4028,6 +4070,33 @@ fn parse_queue_retention_overrides(
     }
 
     Ok(overrides)
+}
+
+/// Complete a waiting job externally, storing `output` as its output when
+/// one is given (ADR-048). The payload is not stored on completion.
+async fn complete_external_row(
+    pool: &sqlx::PgPool,
+    metrics: &awa_worker::AwaMetrics,
+    callback_id: uuid::Uuid,
+    payload: Option<serde_json::Value>,
+    output: Option<serde_json::Value>,
+) -> Result<awa_model::JobRow, awa_model::AwaError> {
+    match output {
+        Some(output) => {
+            let (row, dropped) = awa_model::admin::complete_external_reporting_output(
+                pool,
+                callback_id,
+                awa_model::ExternalCompletion::new().output(output),
+            )
+            .await?;
+            metrics.record_external_output(&row, dropped);
+            if let Some(reason) = dropped {
+                awa_model::admin::warn_external_output_dropped(reason);
+            }
+            Ok(row)
+        }
+        None => awa_model::admin::complete_external(pool, callback_id, payload, None).await,
+    }
 }
 
 #[cfg(test)]

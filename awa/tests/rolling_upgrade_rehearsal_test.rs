@@ -11,7 +11,7 @@ use awa::model::{
     cron::{pause_cron_job, trigger_cron_job, upsert_cron_job, PeriodicJob},
     dlq, insert_with, migrations, storage, InsertOpts, JobState, QueueStorage, QueueStorageConfig,
 };
-use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa::{Client, ClientBuilder, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -239,6 +239,53 @@ impl Worker for RecordingWorker {
     }
 }
 
+/// A current-build `simple_chaos_job` handler that records an output on
+/// every attempt (ADR-048). Sequence ranges pick the outcome: below
+/// `OUTPUT_RETRY_SEQ` completes, `OUTPUT_RETRY_SEQ..OUTPUT_FAIL_SEQ` asks for
+/// a later retry, and from `OUTPUT_FAIL_SEQ` fails terminally.
+#[derive(Clone)]
+struct OutputRecordingWorker {
+    completed: Arc<Mutex<HashSet<i64>>>,
+    attempted: Arc<Mutex<HashSet<i64>>>,
+}
+
+const OUTPUT_RETRY_SEQ: i64 = 1_000;
+const OUTPUT_FAIL_SEQ: i64 = 2_000;
+
+fn rehearsal_output(seq: i64) -> serde_json::Value {
+    serde_json::json!({ "seq": seq, "by": "current" })
+}
+
+#[async_trait]
+impl Worker for OutputRecordingWorker {
+    fn kind(&self) -> &'static str {
+        "simple_chaos_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let seq = ctx
+            .job
+            .args
+            .get("seq")
+            .and_then(serde_json::Value::as_i64)
+            .expect("simple_chaos_job args must contain seq");
+        ctx.set_output(&rehearsal_output(seq))
+            .map_err(|err| JobError::terminal(err.to_string()))?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        self.attempted.lock().unwrap().insert(seq);
+        if seq >= OUTPUT_FAIL_SEQ {
+            return Err(JobError::terminal("designed failure with an output"));
+        }
+        if seq >= OUTPUT_RETRY_SEQ {
+            // Long enough that this runtime shuts down before the retry is
+            // due, so the released worker runs the second attempt.
+            return Ok(JobResult::RetryAfter(Duration::from_secs(3)));
+        }
+        self.completed.lock().unwrap().insert(seq);
+        Ok(JobResult::Completed)
+    }
+}
+
 struct ReleasedWorker {
     child: Child,
     started: Arc<Mutex<HashSet<i64>>>,
@@ -262,13 +309,14 @@ impl ReleasedWorker {
 }
 
 async fn spawn_released_worker(queue: &str) -> ReleasedWorker {
-    spawn_released_worker_with(queue, 80, None).await
+    spawn_released_worker_with(queue, 80, None, false).await
 }
 
 async fn spawn_released_worker_with(
     queue: &str,
     sleep_ms: u64,
     deadline_duration_ms: Option<u64>,
+    schema_already_current: bool,
 ) -> ReleasedWorker {
     let python = released_python();
     assert!(
@@ -291,6 +339,9 @@ async fn spawn_released_worker_with(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    if schema_already_current {
+        command.env("MIXED_SKIP_MIGRATE", "1");
+    }
     if let Some(deadline_duration_ms) = deadline_duration_ms {
         command.env(
             "MIXED_DEADLINE_DURATION_MS",
@@ -435,6 +486,20 @@ fn current_client_with_heartbeat_rescue(
     completed: Arc<Mutex<HashSet<i64>>>,
     heartbeat_rescue_interval: Duration,
 ) -> Client {
+    current_builder(pool, queue, heartbeat_rescue_interval)
+        .register_worker(RecordingWorker {
+            completed,
+            delay: Duration::from_millis(80),
+        })
+        .build()
+        .expect("build current worker")
+}
+
+fn current_builder(
+    pool: sqlx::PgPool,
+    queue: &str,
+    heartbeat_rescue_interval: Duration,
+) -> ClientBuilder {
     Client::builder(pool)
         .queue(
             queue,
@@ -462,12 +527,6 @@ fn current_client_with_heartbeat_rescue(
         .heartbeat_staleness(Duration::from_millis(500))
         .heartbeat_rescue_interval(heartbeat_rescue_interval)
         .deadline_rescue_interval(Duration::from_millis(100))
-        .register_worker(RecordingWorker {
-            completed,
-            delay: Duration::from_millis(80),
-        })
-        .build()
-        .expect("build current worker")
 }
 
 /// A current-build runtime serving the shared simple queue alongside the
@@ -1004,7 +1063,7 @@ async fn test_migrate_first_deadline_rescue_resumes_with_current_leader() {
 
     // Keep the released handler alive beyond its deadline. Its runtime
     // heartbeat and maintenance loops continue while the job is running.
-    let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300)).await;
+    let mut old_worker = spawn_released_worker_with(&queue, 60_000, Some(300), false).await;
     assert_eq!(schema_version(&pool).await, 40);
 
     report.phase("released_v040_installed");
@@ -1689,4 +1748,296 @@ async fn test_overlap_current_roll_races_live_migration() {
     );
     report.phase("reconciled_exact");
     report.finish();
+}
+
+/// Run the released admin surface once: read every id in `read_ids`, list
+/// the queue, then retry every id in `retry_ids`. Returns its stdout.
+async fn run_released_admin(queue: &str, read_ids: &[i64], retry_ids: &[i64]) -> String {
+    let join = |ids: &[i64]| ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let output = tokio::time::timeout(Duration::from_secs(60), async {
+        Command::new(released_python())
+            .arg(mixed_fleet_helper())
+            .env("DATABASE_URL", database_url())
+            .env("MIXED_QUEUE", queue)
+            .env("MIXED_MODE", "admin_read_and_retry")
+            .env("MIXED_SKIP_MIGRATE", "1")
+            .env("MIXED_READ_IDS", join(read_ids))
+            .env("MIXED_RETRY_IDS", join(retry_ids))
+            .env("PYTHONUNBUFFERED", "1")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("run released admin helper")
+    })
+    .await
+    .expect("released admin helper did not finish within 60s");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "released admin helper failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+async fn wait_for_job_states(
+    store: &QueueStorage,
+    pool: &sqlx::PgPool,
+    ids: &[i64],
+    expected: JobState,
+    timeout: Duration,
+) -> Vec<awa::model::JobRow> {
+    let start = Instant::now();
+    loop {
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            rows.push(
+                store
+                    .load_job(pool, *id)
+                    .await
+                    .expect("load job")
+                    .expect("job exists"),
+            );
+        }
+        if rows.iter().all(|row| row.state == expected) {
+            return rows;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "jobs did not all reach {expected:?}: {:?}",
+            rows.iter()
+                .map(|row| (row.id, row.state))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn error_outputs(row: &awa::model::JobRow) -> Vec<Option<serde_json::Value>> {
+    row.errors
+        .iter()
+        .flatten()
+        .map(|entry| entry.get("output").cloned())
+        .collect()
+}
+
+/// ADR-048 across a mixed fleet: the released 0.6 runtime and the current
+/// runtime share one migrated queue. Current completions keep their outputs
+/// and released completions have none; a failed attempt's output, kept in
+/// its error entry, is read, retried and completed by the released
+/// artifact without loss; compact receipt batches with and without
+/// outputs coexist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a released awa-pg 0.6.3 environment"]
+async fn test_migrate_first_mixed_fleet_job_output() {
+    let _rehearsal_guard = REHEARSAL_LOCK.lock().await;
+    let mut report = RehearsalReport::new("migrate_first_mixed_fleet_job_output");
+    report.phase("start");
+    let pool = pool().await;
+    reset_database(&pool).await;
+    let queue = format!("upgrade_output_{}", Uuid::new_v4().simple());
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: "awa".to_string(),
+        ..Default::default()
+    })
+    .expect("queue storage");
+    let insert = |seq: i64| {
+        let pool = pool.clone();
+        let queue = queue.clone();
+        async move {
+            insert_with(
+                &pool,
+                &SimpleChaosJob { seq },
+                InsertOpts {
+                    queue,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("insert")
+            .id
+        }
+    };
+
+    let mut old_worker = spawn_released_worker(&queue).await;
+    assert_eq!(schema_version(&pool).await, 40);
+    migrations::run(&pool)
+        .await
+        .expect("current migrations must accept a live released runtime");
+    assert_eq!(schema_version(&pool).await, migrations::CURRENT_VERSION);
+    report.phase("migrated_with_released_runtime_live");
+
+    // Phase 1: both fleets complete jobs from one queue.
+    let current_completed = Arc::new(Mutex::new(HashSet::new()));
+    let current_attempted = Arc::new(Mutex::new(HashSet::new()));
+    let current = current_builder(pool.clone(), &queue, Duration::from_millis(100))
+        .register_worker(OutputRecordingWorker {
+            completed: current_completed.clone(),
+            attempted: current_attempted.clone(),
+        })
+        .build()
+        .expect("build current worker");
+    current.start().await.expect("start current worker");
+
+    let mut completed_ids = Vec::new();
+    for seq in 0..80 {
+        completed_ids.push((seq, insert(seq).await));
+    }
+    let ids: Vec<i64> = completed_ids.iter().map(|(_, id)| *id).collect();
+    let rows = wait_for_job_states(
+        &store,
+        &pool,
+        &ids,
+        JobState::Completed,
+        Duration::from_secs(60),
+    )
+    .await;
+    let by_current = current_completed.lock().unwrap().clone();
+    let by_released = old_worker.completed();
+    let (mut with_output, mut without_output) = (0, 0);
+    for ((seq, _), row) in completed_ids.iter().zip(&rows) {
+        match (by_current.contains(seq), by_released.contains(seq)) {
+            (true, false) => {
+                assert_eq!(row.output, Some(rehearsal_output(*seq)), "seq {seq}");
+                with_output += 1;
+            }
+            (false, true) => {
+                assert_eq!(row.output, None, "released completion of seq {seq}");
+                without_output += 1;
+            }
+            // A rescued attempt can run on both; either completion may win.
+            (true, true) => {}
+            (false, false) => panic!("seq {seq} completed but no worker reported it"),
+        }
+    }
+    assert!(
+        with_output > 0 && without_output > 0,
+        "both fleets must complete jobs: current {with_output}, released {without_output}"
+    );
+    report.fact("completed_with_output", with_output);
+    report.fact("completed_without_output", without_output);
+    report.phase("mixed_fleet_outputs_reconciled");
+
+    // Phase 2: only the current runtime runs, so it alone records failed
+    // outputs: one retry it asks for, one terminal failure.
+    old_worker.shutdown().await;
+    let retry_ids: Vec<i64> =
+        futures_join((OUTPUT_RETRY_SEQ..OUTPUT_RETRY_SEQ + 5).map(insert)).await;
+    let failed_ids: Vec<i64> =
+        futures_join((OUTPUT_FAIL_SEQ..OUTPUT_FAIL_SEQ + 5).map(insert)).await;
+    let failed_rows = wait_for_job_states(
+        &store,
+        &pool,
+        &failed_ids,
+        JobState::Failed,
+        Duration::from_secs(30),
+    )
+    .await;
+    let start = Instant::now();
+    while current_attempted
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|seq| (OUTPUT_RETRY_SEQ..OUTPUT_FAIL_SEQ).contains(*seq))
+        .count()
+        < retry_ids.len()
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "current worker did not attempt every retry job"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    current.shutdown(Duration::from_secs(5)).await;
+    for (offset, row) in failed_rows.iter().enumerate() {
+        let seq = OUTPUT_FAIL_SEQ + offset as i64;
+        assert_eq!(row.output, None, "a failed job has no completion output");
+        assert_eq!(error_outputs(row), vec![Some(rehearsal_output(seq))]);
+    }
+    report.phase("current_recorded_failed_outputs");
+
+    // Phase 3: the released admin surface reads every row the current
+    // runtime wrote and retries the terminal failures.
+    let mut read_ids = ids.clone();
+    read_ids.extend(&retry_ids);
+    read_ids.extend(&failed_ids);
+    let admin = run_released_admin(&queue, &read_ids, &failed_ids).await;
+    assert_eq!(
+        admin
+            .lines()
+            .filter(|line| line.starts_with("READ"))
+            .count(),
+        read_ids.len(),
+        "released reads:\n{admin}"
+    );
+    assert!(admin.contains("LISTED"), "released list:\n{admin}");
+    assert_eq!(
+        admin
+            .lines()
+            .filter(|line| line.starts_with("RETRIED"))
+            .count(),
+        failed_ids.len(),
+        "released retries:\n{admin}"
+    );
+    report.phase("released_admin_read_and_retried");
+
+    // Phase 4: a released worker runs the next attempt of every job whose
+    // previous attempt recorded an output.
+    let mut old_worker = spawn_released_worker_with(&queue, 80, None, true).await;
+    let mut resumed = retry_ids.clone();
+    resumed.extend(&failed_ids);
+    let resumed_rows = wait_for_job_states(
+        &store,
+        &pool,
+        &resumed,
+        JobState::Completed,
+        Duration::from_secs(60),
+    )
+    .await;
+    old_worker.shutdown().await;
+    let released_done = old_worker.completed();
+    let resumed_seqs =
+        (OUTPUT_RETRY_SEQ..OUTPUT_RETRY_SEQ + 5).chain(OUTPUT_FAIL_SEQ..OUTPUT_FAIL_SEQ + 5);
+    for (seq, row) in resumed_seqs.zip(&resumed_rows) {
+        assert!(
+            released_done.contains(&seq),
+            "released worker must run seq {seq}"
+        );
+        assert_eq!(row.output, None, "released completion of seq {seq}");
+        let kept = error_outputs(row);
+        assert_eq!(
+            kept.last().cloned().flatten(),
+            Some(rehearsal_output(seq)),
+            "seq {seq} lost its failed output: {:?}",
+            row.errors
+        );
+    }
+    report.phase("released_completed_after_failed_outputs");
+
+    let (with_outputs, without_outputs): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE outputs IS NOT NULL), \
+                count(*) FILTER (WHERE outputs IS NULL) \
+         FROM awa.receipt_completion_batches",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count compact batches");
+    report.fact("compact_batches_with_outputs", with_outputs);
+    report.fact("compact_batches_without_outputs", without_outputs);
+    assert!(
+        with_outputs > 0,
+        "no current completion rode a compact batch with outputs"
+    );
+    report.phase("reconciled");
+    report.finish();
+}
+
+async fn futures_join<F: std::future::Future<Output = i64>>(
+    futures: impl Iterator<Item = F>,
+) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for future in futures {
+        ids.push(future.await);
+    }
+    ids
 }

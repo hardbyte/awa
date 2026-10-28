@@ -384,6 +384,32 @@
           "datasource": { "uid": "${DS_PROMETHEUS}" }
         },
         {
+          "id": 406,
+          "type": "timeseries",
+          "title": "Job Outputs (recorded / dropped)",
+          "description": "Job outputs (ADR-048) published per second by outcome, and outputs not published, by reason. A sustained schema_missing rate means a binary is running ahead of migration v052; too_large and invalid count recordings the handler made that were rejected.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
+          "targets": [
+            { "expr": "sum by (awa_job_outcome) (rate(awa_job_output_recorded_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "recorded {{awa_job_outcome}}" },
+            { "expr": "sum by (awa_output_reason) (rate(awa_job_output_dropped_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "dropped {{awa_output_reason}}" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 407,
+          "type": "timeseries",
+          "title": "Job Output Size (p50 / p95)",
+          "description": "Size of published job outputs in bytes of JSON text. Outputs are capped at 4 KiB; large outputs make compact completion batches hold fewer jobs.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+          "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
+          "targets": [
+            { "expr": "histogram_quantile(0.50, sum by (le) (rate(awa_job_output_size_bytes_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p50" },
+            { "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_output_size_bytes_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
           "id": 408,
           "type": "timeseries",
           "title": "Staged Follow-ups (inserted / duplicate / discarded)",

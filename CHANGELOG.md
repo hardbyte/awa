@@ -6,7 +6,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ### Upgrading
 
-This release adds migrations v044 to v051. Run `awa migrate` as the migrator
+This release adds migrations v044 to v052. Run `awa migrate` as the migrator
 role; the [0.6→0.7 upgrade guide](docs/upgrade-0.6-to-0.7.md) has the details
 for each step.
 
@@ -46,9 +46,65 @@ for each step.
   `query_as::<_, JobRow>` over an explicit column list break when one lands.
 - **Run `awa storage rebuild-terminal-counters` from an upgraded binary.** An
   older binary can deadlock with an upgraded runtime's rotation tick.
+- **v052 adds job output columns** (ADR-048). It adds two nullable columns per
+  queue-storage schema, a `NOT VALID` check and a final `output` column on
+  `terminal_jobs`, without replaying the installer or scanning rows. It takes
+  brief `ACCESS EXCLUSIVE` locks on the terminal tables, held until the
+  migration transaction commits, and waits at most 2 s for each when no
+  `lock_timeout` is set. A released 0.6.9 worker keeps completing, reading,
+  listing and retrying jobs on the migrated schema alongside a 0.7 worker
+  (rehearsed migrate-first in `test_migrate_first_mixed_fleet_job_output`).
+  A binary that has ADR-048 but runs against a schema without the columns
+  drops completion outputs and counts them as `schema_missing`; this is tested
+  against a schema with the columns renamed away
+  (`a_schema_without_output_columns_drops_completion_outputs`), not with a
+  released binary.
+- **Queue-storage failure transitions take `impl Into<AttemptError>`.** The
+  `error` argument of `fail_retryable*`, `fail_terminal*` and `fail_to_dlq*`,
+  and the `reason` of `cancel_running*`, accept `&str` and `String` as before.
+  Code that passes a function pointer or names the type may need a cast.
+- **`callback_contract::CompletePayload` is `#[non_exhaustive]`** and gains
+  `output`. Senders that built it with a struct literal start from
+  `CompletePayload::default()` and set fields.
+- **`JobKindDescriptor` gains a public `output` field.** Code that builds it
+  with a struct literal adds `output: None` or starts from
+  `JobKindDescriptor::new()`.
+- **`#[derive(JobArgs)]` rejects unknown `#[awa(...)]` keys.** It accepts
+  `kind` and `output`; any other key, or a malformed value, is now a compile
+  error rather than silently ignored.
+- **`awa-testing`'s `WorkResult::Completed` holds the row read back after
+  completion** (state `Completed`, `finalized_at` and `output` set), not the
+  claimed row.
 
 ### Added
 
+- **Job output ([ADR-048](docs/adr/048-retained-job-output.md), [guide](docs/job-output.md)).**
+  A handler can record a JSON output of up to 4 KiB with `ctx.set_output`
+  (`ctx.output_slot()` for `register` closures) or `job.set_output` in Python.
+  It is published by the attempt's own transition: as `JobRow.output` when the
+  job completes, or under `output` in the error entry of a failure, where only
+  the latest entry to record one keeps it. It rides the compact completion
+  batch, is shown on the admin UI's job detail and in `terminal_jobs.output`,
+  and is never read by the engine; enqueue specs and the dispatch row do not
+  see it. A failed recording (`OutputError`, Python `awa.OutputError`) clears
+  the output without failing the attempt. External completions store one only
+  when given: `Client::complete_external_with` with `ExternalCompletion`,
+  Python `complete_external(..., output=...)`, or the HTTP callback body's
+  `output` field. Canonical storage discards outputs. New metrics:
+  `awa.job.output_recorded`, `awa.job.output_size` and
+  `awa.job.output_dropped`, whose `too_large` and `invalid` reasons count
+  rejected recordings a handler ignored. The Grafana dashboard gains output
+  panels, and the alert rules an `awa_job_output_schema_missing` warning for a
+  binary running ahead of migration v052.
+- **Typed job outputs.** `#[awa(output = T)]` declares the output type of a
+  kind. It implements the new `JobOutput` trait, and with it
+  `ctx.typed_output::<K>()`, `JobRow::output_as` / `error_output_as` and
+  `ExternalCompletion::output_for` give typed access to the JSON output.
+  Python's `@client.task(..., output=T)` checks `set_output` values, and
+  `Job.output_as` / `error_output_as` decode them. The type name, with a JSON
+  Schema when the runtime has one, is published in the new
+  `awa.job_kind_descriptors.output` column and shown on the admin UI's kinds
+  and job detail pages.
 - **Handler-staged follow-up jobs ([ADR-046](docs/adr/046-handler-staged-follow-ups.md)).**
   A handler can stage follow-up jobs built from values it computed:
   `ctx.enqueue_on_completion(request)`, `ctx.follow_ups()` for `register`
@@ -183,6 +239,11 @@ for each step.
 
 ### Fixed
 
+- **JSON floats read back from Postgres exactly.** Postgres prints `jsonb`
+  numbers in plain decimal, and serde_json's default parser could round a long
+  one to the neighbouring `f64`, so a value like `5.130112436774387e-96` in job
+  args read back one unit in the last place off. serde_json's
+  `float_roundtrip` feature is now enabled.
 - **A duplicate follow-up no longer fails its trigger.** A follow-up enqueued
   with unique options that conflicted with an existing job aborted the
   trigger's transaction: the trigger's completion (or other outcome) rolled

@@ -147,6 +147,7 @@ impl QueueStorageDlqRow {
                 callback_on_fail: None,
                 callback_transform: None,
                 progress: payload.progress,
+                output: None,
             },
             reason: self.dlq_reason,
             dlq_at: self.dlq_at,

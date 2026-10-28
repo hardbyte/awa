@@ -208,6 +208,26 @@ async fn job_kind_descriptor_rejects_oversized_docs_url() {
     .await;
 }
 
+#[tokio::test]
+async fn job_kind_descriptor_rejects_oversized_output_schema() {
+    with_clean_catalog("constraint_", |p| async move {
+        let schema = serde_json::json!({ "description": "s".repeat(65536) });
+        let result = sync_job_kind_descriptors(
+            &p,
+            &[NamedJobKindDescriptor {
+                kind: "constraint_long_output".into(),
+                descriptor: JobKindDescriptor::new()
+                    .output(awa_model::OutputDescriptor::new("Big").schema(schema)),
+            }],
+            Duration::from_secs(10),
+        )
+        .await;
+        let err = result.expect_err(">64 KiB output descriptor should violate CHECK");
+        assert!(is_check_violation(&err), "unexpected error: {err:?}");
+    })
+    .await;
+}
+
 // ── Retention ────────────────────────────────────────────────────────────
 
 async fn backdate_queue_last_seen(pool: &PgPool, queue: &str, days: i32) {

@@ -24,6 +24,7 @@ import { ProgressDisplay } from "@/components/ProgressDisplay";
 import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
+import { OutputCard } from "@/components/OutputCard";
 import { POLL } from "@/lib/constants";
 
 function hasMetadata(job: JobRow): boolean {
@@ -405,6 +406,13 @@ export function JobDetailPage() {
           <JsonView data={job.args} />
         </CardContent>
       </Card>
+
+      {/* Output (ADR-048) */}
+      <OutputCard
+        output={job.output}
+        errors={job.errors}
+        outputType={job.kind_descriptor?.output?.type}
+      />
 
       {/* Metadata */}
       {hasMetadata(job) && (

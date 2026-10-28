@@ -35,6 +35,9 @@ pub mod names {
     pub const COMPLETION_DEADLOCK_RETRY: &str = "awa.completion.deadlock_retry";
     pub const COMPLETION_RECONNECT_RETRY: &str = "awa.completion.reconnect_retry";
     pub const STAGED_FOLLOW_UPS_DISCARDED: &str = "awa.job.staged_follow_ups_discarded";
+    pub const JOB_OUTPUT_RECORDED: &str = "awa.job.output_recorded";
+    pub const JOB_OUTPUT_SIZE: &str = "awa.job.output_size";
+    pub const JOB_OUTPUT_DROPPED: &str = "awa.job.output_dropped";
     pub const STAGED_FOLLOW_UPS_COMMITTED: &str = "awa.job.staged_follow_ups_committed";
     pub const JOB_CANCELLED: &str = "awa.job.cancelled";
     pub const JOB_CLAIMED: &str = "awa.job.claimed";
@@ -124,6 +127,13 @@ pub struct AwaMetrics {
     /// Follow-ups a handler staged (ADR-046) and then discarded by returning
     /// `WaitForCallback`, which parks the job without completing it.
     pub staged_follow_ups_discarded: Counter<u64>,
+    /// Outputs (ADR-048) published with an attempt's transition, by outcome:
+    /// `completed` for the job's output, `failed` for an error entry.
+    pub job_output_recorded: Counter<u64>,
+    /// Size of published outputs, in bytes of JSON text.
+    pub job_output_size: Histogram<u64>,
+    /// Outputs a handler recorded that were not published, by reason.
+    pub job_output_dropped: Counter<u64>,
     /// Staged follow-ups (ADR-046) whose completion committed, by
     /// `awa.follow_up.result`: `inserted`, or `duplicate` when a job with
     /// the same unique key already existed.
@@ -324,6 +334,25 @@ impl AwaMetrics {
                     "Number of staged follow-ups discarded because the handler parked the job with WaitForCallback",
                 )
                 .with_unit("{follow_up}")
+                .build(),
+            job_output_recorded: meter
+                .u64_counter(names::JOB_OUTPUT_RECORDED)
+                .with_description(
+                    "Number of job outputs published with an attempt's transition (ADR-048)",
+                )
+                .with_unit("{output}")
+                .build(),
+            job_output_size: meter
+                .u64_histogram(names::JOB_OUTPUT_SIZE)
+                .with_description("Size of published job outputs in bytes of JSON text")
+                .with_unit("By")
+                .build(),
+            job_output_dropped: meter
+                .u64_counter(names::JOB_OUTPUT_DROPPED)
+                .with_description(
+                    "Number of job outputs not published: canonical storage, a schema before migration v052, an outcome that keeps none, an abandoned handler, a completion without a claim, or a recording rejected as too large or invalid",
+                )
+                .with_unit("{output}")
                 .build(),
             staged_follow_ups_committed: meter
                 .u64_counter(names::STAGED_FOLLOW_UPS_COMMITTED)
@@ -630,6 +659,39 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
         ];
         self.staged_follow_ups_discarded.add(count, &attrs);
+    }
+
+    /// Record an output published as the job's output (`completed`) or in
+    /// an error entry (`failed`).
+    pub fn record_job_output_recorded(&self, kind: &str, queue: &str, outcome: &str, bytes: u64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.job.outcome", outcome.to_string()),
+        ];
+        self.job_output_recorded.add(1, &attrs);
+        self.job_output_size.record(bytes, &attrs);
+    }
+
+    /// Count an external completion's output: stored, or dropped for
+    /// `dropped` (ADR-048).
+    pub fn record_external_output(&self, job: &awa_model::JobRow, dropped: Option<&str>) {
+        if let Some(reason) = dropped {
+            self.record_job_output_dropped(&job.kind, &job.queue, reason);
+        } else if let Some(output) = &job.output {
+            let bytes = awa_model::output::serialized_len(output).unwrap_or(0) as u64;
+            self.record_job_output_recorded(&job.kind, &job.queue, "completed", bytes);
+        }
+    }
+
+    /// Record an output that was not published, by `awa.output.reason`.
+    pub fn record_job_output_dropped(&self, kind: &str, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.output.reason", reason.to_string()),
+        ];
+        self.job_output_dropped.add(1, &attrs);
     }
 
     /// Record the staged follow-ups of a completion that committed. `kind`

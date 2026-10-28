@@ -74,4 +74,20 @@ test.describe("Kinds page", () => {
     await expect(kindsTable.getByText("Descriptor drift", { exact: true })).toBeVisible();
     await expect(kindsTable.getByText("Descriptor drift across live runtimes")).toBeVisible();
   });
+  test("a kind's declared output type and schema render", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/kinds") && r.ok()),
+      page.goto("/kinds"),
+    ]);
+
+    const kindsTable = page.getByRole("grid", { name: "Job kinds" });
+    const row = kindsTable.getByRole("row", { name: /E2E Job/ });
+    await expect(row.getByText("E2eSummary", { exact: true })).toBeVisible();
+    await row.getByText("Schema", { exact: true }).click();
+    await expect(row.getByText("integer")).toBeVisible();
+
+    // A kind that declares no output shows no output line.
+    const legacyRow = kindsTable.getByRole("row", { name: /legacy_job/ });
+    await expect(legacyRow.getByText(/^Output/)).toHaveCount(0);
+  });
 });

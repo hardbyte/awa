@@ -226,6 +226,168 @@ $refresh$;
 
 REVOKE EXECUTE ON FUNCTION awa.refresh_lane_sequence_helpers(TEXT) FROM PUBLIC;
 
+-- Retained job output (ADR-048): add the output columns to an existing
+-- substrate and expose them through terminal_jobs. Called by the installer
+-- and by migration v052, which does not replay the installer. Each column is
+-- added only when missing, so a re-run takes no lock on the tables, and the
+-- cardinality check is NOT VALID: it holds for new batch rows without
+-- scanning retained history.
+CREATE OR REPLACE FUNCTION awa.install_queue_storage_job_output(p_schema TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog, awa, public
+SET quote_all_identifiers = off
+AS $job_output$
+DECLARE
+    v_view REGCLASS := to_regclass(format('%I.terminal_jobs', p_schema));
+BEGIN
+    -- When anything is missing, lock in the order terminal_jobs readers do
+    -- (the view, then its tables), so a read that starts mid-migration
+    -- waits instead of deadlocking against the ALTERs.
+    IF v_view IS NOT NULL AND (
+        NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = v_view AND attname = 'output' AND NOT attisdropped
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = format('%I.receipt_completion_batches', p_schema)::regclass
+              AND conname = 'receipt_completion_batches_outputs_cardinality'
+        )
+    ) THEN
+        EXECUTE format(
+            'LOCK TABLE %1$I.terminal_jobs, %1$I.done_entries, %1$I.receipt_completion_batches IN ACCESS EXCLUSIVE MODE',
+            p_schema
+        );
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = format('%I.done_entries', p_schema)::regclass
+          AND attname = 'output'
+          AND NOT attisdropped
+    ) THEN
+        EXECUTE format('ALTER TABLE %I.done_entries ADD COLUMN IF NOT EXISTS output JSON', p_schema);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = format('%I.receipt_completion_batches', p_schema)::regclass
+          AND attname = 'outputs'
+          AND NOT attisdropped
+    ) THEN
+        EXECUTE format(
+            'ALTER TABLE %I.receipt_completion_batches ADD COLUMN IF NOT EXISTS outputs JSON[]',
+            p_schema
+        );
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = format('%I.receipt_completion_batches', p_schema)::regclass
+          AND conname = 'receipt_completion_batches_outputs_cardinality'
+    ) THEN
+        EXECUTE format(
+            $ddl$
+            ALTER TABLE %I.receipt_completion_batches
+                ADD CONSTRAINT receipt_completion_batches_outputs_cardinality
+                CHECK (outputs IS NULL OR completed_count = cardinality(outputs)) NOT VALID
+            $ddl$,
+            p_schema
+        );
+    END IF;
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE VIEW %1$I.terminal_jobs AS
+        SELECT
+            done.ready_slot,
+            done.ready_generation,
+            done.job_id,
+            done.kind,
+            done.queue,
+            COALESCE(done.args, ready.args, '{}'::jsonb) AS args,
+            done.state,
+            done.priority,
+            done.attempt,
+            done.run_lease,
+            COALESCE(done.max_attempts, ready.max_attempts, 25::smallint) AS max_attempts,
+            done.lane_seq,
+            done.enqueue_shard,
+            COALESCE(done.run_at, ready.run_at, done.finalized_at) AS run_at,
+            COALESCE(done.attempted_at, ready.attempted_at) AS attempted_at,
+            done.finalized_at,
+            COALESCE(done.created_at, ready.created_at, done.finalized_at) AS created_at,
+            COALESCE(done.unique_key, ready.unique_key) AS unique_key,
+            COALESCE(done.unique_states, ready.unique_states) AS unique_states,
+            COALESCE(done.payload, ready.payload, '{}'::jsonb) AS payload,
+            done.output
+        FROM %1$I.done_entries AS done
+        LEFT JOIN %1$I.ready_entries AS ready
+          ON ready.ready_slot       = done.ready_slot
+         AND ready.ready_generation = done.ready_generation
+         AND ready.queue            = done.queue
+         AND ready.priority         = done.priority
+         AND ready.enqueue_shard    = done.enqueue_shard
+         AND ready.lane_seq         = done.lane_seq
+        UNION ALL
+        SELECT
+            batch.ready_slot,
+            batch.ready_generation,
+            item.job_id,
+            ready.kind,
+            batch.queue,
+            ready.args,
+            'completed'::awa.job_state AS state,
+            batch.priority,
+            item.attempt,
+            item.run_lease,
+            ready.max_attempts,
+            item.lane_seq,
+            batch.enqueue_shard,
+            ready.run_at,
+            item.attempted_at,
+            batch.finalized_at,
+            ready.created_at,
+            ready.unique_key,
+            ready.unique_states,
+            COALESCE(ready.payload, '{}'::jsonb) AS payload,
+            -- Subscript rather than unnest, so only matching rows detoast
+            -- the batch's output array.
+            batch.outputs[item.ord] AS output
+        FROM %1$I.receipt_completion_batches AS batch
+        CROSS JOIN LATERAL unnest(
+            batch.job_ids,
+            batch.run_leases,
+            batch.lane_seqs,
+            batch.attempts,
+            batch.attempted_ats
+        ) WITH ORDINALITY AS item(job_id, run_lease, lane_seq, attempt, attempted_at, ord)
+        JOIN %1$I.ready_entries AS ready
+          ON ready.ready_slot       = batch.ready_slot
+         AND ready.ready_generation = batch.ready_generation
+         AND ready.queue            = batch.queue
+         AND ready.priority         = batch.priority
+         AND ready.enqueue_shard    = batch.enqueue_shard
+         AND ready.lane_seq         = item.lane_seq
+         AND ready.job_id           = item.job_id
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM %1$I.receipt_completion_tombstones AS tomb
+            WHERE tomb.ready_slot       = batch.ready_slot
+              AND tomb.ready_generation = batch.ready_generation
+              AND tomb.job_id           = item.job_id
+              AND tomb.run_lease        = item.run_lease
+        )
+        $ddl$,
+        p_schema
+    );
+END;
+$job_output$;
+
+REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_job_output(TEXT) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
     p_queue_slot_count     INT     DEFAULT 16,
@@ -2145,13 +2307,16 @@ BEGIN
             attempts         SMALLINT[] NOT NULL,
             attempted_ats    TIMESTAMPTZ[] NOT NULL,
             finalized_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            outputs          JSON[],
             PRIMARY KEY (ready_slot, batch_id),
             CHECK (completed_count > 0),
             CHECK (completed_count = cardinality(job_ids)),
             CHECK (completed_count = cardinality(run_leases)),
             CHECK (completed_count = cardinality(lane_seqs)),
             CHECK (completed_count = cardinality(attempts)),
-            CHECK (completed_count = cardinality(attempted_ats))
+            CHECK (completed_count = cardinality(attempted_ats)),
+            CONSTRAINT receipt_completion_batches_outputs_cardinality
+                CHECK (outputs IS NULL OR completed_count = cardinality(outputs))
         ) PARTITION BY LIST (ready_slot)
         $ddl$,
         p_schema,
@@ -2217,6 +2382,7 @@ BEGIN
             unique_key       BYTEA,
             unique_states    TEXT,
             payload          JSONB,
+            output           JSON,
             PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)
         ) PARTITION BY LIST (ready_slot)
         $ddl$,
@@ -2318,87 +2484,9 @@ BEGIN
         p_schema
     );
 
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE VIEW %1$I.terminal_jobs AS
-        SELECT
-            done.ready_slot,
-            done.ready_generation,
-            done.job_id,
-            done.kind,
-            done.queue,
-            COALESCE(done.args, ready.args, '{}'::jsonb) AS args,
-            done.state,
-            done.priority,
-            done.attempt,
-            done.run_lease,
-            COALESCE(done.max_attempts, ready.max_attempts, 25::smallint) AS max_attempts,
-            done.lane_seq,
-            done.enqueue_shard,
-            COALESCE(done.run_at, ready.run_at, done.finalized_at) AS run_at,
-            COALESCE(done.attempted_at, ready.attempted_at) AS attempted_at,
-            done.finalized_at,
-            COALESCE(done.created_at, ready.created_at, done.finalized_at) AS created_at,
-            COALESCE(done.unique_key, ready.unique_key) AS unique_key,
-            COALESCE(done.unique_states, ready.unique_states) AS unique_states,
-            COALESCE(done.payload, ready.payload, '{}'::jsonb) AS payload
-        FROM %1$I.done_entries AS done
-        LEFT JOIN %1$I.ready_entries AS ready
-          ON ready.ready_slot       = done.ready_slot
-         AND ready.ready_generation = done.ready_generation
-         AND ready.queue            = done.queue
-         AND ready.priority         = done.priority
-         AND ready.enqueue_shard    = done.enqueue_shard
-         AND ready.lane_seq         = done.lane_seq
-        UNION ALL
-        SELECT
-            batch.ready_slot,
-            batch.ready_generation,
-            item.job_id,
-            ready.kind,
-            batch.queue,
-            ready.args,
-            'completed'::awa.job_state AS state,
-            batch.priority,
-            item.attempt,
-            item.run_lease,
-            ready.max_attempts,
-            item.lane_seq,
-            batch.enqueue_shard,
-            ready.run_at,
-            item.attempted_at,
-            batch.finalized_at,
-            ready.created_at,
-            ready.unique_key,
-            ready.unique_states,
-            COALESCE(ready.payload, '{}'::jsonb) AS payload
-        FROM %1$I.receipt_completion_batches AS batch
-        CROSS JOIN LATERAL unnest(
-            batch.job_ids,
-            batch.run_leases,
-            batch.lane_seqs,
-            batch.attempts,
-            batch.attempted_ats
-        ) WITH ORDINALITY AS item(job_id, run_lease, lane_seq, attempt, attempted_at, ord)
-        JOIN %1$I.ready_entries AS ready
-          ON ready.ready_slot       = batch.ready_slot
-         AND ready.ready_generation = batch.ready_generation
-         AND ready.queue            = batch.queue
-         AND ready.priority         = batch.priority
-         AND ready.enqueue_shard    = batch.enqueue_shard
-         AND ready.lane_seq         = item.lane_seq
-         AND ready.job_id           = item.job_id
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM %1$I.receipt_completion_tombstones AS tomb
-            WHERE tomb.ready_slot       = batch.ready_slot
-              AND tomb.ready_generation = batch.ready_generation
-              AND tomb.job_id           = item.job_id
-              AND tomb.run_lease        = item.run_lease
-        )
-        $ddl$,
-        p_schema
-    );
+    -- Retained job output (ADR-048): the output columns and the
+    -- terminal_jobs view that exposes them.
+    PERFORM awa.install_queue_storage_job_output(p_schema);
 
     EXECUTE format(
         $ddl$
