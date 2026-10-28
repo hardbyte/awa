@@ -158,6 +158,8 @@ datasource. Run the whole thing locally with `scripts/telemetry-e2e-local.sh`.
 
 All metrics use the `awa` OTel meter name and are exported via OTLP to your configured collector.
 
+In Prometheus they appear under the OpenTelemetry [OTLP-to-Prometheus translation](https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/), which the collector's Prometheus exporter applies by default: dots become underscores, the unit is appended (`s` → `_seconds`, `By` → `_bytes`; annotations such as `{job}` are dropped), counters end in `_total`, and histograms export `_bucket`, `_sum` and `_count`. So `awa.job.duration` (unit `s`) is queried as `awa_job_duration_seconds_bucket`, and the attribute `awa.job.queue` as the label `awa_job_queue`. `scripts/otel-prometheus-names.py` prints every series and label name awa exports; `scripts/validate-grafana.sh` checks the shipped dashboard and alert rules against that list and against a live Prometheus.
+
 ### Job lifecycle
 
 | Metric | Type | Labels | Description |

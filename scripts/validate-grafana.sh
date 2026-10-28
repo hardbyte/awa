@@ -4,8 +4,9 @@
 # between dashboards/alerts and what awa actually emits fails loudly:
 #
 #   1. Every awa_* identifier referenced by the OTel dashboard's PromQL and
-#      the Prometheus alert rules must exist in Prometheus as a metric name
-#      or a label name.
+#      the Prometheus alert rules must be a name awa exports under the
+#      OpenTelemetry OTLP-to-Prometheus translation, and every awa_* name
+#      Prometheus holds must be one that translation predicts.
 #   2. Both dashboard JSONs must import cleanly through the Grafana API
 #      (schema validity, not just JSON well-formedness).
 #   3. Every rawSql panel on the Postgres dashboard must EXPLAIN against a
@@ -13,7 +14,8 @@
 #      still references).
 #
 # Environment: PROMETHEUS_URL (default :9090), GRAFANA_URL (default :3000),
-# DATABASE_URL (default local test instance). Requires: jq, curl, psql.
+# DATABASE_URL (default local test instance). Requires: jq, curl, psql,
+# python3.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -27,7 +29,12 @@ ALERTS_PROM=docs/grafana/alerts/awa-alerts-prometheus.yaml
 failures=0
 
 # ── 1. Metric/label coverage ─────────────────────────────────────────
-echo "── validating awa_* references against live Prometheus"
+# Expected names come from the instruments awa-metrics defines, translated
+# by the OpenTelemetry OTLP-to-Prometheus rules the collector applies
+# (unit suffixes, `_total` on counters, histogram series, `_` for invalid
+# characters): see scripts/otel-prometheus-names.py.
+echo "── validating awa_* references against the OTel→Prometheus names and live Prometheus"
+expected=$(python3 scripts/otel-prometheus-names.py)
 referenced=$(
   {
     jq -r '[.. | .expr? // empty] | .[]' "$DASHBOARD_OTEL"
@@ -37,31 +44,35 @@ referenced=$(
 prom_names=$(curl -sf "$PROMETHEUS_URL/api/v1/label/__name__/values" | jq -r '.data[]')
 prom_labels=$(curl -sf "$PROMETHEUS_URL/api/v1/labels" | jq -r '.data[]')
 known=$(printf '%s\n%s\n' "$prom_names" "$prom_labels" | sort -u)
-# Fallback set for condition-gated metrics the validation workload never
-# fires (e.g. a SkippedBusy ring rotation): every metric name string
-# defined in awa-metrics, normalised to Prometheus form (dots →
-# underscores). A dashboard reference must exist in Prometheus OR still be
-# defined in source — renames and removals fail either way.
-source_names=$(grep -oE '"awa\.[a-z0-9_.]+"' awa-metrics/src/lib.rs | tr -d '"' | tr '.' '_' | sort -u)
 
+# a) Every reference is a name awa can export. A metric the workload never
+#    fires (e.g. a SkippedBusy ring rotation) is still checked this way.
 missing=0
 while IFS= read -r name; do
-  if grep -qxF "$name" <<<"$known"; then
-    continue
-  fi
-  base=$(sed -E 's/_(bucket|sum|count|total)$//; s/_(seconds|bytes)$//' <<<"$name")
-  if grep -qxF "$base" <<<"$source_names"; then
+  if ! grep -qxF "$name" <<<"$expected"; then
+    echo "  MISSING: $name (referenced by dashboard/alerts; no awa-metrics instrument or attribute exports it)"
+    missing=$((missing + 1))
+  elif ! grep -qxF "$name" <<<"$known"; then
     echo "  conditional: $name (defined in awa-metrics, not observed in this workload)"
-    continue
   fi
-  echo "  MISSING: $name (referenced by dashboard/alerts, absent from Prometheus AND awa-metrics)"
-  missing=$((missing + 1))
 done <<<"$referenced"
-if [ "$missing" -gt 0 ]; then
-  echo "  $missing referenced awa_* identifiers not found — dashboard/alert drift"
+
+# b) Every awa_* series and label the collector exported is one the
+#    translation predicts, so the expected names match what Prometheus sees.
+unexpected=0
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  if ! grep -qxF "$name" <<<"$expected"; then
+    echo "  UNEXPECTED: $name (exported to Prometheus, but not the OTel→Prometheus name of any awa-metrics instrument or attribute)"
+    unexpected=$((unexpected + 1))
+  fi
+done < <(grep -E '^awa_' <<<"$known" || true)
+
+if [ "$missing" -gt 0 ] || [ "$unexpected" -gt 0 ]; then
+  echo "  $missing missing, $unexpected unexpected awa_* identifiers — dashboard/alert or naming drift"
   failures=$((failures + 1))
 else
-  echo "  OK: $(wc -l <<<"$referenced") awa_* identifiers all present"
+  echo "  OK: $(wc -l <<<"$referenced") awa_* references all exportable"
 fi
 
 # ── 2. Grafana API import ────────────────────────────────────────────
