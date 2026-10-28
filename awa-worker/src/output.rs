@@ -60,6 +60,9 @@ impl OutputSlot {
     /// The value is serialized and checked now. Recording JSON null clears
     /// the slot. A failed call also clears it, so an earlier value never
     /// stands in for the one that failed, and it does not fail the attempt.
+    ///
+    /// Calls from clones of the slot take effect in the order they finish:
+    /// serialization runs first, outside the slot's lock.
     pub fn set<T: Serialize + ?Sized>(&self, output: &T) -> Result<(), OutputError> {
         // User `Serialize` impls run outside the lock.
         let value = serde_json::to_value(output)
