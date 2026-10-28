@@ -54,6 +54,7 @@ Each record preserves its status, context, decision, consequences, and alternati
 | 044 | [Gate A — storage evolution for 0.7](044-storage-evolution-gate-a.md) | The #295 segment-engine RFC graduates to 0.8: the allocator ideas landed inside the engine as staged migrations and measured better; the remaining WAL headroom has no in-place delivery path (#295, #383). |  |
 | 045 | [Hot-path triggers never wait on another transaction](045-hot-path-trigger-lock-contract.md) | Triggers on the canonical hot tables may write only append-only, unconstrained mark tables or the job's own unique claim; the maintenance path never truncates; the contract is an executable test and a TLA+ witness (v046, 0.6 patch). |  |
 | 046 | [Handler-staged follow-up jobs](046-handler-staged-follow-ups.md) | A handler stages follow-up requests on its `JobContext`; they are inserted in the attempt's lease-guarded completion transaction, deduplicated by their own unique keys, and discarded on every other outcome. | <span class="awa-status awa-status--proposed">Proposed</span> |
+| 048 | [Retained job output](048-retained-job-output.md) | A handler may record a size-bounded JSON output for its attempt, sealed with the staging buffer and published only by the attempt's own lease-guarded transition: as the job's output on completion, or in the error entry of a failure. Stored on the compact completion batch, so it keeps the compact path; never read by the engine. | <span class="awa-status awa-status--proposed">Proposed</span> |
 
 ## Correctness evidence
 
