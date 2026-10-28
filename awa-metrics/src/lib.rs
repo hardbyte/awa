@@ -36,7 +36,7 @@ pub mod names {
     pub const COMPLETION_RECONNECT_RETRY: &str = "awa.completion.reconnect_retry";
     pub const STAGED_FOLLOW_UPS_DISCARDED: &str = "awa.job.staged_follow_ups_discarded";
     pub const JOB_OUTPUT_RECORDED: &str = "awa.job.output_recorded";
-    pub const JOB_OUTPUT_BYTES: &str = "awa.job.output_bytes";
+    pub const JOB_OUTPUT_SIZE: &str = "awa.job.output_size";
     pub const JOB_OUTPUT_DROPPED: &str = "awa.job.output_dropped";
     pub const JOB_CANCELLED: &str = "awa.job.cancelled";
     pub const JOB_CLAIMED: &str = "awa.job.claimed";
@@ -130,7 +130,7 @@ pub struct AwaMetrics {
     /// `completed` for the job's output, `failed` for an error entry.
     pub job_output_recorded: Counter<u64>,
     /// Size of published outputs, in bytes of JSON text.
-    pub job_output_bytes: Histogram<u64>,
+    pub job_output_size: Histogram<u64>,
     /// Outputs a handler recorded that were not published, by reason.
     pub job_output_dropped: Counter<u64>,
     /// Total jobs cancelled.
@@ -337,8 +337,8 @@ impl AwaMetrics {
                 )
                 .with_unit("{output}")
                 .build(),
-            job_output_bytes: meter
-                .u64_histogram(names::JOB_OUTPUT_BYTES)
+            job_output_size: meter
+                .u64_histogram(names::JOB_OUTPUT_SIZE)
                 .with_description("Size of published job outputs in bytes of JSON text")
                 .with_unit("By")
                 .build(),
@@ -658,7 +658,7 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.job.outcome", outcome.to_string()),
         ];
         self.job_output_recorded.add(1, &attrs);
-        self.job_output_bytes.record(bytes, &attrs);
+        self.job_output_size.record(bytes, &attrs);
     }
 
     /// Record a recorded output that was not published.

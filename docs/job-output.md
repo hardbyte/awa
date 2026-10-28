@@ -146,7 +146,7 @@ Registered enqueue specs receive the completed row without its output.
 | Metric | Attributes |
 | --- | --- |
 | `awa.job.output_recorded` | `awa.job.kind`, `awa.job.queue`, `awa.job.outcome` (`completed` or `failed`) |
-| `awa.job.output_bytes` | the same, as a histogram of JSON text bytes |
+| `awa.job.output_size` | the same, as a histogram of JSON text bytes |
 | `awa.job.output_dropped` | `awa.job.kind`, `awa.job.queue`, `awa.output.reason` |
 
 The `awa.output.reason` values:

@@ -21,9 +21,10 @@
 -- the parent and every partition, and replacing the view takes it on the
 -- view; all are held until the migration transaction commits. Nothing is
 -- scanned or rewritten: the columns are nullable without defaults and the
--- check is NOT VALID. When no lock_timeout is set, each lock acquisition
--- waits at most 2 s. A timeout (SQLSTATE 55P03) rolls the whole migration
--- back and it can be re-run.
+-- check is NOT VALID. The view is locked before its tables, the order
+-- terminal_jobs readers take them. When no lock_timeout is set, each lock
+-- acquisition waits at most 2 s. A timeout (SQLSTATE 55P03) or a deadlock
+-- (40P01) rolls the whole migration back and it can be re-run.
 -- Design: docs/adr/048-retained-job-output.md
 
 DO $$
@@ -42,10 +43,15 @@ BEGIN
             OR to_regclass(format('%I.receipt_completion_batches', v_schema)) IS NULL;
         BEGIN
             PERFORM awa.install_queue_storage_job_output(v_schema);
-        EXCEPTION WHEN lock_not_available THEN
-            RAISE EXCEPTION 'v052 could not lock %''s terminal tables within lock_timeout % to add the job output columns; a long transaction or terminal read holds them. Nothing was migrated: re-run when they are free, or with a longer lock_timeout for the migration session',
-                quote_ident(v_schema), current_setting('lock_timeout')
-                USING ERRCODE = '55P03';
+        EXCEPTION
+            WHEN lock_not_available THEN
+                RAISE EXCEPTION 'v052 could not lock %''s terminal tables within lock_timeout % to add the job output columns; a long transaction or terminal read holds them. Nothing was migrated: re-run when they are free, or with a longer lock_timeout for the migration session',
+                    quote_ident(v_schema), current_setting('lock_timeout')
+                    USING ERRCODE = '55P03';
+            WHEN deadlock_detected THEN
+                RAISE EXCEPTION 'v052 deadlocked with a concurrent transaction while locking %''s terminal tables to add the job output columns. Nothing was migrated: re-run it',
+                    quote_ident(v_schema)
+                    USING ERRCODE = '40P01';
         END;
     END LOOP;
 

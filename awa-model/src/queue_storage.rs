@@ -7469,7 +7469,9 @@ impl QueueStorage {
                         ",\n                    output",
                         ",\n                        $16::jsonb[]",
                         ",\n                        outputs",
-                        ",\n                        array_agg(completed.output ORDER BY completed.lane_seq, completed.job_id)",
+                        // NULL for a batch row whose jobs recorded no output.
+                        ",\n                        CASE WHEN bool_or(completed.output IS NOT NULL) \
+                         THEN array_agg(completed.output ORDER BY completed.lane_seq, completed.job_id) END",
                     )
             } else {
                 ("", "", "", "")

@@ -74,7 +74,7 @@ for each step.
   when given: `Client::complete_external_with` with `ExternalCompletion`,
   Python `complete_external(..., output=...)`, or the HTTP callback body's
   `output` field. Canonical storage discards outputs. New metrics:
-  `awa.job.output_recorded`, `awa.job.output_bytes` and
+  `awa.job.output_recorded`, `awa.job.output_size` and
   `awa.job.output_dropped`.
 - **Handler-staged follow-up jobs ([ADR-046](docs/adr/046-handler-staged-follow-ups.md)).**
   A handler can stage follow-up jobs built from values it computed:

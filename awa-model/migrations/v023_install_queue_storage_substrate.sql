@@ -239,7 +239,29 @@ SECURITY INVOKER
 SET search_path = pg_catalog, awa, public
 SET quote_all_identifiers = off
 AS $job_output$
+DECLARE
+    v_view REGCLASS := to_regclass(format('%I.terminal_jobs', p_schema));
 BEGIN
+    -- When anything is missing, lock in the order terminal_jobs readers do
+    -- (the view, then its tables), so a read that starts mid-migration
+    -- waits instead of deadlocking against the ALTERs.
+    IF v_view IS NOT NULL AND (
+        NOT EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = v_view AND attname = 'output' AND NOT attisdropped
+        )
+        OR NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = format('%I.receipt_completion_batches', p_schema)::regclass
+              AND conname = 'receipt_completion_batches_outputs_cardinality'
+        )
+    ) THEN
+        EXECUTE format(
+            'LOCK TABLE %1$I.terminal_jobs, %1$I.done_entries, %1$I.receipt_completion_batches IN ACCESS EXCLUSIVE MODE',
+            p_schema
+        );
+    END IF;
+
     IF NOT EXISTS (
         SELECT 1 FROM pg_attribute
         WHERE attrelid = format('%I.done_entries', p_schema)::regclass
