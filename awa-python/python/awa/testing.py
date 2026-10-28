@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import operator
@@ -27,7 +28,7 @@ from typing import Any, Awaitable, Callable, Generic, TypeVar
 import pytest_asyncio
 
 import awa
-from awa._awa import derive_kind
+from awa._awa import _check_run_at as _runtime_check_run_at, derive_kind
 
 # Default test database URL
 DEFAULT_DATABASE_URL = "postgres://postgres:test@localhost:5432/awa_test"
@@ -220,18 +221,24 @@ def _check_unique_opts(unique_opts: Any) -> None:
 
 
 def _check_run_at(run_at: Any) -> None:
-    """Mirror the runtime's ``run_at`` parsing: a datetime or an RFC 3339 string."""
+    """Parse ``run_at`` with the runtime's own parser."""
     if run_at is None:
         return
-    text = run_at if isinstance(run_at, str) else getattr(run_at, "isoformat", None)
-    if callable(text):
-        text = text()
-    if not isinstance(text, str):
-        raise awa.StagingError("run_at must be a datetime or RFC3339 string")
     try:
-        datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as e:
+        _runtime_check_run_at(run_at)
+    except Exception as e:
         raise awa.StagingError(f"run_at is not a valid timestamp: {e}") from e
+
+
+def _snapshot(value: Any) -> Any:
+    """Copy a staged value so later mutation by the handler cannot change it;
+    the runtime serializes what it stages at the call."""
+    if isinstance(value, memoryview):
+        return memoryview(value.tobytes())
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
 
 
 def _args_to_json(args: Any) -> Any:
@@ -303,7 +310,12 @@ class HandlerJob(Generic[T]):
             self.staging_error = self.staging_error or error
             raise error from e
         self._staged_bytes += size
-        self.staged.append(StagedFollowUp(args=args, kwargs=dict(kwargs)))
+        self.staged.append(
+            StagedFollowUp(
+                args=_snapshot(args),
+                kwargs={name: _snapshot(value) for name, value in kwargs.items()},
+            )
+        )
 
 
 @dataclass

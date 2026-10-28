@@ -57,7 +57,9 @@ for each step.
   deduplicated by their own unique keys, and discarded on every other outcome.
   A failed stage (`StageError`, Python `awa.StagingError`) fails an attempt
   that still returns `Completed`. Limits are 16 follow-ups and 64 KiB per
-  attempt. Only jobs that stage leave the batched completion path. New
+  attempt. Staging is a new reason for an otherwise batchable job to leave
+  the batched completion path; jobs with registered `Completed` specs already
+  complete in their own transaction. New
   `EnqueueRequest::unique` and `::metadata` set one option without replacing
   the rest, `awa_model::insert_prepared` inserts a prepared row, and the
   `awa.job.staged_follow_ups_discarded` counter records follow-ups dropped by
