@@ -75,10 +75,8 @@ struct Summarize {
 
 // ── completion stores the output, on the compact and the general path ──
 
-/// Untagged jobs normally complete on the compact receipt path, tagged jobs
-/// always on the general path; both read the output back through `get_job`.
-/// `a_flush_split_by_output_size_keeps_every_output_with_its_job` pins the
-/// compact path.
+/// Untagged jobs complete on the compact receipt path, tagged jobs on the
+/// general path; both read the output back through `get_job`.
 #[tokio::test]
 async fn completion_stores_the_output_on_both_terminal_paths() {
     let db = TestDatabase::queue_storage().await;
@@ -86,7 +84,14 @@ async fn completion_stores_the_output_on_both_terminal_paths() {
     let queue = "output_paths";
     let events: Arc<Mutex<Vec<Option<Value>>>> = Arc::default();
     let seen = events.clone();
+    // The default one-second ring rotation lets prune truncate completed
+    // rows before the table checks below run on a slow machine.
     let client = Client::builder(pool.clone())
+        .queue_storage(
+            awa::QueueStorageConfig::default(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
         .queue(queue, queue_config())
         .register::<Summarize, _, _>(|args, ctx| {
             let output = ctx.output_slot();
@@ -121,10 +126,6 @@ async fn completion_stores_the_output_on_both_terminal_paths() {
     assert_eq!(compact_row.output, Some(json!({"n": 1, "doubled": 2})));
     assert_eq!(general_row.output, Some(json!({"n": 2, "doubled": 4})));
 
-    // An untagged job normally completes on the compact path, but the engine
-    // finishes any job its compact statement misses on the general path, so
-    // only the tagged job's path is fixed. Either way the output is stored
-    // once, with the row that completed the job.
     let batch_outputs = |job_id: i64| {
         let pool = pool.clone();
         async move {
@@ -150,10 +151,10 @@ async fn completion_stores_the_output_on_both_terminal_paths() {
             .unwrap()
         }
     };
-    let compact_paths = (batch_outputs(compact).await, done_outputs(compact).await);
-    assert!(
-        compact_paths == (1, 0) || compact_paths == (0, 1),
-        "the untagged job's output is stored once (batch, done): {compact_paths:?}"
+    assert_eq!(
+        (batch_outputs(compact).await, done_outputs(compact).await),
+        (1, 0),
+        "the untagged job stays on the compact path"
     );
     assert_eq!(
         (batch_outputs(general).await, done_outputs(general).await),
