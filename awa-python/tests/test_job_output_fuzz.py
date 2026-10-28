@@ -156,6 +156,8 @@ def same(left: Any, right: Any) -> bool:
     """JSON equality as jsonb keeps it: numbers compare by value."""
     if isinstance(left, bool) or isinstance(right, bool):
         return left is right
+    if isinstance(left, int) and isinstance(right, int):
+        return left == right
     if isinstance(left, (int, float)) and isinstance(right, (int, float)):
         return float(left) == float(right)
     if isinstance(left, list) and isinstance(right, list):

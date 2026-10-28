@@ -524,3 +524,266 @@ async fn a_schema_without_output_columns_drops_completion_outputs() {
     assert_eq!(general.output, None);
     assert_eq!(outputs_in(&failed.errors), vec![json!({"n": 0})]);
 }
+
+// ── a flush split by output size keeps every output with its job ──
+
+/// Twenty outputs of about 3.5 KiB pass the 64 KiB batch budget, so one
+/// flush writes several batch rows. Every output reads back on its own job,
+/// and a batch row whose jobs recorded nothing stores no output array.
+#[tokio::test]
+async fn a_flush_split_by_output_size_keeps_every_output_with_its_job() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let store = awa::QueueStorage::from_existing_schema("awa").unwrap();
+    for n in 0..40 {
+        insert(&pool, &Summarize { n }, "output_split", 1, &[]).await;
+    }
+    for n in 0..5 {
+        insert(&pool, &Summarize { n }, "output_split_none", 1, &[]).await;
+    }
+    let lease = Duration::from_secs(60);
+    let mut claimed = store
+        .claim_runtime_batch(&pool, "output_split", 40, lease)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 40);
+    for (index, job) in claimed.iter_mut().enumerate() {
+        job.job.output = (index % 2 == 0).then(|| json!({ "n": index, "pad": "x".repeat(3_500) }));
+    }
+    let mut flush = claimed.clone();
+    flush.extend(
+        store
+            .claim_runtime_batch(&pool, "output_split_none", 5, lease)
+            .await
+            .unwrap(),
+    );
+    let updated = store.complete_runtime_batch(&pool, &flush).await.unwrap();
+    assert_eq!(updated.len(), flush.len());
+
+    for job in &claimed {
+        let row = store.load_job(&pool, job.job.id).await.unwrap().unwrap();
+        assert_eq!(row.state, JobState::Completed);
+        assert_eq!(row.output, job.job.output, "job {}", job.job.id);
+    }
+    let (with_outputs, all_null, without_outputs): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE outputs IS NOT NULL), \
+                count(*) FILTER (WHERE outputs IS NOT NULL AND NOT EXISTS \
+                    (SELECT 1 FROM unnest(outputs) AS output WHERE output IS NOT NULL)), \
+                count(*) FILTER (WHERE outputs IS NULL) \
+         FROM awa.receipt_completion_batches",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        with_outputs >= 2,
+        "the flush was not split: {with_outputs} rows"
+    );
+    assert_eq!(all_null, 0, "a batch row stored an array of only nulls");
+    assert!(
+        without_outputs >= 1,
+        "the output-free queue's row stores no array"
+    );
+}
+
+// ── panic and handler cancel keep the output in their entry ──
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct Ends {
+    how: String,
+}
+
+#[tokio::test]
+async fn panic_and_cancel_keep_the_output_in_their_error_entry() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let queue = "output_panic_cancel";
+    let client = Client::builder(pool.clone())
+        .queue(queue, queue_config())
+        .register::<Ends, _, _>(|args, ctx| {
+            let output = ctx.output_slot();
+            async move {
+                output.set(&json!({ "how": args.how })).unwrap();
+                match args.how.as_str() {
+                    "panic" => panic!("handler panicked after recording"),
+                    _ => Ok(JobResult::Cancel("cancelled by the handler".into())),
+                }
+            }
+        })
+        .build()
+        .unwrap();
+    let panicked = insert(
+        &pool,
+        &Ends {
+            how: "panic".into(),
+        },
+        queue,
+        1,
+        &[],
+    )
+    .await;
+    let cancelled = insert(
+        &pool,
+        &Ends {
+            how: "cancel".into(),
+        },
+        queue,
+        1,
+        &[],
+    )
+    .await;
+    client.start().await.unwrap();
+    let panicked = wait_for_state(&pool, panicked, JobState::Failed).await;
+    let cancelled = wait_for_state(&pool, cancelled, JobState::Cancelled).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(panicked.output, None);
+    assert_eq!(outputs_in(&panicked.errors), vec![json!({"how": "panic"})]);
+    assert_eq!(cancelled.output, None);
+    assert_eq!(
+        outputs_in(&cancelled.errors),
+        vec![json!({"how": "cancel"})]
+    );
+}
+
+// ── the DLQ keeps a failed output; a DLQ retry dispatches without it ──
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct DeadLetter {
+    n: i64,
+}
+
+#[tokio::test]
+async fn the_dlq_keeps_the_failed_output_and_a_retry_dispatches_without_it() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let queue = "output_dlq";
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let leaked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (runs_seen, leaked_seen) = (runs.clone(), leaked.clone());
+    let client = Client::builder(pool.clone())
+        .queue(queue, queue_config())
+        .dlq_enabled_by_default(true)
+        .register::<DeadLetter, _, _>(move |_args, ctx| {
+            let run = runs_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let row = serde_json::to_string(&(&ctx.job.errors, &ctx.job.metadata)).unwrap();
+            if row.contains("dlq-marker") {
+                leaked_seen.lock().unwrap().push(row);
+            }
+            let output = ctx.output_slot();
+            async move {
+                if run == 0 {
+                    output.set(&json!({ "marker": "dlq-marker" })).unwrap();
+                    return Err(JobError::Terminal("dead-lettered".into()));
+                }
+                output.set(&json!({ "revived": true })).unwrap();
+                Ok(JobResult::Completed)
+            }
+        })
+        .build()
+        .unwrap();
+    let id = insert(&pool, &DeadLetter { n: 1 }, queue, 1, &[]).await;
+    client.start().await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let dead = loop {
+        if let Some(row) = awa::model::dlq::get_dlq_job(&pool, id).await.unwrap() {
+            break row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job never reached the DLQ"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        outputs_in(&dead.job.errors),
+        vec![json!({ "marker": "dlq-marker" })]
+    );
+
+    awa::model::dlq::retry_from_dlq(&pool, id, &awa::RetryFromDlqOpts::default())
+        .await
+        .unwrap()
+        .expect("revived");
+    let done = wait_for_state(&pool, id, JobState::Completed).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(done.output, Some(json!({ "revived": true })));
+    assert!(
+        leaked.lock().unwrap().is_empty(),
+        "a dispatch row carried a failed output: {:?}",
+        leaked.lock().unwrap()
+    );
+}
+
+// ── rescue keeps the earlier output; a stale completion stores nothing ──
+
+#[tokio::test]
+async fn rescue_keeps_the_earlier_output_and_a_stale_completion_stores_nothing() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let store = awa::QueueStorage::from_existing_schema("awa").unwrap();
+    let queue = "output_rescue";
+    let lease = Duration::from_secs(60);
+    let id = insert(&pool, &Summarize { n: 1 }, queue, 5, &[]).await;
+
+    let first = store
+        .claim_runtime_batch(&pool, queue, 1, lease)
+        .await
+        .unwrap()
+        .remove(0);
+    store
+        .fail_retryable_after_with_claim(
+            &pool,
+            id,
+            first.job.run_lease,
+            Duration::ZERO,
+            awa::AttemptError::new("first attempt").with_output(Some(json!({ "attempt": 1 }))),
+            None,
+            Some(&first.claim),
+        )
+        .await
+        .unwrap()
+        .expect("attempt 1 failed");
+    store
+        .promote_due(&pool, JobState::Retryable, 10)
+        .await
+        .unwrap();
+
+    let mut second = store
+        .claim_runtime_batch(&pool, queue, 1, lease)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(second.job.attempt, 2);
+    let rescued = store
+        .rescue_stale_heartbeats(&pool, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(
+        rescued.iter().any(|row| row.id == id),
+        "attempt 2 was not rescued"
+    );
+
+    // The rescued attempt's late completion is stale: nothing it carries is
+    // stored.
+    second.job.output = Some(json!({ "attempt": 2 }));
+    let updated = store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&second))
+        .await
+        .unwrap();
+    assert!(
+        updated.is_empty(),
+        "a rescued attempt completed: {updated:?}"
+    );
+
+    let row = store.load_job(&pool, id).await.unwrap().unwrap();
+    assert_ne!(row.state, JobState::Completed);
+    assert_eq!(row.output, None);
+    assert_eq!(
+        outputs_in(&row.errors),
+        vec![json!({ "attempt": 1 })],
+        "the rescue entry carries no output and keeps the earlier one: {:?}",
+        row.errors
+    );
+}

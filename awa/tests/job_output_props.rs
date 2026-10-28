@@ -70,7 +70,12 @@ fn same_json(left: Option<&Value>, right: Option<&Value>) -> bool {
 
 fn same_value(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(l), Value::Number(r)) => l == r || l.as_f64() == r.as_f64(),
+        // Integers must match exactly; only a float may equal an integer
+        // of the same value.
+        (Value::Number(l), Value::Number(r)) if l.is_f64() || r.is_f64() => {
+            l.as_f64() == r.as_f64()
+        }
+        (Value::Number(l), Value::Number(r)) => l == r,
         (Value::Array(l), Value::Array(r)) => {
             l.len() == r.len() && l.iter().zip(r).all(|(l, r)| same_value(l, r))
         }
