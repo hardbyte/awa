@@ -129,6 +129,8 @@ client_builder.register::<SyncInventory, _, _>(|args, ctx| {
 
 **A failed call clears the slot.** An earlier value left in place would look like the current one.
 
+**Calls take effect in the order they reach the slot's lock.** A call from any clone of the slot replaces, clears or fails against what is there at that moment, so among concurrent calls the last to finish wins, whether it succeeded or failed. Because serialization runs before the lock, a slow call can finish after one that started later. A handler that records from several tasks orders those tasks itself.
+
 **Field rather than method.** `JobRow` gains a field because the row is the value that flows to HTTP, the admin UI, lifecycle events and Python. `#[non_exhaustive]` makes the field a non-breaking addition. `#[sqlx(default)]` and `#[serde(default)]` keep explicit-column queries and JSON from older servers working.
 
 **Getters.** `ctx.output()` and `OutputSlot::get` let unit tests assert what a handler recorded. `ctx.job` stays the row as claimed, before the run.
@@ -296,7 +298,7 @@ For a job A whose attempt recorded output O:
 
 - **Published with its own transition.** O is stored as A's output if and only if that attempt's own `Completed` finalization committed under its run lease. O appears in an error entry only if that attempt's own failure transition committed under its run lease. No output comes from an attempt that was rescued or superseded, or whose transition rolled back.
 - **One output per job.** A job row completes at most once. Its output is therefore either the sealed output of the attempt whose completion committed, or the value passed to the external completion that committed. An external completion that wins a race with a handler waiting in `ctx.wait_for_callback` stores its own output, if any, and the handler's later completion is stale.
-- **Never on a dispatch path.** No scheduler, spec, dependency or follow-up reads an output, and the dispatch row carries none.
+- **Never on a dispatch path.** No scheduler, spec, dependency or follow-up reads an output, and the dispatch row carries none. The one exception is a mixed-version fleet: an N−1 worker does not strip failed outputs, so a retry it claims carries the previous attempt's output in `errors` (see Migrate first).
 
 Not guaranteed:
 
