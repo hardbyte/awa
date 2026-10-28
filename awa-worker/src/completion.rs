@@ -321,7 +321,8 @@ impl CompletionWorker {
         let flush_start = std::time::Instant::now();
         // Requests whose own transaction committed before a later one in the
         // same flush failed; they still learn their outcome.
-        let mut committed_before_error: Option<(HashSet<i64>, HashSet<(i64, i64)>)> = None;
+        let mut committed_job_ids: HashSet<i64> = HashSet::new();
+        let mut committed_pairs: HashSet<(i64, i64)> = HashSet::new();
 
         let updated = match &self.storage {
             RuntimeStorage::Canonical => sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
@@ -378,12 +379,9 @@ impl CompletionWorker {
                     match rest_updated {
                         Ok(rows) => updated.extend(rows),
                         Err(err) => {
-                            if !with_job.is_empty() {
-                                committed_before_error = Some((
-                                    with_job.iter().map(|request| request.job_id).collect(),
-                                    updated.iter().copied().collect(),
-                                ));
-                            }
+                            committed_job_ids =
+                                with_job.iter().map(|request| request.job_id).collect();
+                            committed_pairs = updated.iter().copied().collect();
                             result = Err(err);
                         }
                     }
@@ -427,11 +425,10 @@ impl CompletionWorker {
                 );
                 let message = format!("completion batch flush failed: {err}");
                 for request in batch {
-                    let response = match &committed_before_error {
-                        Some((job_ids, updated)) if job_ids.contains(&request.job_id) => {
-                            Ok(updated.contains(&(request.job_id, request.run_lease)))
-                        }
-                        _ => Err(AwaError::Validation(message.clone())),
+                    let response = if committed_job_ids.contains(&request.job_id) {
+                        Ok(committed_pairs.contains(&(request.job_id, request.run_lease)))
+                    } else {
+                        Err(AwaError::Validation(message.clone()))
                     };
                     let _ = request.response.send(response);
                 }
