@@ -467,6 +467,26 @@ groups:
                   reducer: { type: last, params: [] }
                   evaluator: { type: gt, params: [1] }
 
+      - uid: awa_job_output_schema_missing
+        title: "awa drops job outputs: schema before migration v052"
+        condition: "C"
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Queue {{ $labels.awa_job_queue }} drops completion outputs"
+          description: |
+            Workers on {{ $labels.awa_job_queue }} record job outputs
+            (ADR-048), but the queue-storage schema has no output columns, so
+            completion outputs are dropped. A binary is running ahead of its
+            migration: run `awa migrate` to apply v052. See "Job Outputs" on
+            the dashboard.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
       - uid: awa_staged_follow_ups_discarded
         title: "awa handler discards staged follow-ups"
         condition: "C"
@@ -491,6 +511,7 @@ groups:
             model:
               refId: A
               datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: sum by (awa_job_queue) (rate(awa_job_output_dropped_total{awa_output_reason="schema_missing"}[5m]))
               expr: sum by (awa_job_kind) (increase(awa_job_staged_follow_ups_discarded_total[15m]))
               instant: true
               intervalMs: 1000

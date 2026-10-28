@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://hardbyte.github.io/awa/http-callbacks/">
       
       
-        <link rel="prev" href="../lifecycle-hooks/">
+        <link rel="prev" href="../job-output/">
       
       
         <link rel="next" href="../callback-receivers/">
@@ -913,6 +913,8 @@
       
         
       
+        
+      
     
     
     
@@ -1013,6 +1015,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -2409,13 +2439,19 @@
 </span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span>-d<span class="w"> </span><span class="s1">'{"timeout_seconds":3600}'</span>
 </span></code></pre></div>
 <p>The <code>complete</code> endpoint completes the job. It does not resume an in-process handler for sequential callback workflows; use the Rust/Python admin API <code>resume_external</code> path for that pattern.</p>
+<p>The <code>payload</code> is not stored. To keep a value on the completed job for later inspection, send it as <code>output</code> (<a href="../job-output/">job output</a>): at most 4 KiB of JSON, without NUL characters. An invalid <code>output</code> is a <code>400</code> and completes nothing. Callback servers older than 0.7 ignore the field. The signature covers the callback ID, not the body, so whoever holds a callback's signature also chooses its output; treat a stored output as the caller's claim, like the payload.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="s2">"</span><span class="nv">$CALLBACK_URL</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">"X-Awa-Signature: </span><span class="nv">$AWA_SIGNATURE</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">  </span>-d<span class="w"> </span><span class="s1">'{"output":{"approved":true,"pages":12}}'</span>
+</span></code></pre></div>
 <h2 id="deploying-callback-ingress-separately">Deploying callback ingress separately<a class="headerlink" href="#deploying-callback-ingress-separately" title="Permanent link">&para;</a></h2>
 <p><code>awa serve</code> bundles the admin UI, admin REST API, static fallback, and the callback receiver behind a single router with permissive CORS. That is convenient for development but undesirable when callbacks must be externally reachable while the admin surface must stay private.</p>
 <p>For that case Awa ships a callback-only receiver as a deployable role (see <a href="../adr/027-callback-ingress-surface/">ADR-027</a>):</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>awa callbacks serve \
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>  --host 0.0.0.0 --port 4000 \
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>  --callback-hmac-secret "$AWA_CALLBACK_HMAC_SECRET" \
-</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>  --path-prefix /api/callbacks
+<div class="language-text highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>awa callbacks serve \
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>  --host 0.0.0.0 --port 4000 \
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>  --callback-hmac-secret "$AWA_CALLBACK_HMAC_SECRET" \
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>  --path-prefix /api/callbacks
 </span></code></pre></div>
 <p>The router:</p>
 <ul>
@@ -2426,32 +2462,32 @@
 <li>Requires a callback signing secret by default. Pass <code>--allow-unsigned</code> only when the receiver lives on a trusted network (mTLS at the load balancer, IP allow-list, private VPC, etc.).</li>
 </ul>
 <p>The same router is available as a Rust library for embedding:</p>
-<div class="language-rust highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">use</span><span class="w"> </span><span class="n">awa_ui</span><span class="p">::{</span><span class="n">callback_router</span><span class="p">,</span><span class="w"> </span><span class="n">CallbackAuth</span><span class="p">,</span><span class="w"> </span><span class="n">CallbackReceiverConfig</span><span class="p">};</span>
-</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>
-</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">router</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">callback_router</span><span class="p">(</span>
-</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="w">    </span><span class="n">pool</span><span class="p">,</span>
-</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="w">    </span><span class="n">CallbackReceiverConfig</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">CallbackAuth</span><span class="p">::</span><span class="n">Signed</span><span class="p">(</span><span class="n">secret</span><span class="p">)),</span>
-</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a><span class="p">)</span>
-</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="k">use</span><span class="w"> </span><span class="n">awa_ui</span><span class="p">::{</span><span class="n">callback_router</span><span class="p">,</span><span class="w"> </span><span class="n">CallbackAuth</span><span class="p">,</span><span class="w"> </span><span class="n">CallbackReceiverConfig</span><span class="p">};</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">router</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">callback_router</span><span class="p">(</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="w">    </span><span class="n">pool</span><span class="p">,</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="w">    </span><span class="n">CallbackReceiverConfig</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">CallbackAuth</span><span class="p">::</span><span class="n">Signed</span><span class="p">(</span><span class="n">secret</span><span class="p">)),</span>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="p">)</span>
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </span></code></pre></div>
 <p>Use <a href="#configure-the-worker"><code>HttpWorkerConfig::callback_path_prefix</code></a> on the worker side to match a non-default <code>--path-prefix</code> so the URLs the worker hands to your function point at the receiver.</p>
 <p>If you want callbacks to land inside your own application (FastAPI, axum, etc.) rather than running Awa's receiver at all, see <a href="../callback-receivers/">Callback receivers</a> for the user-owned API integration pattern.</p>
 <h2 id="function-side-verification">Function-side verification<a class="headerlink" href="#function-side-verification" title="Permanent link">&para;</a></h2>
 <p>The signature primarily protects the Awa callback receiver from unauthorized completion requests. If the function endpoint is public, you may also verify the worker-to-function request before starting work. In that case the function must know the same 32-byte secret and recompute the BLAKE3 keyed hash over the received <code>callback_id</code>.</p>
 <p>Add the dependency with <code>uv add blake3</code>, then:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">blake3</span>
-</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">hmac</span>
-</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>
-</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>
-</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="k">def</span><span class="w"> </span><span class="nf">valid_signature</span><span class="p">(</span><span class="n">secret</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">callback_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">provided</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>    <span class="n">expected</span> <span class="o">=</span> <span class="n">blake3</span><span class="o">.</span><span class="n">blake3</span><span class="p">(</span><span class="n">callback_id</span><span class="o">.</span><span class="n">encode</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="n">secret</span><span class="p">)</span><span class="o">.</span><span class="n">hexdigest</span><span class="p">()</span>
-</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a>    <span class="k">return</span> <span class="n">hmac</span><span class="o">.</span><span class="n">compare_digest</span><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">provided</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">blake3</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">hmac</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="k">def</span><span class="w"> </span><span class="nf">valid_signature</span><span class="p">(</span><span class="n">secret</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">callback_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">provided</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a>    <span class="n">expected</span> <span class="o">=</span> <span class="n">blake3</span><span class="o">.</span><span class="n">blake3</span><span class="p">(</span><span class="n">callback_id</span><span class="o">.</span><span class="n">encode</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="n">secret</span><span class="p">)</span><span class="o">.</span><span class="n">hexdigest</span><span class="p">()</span>
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a>    <span class="k">return</span> <span class="n">hmac</span><span class="o">.</span><span class="n">compare_digest</span><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">provided</span><span class="p">)</span>
 </span></code></pre></div>
 <p>Rust example:</p>
-<div class="language-rust highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">fn</span><span class="w"> </span><span class="nf">valid_signature</span><span class="p">(</span><span class="n">secret</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"> </span><span class="n">callback_id</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">,</span><span class="w"> </span><span class="n">provided</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blake3</span><span class="p">::</span><span class="n">keyed_hash</span><span class="p">(</span><span class="n">secret</span><span class="p">,</span><span class="w"> </span><span class="n">callback_id</span><span class="p">.</span><span class="n">as_bytes</span><span class="p">());</span>
-</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="w">    </span><span class="n">blake3</span><span class="p">::</span><span class="n">Hash</span><span class="p">::</span><span class="n">from_hex</span><span class="p">(</span><span class="n">provided</span><span class="p">).</span><span class="n">is_ok_and</span><span class="p">(</span><span class="o">|</span><span class="n">hash</span><span class="o">|</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">hash</span><span class="p">)</span>
-</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="p">}</span>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">fn</span><span class="w"> </span><span class="nf">valid_signature</span><span class="p">(</span><span class="n">secret</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">32</span><span class="p">],</span><span class="w"> </span><span class="n">callback_id</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">,</span><span class="w"> </span><span class="n">provided</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blake3</span><span class="p">::</span><span class="n">keyed_hash</span><span class="p">(</span><span class="n">secret</span><span class="p">,</span><span class="w"> </span><span class="n">callback_id</span><span class="p">.</span><span class="n">as_bytes</span><span class="p">());</span>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="w">    </span><span class="n">blake3</span><span class="p">::</span><span class="n">Hash</span><span class="p">::</span><span class="n">from_hex</span><span class="p">(</span><span class="n">provided</span><span class="p">).</span><span class="n">is_ok_and</span><span class="p">(</span><span class="o">|</span><span class="n">hash</span><span class="o">|</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">hash</span><span class="p">)</span>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="p">}</span>
 </span></code></pre></div>
 <p>If the function does not verify the inbound request, keep it behind your normal cloud auth layer and still forward <code>X-Awa-Signature</code> to the callback receiver.</p>
 
@@ -2492,7 +2528,7 @@
       <nav class="md-footer__inner md-grid" aria-label="Footer" >
         
           
-          <a href="../lifecycle-hooks/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Lifecycle hooks">
+          <a href="../job-output/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Job output">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
@@ -2502,7 +2538,7 @@
                 Previous
               </span>
               <div class="md-ellipsis">
-                Lifecycle hooks
+                Job output
               </div>
             </div>
           </a>

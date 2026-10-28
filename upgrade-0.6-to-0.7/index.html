@@ -911,6 +911,8 @@
       
         
       
+        
+      
     
     
     
@@ -1008,6 +1010,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -1533,6 +1563,17 @@
     <span class="md-ellipsis">
       
         v051: per-slot claim functions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v052-job-output-columns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v052: job output columns
       
     </span>
   </a>
@@ -2423,6 +2464,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v052-job-output-columns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v052: job output columns
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#the-one-gate" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2821,6 +2873,31 @@ once instead, run that grant again after migrating. External migration runners
 apply the complete generated <code>awa migrate --sql --from 50 --to 51</code> bundle, which
 refreshes the installer definition before the tail reinstalls the custom
 substrates.</p>
+<h2 id="v052-job-output-columns">v052: job output columns<a class="headerlink" href="#v052-job-output-columns" title="Permanent link">&para;</a></h2>
+<p>v052 adds the storage for <a href="../job-output/">job output</a> (ADR-048) to the default
+and every discovered custom queue-storage schema:
+- a nullable <code>output json</code> column on <code>done_entries</code>;
+- a nullable <code>outputs json[]</code> array on <code>receipt_completion_batches</code>, with a
+  <code>NOT VALID</code> check on its length;
+- a final <code>output</code> column on <code>terminal_jobs</code>.</p>
+<p>It is not an installer replay. It redefines the installer, so new schemas
+get the columns, then runs a targeted helper for each schema. Nothing is
+rewritten or scanned. Adding the columns and replacing the view still take
+<code>ACCESS EXCLUSIVE</code> locks on the terminal tables and view, held until the
+whole pending range commits, so completions and terminal reads wait while it
+runs. It locks <code>terminal_jobs</code> before its tables, the order terminal reads
+use. When no <code>lock_timeout</code> is set, each lock acquisition waits at most 2 s.
+On a timeout or a deadlock nothing is applied; retry the complete migration.</p>
+<p>Binaries before v052 run unchanged on the migrated schema: they name terminal
+columns explicitly. While both versions run, a 0.6 worker that claims the
+retry of an attempt a 0.7 worker failed sees that attempt's output in
+<code>job.errors</code>; 0.7 workers remove it from the row they dispatch. A 0.7 binary running before the migration checks its
+schema's catalog for the columns. Until they exist, it neither writes nor
+reads them, and it drops completion outputs (counted as
+<code>awa.job.output_dropped{awa.output.reason="schema_missing"}</code>). Health-gated
+workers report not ready until the migration runs, as for any version bump.</p>
+<p>External migration runners apply the complete <code>awa migrate --sql --from 51
+--to 52</code> bundle, which defines the helper before the tail calls it.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>

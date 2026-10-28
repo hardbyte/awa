@@ -29,6 +29,7 @@ These links are curated for agents. Each target is the Markdown representation o
 - [Guide index](guides/index.md): Use these guides once a quickstart is running.
 - [Bridge adapters](bridge-adapters/index.md): Insert Awa jobs within existing transactions from non-sqlx Postgres libraries.
 - [Lifecycle hooks](lifecycle-hooks/index.md): Lifecycle hooks let application code react to the points in a job's life — when it starts, finishes, retries, parks on an external callback, and so on — without putting that logic inside the job handler itself. Typical uses are metrics.
+- [Job output](job-output/index.md): A handler can record an output: a small JSON value describing what its attempt produced, kept for people and tools to inspect. If the attempt completes, it becomes the job's output. If the attempt fails, it is kept in that failure's entry.
 - [HTTP callbacks](http-callbacks/index.md): Awa has two callback-related surfaces.
 - [Callback receivers](callback-receivers/index.md): Awa supports three ways to host the HTTP callback ingress surface.
 - [Dead-letter queue](dead-letter-queue/index.md): The Dead Letter Queue (DLQ) holds jobs that have exhausted all of their retry attempts. It is the recovery surface for terminal failures: an operator can inspect what failed, decide whether the underlying problem has been fixed, and either.

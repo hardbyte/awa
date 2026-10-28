@@ -16,7 +16,7 @@
         <link rel="prev" href="../bridge-adapters/">
       
       
-        <link rel="next" href="../http-callbacks/">
+        <link rel="next" href="../job-output/">
       
       
         
@@ -913,6 +913,8 @@
       
         
       
+        
+      
     
     
     
@@ -1173,6 +1175,34 @@
   
 </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -2568,6 +2598,7 @@
 <li><strong>Deploy order.</strong> A worker that does not know the follow-up's kind fails it terminally. Deploy the workers that handle the follow-up first, or put it on a queue only they poll.</li>
 </ul>
 <p>The test harnesses behave the same way: <code>awa_testing::TestClient::work_one</code> and Python's <code>AwaTestClient.work_one</code> insert staged follow-ups when the handler completes, and <code>awa.testing.HandlerJob</code> records them in <code>job.staged</code> for unit tests without a database.</p>
+<p>A handler that also wants to leave a record of what it did for people to inspect can record a <a href="../job-output/">job output</a> beside the follow-up. The follow-up still gets its value in its args: a job must not read another job's output, and registered specs receive the row without it. <code>Completed</code> events carry the output.</p>
 <h3 id="atomicity-guarantees">Atomicity guarantees<a class="headerlink" href="#atomicity-guarantees" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
@@ -2656,13 +2687,13 @@
         
         
           
-          <a href="../http-callbacks/" class="md-footer__link md-footer__link--next" aria-label="Next: HTTP callbacks">
+          <a href="../job-output/" class="md-footer__link md-footer__link--next" aria-label="Next: Job output">
             <div class="md-footer__title">
               <span class="md-footer__direction">
                 Next
               </span>
               <div class="md-ellipsis">
-                HTTP callbacks
+                Job output
               </div>
             </div>
             <div class="md-footer__button md-icon">

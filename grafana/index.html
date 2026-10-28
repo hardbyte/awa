@@ -911,6 +911,8 @@
       
         
       
+        
+      
     
     
     
@@ -1008,6 +1010,34 @@
     
   
     Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
   
 
     
@@ -2634,6 +2664,16 @@
 <td>Scheduled/retryable jobs promoted per second</td>
 </tr>
 <tr>
+<td><strong>Job Outputs</strong></td>
+<td>Time series</td>
+<td>Outputs published per second by outcome, and dropped outputs by reason</td>
+</tr>
+<tr>
+<td><strong>Job Output Size (p50/p95)</strong></td>
+<td>Time series</td>
+<td>Size of published outputs in bytes of JSON text</td>
+</tr>
+<tr>
 <td><strong>Staged Follow-ups</strong></td>
 <td>Time series</td>
 <td>Handler-staged follow-ups inserted, skipped as duplicates, or discarded by <code>WaitForCallback</code>, per second</td>
@@ -2742,6 +2782,7 @@ a migrated schema, and a trace must be readable through Grafana's Tempo
 datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.sh</code>.</p>
 <h2 id="metrics-reference">Metrics Reference<a class="headerlink" href="#metrics-reference" title="Permanent link">&para;</a></h2>
 <p>All metrics use the <code>awa</code> OTel meter name and are exported via OTLP to your configured collector.</p>
+<p>In Prometheus they appear under the OpenTelemetry <a href="https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/">OTLP-to-Prometheus translation</a>, which the collector's Prometheus exporter applies by default: dots become underscores, the unit is appended (<code>s</code> → <code>_seconds</code>, <code>By</code> → <code>_bytes</code>; annotations such as <code>{job}</code> are dropped), counters end in <code>_total</code>, and histograms export <code>_bucket</code>, <code>_sum</code> and <code>_count</code>. So <code>awa.job.duration</code> (unit <code>s</code>) is queried as <code>awa_job_duration_seconds_bucket</code>, and the attribute <code>awa.job.queue</code> as the label <code>awa_job_queue</code>. <code>scripts/otel-prometheus-names.py</code> prints every series and label name awa exports; <code>scripts/validate-grafana.sh</code> checks the shipped dashboard and alert rules against that list and against a live Prometheus.</p>
 <h3 id="job-lifecycle">Job lifecycle<a class="headerlink" href="#job-lifecycle" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
@@ -2794,6 +2835,24 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Counter</td>
 <td>kind, queue</td>
 <td>Follow-ups a handler staged (ADR-046) and then discarded by returning <code>WaitForCallback</code>, which parks the job without completing it. Almost always a handler bug: stage after <code>ctx.wait_for_callback</code> instead</td>
+</tr>
+<tr>
+<td><code>awa.job.output_recorded</code></td>
+<td>Counter</td>
+<td>kind, queue, outcome</td>
+<td>Job outputs (ADR-048) published: <code>completed</code> as the job's output, <code>failed</code> in an error entry</td>
+</tr>
+<tr>
+<td><code>awa.job.output_size</code></td>
+<td>Histogram</td>
+<td>kind, queue, outcome</td>
+<td>Size of published job outputs, in bytes of JSON text</td>
+</tr>
+<tr>
+<td><code>awa.job.output_dropped</code></td>
+<td>Counter</td>
+<td>kind, queue, <code>awa.output.reason</code></td>
+<td>Outputs that were not published: <code>canonical</code>, <code>schema_missing</code> (a binary ahead of migration v052), <code>outcome</code> (<code>Snooze</code> or <code>WaitForCallback</code>), <code>abandoned</code>, <code>no_claim</code>, and <code>too_large</code> / <code>invalid</code> for each recording the handler made that was rejected</td>
 </tr>
 <tr>
 <td><code>awa.job.cancelled</code></td>

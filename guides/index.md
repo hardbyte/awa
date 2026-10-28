@@ -8,6 +8,7 @@ Use these guides once a quickstart is running.
 | --- | --- |
 | Enqueue inside a Python framework transaction | [Bridge adapters](../bridge-adapters/index.md) |
 | Run follow-up work after a durable outcome | [Lifecycle hooks](../lifecycle-hooks/index.md) |
+| Keep what a job produced for later inspection | [Job output](../job-output/index.md) |
 | Send work to an HTTP function and wait for its callback | [HTTP callbacks](../http-callbacks/index.md) |
 | Accept callbacks in an application-owned endpoint | [Callback receivers](../callback-receivers/index.md) |
 | Retain, inspect, and redrive exhausted failures | [Dead-letter queue](../dead-letter-queue/index.md) |

@@ -17,6 +17,7 @@ Two rule sets, pick whichever matches your observability stack:
 | `awa_no_active_runtime` | critical | active runtimes = 0 for 5m | at least one runtime reporting |
 | `awa_throughput_collapsed` _(Prom only)_ | warning | completion rate < 10% of 1h baseline for 10m | rate recovers |
 | `awa_descriptor_drift_persistent` | info | descriptor drift detected for 15m | all live runtimes agree |
+| `awa_job_output_schema_missing` _(Prom only)_ | warning | a queue drops completion outputs because its schema predates migration v052, for 10m | `awa migrate` applies v052 |
 | `awa_staged_follow_ups_discarded` _(Prom only)_ | info | a kind discarded staged follow-ups (returned `WaitForCallback` after staging) in each of the last 15m | no discards for 15m |
 
 Every rule's `description` annotation names the dashboard panel an operator should look at and links to the relevant awa-ui page. The 2–15 minute `for` windows deliberately skip transient spikes (rolling deploys, CI runs).
