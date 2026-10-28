@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      contents: read
       pull-requests: read
     outputs:
       full: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
@@ -28,6 +29,9 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
       frontend: ${{ steps.filter.outputs.frontend }}
       skills: ${{ steps.filter.outputs.skills }}
+      keys: ${{ steps.keys.outputs.keys }}
+      found: ${{ steps.passed.outputs.found }}
+      passed: ${{ steps.passed.outputs.passed }}
     steps:
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: filter
@@ -54,13 +58,95 @@ jobs:
             skills:
               - 'skills/**'
               - '.github/workflows/ci.yml'
+      # Pass markers. A job that succeeds records its key in the Actions cache
+      # (see `pass-markers`), and a later pull-request run whose inputs hash
+      # to the same key skips that job. A key is the job name plus a digest of
+      # the git tree hashes the job reads, so any change under those paths
+      # (including .github, which holds this workflow) misses. Pushes to main,
+      # release branches and manual runs never skip, so every merge still runs
+      # in full and catches drift the key cannot see: the floating stable
+      # toolchain, `-alpine` images and unpinned Python test dependencies.
+      #
+      # Markers can only be trusted because cache lookups are scoped by ref: a
+      # pull-request run sees entries from its own merge ref and its base
+      # branch, never another pull request's. Look markers up only through
+      # actions/cache, never by listing caches through the REST API, which
+      # would let a fork's run forge a pass for everyone.
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Compute pass-marker keys
+        id: keys
+        run: |
+          set -o pipefail
+          github_tree=$(git rev-parse HEAD:.github)
+          # Tree entries: the named paths, or every top-level entry but the named ones.
+          only() { local path hash; for path in "$@"; do hash=$(git rev-parse "HEAD:$path") || return; echo "$path $hash"; done; }
+          except() { git ls-tree HEAD | awk -F'\t' -v skip=" $* " 'index(skip, " " $2 " ") == 0'; }
+          digest() { { echo "$github_tree"; cat; } | sha256sum | cut -c1-40; }
+
+          # Paths no code job reads. Leaving a path out of this list only costs
+          # a re-run; listing one that a job reads lets a change to it skip the job.
+          not_code="docs mkdocs.yml requirements-docs.txt CHANGELOG.md AGENTS.md benchmarks correctness skills"
+          code=$(except $not_code | digest)
+          tla=$(only correctness | digest)
+          skills=$(only skills | digest)
+          frontend=$(only awa-ui/frontend | digest)
+          # validate-grafana.sh checks the dashboards published under docs/grafana.
+          telemetry=$({ except $not_code && only docs/grafana; } | digest)
+
+          # A job with no key here never skips.
+          declare -A inputs=([tla-storage]=$tla [agent-skills]=$skills [frontend-lint]=$frontend [telemetry-validation]=$telemetry)
+          for job in rust-lint rust-build rust-test rust-test-queue-storage \
+            rust-test-alloydb-omni rust-bridge-tokio-pg python-build-test \
+            python-shutdown frontend-e2e cli-wheel-build windows-wheel-build \
+            cli-smoke chaos-smoke; do
+            inputs[$job]=$code
+          done
+          keys=$(for job in "${!inputs[@]}"; do echo "$job ci-pass-v1-$job-${inputs[$job]}"; done |
+            jq -cnR '[inputs | split(" ") | {(.[0]): .[1]}] | add')
+          echo "keys=$keys" >> "$GITHUB_OUTPUT"
+      # One lookup per job: actions/cache has no batch lookup. Lookups run on
+      # every event so that `pass-markers` saves only the markers that are new;
+      # only a pull request acts on them.
+      - { id: tla-storage, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['tla-storage'] }}" } }
+      - { id: rust-lint, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['rust-lint'] }}" } }
+      - { id: agent-skills, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['agent-skills'] }}" } }
+      - { id: rust-build, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['rust-build'] }}" } }
+      - { id: rust-test, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['rust-test'] }}" } }
+      - { id: rust-test-queue-storage, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['rust-test-queue-storage'] }}" } }
+      - { id: rust-test-alloydb-omni, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['rust-test-alloydb-omni'] }}" } }
+      - { id: rust-bridge-tokio-pg, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['rust-bridge-tokio-pg'] }}" } }
+      - { id: python-build-test, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['python-build-test'] }}" } }
+      - { id: python-shutdown, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['python-shutdown'] }}" } }
+      - { id: frontend-lint, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['frontend-lint'] }}" } }
+      - { id: frontend-e2e, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['frontend-e2e'] }}" } }
+      - { id: cli-wheel-build, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['cli-wheel-build'] }}" } }
+      - { id: windows-wheel-build, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['windows-wheel-build'] }}" } }
+      - { id: cli-smoke, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['cli-smoke'] }}" } }
+      - { id: chaos-smoke, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['chaos-smoke'] }}" } }
+      - { id: telemetry-validation, uses: actions/cache/restore@v5, with: { path: .ci-pass, lookup-only: true, key: "${{ fromJSON(steps.keys.outputs.keys)['telemetry-validation'] }}" } }
+      - name: Collect pass markers
+        id: passed
+        env:
+          STEPS: ${{ toJSON(steps) }}
+          SKIP: ${{ github.event_name == 'pull_request' }}
+        run: |
+          found=$(jq -c '[to_entries[] | select(.value.outputs["cache-hit"] == "true") | {(.key): true}] | add // {}' <<<"$STEPS")
+          passed=$([ "$SKIP" = true ] && echo "$found" || echo '{}')
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+          echo "passed=$passed" >> "$GITHUB_OUTPUT"
+          if [ "$passed" != "{}" ]; then
+            echo "Skipping jobs that already passed on these inputs: $(jq -r 'keys | join(", ")' <<<"$passed")" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # The release workflow requires a successful branch-push CI run on the exact
   # tagged SHA. Keep the storage models here so that gate covers the executable
   # tests and their formal concurrency model together.
   tla-storage:
     name: TLA+ storage model checking
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['tla-storage']
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -76,7 +162,7 @@ jobs:
   rust-lint:
     name: Rust lint (fmt + clippy)
     needs: [changes]
-    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true'
+    if: (needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true') && !fromJSON(needs.changes.outputs.passed)['rust-lint']
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -120,7 +206,7 @@ jobs:
   agent-skills:
     name: Agent Skills validate
     needs: [changes]
-    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.skills == 'true'
+    if: (needs.changes.outputs.full == 'true' || needs.changes.outputs.skills == 'true') && !fromJSON(needs.changes.outputs.passed)['agent-skills']
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -148,7 +234,8 @@ jobs:
 
   rust-build:
     name: Rust build
-    needs: [rust-lint]
+    needs: [changes, rust-lint]
+    if: ${{ !cancelled() && !failure() && (needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true') && !fromJSON(needs.changes.outputs.passed)['rust-build'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -162,8 +249,8 @@ jobs:
 
   rust-test:
     name: Rust tests (pg${{ matrix.postgres }}, ${{ matrix.shard }})
-    needs: [rust-build]
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes, rust-build]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['rust-test'] }}
     runs-on: ubuntu-latest
     # Sharded per #335: the migration replay suite is partitioned per-test
     # across four shards with cargo-nextest, the other slow awa binaries form
@@ -224,8 +311,8 @@ jobs:
   # fresh database (a separate DB avoids cross-engine job_unique_claims carryover).
   rust-test-queue-storage:
     name: Rust tests (queue_storage, pg${{ matrix.postgres }})
-    needs: [rust-build]
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes, rust-build]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['rust-test-queue-storage'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -268,8 +355,8 @@ jobs:
   # prune behaviour (idle skip + no relfilenode churn), not columnar performance.
   rust-test-alloydb-omni:
     name: Rust prune tests (AlloyDB Omni)
-    needs: [rust-build]
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes, rust-build]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['rust-test-alloydb-omni'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -302,7 +389,8 @@ jobs:
   # ─── Rust bridge (tokio-postgres) ──────────────────────
   rust-bridge-tokio-pg:
     name: Rust bridge (tokio-postgres)
-    needs: [rust-lint]
+    needs: [changes, rust-lint]
+    if: ${{ !cancelled() && !failure() && (needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true') && !fromJSON(needs.changes.outputs.passed)['rust-bridge-tokio-pg'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -338,7 +426,8 @@ jobs:
   # ─── Python (awa-python) ────────────────────────────────
   python-build-test:
     name: Python build + test (py${{ matrix.python }})
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['python-build-test']
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -406,7 +495,7 @@ jobs:
   python-shutdown:
     name: Python 3.12 wheel shutdown
     needs: [changes]
-    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
+    if: (needs.changes.outputs.full == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true') && !fromJSON(needs.changes.outputs.passed)['python-shutdown']
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -448,7 +537,7 @@ jobs:
   frontend-lint:
     name: Frontend lint + typecheck
     needs: [changes]
-    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.frontend == 'true'
+    if: (needs.changes.outputs.full == 'true' || needs.changes.outputs.frontend == 'true') && !fromJSON(needs.changes.outputs.passed)['frontend-lint']
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -470,7 +559,8 @@ jobs:
 
   frontend-e2e:
     name: Frontend E2E tests
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['frontend-e2e']
     runs-on: ubuntu-latest
     # 20m has been hitting the wall on slow GH-hosted runners — the
     # full Playwright suite (8 specs) plus per-test PG seeding is on
@@ -523,7 +613,8 @@ jobs:
   # ─── CLI wheel build test ───────────────────────────────
   cli-wheel-build:
     name: CLI wheel build
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['cli-wheel-build']
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -544,7 +635,8 @@ jobs:
 
   windows-wheel-build:
     name: Windows wheel build
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes]
+    if: needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['windows-wheel-build']
     runs-on: windows-latest
     timeout-minutes: 30
     permissions:
@@ -578,8 +670,8 @@ jobs:
   # ─── CLI smoke test ─────────────────────────────────────
   cli-smoke:
     name: CLI smoke test
-    needs: [rust-build]
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes, rust-build]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['cli-smoke'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -633,8 +725,8 @@ jobs:
   # the full benchmark/soak overhead.
   chaos-smoke:
     name: Chaos smoke (mixed Rust + Python)
-    needs: [rust-build]
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes, rust-build]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['chaos-smoke'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -683,8 +775,8 @@ jobs:
   # ─── Telemetry validation ─────────────────────────────────────
   telemetry-validation:
     name: Telemetry OTLP validation
-    needs: [rust-build]
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
+    needs: [changes, rust-build]
+    if: ${{ !cancelled() && !failure() && needs.changes.outputs.full == 'true' && !fromJSON(needs.changes.outputs.passed)['telemetry-validation'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -760,3 +852,66 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
           PROMETHEUS_URL: http://localhost:9090
           GRAFANA_URL: http://localhost:3000
+
+  # ─── Pass markers ─────────────────────────────────────────────
+  # Record a marker for every job that succeeded in this run, so a later
+  # pull-request run on the same inputs can skip it (see `changes`). A matrix
+  # job counts only when every leg passed. A job that skipped on its marker
+  # reports `skipped`, and a job whose marker already exists records nothing.
+  # These run even when a newer push cancels the run: jobs that finished
+  # before the cancel still passed, and a docs-only push should skip them.
+  pass-markers:
+    name: Collect passed jobs
+    needs:
+      - changes
+      - tla-storage
+      - rust-lint
+      - agent-skills
+      - rust-build
+      - rust-test
+      - rust-test-queue-storage
+      - rust-test-alloydb-omni
+      - rust-bridge-tokio-pg
+      - python-build-test
+      - python-shutdown
+      - frontend-lint
+      - frontend-e2e
+      - cli-wheel-build
+      - windows-wheel-build
+      - cli-smoke
+      - chaos-smoke
+      - telemetry-validation
+    if: ${{ always() && needs.changes.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      markers: ${{ steps.passed.outputs.markers }}
+    steps:
+      - id: passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          KEYS: ${{ needs.changes.outputs.keys }}
+          FOUND: ${{ needs.changes.outputs.found }}
+        run: |
+          markers=$(jq -c --argjson keys "$KEYS" --argjson found "$FOUND" \
+            '[to_entries[] | select(.value.result == "success" and $keys[.key] != null and $found[.key] == null)
+              | {job: .key, key: $keys[.key]}]' <<<"$NEEDS")
+          echo "markers=$markers" >> "$GITHUB_OUTPUT"
+
+  save-pass-marker:
+    name: Save pass marker (${{ matrix.job }})
+    needs: [pass-markers]
+    if: ${{ always() && needs.pass-markers.result == 'success' && needs.pass-markers.outputs.markers != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.pass-markers.outputs.markers) }}
+    steps:
+      - run: echo "$KEY" > .ci-pass
+        env:
+          KEY: ${{ matrix.key }}
+      - uses: actions/cache/save@v5
+        with:
+          path: .ci-pass
+          key: ${{ matrix.key }}
