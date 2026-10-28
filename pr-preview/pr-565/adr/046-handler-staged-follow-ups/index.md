@@ -4,7 +4,7 @@
 
 ## Status
 
-Proposed. Extends [ADR-029](../029-transactional-followup-jobs/index.md) transactional follow-ups. No schema change.
+Accepted. Extends [ADR-029](../029-transactional-followup-jobs/index.md) transactional follow-ups. No schema change. Implemented by `awa-worker/src/follow_ups.rs`, the staged path in `awa-worker/src/executor.rs`, the `AwaStagedFollowUps` TLA+ model and `awa/tests/staged_follow_up_test.rs`.
 
 ## Context
 
@@ -93,7 +93,7 @@ client_builder.register::<StageA, _, _>(|args, ctx| {
 
 `register` closures return a `'static` future that cannot borrow the context, which is why the handle exists. A `Worker` impl can call `ctx.enqueue_on_completion` directly.
 
-Staging serializes the args, computes the unique key, checks the limits and validates every rule the insert would otherwise enforce in the database (priority 1–4, `max_attempts` 1–1000, kind and queue names of at most 200 characters, at most 20 tags, no NUL bytes), so nothing type-dependent or predictably rejected reaches the completion transaction. `StageError` converts to `JobError::Terminal` by default. That suits `Invalid`, which is deterministic for the request. `TooMany` and `TooLarge` depend on how much this attempt has already staged, so a handler whose fan-out varies between attempts can map them to a retryable error instead. `Sealed` means the call came after the handler returned, which is a handler bug rather than a property of the request.
+Staging serializes the args, computes the unique key, checks the limits and validates every rule the insert would otherwise enforce in the database (priority 1–4, `max_attempts` 1–1000, kind and queue names of at most 200 characters, at most 20 tags, no NUL bytes, a `run_at` within the years 1–9999), so nothing type-dependent or predictably rejected reaches the completion transaction. `StageError` converts to `JobError::Terminal` by default. That suits `Invalid`, which is deterministic for the request. `TooMany` and `TooLarge` depend on how much this attempt has already staged, so a handler whose fan-out varies between attempts can map them to a retryable error instead. `Sealed` means the call came after the handler returned, which is a handler bug rather than a property of the request.
 
 A failed stage **poisons the attempt**. If any `enqueue_on_completion` call failed and the handler still returns `Completed`, the runtime fails the attempt terminally with the staging error, so the job goes to the DLQ when one is enabled and registered `on_exhausted_enqueue` specs fire. A swallowed error (`let _ = ...`, or `except Exception` in Python) therefore cannot let A complete without the follow-up it asked for.
 
@@ -208,10 +208,10 @@ No schema change. A stage-B kind is new code, and an older worker that claims a 
 
 ## Validation
 
-The implementation adds:
-
 - **A TLA+ model**, `correctness/storage/AwaStagedFollowUps.tla`. Two jobs whose attempts stage a nondeterministic key, lease-guarded completion with the staged inserts in one step, lost acknowledgements and finalize retries, rescue and reclaim under a new lease, external completion, and release of a key's unique claim. Invariants: every follow-up traces to a committed handler completion of the attempt that staged it; at most one row per key; every committed completion has its follow-up or a row holding its key; only the current lease completes a job. Negative configs, each expected to fail, insert before completion, insert after it in a separate transaction, complete without the lease guard, drain the staged follow-ups on the first finalize attempt, and send a staging job down the batched path.
-- **Tests on both engines.** Insertion with completion; discard on each non-`Completed` outcome; poisoning after a failed stage; sealing after return; a stale completion inserts nothing; deduplication across concurrent A jobs; a non-dedup unique violation rolls the completion back; a finalize retry inserts once; a job that stages nothing still completes through the batcher; limits; registered specs and staged follow-ups together; the `awa-testing` harness; Python staging, `AwaTestClient.work_one` and the `HandlerJob` stand-in.
+- **Integration tests on both engines** (`awa/tests/staged_follow_up_test.rs`): insertion with completion and deduplication across A jobs; discard on `RetryAfter`, `Snooze`, `Cancel`, retryable and terminal errors, a panic and `WaitForCallback`; poisoning after a swallowed staging error; sealing after the handler returns; fan-out with a registered spec in the same completion; a rejected insert rolls the completion back; the `awa-testing` harness.
+- **Executor tests**: a finalize retry after a lost acknowledgement inserts the staged follow-up once, and a completion for a superseded lease inserts none. Staging limits and poisoning are unit-tested in `follow_ups.rs`.
+- **Python tests** (`awa-python/tests/test_staged_follow_ups.py`): staging and deduplication through the runtime, poisoning, discard on `Cancel`, `AwaTestClient.work_one` and the `HandlerJob` stand-in.
 
 ## Consequences
 
