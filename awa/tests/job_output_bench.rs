@@ -36,6 +36,9 @@ enum Scenario {
     Small,
     /// A string just under the 4 KiB cap on every job.
     LargeString,
+    /// Pseudo-random hex just under the cap, which TOAST cannot compress:
+    /// the worst case for WAL.
+    Incompressible,
     /// An array of small integers just under the cap: the worst jsonb
     /// expansion.
     LargeNumericArray,
@@ -52,6 +55,7 @@ impl Scenario {
             Scenario::Baseline => "baseline (no output)",
             Scenario::Small => "100 B output, every job",
             Scenario::LargeString => "4 KiB string, every job",
+            Scenario::Incompressible => "4 KiB random hex, every job",
             Scenario::LargeNumericArray => "4 KiB numeric array, every job",
             Scenario::ManyKeys => "4 KiB object of short keys, every job",
             Scenario::RetryStorm => "4 KiB output on 4 failed attempts",
@@ -71,6 +75,20 @@ impl Scenario {
             Scenario::LargeString | Scenario::RetryStorm => {
                 Some(json!("x".repeat(MAX_OUTPUT_BYTES - 64)))
             }
+            Scenario::Incompressible => {
+                let mut state = n as u64 ^ 0x9e37_79b9_7f4a_7c15;
+                let hex: String = (0..(MAX_OUTPUT_BYTES - 64) / 16)
+                    .map(|_| {
+                        // splitmix64
+                        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                        let mut z = state;
+                        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                        format!("{:016x}", z ^ (z >> 31))
+                    })
+                    .collect();
+                Some(Value::from(hex))
+            }
             Scenario::LargeNumericArray => {
                 Some(Value::from(vec![1u8; (MAX_OUTPUT_BYTES - 64) / 2]))
             }
@@ -87,6 +105,7 @@ impl Scenario {
 struct Measured {
     drain: Duration,
     wal_per_job: f64,
+    lifecycle_wal_per_job: f64,
     jobs_per_batch_row: f64,
     get_job_p50: Duration,
     get_job_p95: Duration,
@@ -149,6 +168,7 @@ async fn run(scenario: Scenario, jobs: i64) -> Measured {
             },
         })
         .collect();
+    let wal_insert_start = wal_lsn(&pool).await;
     for chunk in params.chunks(500) {
         awa::insert_many(&pool, chunk).await.unwrap();
     }
@@ -208,6 +228,7 @@ async fn run(scenario: Scenario, jobs: i64) -> Measured {
     Measured {
         drain,
         wal_per_job: (wal_end - wal_start) as f64 / jobs as f64,
+        lifecycle_wal_per_job: (wal_end - wal_insert_start) as f64 / jobs as f64,
         jobs_per_batch_row,
         get_job_p50: latencies[latencies.len() / 2],
         get_job_p95: latencies[latencies.len() * 95 / 100],
@@ -225,6 +246,7 @@ async fn job_output_cost() {
         Scenario::Baseline,
         Scenario::Small,
         Scenario::LargeString,
+        Scenario::Incompressible,
         Scenario::LargeNumericArray,
         Scenario::ManyKeys,
         Scenario::RetryStorm,
@@ -237,19 +259,27 @@ async fn job_output_cost() {
             .collect(),
         Err(_) => all.to_vec(),
     };
-    println!("\n{jobs} jobs per scenario, queue storage, 64 workers");
+    println!("\n{jobs} jobs per scenario, queue storage, 64 workers; WAL in bytes per job");
     println!(
-        "{:<36} {:>8} {:>9} {:>10} {:>12} {:>12} {:>12}",
-        "scenario", "drain s", "jobs/s", "WAL B/job", "jobs/batch", "get p50", "get p95"
+        "{:<36} {:>8} {:>9} {:>11} {:>11} {:>12} {:>12} {:>12}",
+        "scenario",
+        "drain s",
+        "jobs/s",
+        "drain WAL",
+        "total WAL",
+        "jobs/batch",
+        "get p50",
+        "get p95"
     );
     for scenario in scenarios {
         let measured = run(scenario, jobs).await;
         println!(
-            "{:<36} {:>8.2} {:>9.0} {:>10.0} {:>12.1} {:>12?} {:>12?}",
+            "{:<36} {:>8.2} {:>9.0} {:>11.0} {:>11.0} {:>12.1} {:>12?} {:>12?}",
             scenario.name(),
             measured.drain.as_secs_f64(),
             jobs as f64 / measured.drain.as_secs_f64(),
             measured.wal_per_job,
+            measured.lifecycle_wal_per_job,
             measured.jobs_per_batch_row,
             measured.get_job_p50,
             measured.get_job_p95,
