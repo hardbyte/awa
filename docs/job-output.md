@@ -61,6 +61,82 @@ async def sync_inventory(job):
 - **Sealed when the handler returns.** Later calls fail with
   `OutputError::Sealed`.
 
+## Typed outputs
+
+Outputs are stored as JSON. A kind can also declare the type its handler
+records, which types the API on top of that JSON and shows the type in the
+admin UI.
+
+Rust:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct Thumbnail { width: u32, url: String }
+
+#[derive(Serialize, Deserialize, JobArgs)]
+#[awa(output = Thumbnail)]
+struct Resize { width: u32 }
+
+client_builder.register::<Resize, _, _>(|args, ctx| {
+    let output = ctx.typed_output::<Resize>();
+    async move {
+        let url = resize(args.width).await?;
+        let _ = output.set(&Thumbnail { width: args.width, url });
+        Ok(JobResult::Completed)
+    }
+})
+
+let job = admin::get_job(&pool, id).await?;
+let thumbnail: Option<Thumbnail> = job.output_as::<Resize>()?;
+let last_failed: Option<Thumbnail> = job.error_output_as::<Resize>()?;
+```
+
+- `ctx.typed_output::<K>()` returns a `TypedOutputSlot` that accepts only
+  `K`'s output type. On a job of another kind, `set` fails with
+  `OutputError::Invalid`.
+- `output_as::<K>()` fails with `AwaError::Validation` on a job of another
+  kind, and with a decode error when the stored JSON does not fit the type.
+  It returns `Ok(None)` when there is no output.
+- `ExternalCompletion::new().output_for::<K>(&value)?` types an external
+  completion. The completion fails, writing nothing, if the job is not of
+  kind `K`.
+
+Python:
+
+```python
+@client.task(Resize, queue="images", output=Thumbnail)
+async def resize(job):
+    job.set_output(Thumbnail(width=job.args.width, url=await render(job.args)))
+
+row = await client.get_job(job_id)
+row.output_as(Thumbnail)        # Thumbnail(...), or None
+row.error_output_as(Thumbnail)  # from the latest failed attempt, or None
+```
+
+With `output=` set, `set_output` refuses an instance of another class, as a
+failed recording. A type `isinstance` cannot check, such as `list[int]` or a
+`TypedDict`, is not enforced. `output_as` decodes pydantic models with
+`model_validate` and dataclasses from their fields, and checks other classes
+with `isinstance`. In tests, pass the same type to
+`AwaTestClient.work_one(..., output=Thumbnail)`.
+
+**The declared type is published in the kind's descriptor.** The admin UI's
+kinds page lists each kind's output type, and job detail labels the output
+with it. Python adds the type's JSON Schema when pydantic can produce one. In
+Rust, pass a schema explicitly:
+
+```rust
+client_builder.job_kind_descriptor::<Resize>(
+    JobKindDescriptor::new()
+        .output(OutputDescriptor::new("Thumbnail").schema(thumbnail_schema)),
+)
+```
+
+**Decoding happens when you read.** A row may have been written before the
+kind declared a type, by an older deployment, or from another language, so
+its JSON always stays readable. Changing a kind's output type is a change for
+its readers, like changing its args.
+
 ## Where an attempt's output goes
 
 | The attempt ends with | Output |

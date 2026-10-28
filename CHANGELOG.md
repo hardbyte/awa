@@ -66,6 +66,12 @@ for each step.
 - **`callback_contract::CompletePayload` is `#[non_exhaustive]`** and gains
   `output`. Senders that built it with a struct literal start from
   `CompletePayload::default()` and set fields.
+- **`JobKindDescriptor` gains a public `output` field.** Code that builds it
+  with a struct literal adds `output: None` or starts from
+  `JobKindDescriptor::new()`.
+- **`#[derive(JobArgs)]` rejects unknown `#[awa(...)]` keys.** It accepts
+  `kind` and `output`; any other key, or a malformed value, is now a compile
+  error rather than silently ignored.
 - **`awa-testing`'s `WorkResult::Completed` holds the row read back after
   completion** (state `Completed`, `finalized_at` and `output` set), not the
   claimed row.
@@ -87,6 +93,15 @@ for each step.
   `output` field. Canonical storage discards outputs. New metrics:
   `awa.job.output_recorded`, `awa.job.output_size` and
   `awa.job.output_dropped`.
+- **Typed job outputs.** `#[awa(output = T)]` declares the output type of a
+  kind. It implements the new `JobOutput` trait, and with it
+  `ctx.typed_output::<K>()`, `JobRow::output_as` / `error_output_as` and
+  `ExternalCompletion::output_for` give typed access to the JSON output.
+  Python's `@client.task(..., output=T)` checks `set_output` values, and
+  `Job.output_as` / `error_output_as` decode them. The type name, with a JSON
+  Schema when the runtime has one, is published in the new
+  `awa.job_kind_descriptors.output` column and shown on the admin UI's kinds
+  and job detail pages.
 - **Handler-staged follow-up jobs ([ADR-046](docs/adr/046-handler-staged-follow-ups.md)).**
   A handler can stage follow-up jobs built from values it computed:
   `ctx.enqueue_on_completion(request)`, `ctx.follow_ups()` for `register`
