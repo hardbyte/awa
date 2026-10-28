@@ -2564,6 +2564,7 @@
 <li><strong>Staging closes when the handler returns.</strong> A task the handler spawned and did not await gets <code>StageError::Sealed</code>.</li>
 <li><strong>Limits per attempt:</strong> 16 follow-ups and 64 KiB of serialized requests, counting kind, queue, args, metadata, tags and ordering key (<code>MAX_STAGED_FOLLOW_UPS</code>, <code>MAX_STAGED_BYTES</code>). Larger fan-out belongs in a dedicated fan-out job.</li>
 <li><strong>Cost.</strong> A job that stages takes a per-job completion transaction instead of the batched path; jobs that stage nothing are unaffected.</li>
+<li><strong>Metrics.</strong> <code>awa.job.staged_follow_ups_committed</code> counts the follow-ups of committed completions by <code>awa.follow_up.result</code>: <code>inserted</code>, or <code>duplicate</code> when a job with the same unique key already existed. The Grafana dashboard's "Staged Follow-ups" panel shows both beside the discards.</li>
 <li><strong>Deploy order.</strong> A worker that does not know the follow-up's kind fails it terminally. Deploy the workers that handle the follow-up first, or put it on a queue only they poll.</li>
 </ul>
 <p>The test harnesses behave the same way: <code>awa_testing::TestClient::work_one</code> and Python's <code>AwaTestClient.work_one</code> insert staged follow-ups when the handler completes, and <code>awa.testing.HandlerJob</code> records them in <code>job.staged</code> for unit tests without a database.</p>

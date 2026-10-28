@@ -2202,6 +2202,12 @@
 <td>descriptor drift detected for 15m</td>
 <td>all live runtimes agree</td>
 </tr>
+<tr>
+<td><code>awa_staged_follow_ups_discarded</code> <em>(Prom only)</em></td>
+<td>info</td>
+<td>a kind discarded staged follow-ups (returned <code>WaitForCallback</code> after staging) in each of the last 15m</td>
+<td>no discards for 15m</td>
+</tr>
 </tbody>
 </table>
 <p>Every rule's <code>description</code> annotation names the dashboard panel an operator should look at and links to the relevant awa-ui page. The 2–15 minute <code>for</code> windows deliberately skip transient spikes (rolling deploys, CI runs).</p>

@@ -2634,6 +2634,11 @@
 <td>Scheduled/retryable jobs promoted per second</td>
 </tr>
 <tr>
+<td><strong>Staged Follow-ups</strong></td>
+<td>Time series</td>
+<td>Handler-staged follow-ups inserted, skipped as duplicates, or discarded by <code>WaitForCallback</code>, per second</td>
+</tr>
+<tr>
 <td><strong>Prune Database Phase Latency p99</strong></td>
 <td>Time series</td>
 <td>Ring prune lock, <code>TRUNCATE</code>, and commit latency by ring</td>
@@ -2777,6 +2782,12 @@ datasource. Run the whole thing locally with <code>scripts/telemetry-e2e-local.s
 <td>Counter</td>
 <td>kind, queue</td>
 <td>Retries of a lease-guarded finalization after database unavailability, including transport/TLS/protocol errors, pool-acquire timeouts, SQLSTATE 08xxx, 57P01–57P03 and 25006. Counts retries that start, rather than recovered jobs. A burst can indicate an outage or pool pressure; correlate with pool wait and database errors</td>
+</tr>
+<tr>
+<td><code>awa.job.staged_follow_ups_committed</code></td>
+<td>Counter</td>
+<td>kind, queue, <code>awa.follow_up.result</code></td>
+<td>Staged follow-ups (ADR-046) of committed completions: <code>inserted</code>, or <code>duplicate</code> when a job with the same unique key already existed. Recorded after the completion transaction commits, so a stale attempt counts nothing</td>
 </tr>
 <tr>
 <td><code>awa.job.staged_follow_ups_discarded</code></td>
