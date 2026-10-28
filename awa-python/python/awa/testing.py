@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import operator
@@ -280,8 +281,9 @@ class HandlerJob(Generic[T]):
 
     @property
     def output(self) -> Any:
-        """The output recorded so far (ADR-048), as JSON-compatible data."""
-        return self._output
+        """The output recorded so far (ADR-048), as JSON-compatible data.
+        Each read returns a fresh copy, as on a real job."""
+        return copy.deepcopy(self._output)
 
     def set_output(self, value: Any) -> None:
         """Record this attempt's output, as ``Job.set_output`` does: the same

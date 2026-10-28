@@ -58,6 +58,12 @@ for each step.
   `error` argument of `fail_retryable*`, `fail_terminal*` and `fail_to_dlq*`,
   and the `reason` of `cancel_running*`, accept `&str` and `String` as before.
   Code that passes a function pointer or names the type may need a cast.
+- **`callback_contract::CompletePayload` is `#[non_exhaustive]`** and gains
+  `output`. Senders that built it with a struct literal start from
+  `CompletePayload::default()` and set fields.
+- **`awa-testing`'s `WorkResult::Completed` holds the row read back after
+  completion** (state `Completed`, `finalized_at` and `output` set), not the
+  claimed row.
 
 ### Added
 

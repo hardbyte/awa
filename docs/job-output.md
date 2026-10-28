@@ -48,6 +48,9 @@ async def sync_inventory(job):
 - **Python conversion.** Pydantic models are dumped in JSON mode, and
   dataclasses and tuples are converted. Sets, non-finite floats, non-string
   keys and integers outside 64 bits are rejected.
+- **Rust conversion.** Values serialize as `serde_json` does, which turns a
+  non-finite float into null: `set_output(&f64::NAN)` clears the output, and
+  `json!({"ratio": f64::NAN})` records `{"ratio": null}`.
 - **A failed recording clears the output and does not fail the attempt.**
   - In Rust, `OutputError` deliberately has no conversion into `JobError`, so
     a bare `?` does not compile. Decide whether a missing output should fail
@@ -91,6 +94,11 @@ List reads (`list_jobs`, the jobs page, `GET /api/jobs`) do not load outputs,
 and their rows carry `None`. A failed attempt's output is in
 `job.errors[i]["output"]`.
 
+Reading `output` for one job of a compact batch reads the batch's whole
+output array, up to 64 KiB. A SQL query that reads `output` across many
+compact-completed jobs pays that once per row, so filter to the jobs you need
+before selecting it.
+
 Outputs are stored as `jsonb`, which keeps numbers as `numeric`. A float with
 no fractional part, such as `1e19`, therefore reads back as the integer of the
 same value. Job args behave the same way.
@@ -131,12 +139,15 @@ Registered enqueue specs receive the completed row without its output.
 - **Compact completions.** An output rides the same compact batch row as the
   rest of the completion, so recording one keeps the fast completion path.
   A batch row starts afresh once its outputs pass 64 KiB.
-- **Lifetime.** An output lives as long as its job is retained, and is pruned
-  with it.
-- **Deletion.** Deleting a job hides its output immediately, but the bytes
-  stay on disk until the job's slot is pruned, as the job's args do. They
-  also stay in WAL archives and backups. Keep secrets and personal data out
-  of outputs.
+- **Lifetime.** A completion's output lives as long as its job is retained,
+  and is pruned with it. A failed attempt's output lives in that attempt's
+  error entry: through failed-job retention, in the DLQ while the job is
+  dead-lettered, and on a job that later completes, until that job is pruned.
+  Each job keeps at most one failed output, the latest.
+- **Deletion.** There is no call that removes an output and keeps its job.
+  Deleting a job hides its output immediately, but the bytes stay on disk
+  until the job's slot is pruned, as the job's args do. They also stay in WAL
+  archives and backups. Keep secrets and personal data out of outputs.
 - **Cost.** The cost is roughly the output's size in WAL per job. A 100-byte
   output adds a few percent to a job's lifecycle WAL; a 4 KiB one on every
   job roughly doubles it.
@@ -159,4 +170,15 @@ The `awa.output.reason` values:
 - `no_claim`.
 
 Warnings about dropped outputs are logged at most once a minute for each kind
-and reason.
+and reason, and once a minute for external completions.
+
+## Testing
+
+- **Rust.** `TestClient::work_one` runs the handler with a real output slot
+  and stores what it records, as the runtime does. On canonical storage the
+  output is discarded.
+- **Python.** `HandlerJob` records outputs with the same conversion, limit and
+  errors as a real job, so a unit test can assert on `job.output` after
+  calling the handler. `AwaTestClient.work_one` returns the sealed value as
+  `WorkResult.output`; the harness finalizes canonical rows, so
+  `result.job.output` stays `None`.

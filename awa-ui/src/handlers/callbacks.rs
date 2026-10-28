@@ -63,12 +63,17 @@ pub async fn complete_callback(
 
     let job = match body.output {
         Some(output) => {
-            awa_model::admin::complete_external_with(
+            let (job, dropped) = awa_model::admin::complete_external_reporting_output(
                 &state.pool,
                 uuid,
                 awa_model::ExternalCompletion::new().output(output),
             )
-            .await?
+            .await?;
+            state.metrics.record_external_output(&job, dropped);
+            if let Some(reason) = dropped {
+                awa_model::admin::warn_external_output_dropped(reason);
+            }
+            job
         }
         None => awa_model::admin::complete_external(&state.pool, uuid, body.payload, None).await?,
     };

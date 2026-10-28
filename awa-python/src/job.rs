@@ -933,6 +933,11 @@ pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAn
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
                     .into_any()
                     .unbind())
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.into_pyobject(py)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                    .into_any()
+                    .unbind())
             } else if let Some(f) = n.as_f64() {
                 Ok(f.into_pyobject(py)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?

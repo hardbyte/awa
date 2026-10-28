@@ -98,8 +98,10 @@ pub fn verify(secret: &[u8; 32], callback_id: &str, signature: &str) -> bool {
     blake3::Hash::from_hex(signature).is_ok_and(|h| expected == h)
 }
 
-/// Body of `POST /api/callbacks/{id}/complete`.
+/// Body of `POST /api/callbacks/{id}/complete`. Build one from
+/// `CompletePayload::default()`, so later fields do not break senders.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct CompletePayload {
     /// Discarded on completion; kept for compatibility.
     #[serde(default)]

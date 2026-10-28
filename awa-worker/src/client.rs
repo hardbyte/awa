@@ -2244,9 +2244,9 @@ impl Client {
         callback_id: Uuid,
         opts: awa_model::ExternalCompletion,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let requested_output = opts.output.as_ref().is_some_and(|output| !output.is_null());
         let mut tx = self.pool.begin().await?;
-        let job = admin::complete_external_with_in_tx(&mut tx, callback_id, opts).await?;
+        let (job, dropped) =
+            admin::complete_external_reporting_output_in_tx(&mut tx, callback_id, opts).await?;
         self.dispatch_callback_followups_in_tx(
             &mut tx,
             &job,
@@ -2255,17 +2255,9 @@ impl Client {
         )
         .await?;
         tx.commit().await?;
-        if requested_output && job.output.is_none() {
-            let reason = match self.storage {
-                crate::storage::RuntimeStorage::Canonical => "canonical",
-                crate::storage::RuntimeStorage::QueueStorage(_) => "schema_missing",
-            };
-            self.metrics
-                .record_job_output_dropped(&job.kind, &job.queue, reason);
-        } else if let Some(output) = &job.output {
-            let bytes = awa_model::output::serialized_len(output).unwrap_or(0) as u64;
-            self.metrics
-                .record_job_output_recorded(&job.kind, &job.queue, "completed", bytes);
+        self.metrics.record_external_output(&job, dropped);
+        if let Some(reason) = dropped {
+            admin::warn_external_output_dropped(reason);
         }
         self.dispatch_callback_event(UntypedJobEvent::Completed {
             job: job.clone(),

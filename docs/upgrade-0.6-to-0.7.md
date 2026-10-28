@@ -237,11 +237,14 @@ get the columns, then runs a targeted helper for each schema. Nothing is
 rewritten or scanned. Adding the columns and replacing the view still take
 `ACCESS EXCLUSIVE` locks on the terminal tables and view, held until the
 whole pending range commits, so completions and terminal reads wait while it
-runs. When no `lock_timeout` is set, each lock acquisition waits at most 2 s.
-On timeout nothing is applied; retry the complete migration.
+runs. It locks `terminal_jobs` before its tables, the order terminal reads
+use. When no `lock_timeout` is set, each lock acquisition waits at most 2 s.
+On a timeout or a deadlock nothing is applied; retry the complete migration.
 
 Binaries before v052 run unchanged on the migrated schema: they name terminal
-columns explicitly. A 0.7 binary running before the migration checks its
+columns explicitly. While both versions run, a 0.6 worker that claims the
+retry of an attempt a 0.7 worker failed sees that attempt's output in
+`job.errors`; 0.7 workers remove it from the row they dispatch. A 0.7 binary running before the migration checks its
 schema's catalog for the columns. Until they exist, it neither writes nor
 reads them, and it drops completion outputs (counted as
 `awa.job.output_dropped{awa.output.reason="schema_missing"}`). Health-gated

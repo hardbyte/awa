@@ -662,6 +662,17 @@ impl AwaMetrics {
     }
 
     /// Record a recorded output that was not published.
+    /// Count an external completion's output: stored, or dropped for
+    /// `dropped` (ADR-048).
+    pub fn record_external_output(&self, job: &awa_model::JobRow, dropped: Option<&str>) {
+        if let Some(reason) = dropped {
+            self.record_job_output_dropped(&job.kind, &job.queue, reason);
+        } else if let Some(output) = &job.output {
+            let bytes = awa_model::output::serialized_len(output).unwrap_or(0) as u64;
+            self.record_job_output_recorded(&job.kind, &job.queue, "completed", bytes);
+        }
+    }
+
     pub fn record_job_output_dropped(&self, kind: &str, queue: &str, reason: &str) {
         let attrs = [
             opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),

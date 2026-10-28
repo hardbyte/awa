@@ -2103,6 +2103,7 @@ impl PyClient {
         output: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let payload_json = payload
             .as_ref()
             .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
@@ -2115,7 +2116,7 @@ impl PyClient {
         crate::async_bridge::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let row = complete_external_row(&pool, uuid, payload_json, output_json)
+            let row = complete_external_row(&pool, &metrics, uuid, payload_json, output_json)
                 .await
                 .map_err(map_awa_error)?;
             Ok(PyJob::from(row))
@@ -2254,6 +2255,7 @@ impl PyClient {
         output: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let payload_json = payload
             .as_ref()
             .map(|value| py_to_json(py, value.bind(py)))
@@ -2267,7 +2269,7 @@ impl PyClient {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let row = complete_external_row(&pool, uuid, payload_json, output_json)
+                let row = complete_external_row(&pool, &metrics, uuid, payload_json, output_json)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(PyJob::from(row))
@@ -4046,18 +4048,24 @@ fn parse_queue_retention_overrides(
 /// one is given (ADR-048). The payload is not stored on completion.
 async fn complete_external_row(
     pool: &sqlx::PgPool,
+    metrics: &awa_worker::AwaMetrics,
     callback_id: uuid::Uuid,
     payload: Option<serde_json::Value>,
     output: Option<serde_json::Value>,
 ) -> Result<awa_model::JobRow, awa_model::AwaError> {
     match output {
         Some(output) => {
-            awa_model::admin::complete_external_with(
+            let (row, dropped) = awa_model::admin::complete_external_reporting_output(
                 pool,
                 callback_id,
                 awa_model::ExternalCompletion::new().output(output),
             )
-            .await
+            .await?;
+            metrics.record_external_output(&row, dropped);
+            if let Some(reason) = dropped {
+                awa_model::admin::warn_external_output_dropped(reason);
+            }
+            Ok(row)
         }
         None => awa_model::admin::complete_external(pool, callback_id, payload, None).await,
     }

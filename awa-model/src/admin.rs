@@ -3429,6 +3429,36 @@ pub async fn complete_external_with_in_tx(
     callback_id: Uuid,
     opts: ExternalCompletion,
 ) -> Result<JobRow, AwaError> {
+    let (row, dropped) = complete_external_reporting_output_in_tx(tx, callback_id, opts).await?;
+    if let Some(reason) = dropped {
+        warn_external_output_dropped(reason);
+    }
+    Ok(row)
+}
+
+/// [`complete_external_with`], also returning why a requested output was
+/// not stored; see [`complete_external_reporting_output_in_tx`].
+#[doc(hidden)]
+pub async fn complete_external_reporting_output(
+    pool: &PgPool,
+    callback_id: Uuid,
+    opts: ExternalCompletion,
+) -> Result<(JobRow, Option<&'static str>), AwaError> {
+    let mut tx = pool.begin().await?;
+    let reported = complete_external_reporting_output_in_tx(&mut tx, callback_id, opts).await?;
+    tx.commit().await?;
+    Ok(reported)
+}
+
+/// [`complete_external_with_in_tx`], also returning why a requested output
+/// was not stored (`"canonical"` or `"schema_missing"`), so callers that
+/// own metrics can count it.
+#[doc(hidden)]
+pub async fn complete_external_reporting_output_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+    opts: ExternalCompletion,
+) -> Result<(JobRow, Option<&'static str>), AwaError> {
     let output = match opts.output {
         Some(output) => crate::output::validate_output(output)
             .map_err(|err| AwaError::Validation(err.to_string()))?,
@@ -3438,21 +3468,39 @@ pub async fn complete_external_with_in_tx(
         let row = store
             .complete_external_with_output_in_tx(tx, callback_id, opts.run_lease, output.clone())
             .await?;
-        if output.is_some() && row.output.is_none() {
-            tracing::warn!(
-                job_id = row.id,
-                "External completion output dropped: the queue-storage schema has no output columns (migration v052)"
-            );
-        }
-        return Ok(row);
+        let dropped = (output.is_some() && row.output.is_none()).then_some("schema_missing");
+        return Ok((row, dropped));
     }
-    if output.is_some() {
+    let row = complete_external_in_tx_inner(tx, callback_id, None, opts.run_lease, false).await?;
+    Ok((row, output.is_some().then_some("canonical")))
+}
+
+/// Warn about a dropped external-completion output at most once a minute.
+/// The value is never logged.
+#[doc(hidden)]
+pub fn warn_external_output_dropped(reason: &'static str) {
+    static LAST_WARNED_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = Utc::now().timestamp();
+    let last = LAST_WARNED_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last >= 60
+        && LAST_WARNED_SECS
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
         tracing::warn!(
-            %callback_id,
-            "External completion output dropped: canonical storage keeps no job outputs"
+            reason,
+            "External completion output dropped: {}",
+            match reason {
+                "canonical" => "canonical storage keeps no job outputs",
+                _ => "the queue-storage schema has no output columns (migration v052)",
+            }
         );
     }
-    complete_external_in_tx_inner(tx, callback_id, None, opts.run_lease, false).await
 }
 
 /// Complete a waiting job and resume the handler with the callback payload.
