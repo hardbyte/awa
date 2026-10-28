@@ -25,7 +25,13 @@
 -- terminal_jobs readers take them. When no lock_timeout is set, each lock
 -- acquisition waits at most 2 s. A timeout (SQLSTATE 55P03) or a deadlock
 -- (40P01) rolls the whole migration back and it can be re-run.
+--
+-- Wall time: catalog updates only, so it does not grow with data volume;
+-- it is the time to acquire the locks plus milliseconds per schema.
+--
 -- Design: docs/adr/048-retained-job-output.md
+-- Discussion: https://github.com/hardbyte/awa/pull/565 (ADR),
+-- https://github.com/hardbyte/awa/pull/566 (implementation)
 
 DO $$
 DECLARE

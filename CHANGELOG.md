@@ -51,9 +51,14 @@ for each step.
   `terminal_jobs`, without replaying the installer or scanning rows. It takes
   brief `ACCESS EXCLUSIVE` locks on the terminal tables, held until the
   migration transaction commits, and waits at most 2 s for each when no
-  `lock_timeout` is set. Binaries without ADR-048 are unaffected; a new binary
-  running before the migration drops completion outputs and counts them as
-  `schema_missing`.
+  `lock_timeout` is set. A released 0.6.9 worker keeps completing, reading,
+  listing and retrying jobs on the migrated schema alongside a 0.7 worker
+  (rehearsed migrate-first in `test_migrate_first_mixed_fleet_job_output`).
+  A binary that has ADR-048 but runs against a schema without the columns
+  drops completion outputs and counts them as `schema_missing`; this is tested
+  against a schema with the columns renamed away
+  (`a_schema_without_output_columns_drops_completion_outputs`), not with a
+  released binary.
 - **Queue-storage failure transitions take `impl Into<AttemptError>`.** The
   `error` argument of `fail_retryable*`, `fail_terminal*` and `fail_to_dlq*`,
   and the `reason` of `cancel_running*`, accept `&str` and `String` as before.

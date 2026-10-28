@@ -32,12 +32,12 @@ AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsSeparateTx.cfg        ;; Reso
 AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsUnfenced.cfg          ;; CompletionByCurrentLease is violated ;; stale attempt completes a reclaimed job
 AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsDrainOnSend.cfg       ;; ResolvedCompletionHasFollowup is violated ;; retry after a drained first send loses the follow-up
 AwaStagedFollowUps.tla        ;; AwaStagedFollowUpsBatchedPath.cfg       ;; CommittedHasFollowupOrDedup is violated ;; batched completion drops staged follow-ups
-AwaJobOutput.tla              ;; -                                      ;; pass ;; job output is published by the attempt's own guarded transition
+AwaJobOutput.tla              ;; -                                      ;; pass ;; job output is published by the guarded transition of its own attempt
 AwaJobOutput.tla              ;; AwaJobOutputEarlyWrite.cfg              ;; OutputTracesToCommit is violated ;; output written when recorded, before the transition commits
 AwaJobOutput.tla              ;; AwaJobOutputSeparateTx.cfg              ;; ResolvedCompletionHasOutput is violated ;; lost acknowledgement strands an output written after the commit
 AwaJobOutput.tla              ;; AwaJobOutputDrainOnSend.cfg             ;; ResolvedCompletionHasOutput is violated ;; retry after a drained first send loses the output
 AwaJobOutput.tla              ;; AwaJobOutputBatchDrops.cfg              ;; ResolvedCompletionHasOutput is violated ;; batched completion drops the output
-AwaJobOutput.tla              ;; AwaJobOutputUnfenced.cfg                ;; NoOutputFromRescuedAttempt is violated ;; a rescued attempt's output is published after its job is reclaimed
+AwaJobOutput.tla              ;; AwaJobOutputUnfenced.cfg                ;; NoOutputFromRescuedAttempt is violated ;; the output of a rescued attempt is published after its job is reclaimed
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness
