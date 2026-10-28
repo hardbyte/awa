@@ -227,8 +227,8 @@ substrates.
 
 v052 adds the storage for [job output](job-output.md) (ADR-048) to the default
 and every discovered custom queue-storage schema:
-- a nullable `output` column on `done_entries`;
-- a nullable `outputs` array on `receipt_completion_batches`, with a
+- a nullable `output json` column on `done_entries`;
+- a nullable `outputs json[]` array on `receipt_completion_batches`, with a
   `NOT VALID` check on its length;
 - a final `output` column on `terminal_jobs`.
 

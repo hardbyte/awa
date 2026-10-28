@@ -1,5 +1,5 @@
 //! ADR-048 property test: any value either fails to record as an output, or
-//! reads back equal through both terminal paths: the compact receipt batch
+//! reads back exactly through both terminal paths: the compact receipt batch
 //! and the general `done_entries` row.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test.
@@ -55,37 +55,6 @@ fn output() -> impl Strategy<Value = Value> {
         1 => (MAX_OUTPUT_BYTES - 8..MAX_OUTPUT_BYTES + 8)
             .prop_map(|n| Value::from("x".repeat(n.saturating_sub(2)))),
     ]
-}
-
-/// JSON equality as jsonb keeps it: jsonb stores numbers as `numeric`,
-/// so a float with no fractional part reads back as an integer of the same
-/// value.
-fn same_json(left: Option<&Value>, right: Option<&Value>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => same_value(left, right),
-        _ => false,
-    }
-}
-
-fn same_value(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        // Integers must match exactly; only a float may equal an integer
-        // of the same value.
-        (Value::Number(l), Value::Number(r)) if l.is_f64() || r.is_f64() => {
-            l.as_f64() == r.as_f64()
-        }
-        (Value::Number(l), Value::Number(r)) => l == r,
-        (Value::Array(l), Value::Array(r)) => {
-            l.len() == r.len() && l.iter().zip(r).all(|(l, r)| same_value(l, r))
-        }
-        (Value::Object(l), Value::Object(r)) => {
-            l.len() == r.len()
-                && l.iter()
-                    .all(|(key, l)| r.get(key).is_some_and(|r| same_value(l, r)))
-        }
-        _ => left == right,
-    }
 }
 
 fn runner() -> TestRunner {
@@ -158,12 +127,13 @@ async fn check(
             .await
             .expect("load")
             .expect("job exists");
-        prop_assert!(
-            same_json(row.output.as_ref(), recorded.as_ref()),
-            "job {}: stored {:?}, recorded {:?}",
-            job.job.id,
-            row.output,
-            recorded
+        // Outputs are stored as `json` text, so they read back exactly,
+        // floats and all.
+        prop_assert_eq!(
+            &row.output,
+            &recorded,
+            "job {}: stored output differs from the recorded one",
+            job.job.id
         );
     }
     Ok(recorded.is_some())

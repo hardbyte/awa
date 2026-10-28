@@ -99,9 +99,11 @@ output array, up to 64 KiB. A SQL query that reads `output` across many
 compact-completed jobs pays that once per row, so filter to the jobs you need
 before selecting it.
 
-Outputs are stored as `jsonb`, which keeps numbers as `numeric`. A float with
-no fractional part, such as `1e19`, therefore reads back as the integer of the
-same value. Job args behave the same way.
+A completion's output is stored as `json`, the text exactly as recorded, so it
+reads back unchanged: `1.0` stays a float and key order is kept. In SQL, cast
+it to `jsonb` for equality or containment (`output::jsonb @> '{"ok":true}'`).
+A failed attempt's output lives in the job's `jsonb` error entries, which keep
+numbers as `numeric`, as job args do: there `1.0` reads back as `1`.
 
 ## External completion
 
@@ -148,9 +150,12 @@ Registered enqueue specs receive the completed row without its output.
   Deleting a job hides its output immediately, but the bytes stay on disk
   until the job's slot is pruned, as the job's args do. They also stay in WAL
   archives and backups. Keep secrets and personal data out of outputs.
-- **Cost.** The cost is roughly the output's size in WAL per job. A 100-byte
-  output adds a few percent to a job's lifecycle WAL; a 4 KiB one on every
-  job roughly doubles it.
+- **Cost.** A job's whole lifecycle writes about 1.3 KB of WAL. A 100-byte
+  output adds under 1%. A 4 KiB output that does not compress adds about
+  4.4 KB, more than quadrupling it, and one that compresses well costs a small
+  fraction of that. Large outputs with many elements, such as long numeric
+  arrays or objects with hundreds of keys, also cut completion throughput by
+  up to five times.
 
 ## Metrics
 

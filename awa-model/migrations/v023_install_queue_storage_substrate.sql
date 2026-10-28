@@ -268,7 +268,7 @@ BEGIN
           AND attname = 'output'
           AND NOT attisdropped
     ) THEN
-        EXECUTE format('ALTER TABLE %I.done_entries ADD COLUMN IF NOT EXISTS output JSONB', p_schema);
+        EXECUTE format('ALTER TABLE %I.done_entries ADD COLUMN IF NOT EXISTS output JSON', p_schema);
     END IF;
 
     IF NOT EXISTS (
@@ -278,7 +278,7 @@ BEGIN
           AND NOT attisdropped
     ) THEN
         EXECUTE format(
-            'ALTER TABLE %I.receipt_completion_batches ADD COLUMN IF NOT EXISTS outputs JSONB[]',
+            'ALTER TABLE %I.receipt_completion_batches ADD COLUMN IF NOT EXISTS outputs JSON[]',
             p_schema
         );
     END IF;
@@ -2307,7 +2307,7 @@ BEGIN
             attempts         SMALLINT[] NOT NULL,
             attempted_ats    TIMESTAMPTZ[] NOT NULL,
             finalized_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-            outputs          JSONB[],
+            outputs          JSON[],
             PRIMARY KEY (ready_slot, batch_id),
             CHECK (completed_count > 0),
             CHECK (completed_count = cardinality(job_ids)),
@@ -2382,7 +2382,7 @@ BEGIN
             unique_key       BYTEA,
             unique_states    TEXT,
             payload          JSONB,
-            output           JSONB,
+            output           JSON,
             PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)
         ) PARTITION BY LIST (ready_slot)
         $ddl$,

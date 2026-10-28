@@ -5676,7 +5676,10 @@ impl QueueStorage {
                     .push_bind(row.finalized_at)
                     .push_bind(terminal_storage_payload(&row.payload, ready_payload));
                 if !output_column.is_empty() {
-                    b.push_bind(&row.output);
+                    // Sent as text and stored as `json`, so the value keeps
+                    // its exact text and skips jsonb's parse (ADR-048).
+                    b.push_bind(row.output.as_ref().map(|output| output.to_string()))
+                        .push_unseparated("::json");
                 }
             });
             builder
@@ -5722,7 +5725,10 @@ impl QueueStorage {
                     .push_bind(&row.unique_states)
                     .push_bind(terminal_storage_payload(&row.payload, ready_payload));
                 if !output_column.is_empty() {
-                    b.push_bind(&row.output);
+                    // Sent as text and stored as `json`, so the value keeps
+                    // its exact text and skips jsonb's parse (ADR-048).
+                    b.push_bind(row.output.as_ref().map(|output| output.to_string()))
+                        .push_unseparated("::json");
                 }
             });
             builder
@@ -7459,15 +7465,20 @@ impl QueueStorage {
             let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; group.len()];
             // ADR-048: outputs ride the batch row as an array aligned with
             // job_ids, and the columns are named only when some job has one.
-            let outputs: Option<Vec<Option<serde_json::Value>>> = group
+            let outputs: Option<Vec<Option<String>>> = group
                 .iter()
                 .any(|entry| entry.job.output.is_some())
-                .then(|| group.iter().map(|entry| entry.job.output.clone()).collect());
+                .then(|| {
+                    group
+                        .iter()
+                        .map(|entry| entry.job.output.as_ref().map(|output| output.to_string()))
+                        .collect()
+                });
             let (output_column, output_unnest, outputs_column, outputs_value) = if outputs.is_some()
             {
                 (
                         ",\n                    output",
-                        ",\n                        $16::jsonb[]",
+                        ",\n                        $16::text[]::json[]",
                         ",\n                        outputs",
                         // NULL for a batch row whose jobs recorded no output.
                         ",\n                        CASE WHEN bool_or(completed.output IS NOT NULL) \

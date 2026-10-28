@@ -196,7 +196,19 @@ async fn run(scenario: Scenario, jobs: i64) -> Measured {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(completed, jobs, "{}: every job completed", scenario.name());
+    if completed != jobs {
+        let states: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT state::text, count(*) FROM awa.jobs WHERE kind = $1 GROUP BY 1 ORDER BY 1",
+        )
+        .bind(OutputBench::kind())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        panic!(
+            "{}: {completed} of {jobs} jobs completed after shutdown; states {states:?}",
+            scenario.name()
+        );
+    }
     let jobs_per_batch_row: f64 = sqlx::query_scalar(
         "SELECT COALESCE(avg(completed_count), 0)::float8 FROM awa.receipt_completion_batches",
     )
