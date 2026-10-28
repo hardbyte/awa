@@ -366,6 +366,41 @@ where
     E: PgExecutor<'e>,
 {
     let row = prepare_row(args, opts)?;
+    execute_prepared(executor, &row).await
+}
+
+/// Insert a job prepared by [`prepare_job_insert`] or [`prepare_raw_job_insert`].
+///
+/// Preparing ahead of the insert fixes the unique key (including its
+/// `by_period` bucket) and the captured trace context at preparation time,
+/// which suits callers that build the row in one place and insert it later,
+/// in another transaction.
+#[tracing::instrument(
+    skip(executor, row),
+    fields(
+        job.kind = row.kind(),
+        job.queue = row.queue(),
+        otel.name = %format!("send {}", row.queue()),
+        otel.kind = "producer",
+        messaging.system = "awa",
+        messaging.destination.name = row.queue(),
+        messaging.operation.r#type = "send",
+    )
+)]
+pub async fn insert_prepared<'e, E>(
+    executor: E,
+    row: &PreparedJobInsert,
+) -> Result<JobRow, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    execute_prepared(executor, row).await
+}
+
+async fn execute_prepared<'e, E>(executor: E, row: &PreparedJobInsert) -> Result<JobRow, AwaError>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as::<_, JobRow>(INSERT_COMPAT_SQL)
         .bind(&row.kind)
         .bind(&row.queue)

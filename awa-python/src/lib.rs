@@ -23,6 +23,7 @@ pyo3::create_exception!(_awa, UnknownJobKind, AwaError);
 pyo3::create_exception!(_awa, SerializationError, AwaError);
 pyo3::create_exception!(_awa, ValidationError, AwaError);
 pyo3::create_exception!(_awa, TerminalError, AwaError);
+pyo3::create_exception!(_awa, StagingError, TerminalError);
 pyo3::create_exception!(_awa, DatabaseError, AwaError);
 pyo3::create_exception!(_awa, CallbackNotFound, AwaError);
 
@@ -115,6 +116,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Functions
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;
+    m.add_function(wrap_pyfunction!(transaction::check_run_at, m)?)?;
     m.add_function(wrap_pyfunction!(migrate, m)?)?;
     m.add_function(wrap_pyfunction!(migrations, m)?)?;
     m.add_function(wrap_pyfunction!(migrations_range, m)?)?;
@@ -161,6 +163,9 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;
     m.add("TerminalError", m.py().get_type::<TerminalError>())?;
+    m.add("StagingError", m.py().get_type::<StagingError>())?;
+    m.add("MAX_STAGED_FOLLOW_UPS", awa_worker::MAX_STAGED_FOLLOW_UPS)?;
+    m.add("MAX_STAGED_BYTES", awa_worker::MAX_STAGED_BYTES)?;
     m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
     m.add("CallbackNotFound", m.py().get_type::<CallbackNotFound>())?;
 
