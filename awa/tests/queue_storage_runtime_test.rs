@@ -12722,16 +12722,25 @@ async fn test_queue_storage_retry_failed_outcome_surfaces_pruned_rows() {
         RotateOutcome::Rotated { .. } => {}
         other => panic!("expected Rotated, got {other:?}"),
     }
-    match store
-        .prune_oldest(&pool, Duration::from_secs(3600))
-        .await
-        .expect("prune_oldest")
-    {
-        PruneOutcome::Pruned {
-            carried_failed_rows: 1,
-            ..
-        } => {}
-        other => panic!("expected Pruned with one carried row, got {other:?}"),
+    // Prune takes its locks NOWAIT, so a background session on the slot
+    // (autovacuum, or a hosted Postgres's own workers) reports Blocked;
+    // retry as the maintenance loop would.
+    let prune_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match store
+            .prune_oldest(&pool, Duration::from_secs(3600))
+            .await
+            .expect("prune_oldest")
+        {
+            PruneOutcome::Pruned {
+                carried_failed_rows: 1,
+                ..
+            } => break,
+            PruneOutcome::Blocked { slot: 0 } if Instant::now() < prune_deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("expected Pruned with one carried row, got {other:?}"),
+        }
     }
 
     let outcome = admin::retry_failed_by_queue(&pool, queue)
