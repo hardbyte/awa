@@ -664,10 +664,19 @@ class AsyncClient:
     # ── External callbacks (async) ──────────────────────────────
 
     async def complete_external(
-        self, callback_id: str, payload: dict[str, Any] | None = None
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        output: Any = None,
     ) -> Job:
-        """Complete a waiting job via external callback."""
-        return await self._raw.complete_external(callback_id, payload)
+        """Complete a waiting job via external callback.
+
+        The payload is not stored. ``output``, when given, is stored as the
+        job's output (ADR-048); an invalid one raises ``OutputError`` and
+        completes nothing.
+        """
+        return await self._raw.complete_external(callback_id, payload, output=output)
 
     async def fail_external(self, callback_id: str, error: str) -> Job:
         """Fail a waiting job via external callback."""
@@ -1360,10 +1369,19 @@ class Client:
     # ── External callbacks (sync) ───────────────────────────────
 
     def complete_external(
-        self, callback_id: str, payload: dict[str, Any] | None = None
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        output: Any = None,
     ) -> Job:
-        """Complete a waiting job via external callback."""
-        return self._raw.complete_external_sync(callback_id, payload)
+        """Complete a waiting job via external callback.
+
+        The payload is not stored. ``output``, when given, is stored as the
+        job's output (ADR-048); an invalid one raises ``OutputError`` and
+        completes nothing.
+        """
+        return self._raw.complete_external_sync(callback_id, payload, output=output)
 
     def fail_external(self, callback_id: str, error: str) -> Job:
         """Fail a waiting job via external callback."""

@@ -1,6 +1,6 @@
 use awa_model::{InsertOpts, JobRow, JobState, QueueStorage};
 use awa_worker::context::ProgressState;
-use awa_worker::FollowUps;
+use awa_worker::{FollowUps, OutputSlot};
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use sqlx::PgPool;
@@ -106,6 +106,10 @@ pub struct PyJob {
     progress_buffer: Option<Arc<std::sync::Mutex<ProgressState>>>,
     /// The attempt's follow-up staging buffer (ADR-046; only set during dispatch).
     follow_ups: Option<FollowUps>,
+    /// The attempt's output slot (ADR-048; only set during dispatch).
+    output_slot: Option<OutputSlot>,
+    /// The completed attempt's output from the job row (for queried jobs).
+    output_json: Option<serde_json::Value>,
     /// Progress JSON from the job row (for queried jobs).
     progress_json: Option<serde_json::Value>,
     /// Error history from the job row (array of {error, attempt, at} objects).
@@ -136,6 +140,8 @@ impl Clone for PyJob {
             queue_storage: self.queue_storage.clone(),
             progress_buffer: self.progress_buffer.clone(),
             follow_ups: self.follow_ups.clone(),
+            output_slot: self.output_slot.clone(),
+            output_json: self.output_json.clone(),
             progress_json: self.progress_json.clone(),
             errors_json: self.errors_json.clone(),
             run_at: self.run_at,
@@ -279,6 +285,54 @@ impl PyJob {
                 staging.set_cause(py, Some(cause));
                 Err(staging)
             }
+        }
+    }
+
+    /// Record this attempt's output (ADR-048), replacing any earlier one.
+    ///
+    /// The value is converted to JSON now: pydantic models are dumped in JSON
+    /// mode, dataclasses and tuples are converted, and sets, non-finite
+    /// floats, non-string keys and integers outside 64 bits are rejected.
+    /// At most `MAX_OUTPUT_BYTES` of JSON text. `None` clears the output.
+    /// A value that cannot be recorded raises `OutputError` and clears the
+    /// output; it does not poison the attempt.
+    fn set_output(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        let Some(slot) = &self.output_slot else {
+            return Err(crate::OutputError::new_err(
+                "an output can only be recorded on the job passed to a running handler",
+            ));
+        };
+        match output_to_json(py, value.bind(py), 0) {
+            Ok(json) => slot
+                .set_json(json)
+                .map_err(|err| crate::OutputError::new_err(err.to_string())),
+            Err(cause) => {
+                let err = slot.fail(awa_worker::OutputError::Invalid(cause.to_string()));
+                let output_error = crate::OutputError::new_err(err.to_string());
+                output_error.set_cause(py, Some(cause));
+                Err(output_error)
+            }
+        }
+    }
+
+    /// Remove the recorded output, so the attempt publishes none.
+    fn clear_output(&self) {
+        if let Some(slot) = &self.output_slot {
+            slot.clear();
+        }
+    }
+
+    /// During dispatch, the output recorded so far; on a job read from the
+    /// database, the completed attempt's output (ADR-048), or None.
+    #[getter]
+    fn output(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = match &self.output_slot {
+            Some(slot) => slot.get(),
+            None => self.output_json.clone(),
+        };
+        match value {
+            Some(value) => json_to_py(py, &value),
+            None => Ok(py.None()),
         }
     }
 
@@ -681,6 +735,7 @@ impl From<JobRow> for PyJob {
     fn from(row: JobRow) -> Self {
         let progress_json = row.progress.clone();
         let errors_json = row.errors.clone();
+        let output_json = row.output.clone();
         PyJob {
             id: row.id,
             kind: row.kind,
@@ -699,6 +754,8 @@ impl From<JobRow> for PyJob {
             queue_storage: None,
             progress_buffer: None,
             follow_ups: None,
+            output_slot: None,
+            output_json,
             progress_json,
             errors_json,
             run_at: row.run_at,
@@ -710,6 +767,7 @@ impl From<JobRow> for PyJob {
 }
 
 impl PyJob {
+    #[allow(clippy::too_many_arguments)]
     pub fn for_dispatch(
         row: JobRow,
         args_override: Py<PyAny>,
@@ -718,6 +776,7 @@ impl PyJob {
         queue_storage: Option<Arc<QueueStorage>>,
         progress_buffer: Arc<std::sync::Mutex<ProgressState>>,
         follow_ups: FollowUps,
+        output_slot: OutputSlot,
     ) -> Self {
         let mut job = Self::from(row);
         job.args_override = Some(args_override);
@@ -726,8 +785,136 @@ impl PyJob {
         job.queue_storage = queue_storage;
         job.progress_buffer = Some(progress_buffer);
         job.follow_ups = Some(follow_ups);
+        job.output_slot = Some(output_slot);
         job
     }
+}
+
+/// Convert a Python value to an output (ADR-048): pydantic models in JSON
+/// mode, dataclasses at any depth, tuples as lists. Sets, non-finite floats,
+/// non-string keys, integers outside 64 bits and other objects are rejected
+/// rather than coerced.
+fn output_to_json(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    depth: usize,
+) -> PyResult<serde_json::Value> {
+    use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+    let type_error = |message: String| pyo3::exceptions::PyTypeError::new_err(message);
+    if depth > MAX_JSON_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "output nesting too deep (max 64 levels)",
+        ));
+    }
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Ok(b) = obj.cast::<PyBool>() {
+        return Ok(serde_json::Value::Bool(b.is_true()));
+    }
+    if obj.cast::<PyInt>().is_ok() {
+        if let Ok(i) = obj.extract::<i64>() {
+            return Ok(serde_json::json!(i));
+        }
+        if let Ok(u) = obj.extract::<u64>() {
+            return Ok(serde_json::json!(u));
+        }
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "output integers must fit in 64 bits",
+        ));
+    }
+    if let Ok(f) = obj.cast::<PyFloat>() {
+        let value = f.value();
+        return serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("output floats must be finite")
+            });
+    }
+    if let Ok(s) = obj.cast::<PyString>() {
+        return Ok(serde_json::Value::String(s.to_str()?.to_owned()));
+    }
+    if let Ok(list) = obj.cast::<PyList>() {
+        return list
+            .iter()
+            .map(|item| output_to_json(py, &item, depth + 1))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(tuple) = obj.cast::<PyTuple>() {
+        return tuple
+            .iter()
+            .map(|item| output_to_json(py, &item, depth + 1))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (key, value) in dict.iter() {
+            let Ok(key) = key.cast::<PyString>() else {
+                return Err(type_error(format!(
+                    "output keys must be str, not {}",
+                    key.get_type().qualname()?
+                )));
+            };
+            map.insert(
+                key.to_str()?.to_owned(),
+                output_to_json(py, &value, depth + 1)?,
+            );
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    // A pydantic model (v2): dump in JSON mode so dates and the like become
+    // strings, as pydantic would send them.
+    if !obj.is_instance_of::<pyo3::types::PyType>() {
+        if let Ok(model_dump) = obj.getattr("model_dump") {
+            if model_dump.is_callable() {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("mode", "json")?;
+                let dumped = model_dump.call((), Some(&kwargs))?;
+                return output_to_json(py, &dumped, depth + 1);
+            }
+        }
+        let dataclasses = py.import("dataclasses")?;
+        if dataclasses
+            .call_method1("is_dataclass", (obj,))?
+            .is_truthy()?
+        {
+            let as_dict = dataclasses.call_method1("asdict", (obj,))?;
+            return output_to_json(py, &as_dict, depth + 1);
+        }
+    }
+    Err(type_error(format!(
+        "{} is not JSON-serializable as an output",
+        obj.get_type().qualname()?
+    )))
+}
+
+/// Validate and normalize a value as `Job.set_output` would, returning the
+/// JSON it would store. Used by the `awa.testing.HandlerJob` stand-in so its
+/// rules cannot drift from the runtime's.
+#[pyfunction]
+#[pyo3(name = "_validate_output")]
+pub fn validate_output(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    match output_json(py, value.bind(py))? {
+        Some(json) => json_to_py(py, &json),
+        None => Ok(py.None()),
+    }
+}
+
+/// Convert and validate a value as an output, raising `OutputError`. `None`
+/// (or JSON null) means no output.
+pub(crate) fn output_json(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Option<serde_json::Value>> {
+    let json = output_to_json(py, value, 0).map_err(|cause| {
+        let err = crate::OutputError::new_err(format!("output is not storable JSON: {cause}"));
+        err.set_cause(py, Some(cause));
+        err
+    })?;
+    awa_model::output::validate_output(json)
+        .map_err(|err| crate::OutputError::new_err(err.to_string()))
 }
 
 /// Convert serde_json::Value to a Python object.

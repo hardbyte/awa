@@ -27,7 +27,7 @@ from typing import Any, Awaitable, Callable, Generic, TypeVar
 import pytest_asyncio
 
 import awa
-from awa._awa import derive_kind
+from awa._awa import _validate_output, derive_kind
 
 # Default test database URL
 DEFAULT_DATABASE_URL = "postgres://postgres:test@localhost:5432/awa_test"
@@ -256,7 +256,8 @@ class HandlerJob(Generic[T]):
 
     ``enqueue_on_completion`` applies the runtime's validation and limits and
     records each request in ``staged``, so handler unit tests can assert on
-    what a handler staged without a database.
+    what a handler staged without a database. ``set_output`` validates with
+    the runtime's own converter, and ``output`` reads back what was recorded.
     """
 
     args: T
@@ -272,9 +273,33 @@ class HandlerJob(Generic[T]):
     staging_error: awa.StagingError | None = None
     _staged_bytes: int = 0
     _sealed: bool = False
+    _output: Any = field(default=None, repr=False)
 
     def is_cancelled(self) -> bool:
         return False
+
+    @property
+    def output(self) -> Any:
+        """The output recorded so far (ADR-048), as JSON-compatible data."""
+        return self._output
+
+    def set_output(self, value: Any) -> None:
+        """Record this attempt's output, as ``Job.set_output`` does: the same
+        conversion and limit, ``None`` clears it, and a failure raises
+        ``awa.OutputError`` and clears it."""
+        if self._sealed:
+            raise awa.OutputError(
+                "the handler already returned; its output can no longer be recorded"
+            )
+        try:
+            self._output = _validate_output(value)
+        except awa.OutputError:
+            self._output = None
+            raise
+
+    def clear_output(self) -> None:
+        if not self._sealed:
+            self._output = None
 
     def enqueue_on_completion(self, args: Any, **kwargs: Any) -> None:
         unknown = set(kwargs) - _STAGING_KWARGS
@@ -316,6 +341,9 @@ class WorkResult:
     job: JobRow | _NoJob
     outcome: str  # "completed", "retryable", "failed", "cancelled", "snoozed", "no_job"
     error: str | None = None
+    # The output the handler recorded (ADR-048). This harness finalizes
+    # canonical rows, which store no outputs, so it is reported here only.
+    output: Any = None
 
     def is_completed(self) -> bool:
         return self.outcome == "completed"
@@ -486,6 +514,7 @@ class AwaTestClient:
             result = await handler(handler_job)
         except awa.TerminalError as e:
             # Terminal error -> failed
+            handler_job._sealed = True
             tx3 = await self._client.transaction()
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
@@ -493,10 +522,13 @@ class AwaTestClient:
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome="failed", error=str(e))
+            return WorkResult(
+                job=job, outcome="failed", error=str(e), output=handler_job.output
+            )
         except Exception as e:
             # Retryable error; the final attempt exhausts the job, mirroring
             # the real executor.
+            handler_job._sealed = True
             new_state = (
                 "failed" if row["attempt"] >= row["max_attempts"] else "retryable"
             )
@@ -507,7 +539,9 @@ class AwaTestClient:
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome=new_state, error=str(e))
+            return WorkResult(
+                job=job, outcome=new_state, error=str(e), output=handler_job.output
+            )
 
         # ADR-046, as in the runtime: staging closes when the handler
         # returns, staged follow-ups ride only on completion, and a
@@ -522,7 +556,9 @@ class AwaTestClient:
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome="failed", error=error)
+            return WorkResult(
+                job=job, outcome="failed", error=error, output=handler_job.output
+            )
 
         # Handle return value
         tx3 = await self._client.transaction()
@@ -547,7 +583,7 @@ class AwaTestClient:
                     await tx3.execute("RELEASE SAVEPOINT awa_staged_follow_up")
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome="completed")
+            return WorkResult(job=job, outcome="completed", output=handler_job.output)
         elif isinstance(result, awa.RetryAfter):
             # RetryAfter reports a failed attempt; the final attempt exhausts
             # the job, mirroring the real executor.
@@ -560,7 +596,7 @@ class AwaTestClient:
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome=new_state)
+            return WorkResult(job=job, outcome=new_state, output=handler_job.output)
         elif isinstance(result, awa.Snooze):
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'available', attempt = attempt - 1 WHERE id = $1",
@@ -576,7 +612,12 @@ class AwaTestClient:
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
-            return WorkResult(job=job, outcome="cancelled", error=result.reason)
+            return WorkResult(
+                job=job,
+                outcome="cancelled",
+                error=result.reason,
+                output=handler_job.output,
+            )
         else:
             await tx3.rollback()
             raise TypeError(f"Unexpected handler return type: {type(result)}")
