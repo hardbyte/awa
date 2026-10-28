@@ -155,7 +155,7 @@ Registered enqueue specs receive the completed row without its output.
   4.4 KB, more than quadrupling it, and one that compresses well costs a small
   fraction of that. Large outputs with many elements, such as long numeric
   arrays or objects with hundreds of keys, also cut completion throughput by
-  up to five times.
+  three to five times.
 
 ## Metrics
 
