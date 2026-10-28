@@ -43,9 +43,9 @@ The deciding constraint on queue storage was the compact completion path of ADR-
 
 End to end, forcing a job onto the general terminal path costs about two thirds of throughput (11.2k down to 3.6–5.7k jobs/s) and adds 427 B of WAL per job.
 
-A 100-byte value carried on the compact batch adds about 3.5% to a job's lifecycle WAL. A 2 KB value on every job roughly doubles it, which is why the value is capped. For comparison, staging one follow-up per job adds about 2,400 B of WAL per job.
+A job's whole lifecycle on the compact path (insert, claim, completion) writes about 1.3 KB of WAL. A 100-byte output carried on the compact batch adds under 1%. A 4 KiB output that does not compress adds about 4.4 KB, more than quadrupling it, which is why the value is capped; one that compresses well costs a small fraction of that. For comparison, staging one follow-up per job adds about 2,400 B of WAL per job.
 
-Stored jsonb can be larger than the JSON text: a 4 KiB array of small numbers takes about 24 KiB as jsonb. Every bound below is therefore stated in text bytes, with headroom for that expansion. The benchmark gates in [Validation](#validation) include worst-case shapes.
+Every bound below is stated in bytes of JSON text, which is also how the value is stored ([Storage](#storage)). The benchmark gates in [Validation](#validation) include worst-case shapes.
 
 ## Decision
 
@@ -226,12 +226,13 @@ Client::complete_external_with(callback_id, opts)    // also runs registered Com
 
 **Queue storage.** Migration v052 changes every substrate schema:
 
-- **Compact completions.** `receipt_completion_batches` gains `outputs jsonb[]`, aligned with `job_ids` by the same `ORDER BY lane_seq, job_id`.
+- **Compact completions.** `receipt_completion_batches` gains `outputs json[]`, aligned with `job_ids` by the same `ORDER BY lane_seq, job_id`.
   - It is NULL when no job in the batch recorded an output, so a batch without outputs costs nothing.
   - A `NOT VALID` check constraint enforces `outputs IS NULL OR cardinality(outputs) = completed_count` on new rows without scanning old ones.
   - Recording an output does not take a job off the compact path.
-- **General-path completions.** `done_entries` gains a nullable `output jsonb` column. It is separate from `payload`, so the payload-elision rule never touches it. Jobs with tags, unique keys, custom metadata, errors or staged follow-ups already take this path.
+- **General-path completions.** `done_entries` gains a nullable `output json` column. It is separate from `payload`, so the payload-elision rule never touches it. Jobs with tags, unique keys, custom metadata, errors or staged follow-ups already take this path.
 - **Failed attempts.** The output is the `output` key of the attempt's error entry, inside the existing payload. It needs no schema change and is kept even before v052.
+- **`json`, not `jsonb`.** A completion's output is stored as the JSON text the runtime serialized, so it reads back exactly: `1.0` stays a float and key order is kept. Postgres only validates `json` on input, while `jsonb` parses it into a tree. Measured on Postgres 16, building a batch's array of 2,000-element numeric outputs cost 5.4 times as much as `jsonb`, and an object of 400 keys 2.1 times, with small outputs about equal. The 4 KiB numeric array also takes about 24 KiB as `jsonb`. End to end the difference is within noise, because a large output's cost is dominated elsewhere. The price is that `json` has no equality operator: SQL that compares outputs casts them to `jsonb` first. A failed output lives in the `jsonb` payload, so it is normalized as job args are.
 - **Batch size.** A compact batch row is one value, and reading one job's output detoasts the whole array. The completion flush therefore starts a new batch row once the recorded outputs in a batch exceed 64 KiB of text. The rows are written in the flush's one transaction, so a flush still commits or fails as a whole.
 
 Only the compact-receipt and general per-job completion paths carry outputs. The completion flush partitions its requests, so requests with a claim always take those paths even when another request in the same flush has none. Queue-storage dispatch always passes a claim today; a request that carries an output and no claim is completed without it and counted as `no_claim`.
@@ -403,7 +404,7 @@ The tail, per schema:
 
 - **More surface to keep stable:** an API on the context, a row field, an options struct and an HTTP field.
 - **A value that must be both inspected and handed on is written twice.**
-- **Larger compact batches cost more to read.** With large outputs a compact batch holds fewer jobs: as few as 17 at the 4 KiB cap. Reading one output still detoasts its batch's outputs: about 64 KiB of text, and up to several times that as jsonb.
+- **Larger compact batches cost more to read.** With large outputs a compact batch holds fewer jobs: as few as 17 at the 4 KiB cap. Reading one output still detoasts its batch's outputs: about 64 KiB of text.
 - **Earlier failures lose their outputs.** Only the latest entry to record one keeps it.
 - **Canonical users get nothing** until they move to queue storage.
 - **Deleted outputs persist** physically until prune, as args do.
@@ -429,6 +430,14 @@ Publish the output on retries, snoozes and failures as well as on completion, ea
 ### A column on `done_entries` or a key in the payload, for every output
 
 One representation and no batch array. Rejected on cost: every job that records an output would leave the compact path (measured above).
+
+### `jsonb`, as args use
+
+One JSON type across the schema, with equality and containment operators. Rejected: it parses every output into a tree on the completion path, stores a numeric array at up to six times its text size, and normalizes numbers, so `1.0` would read back as `1`. Queries that need operators cast with `output::jsonb`.
+
+### `bytea`
+
+Opaque bytes would also keep the exact value and skip parsing. Rejected: an output could not be read in SQL, the admin UI could not render it, and Rust and Python handlers would need a shared encoding beyond JSON.
 
 ### A side table keyed by job
 
