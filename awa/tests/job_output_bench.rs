@@ -39,6 +39,9 @@ enum Scenario {
     /// An array of small integers just under the cap: the worst jsonb
     /// expansion.
     LargeNumericArray,
+    /// An object of many short keys just under the cap: jsonb stores a key
+    /// table and an offset per entry.
+    ManyKeys,
     /// Every attempt but the last fails with a 4 KiB output, five attempts.
     RetryStorm,
 }
@@ -50,6 +53,7 @@ impl Scenario {
             Scenario::Small => "100 B output, every job",
             Scenario::LargeString => "4 KiB string, every job",
             Scenario::LargeNumericArray => "4 KiB numeric array, every job",
+            Scenario::ManyKeys => "4 KiB object of short keys, every job",
             Scenario::RetryStorm => "4 KiB output on 4 failed attempts",
         }
     }
@@ -70,6 +74,12 @@ impl Scenario {
             Scenario::LargeNumericArray => {
                 Some(Value::from(vec![1u8; (MAX_OUTPUT_BYTES - 64) / 2]))
             }
+            // `"k0000":1,` is ten bytes, so 400 keys stay under the cap.
+            Scenario::ManyKeys => Some(Value::Object(
+                (0..400)
+                    .map(|key| (format!("k{key:04}"), Value::from(1)))
+                    .collect(),
+            )),
         }
     }
 }
@@ -216,6 +226,7 @@ async fn job_output_cost() {
         Scenario::Small,
         Scenario::LargeString,
         Scenario::LargeNumericArray,
+        Scenario::ManyKeys,
         Scenario::RetryStorm,
     ];
     let scenarios: Vec<Scenario> = match std::env::var("OUTPUT_BENCH_SCENARIOS") {
