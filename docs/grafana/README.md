@@ -53,6 +53,7 @@ The dashboard ships three example panels — **Queue Descriptor Catalog**, **Job
 | **Promotion Throughput** | Time series | Scheduled/retryable jobs promoted per second |
 | **Job Outputs** | Time series | Outputs published per second by outcome, and dropped outputs by reason |
 | **Job Output Size (p50/p95)** | Time series | Size of published outputs in bytes of JSON text |
+| **Staged Follow-ups** | Time series | Handler-staged follow-ups inserted, skipped as duplicates, or discarded by `WaitForCallback`, per second |
 | **Prune Database Phase Latency p99** | Time series | Ring prune lock, `TRUNCATE`, and commit latency by ring |
 | **Claims / Waiting External** | Time series | Queue claim rate and callback-parked job rate |
 | **Error Rate** | Stat | Failed / (completed + failed) percentage |
@@ -166,6 +167,7 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.job.retried` | Counter | kind, queue | Jobs retried |
 | `awa.completion.deadlock_retry` | Counter | kind, queue | Re-runs of a finalize transaction after Postgres aborted it as a deadlock victim (SQLSTATE 40P01); one increment per retry, up to three per completion. Any sustained rate means job transitions are waiting on each other |
 | `awa.completion.reconnect_retry` | Counter | kind, queue | Retries of a lease-guarded finalization after database unavailability, including transport/TLS/protocol errors, pool-acquire timeouts, SQLSTATE 08xxx, 57P01–57P03 and 25006. Counts retries that start, rather than recovered jobs. A burst can indicate an outage or pool pressure; correlate with pool wait and database errors |
+| `awa.job.staged_follow_ups_committed` | Counter | kind, queue, `awa.follow_up.result` | Staged follow-ups (ADR-046) of committed completions: `inserted`, or `duplicate` when a job with the same unique key already existed. Recorded after the completion transaction commits, so a stale attempt counts nothing |
 | `awa.job.staged_follow_ups_discarded` | Counter | kind, queue | Follow-ups a handler staged (ADR-046) and then discarded by returning `WaitForCallback`, which parks the job without completing it. Almost always a handler bug: stage after `ctx.wait_for_callback` instead |
 | `awa.job.output_recorded` | Counter | kind, queue, outcome | Job outputs (ADR-048) published: `completed` as the job's output, `failed` in an error entry |
 | `awa.job.output_size` | Histogram | kind, queue, outcome | Size of published job outputs, in bytes of JSON text |

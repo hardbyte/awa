@@ -408,6 +408,19 @@
             { "expr": "histogram_quantile(0.95, sum by (le) (rate(awa_job_output_size_bytes_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95" }
           ],
           "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 408,
+          "type": "timeseries",
+          "title": "Staged Follow-ups (inserted / duplicate / discarded)",
+          "description": "Handler-staged follow-ups (ADR-046) per second, by what their attempt came to: inserted with the completion, skipped as a duplicate of an existing unique key, or discarded because the handler returned WaitForCallback. Discards are almost always a handler bug.",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 39 },
+          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
+          "targets": [
+            { "expr": "sum by (awa_follow_up_result) (rate(awa_job_staged_follow_ups_committed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "{{awa_follow_up_result}}" },
+            { "expr": "sum(rate(awa_job_staged_follow_ups_discarded_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "discarded" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
         }
       ]
     },

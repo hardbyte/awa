@@ -1366,7 +1366,7 @@ async fn complete_job_canonical(
         >,
     >,
     _dlq_enabled: bool,
-    _metrics: &crate::metrics::AwaMetrics,
+    metrics: &crate::metrics::AwaMetrics,
 ) -> Result<CompletionOutcome, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
@@ -1377,8 +1377,14 @@ async fn complete_job_canonical(
             // follow-ups, so we bypass it here.
             let specs = completed_specs(enqueue_specs, &job.kind);
             if !specs.is_empty() || !staged_follow_ups.is_empty() {
-                let outcome =
-                    complete_canonical_with_followups(pool, job, &specs, staged_follow_ups).await?;
+                let outcome = complete_canonical_with_followups(
+                    pool,
+                    job,
+                    &specs,
+                    staged_follow_ups,
+                    metrics,
+                )
+                .await?;
                 return match outcome {
                     None => Ok(CompletionOutcome::IgnoredStale),
                     Some(updated_job) => {
@@ -2021,6 +2027,7 @@ async fn complete_job_queue_storage(
                     queue_storage_unique_states,
                     &specs,
                     staged_follow_ups,
+                    metrics,
                 )
                 .await?;
                 return match outcome {
@@ -2592,6 +2599,7 @@ async fn complete_job_queue_storage(
 ///   post-completion snapshot, mirroring the fallback constructed elsewhere
 ///   in this file when `runtime.store.load_job` doesn't return one.
 #[allow(clippy::explicit_auto_deref)]
+#[allow(clippy::too_many_arguments)]
 async fn complete_queue_storage_with_followups(
     runtime: &QueueStorageRuntime,
     pool: &PgPool,
@@ -2600,6 +2608,7 @@ async fn complete_queue_storage_with_followups(
     queue_storage_unique_states: Option<&str>,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
     staged_follow_ups: &[PreparedJobInsert],
+    metrics: &crate::metrics::AwaMetrics,
 ) -> Result<Option<JobRow>, AwaError> {
     let Some(claim) = queue_storage_claim else {
         // The slow path is keyed on `ClaimedEntry` (it needs `lease_slot`,
@@ -2644,9 +2653,16 @@ async fn complete_queue_storage_with_followups(
     updated_job.progress = None;
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
-    crate::enqueue_specs::insert_staged_in_tx(&mut tx, &updated_job, staged_follow_ups).await?;
+    let staged =
+        crate::enqueue_specs::insert_staged_in_tx(&mut tx, &updated_job, staged_follow_ups).await?;
 
     tx.commit().await?;
+    metrics.record_staged_follow_ups_committed(
+        &updated_job.kind,
+        &updated_job.queue,
+        staged.inserted,
+        staged.duplicates,
+    );
     Ok(Some(updated_job))
 }
 
@@ -2975,6 +2991,7 @@ async fn complete_canonical_with_followups(
     job: &JobRow,
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
     staged_follow_ups: &[PreparedJobInsert],
+    metrics: &crate::metrics::AwaMetrics,
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
 
@@ -3007,9 +3024,16 @@ async fn complete_canonical_with_followups(
     };
 
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
-    crate::enqueue_specs::insert_staged_in_tx(&mut tx, &updated_job, staged_follow_ups).await?;
+    let staged =
+        crate::enqueue_specs::insert_staged_in_tx(&mut tx, &updated_job, staged_follow_ups).await?;
 
     tx.commit().await?;
+    metrics.record_staged_follow_ups_committed(
+        &updated_job.kind,
+        &updated_job.queue,
+        staged.inserted,
+        staged.duplicates,
+    );
     Ok(Some(updated_job))
 }
 

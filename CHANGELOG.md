@@ -119,7 +119,10 @@ for each step.
   `EnqueueRequest::unique` and `::metadata` set one option without replacing
   the rest, `awa_model::insert_prepared` inserts a prepared row, and the
   `awa.job.staged_follow_ups_discarded` counter records follow-ups dropped by
-  `WaitForCallback`. The Rust and Python test harnesses insert staged
+  `WaitForCallback`. `awa.job.staged_follow_ups_committed` counts the
+  follow-ups of committed completions, `inserted` or `duplicate`, and the
+  Grafana dashboard and alert rules gain a panel and an info alert for them.
+  The Rust and Python test harnesses insert staged
   follow-ups like the runtime.
 - **Owner-scoped periodic schedules (opt-in, v045,
   [#481](https://github.com/hardbyte/awa/issues/481)).** A client can declare

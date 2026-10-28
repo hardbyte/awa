@@ -487,11 +487,32 @@ groups:
         data:
           - refId: A
             relativeTimeRange: { from: 600, to: 0 }
+      - uid: awa_staged_follow_ups_discarded
+        title: "awa handler discards staged follow-ups"
+        condition: "C"
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: info
+          owner: awa
+        annotations:
+          summary: "Kind {{ $labels.awa_job_kind }} stages follow-ups and then parks"
+          description: |
+            A handler of {{ $labels.awa_job_kind }} staged follow-ups
+            (ADR-046) and then returned WaitForCallback, which parks the job
+            without completing it, so the follow-ups were dropped. Stage them
+            after the callback resumes the handler instead. See "Staged
+            Follow-ups" on the dashboard.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
             datasourceUid: DS_PROMETHEUS
             model:
               refId: A
               datasource: { type: prometheus, uid: DS_PROMETHEUS }
               expr: sum by (awa_job_queue) (rate(awa_job_output_dropped_total{awa_output_reason="schema_missing"}[5m]))
+              expr: sum by (awa_job_kind) (increase(awa_job_staged_follow_ups_discarded_total[15m]))
               instant: true
               intervalMs: 1000
               maxDataPoints: 43200

@@ -8,8 +8,8 @@
 //! Requires a running Postgres instance.
 //! Set DATABASE_URL or use the default: postgres://postgres:awa@localhost:5432/awa_test
 
-use awa::model::{insert_with, migrations, InsertOpts};
-use awa::{Client, JobArgs, JobError, JobResult, JobState, QueueConfig};
+use awa::model::{insert_with, migrations, InsertOpts, UniqueOpts};
+use awa::{Client, EnqueueRequest, JobArgs, JobError, JobResult, JobState, QueueConfig};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
@@ -616,5 +616,124 @@ async fn test_failed_job_emits_failure_metrics() {
     );
 
     // Clean up
+    let _ = meter_provider.shutdown();
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct StagingObservableJob {
+    item_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct StagedObservableFollowUp {
+    item_id: i64,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_staged_follow_ups_emit_committed_metrics() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let pool = setup().await;
+    let queue = "observ_staged_metrics_test";
+    clean_queue(&pool, queue).await;
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
+        .bind(StagedObservableFollowUp::kind())
+        .execute(&pool)
+        .await
+        .expect("Failed to clear follow-ups");
+
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    // The same unique follow-up staged twice: one insert, one duplicate.
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .register::<StagingObservableJob, _, _>(|args, ctx| {
+            let follow_ups = ctx.follow_ups();
+            async move {
+                for _ in 0..2 {
+                    follow_ups.enqueue_on_completion(
+                        EnqueueRequest::new(StagedObservableFollowUp {
+                            item_id: args.item_id,
+                        })
+                        .queue("observ_staged_metrics_follow_ups")
+                        .unique(UniqueOpts::default()),
+                    )?;
+                }
+                Ok(JobResult::Completed)
+            }
+        })
+        .build()
+        .expect("Failed to build client");
+    client.start().await.expect("Failed to start client");
+
+    let job = insert_with(
+        &pool,
+        &StagingObservableJob { item_id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to insert job");
+    let final_state = wait_for_job_state(
+        &pool,
+        job.id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(final_state, JobState::Completed);
+    client.shutdown(Duration::from_secs(5)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+
+    let mut by_result: HashMap<String, u64> = HashMap::new();
+    for rm in &exporter
+        .get_finished_metrics()
+        .expect("Failed to get finished metrics")
+    {
+        for scope_metrics in rm.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() != "awa.job.staged_follow_ups_committed" {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    for point in sum.data_points() {
+                        if !point.attributes().any(|kv| {
+                            kv.key.as_str() == "awa.job.queue" && kv.value.as_str() == queue
+                        }) {
+                            continue;
+                        }
+                        for kv in point.attributes() {
+                            if kv.key.as_str() == "awa.follow_up.result" {
+                                // Cumulative exports repeat the running total.
+                                let entry =
+                                    by_result.entry(kv.value.as_str().to_string()).or_default();
+                                *entry = (*entry).max(point.value());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(by_result.get("inserted"), Some(&1), "{by_result:?}");
+    assert_eq!(by_result.get("duplicate"), Some(&1), "{by_result:?}");
+
     let _ = meter_provider.shutdown();
 }

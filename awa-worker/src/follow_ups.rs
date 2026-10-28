@@ -233,7 +233,9 @@ pub async fn insert_staged_follow_ups_in_tx(
     job: &awa_model::JobRow,
     rows: &[PreparedJobInsert],
 ) -> Result<(), AwaError> {
-    crate::enqueue_specs::insert_staged_in_tx(conn, job, rows).await
+    crate::enqueue_specs::insert_staged_in_tx(conn, job, rows)
+        .await
+        .map(|_| ())
 }
 
 /// Reject what the insert would reject, so it fails the stage rather than
