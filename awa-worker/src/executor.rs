@@ -506,6 +506,13 @@ impl JobExecutor {
                 &job_queue,
                 &metrics,
             );
+            // A rejected recording clears the slot without failing the
+            // attempt, so it would otherwise go unseen.
+            for (reason, count) in ctx.output_slot().rejections() {
+                for _ in 0..count {
+                    record_output_dropped(&metrics, &job_kind, &job_queue, reason);
+                }
+            }
 
             // Keep worker/heartbeat ownership while the bounded finalizer queue is full.
             let finalize_permit = match result {

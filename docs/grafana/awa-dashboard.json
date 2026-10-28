@@ -387,7 +387,7 @@
           "id": 406,
           "type": "timeseries",
           "title": "Job Outputs (recorded / dropped)",
-          "description": "Job outputs (ADR-048) published per second by outcome, and recorded outputs not published, by reason. A sustained schema_missing rate means a binary is running ahead of migration v052.",
+          "description": "Job outputs (ADR-048) published per second by outcome, and outputs not published, by reason. A sustained schema_missing rate means a binary is running ahead of migration v052; too_large and invalid count recordings the handler made that were rejected.",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
           "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } } },
           "targets": [

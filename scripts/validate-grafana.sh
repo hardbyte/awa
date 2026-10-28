@@ -49,7 +49,7 @@ while IFS= read -r name; do
   if grep -qxF "$name" <<<"$known"; then
     continue
   fi
-  base=$(sed -E 's/_(bucket|sum|count|total)$//; s/_seconds$//' <<<"$name")
+  base=$(sed -E 's/_(bucket|sum|count|total)$//; s/_(seconds|bytes)$//' <<<"$name")
   if grep -qxF "$base" <<<"$source_names"; then
     echo "  conditional: $name (defined in awa-metrics, not observed in this workload)"
     continue

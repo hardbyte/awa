@@ -299,4 +299,14 @@ test.describe("Job detail page", () => {
     await expect(page.getByRole("button", { name: "Copy arguments JSON" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Copy output JSON" })).toHaveCount(0);
   });
+  test("dlq job detail shows the dead-lettered attempt's output", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => /\/api\/dlq\/600001$/.test(r.url()) && r.ok()),
+      page.goto("/dlq/600001"),
+    ]);
+
+    await expect(page.getByText("Output from failed attempt 2")).toBeVisible();
+    await expect(page.getByText("dead-lettered").first()).toBeVisible();
+    await expect(page.getByRole("button", { name: "Copy output JSON" })).toBeVisible();
+  });
 });

@@ -51,6 +51,8 @@ The dashboard ships three example panels — **Queue Descriptor Catalog**, **Job
 | **Maintenance Rescues** | Bars | Heartbeat, deadline, callback_timeout rescues |
 | **Completion Flush Performance** | Time series | Batch completion write latency |
 | **Promotion Throughput** | Time series | Scheduled/retryable jobs promoted per second |
+| **Job Outputs** | Time series | Outputs published per second by outcome, and dropped outputs by reason |
+| **Job Output Size (p50/p95)** | Time series | Size of published outputs in bytes of JSON text |
 | **Prune Database Phase Latency p99** | Time series | Ring prune lock, `TRUNCATE`, and commit latency by ring |
 | **Claims / Waiting External** | Time series | Queue claim rate and callback-parked job rate |
 | **Error Rate** | Stat | Failed / (completed + failed) percentage |
@@ -167,7 +169,7 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.job.staged_follow_ups_discarded` | Counter | kind, queue | Follow-ups a handler staged (ADR-046) and then discarded by returning `WaitForCallback`, which parks the job without completing it. Almost always a handler bug: stage after `ctx.wait_for_callback` instead |
 | `awa.job.output_recorded` | Counter | kind, queue, outcome | Job outputs (ADR-048) published: `completed` as the job's output, `failed` in an error entry |
 | `awa.job.output_size` | Histogram | kind, queue, outcome | Size of published job outputs, in bytes of JSON text |
-| `awa.job.output_dropped` | Counter | kind, queue, `awa.output.reason` | Recorded outputs that were not published: `canonical`, `schema_missing` (a binary ahead of migration v052), `outcome` (`Snooze` or `WaitForCallback`), `abandoned`, `no_claim` |
+| `awa.job.output_dropped` | Counter | kind, queue, `awa.output.reason` | Outputs that were not published: `canonical`, `schema_missing` (a binary ahead of migration v052), `outcome` (`Snooze` or `WaitForCallback`), `abandoned`, `no_claim`, and `too_large` / `invalid` for each recording the handler made that was rejected |
 | `awa.job.cancelled` | Counter | kind, queue | Jobs cancelled |
 | `awa.job.claimed` | Counter | queue | Jobs claimed from DB |
 | `awa.job.in_flight` | UpDownCounter | queue | Currently executing |

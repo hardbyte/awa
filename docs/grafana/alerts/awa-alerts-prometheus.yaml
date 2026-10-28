@@ -466,3 +466,56 @@ groups:
                   query: { params: [C] }
                   reducer: { type: last, params: [] }
                   evaluator: { type: gt, params: [1] }
+
+      - uid: awa_job_output_schema_missing
+        title: "awa drops job outputs: schema before migration v052"
+        condition: "C"
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Queue {{ $labels.awa_job_queue }} drops completion outputs"
+          description: |
+            Workers on {{ $labels.awa_job_queue }} record job outputs
+            (ADR-048), but the queue-storage schema has no output columns, so
+            completion outputs are dropped. A binary is running ahead of its
+            migration: run `awa migrate` to apply v052. See "Job Outputs" on
+            the dashboard.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: sum by (awa_job_queue) (rate(awa_job_output_dropped_total{awa_output_reason="schema_missing"}[5m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0] }

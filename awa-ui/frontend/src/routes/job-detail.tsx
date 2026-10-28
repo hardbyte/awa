@@ -24,6 +24,7 @@ import { ProgressDisplay } from "@/components/ProgressDisplay";
 import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
+import { OutputCard } from "@/components/OutputCard";
 import { POLL } from "@/lib/constants";
 
 function hasMetadata(job: JobRow): boolean {
@@ -32,30 +33,6 @@ function hasMetadata(job: JobRow): boolean {
     typeof job.metadata === "object" &&
     Object.keys(job.metadata as Record<string, unknown>).length > 0
   );
-}
-
-interface ShownOutput {
-  value: unknown;
-  /** The failed attempt that recorded it; null for the completion's output. */
-  attempt: number | null;
-}
-
-// The completed attempt's output, else the output of the latest failed
-// attempt that recorded one: a failure keeps its output in its error entry,
-// and only the latest such entry keeps it (ADR-048).
-function outputToShow(job: JobRow): ShownOutput | null {
-  if (job.output !== undefined && job.output !== null) {
-    return { value: job.output, attempt: null };
-  }
-  for (const entry of [...(job.errors ?? [])].reverse()) {
-    if (entry && typeof entry === "object") {
-      const { output, attempt } = entry as { output?: unknown; attempt?: unknown };
-      if (output !== undefined && output !== null) {
-        return { value: output, attempt: typeof attempt === "number" ? attempt : 0 };
-      }
-    }
-  }
-  return null;
 }
 
 // Treat empty display_name the same as missing — the contract is
@@ -144,8 +121,6 @@ export function JobDetailPage() {
     job.state
   );
   const canCancel = !["completed", "failed", "cancelled"].includes(job.state);
-  const shownOutput = outputToShow(job);
-  const outputType = job.kind_descriptor?.output?.type;
 
   return (
     <div className="space-y-6">
@@ -433,33 +408,11 @@ export function JobDetailPage() {
       </Card>
 
       {/* Output (ADR-048) */}
-      {shownOutput && (
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-semibold">
-                  {shownOutput.attempt === null
-                    ? "Output"
-                    : `Output from failed attempt ${shownOutput.attempt}`}
-                </span>
-                {outputType && (
-                  <Badge intent="secondary" aria-label={`Output type ${outputType}`}>
-                    <code>{outputType}</code>
-                  </Badge>
-                )}
-              </div>
-              <CopyButton
-                value={JSON.stringify(shownOutput.value, null, 2)}
-                label="Copy output JSON"
-              />
-            </div>
-          </CardHeader>
-          <CardContent>
-            <JsonView data={shownOutput.value} />
-          </CardContent>
-        </Card>
-      )}
+      <OutputCard
+        output={job.output}
+        errors={job.errors}
+        outputType={job.kind_descriptor?.output?.type}
+      />
 
       {/* Metadata */}
       {hasMetadata(job) && (

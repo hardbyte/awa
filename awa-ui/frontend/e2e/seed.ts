@@ -218,7 +218,7 @@ export default async function globalSetup() {
     VALUES (
       600001, 'dlq_job', 'e2e_dlq', '{"test": true}'::jsonb, 'failed', 2, 2, 2, 5,
       now() - interval '6 minutes', now() - interval '5 minutes', now() - interval '4 minutes', now() - interval '15 minutes',
-      '{"metadata":{"source":"playwright"},"tags":["dlq"],"errors":[{"error":"dead lettered","attempt":2,"at":"2026-01-01T00:03:00Z","terminal":true}],"progress":null}'::jsonb,
+      '{"metadata":{"source":"playwright"},"tags":["dlq"],"errors":[{"error":"dead lettered","attempt":2,"at":"2026-01-01T00:03:00Z","terminal":true,"output":{"rows":3,"stage":"dead-lettered"}}],"progress":null}'::jsonb,
       'manual_test', now() - interval '3 minutes', 2
     );
   `;

@@ -571,7 +571,12 @@ impl Worker for FailureModeWorker {
             serde_json::from_value(ctx.job.args.clone()).map_err(JobError::retryable)?;
 
         match args.mode.as_str() {
-            "complete" => Ok(JobResult::Completed),
+            "complete" => {
+                // Exercises the ADR-048 output metrics end to end.
+                ctx.set_output(&serde_json::json!({ "mode": "complete" }))
+                    .map_err(|err| JobError::terminal(err.to_string()))?;
+                Ok(JobResult::Completed)
+            }
             "terminal_fail" => Err(JobError::terminal("intentional telemetry test failure")),
             "retry_once" => {
                 if ctx.job.attempt == 1 {
@@ -1370,6 +1375,13 @@ async fn test_failure_path_metrics_reach_prometheus() {
     let duration_count =
         wait_for_metric(&http, "awa_job_duration_seconds_count", 5.0, timeout).await;
     eprintln!("  awa_job_duration_seconds_count = {duration_count}");
+
+    let outputs_recorded =
+        wait_for_metric(&http, "awa_job_output_recorded_total", 1.0, timeout).await;
+    eprintln!("  awa_job_output_recorded_total = {outputs_recorded}");
+    let output_sizes =
+        wait_for_metric(&http, "awa_job_output_size_bytes_count", 1.0, timeout).await;
+    eprintln!("  awa_job_output_size_bytes_count = {output_sizes}");
 
     assert!(completed >= expected_completed as f64);
     assert!(failed >= expected_failed as f64);

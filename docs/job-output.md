@@ -248,7 +248,15 @@ The `awa.output.reason` values:
 - `outcome`, for `Snooze` or `WaitForCallback`;
 - `abandoned`, for a handler cut off past its deadline, or a shutdown that
   ends before the attempt is finalized;
-- `no_claim`.
+- `no_claim`;
+- `too_large` and `invalid`, for each recording the handler made that was
+  rejected (`OutputError::TooLarge` or `OutputError::Invalid`, including a
+  typed slot used on another kind). They count calls rather than attempts,
+  and show up even when the handler ignores the error.
+
+The Grafana dashboard shows these on the "Job Outputs" and "Job Output Size"
+panels, and the `awa_job_output_schema_missing` alert fires while a binary
+drops completion outputs for lack of migration v052.
 
 Warnings about dropped outputs are logged at most once a minute for each kind
 and reason, and once a minute for external completions.

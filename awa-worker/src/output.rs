@@ -27,6 +27,10 @@ pub struct OutputSlot {
 struct Slot {
     sealed: bool,
     value: Option<serde_json::Value>,
+    /// Calls rejected before the slot sealed, counted as dropped outputs
+    /// once it seals.
+    rejected_too_large: u64,
+    rejected_invalid: u64,
 }
 
 impl std::fmt::Debug for OutputSlot {
@@ -104,6 +108,10 @@ impl OutputSlot {
             }
             Err(err) => {
                 slot.value = None;
+                match err {
+                    OutputError::TooLarge { .. } => slot.rejected_too_large += 1,
+                    _ => slot.rejected_invalid += 1,
+                }
                 Err(err)
             }
         }
@@ -131,6 +139,16 @@ impl OutputSlot {
         let mut slot = self.lock();
         slot.sealed = true;
         slot.value.clone()
+    }
+
+    /// How many calls were rejected before the slot sealed, by the reason
+    /// `awa.job.output_dropped` reports.
+    pub(crate) fn rejections(&self) -> [(&'static str, u64); 2] {
+        let slot = self.lock();
+        [
+            ("too_large", slot.rejected_too_large),
+            ("invalid", slot.rejected_invalid),
+        ]
     }
 
     /// Seal the slot for a test harness that finalizes the job itself.
@@ -261,6 +279,13 @@ mod tests {
             Err(OutputError::Invalid(_))
         ));
         assert_eq!(slot.seal(), None);
+        assert_eq!(slot.rejections(), [("too_large", 1), ("invalid", 1)]);
+        // Calls after sealing are not the attempt's rejections.
+        assert!(matches!(
+            slot.set(&"x".repeat(MAX_OUTPUT_BYTES)),
+            Err(OutputError::Sealed)
+        ));
+        assert_eq!(slot.rejections(), [("too_large", 1), ("invalid", 1)]);
     }
 
     #[test]

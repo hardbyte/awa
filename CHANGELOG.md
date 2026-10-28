@@ -92,7 +92,10 @@ for each step.
   Python `complete_external(..., output=...)`, or the HTTP callback body's
   `output` field. Canonical storage discards outputs. New metrics:
   `awa.job.output_recorded`, `awa.job.output_size` and
-  `awa.job.output_dropped`.
+  `awa.job.output_dropped`, whose `too_large` and `invalid` reasons count
+  rejected recordings a handler ignored. The Grafana dashboard gains output
+  panels, and the alert rules an `awa_job_output_schema_missing` warning for a
+  binary running ahead of migration v052.
 - **Typed job outputs.** `#[awa(output = T)]` declares the output type of a
   kind. It implements the new `JobOutput` trait, and with it
   `ctx.typed_output::<K>()`, `JobRow::output_as` / `error_output_as` and
