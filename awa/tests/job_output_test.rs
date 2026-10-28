@@ -787,3 +787,279 @@ async fn rescue_keeps_the_earlier_output_and_a_stale_completion_stores_nothing()
         row.errors
     );
 }
+
+// ── typed outputs ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Thumbnail {
+    width: u32,
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+#[awa(output = Thumbnail)]
+struct Resize {
+    width: u32,
+    fail: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Verdict {
+    approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+#[awa(output = Verdict)]
+struct Review {
+    n: i64,
+}
+
+/// A kind declaring an output publishes its type in the kind descriptor; the
+/// handler records through the typed slot, which refuses another kind's
+/// slot, and readers decode with `output_as` / `error_output_as`.
+#[tokio::test]
+async fn typed_outputs_round_trip_and_publish_their_type() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let queue = "output_typed";
+    let mismatches: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = mismatches.clone();
+    let client = Client::builder(pool.clone())
+        .queue(queue, queue_config())
+        .register::<Resize, _, _>(move |args, ctx| {
+            // The wrong kind's slot fails, and clears like any failed set.
+            match ctx
+                .typed_output::<Review>()
+                .set(&Verdict { approved: true })
+            {
+                Err(OutputError::Invalid(message)) => seen.lock().unwrap().push(message),
+                other => panic!("expected a kind mismatch, got {other:?}"),
+            }
+            assert_eq!(ctx.output(), None);
+            let output = ctx.typed_output::<Resize>();
+            async move {
+                output
+                    .set(&Thumbnail {
+                        width: args.width,
+                        url: format!("https://img/{}", args.width),
+                    })
+                    .unwrap();
+                assert_eq!(output.get().unwrap().unwrap().width, args.width);
+                if args.fail {
+                    return Err(JobError::terminal("thumbnail rejected"));
+                }
+                Ok(JobResult::Completed)
+            }
+        })
+        .job_kind_descriptor::<Review>(awa::JobKindDescriptor::new().display_name("Review"))
+        .build()
+        .unwrap();
+
+    let completed = insert(
+        &pool,
+        &Resize {
+            width: 64,
+            fail: false,
+        },
+        queue,
+        1,
+        &[],
+    )
+    .await;
+    let failed = insert(
+        &pool,
+        &Resize {
+            width: 32,
+            fail: true,
+        },
+        queue,
+        1,
+        &[],
+    )
+    .await;
+    client.start().await.unwrap();
+    let completed = wait_for_state(&pool, completed, JobState::Completed).await;
+    let failed = wait_for_state(&pool, failed, JobState::Failed).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        completed.output_as::<Resize>().unwrap(),
+        Some(Thumbnail {
+            width: 64,
+            url: "https://img/64".to_string()
+        })
+    );
+    let err = completed.output_as::<Review>().unwrap_err();
+    assert!(matches!(err, awa::AwaError::Validation(_)), "{err:?}");
+    assert_eq!(completed.error_output_as::<Resize>().unwrap(), None);
+    assert_eq!(failed.output_as::<Resize>().unwrap(), None);
+    assert_eq!(
+        failed.error_output_as::<Resize>().unwrap().map(|t| t.width),
+        Some(32)
+    );
+    let mismatches = mismatches.lock().unwrap().clone();
+    assert_eq!(mismatches.len(), 2);
+    assert!(
+        mismatches[0].contains("is of kind resize, not review"),
+        "{mismatches:?}"
+    );
+
+    // Both the registered kind and the descriptor-only kind publish their
+    // output type; the hand-written descriptor keeps its other fields.
+    let descriptors =
+        admin::job_kind_descriptors_for_names(&pool, &["resize".to_string(), "review".to_string()])
+            .await
+            .unwrap();
+    assert_eq!(
+        descriptors["resize"].output,
+        Some(awa::OutputDescriptor::new("Thumbnail"))
+    );
+    assert_eq!(
+        descriptors["review"].output,
+        Some(awa::OutputDescriptor::new("Verdict"))
+    );
+    assert_eq!(
+        descriptors["review"].display_name.as_deref(),
+        Some("Review")
+    );
+    let overview = admin::job_kind_overviews(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|kind| kind.kind == "resize")
+        .unwrap();
+    assert_eq!(overview.output, Some(json!({"type": "Thumbnail"})));
+}
+
+/// An explicit output descriptor, such as one carrying a JSON Schema, wins
+/// over the declared type name.
+#[tokio::test]
+async fn an_explicit_output_descriptor_is_kept() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let schema = json!({"type": "object", "required": ["width", "url"]});
+    let client = Client::builder(pool.clone())
+        .queue("output_descriptor", queue_config())
+        .job_kind_descriptor::<Resize>(
+            awa::JobKindDescriptor::new()
+                .output(awa::OutputDescriptor::new("Thumbnail").schema(schema.clone())),
+        )
+        .register::<Resize, _, _>(|_, _| async { Ok(JobResult::Completed) })
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let descriptors = admin::job_kind_descriptors_for_names(&pool, &["resize".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        descriptors["resize"].output,
+        Some(awa::OutputDescriptor::new("Thumbnail").schema(schema))
+    );
+}
+
+struct ReviewWorker;
+
+#[async_trait::async_trait]
+impl awa::Worker for ReviewWorker {
+    fn kind(&self) -> &'static str {
+        Review::kind()
+    }
+
+    async fn perform(&self, ctx: &awa::JobContext) -> Result<JobResult, JobError> {
+        let guard = ctx
+            .register_callback(Duration::from_secs(60))
+            .await
+            .map_err(JobError::retryable)?;
+        Ok(JobResult::WaitForCallback(guard))
+    }
+}
+
+/// `ExternalCompletion::output_for::<T>` completes only a job of kind `T`.
+#[tokio::test]
+async fn typed_external_completion_checks_the_kind() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let queue = "output_typed_external";
+    let client = Client::builder(pool.clone())
+        .queue(queue, queue_config())
+        .register_worker(ReviewWorker)
+        .build()
+        .unwrap();
+    let job = insert(&pool, &Review { n: 1 }, queue, 1, &[]).await;
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, job, JobState::WaitingExternal).await;
+    let callback = parked.callback_id.unwrap();
+
+    let wrong_kind = awa::model::ExternalCompletion::new()
+        .output_for::<Resize>(&Thumbnail {
+            width: 1,
+            url: "x".to_string(),
+        })
+        .unwrap();
+    let err = client
+        .complete_external_with(callback, wrong_kind)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, awa::AwaError::Validation(message) if message.contains("not resize")),
+        "{err:?}"
+    );
+    assert_eq!(
+        admin::get_job(&pool, job).await.unwrap().state,
+        JobState::WaitingExternal,
+        "a mismatched kind completes nothing"
+    );
+
+    let completed = client
+        .complete_external_with(
+            callback,
+            awa::model::ExternalCompletion::new()
+                .output_for::<Review>(&Verdict { approved: true })
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    client.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(
+        completed.output_as::<Review>().unwrap(),
+        Some(Verdict { approved: true })
+    );
+}
+
+/// Before v052 the descriptor catalog has no output column; the sync leaves
+/// the output type out and stores the rest of the descriptor.
+#[tokio::test]
+async fn descriptors_sync_without_the_output_column() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    sqlx::query("ALTER TABLE awa.job_kind_descriptors RENAME COLUMN output TO output_hidden")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let client = Client::builder(pool.clone())
+        .queue("output_old_catalog", queue_config())
+        .job_kind_descriptor::<Resize>(awa::JobKindDescriptor::new().display_name("Resize"))
+        .register::<Resize, _, _>(|_, _| async { Ok(JobResult::Completed) })
+        .build()
+        .unwrap();
+    client.start().await.unwrap();
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let descriptors = admin::job_kind_descriptors_for_names(&pool, &["resize".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        descriptors["resize"].display_name.as_deref(),
+        Some("Resize")
+    );
+    assert_eq!(descriptors["resize"].output, None);
+    let overview = admin::job_kind_overviews(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|kind| kind.kind == "resize")
+        .unwrap();
+    assert_eq!(overview.output, None);
+}

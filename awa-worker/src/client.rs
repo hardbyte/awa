@@ -140,6 +140,9 @@ pub struct ClientBuilder {
     queues: Vec<(String, QueueConfig)>,
     queue_descriptors: HashMap<String, QueueDescriptor>,
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
+    /// Output types declared by `#[awa(output = T)]` on registered args,
+    /// folded into the kind descriptors at build.
+    output_types: HashMap<String, &'static str>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
     enqueue_specs: HashMap<
@@ -205,6 +208,7 @@ impl ClientBuilder {
             queues: Vec::new(),
             queue_descriptors: HashMap::new(),
             job_kind_descriptors: HashMap::new(),
+            output_types: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
             enqueue_specs: HashMap::new(),
@@ -294,8 +298,12 @@ impl ClientBuilder {
     }
 
     /// Attach descriptive metadata to a typed job kind. The kind string is
-    /// taken from [`JobArgs::kind`] on `T`.
-    pub fn job_kind_descriptor<T: JobArgs>(mut self, descriptor: JobKindDescriptor) -> Self {
+    /// taken from [`JobArgs::kind`] on `T`. A descriptor without an output
+    /// type takes the one `T` declares with `#[awa(output = ...)]`.
+    pub fn job_kind_descriptor<T: JobArgs>(mut self, mut descriptor: JobKindDescriptor) -> Self {
+        if descriptor.output.is_none() {
+            descriptor.output = T::output_type().map(awa_model::OutputDescriptor::new);
+        }
         self.job_kind_descriptors
             .insert(T::kind().to_string(), descriptor);
         self
@@ -316,6 +324,7 @@ impl ClientBuilder {
     ///
     /// The worker handles jobs of type `T` where `T: JobArgs + DeserializeOwned`.
     /// The handler function receives the deserialized args and job context.
+    /// An output type `T` declares is published in the kind's descriptor.
     pub fn register<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -323,6 +332,9 @@ impl ClientBuilder {
         Fut: std::future::Future<Output = Result<JobResult, JobError>> + Send + 'static,
     {
         let kind = T::kind().to_string();
+        if let Some(output_type) = T::output_type() {
+            self.output_types.insert(kind.clone(), output_type);
+        }
         let worker = TypedWorker {
             kind: T::kind(),
             handler: Arc::new(handler),
@@ -1181,11 +1193,19 @@ impl ClientBuilder {
             },
         };
 
+        let mut job_kind_descriptors = self.job_kind_descriptors;
+        for (kind, output_type) in self.output_types {
+            let descriptor = job_kind_descriptors.entry(kind).or_default();
+            if descriptor.output.is_none() {
+                descriptor.output = Some(awa_model::OutputDescriptor::new(output_type));
+            }
+        }
+
         Ok(Client {
             pool: self.pool,
             queues: self.queues,
             queue_descriptors: self.queue_descriptors,
-            job_kind_descriptors: self.job_kind_descriptors,
+            job_kind_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
             enqueue_specs: Arc::new(self.enqueue_specs),

@@ -38,7 +38,7 @@ pub use follow_ups::insert_staged_follow_ups_in_tx;
 pub use follow_ups::{FollowUps, StageError, MAX_STAGED_BYTES, MAX_STAGED_FOLLOW_UPS};
 pub use maintenance::RetentionPolicy;
 pub use metrics::AwaMetrics;
-pub use output::{OutputError, OutputSlot, MAX_OUTPUT_BYTES};
+pub use output::{OutputError, OutputSlot, TypedOutputSlot, MAX_OUTPUT_BYTES};
 
 #[cfg(feature = "http-worker")]
 pub use http_worker::{HttpWorker, HttpWorkerConfig, HttpWorkerMode};

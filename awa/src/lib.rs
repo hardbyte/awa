@@ -15,10 +15,10 @@ pub use awa_model::{
     insert_many_copy, insert_many_copy_from_pool, insert_with, map_sqlx_error, migrations,
     partition_for_ordering_key, partition_hash64, prepare_job_insert, prepare_raw_job_insert,
     storage, AttemptError, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow,
-    ExternalCompletion, InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState,
-    ListDlqFilter, PartitionedQueue, PartitionedQueueError, PreparedJobInsert, QueueDescriptor,
-    QueueStorage, QueueStorageConfig, ResolveOutcome, RetryFromDlqOpts, StorageCapability,
-    StorageStatus, UniqueOpts,
+    ExternalCompletion, InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobOutput, JobRow,
+    JobState, ListDlqFilter, OutputDescriptor, PartitionedQueue, PartitionedQueueError,
+    PreparedJobInsert, QueueDescriptor, QueueStorage, QueueStorageConfig, ResolveOutcome,
+    RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
 };
 
 // Re-export worker runtime
@@ -27,7 +27,8 @@ pub use awa_worker::{
     ClientBuilder, CronMissedFirePolicy, EnqueueRequest, FollowUps, HealthCheck, JobContext,
     JobError, JobEvent, JobResult, OutputError, OutputSlot, PeriodicJob, PeriodicJobBuilder,
     QueueCapacity, QueueConfig, QueueHealth, RateLimit, RescueReason, RetentionPolicy, StageError,
-    UntypedJobEvent, Worker, MAX_OUTPUT_BYTES, MAX_STAGED_BYTES, MAX_STAGED_FOLLOW_UPS,
+    TypedOutputSlot, UntypedJobEvent, Worker, MAX_OUTPUT_BYTES, MAX_STAGED_BYTES,
+    MAX_STAGED_FOLLOW_UPS,
 };
 
 #[cfg(feature = "http-worker")]

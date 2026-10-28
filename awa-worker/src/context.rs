@@ -1,9 +1,9 @@
 use crate::enqueue_specs::EnqueueRequest;
 use crate::follow_ups::{FollowUps, StageError};
-use crate::output::{OutputError, OutputSlot};
+use crate::output::{OutputError, OutputSlot, TypedOutputSlot};
 pub use crate::runtime::ProgressState;
 use crate::storage::RuntimeStorage;
-use awa_model::{AwaError, CallbackConfig, JobArgs, JobRow, QueueStorage};
+use awa_model::{AwaError, CallbackConfig, JobArgs, JobOutput, JobRow, QueueStorage};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
@@ -189,6 +189,21 @@ impl JobContext {
     /// `ClientBuilder::register` closure returns.
     pub fn output_slot(&self) -> OutputSlot {
         self.output.clone()
+    }
+
+    /// This attempt's output slot, typed by the output `T` declares with
+    /// `#[awa(output = ...)]`. On a job that is not of kind `T`, every
+    /// `set` on the slot fails with [`OutputError::Invalid`].
+    pub fn typed_output<T: JobOutput>(&self) -> TypedOutputSlot<T::Output> {
+        let mismatch = (self.job.kind != T::kind()).then(|| {
+            format!(
+                "job {} is of kind {}, not {}",
+                self.job.id,
+                self.job.kind,
+                T::kind()
+            )
+        });
+        TypedOutputSlot::new(self.output.clone(), mismatch)
     }
 
     /// Clone the shared cancellation flag for language bridges.

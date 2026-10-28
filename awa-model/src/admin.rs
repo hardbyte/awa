@@ -1307,6 +1307,10 @@ pub struct JobKindDescriptor {
     pub docs_url: Option<String>,
     pub tags: Vec<String>,
     pub extra: serde_json::Value,
+    /// The kind's declared output type (ADR-048). Registering a worker for a
+    /// kind derived with `#[awa(output = T)]` fills this in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<crate::OutputDescriptor>,
 }
 
 impl Default for JobKindDescriptor {
@@ -1318,6 +1322,7 @@ impl Default for JobKindDescriptor {
             docs_url: None,
             tags: Vec::new(),
             extra: serde_json::json!({}),
+            output: None,
         }
     }
 }
@@ -1333,42 +1338,42 @@ pub struct NamedJobKindDescriptor {
 /// [`build_descriptor_upsert`] and the bind loop below.
 const DESCRIPTOR_PARAMS_PER_ROW: u32 = 9;
 
-/// Postgres caps bound parameters at 65535 per statement. 9 params × 7000 rows
-/// = 63k, so chunk below that with a comfortable margin.
+/// Postgres caps bound parameters at 65535 per statement. A job-kind row with
+/// an output descriptor binds 10, so 5000 rows stay at 50k.
 const DESCRIPTOR_BATCH_SIZE: usize = 5000;
 
 /// Build a batched INSERT ... VALUES (...), (...), ... ON CONFLICT upsert for
 /// a descriptor catalog. `table` is `awa.queue_descriptors` or
 /// `awa.job_kind_descriptors`; `pk` is `queue` or `kind`.
-fn build_descriptor_upsert(table: &str, pk: &str, count: usize) -> String {
+fn build_descriptor_upsert(table: &str, pk: &str, count: usize, with_output: bool) -> String {
+    let output_column = if with_output { ", output" } else { "" };
     let mut query = format!(
         "INSERT INTO {table} (\
              {pk}, display_name, description, owner, docs_url, tags, extra, \
-             descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at\
+             descriptor_hash, sync_interval_ms{output_column}, created_at, updated_at, last_seen_at\
          ) VALUES "
     );
+    let params_per_row = DESCRIPTOR_PARAMS_PER_ROW + u32::from(with_output);
     let mut param_index = 1u32;
     for i in 0..count {
         if i > 0 {
             query.push_str(", ");
         }
-        query.push_str(&format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now(), now(), now())",
-            param_index,
-            param_index + 1,
-            param_index + 2,
-            param_index + 3,
-            param_index + 4,
-            param_index + 5,
-            param_index + 6,
-            param_index + 7,
-            param_index + 8,
-        ));
-        param_index += DESCRIPTOR_PARAMS_PER_ROW;
+        query.push('(');
+        for param in 0..params_per_row {
+            query.push_str(&format!("${}, ", param_index + param));
+        }
+        query.push_str("now(), now(), now())");
+        param_index += params_per_row;
     }
     // updated_at only advances when the hash changes — so an untouched
     // descriptor keeps its original `updated_at` timestamp across ticks
     // but still gets a fresh `last_seen_at` for liveness.
+    let output_update = if with_output {
+        "output = EXCLUDED.output, "
+    } else {
+        ""
+    };
     query.push_str(&format!(
         " ON CONFLICT ({pk}) DO UPDATE SET \
              display_name = EXCLUDED.display_name, \
@@ -1377,6 +1382,7 @@ fn build_descriptor_upsert(table: &str, pk: &str, count: usize) -> String {
              docs_url = EXCLUDED.docs_url, \
              tags = EXCLUDED.tags, \
              extra = EXCLUDED.extra, \
+             {output_update}\
              descriptor_hash = EXCLUDED.descriptor_hash, \
              sync_interval_ms = EXCLUDED.sync_interval_ms, \
              updated_at = CASE \
@@ -1412,7 +1418,7 @@ pub async fn sync_queue_descriptors(
             .iter()
             .map(|named| named.descriptor.descriptor_hash())
             .collect();
-        let sql = build_descriptor_upsert("awa.queue_descriptors", "queue", chunk.len());
+        let sql = build_descriptor_upsert("awa.queue_descriptors", "queue", chunk.len(), false);
         let mut query = sqlx::query(audited_sql(sql));
         for (named, hash) in chunk.iter().zip(hashes.iter()) {
             query = query
@@ -1443,13 +1449,23 @@ pub async fn sync_job_kind_descriptors(
         return Ok(());
     }
     let sync_interval_ms = sync_interval.as_millis() as i64;
+    // Migration v052 adds the output column; a binary ahead of it syncs the
+    // rest of the descriptor.
+    let with_output: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+         WHERE attrelid = 'awa.job_kind_descriptors'::regclass \
+           AND attname = 'output' AND NOT attisdropped)",
+    )
+    .fetch_one(pool)
+    .await?;
 
     for chunk in descriptors.chunks(DESCRIPTOR_BATCH_SIZE) {
         let hashes: Vec<String> = chunk
             .iter()
             .map(|named| named.descriptor.descriptor_hash())
             .collect();
-        let sql = build_descriptor_upsert("awa.job_kind_descriptors", "kind", chunk.len());
+        let sql =
+            build_descriptor_upsert("awa.job_kind_descriptors", "kind", chunk.len(), with_output);
         let mut query = sqlx::query(audited_sql(sql));
         for (named, hash) in chunk.iter().zip(hashes.iter()) {
             query = query
@@ -1462,6 +1478,15 @@ pub async fn sync_job_kind_descriptors(
                 .bind(&named.descriptor.extra)
                 .bind(hash.as_str())
                 .bind(sync_interval_ms);
+            if with_output {
+                query = query.bind(
+                    named
+                        .descriptor
+                        .output
+                        .as_ref()
+                        .map(|output| sqlx::types::Json(output.clone())),
+                );
+            }
         }
         query.execute(pool).await?;
     }
@@ -1572,8 +1597,14 @@ impl JobKindDescriptor {
         self
     }
 
+    /// Describe the kind's output (ADR-048).
+    pub fn output(mut self, output: crate::OutputDescriptor) -> Self {
+        self.output = Some(output);
+        self
+    }
+
     pub fn descriptor_hash(&self) -> String {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "display_name": self.display_name,
             "description": self.description,
             "owner": self.owner,
@@ -1581,6 +1612,13 @@ impl JobKindDescriptor {
             "tags": self.tags,
             "extra": canonicalize_json(&self.extra),
         });
+        // Only a declared output joins the hash, so descriptors without one
+        // keep the hash earlier binaries computed.
+        if let Some(output) = &self.output {
+            payload["output"] = canonicalize_json(
+                &serde_json::to_value(output).expect("output descriptor serializes"),
+            );
+        }
         let encoded = serde_json::to_vec(&payload)
             .expect("job kind descriptor JSON serialization should not fail");
         hex::encode(blake3::hash(&encoded).as_bytes())
@@ -1641,6 +1679,8 @@ pub struct JobKindOverview {
     pub docs_url: Option<String>,
     pub tags: Vec<String>,
     pub extra: serde_json::Value,
+    /// The kind's declared output type, from its descriptor (ADR-048).
+    pub output: Option<serde_json::Value>,
     pub descriptor_last_seen_at: Option<DateTime<Utc>>,
     pub descriptor_stale: bool,
     pub descriptor_mismatch: bool,
@@ -2534,8 +2574,11 @@ where
             Option<String>,
             Vec<String>,
             serde_json::Value,
+            Option<serde_json::Value>,
         ),
     >(
+        // `to_jsonb(d) -> 'output'` reads NULL from a schema before
+        // migration v052 instead of failing.
         r#"
         SELECT
             kind,
@@ -2544,8 +2587,9 @@ where
             owner,
             docs_url,
             tags,
-            extra
-        FROM awa.job_kind_descriptors
+            extra,
+            to_jsonb(d) -> 'output' AS output
+        FROM awa.job_kind_descriptors AS d
         WHERE kind = ANY($1)
         "#,
     )
@@ -2556,7 +2600,7 @@ where
     Ok(rows
         .into_iter()
         .map(
-            |(kind, display_name, description, owner, docs_url, tags, extra)| {
+            |(kind, display_name, description, owner, docs_url, tags, extra, output)| {
                 (
                     kind,
                     JobKindDescriptor {
@@ -2566,6 +2610,7 @@ where
                         docs_url,
                         tags,
                         extra,
+                        output: output.and_then(|output| serde_json::from_value(output).ok()),
                     },
                 )
             },
@@ -2946,6 +2991,7 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
                 kd.docs_url,
                 COALESCE(kd.tags, ARRAY[]::text[]) AS tags,
                 COALESCE(kd.extra, '{{}}'::jsonb) AS extra,
+                to_jsonb(kd) -> 'output' AS output,
                 kd.last_seen_at AS descriptor_last_seen_at,
                 CASE
                     WHEN kd.last_seen_at IS NULL THEN FALSE
@@ -3032,6 +3078,7 @@ pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, A
             kd.docs_url,
             COALESCE(kd.tags, ARRAY[]::text[]) AS tags,
             COALESCE(kd.extra, '{}'::jsonb) AS extra,
+            to_jsonb(kd) -> 'output' AS output,
             kd.last_seen_at AS descriptor_last_seen_at,
             CASE
                 WHEN kd.last_seen_at IS NULL THEN FALSE
@@ -3385,6 +3432,9 @@ pub struct ExternalCompletion {
     pub output: Option<serde_json::Value>,
     /// Complete only the attempt with this run lease.
     pub run_lease: Option<i64>,
+    /// The kind [`Self::output_for`] typed the output for; completing a job
+    /// of another kind fails before anything is written.
+    expected_kind: Option<&'static str>,
 }
 
 impl ExternalCompletion {
@@ -3395,7 +3445,22 @@ impl ExternalCompletion {
     /// Store `output` as the job's output.
     pub fn output(mut self, output: serde_json::Value) -> Self {
         self.output = Some(output);
+        self.expected_kind = None;
         self
+    }
+
+    /// Store `output`, typed by the output `T` declares with
+    /// `#[awa(output = ...)]`, as the job's output. The completion fails
+    /// without writing if the job is not of kind `T`.
+    pub fn output_for<T: crate::JobOutput>(
+        mut self,
+        output: &T::Output,
+    ) -> Result<Self, crate::OutputError> {
+        let value = serde_json::to_value(output)
+            .map_err(|err| crate::OutputError::Invalid(err.to_string()))?;
+        self.output = Some(value);
+        self.expected_kind = Some(T::kind());
+        Ok(self)
     }
 
     /// Complete only the attempt with this run lease.
@@ -3464,7 +3529,35 @@ pub async fn complete_external_reporting_output_in_tx(
             .map_err(|err| AwaError::Validation(err.to_string()))?,
         None => None,
     };
-    if let Some(store) = callback_queue_storage_in_tx(tx, callback_id).await? {
+    let store = callback_queue_storage_in_tx(tx, callback_id).await?;
+    if let Some(expected) = opts.expected_kind {
+        let job = match &store {
+            Some(store) => store
+                .callback_job_in_tx(tx, callback_id, opts.run_lease, false)
+                .await?
+                .map(|job| (job.id, job.kind)),
+            None => {
+                sqlx::query_as::<_, (i64, String)>(
+                    "SELECT id, kind FROM awa.jobs_hot \
+                 WHERE callback_id = $1 AND state IN ('waiting_external', 'running') \
+                   AND ($2::bigint IS NULL OR run_lease = $2)",
+                )
+                .bind(callback_id)
+                .bind(opts.run_lease)
+                .fetch_optional(tx.as_mut())
+                .await?
+            }
+        };
+        // A missing job falls through to the completion's own not-found error.
+        if let Some((id, kind)) = job {
+            if kind != expected {
+                return Err(AwaError::Validation(format!(
+                    "job {id} is of kind {kind}, not {expected}"
+                )));
+            }
+        }
+    }
+    if let Some(store) = store {
         let row = store
             .complete_external_with_output_in_tx(tx, callback_id, opts.run_lease, output.clone())
             .await?;

@@ -134,6 +134,49 @@ pub struct JobRow {
     pub output: Option<serde_json::Value>,
 }
 
+impl JobRow {
+    /// This job's completion output, decoded as the output type `T`
+    /// declares (ADR-048). `Ok(None)` when it has none.
+    ///
+    /// Fails when the job is not of `T`'s kind, or when the stored value does
+    /// not decode: another language or an earlier version may have written
+    /// a different shape.
+    pub fn output_as<T: crate::JobOutput>(&self) -> Result<Option<T::Output>, crate::AwaError> {
+        self.decode_output::<T>(self.output.as_ref())
+    }
+
+    /// The output kept in this job's error entries, from the latest failed
+    /// attempt that recorded one, decoded as `T` declares (ADR-048).
+    pub fn error_output_as<T: crate::JobOutput>(
+        &self,
+    ) -> Result<Option<T::Output>, crate::AwaError> {
+        let output = self.errors.iter().flatten().rev().find_map(|entry| {
+            entry
+                .get(crate::output::ERROR_ENTRY_OUTPUT_KEY)
+                .filter(|output| !output.is_null())
+        });
+        self.decode_output::<T>(output)
+    }
+
+    fn decode_output<T: crate::JobOutput>(
+        &self,
+        output: Option<&serde_json::Value>,
+    ) -> Result<Option<T::Output>, crate::AwaError> {
+        if self.kind != T::kind() {
+            return Err(crate::AwaError::Validation(format!(
+                "job {} is of kind {}, not {}",
+                self.id,
+                self.kind,
+                T::kind()
+            )));
+        }
+        output
+            .map(|output| serde_json::from_value(output.clone()))
+            .transpose()
+            .map_err(crate::AwaError::from)
+    }
+}
+
 /// Options for inserting a job.
 #[derive(Debug, Clone)]
 pub struct InsertOpts {

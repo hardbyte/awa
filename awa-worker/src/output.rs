@@ -8,7 +8,9 @@
 
 use awa_model::output::validate_output;
 pub use awa_model::output::{OutputError, MAX_OUTPUT_BYTES};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// A cloneable handle to the current attempt's output.
@@ -135,6 +137,76 @@ impl OutputSlot {
     #[doc(hidden)]
     pub fn seal_for_testing(&self) -> Option<serde_json::Value> {
         self.seal()
+    }
+}
+
+/// An [`OutputSlot`] that accepts only the output type a kind declares with
+/// `#[awa(output = ...)]`.
+///
+/// Obtained from
+/// [`JobContext::typed_output`](crate::JobContext::typed_output). Like the
+/// untyped slot it is cloneable and `'static`.
+pub struct TypedOutputSlot<O> {
+    slot: OutputSlot,
+    /// Set when the slot was asked for on a job of another kind; every
+    /// [`Self::set`] then fails with this message.
+    kind_mismatch: Option<Arc<str>>,
+    _output: PhantomData<fn() -> O>,
+}
+
+impl<O> Clone for TypedOutputSlot<O> {
+    fn clone(&self) -> Self {
+        Self {
+            slot: self.slot.clone(),
+            kind_mismatch: self.kind_mismatch.clone(),
+            _output: PhantomData,
+        }
+    }
+}
+
+impl<O> std::fmt::Debug for TypedOutputSlot<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedOutputSlot")
+            .field("slot", &self.slot)
+            .field("output", &std::any::type_name::<O>())
+            .field("kind_mismatch", &self.kind_mismatch)
+            .finish()
+    }
+}
+
+impl<O: Serialize + DeserializeOwned> TypedOutputSlot<O> {
+    pub(crate) fn new(slot: OutputSlot, kind_mismatch: Option<String>) -> Self {
+        Self {
+            slot,
+            kind_mismatch: kind_mismatch.map(Arc::from),
+            _output: PhantomData,
+        }
+    }
+
+    /// Record this attempt's output, as [`OutputSlot::set`] does. On a job of
+    /// another kind it fails with [`OutputError::Invalid`] and clears the
+    /// slot, like any failed set.
+    pub fn set(&self, output: &O) -> Result<(), OutputError> {
+        match &self.kind_mismatch {
+            Some(message) => Err(self.slot.fail(OutputError::Invalid(message.to_string()))),
+            None => self.slot.set(output),
+        }
+    }
+
+    /// Remove any recorded output, as [`OutputSlot::clear`] does.
+    pub fn clear(&self) {
+        self.slot.clear();
+    }
+
+    /// The output recorded so far, decoded as `O`. A value recorded through
+    /// the untyped slot may not decode.
+    pub fn get(&self) -> Result<Option<O>, serde_json::Error> {
+        self.slot.get().map(serde_json::from_value).transpose()
+    }
+
+    /// The untyped slot underneath.
+    pub fn untyped(&self) -> &OutputSlot {
+        &self.slot
     }
 }
 

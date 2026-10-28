@@ -7,6 +7,43 @@
 
 use serde_json::Value;
 
+/// A job kind's declared output type (ADR-048).
+///
+/// Implemented by `#[derive(JobArgs)]` with `#[awa(output = MyOutput)]`. The
+/// stored output is still JSON, written by any language or version, so every
+/// typed read decodes and can fail; see [`crate::JobRow::output_as`].
+pub trait JobOutput: crate::JobArgs {
+    /// What this kind's handler records as its output.
+    type Output: serde::Serialize + serde::de::DeserializeOwned;
+}
+
+/// How a job kind's output is described to operators, through its kind
+/// descriptor (ADR-048).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct OutputDescriptor {
+    /// The output type's name, as declared in code.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// A JSON Schema for the output, when one is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+}
+
+impl OutputDescriptor {
+    pub fn new(type_name: impl Into<String>) -> Self {
+        Self {
+            type_name: type_name.into(),
+            schema: None,
+        }
+    }
+
+    pub fn schema(mut self, schema: Value) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+}
+
 /// Largest output an attempt may record, in bytes of compact JSON text.
 pub const MAX_OUTPUT_BYTES: usize = 4 * 1024;
 

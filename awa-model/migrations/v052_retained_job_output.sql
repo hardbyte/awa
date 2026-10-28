@@ -2,7 +2,9 @@
 --
 -- Adds `done_entries.output` and `receipt_completion_batches.outputs` to
 -- every queue-storage schema, a NOT VALID cardinality check on the batch
--- array, and a final `output` column on `terminal_jobs`.
+-- array, and a final `output` column on `terminal_jobs`. Also adds
+-- `awa.job_kind_descriptors.output`, the output type a kind declares
+-- (`#[awa(output = T)]`), capped at 64 KiB of JSON text.
 --
 -- This file is the migration tail. `awa migrate` and
 -- `awa migrate --sql --from 51 --to 52` run V23_UP first, which redefines
@@ -19,9 +21,11 @@
 --
 -- Locks: adding a column to a partitioned table takes ACCESS EXCLUSIVE on
 -- the parent and every partition, and replacing the view takes it on the
--- view; all are held until the migration transaction commits. Nothing is
--- scanned or rewritten: the columns are nullable without defaults and the
--- check is NOT VALID. The view is locked before its tables, the order
+-- view; all are held until the migration transaction commits. The
+-- descriptor catalog is locked the same way, for the time it takes to add
+-- the column and check its handful of rows. No job table is scanned or
+-- rewritten: the columns are nullable without defaults and the batch check
+-- is NOT VALID. The view is locked before its tables, the order
 -- terminal_jobs readers take them. When no lock_timeout is set, each lock
 -- acquisition waits at most 2 s. A timeout (SQLSTATE 55P03) or a deadlock
 -- (40P01) rolls the whole migration back and it can be re-run.
@@ -41,6 +45,24 @@ BEGIN
     IF v_previous_lock_timeout = '0' THEN
         PERFORM set_config('lock_timeout', '2s', true);
     END IF;
+
+    BEGIN
+        ALTER TABLE awa.job_kind_descriptors ADD COLUMN IF NOT EXISTS output JSONB;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'awa.job_kind_descriptors'::regclass
+              AND conname = 'job_kind_descriptors_output_size'
+        ) THEN
+            ALTER TABLE awa.job_kind_descriptors
+                ADD CONSTRAINT job_kind_descriptors_output_size
+                CHECK (output IS NULL OR octet_length(output::text) <= 65536);
+        END IF;
+    EXCEPTION
+        WHEN lock_not_available THEN
+            RAISE EXCEPTION 'v052 could not lock awa.job_kind_descriptors within lock_timeout % to add its output column; a runtime''s descriptor sync or a long transaction holds it. Nothing was migrated: re-run it',
+                current_setting('lock_timeout')
+                USING ERRCODE = '55P03';
+    END;
 
     FOR v_schema IN
         SELECT discovered.schema_name FROM awa.queue_storage_schemas() AS discovered

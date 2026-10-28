@@ -48,7 +48,7 @@ pub use insert::{
     insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_prepared, insert_with,
 };
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
-pub use output::{AttemptError, OutputError, MAX_OUTPUT_BYTES};
+pub use output::{AttemptError, JobOutput, OutputDescriptor, OutputError, MAX_OUTPUT_BYTES};
 pub use partitioned_queue::{
     partition_for_ordering_key, partition_hash64, PartitionedQueue, PartitionedQueueError,
 };
@@ -84,6 +84,16 @@ pub trait JobArgs: serde::Serialize {
     /// Serialize to JSON value.
     fn to_args(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(self)
+    }
+
+    /// The name of this kind's declared output type, set by
+    /// `#[awa(output = T)]` (ADR-048). Registering a worker for the kind
+    /// publishes it in the kind's descriptor.
+    fn output_type() -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
     }
 }
 
