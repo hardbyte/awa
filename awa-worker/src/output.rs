@@ -104,7 +104,9 @@ impl OutputSlot {
         }
     }
 
-    /// Remove any recorded output, so the attempt publishes none.
+    /// Remove any recorded output, so the attempt publishes none. After the
+    /// handler returns this does nothing; `set(&())` reports
+    /// [`OutputError::Sealed`] for a caller that needs to know.
     pub fn clear(&self) {
         let mut slot = self.lock();
         if !slot.sealed {
