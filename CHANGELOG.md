@@ -49,6 +49,25 @@ for each step.
 
 ### Added
 
+- **Handler-staged follow-up jobs ([ADR-046](docs/adr/046-handler-staged-follow-ups.md)).**
+  A handler can stage follow-up jobs built from values it computed:
+  `ctx.enqueue_on_completion(request)`, `ctx.follow_ups()` for `register`
+  closures, and `job.enqueue_on_completion(args, **insert_opts)` in Python.
+  They are inserted in the same transaction as the attempt's completion,
+  deduplicated by their own unique keys, and discarded on every other outcome.
+  A failed stage (`StageError`, Python `awa.StagingError`) fails an attempt
+  that still returns `Completed`. Limits are 16 follow-ups and 64 KiB per
+  attempt. Staging is a new reason for an otherwise batchable job to leave
+  the batched completion path; jobs with registered `Completed` specs already
+  complete in their own transaction. New
+  `EnqueueRequest::unique` and `::metadata` set one option without replacing
+  the rest, `awa_model::insert_prepared` inserts a prepared row, and the
+  `awa.job.staged_follow_ups_discarded` counter records follow-ups dropped by
+  `WaitForCallback`. `awa.job.staged_follow_ups_committed` counts the
+  follow-ups of committed completions, `inserted` or `duplicate`, and the
+  Grafana dashboard and alert rules gain a panel and an info alert for them.
+  The Rust and Python test harnesses insert staged
+  follow-ups like the runtime.
 - **Owner-scoped periodic schedules (opt-in, v045,
   [#481](https://github.com/hardbyte/awa/issues/481)).** A client can declare
   the complete set of periodic schedules it owns. awa then adds, updates and

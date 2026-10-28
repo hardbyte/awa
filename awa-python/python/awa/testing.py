@@ -16,15 +16,19 @@ Usage:
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import json
+import operator
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
 import pytest_asyncio
 
 import awa
-from awa._awa import derive_kind
+from awa._awa import _check_run_at as _runtime_check_run_at, derive_kind
 
 # Default test database URL
 DEFAULT_DATABASE_URL = "postgres://postgres:test@localhost:5432/awa_test"
@@ -84,9 +88,183 @@ NoJob = _NoJob()
 T = TypeVar("T")
 
 
+_STAGING_KWARGS = frozenset(
+    {
+        "kind",
+        "queue",
+        "priority",
+        "max_attempts",
+        "tags",
+        "metadata",
+        "run_at",
+        "unique_opts",
+        "ordering_key",
+    }
+)
+
+
+def _compact_len(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
+
+
+def _str_option(kwargs: dict[str, Any], name: str, default: str) -> str:
+    value = kwargs.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise awa.StagingError(f"{name} must be a str, not {type(value).__name__}")
+    return value
+
+
+def _int_option(kwargs: dict[str, Any], name: str, default: int) -> int:
+    # Like the runtime's conversion: anything with __index__, but no floats.
+    value = kwargs.get(name)
+    if value is None:
+        return default
+    try:
+        value = operator.index(value)
+    except TypeError:
+        raise awa.StagingError(
+            f"{name} must be an int, not {type(value).__name__}"
+        ) from None
+    if not -(2**15) <= value < 2**15:
+        raise awa.StagingError(f"{name} {value} does not fit in 16 bits")
+    return value
+
+
+def _tags_option(kwargs: dict[str, Any]) -> list[str]:
+    # Like the runtime's conversion: a sequence of str, but not a str itself.
+    value = kwargs.get("tags")
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise awa.StagingError(
+            f"tags must be a list of str, not {type(value).__name__}"
+        )
+    if not all(isinstance(tag, str) for tag in value):
+        raise awa.StagingError("tags must be a list of str")
+    return list(value)
+
+
+def _check_json(value: Any, name: str) -> None:
+    """Reject what the runtime's JSON conversion or jsonb would reject."""
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise awa.StagingError(f"{name} must not contain NUL characters")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise awa.StagingError(f"{name} keys must be str, not {type(key).__name__}")
+            _check_json(key, name)
+            _check_json(item, name)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_json(item, name)
+
+
+def _validated_size(args: Any, kwargs: dict[str, Any]) -> int:
+    """Apply the runtime's staging rules and return the request's size."""
+    kind = _str_option(kwargs, "kind", "") or derive_kind(type(args).__name__)
+    queue = _str_option(kwargs, "queue", "default")
+    priority = _int_option(kwargs, "priority", 2)
+    max_attempts = _int_option(kwargs, "max_attempts", 25)
+    tags = _tags_option(kwargs)
+    args_json = _args_to_json(args)
+    metadata = kwargs.get("metadata") or {}
+    _check_json(args_json, "args")
+    _check_json(metadata, "metadata")
+    if not 1 <= priority <= 4:
+        raise awa.StagingError(f"priority {priority} is outside 1..=4")
+    if not 1 <= max_attempts <= 1000:
+        raise awa.StagingError(f"max_attempts {max_attempts} is outside 1..=1000")
+    for name, value in (("kind", kind), ("queue", queue)):
+        if len(value) > 200:
+            raise awa.StagingError(f"{name} is longer than 200 characters")
+    if len(tags) > 20:
+        raise awa.StagingError("more than 20 tags")
+    if any("\x00" in value for value in (kind, queue, *tags)):
+        raise awa.StagingError("kind, queue and tags must not contain NUL bytes")
+    ordering_key = kwargs.get("ordering_key") or b""
+    if isinstance(ordering_key, str):
+        ordering_key = ordering_key.encode()
+    if not isinstance(ordering_key, (bytes, bytearray, memoryview)):
+        raise awa.StagingError("ordering_key must be bytes-like or str")
+    _check_unique_opts(kwargs.get("unique_opts"))
+    _check_run_at(kwargs.get("run_at"))
+    return (
+        len(kind.encode())
+        + len(queue.encode())
+        + _compact_len(args_json)
+        + _compact_len(metadata)
+        + sum(len(tag.encode()) for tag in tags)
+        + len(ordering_key)
+    )
+
+
+def _check_unique_opts(unique_opts: Any) -> None:
+    """Mirror the runtime's ``unique_opts`` parsing."""
+    if unique_opts is None:
+        return
+    if not isinstance(unique_opts, dict):
+        raise awa.StagingError("unique_opts must be a dict")
+    for key in ("by_queue", "by_args"):
+        if key in unique_opts and not isinstance(unique_opts[key], bool):
+            raise awa.StagingError(f"unique_opts[{key!r}] must be a bool")
+    by_period = unique_opts.get("by_period")
+    if by_period is not None and not (
+        isinstance(by_period, int) and -(2**63) <= by_period < 2**63
+    ):
+        raise awa.StagingError("unique_opts['by_period'] must be a 64-bit int")
+    states = unique_opts.get("states")
+    if states is not None and not (isinstance(states, int) and 0 <= states <= 255):
+        raise awa.StagingError("unique_opts['states'] must be an int in 0..=255")
+
+
+def _check_run_at(run_at: Any) -> None:
+    """Parse ``run_at`` with the runtime's own parser."""
+    if run_at is None:
+        return
+    try:
+        _runtime_check_run_at(run_at)
+    except Exception as e:
+        raise awa.StagingError(f"run_at is not a valid timestamp: {e}") from e
+
+
+def _snapshot(value: Any) -> Any:
+    """Copy a staged value so later mutation by the handler cannot change it;
+    the runtime serializes what it stages at the call."""
+    if isinstance(value, memoryview):
+        return memoryview(value.tobytes())
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
+def _args_to_json(args: Any) -> Any:
+    if hasattr(args, "model_dump"):
+        return args.model_dump(mode="json")
+    if dataclasses.is_dataclass(args) and not isinstance(args, type):
+        return dataclasses.asdict(args)
+    return args
+
+
+@dataclass
+class StagedFollowUp:
+    """A follow-up staged with ``HandlerJob.enqueue_on_completion``."""
+
+    args: Any
+    kwargs: dict[str, Any]
+
+
 @dataclass
 class HandlerJob(Generic[T]):
-    """Python-side stand-in for the runtime job wrapper used by workers."""
+    """Python-side stand-in for the runtime job wrapper used by workers.
+
+    ``enqueue_on_completion`` applies the runtime's validation and limits and
+    records each request in ``staged``, so handler unit tests can assert on
+    what a handler staged without a database.
+    """
 
     args: T
     id: int
@@ -97,9 +275,47 @@ class HandlerJob(Generic[T]):
     deadline: datetime | None
     metadata: dict[str, Any]
     tags: list[str]
+    staged: list[StagedFollowUp] = field(default_factory=list)
+    staging_error: awa.StagingError | None = None
+    _staged_bytes: int = 0
+    _sealed: bool = False
 
     def is_cancelled(self) -> bool:
         return False
+
+    def enqueue_on_completion(self, args: Any, **kwargs: Any) -> None:
+        unknown = set(kwargs) - _STAGING_KWARGS
+        if unknown:
+            # As at runtime, a bad keyword is a plain TypeError from the call.
+            raise TypeError(f"unexpected keyword arguments: {sorted(unknown)}")
+        if self._sealed:
+            raise awa.StagingError(
+                "the handler already returned; follow-ups can no longer be staged"
+            )
+        try:
+            size = _validated_size(args, kwargs)
+            if len(self.staged) >= awa.MAX_STAGED_FOLLOW_UPS:
+                raise awa.StagingError(
+                    f"too many staged follow-ups (limit {awa.MAX_STAGED_FOLLOW_UPS})"
+                )
+            if self._staged_bytes + size > awa.MAX_STAGED_BYTES:
+                raise awa.StagingError(
+                    f"staged follow-ups exceed {awa.MAX_STAGED_BYTES} bytes"
+                )
+        except awa.StagingError as e:
+            self.staging_error = self.staging_error or e
+            raise
+        except Exception as e:
+            error = awa.StagingError(f"follow-up could not be prepared: {e}")
+            self.staging_error = self.staging_error or error
+            raise error from e
+        self._staged_bytes += size
+        self.staged.append(
+            StagedFollowUp(
+                args=_snapshot(args),
+                kwargs={name: _snapshot(value) for name, value in kwargs.items()},
+            )
+        )
 
 
 @dataclass
@@ -305,6 +521,21 @@ class AwaTestClient:
             job = await _get_job(self._client, job_id)
             return WorkResult(job=job, outcome=new_state, error=str(e))
 
+        # ADR-046, as in the runtime: staging closes when the handler
+        # returns, staged follow-ups ride only on completion, and a
+        # completion after a failed stage fails the attempt terminally.
+        handler_job._sealed = True
+        if result is None and handler_job.staging_error is not None:
+            error = f"a follow-up failed to stage: {handler_job.staging_error}"
+            tx3 = await self._client.transaction()
+            await tx3.execute(
+                "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+                job_id,
+            )
+            await tx3.commit()
+            job = await _get_job(self._client, job_id)
+            return WorkResult(job=job, outcome="failed", error=error)
+
         # Handle return value
         tx3 = await self._client.transaction()
         if result is None:
@@ -313,6 +544,19 @@ class AwaTestClient:
                 "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1",
                 job_id,
             )
+            for staged in handler_job.staged:
+                # A savepoint per insert, so a duplicate unique key is
+                # skipped without aborting the completion.
+                await tx3.execute("SAVEPOINT awa_staged_follow_up")
+                try:
+                    await tx3.insert(staged.args, **staged.kwargs)
+                except awa.UniqueConflict as e:
+                    # Only the deduplication index means "already enqueued".
+                    if "idx_awa_jobs_unique" not in str(e):
+                        raise
+                    await tx3.execute("ROLLBACK TO SAVEPOINT awa_staged_follow_up")
+                else:
+                    await tx3.execute("RELEASE SAVEPOINT awa_staged_follow_up")
             await tx3.commit()
             job = await _get_job(self._client, job_id)
             return WorkResult(job=job, outcome="completed")
