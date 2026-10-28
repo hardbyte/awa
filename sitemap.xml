@@ -273,6 +273,10 @@
          <lastmod>2026-10-28</lastmod>
     </url>
     <url>
+         <loc>https://hardbyte.github.io/awa/adr/048-retained-job-output/</loc>
+         <lastmod>2026-10-28</lastmod>
+    </url>
+    <url>
          <loc>https://hardbyte.github.io/awa/adr/bench/019-queue-storage-validation-2026-04-19/</loc>
          <lastmod>2026-10-28</lastmod>
     </url>
