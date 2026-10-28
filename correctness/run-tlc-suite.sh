@@ -37,7 +37,7 @@ AwaJobOutput.tla              ;; AwaJobOutputEarlyWrite.cfg              ;; Outp
 AwaJobOutput.tla              ;; AwaJobOutputSeparateTx.cfg              ;; ResolvedCompletionHasOutput is violated ;; lost acknowledgement strands an output written after the commit
 AwaJobOutput.tla              ;; AwaJobOutputDrainOnSend.cfg             ;; ResolvedCompletionHasOutput is violated ;; retry after a drained first send loses the output
 AwaJobOutput.tla              ;; AwaJobOutputBatchDrops.cfg              ;; ResolvedCompletionHasOutput is violated ;; batched completion drops the output
-AwaJobOutput.tla              ;; AwaJobOutputUnfenced.cfg                ;; CompletionByCurrentLease is violated ;; stale attempt completes a reclaimed job
+AwaJobOutput.tla              ;; AwaJobOutputUnfenced.cfg                ;; NoOutputFromRescuedAttempt is violated ;; a rescued attempt's output is published after its job is reclaimed
 AwaSegmentedStorage.tla        ;; -                                       ;; pass ;; segmented storage, 1 worker
 AwaSegmentedStorage.tla        ;; AwaSegmentedStorageInterleavings.cfg    ;; pass ;; segmented storage, 2-worker interleavings
 AwaSegmentedStorageRaces.tla   ;; AwaSegmentedStorageRaces.cfg            ;; PrunedLeaseSegmentsAreEmpty is violated|PrunedClaimSegmentsAreEmpty is violated ;; claim/rotate/prune race witness

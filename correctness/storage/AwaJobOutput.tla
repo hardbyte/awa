@@ -33,9 +33,9 @@ Phases == {"idle", "running", "ready", "request", "response", "unknown",
            "publish", "done", "dead"}
 
 VARIABLES state, lease, phase, sealed, held, inFlight, sentOnce, response,
-          completions, failures, output, errs
+          completions, failures, output, errs, rescued
 vars == <<state, lease, phase, sealed, held, inFlight, sentOnce, response,
-          completions, failures, output, errs>>
+          completions, failures, output, errs, rescued>>
 
 NoOutput == [src |-> NoSrc, val |-> NoVal]
 
@@ -52,13 +52,14 @@ Init ==
     /\ failures = {}
     /\ output = [j \in Jobs |-> NoOutput]
     /\ errs = {}
+    /\ rescued = {}
 
 Start(j, l) ==
     /\ state[j] = "running" /\ lease[j] = l
     /\ phase[<<j, l>>] = "idle"
     /\ phase' = [phase EXCEPT ![<<j, l>>] = "running"]
     /\ UNCHANGED <<state, lease, sealed, held, inFlight, sentOnce, response,
-                   completions, failures, output, errs>>
+                   completions, failures, output, errs, rescued>>
 
 \* The handler records v (or nothing) and returns Completed. In "early"
 \* mode recording writes the job's output at once.
@@ -72,7 +73,7 @@ RecordAndComplete(j, l, v) ==
                     THEN [output EXCEPT ![j] = [src |-> a, val |-> v]]
                     ELSE output
     /\ UNCHANGED <<state, lease, inFlight, sentOnce, response, completions,
-                   failures, errs>>
+                   failures, errs, rescued>>
 
 \* The handler records v and fails (an error, panic, cancel or exhaustion).
 \* The executor's lease-guarded failure transition appends the attempt's
@@ -94,7 +95,7 @@ RecordAndFail(j, l, v) ==
     /\ output' = IF OutputMode = "early" /\ v # NoVal
                     THEN [output EXCEPT ![j] = [src |-> a, val |-> v]]
                     ELSE output
-    /\ UNCHANGED <<lease, held, inFlight, sentOnce, response, completions>>
+    /\ UNCHANGED <<lease, held, inFlight, sentOnce, response, completions, rescued>>
 
 \* The first send may use the batched path; retries are direct.
 Send(j, l) ==
@@ -105,14 +106,14 @@ Send(j, l) ==
     /\ held' = IF KeepOutputOnRetry THEN held ELSE [held EXCEPT ![a] = NoVal]
     /\ sentOnce' = [sentOnce EXCEPT ![a] = TRUE]
     /\ UNCHANGED <<state, lease, sealed, response, completions, failures,
-                   output, errs>>
+                   output, errs, rescued>>
 
 AbortRequest(j, l) ==
     LET a == <<j, l>> IN
     /\ phase[a] = "request"
     /\ phase' = [phase EXCEPT ![a] = "unknown"]
     /\ UNCHANGED <<state, lease, sealed, held, inFlight, sentOnce, response,
-                   completions, failures, output, errs>>
+                   completions, failures, output, errs, rescued>>
 
 \* The guarded completion transaction publishes the output in "atomic"
 \* mode, on the direct path always and on the batched path when it carries
@@ -131,7 +132,7 @@ Commit(j, l) ==
     /\ completions' = IF accepted THEN completions \union {a} ELSE completions
     /\ output' = IF publishes THEN [output EXCEPT ![j] = [src |-> a, val |-> req.val]]
                  ELSE output
-    /\ UNCHANGED <<lease, sealed, held, inFlight, sentOnce, failures, errs>>
+    /\ UNCHANGED <<lease, sealed, held, inFlight, sentOnce, failures, errs, rescued>>
 
 LoseResponse(j, l) ==
     LET a == <<j, l>> IN
@@ -139,7 +140,7 @@ LoseResponse(j, l) ==
     /\ phase' = [phase EXCEPT ![a] = "unknown"]
     /\ response' = [response EXCEPT ![a] = "none"]
     /\ UNCHANGED <<state, lease, sealed, held, inFlight, sentOnce,
-                   completions, failures, output, errs>>
+                   completions, failures, output, errs, rescued>>
 
 Acknowledge(j, l) ==
     LET a == <<j, l>> IN
@@ -150,7 +151,7 @@ Acknowledge(j, l) ==
                     THEN "publish" ELSE "done"]
     /\ response' = [response EXCEPT ![a] = "none"]
     /\ UNCHANGED <<state, lease, sealed, held, inFlight, sentOnce,
-                   completions, failures, output, errs>>
+                   completions, failures, output, errs, rescued>>
 
 \* "separate" mode: the output is written in its own step after the
 \* completion was acknowledged.
@@ -160,14 +161,14 @@ SeparatePublish(j, l) ==
     /\ phase' = [phase EXCEPT ![a] = "done"]
     /\ output' = [output EXCEPT ![j] = [src |-> a, val |-> held[a]]]
     /\ UNCHANGED <<state, lease, sealed, held, inFlight, sentOnce, response,
-                   completions, failures, errs>>
+                   completions, failures, errs, rescued>>
 
 Crash(j, l) ==
     LET a == <<j, l>> IN
     /\ phase[a] \in {"running", "ready", "unknown", "publish"}
     /\ phase' = [phase EXCEPT ![a] = "dead"]
     /\ UNCHANGED <<state, lease, sealed, held, inFlight, sentOnce, response,
-                   completions, failures, output, errs>>
+                   completions, failures, output, errs, rescued>>
 
 \* Heartbeat or deadline rescue, from a process that never saw the output.
 \* It may fire while the attempt is alive.
@@ -175,6 +176,7 @@ Rescue(j) ==
     /\ state[j] = "running"
     /\ state' = [state EXCEPT ![j] = IF lease[j] < MaxLease THEN "available" ELSE "failed"]
     /\ errs' = errs \union {[src |-> <<j, lease[j]>>, out |-> NoVal]}
+    /\ rescued' = rescued \union {<<j, lease[j]>>}
     /\ UNCHANGED <<lease, phase, sealed, held, inFlight, sentOnce, response,
                    completions, failures, output>>
 
@@ -186,7 +188,7 @@ ExternalComplete(j, v) ==
     /\ output' = IF v # NoVal THEN [output EXCEPT ![j] = [src |-> Ext, val |-> v]]
                  ELSE output
     /\ UNCHANGED <<lease, phase, sealed, held, inFlight, sentOnce, response,
-                   completions, failures, errs>>
+                   completions, failures, errs, rescued>>
 
 Claim(j) ==
     /\ state[j] = "available"
@@ -194,7 +196,7 @@ Claim(j) ==
     /\ lease' = [lease EXCEPT ![j] = lease[j] + 1]
     /\ state' = [state EXCEPT ![j] = "running"]
     /\ UNCHANGED <<phase, sealed, held, inFlight, sentOnce, response,
-                   completions, failures, output, errs>>
+                   completions, failures, output, errs, rescued>>
 
 Next ==
     \/ \E j \in Jobs, l \in Leases :
@@ -233,6 +235,12 @@ OutputTracesToCommit ==
             \/ /\ output[j].src \in completions
                /\ output[j].val = sealed[output[j].src]
             \/ output[j].src = Ext
+
+\* Nothing a rescued attempt sealed is published, as the job's output or in
+\* an error entry, even after its job is claimed again.
+NoOutputFromRescuedAttempt ==
+    /\ \A j \in Jobs : output[j].src \notin rescued
+    /\ \A e \in errs : e.out # NoVal => e.src \notin rescued
 
 \* Only a completed job has an output.
 OutputOnlyWhenCompleted ==
