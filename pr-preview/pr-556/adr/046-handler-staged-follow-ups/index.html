@@ -2393,7 +2393,7 @@
 <li>Can someone inspect A's result afterwards?</li>
 <li>Does B depend on fetching A's stored result later?</li>
 </ol>
-<p>This ADR answers the first. The second is a separate feature, <a href="#retain-the-result-on-the-job">retained results</a>, which this ADR neither provides nor rules out. The third is what makes a stored result a retention problem, because B might run after A has been pruned. This ADR's answer to it is no: B gets its value in its own args. Today a handler has three ways to pass the value, none adequate:</p>
+<p>This ADR answers the first. The second is a separate feature, retained job output, specified by <a href="https://github.com/hardbyte/awa/pull/565">ADR-048</a>. The third is what makes a stored result a retention problem, because B might run after A has been pruned. This ADR's answer to it is no: B gets its value in its own args. Today a handler has three ways to pass the value, none adequate:</p>
 <ul>
 <li><strong>Write it where a registered spec can read it.</strong> Completion clears the progress buffer before specs run, on both engines. Progress also survives retries by design (<a href="../014-structured-progress/">ADR-014</a>), so a value written by a failed attempt could reach a later attempt's follow-up.</li>
 <li><strong>Insert B from the handler</strong> with <code>insert_with(ctx.pool(), ...)</code> and unique options. B then exists before A commits, survives if A fails or is rescued, and a non-deterministic handler can insert a different B on each attempt.</li>
@@ -2561,7 +2561,7 @@
 <ul>
 <li><strong>A pipeline definition.</strong> Awa stores no relation between A and B. No graph, step list or topology exists in the builder, the schema or the runtime; the only place the "pipeline" exists is the handler's code.</li>
 <li><strong>Fan-in or joins.</strong> Nothing waits for several jobs, or for B to finish. A's handler has returned before B is inserted; A's completion and B's row then become visible together, in one transaction. B's outcome never reaches A.</li>
-<li><strong>Workflow state, or step results that drive other jobs.</strong> A's value travels to B only in B's args, and this ADR records nothing on A. A result retained on A for inspection would not cross this line, provided neither the engine nor another job reads it to decide what runs (see <a href="#retain-the-result-on-the-job">Retain the result on the job</a>).</li>
+<li><strong>Workflow state, or step results that drive other jobs.</strong> A's value travels to B only in B's args, and this ADR records nothing on A. An output retained on A for inspection (<a href="https://github.com/hardbyte/awa/pull/565">ADR-048</a>) does not cross this line, because neither the engine nor another job reads it to decide what runs.</li>
 <li><strong>Guarantees across steps.</strong> Inserting B is part of A's completion: an insert error other than a duplicate key rolls A's completion back (see <a href="#guarantees">Guarantees</a>). Once both have committed, nothing B does affects A. There is no compensation, saga, rollback across jobs, or retry of a chain as a unit.</li>
 <li><strong>Durable execution.</strong> A handler body is never resumed or replayed. A finalize retry repeats the completion transaction for the same attempt with the same sealed follow-ups. A retried attempt runs the handler from the beginning with an empty staging buffer.</li>
 <li><strong>Predicates in the engine.</strong> A conditional follow-up is an <code>if</code> in the handler. The engine inserts the rows it is handed and evaluates no conditions.</li>
@@ -2594,13 +2594,13 @@
 <ul>
 <li>The handler states, in one place, what it produced and what should happen next, with the atomicity ADR-029 gives registered specs.</li>
 <li>No public type changes shape. The additions are new methods and types.</li>
-<li>Fan-out is staging more than once; a conditional follow-up is an <code>if</code> in the handler.</li>
+<li>Staging can create multiple independent follow-ups; a conditional follow-up is an <code>if</code> in the handler.</li>
 <li>Unlike a registered <code>Completed</code> spec, which sends every job of its kind through the per-job transaction, staging sends only the jobs that stage.</li>
 <li>Python gets transactional follow-ups without running Python code inside a database transaction.</li>
 </ul>
 <h3 id="negative">Negative<a class="headerlink" href="#negative" title="Permanent link">&para;</a></h3>
 <ul>
-<li><strong>Coupling.</strong> A's handler now decides what happens next, instead of only reporting what it produced and leaving separately registered logic to decide. Staging buys atomicity and early validation with that coupling. One consequence is that pipeline topology is no longer fully visible in the client builder: a reader must look in handlers for staged follow-ups. A handler that should stay reusable across pipelines can take its request from an injected factory (<code>ctx.extract</code>). A future retained-result feature would restore the "report, don't decide" shape for inspection, but not for dispatch.</li>
+<li><strong>Coupling.</strong> A's handler now decides what happens next, instead of only reporting what it produced and leaving separately registered logic to decide. Staging buys atomicity and early validation with that coupling. One consequence is that pipeline topology is no longer fully visible in the client builder: a reader must look in handlers for staged follow-ups. A handler that should stay reusable across pipelines can take its request from an injected factory (<code>ctx.extract</code>). Retained output (<a href="https://github.com/hardbyte/awa/pull/565">ADR-048</a>) restores the "report, don't decide" shape for inspection, but not for dispatch.</li>
 <li>The staged value is transient. Debugging relies on B's args, and a deduplication skip leaves no trace on A beyond a debug log.</li>
 <li>A job that stages pays a per-job completion transaction and loses the compact completion path.</li>
 </ul>
@@ -2617,29 +2617,15 @@
 <li>Staging is strictly more direct: the handler that has the value builds the request, and the type is checked at compile time.</li>
 </ul>
 <h3 id="retain-the-result-on-the-job">Retain the result on the job<a class="headerlink" href="#retain-the-result-on-the-job" title="Permanent link">&para;</a></h3>
-<p>Not required for this handoff, and not ruled out: retained results are a separate feature. They answer question 2 above; staging answers question 1. The two are compatible. A completing handler could stage B with the value in B's args and also record the value as A's result, in the same guarded completion. B would then never depend on A's result surviving pruning, which is question 3.</p>
+<p>Not required for this handoff, and not ruled out: retained output is a separate feature, specified by <a href="https://github.com/hardbyte/awa/pull/565">ADR-048</a>. It answers question 2 above; staging answers question 1. The two are compatible. A completing handler can stage B with the value in B's args and also record the value as A's output, in the same guarded completion. B then never depends on A's output surviving pruning, which is question 3, and B must not read A's output: a value B needs travels in its args.</p>
 <p>An earlier draft rejected persisted output outright. Its reasons do not hold up as reasons against the feature:</p>
 <ul>
-<li><strong>"The value vanishes when terminal rows are pruned."</strong> That is the expected lifetime of a result kept for inspection, not a defect. It would matter only if B fetched A's result later, and staging puts the value in B's args instead.</li>
-<li><strong>"It starts turning Awa into a results store."</strong> That is a product-scope preference. An opaque, size-bounded result for inspection does not make Awa a workflow engine, by the test in the non-goals section, as long as nothing reads it to drive dispatch.</li>
-<li><strong>"It takes completion off the compact path of <a href="../026-narrow-terminal-history/">ADR-026</a>."</strong> That is a real cost for jobs that record only a result. A job that stages follow-ups has already left the compact path.</li>
-<li><strong>"It widens a stable read surface."</strong> True. Size limits, successful-attempt semantics, visibility and expiry would have to be defined. That is implementation work, not an architectural obstacle.</li>
+<li><strong>"The value vanishes when terminal rows are pruned."</strong> That is the expected lifetime of a value kept for inspection, not a defect. It would matter only if B fetched A's output later, and staging puts the value in B's args instead.</li>
+<li><strong>"It starts turning Awa into a results store."</strong> An opaque, size-bounded output for inspection does not make Awa a workflow engine, by the test in the non-goals section, as long as neither the engine nor another job reads it.</li>
+<li><strong>"It takes completion off the compact path of <a href="../026-narrow-terminal-history/">ADR-026</a>."</strong> Measured, it need not: an array of outputs on the compact batch row keeps the compact path, at about 46 B of WAL per job for a 100-byte output. Only storing it on the general path's terminal row would cost the compact path.</li>
+<li><strong>"It widens a stable read surface."</strong> True, and ADR-048 defines the size limit, the per-attempt semantics, visibility and lifetime.</li>
 </ul>
-<p>Why staging for the handoff, then: the handler already has the value and can construct and validate B directly, before the completion takes its locks. Staging also avoids running Python inside the completion transaction. A result read by a registered spec would need both (see <a href="#an-attempt-scoped-output-slot-on-the-context-read-by-a-registered-spec">An attempt-scoped output slot</a>).</p>
-<p>A retained-result feature needs its own ADR. A sensible starting contract:</p>
-<ul>
-<li><strong>Optional, size-bounded JSON</strong>, set by the handler.</li>
-<li><strong>Published only with the successful attempt's guarded completion.</strong> A value from a failed or superseded attempt is never visible.</li>
-<li><strong>Lives exactly as long as the job is queryable</strong>, and is deleted with it.</li>
-<li><strong>Never read by the scheduler</strong> to drive dependencies or follow-ups.</li>
-</ul>
-<p>Storage differs by engine:</p>
-<ul>
-<li><strong>Canonical</strong> can write the result in its existing completion update.</li>
-<li><strong>Queue storage</strong> has no single mutable job row for a job's whole life, and some completions are stored in compact batches rather than full terminal rows, so the result needs a deliberate representation there.</li>
-<li><strong>Retention.</strong> Queue storage prunes completed history by segment rotation, not by the canonical completed-retention setting. "Same lifetime as the job" is feasible on both engines; a guaranteed retention duration would need more work.</li>
-<li><strong>Cost.</strong> The extra serialization, storage and WAL bytes are real. No benchmark shows that a small optional result is prohibitively expensive, and one should be part of that ADR.</li>
-</ul>
+<p>Why staging for the handoff, then: the handler already has the value and can construct and validate B directly, before the completion takes its locks. Staging also avoids running Python inside the completion transaction. An output read by a registered spec would need both (see <a href="#an-attempt-scoped-output-slot-on-the-context-read-by-a-registered-spec">An attempt-scoped output slot</a>).</p>
 <h3 id="insert-from-the-handler-with-ctxpool">Insert from the handler with <code>ctx.pool()</code><a class="headerlink" href="#insert-from-the-handler-with-ctxpool" title="Permanent link">&para;</a></h3>
 <p>Kept as a documented workaround, rejected as the pattern: B exists before A commits and survives A's failure, and a non-deterministic handler can insert a different B on each attempt.</p>
 <h3 id="wait-for-caller-owned-completion">Wait for caller-owned completion<a class="headerlink" href="#wait-for-caller-owned-completion" title="Permanent link">&para;</a></h3>
@@ -2653,7 +2639,7 @@
 <li><strong>Deadlock-free multi-insert completion.</strong> Acquire every unique claim and enqueue-lane lock a completion needs, registered and staged, in one global order before inserting.</li>
 <li><strong>A deduplication metric</strong> counting follow-ups skipped on an existing key, and <strong>provenance</strong>: stamp each follow-up with the triggering job ID under the reserved <code>awa:</code> metadata namespace so B can be traced to A. Both help answer "why is there no B for this value?"</li>
 <li><strong>Staging for other outcomes</strong>, such as a follow-up on <code>RetryAfter</code>, if a use case appears.</li>
-<li><strong>Retained results</strong>, as a separate ADR, under the contract sketched in <a href="#retain-the-result-on-the-job">Retain the result on the job</a>.</li>
+<li><strong>Retained output</strong>: specified separately by <a href="https://github.com/hardbyte/awa/pull/565">ADR-048</a>.</li>
 </ul>
 
 
