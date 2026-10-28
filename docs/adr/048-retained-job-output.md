@@ -230,7 +230,7 @@ Client::complete_external_with(callback_id, opts)    // also runs registered Com
   - Recording an output does not take a job off the compact path.
 - **General-path completions.** `done_entries` gains a nullable `output jsonb` column. It is separate from `payload`, so the payload-elision rule never touches it. Jobs with tags, unique keys, custom metadata, errors or staged follow-ups already take this path.
 - **Failed attempts.** The output is the `output` key of the attempt's error entry, inside the existing payload. It needs no schema change and is kept even before v052.
-- **Batch size.** A compact batch row is one value, and reading one job's output detoasts the whole array. The completion flush therefore starts a new batch once the recorded outputs in a batch exceed 64 KiB of text.
+- **Batch size.** A compact batch row is one value, and reading one job's output detoasts the whole array. The completion flush therefore starts a new batch row once the recorded outputs in a batch exceed 64 KiB of text. The rows are written in the flush's one transaction, so a flush still commits or fails as a whole.
 
 Only the compact-receipt and general per-job completion paths carry outputs. The completion flush partitions its requests, so requests with a claim always take those paths even when another request in the same flush has none. Queue-storage dispatch always passes a claim today; a request that carries an output and no claim is completed without it and counted as `no_claim`.
 
@@ -262,7 +262,7 @@ Deletion does not erase the bytes:
 - **Compact path.** Deleting a compact-completed job writes a tombstone. The tombstone hides the job and its output from every read, but the bytes stay in the batch row until prune.
 - **Failed outputs.** These live in payloads that earlier ready rows also hold. They too stay until prune.
 
-So the maximum physical residency of an output is the retention window plus slot rotation, plus whatever WAL archives and backups keep.
+So a completion output's maximum physical residency is the retention window plus slot rotation, plus whatever WAL archives and backups keep. A failed output lives as long as the row that carries its error entry: through failed-job retention, through DLQ retention while dead-lettered, and through completed-job retention on a job that later completes. There is no call that erases an output and keeps its job.
 
 Outputs often hold derived data, which can be more sensitive than the args that produced it. Keep secrets and personal data out of them. Erasing an output on delete is listed under [Open extensions](#open-extensions).
 
@@ -271,12 +271,12 @@ Outputs often hold derived data, which can be more sensitive than the args that 
 Outputs are never logged, and `OutputError` messages name the type and position of a failure, not the value. Metrics:
 
 - `awa.job.output_recorded`, a counter with the existing `awa.job.kind` and `awa.job.queue` attributes and `awa.job.outcome` (`completed` or `failed`);
-- `awa.job.output_bytes`, a histogram of text bytes;
+- `awa.job.output_size`, a histogram of text bytes;
 - `awa.job.output_dropped`, a counter with `awa.job.kind`, `awa.job.queue` and `awa.output.reason`: `canonical`, `schema_missing`, `outcome` (`Snooze` or `WaitForCallback`), `abandoned` or `no_claim`.
 
 Invalid and oversized values never reach the slot; the handler sees the error.
 
-Warnings for dropped outputs are rate-limited to one per kind per minute. The Grafana dashboard gains recorded and dropped panels. A sustained `schema_missing` rate means a binary is running ahead of its migration.
+Warnings for dropped outputs are rate-limited to one per kind and reason per minute, and external-completion drops to one per minute. The Grafana dashboard gains recorded and dropped panels. A sustained `schema_missing` rate means a binary is running ahead of its migration.
 
 ### Testing
 
@@ -326,9 +326,9 @@ The tail, per schema:
 - adds the `NOT VALID` check;
 - replaces the `terminal_jobs` view.
 
-**Locking.** Adding a column to a partitioned parent takes an `ACCESS EXCLUSIVE` lock on the parent and every partition, and replacing the view takes one on the view, even on a re-run. The runner applies the whole pending range in one transaction, so these locks are held until it commits; while they are held, completions and `terminal_jobs` reads wait. When no `lock_timeout` is set, the tail sets 2 s and restores the previous value afterwards, as v050 does, so a busy system fails the migration fast instead of stalling the fleet. A timeout rolls back every pending migration, which can then be re-run. Nothing is rewritten or scanned.
+**Locking.** Adding a column to a partitioned parent takes an `ACCESS EXCLUSIVE` lock on the parent and every partition, and replacing the view takes one on the view, even on a re-run. The runner applies the whole pending range in one transaction, so these locks are held until it commits; while they are held, completions and `terminal_jobs` reads wait. The helper locks `terminal_jobs` before its tables, the order readers take them, so a read that starts mid-migration waits rather than deadlocking. When no `lock_timeout` is set, the tail sets 2 s and restores the previous value afterwards, as v050 does, so a busy system fails the migration fast instead of stalling the fleet. A timeout or deadlock rolls back every pending migration, which can then be re-run. Nothing is rewritten or scanned.
 
-**Migrate first.** N−1 binaries insert with explicit column lists, so they write NULL. They read `terminal_jobs` by explicit column, so they ignore the new one.
+**Migrate first.** N−1 binaries insert with explicit column lists, so they write NULL. They read `terminal_jobs` by explicit column, so they ignore the new one. They do not strip failed outputs from the row they dispatch, so while versions are mixed an N−1 worker that claims a retry sees the previous attempt's output in `errors`.
 
 **Binary first.**
 
