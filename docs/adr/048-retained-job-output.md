@@ -76,6 +76,8 @@ impl JobContext {
 pub struct OutputSlot { /* Arc to the attempt's output slot */ }
 impl OutputSlot {
     pub fn set<T: Serialize + ?Sized>(&self, output: &T) -> Result<(), OutputError>;
+    /// After the handler returns this does nothing; `set(&())` reports
+    /// `Sealed` for a caller that needs to know.
     pub fn clear(&self);
     pub fn get(&self) -> Option<serde_json::Value>;
 }
