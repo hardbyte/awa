@@ -220,18 +220,21 @@ async fn insert_follow_up<F: JobArgs>(
     }
     let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
     let inserted = insert_with(&mut *savepoint, args, opts).await.map(|_| ());
-    settle_follow_up_savepoint(savepoint, inserted, trigger, F::kind()).await
+    settle_follow_up_savepoint(savepoint, inserted, trigger, F::kind())
+        .await
+        .map(|_| ())
 }
 
 /// Insert one handler-staged follow-up (ADR-046) inside the completion
 /// transaction, with the same duplicate handling as [`insert_follow_up`].
+/// Returns whether the row was inserted rather than skipped as a duplicate.
 async fn insert_staged_follow_up(
     conn: &mut PgConnection,
     trigger: &JobRow,
     row: &PreparedJobInsert,
-) -> Result<(), AwaError> {
+) -> Result<bool, AwaError> {
     if row.unique_key().is_none() {
-        return insert_prepared(&mut *conn, row).await.map(|_| ());
+        return insert_prepared(&mut *conn, row).await.map(|_| true);
     }
     let mut savepoint = conn.begin().await.map_err(map_sqlx_error)?;
     let inserted = insert_prepared(&mut *savepoint, row).await.map(|_| ());
@@ -239,15 +242,20 @@ async fn insert_staged_follow_up(
 }
 
 /// Release the savepoint around a unique follow-up insert, or roll it back
-/// and skip the follow-up when its key already exists.
+/// and skip the follow-up when its key already exists. Returns whether the
+/// follow-up was inserted.
 async fn settle_follow_up_savepoint(
     savepoint: sqlx::Transaction<'_, sqlx::Postgres>,
     inserted: Result<(), AwaError>,
     trigger: &JobRow,
     follow_up_kind: &str,
-) -> Result<(), AwaError> {
+) -> Result<bool, AwaError> {
     match inserted {
-        Ok(()) => savepoint.commit().await.map_err(map_sqlx_error),
+        Ok(()) => savepoint
+            .commit()
+            .await
+            .map_err(map_sqlx_error)
+            .map(|()| true),
         Err(AwaError::UniqueConflict { constraint })
             if is_duplicate_follow_up(constraint.as_deref()) =>
         {
@@ -259,7 +267,7 @@ async fn settle_follow_up_savepoint(
                 constraint = constraint.as_deref().unwrap_or(""),
                 "Follow-up already enqueued; skipping the duplicate"
             );
-            Ok(())
+            Ok(false)
         }
         Err(err) => Err(err),
     }
@@ -504,15 +512,27 @@ pub(crate) async fn dispatch_specs_in_tx(
 
 /// Insert the follow-ups a handler staged (ADR-046), in staging order, inside
 /// the attempt's completion transaction. Runs after the registered specs.
+/// What a completion's staged follow-ups came to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StagedInserts {
+    pub(crate) inserted: u64,
+    pub(crate) duplicates: u64,
+}
+
 pub(crate) async fn insert_staged_in_tx(
     conn: &mut PgConnection,
     job: &JobRow,
     staged: &[PreparedJobInsert],
-) -> Result<(), AwaError> {
+) -> Result<StagedInserts, AwaError> {
+    let mut counts = StagedInserts::default();
     for row in staged {
-        insert_staged_follow_up(conn, job, row).await?;
+        if insert_staged_follow_up(conn, job, row).await? {
+            counts.inserted += 1;
+        } else {
+            counts.duplicates += 1;
+        }
     }
-    Ok(())
+    Ok(counts)
 }
 
 #[cfg(test)]

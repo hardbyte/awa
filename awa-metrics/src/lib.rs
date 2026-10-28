@@ -35,6 +35,7 @@ pub mod names {
     pub const COMPLETION_DEADLOCK_RETRY: &str = "awa.completion.deadlock_retry";
     pub const COMPLETION_RECONNECT_RETRY: &str = "awa.completion.reconnect_retry";
     pub const STAGED_FOLLOW_UPS_DISCARDED: &str = "awa.job.staged_follow_ups_discarded";
+    pub const STAGED_FOLLOW_UPS_COMMITTED: &str = "awa.job.staged_follow_ups_committed";
     pub const JOB_CANCELLED: &str = "awa.job.cancelled";
     pub const JOB_CLAIMED: &str = "awa.job.claimed";
     pub const JOB_DURATION: &str = "awa.job.duration";
@@ -123,6 +124,10 @@ pub struct AwaMetrics {
     /// Follow-ups a handler staged (ADR-046) and then discarded by returning
     /// `WaitForCallback`, which parks the job without completing it.
     pub staged_follow_ups_discarded: Counter<u64>,
+    /// Staged follow-ups (ADR-046) whose completion committed, by
+    /// `awa.follow_up.result`: `inserted`, or `duplicate` when a job with
+    /// the same unique key already existed.
+    pub staged_follow_ups_committed: Counter<u64>,
     /// Total jobs cancelled.
     pub jobs_cancelled: Counter<u64>,
     /// Total jobs claimed (dequeued) for execution.
@@ -317,6 +322,13 @@ impl AwaMetrics {
                 .u64_counter(names::STAGED_FOLLOW_UPS_DISCARDED)
                 .with_description(
                     "Number of staged follow-ups discarded because the handler parked the job with WaitForCallback",
+                )
+                .with_unit("{follow_up}")
+                .build(),
+            staged_follow_ups_committed: meter
+                .u64_counter(names::STAGED_FOLLOW_UPS_COMMITTED)
+                .with_description(
+                    "Number of staged follow-ups whose completion committed, inserted or skipped as duplicates",
                 )
                 .with_unit("{follow_up}")
                 .build(),
@@ -618,6 +630,27 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
         ];
         self.staged_follow_ups_discarded.add(count, &attrs);
+    }
+
+    /// Record the staged follow-ups of a completion that committed. `kind`
+    /// and `queue` are the completed job's.
+    pub fn record_staged_follow_ups_committed(
+        &self,
+        kind: &str,
+        queue: &str,
+        inserted: u64,
+        duplicates: u64,
+    ) {
+        for (result, count) in [("inserted", inserted), ("duplicate", duplicates)] {
+            if count > 0 {
+                let attrs = [
+                    opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+                    opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+                    opentelemetry::KeyValue::new("awa.follow_up.result", result),
+                ];
+                self.staged_follow_ups_committed.add(count, &attrs);
+            }
+        }
     }
 
     pub fn record_job_retried(&self, kind: &str, queue: &str) {
