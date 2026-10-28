@@ -28,7 +28,7 @@ from typing import Any, Awaitable, Callable, Generic, TypeVar
 import pytest_asyncio
 
 import awa
-from awa._awa import _validate_output, derive_kind
+from awa._awa import _decode_output, _validate_output, derive_kind
 
 # Default test database URL
 DEFAULT_DATABASE_URL = "postgres://postgres:test@localhost:5432/awa_test"
@@ -86,6 +86,7 @@ NoJob = _NoJob()
 """Singleton sentinel used as WorkResult.job when no job was found."""
 
 T = TypeVar("T")
+O = TypeVar("O")
 
 
 _STAGING_KWARGS = frozenset(
@@ -275,6 +276,8 @@ class HandlerJob(Generic[T]):
     _staged_bytes: int = 0
     _sealed: bool = False
     _output: Any = field(default=None, repr=False)
+    # The type given to `task(..., output=...)`, which `set_output` checks.
+    output_type: Any = field(default=None, repr=False)
 
     def is_cancelled(self) -> bool:
         return False
@@ -294,7 +297,7 @@ class HandlerJob(Generic[T]):
                 "the handler already returned; its output can no longer be recorded"
             )
         try:
-            self._output = _validate_output(value)
+            self._output = _validate_output(value, self.output_type)
         except awa.OutputError:
             self._output = None
             raise
@@ -302,6 +305,10 @@ class HandlerJob(Generic[T]):
     def clear_output(self) -> None:
         if not self._sealed:
             self._output = None
+
+    def output_as(self, tp: type[O]) -> O | None:
+        """The recorded output decoded as ``tp``, as ``Job.output_as`` does."""
+        return _decode_output(tp, self._output)
 
     def enqueue_on_completion(self, args: Any, **kwargs: Any) -> None:
         unknown = set(kwargs) - _STAGING_KWARGS
@@ -419,8 +426,12 @@ class AwaTestClient:
         *,
         kind: str | None = None,
         queue: str = "default",
+        output: Any = None,
     ) -> WorkResult:
         """Claim and execute a single job of the given type.
+
+        ``output`` is the type the handler's task declares, which
+        ``set_output`` checks as the runtime does.
 
         Claims one available job matching the kind and queue, deserializes
         args, calls the handler, and updates the job state.
@@ -509,6 +520,7 @@ class AwaTestClient:
             deadline=deadline,
             metadata=row.get("metadata") or {},
             tags=row.get("tags") or [],
+            output_type=output,
         )
 
         # Execute handler

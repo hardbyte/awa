@@ -236,3 +236,108 @@ async def test_test_client_reports_the_sealed_output(tc):
     snoozed = await tc.work_one(Summarize, handler=snooze)
     assert snoozed.outcome == "snoozed"
     assert snoozed.output is None
+
+
+@dataclass
+class Thumbnail:
+    width: int
+    url: str
+
+
+@dataclass
+class Resize:
+    width: int
+    fail: bool = False
+
+
+async def kind_descriptor_output(client, kind: str):
+    tx = await client.transaction()
+    try:
+        row = await tx.fetch_one(
+            "SELECT output::text AS output FROM awa.job_kind_descriptors WHERE kind = $1",
+            kind,
+        )
+    finally:
+        await tx.rollback()
+    return row["output"]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_output_type_is_checked_decoded_and_published(client):
+    queue = "output_py_typed"
+    refused = []
+
+    @client.task(Resize, queue=queue, output=Thumbnail)
+    async def resize(job):
+        try:
+            job.set_output({"width": job.args.width, "url": "untyped"})
+        except awa.OutputError as e:
+            refused.append(str(e))
+        assert job.output is None
+        job.set_output(Thumbnail(width=job.args.width, url=f"https://img/{job.args.width}"))
+        assert job.output_as(Thumbnail) == Thumbnail(
+            width=job.args.width, url=f"https://img/{job.args.width}"
+        )
+        if job.args.fail:
+            raise awa.TerminalError("rejected")
+
+    done = await client.insert(Resize(width=64), queue=queue)
+    failed = await client.insert(Resize(width=32, fail=True), queue=queue, max_attempts=1)
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
+    done = await wait_for_state(client, done.id, "completed")
+    failed = await wait_for_state(client, failed.id, "failed")
+    await client.shutdown()
+
+    assert len(refused) == 2 and "Thumbnail" in refused[0], refused
+    assert done.output_as(Thumbnail) == Thumbnail(width=64, url="https://img/64")
+    assert done.error_output_as(Thumbnail) is None
+    assert failed.output_as(Thumbnail) is None
+    assert failed.error_output_as(Thumbnail) == Thumbnail(width=32, url="https://img/32")
+    with pytest.raises(TypeError):
+        done.output_as(int)
+
+    descriptor = await kind_descriptor_output(client, "resize")
+    import json
+
+    published = json.loads(descriptor)
+    assert published["type"] == "Thumbnail"
+
+
+@pytest.mark.asyncio
+async def test_a_pydantic_output_publishes_its_schema(client):
+    pydantic = pytest.importorskip("pydantic")
+
+    class Verdict(pydantic.BaseModel):
+        approved: bool
+
+    queue = "output_py_pydantic"
+
+    @client.task(Summarize, queue=queue, output=Verdict)
+    async def review(job):
+        job.set_output(Verdict(approved=True))
+
+    job = await client.insert(Summarize(n=1), queue=queue)
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
+    done = await wait_for_state(client, job.id, "completed")
+    await client.shutdown()
+
+    assert done.output_as(Verdict) == Verdict(approved=True)
+    import json
+
+    published = json.loads(await kind_descriptor_output(client, "summarize"))
+    assert published["type"] == "Verdict"
+    assert published["schema"]["properties"]["approved"]["type"] == "boolean"
+
+
+def test_handler_job_checks_the_declared_output_type():
+    job = handler_job(output_type=Thumbnail)
+    with pytest.raises(awa.OutputError):
+        job.set_output({"width": 1, "url": "x"})
+    assert job.output is None
+    job.set_output(Thumbnail(width=1, url="x"))
+    assert job.output == {"width": 1, "url": "x"}
+    assert job.output_as(Thumbnail) == Thumbnail(width=1, url="x")
+    # A type isinstance cannot check is not enforced.
+    generic = handler_job(output_type=list[int])
+    generic.set_output([1, 2])
+    assert generic.output_as(list) == [1, 2]

@@ -169,6 +169,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OutputError", m.py().get_type::<OutputError>())?;
     m.add("MAX_OUTPUT_BYTES", awa_worker::MAX_OUTPUT_BYTES)?;
     m.add_function(wrap_pyfunction!(job::validate_output, m)?)?;
+    m.add_function(wrap_pyfunction!(job::decode_output_py, m)?)?;
     m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
     m.add("CallbackNotFound", m.py().get_type::<CallbackNotFound>())?;
 

@@ -36,6 +36,7 @@ pub struct PythonWorker {
     kind: &'static str,
     handler: Py<PyAny>,
     args_type: Py<PyAny>,
+    output_type: Option<Py<PyAny>>,
     task_locals: pyo3_async_runtimes::TaskLocals,
 }
 
@@ -45,6 +46,7 @@ impl PythonWorker {
             kind: Box::leak(entry.kind.clone().into_boxed_str()),
             handler: entry.handler.clone_ref(py),
             args_type: entry.args_type.clone_ref(py),
+            output_type: entry.output_type.as_ref().map(|tp| tp.clone_ref(py)),
             task_locals: entry.task_locals.clone(),
         })
     }
@@ -60,8 +62,11 @@ impl Worker for PythonWorker {
         let handler = Python::attach(|py| self.handler.clone_ref(py));
         let args_type = Python::attach(|py| self.args_type.clone_ref(py));
         let task_locals = self.task_locals.clone();
-        let py_job = Python::attach(|py| build_dispatch_job(py, ctx.job.clone(), &args_type, ctx))
-            .map_err(|err| classify_python_error(err, true))?;
+        let py_job = Python::attach(|py| {
+            let output_type = self.output_type.as_ref().map(|tp| tp.clone_ref(py));
+            build_dispatch_job(py, ctx.job.clone(), &args_type, output_type, ctx)
+        })
+        .map_err(|err| classify_python_error(err, true))?;
 
         // Hand the handler the trace context to attach: the execution span's
         // own context when a Rust trace pipeline is installed (Python spans
@@ -94,6 +99,7 @@ fn build_dispatch_job(
     py: Python<'_>,
     job_row: JobRow,
     args_type: &Py<PyAny>,
+    output_type: Option<Py<PyAny>>,
     ctx: &JobContext,
 ) -> PyResult<Py<PyAny>> {
     let args_json = json_to_py(py, &job_row.args)?;
@@ -120,6 +126,7 @@ fn build_dispatch_job(
         ctx.progress_buffer(),
         ctx.follow_ups(),
         ctx.output_slot(),
+        output_type,
     );
     Ok(Py::new(py, job)?.into_bound(py).into_any().unbind())
 }

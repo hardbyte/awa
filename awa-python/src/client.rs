@@ -399,6 +399,11 @@ pub struct WorkerEntry {
     pub kind: String,
     pub handler: Py<PyAny>,
     pub args_type: Py<PyAny>,
+    /// The output type given to `task(..., output=...)`, which `set_output`
+    /// checks values against.
+    pub output_type: Option<Py<PyAny>>,
+    /// Published as the kind descriptor's output.
+    pub output_descriptor: Option<awa_model::OutputDescriptor>,
     pub queue: String,
     pub task_locals: pyo3_async_runtimes::TaskLocals,
 }
@@ -409,6 +414,8 @@ impl Clone for WorkerEntry {
             kind: self.kind.clone(),
             handler: self.handler.clone_ref(py),
             args_type: self.args_type.clone_ref(py),
+            output_type: self.output_type.as_ref().map(|tp| tp.clone_ref(py)),
+            output_descriptor: self.output_descriptor.clone(),
             queue: self.queue.clone(),
             task_locals: self.task_locals.clone(),
         })
@@ -709,14 +716,25 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (args_type, *, kind=None, queue="default".to_string()))]
+    #[pyo3(signature = (args_type, *, kind=None, queue="default".to_string(), output=None, output_descriptor=None))]
     fn worker(
         &self,
         py: Python<'_>,
         args_type: Py<PyAny>,
         kind: Option<String>,
         queue: String,
+        output: Option<Py<PyAny>>,
+        output_descriptor: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        let output_descriptor = output_descriptor
+            .map(|descriptor| {
+                serde_json::from_value::<awa_model::OutputDescriptor>(py_to_json(
+                    py,
+                    descriptor.bind(py),
+                )?)
+                .map_err(|err| validation_error(format!("invalid output descriptor: {err}")))
+            })
+            .transpose()?;
         let workers = self.workers.clone();
         let kind_str = kind.unwrap_or_else(|| {
             Python::attach(|py| {
@@ -741,6 +759,8 @@ impl PyClient {
                     kind: kind_str.clone(),
                     handler: handler_py.clone_ref(py),
                     args_type: args_type.clone_ref(py),
+                    output_type: output.as_ref().map(|tp| tp.clone_ref(py)),
+                    output_descriptor: output_descriptor.clone(),
                     queue: queue.clone(),
                     task_locals: crate::async_bridge::get_current_locals(py)?,
                 };
@@ -2046,11 +2066,19 @@ impl PyClient {
         for (queue, descriptor) in queue_descriptors {
             builder = builder.queue_descriptor(queue, descriptor);
         }
-        let job_kind_descriptors = self
+        let mut job_kind_descriptors = self
             .job_kind_descriptors
             .lock()
             .expect("job_kind_descriptors mutex poisoned")
             .clone();
+        for entry in &entries {
+            if let Some(output) = &entry.output_descriptor {
+                let descriptor = job_kind_descriptors.entry(entry.kind.clone()).or_default();
+                if descriptor.output.is_none() {
+                    descriptor.output = Some(output.clone());
+                }
+            }
+        }
         for (kind, descriptor) in job_kind_descriptors {
             builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
