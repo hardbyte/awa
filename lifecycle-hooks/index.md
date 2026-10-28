@@ -129,12 +129,50 @@ Give the follow-up unique options to collapse duplicates. When several triggers 
 
 ```rust
 .on_completed_enqueue_with::<StageA, StageB, _>(|args, _job| {
-    EnqueueRequest::new(StageB { item_id: args.item_id }).with_opts(InsertOpts {
-        unique: Some(UniqueOpts::default()),
-        ..Default::default()
-    })
+    EnqueueRequest::new(StageB { item_id: args.item_id }).unique(UniqueOpts::default())
 })
 ```
+
+`.unique()` and `.metadata()` set one option each. `with_opts` replaces every option, including an earlier `.queue()` or `.priority()`.
+
+### Handler-staged follow-ups
+
+Registered specs see only the trigger's args and job row. When the follow-up needs a value the handler computes, such as the ID of the item it resolved, the handler stages the follow-up itself ([ADR-046](../adr/046-handler-staged-follow-ups/index.md)):
+
+```rust
+.register::<StageA, _, _>(|args, ctx| {
+    // A cloneable handle: the returned future cannot borrow `ctx`.
+    let follow_ups = ctx.follow_ups();
+    async move {
+        let item_id = resolve_item(&args).await?;
+        follow_ups.enqueue_on_completion(
+            EnqueueRequest::new(StageB { item_id }).unique(UniqueOpts::default()),
+        )?;
+        Ok(JobResult::Completed)
+    }
+})
+```
+
+A `Worker` impl can call `ctx.enqueue_on_completion(..)` directly. In Python, the job passed to the handler has the same method, with the keyword arguments of `Transaction.insert`:
+
+```python
+@client.task(StageA, queue="stage_a")
+async def resolve(job):
+    item_id = await resolve_item(job.args)
+    job.enqueue_on_completion(StageB(item_id=item_id), unique_opts={})
+```
+
+Staged follow-ups are inserted in the same transaction as the attempt's completion, after any registered `Completed` specs, with the same [deduplication](#deduplicating-follow-ups). The rules:
+
+- **Only `Completed` inserts them.** `RetryAfter`, `Snooze`, `Cancel`, an error, a panic, a rescued or superseded attempt, and `Client::complete_external` all discard them. A retried attempt starts empty and stages again when its handler re-runs. `WaitForCallback` discards them with a warning and the `awa.job.staged_follow_ups_discarded` counter; to build a follow-up from a callback payload, wait with `ctx.wait_for_callback` inside the handler, then stage.
+- **A failed stage fails the attempt.** Staging serializes the args, checks the limits, and rejects anything the insert would reject (priority outside 1–4, `max_attempts` outside 1–1000, kind or queue names over 200 characters, more than 20 tags, NUL bytes, a `run_at` outside the years 1–9999), returning `StageError` (Python: `awa.StagingError`, a `TerminalError`, also raised when args or options do not convert). If the handler ignores the error and returns `Completed`, the attempt fails terminally instead of completing without its follow-up.
+- **Staging closes when the handler returns.** A task the handler spawned and did not await gets `StageError::Sealed`.
+- **Limits per attempt:** 16 follow-ups and 64 KiB of serialized requests, counting kind, queue, args, metadata, tags and ordering key (`MAX_STAGED_FOLLOW_UPS`, `MAX_STAGED_BYTES`). Larger fan-out belongs in a dedicated fan-out job.
+- **Cost.** A job that stages takes a per-job completion transaction instead of the batched path; jobs that stage nothing are unaffected.
+- **Metrics.** `awa.job.staged_follow_ups_committed` counts the follow-ups of committed completions by `awa.follow_up.result`: `inserted`, or `duplicate` when a job with the same unique key already existed. The Grafana dashboard's "Staged Follow-ups" panel shows both beside the discards.
+- **Deploy order.** A worker that does not know the follow-up's kind fails it terminally. Deploy the workers that handle the follow-up first, or put it on a queue only they poll.
+
+The test harnesses behave the same way: `awa_testing::TestClient::work_one` and Python's `AwaTestClient.work_one` insert staged follow-ups when the handler completes, and `awa.testing.HandlerJob` records them in `job.staged` for unit tests without a database.
 
 ### Atomicity guarantees
 
@@ -152,7 +190,8 @@ Rescue stays best-effort by design: making it atomic would couple rescue livenes
 
 - **Observation** (metrics, traces, alerts) → `on_event` — cheap, in-process, acceptable to drop a sample on a crash.
 - **Side effect that must survive a crash** (send email, persist record, kick off downstream work) → `on_*_enqueue` — slightly more expensive (it's an Awa job) but durable, retried, DLQ'd, and visible in admin.
+- **Follow-up built from a value the handler computes** → stage it with `enqueue_on_completion`. It has the same atomicity as `on_completed_enqueue`, only for `Completed`.
 
 If you can't tell which you want, use `on_*_enqueue`. The cost of an unnecessary follow-up is bounded; the cost of a lost reliable side effect is not.
 
-See [ADR-015](../adr/015-post-commit-lifecycle-hooks/index.md) for hook rationale, and [ADR-029](../adr/029-transactional-followup-jobs/index.md) for the follow-up enqueue design and atomicity matrix.
+See [ADR-015](../adr/015-post-commit-lifecycle-hooks/index.md) for hook rationale, [ADR-029](../adr/029-transactional-followup-jobs/index.md) for the follow-up enqueue design and atomicity matrix, and [ADR-046](../adr/046-handler-staged-follow-ups/index.md) for handler-staged follow-ups.

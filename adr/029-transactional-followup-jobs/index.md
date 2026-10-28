@@ -166,6 +166,7 @@ Powerful and durable but heavy infra (logical replication slot, Debezium-class c
 - **ADR-021** (sequential callbacks, callback heartbeats). The callback resolution surface is unchanged; resolution through the worker `Client` dispatches follow-ups in the same transaction, while bare storage/admin callers have no process-local registry to dispatch.
 - **ADR-006** (insert-only transaction bridge) and **ADR-016/017** (Postgres adapter / Python transaction bridge). The same transactional insert primitive is reused; nothing new is added to the bridge contract.
 - **ADR-042** (caller-owned finalization). A caller-owned completion cannot evaluate a process-local `on_completed_enqueue` closure from the generic SQL function. Its v1 contract therefore rejects combining registered Completed specs and caller-owned completion for the same kind; the handler inserts explicit follow-up/outbox work in its transaction instead.
+- **ADR-046** (handler-staged follow-ups). A second source of follow-ups for the worker-driven `Completed` row: the handler stages requests built from values it computed, and they are inserted in the same completion transaction after the registered specs, with the same deduplication.
 
 ## Implementation
 

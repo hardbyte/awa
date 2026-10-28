@@ -1132,6 +1132,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#handler-staged-follow-ups" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Handler-staged follow-ups
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#atomicity-guarantees" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2269,6 +2280,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#handler-staged-follow-ups" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Handler-staged follow-ups
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#atomicity-guarantees" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2511,12 +2533,41 @@
 <h3 id="deduplicating-follow-ups">Deduplicating follow-ups<a class="headerlink" href="#deduplicating-follow-ups" title="Permanent link">&para;</a></h3>
 <p>Give the follow-up unique options to collapse duplicates. When several triggers produce a follow-up with the same unique key, the first insert wins and the later ones are skipped: each trigger's transition still commits, and exactly one follow-up job exists. With <code>UniqueOpts::default()</code> the key covers the follow-up's kind and args, so put only the deduplication key in the follow-up's args. Custom options can add the queue or a time period, or set <code>by_args: false</code> so the key leaves args out; then follow-ups of the same kind collapse whatever their args. <code>UniqueOpts::states</code> decides how long the deduplication lasts: the default includes <code>completed</code>, so a finished follow-up keeps blocking duplicates until its terminal row is pruned. Drop <code>completed</code> from the states to block duplicates only while the existing follow-up is still scheduled, available, running or retryable.</p>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">.</span><span class="n">on_completed_enqueue_with</span><span class="p">::</span><span class="o">&lt;</span><span class="n">StageA</span><span class="p">,</span><span class="w"> </span><span class="n">StageB</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">args</span><span class="p">,</span><span class="w"> </span><span class="n">_job</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">    </span><span class="n">EnqueueRequest</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">StageB</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">item_id</span><span class="p">:</span><span class="w"> </span><span class="nc">args</span><span class="p">.</span><span class="n">item_id</span><span class="w"> </span><span class="p">}).</span><span class="n">with_opts</span><span class="p">(</span><span class="n">InsertOpts</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">        </span><span class="n">unique</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">UniqueOpts</span><span class="p">::</span><span class="n">default</span><span class="p">()),</span>
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">        </span><span class="o">..</span><span class="nb">Default</span><span class="p">::</span><span class="n">default</span><span class="p">()</span>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span><span class="p">})</span>
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="p">})</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">    </span><span class="n">EnqueueRequest</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">StageB</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">item_id</span><span class="p">:</span><span class="w"> </span><span class="nc">args</span><span class="p">.</span><span class="n">item_id</span><span class="w"> </span><span class="p">}).</span><span class="n">unique</span><span class="p">(</span><span class="n">UniqueOpts</span><span class="p">::</span><span class="n">default</span><span class="p">())</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="p">})</span>
 </span></code></pre></div>
+<p><code>.unique()</code> and <code>.metadata()</code> set one option each. <code>with_opts</code> replaces every option, including an earlier <code>.queue()</code> or <code>.priority()</code>.</p>
+<h3 id="handler-staged-follow-ups">Handler-staged follow-ups<a class="headerlink" href="#handler-staged-follow-ups" title="Permanent link">&para;</a></h3>
+<p>Registered specs see only the trigger's args and job row. When the follow-up needs a value the handler computes, such as the ID of the item it resolved, the handler stages the follow-up itself (<a href="../adr/046-handler-staged-follow-ups/">ADR-046</a>):</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">.</span><span class="n">register</span><span class="p">::</span><span class="o">&lt;</span><span class="n">StageA</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">args</span><span class="p">,</span><span class="w"> </span><span class="n">ctx</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span><span class="c1">// A cloneable handle: the returned future cannot borrow `ctx`.</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">follow_ups</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ctx</span><span class="p">.</span><span class="n">follow_ups</span><span class="p">();</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">    </span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">item_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">resolve_item</span><span class="p">(</span><span class="o">&amp;</span><span class="n">args</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">        </span><span class="n">follow_ups</span><span class="p">.</span><span class="n">enqueue_on_completion</span><span class="p">(</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">            </span><span class="n">EnqueueRequest</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">StageB</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">item_id</span><span class="w"> </span><span class="p">}).</span><span class="n">unique</span><span class="p">(</span><span class="n">UniqueOpts</span><span class="p">::</span><span class="n">default</span><span class="p">()),</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">        </span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">JobResult</span><span class="p">::</span><span class="n">Completed</span><span class="p">)</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="p">})</span>
+</span></code></pre></div>
+<p>A <code>Worker</code> impl can call <code>ctx.enqueue_on_completion(..)</code> directly. In Python, the job passed to the handler has the same method, with the keyword arguments of <code>Transaction.insert</code>:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nd">@client</span><span class="o">.</span><span class="n">task</span><span class="p">(</span><span class="n">StageA</span><span class="p">,</span> <span class="n">queue</span><span class="o">=</span><span class="s2">"stage_a"</span><span class="p">)</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">resolve</span><span class="p">(</span><span class="n">job</span><span class="p">):</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    <span class="n">item_id</span> <span class="o">=</span> <span class="k">await</span> <span class="n">resolve_item</span><span class="p">(</span><span class="n">job</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">job</span><span class="o">.</span><span class="n">enqueue_on_completion</span><span class="p">(</span><span class="n">StageB</span><span class="p">(</span><span class="n">item_id</span><span class="o">=</span><span class="n">item_id</span><span class="p">),</span> <span class="n">unique_opts</span><span class="o">=</span><span class="p">{})</span>
+</span></code></pre></div>
+<p>Staged follow-ups are inserted in the same transaction as the attempt's completion, after any registered <code>Completed</code> specs, with the same <a href="#deduplicating-follow-ups">deduplication</a>. The rules:</p>
+<ul>
+<li><strong>Only <code>Completed</code> inserts them.</strong> <code>RetryAfter</code>, <code>Snooze</code>, <code>Cancel</code>, an error, a panic, a rescued or superseded attempt, and <code>Client::complete_external</code> all discard them. A retried attempt starts empty and stages again when its handler re-runs. <code>WaitForCallback</code> discards them with a warning and the <code>awa.job.staged_follow_ups_discarded</code> counter; to build a follow-up from a callback payload, wait with <code>ctx.wait_for_callback</code> inside the handler, then stage.</li>
+<li><strong>A failed stage fails the attempt.</strong> Staging serializes the args, checks the limits, and rejects anything the insert would reject (priority outside 1–4, <code>max_attempts</code> outside 1–1000, kind or queue names over 200 characters, more than 20 tags, NUL bytes, a <code>run_at</code> outside the years 1–9999), returning <code>StageError</code> (Python: <code>awa.StagingError</code>, a <code>TerminalError</code>, also raised when args or options do not convert). If the handler ignores the error and returns <code>Completed</code>, the attempt fails terminally instead of completing without its follow-up.</li>
+<li><strong>Staging closes when the handler returns.</strong> A task the handler spawned and did not await gets <code>StageError::Sealed</code>.</li>
+<li><strong>Limits per attempt:</strong> 16 follow-ups and 64 KiB of serialized requests, counting kind, queue, args, metadata, tags and ordering key (<code>MAX_STAGED_FOLLOW_UPS</code>, <code>MAX_STAGED_BYTES</code>). Larger fan-out belongs in a dedicated fan-out job.</li>
+<li><strong>Cost.</strong> A job that stages takes a per-job completion transaction instead of the batched path; jobs that stage nothing are unaffected.</li>
+<li><strong>Metrics.</strong> <code>awa.job.staged_follow_ups_committed</code> counts the follow-ups of committed completions by <code>awa.follow_up.result</code>: <code>inserted</code>, or <code>duplicate</code> when a job with the same unique key already existed. The Grafana dashboard's "Staged Follow-ups" panel shows both beside the discards.</li>
+<li><strong>Deploy order.</strong> A worker that does not know the follow-up's kind fails it terminally. Deploy the workers that handle the follow-up first, or put it on a queue only they poll.</li>
+</ul>
+<p>The test harnesses behave the same way: <code>awa_testing::TestClient::work_one</code> and Python's <code>AwaTestClient.work_one</code> insert staged follow-ups when the handler completes, and <code>awa.testing.HandlerJob</code> records them in <code>job.staged</code> for unit tests without a database.</p>
 <h3 id="atomicity-guarantees">Atomicity guarantees<a class="headerlink" href="#atomicity-guarantees" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
@@ -2546,9 +2597,10 @@
 <ul>
 <li><strong>Observation</strong> (metrics, traces, alerts) → <code>on_event</code> — cheap, in-process, acceptable to drop a sample on a crash.</li>
 <li><strong>Side effect that must survive a crash</strong> (send email, persist record, kick off downstream work) → <code>on_*_enqueue</code> — slightly more expensive (it's an Awa job) but durable, retried, DLQ'd, and visible in admin.</li>
+<li><strong>Follow-up built from a value the handler computes</strong> → stage it with <code>enqueue_on_completion</code>. It has the same atomicity as <code>on_completed_enqueue</code>, only for <code>Completed</code>.</li>
 </ul>
 <p>If you can't tell which you want, use <code>on_*_enqueue</code>. The cost of an unnecessary follow-up is bounded; the cost of a lost reliable side effect is not.</p>
-<p>See <a href="../adr/015-post-commit-lifecycle-hooks/">ADR-015</a> for hook rationale, and <a href="../adr/029-transactional-followup-jobs/">ADR-029</a> for the follow-up enqueue design and atomicity matrix.</p>
+<p>See <a href="../adr/015-post-commit-lifecycle-hooks/">ADR-015</a> for hook rationale, <a href="../adr/029-transactional-followup-jobs/">ADR-029</a> for the follow-up enqueue design and atomicity matrix, and <a href="../adr/046-handler-staged-follow-ups/">ADR-046</a> for handler-staged follow-ups.</p>
 
 
 
