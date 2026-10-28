@@ -33,7 +33,7 @@ export interface JobRow {
   // before maintenance-based aging.
   original_priority: number;
   queue_descriptor: DescriptorFields | null;
-  kind_descriptor: DescriptorFields | null;
+  kind_descriptor: (DescriptorFields & { output?: OutputDescriptor | null }) | null;
   /** Populated when the job has been moved to the Dead Letter Queue.
    *  When set, retry/cancel actions must route through `/api/dlq/*`. */
   dlq?: DlqMetadata;
@@ -50,6 +50,13 @@ export type DlqRow = JobRow & {
   dlq_at: string;
   original_run_lease: number;
 };
+
+/** The output type a job kind declares (ADR-048), with its JSON Schema when
+ *  the declaring runtime published one. */
+export interface OutputDescriptor {
+  type: string;
+  schema?: unknown;
+}
 
 export interface DescriptorFields {
   display_name: string | null;
@@ -81,6 +88,7 @@ export type QueueStats = QueueOverview;
 
 export interface JobKindOverview extends DescriptorFields {
   kind: string;
+  output: OutputDescriptor | null;
   descriptor_last_seen_at: string | null;
   descriptor_stale: boolean;
   descriptor_mismatch: boolean;

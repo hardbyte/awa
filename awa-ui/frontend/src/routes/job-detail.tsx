@@ -34,6 +34,30 @@ function hasMetadata(job: JobRow): boolean {
   );
 }
 
+interface ShownOutput {
+  value: unknown;
+  /** The failed attempt that recorded it; null for the completion's output. */
+  attempt: number | null;
+}
+
+// The completed attempt's output, else the output of the latest failed
+// attempt that recorded one: a failure keeps its output in its error entry,
+// and only the latest such entry keeps it (ADR-048).
+function outputToShow(job: JobRow): ShownOutput | null {
+  if (job.output !== undefined && job.output !== null) {
+    return { value: job.output, attempt: null };
+  }
+  for (const entry of [...(job.errors ?? [])].reverse()) {
+    if (entry && typeof entry === "object") {
+      const { output, attempt } = entry as { output?: unknown; attempt?: unknown };
+      if (output !== undefined && output !== null) {
+        return { value: output, attempt: typeof attempt === "number" ? attempt : 0 };
+      }
+    }
+  }
+  return null;
+}
+
 // Treat empty display_name the same as missing — the contract is
 // "display name if set, otherwise the raw key". `??` alone would let
 // `display_name: ""` render a blank label.
@@ -120,6 +144,8 @@ export function JobDetailPage() {
     job.state
   );
   const canCancel = !["completed", "failed", "cancelled"].includes(job.state);
+  const shownOutput = outputToShow(job);
+  const outputType = job.kind_descriptor?.output?.type;
 
   return (
     <div className="space-y-6">
@@ -407,19 +433,30 @@ export function JobDetailPage() {
       </Card>
 
       {/* Output (ADR-048) */}
-      {job.output !== undefined && job.output !== null && (
+      {shownOutput && (
         <Card>
           <CardHeader>
-            <div className="flex items-center justify-between">
-              <span className="font-semibold">Output</span>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold">
+                  {shownOutput.attempt === null
+                    ? "Output"
+                    : `Output from failed attempt ${shownOutput.attempt}`}
+                </span>
+                {outputType && (
+                  <Badge intent="secondary" aria-label={`Output type ${outputType}`}>
+                    <code>{outputType}</code>
+                  </Badge>
+                )}
+              </div>
               <CopyButton
-                value={JSON.stringify(job.output, null, 2)}
+                value={JSON.stringify(shownOutput.value, null, 2)}
                 label="Copy output JSON"
               />
             </div>
           </CardHeader>
           <CardContent>
-            <JsonView data={job.output} />
+            <JsonView data={shownOutput.value} />
           </CardContent>
         </Card>
       )}

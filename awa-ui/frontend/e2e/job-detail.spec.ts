@@ -267,4 +267,36 @@ test.describe("Job detail page", () => {
     const copyBtn = page.getByRole("button", { name: "Copy arguments JSON" });
     await expect(copyBtn).toBeVisible({ timeout: 10000 });
   });
+  test("completed job shows its output labelled with the declared type", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => /\/api\/jobs\/800002$/.test(r.url()) && r.ok()),
+      page.goto("/jobs/800002"),
+    ]);
+
+    await expect(page.getByText("Output", { exact: true })).toBeVisible();
+    await expect(page.getByLabel("Output type E2eSummary")).toBeVisible();
+    await expect(page.getByText("seeded output")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Copy output JSON" })).toBeVisible();
+  });
+
+  test("failed job shows the latest failed attempt's output", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => /\/api\/jobs\/800003$/.test(r.url()) && r.ok()),
+      page.goto("/jobs/800003"),
+    ]);
+
+    await expect(page.getByText("Output from failed attempt 3")).toBeVisible();
+    await expect(page.getByLabel("Output type E2eSummary")).toBeVisible();
+    await expect(page.getByText("partial").first()).toBeVisible();
+  });
+
+  test("job without an output shows no output card", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => /\/api\/jobs\/800001$/.test(r.url()) && r.ok()),
+      page.goto("/jobs/800001"),
+    ]);
+
+    await expect(page.getByRole("button", { name: "Copy arguments JSON" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Copy output JSON" })).toHaveCount(0);
+  });
 });

@@ -14,12 +14,32 @@ import {
 } from "@/components/ui/table";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { timeAgo } from "@/lib/time";
+import { JsonView } from "@/components/JsonView";
 
 function kindLabel(kind: JobKindOverview): string {
   // Treat empty display_name the same as missing — the contract is
   // "display name if set, otherwise the raw key". `??` alone would let
   // `display_name: ""` render a blank label.
   return kind.display_name?.trim() ? kind.display_name : kind.kind;
+}
+
+// The output type the kind declares, with its JSON Schema behind a toggle
+// when the runtime published one.
+function OutputType({ kind }: { kind: JobKindOverview }) {
+  if (!kind.output) return null;
+  return (
+    <div className="mt-1 text-xs font-normal text-muted-fg">
+      Output <code className="rounded bg-muted px-1 py-0.5">{kind.output.type}</code>
+      {kind.output.schema !== undefined && kind.output.schema !== null && (
+        <details className="mt-1">
+          <summary className="cursor-pointer">Schema</summary>
+          <div className="mt-1">
+            <JsonView data={kind.output.schema} />
+          </div>
+        </details>
+      )}
+    </div>
+  );
 }
 
 // Only surfaces a line when the descriptor needs attention — drift, stale,
@@ -95,6 +115,7 @@ export function KindsPage() {
               {kind.description && (
                 <p className="mt-2 text-sm text-muted-fg">{kind.description}</p>
               )}
+              <OutputType kind={kind} />
 
               <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
                 <span className="text-muted-fg">Jobs</span>
@@ -166,6 +187,7 @@ export function KindsPage() {
                         {kind.description}
                       </div>
                     )}
+                    <OutputType kind={kind} />
                     {descriptorSyncLabel(kind) && (
                       <div className="mt-1 text-xs font-normal text-muted-fg">
                         {descriptorSyncLabel(kind)}
