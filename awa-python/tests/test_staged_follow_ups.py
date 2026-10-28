@@ -258,6 +258,8 @@ def test_handler_job_matches_runtime_validation():
         {"unique_opts": "nope"},
         {"unique_opts": {"states": 300}},
         {"run_at": "not-a-time"},
+        {"run_at": "2026-01-01"},
+        {"run_at": "2026-01-01T10:00"},
         {"ordering_key": 123},
     ):
         fresh = HandlerJob(**{**job.__dict__, "staged": [], "staging_error": None})
@@ -265,10 +267,36 @@ def test_handler_job_matches_runtime_validation():
             fresh.enqueue_on_completion(StageProcess(item_id=1), **bad)
         assert fresh.staging_error is not None, bad
 
+    accepted = HandlerJob(**{**job.__dict__, "staged": [], "staging_error": None})
+    accepted.enqueue_on_completion(StageProcess(item_id=1), run_at="2026-01-01T10:00:00")
+    assert accepted.staging_error is None, "a naive timestamp is read as UTC, as at runtime"
+
     other = HandlerJob(**{**job.__dict__, "staged": [], "staging_error": None})
     with pytest.raises(TypeError):
         other.enqueue_on_completion(StageProcess(item_id=1), bogus=True)
     assert other.staging_error is None, "a bad keyword is a TypeError, as at runtime"
+
+
+def test_handler_job_snapshots_what_it_stages():
+    job = HandlerJob(
+        args=StageResolve(source=1, item_id=1),
+        id=1,
+        attempt=1,
+        max_attempts=25,
+        queue="default",
+        priority=2,
+        deadline=None,
+        metadata={},
+        tags=[],
+    )
+    payload = StageProcess(item_id=1)
+    metadata = {"step": 1}
+    job.enqueue_on_completion(payload, metadata=metadata)
+    payload.item_id = 2
+    metadata["step"] = 2
+    job.enqueue_on_completion(payload, metadata=metadata)
+    assert [s.args.item_id for s in job.staged] == [1, 2]
+    assert [s.kwargs["metadata"]["step"] for s in job.staged] == [1, 2]
 
 
 @pytest.mark.asyncio

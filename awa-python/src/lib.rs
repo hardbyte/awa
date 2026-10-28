@@ -117,6 +117,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Functions
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;
+    m.add_function(wrap_pyfunction!(transaction::check_run_at, m)?)?;
     m.add_function(wrap_pyfunction!(migrate, m)?)?;
     m.add_function(wrap_pyfunction!(migrations, m)?)?;
     m.add_function(wrap_pyfunction!(migrations_range, m)?)?;
