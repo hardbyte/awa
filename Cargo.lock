@@ -371,7 +371,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "awa"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "awa-cli"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "assert_cmd",
  "awa-model",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "awa-metrics"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "awa-model",
  "opentelemetry",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "awa-seaorm"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "awa",
  "awa-testing",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "awa-testing"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "awa-ui"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "awa-metrics",
  "awa-model",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.7.0-alpha.1"
+version = "0.7.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",

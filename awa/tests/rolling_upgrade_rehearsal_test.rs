@@ -1590,12 +1590,10 @@ async fn test_migrate_first_full_workload_reconciles_designed_outcomes() {
         .filter(|expectation| expectation.state == JobState::Failed)
         .map(|expectation| expectation.id)
         .collect();
-    let archived = dlq::list_dlq(
+    let archived = dlq::find_dlq(
         &pool,
-        &dlq::ListDlqFilter {
-            queue: Some(workload_queue.clone()),
-            ..Default::default()
-        },
+        &awa::JobFilter::new().queue(workload_queue.clone()),
+        awa::DlqPage::default(),
     )
     .await
     .expect("list workload DLQ archive");

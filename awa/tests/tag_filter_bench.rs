@@ -110,7 +110,10 @@ async fn tag_filter_cost() {
     let started = Instant::now();
     client.start().await.unwrap();
     while returned.load(Ordering::Relaxed) < jobs {
-        assert!(started.elapsed() < Duration::from_secs(900), "drain stalled");
+        assert!(
+            started.elapsed() < Duration::from_secs(900),
+            "drain stalled"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     client.shutdown(Duration::from_secs(30)).await;
@@ -132,9 +135,21 @@ async fn tag_filter_cost() {
     let rare = format!("order:{}", jobs / 2 - (jobs / 2) % 3);
     let mut rare_median = Duration::ZERO;
     for (label, filter, limit) in [
-        ("find_jobs, kind, limit 100", JobFilter::new().kind(TagBench::kind()), 100),
-        ("find_jobs, common tag, limit 100", JobFilter::new().tag("tenant:7"), 100),
-        ("find_jobs, rare tag", JobFilter::new().tag(rare.clone()), 20),
+        (
+            "find_jobs, kind, limit 100",
+            JobFilter::new().kind(TagBench::kind()),
+            100,
+        ),
+        (
+            "find_jobs, common tag, limit 100",
+            JobFilter::new().tag("tenant:7"),
+            100,
+        ),
+        (
+            "find_jobs, rare tag",
+            JobFilter::new().tag(rare.clone()),
+            20,
+        ),
     ] {
         let (elapsed, rows) = median_of_three(|| {
             let pool = pool.clone();
@@ -147,7 +162,10 @@ async fn tag_filter_cost() {
             }
         })
         .await;
-        println!("{label:<40} {:>8.1}ms {rows:>8}", elapsed.as_secs_f64() * 1e3);
+        println!(
+            "{label:<40} {:>8.1}ms {rows:>8}",
+            elapsed.as_secs_f64() * 1e3
+        );
         if label.contains("rare") {
             assert_eq!(rows, 1);
             rare_median = elapsed;
