@@ -138,6 +138,27 @@ test.describe("Batch operations page", () => {
     await expect(page.getByRole("gridcell", { name: "move queue" })).toBeVisible();
   });
 
+  test("sends tags, state and created bounds in the shared filter", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.route("**/api/batch-ops/preview", async (route) => {
+      const body = route.request().postDataJSON();
+      expect(body.filter).toEqual({
+        queue: "e2e_test",
+        tags: ["e2e", "priority"],
+        state: "scheduled",
+        created_at_gte: "2026-10-01T00:00:00.000Z",
+      });
+      await route.fulfill({ json: { total_matched: 4, sample: [] } });
+    });
+
+    await page.goto("/batch-ops?queue=e2e_test&tags=e2e%2C%20priority&state=scheduled");
+    await page.getByLabel("Created from").fill("2026-10-01T00:00:00Z");
+    await page.getByRole("button", { name: "Preview" }).click();
+    await expect(page.getByTestId("batch-preview-count")).toHaveText(
+      "4 eligible job(s) would change."
+    );
+  });
+
   test("requests cancellation for an active operation", async ({ page }) => {
     const operations = [
       operation({

@@ -253,6 +253,27 @@ workers report not ready until the migration runs, as for any version bump.
 External migration runners apply the complete `awa migrate --sql --from 51
 --to 52` bundle, which defines the helper before the tail calls it.
 
+## Tag indexes (ADR-049)
+
+Tags become the indexed way to find jobs on queue storage. There is no
+migration: new schemas, and the empty partitions of existing ones, get their
+indexes when `awa migrate` or schema preparation runs. For the populated
+partitions of an existing schema, run as the migrator after upgrading:
+
+```
+awa storage build-tag-index --wait
+```
+
+Each ring partition is indexed once pruning empties it, so `--wait` finishes
+within one ring cycle. `--now` builds populated partitions immediately with
+`CREATE INDEX CONCURRENTLY`, at the cost of holding back vacuum and blocking
+pruning of each partition while it builds. Tag lookups work throughout and
+scan any partition that has no index yet. See [Finding jobs](finding-jobs.md).
+
+A batch operation whose filter uses several tags, several states or
+`dead_lettered` is refused until every live runtime is 0.7.0-alpha.2 or
+later.
+
 ## The one gate
 
 `awa migrate` on a 0.7 binary refuses to apply migrations unless one of these holds:

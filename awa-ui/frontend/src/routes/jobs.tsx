@@ -7,6 +7,7 @@ import { useState, useCallback, useMemo } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   fetchJobs,
+  fetchJobCount,
   fetchStats,
   fetchQueues,
   bulkRetry,
@@ -133,6 +134,21 @@ export function JobsPage() {
     queryFn: () => fetchJobs(params),
     refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
   });
+
+  // A batch operation acts on available and scheduled jobs, so the jobs
+  // page offers one only when its filter can reach them.
+  const batchEligible = ["all", "available", "scheduled"].includes(filters.state);
+  const batchSearch: Record<string, string> = Object.fromEntries(
+    Object.entries({
+      kind: searchFilters.kind,
+      queue: searchFilters.queue,
+      tags: searchFilters.tags?.join(", "),
+      ids: searchFilters.ids?.join(", "),
+      state: filters.state === "all" ? undefined : filters.state,
+      created_at_gte: searchFilters.createdGte,
+      created_at_lt: searchFilters.createdLt,
+    }).filter((entry): entry is [string, string] => Boolean(entry[1]))
+  );
 
   // Counted when the filter changes, not on every poll: a count reads the
   // whole matching population.
@@ -383,6 +399,31 @@ export function JobsPage() {
 
       {/* Search bar with integrated filter chips */}
       <SearchBar value={filters.search} onChange={setSearch} />
+
+      {hasFilter && (
+        <div className="flex flex-wrap items-center gap-3 text-sm text-muted-fg">
+          {countQuery.data && (
+            <span data-testid="match-count">
+              {countQuery.data.kind === "at_least"
+                ? `${countQuery.data.value.toLocaleString()}+`
+                : countQuery.data.value.toLocaleString()}{" "}
+              matching
+            </span>
+          )}
+          {batchEligible && (
+            <Button
+              size="sm"
+              intent="outline"
+              isDisabled={readOnly}
+              onPress={() =>
+                void navigate({ to: "/batch-ops", search: batchSearch })
+              }
+            >
+              Change priority or queue of matching jobs
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* Bulk action toolbar */}
       {selected.size > 0 && (

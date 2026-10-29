@@ -474,9 +474,7 @@ export function cancelBatchOperation(id: string): Promise<BatchOperation> {
 }
 
 // Dead Letter Queue
-export interface ListDlqParams {
-  kind?: string;
-  queue?: string;
+export interface ListDlqParams extends JobFilterParams {
   tag?: string;
   before_id?: number;
   /** Pair with `before_id` for a race-free `(dlq_at, id)` cursor matching
@@ -495,11 +493,7 @@ export interface DlqBulkResult {
 }
 
 export function fetchDlq(params: ListDlqParams = {}): Promise<DlqRow[]> {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
-  }
-  const query = qs.toString();
+  const query = jobFilterQuery(params).toString();
   return apiFetch(`/dlq${query ? `?${query}` : ""}`);
 }
 
@@ -525,22 +519,14 @@ export function purgeDlqJob(id: number): Promise<DlqBulkResult> {
   return apiFetch(`/dlq/${id}`, { method: "DELETE" });
 }
 
-export function bulkRetryDlq(filter: {
-  kind?: string;
-  queue?: string;
-  tag?: string;
-}): Promise<DlqBulkResult> {
+export function bulkRetryDlq(filter: JobFilterParams & { tag?: string }): Promise<DlqBulkResult> {
   return apiFetch("/dlq/bulk-retry", {
     method: "POST",
     body: JSON.stringify(filter),
   });
 }
 
-export function bulkPurgeDlq(filter: {
-  kind?: string;
-  queue?: string;
-  tag?: string;
-}): Promise<DlqBulkResult> {
+export function bulkPurgeDlq(filter: JobFilterParams & { tag?: string }): Promise<DlqBulkResult> {
   return apiFetch("/dlq/bulk-purge", {
     method: "POST",
     body: JSON.stringify(filter),

@@ -153,6 +153,30 @@ test.describe("Jobs page", () => {
 });
 
 test.describe("Search bar filters", () => {
+  test("several tags narrow to jobs carrying all of them, with a match count", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
+      page.goto("/jobs?q=tag%3Ae2e%20tag%3Apriority"),
+    ]);
+    await expect(page.getByText("tag:e2e", { exact: true })).toBeVisible();
+    await expect(page.getByText("tag:priority", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("match-count")).toHaveText("1 matching");
+    await expect(page.getByText("#800005").first()).toBeVisible();
+    await expect(page.getByText("#800006")).toHaveCount(0);
+  });
+
+  test("the batch link carries the filter to the batch operations form", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs/count") && r.ok()),
+      page.goto("/jobs?state=available&q=queue%3Ae2e_test%20tag%3Ae2e"),
+    ]);
+    await page.getByRole("button", { name: "Change priority or queue of matching jobs" }).click();
+    await page.waitForURL(/\/batch-ops\?/);
+    await expect(page.getByLabel("Queue filter")).toHaveValue("e2e_test");
+    await expect(page.getByLabel("Tags filter")).toHaveValue("e2e");
+    await expect(page.getByLabel("State filter")).toHaveValue("available");
+  });
+
   test("typing queue:e2e_test and pressing Enter creates a chip and updates URL", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),

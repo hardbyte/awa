@@ -4,6 +4,60 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Upgrading
+
+- **Build the tag indexes after upgrading** (ADR-049). As the migrator, run
+  `awa storage build-tag-index --wait`. There is no migration: empty
+  partitions and new schemas are indexed during `awa migrate` and schema
+  preparation, and the command covers populated partitions, each once pruning
+  empties it. `--now` builds them immediately with `CREATE INDEX
+  CONCURRENTLY`, at the cost of holding back vacuum and blocking pruning of
+  each partition while it builds. See the
+  [upgrade guide](docs/upgrade-0.6-to-0.7.md#tag-indexes-adr-049).
+- **Rust library users: `BatchOperationFilter` is now `JobFilter`.** Its
+  `state` and `tag` fields become `states` and `tags` lists. Build a filter
+  with `JobFilter::new().state(..).tag(..)` or `JobFilter { kind: ..,
+  ..Default::default() }`. Its JSON shape is unchanged, so stored batch
+  operations still load. Unknown JSON fields are now an error rather than
+  ignored.
+- **Deprecated:** `admin::list_jobs` and `ListJobsFilter` (use `find_jobs`
+  with `JobFilter` and `JobPage`), and `dlq::list_dlq`, `purge_dlq`,
+  `bulk_retry_from_dlq` and `ListDlqFilter` (use `find_dlq`,
+  `purge_dlq_matching` and `bulk_retry_from_dlq_matching`). They keep working
+  through 0.8.
+- **A batch operation whose filter uses several tags, several states or
+  `dead_lettered` is refused** while a runtime older than 0.7.0-alpha.2 is
+  live, because an older runner would ignore those fields.
+
+### Added
+
+- **One job filter ([ADR-049](docs/adr/049-job-filter-and-indexed-tags.md),
+  [guide](docs/finding-jobs.md)).** `JobFilter` (kind, queue, any-of states,
+  all-of tags, dead-lettered, ids, created-at bounds) drives job listing,
+  counting, batch preview and execution, and the DLQ, so each selects the same
+  jobs. `admin::find_jobs` and `admin::count_jobs` (exact up to 10,000);
+  Python `find_jobs` and `count_jobs`, with a `filter=` dict on the DLQ
+  helpers; `GET /api/jobs` with repeatable `tag` and `state` and
+  `GET /api/jobs/count`; `awa job list` and the DLQ commands gain `--tag`,
+  `--state`, `--id` and created-at bounds. The admin UI's search accepts
+  several `tag:` terms, `id:` and `created>=`/`created<`, shows the match
+  count, and carries a search into the batch-operations form.
+- **Tags are indexed on queue storage.** A partial GIN index over non-empty
+  payload tags on each partition where a job's row outlives its claim makes
+  finding jobs by tag an indexed lookup in every state, including
+  dead-lettered. Postgres maintains it for every binary; untagged jobs add
+  nothing to it.
+
+### Changed
+
+- **Listing is faster on queue storage.** One query narrows candidates with
+  only the predicates a filter sets and reads only the storage its states can
+  reach, and a page of jobs loads in one batched read instead of one round
+  trip per job. Previously a listing query bound every field as
+  `($n IS NULL OR …)` and degraded to minutes once Postgres switched it to a
+  generic plan; at 50,000 retained jobs a rare-tag lookup now takes tens of
+  milliseconds instead of more than two minutes.
+
 ## [0.7.0-alpha.1] — 2026-10-29
 
 ### Upgrading
