@@ -10,6 +10,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   effective priority. Migration v053 joins receipt claims and materialized leases
   to the exact job attempt rather than comparing effective and lane priorities,
   excluding tombstoned and older-attempt ready rows to prevent duplicates.
+  Receipt and materialized-lease rows consistently report the claimed effective
+  priority.
   The migration only refreshes the compatibility function; storage and runtime
   write protocols are unchanged.
 

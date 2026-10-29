@@ -17802,10 +17802,10 @@ async fn jobs_compat_view_reports_aged_claims(mode: CompatClaimMode) {
         assert_eq!(converted.rows_affected(), 1);
     }
 
-    type Projection = (i64, String, i64, i16, serde_json::Value);
+    type Projection = (i64, String, i64, i16, serde_json::Value, i16);
     async fn read_projection(pool: &sqlx::PgPool, job_id: i64) -> Vec<Projection> {
         sqlx::query_as(
-            "SELECT id, state::text, run_lease, attempt, args \
+            "SELECT id, state::text, run_lease, attempt, args, priority \
              FROM awa.jobs WHERE id = $1 ORDER BY run_lease",
         )
         .bind(job_id)
@@ -17821,11 +17821,12 @@ async fn jobs_compat_view_reports_aged_claims(mode: CompatClaimMode) {
             claimed[0].job.run_lease,
             claimed[0].job.attempt,
             args.clone(),
+            claimed[0].job.priority,
         )],
         "aging must not hide a live claim or duplicate a tombstoned ready row"
     );
 
-    store
+    let retried = store
         .retry_after(
             &pool,
             job_id,
@@ -17844,6 +17845,7 @@ async fn jobs_compat_view_reports_aged_claims(mode: CompatClaimMode) {
             claimed[0].job.run_lease,
             claimed[0].job.attempt,
             args.clone(),
+            retried.priority,
         )],
         "closed receipts must not remain visible as running"
     );
@@ -17868,6 +17870,7 @@ async fn jobs_compat_view_reports_aged_claims(mode: CompatClaimMode) {
             reclaimed[0].job.run_lease,
             reclaimed[0].job.attempt,
             args.clone(),
+            reclaimed[0].job.priority,
         )],
         "retained ready rows from older attempts must not duplicate the current one"
     );
@@ -17886,6 +17889,7 @@ async fn jobs_compat_view_reports_aged_claims(mode: CompatClaimMode) {
             reclaimed[0].job.run_lease,
             reclaimed[0].job.attempt,
             args,
+            reclaimed[0].job.priority,
         )],
         "completed attempts must not also remain visible as running"
     );
