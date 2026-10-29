@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { timeAgo } from "@/lib/time";
-import { parseSearch } from "@/components/SearchBar";
+import { buildSearch, parseSearch, toRfc3339 } from "@/components/SearchBar";
 
 describe("timeAgo", () => {
   it("shows seconds for recent times", () => {
@@ -39,14 +39,14 @@ describe("parseSearch", () => {
   });
 
   it("parses a single tag filter", () => {
-    expect(parseSearch("tag:urgent")).toEqual({ tag: "urgent" });
+    expect(parseSearch("tag:urgent")).toEqual({ tags: ["urgent"] });
   });
 
   it("parses multiple filters", () => {
     expect(parseSearch("kind:send_email queue:default tag:urgent")).toEqual({
       kind: "send_email",
       queue: "default",
-      tag: "urgent",
+      tags: ["urgent"],
     });
   });
 
@@ -69,5 +69,29 @@ describe("parseSearch", () => {
     expect(parseSearch("kind:first kind:second")).toEqual({
       kind: "second",
     });
+  });
+
+  it("collects repeated tags and ids", () => {
+    expect(parseSearch("tag:a tag:b tag:a id:3,4 id:5")).toEqual({
+      tags: ["b", "a"],
+      ids: [3, 4, 5],
+    });
+  });
+
+  it("parses created bounds and drops malformed ids", () => {
+    expect(parseSearch("created>=2026-10-01 created<2026-10-02 id:x")).toEqual({
+      createdGte: "2026-10-01",
+      createdLt: "2026-10-02",
+    });
+  });
+
+  it("round-trips through buildSearch", () => {
+    const search = "kind:k queue:q tag:a tag:b id:7 created>=2026-10-01";
+    expect(buildSearch(parseSearch(search))).toBe(search);
+  });
+
+  it("converts typed dates to RFC 3339", () => {
+    expect(toRfc3339("2026-10-01T00:00:00Z")).toBe("2026-10-01T00:00:00.000Z");
+    expect(toRfc3339("not a date")).toBeUndefined();
   });
 });

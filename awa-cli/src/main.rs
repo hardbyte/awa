@@ -326,6 +326,7 @@ fn access_for(command: &Commands) -> context::Access {
             StorageCommands::Finalize { check: true, .. } => ReadOnly,
             StorageCommands::FlipRingAuthority { check: true, .. } => ReadOnly,
             StorageCommands::Prepare { .. }
+            | StorageCommands::BuildTagIndex { .. }
             | StorageCommands::PrepareQueueStorageSchema { .. }
             | StorageCommands::PrepareQueue { .. }
             | StorageCommands::Abort
@@ -595,29 +596,70 @@ enum JobCommands {
         #[arg(long)]
         kind: String,
     },
-    /// List jobs
+    /// List jobs, newest first
     List {
+        #[command(flatten)]
+        filter: FilterArgs,
+        /// Only dead-lettered jobs (true) or none of them (false).
         #[arg(long)]
-        state: Option<String>,
+        dead_lettered: Option<bool>,
+        /// Jobs with a smaller id: the last id of the previous page.
         #[arg(long)]
-        kind: Option<String>,
-        #[arg(long)]
-        queue: Option<String>,
+        before_id: Option<i64>,
         #[arg(long, default_value = "20")]
         limit: i64,
     },
+}
+
+/// A job filter (ADR-049), shared by `job list` and the DLQ commands.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct FilterArgs {
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long)]
+    queue: Option<String>,
+    /// Repeat for jobs carrying all of the tags.
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Repeat for jobs in any of the states.
+    #[arg(long = "state")]
+    states: Vec<String>,
+    /// Comma-separated, or repeated.
+    #[arg(long = "id", value_delimiter = ',')]
+    ids: Vec<i64>,
+    /// RFC 3339 time; jobs created at or after it.
+    #[arg(long)]
+    created_at_gte: Option<DateTime<Utc>>,
+    /// RFC 3339 time; jobs created before it.
+    #[arg(long)]
+    created_at_lt: Option<DateTime<Utc>>,
+}
+
+impl FilterArgs {
+    fn job_filter(&self) -> Result<awa_model::JobFilter, Box<dyn std::error::Error>> {
+        let mut states = Vec::with_capacity(self.states.len());
+        for state in &self.states {
+            states.push(state.parse::<awa_model::JobState>()?);
+        }
+        Ok(awa_model::JobFilter {
+            kind: self.kind.clone(),
+            queue: self.queue.clone(),
+            ids: (!self.ids.is_empty()).then(|| self.ids.clone()),
+            created_at_gte: self.created_at_gte,
+            created_at_lt: self.created_at_lt,
+            ..Default::default()
+        }
+        .tags(self.tags.clone())
+        .states(states))
+    }
 }
 
 #[derive(Subcommand)]
 enum DlqCommands {
     /// List rows in the Dead Letter Queue
     List {
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(long)]
-        queue: Option<String>,
-        #[arg(long)]
-        tag: Option<String>,
+        #[command(flatten)]
+        filter: FilterArgs,
         #[arg(long)]
         before_id: Option<i64>,
         #[arg(long)]
@@ -634,15 +676,11 @@ enum DlqCommands {
     Retry { id: i64 },
     /// Retry DLQ rows in bulk matching the filter
     RetryBulk {
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(long)]
-        queue: Option<String>,
-        #[arg(long)]
-        tag: Option<String>,
+        #[command(flatten)]
+        filter: FilterArgs,
         /// Retry every row in the DLQ when no filter is provided.
-        /// Required without `--kind`, `--queue`, or `--tag` to guard against
-        /// accidentally reviving the entire DLQ.
+        /// Required without a filter to guard against accidentally reviving
+        /// the entire DLQ.
         #[arg(long)]
         all: bool,
     },
@@ -660,15 +698,11 @@ enum DlqCommands {
     },
     /// Purge (delete) DLQ rows matching the filter
     Purge {
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(long)]
-        queue: Option<String>,
-        #[arg(long)]
-        tag: Option<String>,
+        #[command(flatten)]
+        filter: FilterArgs,
         /// Purge every row in the DLQ when no filter is provided.
-        /// Required without `--kind`, `--queue`, or `--tag` to guard against
-        /// accidentally wiping the DLQ.
+        /// Required without a filter to guard against accidentally wiping
+        /// the DLQ.
         #[arg(long)]
         all: bool,
     },
@@ -786,6 +820,20 @@ enum CronCommands {
 enum StorageCommands {
     /// Show the current storage transition state
     Status,
+    /// Build the queue-storage tag indexes (ADR-049); run as the migrator
+    BuildTagIndex {
+        /// Build populated ring partitions now with CREATE INDEX
+        /// CONCURRENTLY, instead of waiting for pruning to empty them. Holds
+        /// back vacuum and blocks pruning of each partition while it builds.
+        #[arg(long)]
+        now: bool,
+        /// Keep passing until every index exists, sleeping between passes.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds between passes with --wait.
+        #[arg(long, default_value = "60")]
+        interval_secs: u64,
+    },
     /// Prepare a future storage engine without changing execution routing
     Prepare {
         #[arg(long)]
@@ -1415,27 +1463,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     JobCommands::List {
-                        state,
-                        kind,
-                        queue,
+                        filter,
+                        dead_lettered,
+                        before_id,
                         limit,
                     } => {
-                        let state = state.map(|s| {
-                            s.parse::<awa_model::JobState>().unwrap_or_else(|e| {
-                                eprintln!("{e}");
-                                std::process::exit(1);
-                            })
-                        });
-
-                        let filter = awa_model::admin::ListJobsFilter {
-                            state,
-                            kind,
-                            queue,
-                            limit: Some(limit),
-                            ..Default::default()
-                        };
-
-                        let jobs = awa_model::admin::list_jobs(&pool, &filter).await?;
+                        let mut filter = filter.job_filter()?;
+                        filter.dead_lettered = dead_lettered;
+                        let jobs = awa_model::admin::find_jobs(
+                            &pool,
+                            &filter,
+                            awa_model::JobPage { before_id, limit },
+                        )
+                        .await?;
                         if jobs.is_empty() {
                             println!("No jobs found.");
                         } else {
@@ -1455,6 +1495,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                             println!("\n{} jobs listed.", jobs.len());
+                            if let Some(last) = jobs.last() {
+                                println!("Next page: --before-id {}", last.id);
+                            }
                         }
                     }
                 },
@@ -1468,22 +1511,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let metrics = awa_worker::AwaMetrics::from_global();
                     match command {
                         DlqCommands::List {
-                            kind,
-                            queue,
-                            tag,
+                            filter,
                             before_id,
                             before_dlq_at,
                             limit,
                         } => {
-                            let filter = awa_model::dlq::ListDlqFilter {
-                                kind,
-                                queue,
-                                tag,
-                                before_id,
-                                before_dlq_at,
-                                limit: Some(limit),
-                            };
-                            let rows = awa_model::dlq::list_dlq(&pool, &filter).await?;
+                            let rows = awa_model::dlq::find_dlq(
+                                &pool,
+                                &filter.job_filter()?,
+                                awa_model::DlqPage {
+                                    before_dlq_at,
+                                    before_id,
+                                    limit,
+                                },
+                            )
+                            .await?;
                             if rows.is_empty() {
                                 println!("DLQ is empty (no matching rows).");
                             } else {
@@ -1541,22 +1583,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 None => println!("No DLQ row with id {id}"),
                             }
                         }
-                        DlqCommands::RetryBulk {
-                            kind,
-                            queue,
-                            tag,
-                            all,
-                        } => {
-                            let filter = awa_model::dlq::ListDlqFilter {
-                                kind,
-                                queue: queue.clone(),
-                                tag,
-                                ..Default::default()
-                            };
-                            let count =
-                                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
+                        DlqCommands::RetryBulk { filter, all } => {
+                            let count = awa_model::dlq::bulk_retry_from_dlq_matching(
+                                &pool,
+                                &filter.job_filter()?,
+                                all,
+                            )
+                            .await?;
                             if count > 0 {
-                                metrics.record_dlq_retried(queue.as_deref(), count);
+                                metrics.record_dlq_retried(filter.queue.as_deref(), count);
                             }
                             println!("Retried {count} DLQ rows.");
                         }
@@ -1585,21 +1620,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             println!("Moved {count} failed jobs into the DLQ.");
                         }
-                        DlqCommands::Purge {
-                            kind,
-                            queue,
-                            tag,
-                            all,
-                        } => {
-                            let filter = awa_model::dlq::ListDlqFilter {
-                                kind,
-                                queue: queue.clone(),
-                                tag,
-                                ..Default::default()
-                            };
-                            let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
+                        DlqCommands::Purge { filter, all } => {
+                            let count = awa_model::dlq::purge_dlq_matching(
+                                &pool,
+                                &filter.job_filter()?,
+                                all,
+                            )
+                            .await?;
                             if count > 0 {
-                                metrics.record_dlq_purged(queue.as_deref(), count);
+                                metrics.record_dlq_purged(filter.queue.as_deref(), count);
                             }
                             println!("Purged {count} DLQ rows.");
                         }
@@ -1836,6 +1865,54 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     StorageCommands::Status => {
                         let report = awa_model::storage::status_report(&pool).await?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
+                        let tag_indexes = awa_model::tag_index::tag_index_status(&pool).await?;
+                        let valid = tag_indexes
+                            .iter()
+                            .filter(|status| {
+                                status.state == awa_model::tag_index::TagIndexState::Valid
+                            })
+                            .count();
+                        println!(
+                            "Tag indexes: {valid} of {} built{}",
+                            tag_indexes.len(),
+                            if valid < tag_indexes.len() {
+                                " (run `awa storage build-tag-index` as the migrator)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    StorageCommands::BuildTagIndex {
+                        now,
+                        wait,
+                        interval_secs,
+                    } => {
+                        let mode = if now {
+                            awa_model::tag_index::BuildMode::Now
+                        } else {
+                            awa_model::tag_index::BuildMode::WhenEmpty
+                        };
+                        loop {
+                            let pass = awa_model::tag_index::build_tag_indexes(&pool, mode).await?;
+                            println!(
+                                "Tag indexes: {} built, {} repaired, {} already valid, {} waiting \
+                                 for pruning to empty their partition.",
+                                pass.built,
+                                pass.repaired,
+                                pass.already_valid,
+                                pass.waiting.len()
+                            );
+                            if pass.complete() || !wait {
+                                if !pass.complete() {
+                                    println!(
+                                        "Run again later, add --wait to keep going, or --now to \
+                                         build populated partitions concurrently."
+                                    );
+                                }
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                        }
                     }
                     StorageCommands::Prepare { engine, details } => {
                         // Auto-fill `details.schema` for queue-storage when the

@@ -232,12 +232,16 @@ export type BatchOperationState =
   | "cancelled"
   | "failed";
 
+/** The JSON form of the shared job filter, as batch operations store it. */
 export interface BatchOperationFilter {
   kind?: string;
   queue?: string;
   ids?: number[];
   tag?: string;
+  tags?: string[];
   state?: string;
+  states?: string[];
+  dead_lettered?: boolean;
   created_at_gte?: string;
   created_at_lt?: string;
 }
@@ -335,13 +339,49 @@ export function effectiveEngine(
   return routed ? "queue_storage" : "canonical";
 }
 
-export interface ListJobsParams {
-  state?: string;
+/** A job filter (ADR-049), as the jobs and DLQ endpoints take it. */
+export interface JobFilterParams {
   kind?: string;
   queue?: string;
+  /** Any of these states. */
+  states?: string[];
+  /** All of these tags. */
+  tags?: string[];
+  ids?: number[];
+  dead_lettered?: boolean;
+  created_at_gte?: string;
+  created_at_lt?: string;
+}
+
+export interface ListJobsParams extends JobFilterParams {
+  /** One state; kept for callers that predate `states`. */
+  state?: string;
+  /** One tag; kept for callers that predate `tags`. */
   tag?: string;
   before_id?: number;
   limit?: number;
+}
+
+/** `kind` is `at_least` when more jobs match than the server counts. */
+export interface JobCount {
+  kind: "exact" | "at_least";
+  value: number;
+}
+
+/** Query string for a filter: `tag` and `state` repeat, `ids` is a list. */
+function jobFilterQuery(params: ListJobsParams): URLSearchParams {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === "") continue;
+    if (k === "tags" || k === "states") {
+      for (const item of v as string[]) qs.append(k === "tags" ? "tag" : "state", item);
+    } else if (k === "ids") {
+      if ((v as number[]).length > 0) qs.set("ids", (v as number[]).join(","));
+    } else {
+      qs.append(k, String(v));
+    }
+  }
+  return qs;
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -358,12 +398,15 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 
 // Jobs
 export function fetchJobs(params: ListJobsParams = {}): Promise<JobRow[]> {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
-  }
-  const query = qs.toString();
+  const query = jobFilterQuery(params).toString();
   return apiFetch(`/jobs${query ? `?${query}` : ""}`);
+}
+
+/** How many jobs a filter selects; exact up to the server's cap. */
+export function fetchJobCount(params: ListJobsParams = {}): Promise<JobCount> {
+  const { before_id: _before, limit: _limit, ...filter } = params;
+  const query = jobFilterQuery(filter).toString();
+  return apiFetch(`/jobs/count${query ? `?${query}` : ""}`);
 }
 
 export function fetchJob(id: number): Promise<JobRow> {

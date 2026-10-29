@@ -3,13 +3,23 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchDistinctKinds, fetchDistinctQueues } from "@/lib/api";
 import { POLL, MAX_SUGGESTIONS } from "@/lib/constants";
 
-interface SearchFilters {
+export interface SearchFilters {
   kind?: string;
   queue?: string;
-  tag?: string;
+  /** All of these tags (ADR-049). */
+  tags?: string[];
+  ids?: number[];
+  /** Created at or after, as typed (a date or an RFC 3339 time). */
+  createdGte?: string;
+  /** Created before, as typed. */
+  createdLt?: string;
 }
 
-/** Parse a search string that may contain kind:, queue:, tag: prefixes. */
+/**
+ * Parse a search string of `kind:`, `queue:`, `tag:`, `id:`, `created>=` and
+ * `created<` terms. `tag:` and `id:` repeat (`id:` also takes a comma
+ * list); for the others the last value wins.
+ */
 export function parseSearch(search: string): SearchFilters {
   const filters: SearchFilters = {};
   const parts = search.trim().split(/\s+/);
@@ -19,19 +29,93 @@ export function parseSearch(search: string): SearchFilters {
     } else if (part.startsWith("queue:") && part.length > 6) {
       filters.queue = part.slice(6);
     } else if (part.startsWith("tag:") && part.length > 4) {
-      filters.tag = part.slice(4);
+      const tag = part.slice(4);
+      filters.tags = [...(filters.tags ?? []).filter((t) => t !== tag), tag];
+    } else if (part.startsWith("id:") && part.length > 3) {
+      const ids = part
+        .slice(3)
+        .split(",")
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0);
+      if (ids.length > 0) {
+        filters.ids = [...new Set([...(filters.ids ?? []), ...ids])];
+      }
+    } else if (part.startsWith("created>=") && part.length > 9) {
+      filters.createdGte = part.slice(9);
+    } else if (part.startsWith("created<") && part.length > 8) {
+      filters.createdLt = part.slice(8);
     }
   }
   return filters;
 }
 
 /** Build a search string from individual filter values. */
-function buildSearch(filters: SearchFilters): string {
+export function buildSearch(filters: SearchFilters): string {
   const parts: string[] = [];
   if (filters.kind) parts.push(`kind:${filters.kind}`);
   if (filters.queue) parts.push(`queue:${filters.queue}`);
-  if (filters.tag) parts.push(`tag:${filters.tag}`);
+  for (const tag of filters.tags ?? []) parts.push(`tag:${tag}`);
+  for (const id of filters.ids ?? []) parts.push(`id:${id}`);
+  if (filters.createdGte) parts.push(`created>=${filters.createdGte}`);
+  if (filters.createdLt) parts.push(`created<${filters.createdLt}`);
   return parts.join(" ");
+}
+
+/** A typed date or time as RFC 3339, or undefined when it does not parse. */
+export function toRfc3339(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const at = new Date(value);
+  return Number.isNaN(at.getTime()) ? undefined : at.toISOString();
+}
+
+/** One removable term: which filter it belongs to, and its value. */
+type Term =
+  | { key: "kind" | "queue" | "createdGte" | "createdLt"; value: string }
+  | { key: "tags"; value: string }
+  | { key: "ids"; value: number };
+
+function terms(filters: SearchFilters): Term[] {
+  const out: Term[] = [];
+  if (filters.kind) out.push({ key: "kind", value: filters.kind });
+  if (filters.queue) out.push({ key: "queue", value: filters.queue });
+  for (const tag of filters.tags ?? []) out.push({ key: "tags", value: tag });
+  for (const id of filters.ids ?? []) out.push({ key: "ids", value: id });
+  if (filters.createdGte) out.push({ key: "createdGte", value: filters.createdGte });
+  if (filters.createdLt) out.push({ key: "createdLt", value: filters.createdLt });
+  return out;
+}
+
+function termLabel(term: Term): string {
+  switch (term.key) {
+    case "tags":
+      return `tag:${term.value}`;
+    case "ids":
+      return `id:${term.value}`;
+    case "createdGte":
+      return `created>=${term.value}`;
+    case "createdLt":
+      return `created<${term.value}`;
+    default:
+      return `${term.key}:${term.value}`;
+  }
+}
+
+function withoutTerm(filters: SearchFilters, term: Term): SearchFilters {
+  const next = { ...filters };
+  if (term.key === "tags") {
+    next.tags = (next.tags ?? []).filter((t) => t !== term.value);
+    if (next.tags.length === 0) delete next.tags;
+  } else if (term.key === "ids") {
+    next.ids = (next.ids ?? []).filter((id) => id !== term.value);
+    if (next.ids.length === 0) delete next.ids;
+  } else {
+    delete next[term.key];
+  }
+  return next;
+}
+
+function mergeFilters(base: SearchFilters, added: SearchFilters): SearchFilters {
+  return parseSearch(`${buildSearch(base)} ${buildSearch(added)}`);
 }
 
 interface Suggestion {
@@ -110,8 +194,12 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
             results.push({ label: `queue:${queue}`, value: `queue:${queue}` });
           }
         }
-      } else if (trimmed.startsWith("tag:")) {
-        // No autocomplete for tags
+      } else if (
+        trimmed.startsWith("tag:") ||
+        trimmed.startsWith("id:") ||
+        trimmed.startsWith("created")
+      ) {
+        // Free-form values: nothing to suggest.
       } else {
         // Show prefix hints for filters not yet applied
         if (!activeFilters.kind) {
@@ -120,8 +208,10 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
         if (!activeFilters.queue) {
           results.push({ label: "queue:<name>", value: "queue:" });
         }
-        if (!activeFilters.tag) {
-          results.push({ label: "tag:<name>", value: "tag:" });
+        results.push({ label: "tag:<name>", value: "tag:" });
+        results.push({ label: "id:<job id>", value: "id:" });
+        if (!activeFilters.createdGte) {
+          results.push({ label: "created>=<date>", value: "created>=" });
         }
       }
 
@@ -141,9 +231,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   /** Apply a filter token — merges into existing filters, clears input */
   const applyToken = useCallback(
     (token: string) => {
-      const parsed = parseSearch(token);
-      const merged = { ...activeFilters, ...parsed };
-      onChange(buildSearch(merged));
+      onChange(buildSearch(mergeFilters(activeFilters, parseSearch(token))));
       setInputValue("");
       setShowSuggestions(false);
       setSelectedIdx(-1);
@@ -151,12 +239,10 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
     [activeFilters, onChange]
   );
 
-  /** Remove a single filter */
-  const removeFilter = useCallback(
-    (key: keyof SearchFilters) => {
-      const next = { ...activeFilters };
-      delete next[key];
-      onChange(buildSearch(next));
+  /** Remove a single term */
+  const removeTerm = useCallback(
+    (term: Term) => {
+      onChange(buildSearch(withoutTerm(activeFilters, term)));
     },
     [activeFilters, onChange]
   );
@@ -207,11 +293,9 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
 
     // Backspace on empty input removes last filter
     if (e.key === "Backspace" && inputValue === "") {
-      const keys = (Object.keys(activeFilters) as (keyof SearchFilters)[]).filter(
-        (k) => activeFilters[k]
-      );
-      if (keys.length > 0) {
-        removeFilter(keys[keys.length - 1]!);
+      const applied = terms(activeFilters);
+      if (applied.length > 0) {
+        removeTerm(applied[applied.length - 1]!);
       }
     }
   };
@@ -231,8 +315,8 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  const hasFilters =
-    activeFilters.kind || activeFilters.queue || activeFilters.tag;
+  const applied = terms(activeFilters);
+  const hasFilters = applied.length > 0;
 
   return (
     <div ref={containerRef} className="relative">
@@ -242,24 +326,13 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
         onClick={() => containerRef.current?.querySelector("input")?.focus()}
       >
         {/* Applied filter chips */}
-        {activeFilters.kind && (
+        {applied.map((term) => (
           <FilterChip
-            label={`kind:${activeFilters.kind}`}
-            onRemove={() => removeFilter("kind")}
+            key={termLabel(term)}
+            label={termLabel(term)}
+            onRemove={() => removeTerm(term)}
           />
-        )}
-        {activeFilters.queue && (
-          <FilterChip
-            label={`queue:${activeFilters.queue}`}
-            onRemove={() => removeFilter("queue")}
-          />
-        )}
-        {activeFilters.tag && (
-          <FilterChip
-            label={`tag:${activeFilters.tag}`}
-            onRemove={() => removeFilter("tag")}
-          />
-        )}
+        ))}
 
         {/* Text input */}
         <input
@@ -272,7 +345,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
             setShowSuggestions(suggs.length > 0);
           }}
           onKeyDown={handleKeyDown}
-          placeholder={hasFilters ? "Add filter..." : "Filter by kind:, queue:, tag: ...  (press /)"}
+          placeholder={hasFilters ? "Add filter..." : "Filter by kind:, queue:, tag:, id:, created>= ...  (press /)"}
           className="min-w-[120px] flex-1 border-0 bg-transparent p-0 text-sm text-fg outline-none placeholder:text-muted-fg"
           aria-label="Search jobs"
         />

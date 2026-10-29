@@ -87,6 +87,7 @@ pub async fn router_with_identity(
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
+        .route("/jobs/count", get(handlers::jobs::count_jobs))
         .route("/jobs/{id}", get(handlers::jobs::get_job))
         .route("/jobs/{id}/retry", post(handlers::jobs::retry_job))
         .route("/jobs/{id}/cancel", post(handlers::jobs::cancel_job))

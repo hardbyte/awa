@@ -1,5 +1,5 @@
-use crate::audited_sql;
 use crate::error::{map_sqlx_error, AwaError};
+use crate::filter::JobFilter;
 use crate::job::{JobRow, JobState};
 use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Utc};
@@ -98,28 +98,11 @@ impl BatchOperationState {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchOperationFilter {
-    pub kind: Option<String>,
-    pub queue: Option<String>,
-    pub ids: Option<Vec<i64>>,
-    pub tag: Option<String>,
-    pub state: Option<JobState>,
-    pub created_at_gte: Option<DateTime<Utc>>,
-    pub created_at_lt: Option<DateTime<Utc>>,
-}
+/// ADR-030's batch-operation filter, now the shared [`JobFilter`] (ADR-049).
+pub type BatchOperationFilter = JobFilter;
 
-impl BatchOperationFilter {
-    pub fn is_empty(&self) -> bool {
-        self.kind.is_none()
-            && self.queue.is_none()
-            && self.ids.as_ref().is_none_or(Vec::is_empty)
-            && self.tag.is_none()
-            && self.state.is_none()
-            && self.created_at_gte.is_none()
-            && self.created_at_lt.is_none()
-    }
-}
+/// States a batch operation can act on: both kinds move ready work.
+const ELIGIBLE_STATES: [JobState; 2] = [JobState::Available, JobState::Scheduled];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op_kind")]
@@ -268,7 +251,11 @@ pub async fn submit_batch_operation(
     request: SubmitBatchOperation,
 ) -> Result<BatchOperation, AwaError> {
     request.spec.validate()?;
+    request.filter.validate()?;
     validate_filter_for_spec(&request.spec, &request.filter)?;
+    if request.filter.uses_extended_fields() {
+        crate::filter::require_fleet_for_extended_filters(pool).await?;
+    }
     if request.filter.is_empty() && !request.allow_all {
         return Err(AwaError::Validation(
             "batch operation requires a filter or allow_all=true".to_string(),
@@ -349,10 +336,21 @@ pub async fn preview_batch_operation(
 ) -> Result<BatchOperationPreview, AwaError> {
     spec.validate()?;
     validate_filter_for_spec(&spec, &filter)?;
-    let effective_filter = filter.clone();
-    let total_matched = count_matching_jobs(pool, &effective_filter, None, None).await?;
-    let sample =
-        load_matching_jobs(pool, &effective_filter, 0, i64::MAX, PREVIEW_SAMPLE_LIMIT).await?;
+    filter.validate()?;
+    let total_matched = crate::job_query::count(pool, &filter, &ELIGIBLE_STATES, None)
+        .await?
+        .value();
+    let sample = crate::job_query::find(
+        pool,
+        &filter,
+        &ELIGIBLE_STATES,
+        crate::job_query::Window::OldestFirst {
+            after_id: 0,
+            max_id: i64::MAX,
+            limit: PREVIEW_SAMPLE_LIMIT,
+        },
+    )
+    .await?;
     Ok(BatchOperationPreview {
         total_matched,
         sample,
@@ -600,21 +598,20 @@ async fn scan_operation(
     operation: BatchOperation,
 ) -> Result<BatchOperation, AwaError> {
     validate_filter_for_spec(&operation.spec.0, &operation.filter.0)?;
-    let effective_filter = operation.filter.0.clone();
-    let max_job_id = max_matching_job_id(pool, &effective_filter)
+    let filter = operation.filter.0.clone();
+    let max_job_id = crate::job_query::max_id(pool, &filter, &ELIGIBLE_STATES)
         .await?
         .unwrap_or(0);
-    let total_matched = if max_job_id == 0 {
-        0
-    } else {
-        count_matching_jobs(pool, &effective_filter, Some(0), Some(max_job_id)).await?
-    };
+    // The candidates frozen into the item table. One whose job has moved on
+    // by the time the runner reaches it is counted as skipped there.
+    let mut total_matched: i64 = 0;
     let operation_id = operation.id;
     let mut after_job_id = 0;
     while after_job_id < max_job_id {
-        let ids = load_matching_job_ids(
+        let ids = crate::job_query::scan_ids(
             pool,
-            &effective_filter,
+            &filter,
+            &ELIGIBLE_STATES,
             after_job_id,
             max_job_id,
             SCAN_PAGE_SIZE,
@@ -624,6 +621,7 @@ async fn scan_operation(
             break;
         };
         after_job_id = last_job_id;
+        total_matched += ids.len() as i64;
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         insert_operation_items(&mut tx, operation_id, &ids).await?;
@@ -772,13 +770,16 @@ fn validate_filter_for_spec(
 ) -> Result<(), AwaError> {
     match spec {
         BatchOperationSpec::SetPriority { .. } | BatchOperationSpec::MoveQueue { .. } => {
-            if let Some(state) = filter.state {
-                if !matches!(state, JobState::Scheduled | JobState::Available) {
-                    return Err(AwaError::Validation(format!(
-                        "{} only supports available or scheduled state filters",
-                        spec.kind().as_str()
-                    )));
-                }
+            if filter
+                .states
+                .iter()
+                .any(|state| !ELIGIBLE_STATES.contains(state))
+                || filter.dead_lettered == Some(true)
+            {
+                return Err(AwaError::Validation(format!(
+                    "{} only supports available or scheduled state filters",
+                    spec.kind().as_str()
+                )));
             }
         }
     }
@@ -961,561 +962,6 @@ async fn canonical_move_queue_tx(
     .await
     .map_err(map_sqlx_error)?;
     Ok(result.rows_affected() > 0)
-}
-
-async fn count_matching_jobs(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: Option<i64>,
-    max_job_id: Option<i64>,
-) -> Result<i64, AwaError> {
-    if QueueStorage::active_schema(pool).await?.is_some() {
-        count_matching_queue_storage_jobs(pool, filter, after_job_id, max_job_id).await
-    } else {
-        count_matching_canonical_jobs(pool, filter, after_job_id, max_job_id).await
-    }
-}
-
-async fn max_matching_job_id(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-) -> Result<Option<i64>, AwaError> {
-    if QueueStorage::active_schema(pool).await?.is_some() {
-        max_matching_queue_storage_job_id(pool, filter).await
-    } else {
-        max_matching_canonical_job_id(pool, filter).await
-    }
-}
-
-async fn max_matching_canonical_job_id(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-) -> Result<Option<i64>, AwaError> {
-    sqlx::query_scalar(
-        r#"
-        SELECT max(id)
-        FROM awa.jobs
-        WHERE state IN ('available', 'scheduled')
-          AND ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR tags @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-        "#,
-    )
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .fetch_one(pool)
-    .await
-    .map_err(map_sqlx_error)
-}
-
-async fn max_matching_queue_storage_job_id(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-) -> Result<Option<i64>, AwaError> {
-    let schema = QueueStorage::active_schema(pool)
-        .await?
-        .ok_or_else(|| AwaError::Validation("queue storage is not active".to_string()))?;
-    sqlx::query_scalar(audited_sql(format!(
-        r#"
-        WITH candidates AS (
-            SELECT
-                ready.job_id AS id,
-                ready.kind,
-                ready.queue,
-                'available'::awa.job_state AS state,
-                ready.created_at,
-                COALESCE(ready.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = ready.queue
-             AND claims.priority = ready.priority
-             AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
-                    AND tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-              )
-            UNION ALL
-            SELECT
-                deferred.job_id AS id,
-                deferred.kind,
-                deferred.queue,
-                deferred.state,
-                deferred.created_at,
-                COALESCE(deferred.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.deferred_jobs AS deferred
-            WHERE deferred.state = 'scheduled'
-        )
-        SELECT max(id)
-        FROM candidates
-        WHERE ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-        "#
-    )))
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .fetch_one(pool)
-    .await
-    .map_err(map_sqlx_error)
-}
-
-async fn load_matching_jobs(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: i64,
-    max_job_id: i64,
-    limit: i64,
-) -> Result<Vec<JobRow>, AwaError> {
-    if let Some(store) = QueueStorage::active_schema(pool)
-        .await?
-        .map(QueueStorage::from_existing_schema)
-        .transpose()?
-    {
-        load_matching_queue_storage_jobs(&store, pool, filter, after_job_id, max_job_id, limit)
-            .await
-    } else {
-        load_matching_canonical_jobs(pool, filter, after_job_id, max_job_id, limit).await
-    }
-}
-
-async fn load_matching_job_ids(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: i64,
-    max_job_id: i64,
-    limit: i64,
-) -> Result<Vec<i64>, AwaError> {
-    if QueueStorage::active_schema(pool).await?.is_some() {
-        load_matching_queue_storage_job_ids(pool, filter, after_job_id, max_job_id, limit).await
-    } else {
-        load_matching_canonical_job_ids(pool, filter, after_job_id, max_job_id, limit).await
-    }
-}
-
-async fn load_matching_canonical_job_ids(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: i64,
-    max_job_id: i64,
-    limit: i64,
-) -> Result<Vec<i64>, AwaError> {
-    sqlx::query_scalar(
-        r#"
-        SELECT id
-        FROM awa.jobs
-        WHERE state IN ('available', 'scheduled')
-          AND ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR tags @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-          AND id > $8
-          AND id <= $9
-        ORDER BY id ASC
-        LIMIT $10
-        "#,
-    )
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .bind(after_job_id)
-    .bind(max_job_id)
-    .bind(limit.max(1))
-    .fetch_all(pool)
-    .await
-    .map_err(map_sqlx_error)
-}
-
-async fn load_matching_queue_storage_job_ids(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: i64,
-    max_job_id: i64,
-    limit: i64,
-) -> Result<Vec<i64>, AwaError> {
-    let schema = QueueStorage::active_schema(pool)
-        .await?
-        .ok_or_else(|| AwaError::Validation("queue storage is not active".to_string()))?;
-    sqlx::query_scalar(audited_sql(format!(
-        r#"
-        WITH candidates AS (
-            SELECT
-                ready.job_id AS id,
-                ready.kind,
-                ready.queue,
-                'available'::awa.job_state AS state,
-                ready.created_at,
-                COALESCE(ready.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = ready.queue
-             AND claims.priority = ready.priority
-             AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
-                    AND tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-              )
-            UNION ALL
-            SELECT
-                deferred.job_id AS id,
-                deferred.kind,
-                deferred.queue,
-                deferred.state,
-                deferred.created_at,
-                COALESCE(deferred.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.deferred_jobs AS deferred
-            WHERE deferred.state = 'scheduled'
-        )
-        SELECT id
-        FROM candidates
-        WHERE ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-          AND id > $8
-          AND id <= $9
-        ORDER BY id ASC
-        LIMIT $10
-        "#
-    )))
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .bind(after_job_id)
-    .bind(max_job_id)
-    .bind(limit.max(1))
-    .fetch_all(pool)
-    .await
-    .map_err(map_sqlx_error)
-}
-
-async fn count_matching_canonical_jobs(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: Option<i64>,
-    max_job_id: Option<i64>,
-) -> Result<i64, AwaError> {
-    sqlx::query_scalar(
-        r#"
-        SELECT count(*)::bigint
-        FROM awa.jobs
-        WHERE state IN ('available', 'scheduled')
-          AND ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR tags @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-          AND ($8::bigint IS NULL OR id > $8)
-          AND ($9::bigint IS NULL OR id <= $9)
-        "#,
-    )
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .bind(after_job_id)
-    .bind(max_job_id)
-    .fetch_one(pool)
-    .await
-    .map_err(map_sqlx_error)
-}
-
-async fn load_matching_canonical_jobs(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: i64,
-    max_job_id: i64,
-    limit: i64,
-) -> Result<Vec<JobRow>, AwaError> {
-    sqlx::query_as::<_, JobRow>(
-        r#"
-        SELECT *
-        FROM awa.jobs
-        WHERE state IN ('available', 'scheduled')
-          AND ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR tags @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-          AND id > $8
-          AND id <= $9
-        ORDER BY id ASC
-        LIMIT $10
-        "#,
-    )
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .bind(after_job_id)
-    .bind(max_job_id)
-    .bind(limit.max(1))
-    .fetch_all(pool)
-    .await
-    .map_err(map_sqlx_error)
-}
-
-async fn count_matching_queue_storage_jobs(
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: Option<i64>,
-    max_job_id: Option<i64>,
-) -> Result<i64, AwaError> {
-    let schema = QueueStorage::active_schema(pool)
-        .await?
-        .ok_or_else(|| AwaError::Validation("queue storage is not active".to_string()))?;
-    sqlx::query_scalar(audited_sql(format!(
-        r#"
-        WITH candidates AS (
-            SELECT
-                ready.job_id AS id,
-                ready.kind,
-                ready.queue,
-                'available'::awa.job_state AS state,
-                ready.created_at,
-                COALESCE(ready.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = ready.queue
-             AND claims.priority = ready.priority
-             AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
-                    AND tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-              )
-            UNION ALL
-            SELECT
-                deferred.job_id AS id,
-                deferred.kind,
-                deferred.queue,
-                deferred.state,
-                deferred.created_at,
-                COALESCE(deferred.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.deferred_jobs AS deferred
-            WHERE deferred.state = 'scheduled'
-        )
-        SELECT count(*)::bigint
-        FROM candidates
-        WHERE ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-          AND ($8::bigint IS NULL OR id > $8)
-          AND ($9::bigint IS NULL OR id <= $9)
-        "#
-    )))
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .bind(after_job_id)
-    .bind(max_job_id)
-    .fetch_one(pool)
-    .await
-    .map_err(map_sqlx_error)
-}
-
-async fn load_matching_queue_storage_jobs(
-    _store: &QueueStorage,
-    pool: &PgPool,
-    filter: &BatchOperationFilter,
-    after_job_id: i64,
-    max_job_id: i64,
-    limit: i64,
-) -> Result<Vec<JobRow>, AwaError> {
-    let schema = _store.schema();
-    let ids: Vec<i64> = sqlx::query_scalar(audited_sql(format!(
-        r#"
-        WITH candidates AS (
-            SELECT
-                ready.job_id AS id,
-                ready.kind,
-                ready.queue,
-                'available'::awa.job_state AS state,
-                ready.created_at,
-                COALESCE(ready.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_claim_heads AS claims
-              ON claims.queue = ready.queue
-             AND claims.priority = ready.priority
-             AND claims.enqueue_shard = ready.enqueue_shard
-            WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
-              AND NOT EXISTS (
-                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
-                  WHERE tomb.queue = ready.queue
-                    AND tomb.priority = ready.priority
-                    AND tomb.enqueue_shard = ready.enqueue_shard
-                    AND tomb.lane_seq = ready.lane_seq
-                    AND tomb.ready_slot = ready.ready_slot
-                    AND tomb.ready_generation = ready.ready_generation
-              )
-            UNION ALL
-            SELECT
-                deferred.job_id AS id,
-                deferred.kind,
-                deferred.queue,
-                deferred.state,
-                deferred.created_at,
-                COALESCE(deferred.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.deferred_jobs AS deferred
-            WHERE deferred.state = 'scheduled'
-        )
-        SELECT id
-        FROM candidates
-        WHERE ($1::awa.job_state IS NULL OR state = $1)
-          AND ($2::text IS NULL OR kind = $2)
-          AND ($3::text IS NULL OR queue = $3)
-          AND ($4::text IS NULL OR COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'tags')), ARRAY[]::text[]) @> ARRAY[$4]::text[])
-          AND ($5::bigint[] IS NULL OR id = ANY($5))
-          AND ($6::timestamptz IS NULL OR created_at >= $6)
-          AND ($7::timestamptz IS NULL OR created_at < $7)
-          AND id > $8
-          AND id <= $9
-        ORDER BY id ASC
-        LIMIT $10
-        "#
-    )))
-    .bind(filter.state)
-    .bind(&filter.kind)
-    .bind(&filter.queue)
-    .bind(&filter.tag)
-    .bind(filter.ids.as_deref())
-    .bind(filter.created_at_gte)
-    .bind(filter.created_at_lt)
-    .bind(after_job_id)
-    .bind(max_job_id)
-    .bind(limit.max(1))
-    .fetch_all(pool)
-    .await
-    .map_err(map_sqlx_error)?;
-
-    let mut jobs = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(job) = _store.load_job(pool, id).await? {
-            if matches_batch_filter(&job, filter, after_job_id, max_job_id) {
-                jobs.push(job);
-            }
-        }
-    }
-    jobs.sort_by_key(|job| job.id);
-    Ok(jobs)
-}
-
-fn matches_batch_filter(
-    job: &JobRow,
-    filter: &BatchOperationFilter,
-    after_job_id: i64,
-    max_job_id: i64,
-) -> bool {
-    if job.id <= after_job_id || job.id > max_job_id {
-        return false;
-    }
-    if !matches!(job.state, JobState::Available | JobState::Scheduled) {
-        return false;
-    }
-    if filter.state.is_some_and(|state| job.state != state) {
-        return false;
-    }
-    if filter.kind.as_ref().is_some_and(|kind| &job.kind != kind) {
-        return false;
-    }
-    if filter
-        .queue
-        .as_ref()
-        .is_some_and(|queue| &job.queue != queue)
-    {
-        return false;
-    }
-    if filter
-        .tag
-        .as_ref()
-        .is_some_and(|tag| !job.tags.iter().any(|job_tag| job_tag == tag))
-    {
-        return false;
-    }
-    if let Some(ids) = &filter.ids {
-        if !ids.contains(&job.id) {
-            return false;
-        }
-    }
-    if filter
-        .created_at_gte
-        .is_some_and(|created_at_gte| job.created_at < created_at_gte)
-    {
-        return false;
-    }
-    if filter
-        .created_at_lt
-        .is_some_and(|created_at_lt| job.created_at >= created_at_lt)
-    {
-        return false;
-    }
-    true
 }
 
 pub async fn run_one_default_chunk(

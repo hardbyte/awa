@@ -4,6 +4,7 @@ mod callback_contract;
 mod client;
 mod dlq;
 mod errors;
+mod filter;
 mod job;
 mod partitioned_queue;
 mod telemetry;

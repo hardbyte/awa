@@ -17,9 +17,9 @@ import {
 } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import type { JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
+import type { JobCount, JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
-import { SearchBar, parseSearch } from "@/components/SearchBar";
+import { SearchBar, parseSearch, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -108,14 +108,22 @@ export function JobsPage() {
 
   const searchFilters = parseSearch(filters.search);
 
-  const params: ListJobsParams = {
-    state: filters.state === "all" ? undefined : filters.state,
+  const filterParams: ListJobsParams = {
+    states: filters.state === "all" ? undefined : [filters.state],
     kind: searchFilters.kind,
     queue: searchFilters.queue,
-    tag: searchFilters.tag,
+    tags: searchFilters.tags,
+    ids: searchFilters.ids,
+    created_at_gte: toRfc3339(searchFilters.createdGte),
+    created_at_lt: toRfc3339(searchFilters.createdLt),
+  };
+  const params: ListJobsParams = {
+    ...filterParams,
     before_id: filters.beforeId,
     limit: filters.limit,
   };
+  const hasFilter =
+    filters.state !== "all" || Object.keys(parseSearch(filters.search)).length > 0;
 
   const hasSel = selected.size > 0;
   const poll = usePollInterval();
@@ -124,6 +132,15 @@ export function JobsPage() {
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
     refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
+  });
+
+  // Counted when the filter changes, not on every poll: a count reads the
+  // whole matching population.
+  const countQuery = useQuery<JobCount>({
+    queryKey: ["jobs-count", filterParams],
+    queryFn: () => fetchJobCount(filterParams),
+    enabled: hasFilter,
+    staleTime: 30_000,
   });
 
   const statsQuery = useQuery<StateCounts>({

@@ -174,12 +174,10 @@ async fn completion_stores_the_output_on_both_terminal_paths() {
     );
 
     // List reads leave outputs out.
-    let listed = admin::list_jobs(
+    let listed = admin::find_jobs(
         &pool,
-        &admin::ListJobsFilter {
-            queue: Some(queue.to_string()),
-            ..Default::default()
-        },
+        &awa::JobFilter::new().queue(queue),
+        awa::JobPage::default(),
     )
     .await
     .unwrap();

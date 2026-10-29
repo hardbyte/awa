@@ -410,8 +410,18 @@ class Client:
         state: str | None = None,
         kind: str | None = None,
         queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
+    async def find_jobs(
+        self,
+        filter: dict[str, Any] | None = None,
+        *,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> list[Job[dict[str, Any]]]: ...
+    async def count_jobs(self, filter: dict[str, Any] | None = None) -> dict[str, Any]: ...
     async def get_job(self, job_id: int) -> Job[dict[str, Any]]: ...
     async def preview_batch_operation(
         self,
@@ -449,6 +459,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: dict[str, Any] | None = None,
         before_id: int | None = None,
         before_dlq_at: datetime.datetime | None = None,
         limit: int = 100,
@@ -459,6 +470,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: dict[str, Any] | None = None,
         before_id: int | None = None,
         before_dlq_at: datetime.datetime | None = None,
         limit: int = 100,
@@ -491,6 +503,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: dict[str, Any] | None = None,
         allow_all: bool = False,
     ) -> int: ...
     def bulk_retry_from_dlq_sync(
@@ -499,6 +512,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: dict[str, Any] | None = None,
         allow_all: bool = False,
     ) -> int: ...
     async def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None: ...
@@ -527,6 +541,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: dict[str, Any] | None = None,
         before_id: int | None = None,
         before_dlq_at: datetime.datetime | None = None,
         allow_all: bool = False,
@@ -537,6 +552,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        filter: dict[str, Any] | None = None,
         before_id: int | None = None,
         before_dlq_at: datetime.datetime | None = None,
         allow_all: bool = False,
@@ -709,8 +725,18 @@ class Client:
         state: str | None = None,
         kind: str | None = None,
         queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
+    def find_jobs_sync(
+        self,
+        filter: dict[str, Any] | None = None,
+        *,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> list[Job[dict[str, Any]]]: ...
+    def count_jobs_sync(self, filter: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def get_job_sync(self, job_id: int) -> Job[dict[str, Any]]: ...
     def preview_batch_operation_sync(
         self,

@@ -64,6 +64,8 @@ from awa.client import (
     BatchOperationPreview,
     BatchOperationState,
     Client,
+    JobCount,
+    JobFilter,
 )
 from awa import callback_contract
 
@@ -77,6 +79,8 @@ __all__ = [
     "BatchOperationKind",
     "BatchOperationPreview",
     "BatchOperationState",
+    "JobCount",
+    "JobFilter",
     # Job types
     "Job",
     "JobState",

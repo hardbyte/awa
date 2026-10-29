@@ -1,38 +1,26 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
+use awa_model::dlq::{self, DlqRow, RetryFromDlqOpts};
+use awa_model::{DlqPage, JobFilter};
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize)]
-pub struct ListDlqParams {
-    pub kind: Option<String>,
-    pub queue: Option<String>,
-    pub tag: Option<String>,
-    pub before_id: Option<i64>,
-    /// Pair with `before_id` for a race-free `(dlq_at, id)` cursor that
-    /// matches the response sort order. Legacy callers omitting this get
-    /// the old id-only cursor.
-    pub before_dlq_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub limit: Option<i64>,
-}
-
+/// `GET /api/dlq`: the jobs endpoint's filter parameters, plus a
+/// `(before_dlq_at, before_id)` cursor matching the newest-first order.
 pub async fn list_dlq(
     State(state): State<AppState>,
-    Query(params): Query<ListDlqParams>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Vec<DlqRow>>, ApiError> {
-    let filter = ListDlqFilter {
-        kind: params.kind,
-        queue: params.queue,
-        tag: params.tag,
-        before_id: params.before_id,
-        before_dlq_at: params.before_dlq_at,
-        limit: params.limit,
+    let query = super::filter_params::parse(raw.as_deref())?;
+    let page = DlqPage {
+        before_dlq_at: query.before_dlq_at,
+        before_id: query.before_id,
+        limit: query.limit.unwrap_or(awa_model::filter::DEFAULT_PAGE_LIMIT),
     };
-    let rows = dlq::list_dlq(&state.pool, &filter).await?;
+    let rows = dlq::find_dlq(&state.pool, &query.filter, page).await?;
     Ok(Json(rows))
 }
 
@@ -113,10 +101,34 @@ pub struct BulkFilterPayload {
     pub queue: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
+    /// All of these tags, alongside `tag`.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub created_at_gte: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub created_at_lt: Option<chrono::DateTime<chrono::Utc>>,
     /// Explicit opt-in to act on every row in the DLQ when no filter is
     /// provided. The model layer rejects empty filters otherwise.
     #[serde(default)]
     pub all: bool,
+}
+
+impl BulkFilterPayload {
+    fn filter(&self) -> JobFilter {
+        JobFilter {
+            kind: self.kind.clone(),
+            queue: self.queue.clone(),
+            ids: self.ids.clone(),
+            created_at_gte: self.created_at_gte,
+            created_at_lt: self.created_at_lt,
+            ..Default::default()
+        }
+        .tags(self.tag.clone())
+        .tags(self.tags.clone())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -130,13 +142,8 @@ pub async fn bulk_retry_dlq(
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
     let queue_attr = payload.queue.clone();
-    let filter = ListDlqFilter {
-        kind: payload.kind,
-        queue: payload.queue,
-        tag: payload.tag,
-        ..Default::default()
-    };
-    let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
+    let count =
+        dlq::bulk_retry_from_dlq_matching(&state.pool, &payload.filter(), payload.all).await?;
     if count > 0 {
         state
             .metrics
@@ -169,13 +176,7 @@ pub async fn bulk_purge_dlq(
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
     let queue_attr = payload.queue.clone();
-    let filter = ListDlqFilter {
-        kind: payload.kind,
-        queue: payload.queue,
-        tag: payload.tag,
-        ..Default::default()
-    };
-    let count = dlq::purge_dlq(&state.pool, &filter, payload.all).await?;
+    let count = dlq::purge_dlq_matching(&state.pool, &payload.filter(), payload.all).await?;
     if count > 0 {
         state
             .metrics

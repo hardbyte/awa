@@ -305,10 +305,7 @@ async fn test_batch_operation_rejects_ineligible_state_filter() {
         client.pool(),
         SubmitBatchOperation {
             spec: BatchOperationSpec::SetPriority { priority: 1 },
-            filter: BatchOperationFilter {
-                state: Some(JobState::Failed),
-                ..Default::default()
-            },
+            filter: BatchOperationFilter::new().state(JobState::Failed),
             submitted_by: Some("test".to_string()),
             allow_all: false,
         },
@@ -1954,6 +1951,8 @@ async fn test_admin_list_jobs() {
         queue: Some(queue.to_string()),
         ..Default::default()
     };
+    // The deprecated entry point still answers through the shared filter.
+    #[allow(deprecated)]
     let jobs = admin::list_jobs(client.pool(), &filter).await.unwrap();
     assert!(!jobs.is_empty());
     assert!(jobs.iter().all(|j| j.state == JobState::Available));
