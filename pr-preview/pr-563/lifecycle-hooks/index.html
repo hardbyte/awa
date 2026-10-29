@@ -2575,7 +2575,7 @@
 </tr>
 </tbody>
 </table>
-<p><code>on_*_enqueue_with</code> returns <code>Option&lt;EnqueueRequest&lt;F&gt;&gt;</code>:</p>
+<p>An <code>on_*_enqueue_with</code> closure returns <code>Option&lt;EnqueueRequest&lt;F&gt;&gt;</code>:</p>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">.</span><span class="n">on_completed_enqueue_with</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Signup</span><span class="p">,</span><span class="w"> </span><span class="n">WelcomeEmail</span><span class="p">,</span><span class="w"> </span><span class="n">_</span><span class="o">&gt;</span><span class="p">(</span><span class="o">|</span><span class="n">args</span><span class="p">,</span><span class="w"> </span><span class="n">job</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">    </span><span class="nb">Some</span><span class="p">(</span>
 </span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">        </span><span class="n">EnqueueRequest</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">WelcomeEmail</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">user_id</span><span class="p">:</span><span class="w"> </span><span class="nc">args</span><span class="p">.</span><span class="n">user_id</span><span class="w"> </span><span class="p">})</span>
