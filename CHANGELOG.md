@@ -75,6 +75,10 @@ for each step.
 - **`awa-testing`'s `WorkResult::Completed` holds the row read back after
   completion** (state `Completed`, `finalized_at` and `output` set), not the
   claimed row.
+- **Rust library users: `on_*_enqueue_with` closures return
+  `Option<EnqueueRequest<F>>`.** Wrap an existing closure's result in
+  `Some(...)`; the turbofish (`::<T, F, _>`) is unchanged. Returning `None`
+  enqueues nothing for that trigger ([ADR-029 amendment](docs/adr/029-transactional-followup-jobs.md#amendment-conditional-registered-follow-ups)).
 
 ### Added
 
@@ -105,6 +109,11 @@ for each step.
   Schema when the runtime has one, is published in the new
   `awa.job_kind_descriptors.output` column and shown on the admin UI's kinds
   and job detail pages.
+- **Conditional registered follow-ups.** An `on_*_enqueue_with` closure can
+  return `None` to enqueue nothing for a trigger while its transition still
+  commits. This covers completions with no handler, such as
+  `complete_external` and `resolve_callback`, where a handler-staged follow-up
+  cannot be used.
 - **Handler-staged follow-up jobs ([ADR-046](docs/adr/046-handler-staged-follow-ups.md)).**
   A handler can stage follow-up jobs built from values it computed:
   `ctx.enqueue_on_completion(request)`, `ctx.follow_ups()` for `register`

@@ -16,7 +16,7 @@ The report that prompted this ADR asked for typed or untyped metadata on `JobRes
 2. Can someone inspect A's result afterwards?
 3. Does B depend on fetching A's stored result later?
 
-This ADR answers the first. The second is a separate feature, retained job output, specified by [ADR-048](https://github.com/hardbyte/awa/pull/565). The third is what makes a stored result a retention problem, because B might run after A has been pruned. This ADR's answer to it is no: B gets its value in its own args. Today a handler has three ways to pass the value, none adequate:
+This ADR answers the first. The second is a separate feature, retained job output, specified by [ADR-048](048-retained-job-output.md). The third is what makes a stored result a retention problem, because B might run after A has been pruned. This ADR's answer to it is no: B gets its value in its own args. Today a handler has three ways to pass the value, none adequate:
 
 - **Write it where a registered spec can read it.** Completion clears the progress buffer before specs run, on both engines. Progress also survives retries by design ([ADR-014](014-structured-progress.md)), so a value written by a failed attempt could reach a later attempt's follow-up.
 - **Insert B from the handler** with `insert_with(ctx.pool(), ...)` and unique options. B then exists before A commits, survives if A fails or is rescued, and a non-deterministic handler can insert a different B on each attempt.
@@ -178,10 +178,10 @@ The [PRD](https://github.com/hardbyte/awa/blob/main/docs/archive/prd.md#35-non-g
 
 - **A pipeline definition.** Awa stores no relation between A and B. No graph, step list or topology exists in the builder, the schema or the runtime; the only place the "pipeline" exists is the handler's code.
 - **Fan-in or joins.** Nothing waits for several jobs, or for B to finish. A's handler has returned before B is inserted; A's completion and B's row then become visible together, in one transaction. B's outcome never reaches A.
-- **Workflow state, or step results that drive other jobs.** A's value travels to B only in B's args, and this ADR records nothing on A. An output retained on A for inspection ([ADR-048](https://github.com/hardbyte/awa/pull/565)) does not cross this line, because neither the engine nor another job reads it to decide what runs.
+- **Workflow state, or step results that drive other jobs.** A's value travels to B only in B's args, and this ADR records nothing on A. An output retained on A for inspection ([ADR-048](048-retained-job-output.md)) does not cross this line, because neither the engine nor another job reads it to decide what runs.
 - **Guarantees across steps.** Inserting B is part of A's completion: an insert error other than a duplicate key rolls A's completion back (see [Guarantees](#guarantees)). Once both have committed, nothing B does affects A. There is no compensation, saga, rollback across jobs, or retry of a chain as a unit.
 - **Durable execution.** A handler body is never resumed or replayed. A finalize retry repeats the completion transaction for the same attempt with the same sealed follow-ups. A retried attempt runs the handler from the beginning with an empty staging buffer.
-- **Predicates in the engine.** A conditional follow-up is an `if` in the handler. The engine inserts the rows it is handed and evaluates no conditions.
+- **Stored predicates.** A conditional follow-up is code: an `if` in the handler, or a registered spec whose closure returns `None` ([ADR-029 amendment](029-transactional-followup-jobs.md#amendment-conditional-registered-follow-ups)). The engine stores and evaluates no conditions of its own.
 
 The PRD's "no fan-out", and the same words in roadmap D7 and [ADR-034](034-job-dependencies.md), refer to a fan-out construct: a step that spawns or releases children and tracks them as a group, usually paired with a fan-in. ADR-034 and D7 now say so explicitly. Staging several follow-ups, at most 16, is not that. It is the same as an application inserting several jobs in one transaction, which Awa has always supported ([ADR-006](006-awa-transaction.md)). The children are independent jobs and nothing tracks them as a set.
 
@@ -198,7 +198,7 @@ No schema change. A stage-B kind is new code, and an older worker that claims a 
 
 ## Relationship to other ADRs
 
-- **ADR-029.** Registered specs keep their role for unconditional follow-ups derived from args. Both run in the same completion transaction. This ADR does not change ADR-029's atomicity matrix; it adds a source of follow-ups to the worker-driven `Completed` row.
+- **ADR-029.** Registered specs keep their role for follow-ups derived from args and the job row, including ones a `_with` closure skips by returning `None`. Both run in the same completion transaction. This ADR does not change ADR-029's atomicity matrix; it adds a source of follow-ups to the worker-driven `Completed` row.
 - **ADR-042.** Caller-owned handlers insert follow-ups in their own transaction, as ADR-042 specifies, and staging is not offered on the caller-owned context. Moving a handler from staging to caller-owned completion swaps `enqueue_on_completion` for an insert in its transaction; no follow-up spec wiring changes.
 - **ADR-026.** A job that stages completes through the general terminal path, not the compact one.
 - **ADR-034 (proposed).** A dependent child exists before its parent runs, so it cannot carry a value the parent computes. Staging is complementary.
@@ -223,7 +223,7 @@ No schema change. A stage-B kind is new code, and an older worker that claims a 
 
 ### Negative
 
-- **Coupling.** A's handler now decides what happens next, instead of only reporting what it produced and leaving separately registered logic to decide. Staging buys atomicity and early validation with that coupling. One consequence is that pipeline topology is no longer fully visible in the client builder: a reader must look in handlers for staged follow-ups. A handler that should stay reusable across pipelines can take its request from an injected factory (`ctx.extract`). Retained output ([ADR-048](https://github.com/hardbyte/awa/pull/565)) restores the "report, don't decide" shape for inspection, but not for dispatch.
+- **Coupling.** A's handler now decides what happens next, instead of only reporting what it produced and leaving separately registered logic to decide. Staging buys atomicity and early validation with that coupling. One consequence is that pipeline topology is no longer fully visible in the client builder: a reader must look in handlers for staged follow-ups. A handler that should stay reusable across pipelines can take its request from an injected factory (`ctx.extract`). Retained output ([ADR-048](048-retained-job-output.md)) restores the "report, don't decide" shape for inspection, but not for dispatch.
 - The staged value is transient. Debugging relies on B's args, and a deduplication skip leaves no trace on A beyond a debug log.
 - A job that stages pays a per-job completion transaction and loses the compact completion path.
 
@@ -238,14 +238,14 @@ No schema change. A stage-B kind is new code, and an older worker that claims a 
 `ctx.set_output(value)` and a spec that reads it. No `JobResult` change and no leakage across retries. Rejected:
 
 - The output type meets the spec's expected type only at run time, inside the completion transaction. A mismatch rolls the completion back, which today leaves the job running until rescue, which then repeats the failure.
-- `Client::complete_external` has no output, so output-reading specs need conditional dispatch, which ADR-029 keeps out of the registry.
+- `Client::complete_external` has no output, so output-reading specs need conditional dispatch, which ADR-029 kept out of the registry. ADR-029's later [amendment](029-transactional-followup-jobs.md#amendment-conditional-registered-follow-ups) lets a `_with` closure return `None`, which removes this objection; the others stand.
 - It adds a 13th `on_*_enqueue*` builder and invites siblings for every outcome.
 - Python would have to run a Python callable inside the completion transaction.
 - Staging is strictly more direct: the handler that has the value builds the request, and the type is checked at compile time.
 
 ### Retain the result on the job
 
-Not required for this handoff, and not ruled out: retained output is a separate feature, specified by [ADR-048](https://github.com/hardbyte/awa/pull/565). It answers question 2 above; staging answers question 1. The two are compatible. A completing handler can stage B with the value in B's args and also record the value as A's output, in the same guarded completion. B then never depends on A's output surviving pruning, which is question 3, and B must not read A's output: a value B needs travels in its args.
+Not required for this handoff, and not ruled out: retained output is a separate feature, specified by [ADR-048](048-retained-job-output.md). It answers question 2 above; staging answers question 1. The two are compatible. A completing handler can stage B with the value in B's args and also record the value as A's output, in the same guarded completion. B then never depends on A's output surviving pruning, which is question 3, and B must not read A's output: a value B needs travels in its args.
 
 An earlier draft rejected persisted output outright. Its reasons do not hold up as reasons against the feature:
 
@@ -275,4 +275,4 @@ Rejected for this problem: the child is created before the parent runs, so it ca
 - **Deadlock-free multi-insert completion.** Acquire every unique claim and enqueue-lane lock a completion needs, registered and staged, in one global order before inserting.
 - **A deduplication metric** counting follow-ups skipped on an existing key, and **provenance**: stamp each follow-up with the triggering job ID under the reserved `awa:` metadata namespace so B can be traced to A. Both help answer "why is there no B for this value?"
 - **Staging for other outcomes**, such as a follow-up on `RetryAfter`, if a use case appears.
-- **Retained output**: specified separately by [ADR-048](https://github.com/hardbyte/awa/pull/565).
+- **Retained output**: specified separately by [ADR-048](048-retained-job-output.md).

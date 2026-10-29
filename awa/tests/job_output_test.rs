@@ -391,15 +391,17 @@ async fn enqueue_specs_receive_the_row_without_its_output() {
             }
         })
         .on_completed_enqueue_with::<Summarize, Noted, _>(|_args, job| {
-            EnqueueRequest::new(Noted {
-                seen_output: job.output.is_some()
-                    || job
-                        .errors
-                        .iter()
-                        .flatten()
-                        .any(|entry| entry.get("output").is_some()),
-            })
-            .queue("output_specs_noted")
+            Some(
+                EnqueueRequest::new(Noted {
+                    seen_output: job.output.is_some()
+                        || job
+                            .errors
+                            .iter()
+                            .flatten()
+                            .any(|entry| entry.get("output").is_some()),
+                })
+                .queue("output_specs_noted"),
+            )
         })
         .build()
         .unwrap();

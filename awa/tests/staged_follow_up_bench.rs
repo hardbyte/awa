@@ -120,11 +120,13 @@ async fn run(scenario: Scenario, jobs: i64, canonical: bool) -> (Duration, i64) 
     if matches!(scenario, Scenario::RegisteredSpec) {
         builder =
             builder.on_completed_enqueue_with::<BenchTrigger, BenchFollowUp, _>(|args, _job| {
-                EnqueueRequest::new(BenchFollowUp {
-                    key: args.n,
-                    slot: 0,
-                })
-                .queue("staged_bench_follow_ups")
+                Some(
+                    EnqueueRequest::new(BenchFollowUp {
+                        key: args.n,
+                        slot: 0,
+                    })
+                    .queue("staged_bench_follow_ups"),
+                )
             });
     }
     let client = builder.build().unwrap();
