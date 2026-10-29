@@ -2475,7 +2475,7 @@
 <li><strong>No <code>#[non_exhaustive]</code>.</strong> That would also forbid <code>..Default::default()</code>, which is how every existing caller builds a filter. Instead, the documented way to construct one is <code>JobFilter { kind: ..., ..Default::default() }</code> or the builder methods. A field added later then breaks no caller that follows it.</li>
 <li><strong>The JSON shape stays ADR-030's.</strong> A filter with one tag serializes as <code>"tag": "..."</code>, and one state as <code>"state": "..."</code>. Only a filter that needs more uses <code>"tags": [...]</code>, <code>"states": [...]</code> or <code>"dead_lettered"</code>.</li>
 <li><strong>Deserialization is strict.</strong> An unknown field is an error, not an ignored key, so a typo can't widen a stored batch operation.</li>
-<li><strong>New fields wait for the fleet.</strong> A runner that predates this ADR would ignore a field it doesn't know. So submitting a batch operation whose filter uses a field ADR-030 didn't define is refused while any live runtime reports an older <code>binary_version</code>. <code>awa migrate</code> refuses the same way while a live runtime is too old.</li>
+<li><strong>New fields wait for the fleet.</strong> A runner that predates this ADR would ignore a field it doesn't know. So submitting a batch operation whose filter uses a field ADR-030 didn't define is refused while any live runtime reports a version older than 0.7.0-alpha.2, the first release with this ADR. <code>awa migrate</code> refuses the same way while a live runtime is too old.</li>
 </ul>
 <p><code>BatchOperationFilter</code> becomes an alias of <code>JobFilter</code>, so batch operations accept the new fields once the fleet is upgraded.</p>
 <p>A filter describes a population, and paging is separate from it. So a filter means the same thing wherever it's stored or sent:
@@ -2568,7 +2568,7 @@
 <h4 id="building-the-index">Building the index<a class="headerlink" href="#building-the-index" title="Permanent link">&para;</a></h4>
 <p>There's no migration. A plain <code>CREATE INDEX</code> blocks writes for the whole build, and Awa's migrations run in one transaction, which rules out <code>CONCURRENTLY</code>.</p>
 <ul>
-<li><strong>New schemas.</strong> Queue-storage schemas installed by a binary from this ADR on create each partition's index when the partition is created.</li>
+<li><strong>New schemas and empty partitions.</strong> <code>awa migrate</code> and schema preparation index every partition that is empty, owned by the caller, and free to lock without waiting. That costs nothing on an empty table, so new and freshly installed schemas come out fully indexed.</li>
 <li><strong>Existing schemas: <code>awa storage build-tag-index</code>.</strong> It runs as the migrator, because since v049 the runtime role need not own Awa's tables, and only an owner may create an index. It builds one index at a time:</li>
 <li><strong>A ring partition</strong> is indexed right after pruning empties it, while it isn't the current slot. The build takes a <code>SHARE</code> lock with <code>NOWAIT</code>, confirms the partition is empty, creates the index (instant on an empty table) and commits. A populated partition is retried on a later pass, so the whole ring is covered within one ring cycle.</li>
 <li><strong><code>--now</code></strong> builds populated partitions with <code>CREATE INDEX CONCURRENTLY</code> instead, and so does every build on <code>deferred_jobs</code> and <code>dlq_entries</code>. Its costs:<ul>
@@ -2578,7 +2578,7 @@
 </ul>
 </li>
 <li><strong>It's resumable.</strong> Each index has a pinned name (<code>{partition}_tags_idx</code>). An existing invalid index is rebuilt with <code>REINDEX INDEX CONCURRENTLY</code>, never skipped by <code>IF NOT EXISTS</code>. Lock attempts use <code>lock_timeout</code> and retry. <code>awa storage status</code> reports how many partitions are indexed.</li>
-<li><strong>Callers can trigger it.</strong> It runs from the CLI, from Rust as <code>storage::build_tag_indexes</code>, and from Python as <code>build_tag_indexes()</code>. <code>awa migrate</code> prints a reminder to run it but doesn't run it. External migration runners run the CLI; a static SQL file can't enumerate each database's partitions or repair invalid indexes.</li>
+<li><strong>Callers can trigger it.</strong> It runs from the CLI or from Rust as <code>tag_index::build_tag_indexes</code>. External migration runners run the CLI; a static SQL file can't enumerate each database's partitions or repair invalid indexes.</li>
 <li><strong>Lookups stay correct during the build.</strong> Until the build finishes, the planner uses the indexes that exist and scans the partitions that have none.</li>
 </ul>
 <h3 id="surfaces">Surfaces<a class="headerlink" href="#surfaces" title="Permanent link">&para;</a></h3>
@@ -2663,7 +2663,7 @@
 <ul>
 <li><strong>Tagged jobs write more WAL.</strong> With two tags per job, the lifecycle writes about a third more. Untagged jobs are unaffected.</li>
 <li><strong>Upgrading gains an online step</strong> for existing schemas. Until it finishes, tag lookups on unindexed partitions still scan. <code>--now</code> holds back vacuum and blocks pruning of the partition it's building.</li>
-<li><strong>Some names are deprecated.</strong> <code>list_jobs</code>, <code>ListJobsFilter</code>, <code>list_dlq</code> and <code>ListDlqFilter</code> are deprecated, and <code>BatchOperationFilter</code> gains fields. Code that builds it with an exhaustive struct literal adds <code>..Default::default()</code>.</li>
+<li><strong>Some names are deprecated, and one type changes.</strong> <code>list_jobs</code>, <code>ListJobsFilter</code>, <code>list_dlq</code>, <code>purge_dlq</code>, <code>bulk_retry_from_dlq</code> and <code>ListDlqFilter</code> are deprecated. <code>BatchOperationFilter</code> becomes <code>JobFilter</code>, whose <code>state</code> and <code>tag</code> fields are now the lists <code>states</code> and <code>tags</code>; code that set them in a struct literal moves to the builder.</li>
 </ul>
 <h2 id="rollout">Rollout<a class="headerlink" href="#rollout" title="Permanent link">&para;</a></h2>
 <ul>

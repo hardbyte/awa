@@ -86,7 +86,7 @@ pub struct JobFilter {
 - **No `#[non_exhaustive]`.** That would also forbid `..Default::default()`, which is how every existing caller builds a filter. Instead, the documented way to construct one is `JobFilter { kind: ..., ..Default::default() }` or the builder methods. A field added later then breaks no caller that follows it.
 - **The JSON shape stays ADR-030's.** A filter with one tag serializes as `"tag": "..."`, and one state as `"state": "..."`. Only a filter that needs more uses `"tags": [...]`, `"states": [...]` or `"dead_lettered"`.
 - **Deserialization is strict.** An unknown field is an error, not an ignored key, so a typo can't widen a stored batch operation.
-- **New fields wait for the fleet.** A runner that predates this ADR would ignore a field it doesn't know. So submitting a batch operation whose filter uses a field ADR-030 didn't define is refused while any live runtime reports an older `binary_version`. `awa migrate` refuses the same way while a live runtime is too old.
+- **New fields wait for the fleet.** A runner that predates this ADR would ignore a field it doesn't know. So submitting a batch operation whose filter uses a field ADR-030 didn't define is refused while any live runtime reports a version older than 0.7.0-alpha.2, the first release with this ADR. `awa migrate` refuses the same way while a live runtime is too old.
 
 `BatchOperationFilter` becomes an alias of `JobFilter`, so batch operations accept the new fields once the fleet is upgraded.
 
@@ -169,7 +169,7 @@ A tag predicate is written `(payload -> 'tags') <> '[]'::jsonb AND payload -> 't
 
 There's no migration. A plain `CREATE INDEX` blocks writes for the whole build, and Awa's migrations run in one transaction, which rules out `CONCURRENTLY`.
 
-- **New schemas.** Queue-storage schemas installed by a binary from this ADR on create each partition's index when the partition is created.
+- **New schemas and empty partitions.** `awa migrate` and schema preparation index every partition that is empty, owned by the caller, and free to lock without waiting. That costs nothing on an empty table, so new and freshly installed schemas come out fully indexed.
 - **Existing schemas: `awa storage build-tag-index`.** It runs as the migrator, because since v049 the runtime role need not own Awa's tables, and only an owner may create an index. It builds one index at a time:
   - **A ring partition** is indexed right after pruning empties it, while it isn't the current slot. The build takes a `SHARE` lock with `NOWAIT`, confirms the partition is empty, creates the index (instant on an empty table) and commits. A populated partition is retried on a later pass, so the whole ring is covered within one ring cycle.
   - **`--now`** builds populated partitions with `CREATE INDEX CONCURRENTLY` instead, and so does every build on `deferred_jobs` and `dlq_entries`. Its costs:
@@ -177,7 +177,7 @@ There's no migration. A plain `CREATE INDEX` blocks writes for the whole build, 
     - **It blocks pruning.** `prune_oldest`'s `NOWAIT` lock on that partition fails, so prune reports `Blocked` until the build finishes.
     - **It can lose a deadlock.** A build that loses one leaves an invalid index, which the next run repairs.
 - **It's resumable.** Each index has a pinned name (`{partition}_tags_idx`). An existing invalid index is rebuilt with `REINDEX INDEX CONCURRENTLY`, never skipped by `IF NOT EXISTS`. Lock attempts use `lock_timeout` and retry. `awa storage status` reports how many partitions are indexed.
-- **Callers can trigger it.** It runs from the CLI, from Rust as `storage::build_tag_indexes`, and from Python as `build_tag_indexes()`. `awa migrate` prints a reminder to run it but doesn't run it. External migration runners run the CLI; a static SQL file can't enumerate each database's partitions or repair invalid indexes.
+- **Callers can trigger it.** It runs from the CLI or from Rust as `tag_index::build_tag_indexes`. External migration runners run the CLI; a static SQL file can't enumerate each database's partitions or repair invalid indexes.
 - **Lookups stay correct during the build.** Until the build finishes, the planner uses the indexes that exist and scans the partitions that have none.
 
 ### Surfaces
@@ -248,7 +248,7 @@ It's deferred because the index serves explicit tags today, and derivation can b
 
 - **Tagged jobs write more WAL.** With two tags per job, the lifecycle writes about a third more. Untagged jobs are unaffected.
 - **Upgrading gains an online step** for existing schemas. Until it finishes, tag lookups on unindexed partitions still scan. `--now` holds back vacuum and blocks pruning of the partition it's building.
-- **Some names are deprecated.** `list_jobs`, `ListJobsFilter`, `list_dlq` and `ListDlqFilter` are deprecated, and `BatchOperationFilter` gains fields. Code that builds it with an exhaustive struct literal adds `..Default::default()`.
+- **Some names are deprecated, and one type changes.** `list_jobs`, `ListJobsFilter`, `list_dlq`, `purge_dlq`, `bulk_retry_from_dlq` and `ListDlqFilter` are deprecated. `BatchOperationFilter` becomes `JobFilter`, whose `state` and `tag` fields are now the lists `states` and `tags`; code that set them in a struct literal moves to the builder.
 
 ## Rollout
 
