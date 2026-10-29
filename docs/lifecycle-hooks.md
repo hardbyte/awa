@@ -111,7 +111,7 @@ There is one builder per outcome, plus a `_with` variant whose closure returns `
 | `on_waiting_for_callback_enqueue` | `JobResult::WaitForCallback` | `(args, &job)` |
 | `on_rescued_enqueue` | maintenance rescue (expired callback / stale heartbeat / deadline) | `(args, &job, RescueReason)` |
 
-`on_*_enqueue_with` returns `Option<EnqueueRequest<F>>`:
+An `on_*_enqueue_with` closure returns `Option<EnqueueRequest<F>>`:
 
 ```rust
 .on_completed_enqueue_with::<Signup, WelcomeEmail, _>(|args, job| {
