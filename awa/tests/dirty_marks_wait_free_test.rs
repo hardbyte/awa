@@ -10,6 +10,12 @@ use sqlx::PgPool;
 use std::time::Duration;
 
 const TABLES: [&str; 2] = ["awa.admin_dirty_queue_marks", "awa.admin_dirty_kind_marks"];
+
+/// The drain and the full refresh consume every queue's marks, not just the
+/// calling test's, so a test that counts marks between two steps races any
+/// other test draining at the same time. Tests here run one at a time.
+static DIRTY_MARKS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn drain_all_marks(pool: &PgPool) {
     sqlx::query("SELECT awa.refresh_admin_metadata()")
         .execute(pool)
@@ -30,6 +36,7 @@ async fn enqueues_in_application_transactions_do_not_deadlock_through_dirty_mark
     ) {
         return;
     }
+    let _serial = DIRTY_MARKS_LOCK.lock().await;
     let pool = setup::setup(4).await;
     let queue = format!("dirty_marks_app_{}", uuid::Uuid::new_v4().simple());
 
@@ -134,6 +141,7 @@ async fn hot_path_triggers_cannot_wait_on_other_transactions() {
     if setup::skip_unless_canonical("hot_path_triggers_cannot_wait_on_other_transactions") {
         return;
     }
+    let _serial = DIRTY_MARKS_LOCK.lock().await;
     let pool = setup::setup(2).await;
 
     for table in TABLES {
@@ -308,6 +316,7 @@ async fn drain_leaves_marks_of_uncommitted_transitions_for_the_next_pass() {
     ) {
         return;
     }
+    let _serial = DIRTY_MARKS_LOCK.lock().await;
     let pool = setup::setup(3).await;
     let queue = format!("dirty_marks_drain_{}", uuid::Uuid::new_v4().simple());
 
@@ -367,6 +376,7 @@ async fn concurrent_reschedules_with_drain_and_refresh_never_deadlock() {
     {
         return;
     }
+    let _serial = DIRTY_MARKS_LOCK.lock().await;
     let pool = setup::setup(12).await;
     let tag = uuid::Uuid::new_v4().simple().to_string();
     let queues: Vec<String> = (0..3)
