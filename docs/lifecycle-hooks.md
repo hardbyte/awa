@@ -100,7 +100,7 @@ let client = Client::builder(pool)
     .build()?;
 ```
 
-There is one builder per outcome, plus a `_with` variant whose closure returns `Option<EnqueueRequest<F>>` so you can override `InsertOpts` on the follow-up, or return `None` to enqueue nothing (queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key):
+There is one builder per outcome, plus a `_with` variant whose closure returns `Option<EnqueueRequest<F>>`. Return `Some` to override `InsertOpts` on the follow-up (queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key), or `None` to enqueue nothing ([Conditional follow-ups](#conditional-follow-ups)):
 
 | Builder | Fires when | Closure signature |
 | --- | --- | --- |

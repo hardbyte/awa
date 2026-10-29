@@ -16,7 +16,7 @@ The report that prompted this ADR asked for typed or untyped metadata on `JobRes
 2. Can someone inspect A's result afterwards?
 3. Does B depend on fetching A's stored result later?
 
-This ADR answers the first. The second is a separate feature, retained job output, specified by [ADR-048](https://github.com/hardbyte/awa/pull/565). The third is what makes a stored result a retention problem, because B might run after A has been pruned. This ADR's answer to it is no: B gets its value in its own args. Today a handler has three ways to pass the value, none adequate:
+This ADR answers the first. The second is a separate feature, retained job output, specified by [ADR-048](048-retained-job-output.md). The third is what makes a stored result a retention problem, because B might run after A has been pruned. This ADR's answer to it is no: B gets its value in its own args. Today a handler has three ways to pass the value, none adequate:
 
 - **Write it where a registered spec can read it.** Completion clears the progress buffer before specs run, on both engines. Progress also survives retries by design ([ADR-014](014-structured-progress.md)), so a value written by a failed attempt could reach a later attempt's follow-up.
 - **Insert B from the handler** with `insert_with(ctx.pool(), ...)` and unique options. B then exists before A commits, survives if A fails or is rescued, and a non-deterministic handler can insert a different B on each attempt.
@@ -245,7 +245,7 @@ No schema change. A stage-B kind is new code, and an older worker that claims a 
 
 ### Retain the result on the job
 
-Not required for this handoff, and not ruled out: retained output is a separate feature, specified by [ADR-048](https://github.com/hardbyte/awa/pull/565). It answers question 2 above; staging answers question 1. The two are compatible. A completing handler can stage B with the value in B's args and also record the value as A's output, in the same guarded completion. B then never depends on A's output surviving pruning, which is question 3, and B must not read A's output: a value B needs travels in its args.
+Not required for this handoff, and not ruled out: retained output is a separate feature, specified by [ADR-048](048-retained-job-output.md). It answers question 2 above; staging answers question 1. The two are compatible. A completing handler can stage B with the value in B's args and also record the value as A's output, in the same guarded completion. B then never depends on A's output surviving pruning, which is question 3, and B must not read A's output: a value B needs travels in its args.
 
 An earlier draft rejected persisted output outright. Its reasons do not hold up as reasons against the feature:
 
@@ -275,4 +275,4 @@ Rejected for this problem: the child is created before the parent runs, so it ca
 - **Deadlock-free multi-insert completion.** Acquire every unique claim and enqueue-lane lock a completion needs, registered and staged, in one global order before inserting.
 - **A deduplication metric** counting follow-ups skipped on an existing key, and **provenance**: stamp each follow-up with the triggering job ID under the reserved `awa:` metadata namespace so B can be traced to A. Both help answer "why is there no B for this value?"
 - **Staging for other outcomes**, such as a follow-up on `RetryAfter`, if a use case appears.
-- **Retained output**: specified separately by [ADR-048](https://github.com/hardbyte/awa/pull/565).
+- **Retained output**: specified separately by [ADR-048](048-retained-job-output.md).

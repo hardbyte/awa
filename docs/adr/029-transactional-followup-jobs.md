@@ -169,7 +169,7 @@ Powerful and durable but heavy infra (logical replication slot, Debezium-class c
 ## Implementation
 
 - **Outcome surface.** `Outcome::{Completed, Retried, Exhausted, Cancelled, WaitingForCallback, Rescued}`. `Started` is intentionally excluded — claim-time enqueue would join the dispatcher's hot path, and the durable-side-effect use case for "job started" is uncommon. Observation belongs to `on_event`. `on_started_enqueue` is not blocked by anything in this design; whether to add it is left as an open question rather than a v1 commitment.
-- **Builder API.** Each outcome has a pair of builders: `on_<outcome>_enqueue` (closure returns `JobArgs`) and `on_<outcome>_enqueue_with` (closure returns `Option<EnqueueRequest<F>>` for `InsertOpts` overrides, or `None` to enqueue nothing, per the amendment below — queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key).
+- **Builder API.** Each outcome has a pair of builders: `on_<outcome>_enqueue` (closure returns `JobArgs`) and `on_<outcome>_enqueue_with` (closure returns `Option<EnqueueRequest<F>>`: `Some` with `InsertOpts` overrides — queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key — or `None` to enqueue nothing, per the [amendment](#amendment-conditional-registered-follow-ups)).
 - **Closure signatures** carry the per-outcome context: Completed/WaitingForCallback: `(args, &job_row)`; Cancelled: `(args, &job_row, &reason)`; Retried: `(args, &job_row, &error, attempt, next_run_at)`; Exhausted: `(args, &job_row, &error, attempt)`; Rescued: `(args, &job_row, RescueReason)`.
 - **Rescued event variant.** Maintenance rescues fire `JobEvent::Rescued { args, job, reason: RescueReason }` alongside the follow-up spec dispatch, keeping rescue context distinct from Retried/Exhausted rather than overloading either.
 
@@ -213,4 +213,3 @@ The condition is evaluated by the same closure that already maps the trigger's a
 **Compatibility.** This is a breaking change from 0.6. Existing `_with` closures wrap their result in `Some(...)`, and the turbofish (`::<T, F, _>`) does not change. Two non-breaking shapes were rejected:
 - **A fourth type parameter** (`R: Into<Option<EnqueueRequest<F>>>`) would keep closure bodies compiling, but every turbofish would become `::<T, F, _, _>`.
 - **Six new `on_*_enqueue_if` builders** would grow the builder surface ADR-046 already counted as a cost.
-
