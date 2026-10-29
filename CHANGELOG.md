@@ -4,6 +4,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
 
 ## [Unreleased]
 
+### Fixed
+
+- `awa.jobs` keeps running jobs visible after priority aging changes their
+  effective priority. Migration v053 joins receipt claims and materialized leases
+  to the exact job attempt rather than comparing effective and lane priorities,
+  excluding tombstoned and older-attempt ready rows to prevent duplicates.
+  The migration only refreshes the compatibility function; storage and runtime
+  write protocols are unchanged.
+
 ## [0.7.0-alpha.1] — 2026-10-29
 
 ### Upgrading

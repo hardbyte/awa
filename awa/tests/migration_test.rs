@@ -381,6 +381,131 @@ async fn test_fresh_install_reaches_current_version() {
     );
 }
 
+#[tokio::test]
+async fn test_v053_preserves_aged_running_claims_during_upgrade() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    for (_, _, sql) in migrations::migration_sql_range(0, 52) {
+        sqlx::raw_sql(audited_sql(sql))
+            .execute(&pool)
+            .await
+            .expect("install the actual v052 schema");
+    }
+    simulate_non_canonical_compat_routing(&pool).await;
+    assert_eq!(migrations::current_version(&pool).await.unwrap(), 52);
+    let store = QueueStorage::new(awa::model::QueueStorageConfig {
+        schema: "awa_queue_storage".to_string(),
+        lease_claim_receipts: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let queue = "v053_aged_running_upgrade";
+    store.enqueue_batch(&pool, queue, 4, 1).await.unwrap();
+    sqlx::query(
+        "UPDATE awa_queue_storage.ready_entries \
+         SET run_at = now() - interval '5 minutes' WHERE queue = $1",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE awa_queue_storage.ready_segments \
+         SET first_run_at = now() - interval '5 minutes' WHERE queue = $1",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+            Uuid::new_v4(),
+            4,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("claim with the v052 storage protocol");
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].claim.lease_claim_receipt);
+    assert_eq!(claimed[0].job.priority, 1);
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = $1")
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before, 0, "v052 loses the aged running claim");
+    let ledger_before: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(batch) FROM awa_queue_storage.lease_claim_batches AS batch \
+         WHERE queue = $1",
+    )
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    migrations::run(&pool).await.expect("upgrade v052 to v053");
+    assert_eq!(
+        migrations::current_version(&pool).await.unwrap(),
+        migrations::CURRENT_VERSION
+    );
+    for _ in 0..2 {
+        let rows: Vec<(i64, i64, i16, serde_json::Value)> = sqlx::query_as(
+            "SELECT id, run_lease, attempt, args FROM awa.jobs \
+             WHERE queue = $1 AND state = 'running'",
+        )
+        .bind(queue)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                claimed[0].job.id,
+                claimed[0].job.run_lease,
+                claimed[0].job.attempt,
+                claimed[0].job.args.clone(),
+            )],
+            "upgrading must expose exactly the existing running attempt"
+        );
+        let ledger_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(batch) FROM awa_queue_storage.lease_claim_batches AS batch \
+             WHERE queue = $1",
+        )
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger_after, ledger_before,
+            "the live claim must be unchanged"
+        );
+
+        // Exercise the exported bundle too, including a repeated application.
+        let mut tx = pool.begin().await.unwrap();
+        for (_, _, sql) in migrations::migration_sql_range(52, 53) {
+            sqlx::raw_sql(audited_sql(sql))
+                .execute(tx.as_mut())
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &claimed)
+            .await
+            .expect("the pre-upgrade claim must still complete"),
+        vec![(claimed[0].job.id, claimed[0].job.run_lease)]
+    );
+}
+
 // ── Idempotency ──────────────────────────────────────────────────
 
 #[tokio::test]
