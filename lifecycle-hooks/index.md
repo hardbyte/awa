@@ -102,7 +102,7 @@ let client = Client::builder(pool)
     .build()?;
 ```
 
-There is one builder per outcome, plus a `_with` variant whose closure returns `EnqueueRequest<F>` so you can override `InsertOpts` on the follow-up (queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key):
+There is one builder per outcome, plus a `_with` variant whose closure returns `Option<EnqueueRequest<F>>`. Return `Some` to override `InsertOpts` on the follow-up (queue, priority, max_attempts, metadata, tags, unique, run_at, deadline_duration, ordering_key), or `None` to enqueue nothing ([Conditional follow-ups](#conditional-follow-ups)):
 
 | Builder | Fires when | Closure signature |
 | --- | --- | --- |
@@ -113,15 +113,29 @@ There is one builder per outcome, plus a `_with` variant whose closure returns `
 | `on_waiting_for_callback_enqueue` | `JobResult::WaitForCallback` | `(args, &job)` |
 | `on_rescued_enqueue` | maintenance rescue (expired callback / stale heartbeat / deadline) | `(args, &job, RescueReason)` |
 
-`on_*_enqueue_with` returns `EnqueueRequest<F>`:
+An `on_*_enqueue_with` closure returns `Option<EnqueueRequest<F>>`:
 
 ```rust
 .on_completed_enqueue_with::<Signup, WelcomeEmail, _>(|args, job| {
-    EnqueueRequest::new(WelcomeEmail { user_id: args.user_id })
-        .queue("email")
-        .priority(1)
+    Some(
+        EnqueueRequest::new(WelcomeEmail { user_id: args.user_id })
+            .queue("email")
+            .priority(1),
+    )
 })
 ```
+
+### Conditional follow-ups
+
+Return `None` from a `_with` closure to enqueue nothing for that trigger. The trigger's transition commits either way:
+
+```rust
+.on_exhausted_enqueue_with::<Charge, NotifyFinance, _>(|args, _job, _error, _attempt| {
+    (args.amount_cents >= 100_000).then(|| EnqueueRequest::new(NotifyFinance { charge_id: args.id }))
+})
+```
+
+The closure decides from the trigger's args, its job row and the outcome's context. It runs wherever the follow-up insert runs, so this works for every outcome, including callback resolutions (`complete_external`, `resolve_callback`) where no handler runs. For worker-driven outcomes and callback resolutions that is inside the transition's transaction. For maintenance rescue it is the separate transaction opened after the rescue commits, so a conditional `on_rescued_enqueue_with` is no more atomic than any rescue follow-up (see [Atomicity guarantees](#atomicity-guarantees)). A job whose kind has a registered `Completed` spec still takes the per-job completion transaction when the closure returns `None`. When the decision depends on something the handler computed, stage the follow-up from the handler instead (see [Handler-staged follow-ups](#handler-staged-follow-ups)).
 
 ### Deduplicating follow-ups
 
@@ -129,7 +143,7 @@ Give the follow-up unique options to collapse duplicates. When several triggers 
 
 ```rust
 .on_completed_enqueue_with::<StageA, StageB, _>(|args, _job| {
-    EnqueueRequest::new(StageB { item_id: args.item_id }).unique(UniqueOpts::default())
+    Some(EnqueueRequest::new(StageB { item_id: args.item_id }).unique(UniqueOpts::default()))
 })
 ```
 
