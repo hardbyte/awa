@@ -18,13 +18,16 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `state` and `tag` fields become `states` and `tags` lists. Build a filter
   with `JobFilter::new().state(..).tag(..)` or `JobFilter { kind: ..,
   ..Default::default() }`. Its JSON keeps ADR-030's keys, so stored batch
-  operations still load: several tags or states go under `tag` or `state` as
-  a list, which a 0.6 server or runner refuses rather than ignoring. Unknown
-  JSON fields are now an error rather than ignored.
+  operations still load. Several tags or states go under `tag` or `state` as
+  a list, which 0.6's filter type rejects rather than ignoring (a unit test
+  reads the new shape with a copy of that type). Unknown JSON fields are now
+  an error rather than ignored. See
+  [stability](docs/stability.md#job-filters-adr-049) for what is and isn't
+  rehearsed across versions.
 - **HTTP: the DLQ bulk-retry and bulk-purge bodies take the filter under
-  `filter`.** The flat `kind`, `queue` and `tag` still work. A 0.6 server
-  sees a nested filter as no filter and refuses it, so a newer client can't
-  purge more than it asked for.
+  `filter`.** The flat `kind`, `queue` and `tag` still work. 0.6's body type
+  reads only the flat fields and its DLQ functions refuse an empty filter,
+  so a nested filter sent to a 0.6 server is refused rather than widened.
 - **A DLQ purge or bulk retry needs a filter that narrows the DLQ** (kind,
   queue, tag, ids or a created bound) unless `allow_all` is set; `state:
   failed` and `dead_lettered: true` alone are refused, since every DLQ row

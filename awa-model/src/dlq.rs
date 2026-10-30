@@ -82,7 +82,7 @@ impl ListDlqFilter {
 }
 
 /// Narrow `predicate` to rows before a `(dlq_at, id)` position, newest first.
-fn before_position(
+pub(crate) fn before_position(
     predicate: &mut Predicate,
     before_dlq_at: Option<DateTime<Utc>>,
     before_id: Option<i64>,

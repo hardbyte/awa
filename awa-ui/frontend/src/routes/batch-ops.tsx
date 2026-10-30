@@ -128,18 +128,20 @@ function buildPayload(form: BatchForm): BatchOperationPayload {
   };
 }
 
-/** Form fields pre-filled from the jobs page's "batch change" link. */
-function initialForm(search: Record<string, string | undefined>): BatchForm {
+/** Form fields pre-filled from the jobs page's "batch change" link. The
+ * router parses query values as JSON, so `?queue=123` arrives as a number. */
+function initialForm(search: Record<string, unknown>): BatchForm {
+  const text = (value: unknown) => (value === undefined || value === null ? "" : String(value));
   const state = search.state === "available" || search.state === "scheduled" ? search.state : "";
   return {
     opKind: "set_priority",
-    queue: search.queue ?? "",
-    kind: search.kind ?? "",
-    ids: search.ids ?? "",
-    tags: search.tags ?? "",
+    queue: text(search.queue),
+    kind: text(search.kind),
+    ids: text(search.ids),
+    tags: text(search.tags),
     state,
-    createdGte: search.created_at_gte ?? "",
-    createdLt: search.created_at_lt ?? "",
+    createdGte: text(search.created_at_gte),
+    createdLt: text(search.created_at_lt),
     priority: "1",
     destinationQueue: "",
   };
@@ -148,7 +150,7 @@ function initialForm(search: Record<string, string | undefined>): BatchForm {
 export function BatchOpsPage() {
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
-  const search = useSearch({ strict: false }) as Record<string, string | undefined>;
+  const search = useSearch({ strict: false }) as Record<string, unknown>;
   const [form, setForm] = useState<BatchForm>(() => initialForm(search));
   const [preview, setPreview] = useState<BatchOperationPreview | null>(null);
   const formFilterError = useMemo(() => filterError(form), [form]);

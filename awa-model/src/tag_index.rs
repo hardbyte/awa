@@ -217,10 +217,12 @@ async fn build_if_empty(
     Ok(true)
 }
 
-/// A lock that wasn't available in time, or a lost deadlock: the target is
-/// left for a later pass.
+/// A lock that wasn't available in time, a lost deadlock, or another
+/// session creating the same index at the same moment (a unique violation on
+/// the catalog): the target is left for a later pass.
 fn is_retryable(err: &AwaError) -> bool {
     match err {
+        AwaError::UniqueConflict { .. } => true,
         AwaError::Database(sqlx::Error::Database(db)) => {
             matches!(db.code().as_deref(), Some("55P03" | "40P01"))
         }

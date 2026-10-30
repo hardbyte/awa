@@ -74,6 +74,11 @@ type Term =
   | { key: "tags"; value: string }
   | { key: "ids"; value: number };
 
+/** A suggestion that starts a term the user still has to complete. */
+function isPrefixHint(value: string): boolean {
+  return value.endsWith(":") || value.endsWith(">=") || value.endsWith("<");
+}
+
 function terms(filters: SearchFilters): Term[] {
   const out: Term[] = [];
   if (filters.kind) out.push({ key: "kind", value: filters.kind });
@@ -270,7 +275,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
           e.preventDefault();
           if (selectedIdx >= 0 && selectedIdx < suggestions.length) {
             const s = suggestions[selectedIdx];
-            if (s && !s.value.endsWith(":")) {
+            if (s && !isPrefixHint(s.value)) {
               applyToken(s.value);
             } else if (s) {
               setInputValue(s.value);
@@ -369,7 +374,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
                 ].join(" ")}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  if (!suggestion.value.endsWith(":")) {
+                  if (!isPrefixHint(suggestion.value)) {
                     applyToken(suggestion.value);
                   } else {
                     setInputValue(suggestion.value);

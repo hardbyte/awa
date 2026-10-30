@@ -15667,8 +15667,12 @@ impl QueueStorage {
         pool: &PgPool,
         filter: &ListDlqFilter,
     ) -> Result<u64, AwaError> {
-        #[allow(deprecated)]
-        crate::dlq::bulk_retry_from_dlq(pool, filter, true).await
+        let (job_filter, page) = filter.split();
+        let Some(mut predicate) = crate::job_query::dlq_predicate(&job_filter) else {
+            return Ok(0);
+        };
+        crate::dlq::before_position(&mut predicate, page.before_dlq_at, page.before_id);
+        self.bulk_retry_from_dlq_where(pool, &predicate).await
     }
 
     /// Move the DLQ rows `predicate` selects back to ready, in one
