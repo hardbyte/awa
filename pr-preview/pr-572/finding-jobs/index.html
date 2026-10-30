@@ -2313,7 +2313,9 @@ admin UI's jobs page and DLQ page, <code>awa job list</code> and <code>awa dlq l
 the same jobs on every one of them.</p>
 <p>Finding jobs needs the queue-storage engine. On the deprecated canonical
 engine (<a href="../adr/037-canonical-engine-deprecation/">ADR-037</a>) these calls
-return an error naming the missing queue_storage backend.</p>
+return an error naming the missing queue_storage backend. The exception is a
+fresh install that holds no jobs yet: listing and counting there return
+nothing, and batch operations are still refused.</p>
 <h2 id="the-filter">The filter<a class="headerlink" href="#the-filter" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
