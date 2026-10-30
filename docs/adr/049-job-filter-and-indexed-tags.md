@@ -136,6 +136,7 @@ Each engine has one function that turns `(filter, eligible states, window)` into
   - A claim, lease or completion finds its ready row by `job_id` in that slot's partition. The lane's priority isn't compared, because aging can leave a lease's priority different from its ready row's.
   - A claim batch whose receipts closure batches have all closed is skipped before it's unnested.
   - JIT is off for these reads. Their estimated cost can cross the JIT threshold, and compiling them takes about a second.
+  - The batched loader's statements keep a connection's first plan. Postgres otherwise re-plans a statement over partitioned tables on every call, because a generic plan prices partitions that runtime pruning skips, and planning costs more than running these probes.
 - **Listing without a tag has no new index.** Ready and done partitions are already indexed by `job_id`, so an id-descending page with a kind, queue or state filter walks recent rows and stops at the page. A rare kind or queue walks further, bounded by the timeout. An index on `(kind, job_id)` or `(queue, job_id)` would tax every job, so it's left until measurements call for one.
 - **Canonical** compiles to one statement over `awa.jobs`, with the same rule about present predicates. The canonical engine is deprecated ([ADR-037](037-canonical-engine-deprecation.md)) and isn't optimised further.
 
@@ -284,7 +285,7 @@ It's deferred because the index serves explicit tags today, and derivation can b
 - **A mixed fleet.** A 0.6.9 producer's tagged jobs are found by tag once the build has run. A batch operation with several tags is refused while a 0.6.9 runtime is live, and the 0.6 filter type fails to read one.
 - **Benchmark.** `awa/tests/tag_filter_bench.rs`, on a realistic mix of tagged and untagged jobs, checks:
   - a 100-row page loads in one batched read;
-  - a rare-tag lookup stays under 100 ms at 50,000 retained jobs;
+  - a rare-tag lookup aims for under 100 ms at 50,000 retained jobs. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before. About half of a rare-tag lookup is loading the one job: `terminal_jobs` expands every compact completion batch before it can filter by id, which also slows `get_job`. An id-keyed read for it needs a migration and is a follow-up;
   - with `fastupdate = off`, p99 enqueue latency for tagged jobs stays within 10% of today.
 
 ## Relationship to other ADRs
