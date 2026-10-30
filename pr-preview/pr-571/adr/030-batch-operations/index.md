@@ -4,7 +4,7 @@
 
 ## Status
 
-Accepted. The initial implementation scope is the framework plus `set_priority` and `move_queue` operation kinds. Amended by [ADR-049](../049-job-filter-and-indexed-tags/index.md): the batch-operation filter becomes `JobFilter`, shared with listing, counting and the DLQ. Existing synchronous bulk retry, bulk cancel, and DLQ bulk endpoints stay as-is for `0.6`; migrating them to the framework is deferred.
+Accepted. The initial implementation scope is the framework plus `set_priority` and `move_queue` operation kinds. Amended by [ADR-049](../049-job-filter-and-indexed-tags/index.md): the batch-operation filter becomes `JobFilter`, shared with listing, counting and the DLQ. Existing synchronous bulk retry, bulk cancel, and DLQ bulk endpoints stay synchronous, and moving them onto the framework is deferred. In 0.7, ADR-049 changes the filter the DLQ bulk endpoints take; bulk retry and bulk cancel by selected ids are unchanged.
 
 ## Context
 

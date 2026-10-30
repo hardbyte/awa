@@ -4,7 +4,7 @@
 
 ## Status
 
-Proposed. Amends [ADR-030](../030-batch-operations/index.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration: new queue-storage schemas install the tag indexes, and existing ones get them through an online build that the migrator runs.
+Proposed. Amends [ADR-030](../030-batch-operations/index.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. `awa migrate` and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by `awa storage build-tag-index`, which the migrator runs after upgrading.
 
 ## Context
 
@@ -84,9 +84,10 @@ pub struct JobFilter {
 - **Every field narrows.** A field that's present narrows the population, and an absent or empty field doesn't. `ids` intersects with the other fields, as ADR-030 specifies.
 - **`created_at` is the original insert time.** It doesn't change across retries, DLQ moves, or priority and queue moves.
 - **No `#[non_exhaustive]`.** That would also forbid `..Default::default()`, which is how every existing caller builds a filter. Instead, the documented way to construct one is `JobFilter { kind: ..., ..Default::default() }` or the builder methods. A field added later then breaks no caller that follows it.
-- **The JSON shape stays ADR-030's.** A filter with one tag serializes as `"tag": "..."`, and one state as `"state": "..."`. Only a filter that needs more uses `"tags": [...]`, `"states": [...]` or `"dead_lettered"`.
+- **The JSON shape stays ADR-030's, and fails closed on older readers.** `tag` and `state` take one value or a list: `"tag": "a"`, `"tag": ["a", "b"]`. There are no `tags` or `states` keys. A 0.6 server or runner ignores a key it doesn't know, so a new key would be dropped and the filter widened, but it refuses a list where it expects one value. A filter with several tags or states therefore fails on an older reader instead of acting on more jobs. `dead_lettered` is the one new key an older reader drops; batch operations refuse `dead_lettered: true` and `false` changes nothing for them, so dropping it widens nothing.
 - **Deserialization is strict.** An unknown field is an error, not an ignored key, so a typo can't widen a stored batch operation.
-- **New fields wait for the fleet.** A runner that predates this ADR would ignore a field it doesn't know. So submitting a batch operation whose filter uses a field ADR-030 didn't define is refused while any live runtime reports a version older than 0.7.0-alpha.2, the first release with this ADR. `awa migrate` refuses the same way while a live runtime is too old.
+- **The DLQ bulk endpoints nest the filter.** Their 0.6 bodies are flat `kind`, `queue` and `tag`. The full filter goes under `filter`, which a 0.6 server ignores, then refuses the request as having no filter. The flat fields still work, and a body may use one form or the other, not both.
+- **New fields wait for the fleet.** Submitting a batch operation whose filter has several tags or states, or `dead_lettered`, is refused while any live runtime reports a version older than 0.7.0-alpha.2, the first release with this ADR. An older runner would fail to load the filter; the check turns that failure into a clear error at submission.
 
 `BatchOperationFilter` becomes an alias of `JobFilter`, so batch operations accept the new fields once the fleet is upgraded.
 
@@ -106,6 +107,8 @@ Each consumer applies the filter, then its own eligibility:
 | Batch preview and scan (`set_priority`, `move_queue`) | `available`, `scheduled` (ADR-030) | id ascending, up to the scan's upper bound |
 | `list_dlq`, `purge_dlq`, `bulk_retry_from_dlq` | dead-lettered | `(dlq_at, id)` descending |
 
+A DLQ purge or bulk retry needs a field that narrows the DLQ (kind, queue, tag, ids or a created bound) unless the caller passes `allow_all`. `state: failed` and `dead_lettered: true` don't count: every DLQ row already matches them.
+
 Preview and execution select from the same population, which is ADR-030's rule. The jobs page shows a different population when it isn't filtered to `available` or `scheduled`. So when it offers a batch operation on "everything matching", it shows the eligible count beside the listed count. It disables the action for filters that can match no eligible state, and in read-only mode.
 
 ### One compiler per engine
@@ -124,11 +127,17 @@ Each engine has one function that turns `(filter, eligible states, window)` into
 - **SQL narrows; the loader decides.** The branches aren't provably disjoint while a claim is in flight. The available branch compares lane sequences against a cursor that sits outside MVCC (ADR-044). So a claimed job can appear in neither branch, or in two, until its claim and cursor both settle. The compiler therefore returns candidate ids, de-duplicated and ordered, with a bounded over-fetch.
 - **Rows load in a batch.** The batched loader reads the page's candidates with `job_id = ANY($1)`, seven queries per page. It picks each job's current row by the rule `get_job` uses, which is `get_job` with one id, and re-checks the filter against that row. The compiler fetches further only while the page is short.
 - **Within a page, each job appears once, in its current state.** A job in the middle of a claim may be missed or shown in its previous state. That's the same advisory sense in which ADR-030 calls the preview advisory. Keyset paging on ids never repeats a job across pages, but a job can change state between pages.
-- **The count is capped and timed out.** `count_jobs` counts distinct candidate ids in SQL, stops at 10,001, and runs under a server-side `statement_timeout`. List reads get the same timeout. The UI fetches the count when the filter changes, debounced, and doesn't poll it.
+- **The count is capped and timed out.** `count_jobs` reads at most 10,001 candidates from each branch, counts the distinct ids, and reports "10,000+" when any branch reached its limit. It runs under a server-side `statement_timeout`. List reads get the same timeout. The UI fetches the count when the filter changes, debounced, and doesn't poll it.
 - **The filter has bounds.**
   - `ids` is capped at 1,000 when a filter is submitted. Rows already stored still load.
   - A filter tag is capped at 256 bytes. Producers aren't affected.
+  - `tags` holds at most 20 entries, the per-job insert limit. A longer list is rejected, not truncated, because dropping an all-of term widens the match.
   - `limit` is clamped in the compiler on both engines.
+- **Every join is a primary-key or `job_id` probe.** Each branch reaches the rows it joins through a lateral subquery fenced with `OFFSET 0`, so the planner can't swap the probe for a hash join over every retained row. Planned freely, it misjudges partial-index hits and the cursor's reach, and a 20,000-job page took over 20 seconds.
+  - Available jobs are read per lane and ring slot, from the claim cursor up the ready primary key, so retained ready rows below the cursor are never read.
+  - A claim, lease or completion finds its ready row by `job_id` in that slot's partition. The lane's priority isn't compared, because aging can leave a lease's priority different from its ready row's.
+  - A claim batch whose receipts closure batches have all closed is skipped before it's unnested.
+  - JIT is off for these reads. Their estimated cost can cross the JIT threshold, and compiling them takes about a second.
 - **Listing without a tag has no new index.** Ready and done partitions are already indexed by `job_id`, so an id-descending page with a kind, queue or state filter walks recent rows and stops at the page. A rare kind or queue walks further, bounded by the timeout. An index on `(kind, job_id)` or `(queue, job_id)` would tax every job, so it's left until measurements call for one.
 - **Canonical** compiles to one statement over `awa.jobs`, with the same rule about present predicates. The canonical engine is deprecated ([ADR-037](../037-canonical-engine-deprecation/index.md)) and isn't optimised further.
 
@@ -185,7 +194,7 @@ There's no migration. A plain `CREATE INDEX` blocks writes for the whole build, 
 | Surface | Change |
 | --- | --- |
 | Rust | `JobFilter`, `JobPage` and `DlqPage`. `admin::find_jobs` and `admin::count_jobs`. Batch-operation functions take `JobFilter`. `list_jobs` and `list_dlq` stay, deprecated. |
-| HTTP | `GET /api/jobs` accepts every `JobFilter` field as a query parameter, plus `before_id` and `limit`. Repeated `tag=` and `state=` mean all-of and any-of; `ids` is comma-separated, up to 1,000. `GET /api/jobs/count` gives the capped count. Batch-operation bodies are unchanged. An older server ignores parameters it doesn't know and returns a wider list, which `docs/ui-design.md` documents. |
+| HTTP | `GET /api/jobs` accepts every `JobFilter` field as a query parameter, plus `before_id` and `limit`. Repeated `tag=` and `state=` mean all-of and any-of; `ids` is comma-separated, up to 1,000. `GET /api/jobs/count` gives the capped count. Batch-operation bodies keep ADR-030's shape, with lists allowed under `tag` and `state`; DLQ bulk bodies take the filter under `filter`. An older server ignores parameters it doesn't know and returns a wider list, which `docs/ui-design.md` documents. |
 | Admin UI | The search bar accepts several `tag:` terms, plus `id:`, `created>=` and `created<`, and shows the capped match count. The batch-operations form takes the same filter, and the jobs page links to it pre-filled, as in [One filter](#one-filter). |
 | CLI | `awa job list` and `awa dlq list` gain `--tag` (repeatable), `--state` (repeatable), `--id`, `--created-at-gte` and `--created-at-lt`. |
 | Python | `find_jobs(...)`, `count_jobs(...)` and `list_dlq(...)` take the same fields as keyword arguments or as a `filter=` dict, which is the shape batch operations take. `list_jobs` gains `tag` and `before_id`. |
@@ -254,7 +263,8 @@ It's deferred because the index serves explicit tags today, and derivation can b
 
 - **No schema migration.** Binaries before and after this ADR read and write the same tables, and the indexes are invisible to them.
 - **A binary from this ADR on uses the new compiler** whether or not the indexes exist. Without them, a tag predicate scans in SQL, which is still one statement and one batched load per page instead of a loop of per-row loads.
-- **Filters with new fields wait for the fleet.** Batch operations whose filter uses a field ADR-030 didn't define are refused until no live runtime is older than this ADR.
+- **Older readers fail closed.** A filter with several tags or states reaches a 0.6 server or runner as a list where it expects one value, which it refuses. A DLQ bulk body reaches a 0.6 server as an empty filter, which it refuses. So a client newer than the server it calls, such as a browser holding the new admin UI during a rolling deploy, gets an error rather than a wider operation.
+- **Filters with new fields wait for the fleet.** Batch operations whose filter has several tags or states, or `dead_lettered`, are refused until no live runtime is older than this ADR.
 
 ## Validation
 
@@ -273,7 +283,7 @@ It's deferred because the index serves explicit tags today, and derivation can b
   - an interrupted `--now` build is repaired by the next run;
   - a ring build never queues an exclusive lock that blocks a lane;
   - pruning during a build reports `Blocked` and then succeeds.
-- **A mixed fleet.** A 0.6.9 producer's tagged jobs are found by tag once the build has run. A batch operation using `tags` is refused while a 0.6.9 runtime is live.
+- **A mixed fleet.** A 0.6.9 producer's tagged jobs are found by tag once the build has run. A batch operation with several tags is refused while a 0.6.9 runtime is live, and the 0.6 filter type fails to read one.
 - **Benchmark.** `awa/tests/tag_filter_bench.rs`, on a realistic mix of tagged and untagged jobs, checks:
   - a 100-row page loads in one batched read;
   - a rare-tag lookup stays under 100 ms at 50,000 retained jobs;
