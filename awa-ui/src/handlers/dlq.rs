@@ -93,15 +93,10 @@ pub async fn retry_dlq_job(
     Ok(Json(job))
 }
 
+/// The 0.6 body of `POST /api/dlq/bulk-retry` and `/bulk-purge`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BulkFilterPayload {
-    /// The full job filter (ADR-049). It is nested rather than flat so a
-    /// server from before ADR-049, which reads only the flat fields below and
-    /// ignores unknown keys, sees no filter and refuses instead of acting on
-    /// more rows.
-    #[serde(default)]
-    pub filter: Option<JobFilter>,
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
@@ -115,21 +110,41 @@ pub struct BulkFilterPayload {
 }
 
 impl BulkFilterPayload {
-    fn filter(&self) -> Result<JobFilter, ApiError> {
-        let flat = JobFilter {
+    fn filter(&self) -> JobFilter {
+        JobFilter {
             kind: self.kind.clone(),
             queue: self.queue.clone(),
             ..Default::default()
         }
-        .tags(self.tag.clone());
-        match &self.filter {
-            None => Ok(flat),
-            Some(filter) if flat.is_empty() => Ok(filter.clone()),
-            Some(_) => Err(AwaError::Validation(
-                "pass either `filter` or the flat kind, queue and tag fields, not both".to_string(),
+        .tags(self.tag.clone())
+    }
+}
+
+/// The body of `POST /api/dlq/retry-matching` and `/purge-matching`: the full
+/// job filter (ADR-049). These are new paths rather than a new body on the
+/// 0.6 ones: a 0.6 server ignores fields it doesn't know, so any body it can
+/// reach is read as its flat fields, and `all: true` beside a filter it
+/// ignored would act on the whole DLQ. A 0.6 server answers these paths with
+/// 404 instead.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchingPayload {
+    pub filter: JobFilter,
+    /// Act on every row; only with an empty filter, where it is the explicit
+    /// opt-in the model layer requires.
+    #[serde(default)]
+    pub all: bool,
+}
+
+impl MatchingPayload {
+    fn filter(&self) -> Result<&JobFilter, ApiError> {
+        if self.all && !self.filter.is_empty() {
+            return Err(AwaError::Validation(
+                "`all` acts on the whole DLQ, so it can't be combined with a filter".to_string(),
             )
-            .into()),
+            .into());
         }
+        Ok(&self.filter)
     }
 }
 
@@ -142,9 +157,23 @@ pub async fn bulk_retry_dlq(
     State(state): State<AppState>,
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
+    retry_matching_filter(&state, &payload.filter(), payload.all).await
+}
+
+pub async fn retry_dlq_matching(
+    State(state): State<AppState>,
+    Json(payload): Json<MatchingPayload>,
+) -> Result<Json<CountResponse>, ApiError> {
+    retry_matching_filter(&state, payload.filter()?, payload.all).await
+}
+
+async fn retry_matching_filter(
+    state: &AppState,
+    filter: &JobFilter,
+    all: bool,
+) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
-    let filter = payload.filter()?;
-    let count = dlq::bulk_retry_from_dlq_matching(&state.pool, &filter, payload.all).await?;
+    let count = dlq::bulk_retry_from_dlq_matching(&state.pool, filter, all).await?;
     if count > 0 {
         state
             .metrics
@@ -175,9 +204,23 @@ pub async fn bulk_purge_dlq(
     State(state): State<AppState>,
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
+    purge_matching_filter(&state, &payload.filter(), payload.all).await
+}
+
+pub async fn purge_dlq_matching(
+    State(state): State<AppState>,
+    Json(payload): Json<MatchingPayload>,
+) -> Result<Json<CountResponse>, ApiError> {
+    purge_matching_filter(&state, payload.filter()?, payload.all).await
+}
+
+async fn purge_matching_filter(
+    state: &AppState,
+    filter: &JobFilter,
+    all: bool,
+) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
-    let filter = payload.filter()?;
-    let count = dlq::purge_dlq_matching(&state.pool, &filter, payload.all).await?;
+    let count = dlq::purge_dlq_matching(&state.pool, filter, all).await?;
     if count > 0 {
         state
             .metrics
@@ -234,30 +277,44 @@ pub async fn bulk_move_failed(
 mod tests {
     use super::*;
 
-    fn payload(json: serde_json::Value) -> Result<BulkFilterPayload, serde_json::Error> {
+    fn flat(json: serde_json::Value) -> Result<BulkFilterPayload, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    fn matching(json: serde_json::Value) -> Result<MatchingPayload, serde_json::Error> {
         serde_json::from_value(json)
     }
 
     #[test]
-    fn bulk_bodies_take_the_nested_filter_or_the_flat_fields() {
-        let nested = payload(serde_json::json!({
+    fn the_06_paths_take_only_the_flat_fields() {
+        let body = flat(serde_json::json!({ "queue": "q", "tag": "a" })).unwrap();
+        assert_eq!(body.filter(), JobFilter::new().queue("q").tag("a"));
+        // A nested filter or a field 0.6 lacks belongs on the matching paths.
+        assert!(flat(serde_json::json!({ "filter": { "tag": "a" } })).is_err());
+        assert!(flat(serde_json::json!({ "queue": "q", "ids": [1] })).is_err());
+        assert!(flat(serde_json::json!({ "tag": ["a", "b"] })).is_err());
+    }
+
+    #[test]
+    fn the_matching_paths_take_the_whole_filter() {
+        let body = matching(serde_json::json!({
             "filter": { "queue": "q", "tag": ["a", "b"], "ids": [1, 2] }
         }))
         .unwrap();
         assert_eq!(
-            nested.filter().unwrap(),
-            JobFilter::new().queue("q").tags(["a", "b"]).ids([1, 2])
+            body.filter().unwrap(),
+            &JobFilter::new().queue("q").tags(["a", "b"]).ids([1, 2])
         );
-        let flat = payload(serde_json::json!({ "queue": "q", "tag": "a" })).unwrap();
-        assert_eq!(flat.filter().unwrap(), JobFilter::new().queue("q").tag("a"));
-        let both = payload(serde_json::json!({ "queue": "q", "filter": { "tag": "a" } })).unwrap();
-        assert!(both.filter().is_err());
+        assert!(matching(serde_json::json!({ "queue": "q" })).is_err());
+        assert!(matching(serde_json::json!({ "filter": { "queue": "q" }, "kind": "k" })).is_err());
     }
 
     #[test]
-    fn flat_fields_beyond_the_06_shape_are_refused() {
-        // A flat `ids` would be ignored by a 0.6 server; this one refuses it
-        // so a client learns to nest.
-        assert!(payload(serde_json::json!({ "queue": "q", "ids": [1] })).is_err());
+    fn all_is_only_for_an_empty_filter() {
+        let everything = matching(serde_json::json!({ "filter": {}, "all": true })).unwrap();
+        assert!(everything.filter().unwrap().is_empty());
+        let narrowed =
+            matching(serde_json::json!({ "filter": { "tag": ["a", "b"] }, "all": true })).unwrap();
+        assert!(narrowed.filter().is_err());
     }
 }

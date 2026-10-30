@@ -168,6 +168,15 @@ test.describe("Batch operations page", () => {
     await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled();
   });
 
+  test("an id beyond the exact range blocks preview and submit", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.goto("/batch-ops?queue=e2e_test");
+    await page.getByLabel("IDs filter").fill("9007199254740993");
+    await expect(page.getByRole("alert")).toHaveText("IDs must be whole job ids");
+    await expect(page.getByRole("button", { name: "Preview" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled();
+  });
+
   test("requests cancellation for an active operation", async ({ page }) => {
     const operations = [
       operation({

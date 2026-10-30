@@ -20,7 +20,7 @@ import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobCount, JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
-import { SearchBar, hasUnparsedDate, parseSearch, toRfc3339 } from "@/components/SearchBar";
+import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -128,12 +128,12 @@ export function JobsPage() {
 
   const hasSel = selected.size > 0;
   const poll = usePollInterval();
-  const unparsedDate = hasUnparsedDate(searchFilters);
+  const searchError = termError(filters.search);
 
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
-    enabled: !unparsedDate,
+    enabled: !searchError,
     refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
   });
 
@@ -159,7 +159,7 @@ export function JobsPage() {
   const countQuery = useQuery<JobCount>({
     queryKey: ["jobs-count", filterParams],
     queryFn: () => fetchJobCount(filterParams),
-    enabled: hasFilter && !unparsedDate,
+    enabled: hasFilter && !searchError,
     staleTime: 30_000,
   });
 
@@ -405,14 +405,13 @@ export function JobsPage() {
       {/* Search bar with integrated filter chips */}
       <SearchBar value={filters.search} onChange={setSearch} />
 
-      {unparsedDate && (
+      {searchError && (
         <p className="text-sm text-danger" role="alert">
-          A created date doesn't parse, so no jobs are listed. Use a date or
-          time such as 2026-10-30.
+          {searchError}. No jobs are listed until the search is fixed.
         </p>
       )}
 
-      {hasFilter && !unparsedDate && (
+      {hasFilter && !searchError && (
         <div className="flex flex-wrap items-center gap-3 text-sm text-muted-fg">
           {countQuery.data && (
             <span data-testid="match-count">

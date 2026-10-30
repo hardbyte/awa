@@ -29,8 +29,10 @@ error, so a typo cannot widen what a purge or batch operation acts on. In
 Rust the lists are the `states` and `tags` fields.
 
 A DLQ purge or bulk retry needs a field that narrows the DLQ (kind, queue,
-tag, ids or a created bound), or `allow_all`. Over HTTP its filter goes
-under `filter`: `{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`.
+tag, ids or a created bound), or `allow_all`. Over HTTP the full filter goes
+to `POST /api/dlq/retry-matching` or `/api/dlq/purge-matching`:
+`{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`, or
+`{"filter": {}, "all": true}` for the whole DLQ.
 
 Each job appears once, in its current state. Listing is newest first; page by
 passing the last id you saw as `before_id`. A job whose claim is in flight

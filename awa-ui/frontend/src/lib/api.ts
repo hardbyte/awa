@@ -536,18 +536,18 @@ export function toWireFilter(filter: JobFilterParams): BatchOperationFilter {
   return wire;
 }
 
-// The filter is nested under `filter`: a server from before ADR-049 reads
-// only flat kind, queue and tag fields, so it sees no filter and refuses
-// rather than acting on the whole DLQ.
+// The full filter goes to the `*-matching` endpoints, which a server from
+// before ADR-049 doesn't have, so it refuses rather than reading the body as
+// its flat fields.
 export function bulkRetryDlq(filter: JobFilterParams): Promise<DlqBulkResult> {
-  return apiFetch("/dlq/bulk-retry", {
+  return apiFetch("/dlq/retry-matching", {
     method: "POST",
     body: JSON.stringify({ filter: toWireFilter(filter) }),
   });
 }
 
 export function bulkPurgeDlq(filter: JobFilterParams): Promise<DlqBulkResult> {
-  return apiFetch("/dlq/bulk-purge", {
+  return apiFetch("/dlq/purge-matching", {
     method: "POST",
     body: JSON.stringify({ filter: toWireFilter(filter) }),
   });

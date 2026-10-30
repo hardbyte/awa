@@ -14,7 +14,7 @@ import {
 import type { DlqRow, ListDlqParams } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import { SearchBar, hasUnparsedDate, parseSearch, toRfc3339 } from "@/components/SearchBar";
+import { SearchBar, parseSearch, termError, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,9 +62,9 @@ export function DlqPage() {
   const poll = usePollInterval();
 
   const searchFilters = parseSearch(filters.search);
-  // A date that doesn't parse is left out of a request, so it would widen
+  // A term that doesn't parse is left out of a request, so it would widen
   // what is listed and what a bulk action touches.
-  const unparsedDate = hasUnparsedDate(searchFilters);
+  const searchError = termError(filters.search);
 
   const params: ListDlqParams = {
     kind: searchFilters.kind,
@@ -81,7 +81,7 @@ export function DlqPage() {
   const dlqQuery = useQuery<DlqRow[]>({
     queryKey: ["dlq", params],
     queryFn: () => fetchDlq(params),
-    enabled: !unparsedDate,
+    enabled: !searchError,
     refetchInterval: poll.interval,
     staleTime: poll.staleTime,
   });
@@ -184,7 +184,7 @@ export function DlqPage() {
           <Button
             size="xs"
             onPress={() => setShowRetryConfirm(true)}
-            isDisabled={retryFilterMutation.isPending || !!unparsedDate}
+            isDisabled={retryFilterMutation.isPending || !!searchError}
           >
             Retry matching ({rows.length}+)
           </Button>
@@ -193,16 +193,18 @@ export function DlqPage() {
             size="xs"
             className="text-danger"
             onPress={() => setShowPurgeConfirm(true)}
-            isDisabled={purgeFilterMutation.isPending || !!unparsedDate}
+            isDisabled={purgeFilterMutation.isPending || !!searchError}
           >
             Purge matching
           </Button>
-          {unparsedDate && (
-            <span className="text-sm text-danger" role="alert">
-              A created date doesn't parse, so bulk actions are off.
-            </span>
-          )}
         </div>
+      )}
+
+      {searchError && (
+        <p className="text-sm text-danger" role="alert">
+          {searchError}. Nothing is listed and bulk actions are off until the
+          search is fixed.
+        </p>
       )}
 
       <Table>

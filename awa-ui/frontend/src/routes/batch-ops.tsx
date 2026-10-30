@@ -13,7 +13,7 @@ import {
   type BatchOperationPayload,
   type BatchOperationPreview,
 } from "@/lib/api";
-import { toRfc3339 } from "@/components/SearchBar";
+import { isJobId, toRfc3339 } from "@/components/SearchBar";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Heading } from "@/components/ui/heading";
@@ -86,7 +86,7 @@ function splitList(value: string): string[] {
  * otherwise be left out, widening the jobs the operation changes.
  */
 function filterError(form: Pick<BatchForm, "ids" | "createdGte" | "createdLt">): string | null {
-  if (splitList(form.ids).some((id) => !/^\d+$/.test(id))) return "IDs must be whole numbers";
+  if (!splitList(form.ids).every(isJobId)) return "IDs must be whole job ids";
   if (form.createdGte.trim() && !toRfc3339(form.createdGte.trim())) return "Created from is not a date";
   if (form.createdLt.trim() && !toRfc3339(form.createdLt.trim())) return "Created before is not a date";
   return null;

@@ -35,8 +35,8 @@ export function parseSearch(search: string): SearchFilters {
       const ids = part
         .slice(3)
         .split(",")
-        .map((id) => Number(id))
-        .filter((id) => Number.isInteger(id) && id > 0);
+        .filter(isJobId)
+        .map(Number);
       if (ids.length > 0) {
         filters.ids = [...new Set([...(filters.ids ?? []), ...ids])];
       }
@@ -68,35 +68,48 @@ export function toRfc3339(value: string | undefined): string | undefined {
   return Number.isNaN(at.getTime()) ? undefined : at.toISOString();
 }
 
-/** Whether a created bound is set but doesn't parse. Requests leave such a
- * bound out, so a page must not list or act on the wider result. */
-export function hasUnparsedDate(filters: SearchFilters): boolean {
-  return Boolean(
-    (filters.createdGte && !toRfc3339(filters.createdGte)) ||
-      (filters.createdLt && !toRfc3339(filters.createdLt))
-  );
+/** A job id the UI can carry exactly: a positive whole number no larger
+ * than JavaScript's safe-integer limit. */
+export function isJobId(value: string): boolean {
+  return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
 }
 
-/** Why a typed term can't be applied, or undefined when it can. `parseSearch`
- * drops an `id:` or date it can't read, which would leave a wider filter
- * than the one typed. */
-export function termError(token: string): string | undefined {
-  for (const part of token.trim().split(/\s+/)) {
-    if (part.startsWith("id:") && part.length > 3) {
-      if (part.slice(3).split(",").some((id) => !/^[1-9]\d*$/.test(id))) {
-        return "id: takes whole job ids, e.g. id:123 or id:123,456";
-      }
-    } else if (part.startsWith("created>=") && part.length > 9) {
-      if (!toRfc3339(part.slice(9))) {
-        return "created>= takes a date or time, e.g. created>=2026-10-30";
-      }
-    } else if (part.startsWith("created<") && part.length > 8) {
-      if (!toRfc3339(part.slice(8))) {
-        return "created< takes a date or time, e.g. created<2026-10-30";
-      }
+/** One search term that isn't a complete, valid filter term, and why. */
+export interface InvalidTerm {
+  term: string;
+  error: string;
+}
+
+/**
+ * The terms of a search, typed or from the URL, that `parseSearch` would
+ * drop. Dropping one leaves a wider filter than the one written, so a page
+ * must not list, count or act on the search while any remain.
+ */
+export function invalidTerms(search: string): InvalidTerm[] {
+  const out: InvalidTerm[] = [];
+  for (const term of search.trim().split(/\s+/).filter(Boolean)) {
+    const prefix = ["kind:", "queue:", "tag:", "id:", "created>=", "created<"].find((p) =>
+      term.startsWith(p)
+    );
+    const value = prefix ? term.slice(prefix.length) : "";
+    let error: string | undefined;
+    if (!prefix) {
+      error = `${term} isn't a filter; use kind:, queue:, tag:, id:, created>= or created<`;
+    } else if (!value) {
+      error = `${prefix} needs a value`;
+    } else if (prefix === "id:" && !value.split(",").every(isJobId)) {
+      error = "id: takes whole job ids, e.g. id:123 or id:123,456";
+    } else if (prefix.startsWith("created") && !toRfc3339(value)) {
+      error = `${prefix} takes a date or time, e.g. ${prefix}2026-10-30`;
     }
+    if (error) out.push({ term, error });
   }
-  return undefined;
+  return out;
+}
+
+/** Why a search can't be applied as written, or undefined when it can. */
+export function termError(search: string): string | undefined {
+  return invalidTerms(search)[0]?.error;
 }
 
 /** One removable term: which filter it belongs to, and its value. */
@@ -179,6 +192,13 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const activeFilters = parseSearch(value);
+  // Kept beside the valid terms, so editing the search never quietly drops
+  // one and widens it.
+  const malformed = invalidTerms(value);
+  const withMalformed = useCallback(
+    (search: string) => [search, ...malformed.map((m) => m.term)].filter(Boolean).join(" "),
+    [malformed]
+  );
 
   const kindsQuery = useQuery<string[]>({
     queryKey: ["distinct-kinds"],
@@ -275,20 +295,29 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
         setShowSuggestions(false);
         return;
       }
-      onChange(buildSearch(mergeFilters(activeFilters, parseSearch(token))));
+      onChange(withMalformed(buildSearch(mergeFilters(activeFilters, parseSearch(token)))));
       setInputValue("");
       setShowSuggestions(false);
       setSelectedIdx(-1);
     },
-    [activeFilters, onChange]
+    [activeFilters, onChange, withMalformed]
   );
 
   /** Remove a single term */
   const removeTerm = useCallback(
     (term: Term) => {
-      onChange(buildSearch(withoutTerm(activeFilters, term)));
+      onChange(withMalformed(buildSearch(withoutTerm(activeFilters, term))));
     },
-    [activeFilters, onChange]
+    [activeFilters, onChange, withMalformed]
+  );
+
+  /** Remove a term that doesn't parse */
+  const removeMalformed = useCallback(
+    (term: string) => {
+      const rest = malformed.filter((m) => m.term !== term).map((m) => m.term);
+      onChange([buildSearch(activeFilters), ...rest].filter(Boolean).join(" "));
+    },
+    [activeFilters, malformed, onChange]
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -338,7 +367,10 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
     // Backspace on empty input removes last filter
     if (e.key === "Backspace" && inputValue === "") {
       const applied = terms(activeFilters);
-      if (applied.length > 0) {
+      const lastMalformed = malformed[malformed.length - 1];
+      if (lastMalformed) {
+        removeMalformed(lastMalformed.term);
+      } else if (applied.length > 0) {
         removeTerm(applied[applied.length - 1]!);
       }
     }
@@ -360,7 +392,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   }, []);
 
   const applied = terms(activeFilters);
-  const hasFilters = applied.length > 0;
+  const hasFilters = applied.length > 0 || malformed.length > 0;
 
   return (
     <div ref={containerRef} className="relative">
@@ -375,6 +407,15 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
             key={termLabel(term)}
             label={termLabel(term)}
             onRemove={() => removeTerm(term)}
+          />
+        ))}
+        {malformed.map(({ term, error }) => (
+          <FilterChip
+            key={`invalid:${term}`}
+            label={term}
+            title={error}
+            invalid
+            onRemove={() => removeMalformed(term)}
           />
         ))}
 
@@ -444,12 +485,24 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
 function FilterChip({
   label,
   onRemove,
+  title,
+  invalid = false,
 }: {
   label: string;
   onRemove: () => void;
+  title?: string;
+  /** A term that doesn't parse, so nothing is listed until it's fixed. */
+  invalid?: boolean;
 }) {
   return (
-    <span className="inline-flex items-center gap-1 rounded-md bg-primary-subtle px-2 py-0.5 text-xs font-medium text-primary-subtle-fg">
+    <span
+      title={title}
+      data-invalid={invalid || undefined}
+      className={[
+        "inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium",
+        invalid ? "bg-danger-subtle text-danger-subtle-fg" : "bg-primary-subtle text-primary-subtle-fg",
+      ].join(" ")}
+    >
       {label}
       <button
         type="button"

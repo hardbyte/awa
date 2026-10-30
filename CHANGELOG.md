@@ -24,10 +24,15 @@ Notable changes between releases. Detailed migration notes for storage transitio
   an error rather than ignored. See
   [stability](docs/stability.md#job-filters-adr-049) for what is and isn't
   rehearsed across versions.
-- **HTTP: the DLQ bulk-retry and bulk-purge bodies take the filter under
-  `filter`.** The flat `kind`, `queue` and `tag` still work. 0.6's body type
-  reads only the flat fields and its DLQ functions refuse an empty filter,
-  so a nested filter sent to a 0.6 server is refused rather than widened.
+- **HTTP: DLQ retry and purge by the full filter use new endpoints,
+  `POST /api/dlq/retry-matching` and `/api/dlq/purge-matching`, with body
+  `{"filter": {...}}`.** `all: true` is accepted only with an empty filter.
+  `/api/dlq/bulk-retry` and `/bulk-purge` keep their 0.6 body (`kind`,
+  `queue`, one `tag`, `all`) and now refuse fields beyond it. A 0.6 server
+  ignores body fields it doesn't know, so a richer body on the old paths
+  could act on more rows there (a filter beside `all: true` would act on the
+  whole DLQ); it answers the new paths with 405, and a v0.6.9 server was
+  checked to.
 - **Finding, counting and batch-operating on jobs by filter require queue
   storage.** On the deprecated canonical engine (ADR-037), `find_jobs`,
   `count_jobs`, the deprecated `list_jobs`, `GET /api/jobs`, `awa job list`

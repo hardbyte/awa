@@ -1121,3 +1121,122 @@ async fn test_batch_ops_api_preview_submit_and_cancel() {
         .expect("request should succeed");
     assert_eq!(patch_response.status(), StatusCode::OK);
 }
+
+async fn post_status(app: &axum::Router, path: &str, payload: Value) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed")
+        .status()
+}
+
+/// A 0.6 server reads any body on the bulk-retry and bulk-purge paths as its
+/// flat fields, so the full filter lives on the matching paths, which it
+/// answers with 404. Neither path accepts a body that a 0.6 server would
+/// read as the whole DLQ while this one narrows it.
+#[tokio::test]
+async fn test_dlq_bulk_bodies_never_mean_more_on_an_older_server() {
+    use awa_model::queue_storage::QueueStorage;
+
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
+    let schema = QueueStorage::active_schema(&pool)
+        .await
+        .unwrap()
+        .expect("queue storage should be active");
+    let store = QueueStorage::from_existing_schema(schema).unwrap();
+    let queue = "api_dlq_bulk";
+    for tag in ["keep", "purge"] {
+        awa_model::insert_many(
+            &pool,
+            &[awa_model::InsertParams {
+                kind: "api_dlq_job".to_string(),
+                args: serde_json::json!({}),
+                opts: awa_model::InsertOpts {
+                    queue: queue.to_string(),
+                    tags: vec![tag.to_string()],
+                    ..Default::default()
+                },
+            }],
+        )
+        .await
+        .unwrap();
+    }
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 2, Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    for claim in &claimed {
+        store
+            .fail_to_dlq(
+                &pool,
+                claim.job.id,
+                claim.job.run_lease,
+                "poison",
+                "bad",
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let depth = |pool: sqlx::PgPool| async move {
+        awa_model::dlq::dlq_depth(&pool, Some(queue)).await.unwrap()
+    };
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should build");
+
+    for (path, body) in [
+        (
+            "/api/dlq/bulk-purge",
+            serde_json::json!({ "filter": { "tag": "purge" }, "all": true }),
+        ),
+        (
+            "/api/dlq/bulk-retry",
+            serde_json::json!({ "queue": queue, "filter": { "tag": "purge" } }),
+        ),
+        (
+            "/api/dlq/purge-matching",
+            serde_json::json!({ "filter": { "tag": ["purge", "x"] }, "all": true }),
+        ),
+        (
+            "/api/dlq/retry-matching",
+            serde_json::json!({ "queue": queue }),
+        ),
+    ] {
+        let status = post_status(&app, path, body.clone()).await;
+        assert!(status.is_client_error(), "{path} {body} -> {status}");
+    }
+    assert_eq!(
+        depth(pool.clone()).await,
+        2,
+        "a refused body changes nothing"
+    );
+
+    let (status, purged) = post_json(
+        &app,
+        "/api/dlq/purge-matching",
+        serde_json::json!({ "filter": { "queue": queue, "tag": "purge" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(purged["count"], serde_json::json!(1));
+    let (status, retried) = post_json(
+        &app,
+        "/api/dlq/bulk-retry",
+        serde_json::json!({ "queue": queue, "tag": "keep" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(retried["count"], serde_json::json!(1));
+    assert_eq!(depth(pool.clone()).await, 0);
+}

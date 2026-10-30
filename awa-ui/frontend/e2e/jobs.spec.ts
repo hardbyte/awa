@@ -177,6 +177,39 @@ test.describe("Search bar filters", () => {
     await expect(page.getByLabel("State filter")).toHaveValue("available");
   });
 
+  test("a malformed term in the URL lists nothing until it is removed", async ({ page }) => {
+    const jobRequests: string[] = [];
+    page.on("request", (r) => {
+      if (r.url().includes("/api/jobs")) jobRequests.push(r.url());
+    });
+    await page.goto("/jobs?q=queue%3Ae2e_test%20id%3Aabc");
+    await expect(page.getByRole("alert")).toContainText("whole job ids");
+    await expect(page.getByText("id:abc", { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Change priority or queue of matching jobs" })
+    ).toHaveCount(0);
+    expect(jobRequests.filter((url) => !url.includes("/api/jobs/"))).toEqual([]);
+
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs?") && r.ok()),
+      page.getByRole("button", { name: "Remove id:abc filter" }).click(),
+    ]);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(page.url()).not.toContain("abc");
+  });
+
+  test("the DLQ keeps bulk actions off for a malformed term in the URL", async ({ page }) => {
+    const bulkRequests: string[] = [];
+    page.on("request", (r) => {
+      if (r.method() === "POST" && r.url().includes("/api/dlq")) bulkRequests.push(r.url());
+    });
+    await page.goto("/dlq?q=queue%3Ae2e_dlq%20id%3Aabc");
+    await expect(page.getByRole("alert")).toContainText("whole job ids");
+    await expect(page.getByRole("button", { name: /Retry matching/ })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Purge matching" })).toBeDisabled();
+    expect(bulkRequests).toEqual([]);
+  });
+
   test("typing queue:e2e_test and pressing Enter creates a chip and updates URL", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),

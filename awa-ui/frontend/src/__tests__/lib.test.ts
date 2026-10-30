@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import { timeAgo } from "@/lib/time";
 import {
   buildSearch,
-  hasUnparsedDate,
+  invalidTerms,
+  isJobId,
   parseSearch,
   termError,
   toRfc3339,
@@ -102,7 +103,7 @@ describe("parseSearch", () => {
     expect(toRfc3339("not a date")).toBeUndefined();
   });
 
-  it("refuses typed ids and dates it would otherwise drop", () => {
+  it("refuses terms it would otherwise drop, typed or from the URL", () => {
     expect(termError("id:123,456")).toBeUndefined();
     expect(termError("queue:billing id:abc")).toMatch(/whole job ids/);
     expect(termError("id:0")).toMatch(/whole job ids/);
@@ -110,12 +111,24 @@ describe("parseSearch", () => {
     expect(termError("created>=not-a-date")).toMatch(/created>=/);
     expect(termError("created<soon")).toMatch(/created</);
     expect(termError("tag:a,b kind:k")).toBeUndefined();
+    expect(termError("queue:q kind:")).toMatch(/kind: needs a value/);
+    expect(termError("queue:q billing")).toMatch(/billing isn't a filter/);
+    expect(termError("")).toBeUndefined();
   });
 
-  it("flags a created bound that doesn't parse", () => {
-    expect(hasUnparsedDate(parseSearch("created>=2026-10-01"))).toBe(false);
-    expect(hasUnparsedDate(parseSearch("created>=nope"))).toBe(true);
-    expect(hasUnparsedDate(parseSearch("queue:q created<nope"))).toBe(true);
+  it("lists every malformed term so none is lost", () => {
+    expect(invalidTerms("queue:q id:abc tag:t created<nope").map((t) => t.term)).toEqual([
+      "id:abc",
+      "created<nope",
+    ]);
+  });
+
+  it("only accepts ids the UI can carry exactly", () => {
+    expect(isJobId("9007199254740991")).toBe(true);
+    expect(isJobId("9007199254740993")).toBe(false);
+    expect(isJobId("12a")).toBe(false);
+    expect(termError("id:9007199254740993")).toMatch(/whole job ids/);
+    expect(parseSearch("id:9007199254740993")).toEqual({});
   });
 });
 
