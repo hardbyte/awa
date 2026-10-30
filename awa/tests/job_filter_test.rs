@@ -188,57 +188,45 @@ async fn filters_agree_with_each_jobs_current_row_on_queue_storage() {
 }
 
 #[tokio::test]
-async fn filters_agree_with_each_jobs_current_row_on_canonical() {
+async fn the_canonical_engine_is_refused_rather_than_searched() {
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
-    let params: Vec<InsertParams> = (0..20)
-        .map(|n| InsertParams {
-            kind: kind_for(n).into(),
-            args: json!({ "n": n }),
-            opts: InsertOpts {
-                queue: QUEUE.into(),
-                tags: tags_for(n),
-                ..Default::default()
-            },
-        })
-        .collect();
-    let ids: Vec<i64> = awa::insert_many(&pool, &params)
-        .await
-        .unwrap()
-        .iter()
-        .map(|job| job.id)
-        .collect();
-    for (n, state) in [
-        (0, "completed"),
-        (1, "completed"),
-        (5, "failed"),
-        (6, "cancelled"),
-        (9, "running"),
-    ] {
-        sqlx::query(
-            "UPDATE awa.jobs_hot SET state = $2::awa.job_state, \
-               finalized_at = CASE WHEN $2 IN ('completed', 'failed', 'cancelled') \
-                                   THEN now() END, \
-               attempted_at = now(), run_lease = run_lease + 1 \
-             WHERE id = $1",
-        )
-        .bind(ids[n])
-        .bind(state)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    assert_filters_agree(&pool, &ids).await;
-    assert!(
-        admin::find_jobs(
+    let refused = |err: awa::AwaError| {
+        let message = err.to_string();
+        assert!(message.contains("queue_storage"), "{message}");
+    };
+    refused(
+        admin::find_jobs(&pool, &JobFilter::new(), JobPage::default())
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        admin::count_jobs(&pool, &JobFilter::new())
+            .await
+            .unwrap_err(),
+    );
+    let spec = BatchOperationSpec::SetPriority { priority: 1 };
+    refused(
+        batch_operations::preview_batch_operation(
             &pool,
-            &JobFilter::new().dead_lettered(true),
-            JobPage::default()
+            spec.clone(),
+            JobFilter::new().queue(QUEUE),
         )
         .await
-        .unwrap()
-        .is_empty(),
-        "the canonical engine has no DLQ"
+        .unwrap_err(),
+    );
+    refused(
+        batch_operations::submit_batch_operation(
+            &pool,
+            SubmitBatchOperation {
+                spec,
+                filter: JobFilter::new().queue(QUEUE),
+                submitted_by: None,
+                allow_all: false,
+            },
+        )
+        .await
+        .unwrap_err(),
     );
 }
 

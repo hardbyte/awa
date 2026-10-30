@@ -6,6 +6,10 @@ admin UI's jobs page and DLQ page, `awa job list` and `awa dlq list`, Python's
 ([ADR-049](adr/049-job-filter-and-indexed-tags.md)). The same filter selects
 the same jobs on every one of them.
 
+Finding jobs needs the queue-storage engine. On the deprecated canonical
+engine ([ADR-037](adr/037-canonical-engine-deprecation.md)) these calls
+return an error naming the missing queue_storage backend.
+
 ## The filter
 
 | Field | Meaning |

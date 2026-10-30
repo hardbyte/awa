@@ -253,6 +253,7 @@ pub async fn submit_batch_operation(
     request.spec.validate()?;
     request.filter.validate()?;
     validate_filter_for_spec(&request.spec, &request.filter)?;
+    crate::job_query::active_store(pool).await?;
     if request.filter.uses_extended_fields() {
         crate::filter::require_fleet_for_extended_filters(pool).await?;
     }
@@ -885,83 +886,11 @@ async fn apply_to_job_tx(
             }
         };
     }
-
-    match spec {
-        BatchOperationSpec::SetPriority { priority } => {
-            canonical_set_priority_tx(tx, job_id, *priority).await
-        }
-        BatchOperationSpec::MoveQueue { queue, priority } => {
-            canonical_move_queue_tx(tx, job_id, queue, *priority).await
-        }
-    }
-}
-
-async fn canonical_set_priority_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    job_id: i64,
-    priority: i16,
-) -> Result<bool, AwaError> {
-    let result = sqlx::query(
-        r#"
-        UPDATE awa.jobs
-        SET priority = $2,
-            metadata = CASE
-                WHEN metadata ? '_awa_original_priority' THEN metadata
-                ELSE jsonb_set(metadata, '{_awa_original_priority}', to_jsonb(priority), true)
-            END
-        WHERE id = $1 AND state IN ('available', 'scheduled') AND priority <> $2
-        "#,
-    )
-    .bind(job_id)
-    .bind(priority)
-    .execute(tx.as_mut())
-    .await
-    .map_err(map_sqlx_error)?;
-    Ok(result.rows_affected() > 0)
-}
-
-async fn canonical_move_queue_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    job_id: i64,
-    queue: &str,
-    priority: Option<i16>,
-) -> Result<bool, AwaError> {
-    let result = sqlx::query(
-        r#"
-        WITH target AS (
-            SELECT id, queue, priority, metadata
-            FROM awa.jobs
-            WHERE id = $1 AND state IN ('available', 'scheduled')
-              AND (queue <> $2 OR ($3::smallint IS NOT NULL AND priority <> $3))
-            FOR UPDATE
-        ), stamped AS (
-            SELECT
-                id,
-                CASE
-                    WHEN $3::smallint IS NULL OR metadata ? '_awa_original_priority' THEN metadata
-                    ELSE jsonb_set(metadata, '{_awa_original_priority}', to_jsonb(priority), true)
-                END AS with_priority,
-                queue AS original_queue
-            FROM target
-        )
-        UPDATE awa.jobs AS jobs
-        SET queue = $2,
-            priority = COALESCE($3, jobs.priority),
-            metadata = CASE
-                WHEN stamped.with_priority ? '_awa_original_queue' THEN stamped.with_priority
-                ELSE jsonb_set(stamped.with_priority, '{_awa_original_queue}', to_jsonb(stamped.original_queue), true)
-            END
-        FROM stamped
-        WHERE jobs.id = stamped.id
-        "#,
-    )
-    .bind(job_id)
-    .bind(queue)
-    .bind(priority)
-    .execute(tx.as_mut())
-    .await
-    .map_err(map_sqlx_error)?;
-    Ok(result.rows_affected() > 0)
+    Err(AwaError::Validation(
+        "batch operations require an active queue_storage backend; \
+         the canonical engine is deprecated (ADR-037)"
+            .to_string(),
+    ))
 }
 
 pub async fn run_one_default_chunk(

@@ -28,6 +28,13 @@ Notable changes between releases. Detailed migration notes for storage transitio
   `filter`.** The flat `kind`, `queue` and `tag` still work. 0.6's body type
   reads only the flat fields and its DLQ functions refuse an empty filter,
   so a nested filter sent to a 0.6 server is refused rather than widened.
+- **Finding, counting and batch-operating on jobs by filter require queue
+  storage.** On the deprecated canonical engine (ADR-037), `find_jobs`,
+  `count_jobs`, the deprecated `list_jobs`, `GET /api/jobs`, `awa job list`
+  and batch-operation preview and submit return an error naming the
+  missing queue_storage backend, as the DLQ APIs already did. In 0.7 a
+  migrated cluster is finalized onto queue storage; only a fresh install that
+  hasn't started a worker is still canonical.
 - **A DLQ purge or bulk retry needs a filter that narrows the DLQ** (kind,
   queue, tag, ids or a created bound) unless `allow_all` is set; `state:
   failed` and `dead_lettered: true` alone are refused, since every DLQ row

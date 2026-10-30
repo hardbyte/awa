@@ -1,4 +1,5 @@
-//! Compiles a [`JobFilter`] to SQL, once per storage engine (ADR-049).
+//! Compiles a [`JobFilter`] to SQL over queue storage (ADR-049). The
+//! deprecated canonical engine isn't supported (ADR-037).
 //!
 //! The SQL narrows candidates: it writes a predicate only for a field the
 //! filter sets, so a prepared statement's generic plan keeps nothing it
@@ -52,7 +53,6 @@ pub(crate) enum Bind {
     Time(DateTime<Utc>),
     States(Vec<String>),
     Json(serde_json::Value),
-    TextArray(Vec<String>),
 }
 
 struct Statement {
@@ -78,7 +78,6 @@ impl Statement {
                 Bind::Time(v) => query.bind(v),
                 Bind::States(v) => query.bind(v),
                 Bind::Json(v) => query.bind(v),
-                Bind::TextArray(v) => query.bind(v),
             };
         }
         query
@@ -119,7 +118,6 @@ impl Predicate {
                 Bind::Time(v) => query.bind(v),
                 Bind::States(v) => query.bind(v),
                 Bind::Json(v) => query.bind(v),
-                Bind::TextArray(v) => query.bind(v),
             };
         }
         query
@@ -137,7 +135,6 @@ impl Predicate {
                 Bind::Time(v) => query.bind(v),
                 Bind::States(v) => query.bind(v),
                 Bind::Json(v) => query.bind(v),
-                Bind::TextArray(v) => query.bind(v),
             };
         }
         query
@@ -659,99 +656,6 @@ fn queue_storage_statement(
     Some(statement)
 }
 
-fn canonical_statement(
-    filter: &JobFilter,
-    eligible: &[JobState],
-    window: Window,
-) -> Option<Statement> {
-    // The canonical engine has no DLQ.
-    if filter.dead_lettered == Some(true) {
-        return None;
-    }
-    let states = filter.effective_states(eligible);
-    if states.is_empty() {
-        return None;
-    }
-    let mut statement = Statement {
-        sql: String::new(),
-        binds: Vec::new(),
-    };
-    // `awa.jobs` is a view over a set-returning function, which no
-    // predicate can push into, so read the two tables directly.
-    let parts: Vec<String> = ["awa.jobs_hot", "awa.scheduled_jobs"]
-        .iter()
-        .map(|table| {
-            let mut conditions = Vec::new();
-            if states.len() < ALL_STATES.len() {
-                let p = statement.param(Bind::States(state_names(&states)));
-                conditions.push(format!("j.state = ANY({p}::awa.job_state[])"));
-            }
-            if let Some(kind) = &filter.kind {
-                let p = statement.param(Bind::Text(kind.clone()));
-                conditions.push(format!("j.kind = {p}"));
-            }
-            if let Some(queue) = &filter.queue {
-                let p = statement.param(Bind::Text(queue.clone()));
-                conditions.push(format!("j.queue = {p}"));
-            }
-            if !filter.tags.is_empty() {
-                let p = statement.param(Bind::TextArray(filter.tags.clone()));
-                conditions.push(format!("j.tags @> {p}::text[]"));
-            }
-            if let Some(ids) = &filter.ids {
-                let p = statement.param(Bind::Ints(ids.clone()));
-                conditions.push(format!("j.id = ANY({p}::bigint[])"));
-            }
-            if let Some(gte) = filter.created_at_gte {
-                let p = statement.param(Bind::Time(gte));
-                conditions.push(format!("j.created_at >= {p}"));
-            }
-            if let Some(lt) = filter.created_at_lt {
-                let p = statement.param(Bind::Time(lt));
-                conditions.push(format!("j.created_at < {p}"));
-            }
-            let tail = match window {
-                Window::NewestFirst { before_id, limit } => {
-                    if let Some(before_id) = before_id {
-                        let p = statement.param(Bind::Int(before_id));
-                        conditions.push(format!("j.id < {p}"));
-                    }
-                    let p = statement.param(Bind::Int(limit));
-                    format!(" ORDER BY j.id DESC LIMIT {p}")
-                }
-                Window::OldestFirst {
-                    after_id,
-                    max_id,
-                    limit,
-                } => {
-                    let after = statement.param(Bind::Int(after_id));
-                    let max = statement.param(Bind::Int(max_id));
-                    conditions.push(format!("j.id > {after} AND j.id <= {max}"));
-                    let p = statement.param(Bind::Int(limit));
-                    format!(" ORDER BY j.id ASC LIMIT {p}")
-                }
-                Window::Unbounded { cap } => capped_tail(&mut statement, cap),
-            };
-            let where_clause = if conditions.is_empty() {
-                String::new()
-            } else {
-                format!(" WHERE {}", conditions.join(" AND "))
-            };
-            counted_branch(
-                format!("SELECT j.id AS job_id FROM {table} AS j{where_clause}{tail}"),
-                window,
-            )
-        })
-        .collect();
-    statement.sql = finish(
-        String::new(),
-        parts.join(" UNION ALL "),
-        window,
-        &mut statement,
-    );
-    Some(statement)
-}
-
 /// Wraps the branches: candidate ids de-duplicated in window order, or the
 /// capped count of distinct ids.
 fn finish(prefix: String, union: String, window: Window, statement: &mut Statement) -> String {
@@ -784,21 +688,30 @@ fn finish(prefix: String, union: String, window: Window, statement: &mut Stateme
     }
 }
 
-/// The statement for whichever engine is active, or `None` when no job can
-/// match.
+/// The active queue-storage engine. Finding jobs by filter is a
+/// queue-storage feature: the canonical engine is deprecated and holds work
+/// only on a fresh install that hasn't started a worker (ADR-037).
+pub(crate) async fn active_store(pool: &PgPool) -> Result<QueueStorage, AwaError> {
+    let schema = QueueStorage::active_schema(pool).await?.ok_or_else(|| {
+        AwaError::Validation(
+            "finding jobs by filter requires an active queue_storage backend; \
+             the canonical engine is deprecated (ADR-037)"
+                .to_string(),
+        )
+    })?;
+    QueueStorage::from_existing_schema(schema)
+}
+
+/// The candidate statement, or `None` when no job can match.
 async fn statement(
     pool: &PgPool,
     filter: &JobFilter,
     eligible: &[JobState],
     window: Window,
-) -> Result<(Option<QueueStorage>, Option<Statement>), AwaError> {
-    match QueueStorage::active_schema(pool).await? {
-        Some(schema) => {
-            let statement = queue_storage_statement(&schema, filter, eligible, window);
-            Ok((Some(QueueStorage::from_existing_schema(schema)?), statement))
-        }
-        None => Ok((None, canonical_statement(filter, eligible, window))),
-    }
+) -> Result<(QueueStorage, Option<Statement>), AwaError> {
+    let store = active_store(pool).await?;
+    let statement = queue_storage_statement(store.schema(), filter, eligible, window);
+    Ok((store, statement))
 }
 
 /// Run a candidate or count statement. Interactive reads run under
@@ -863,31 +776,13 @@ pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// dead-lettered.
 async fn load(
     pool: &PgPool,
-    store: Option<&QueueStorage>,
+    store: &QueueStorage,
     ids: &[i64],
 ) -> Result<Vec<(JobRow, bool)>, AwaError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    match store {
-        Some(store) => store.load_jobs_without_output(pool, ids).await,
-        None => {
-            let rows: Vec<JobRow> = sqlx::query_as(
-                "SELECT * FROM awa.jobs_hot WHERE id = ANY($1) \
-                 UNION ALL SELECT * FROM awa.scheduled_jobs WHERE id = ANY($1)",
-            )
-            .bind(ids)
-            .fetch_all(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-            let mut by_id: std::collections::HashMap<i64, JobRow> =
-                rows.into_iter().map(|job| (job.id, job)).collect();
-            Ok(ids
-                .iter()
-                .filter_map(|id| by_id.remove(id).map(|job| (job, false)))
-                .collect())
-        }
-    }
+    store.load_jobs_without_output(pool, ids).await
 }
 
 /// Jobs in `filter`'s population that `eligible` allows, in `window` order:
@@ -935,7 +830,7 @@ pub(crate) async fn find(
         };
         let ids = fetch_scalars(pool, statement, Some(READ_TIMEOUT)).await?;
         let exhausted = (ids.len() as i64) < fetch;
-        for (job, dead_lettered) in load(pool, store.as_ref(), &ids).await? {
+        for (job, dead_lettered) in load(pool, &store, &ids).await? {
             if effective.contains(&job.state) && filter.matches(&job, dead_lettered) {
                 jobs.push(job);
                 if jobs.len() as i64 >= limit {
