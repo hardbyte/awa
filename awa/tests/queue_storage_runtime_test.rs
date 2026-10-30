@@ -17691,6 +17691,211 @@ async fn test_jobs_compat_view_reports_receipt_running_claims() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_jobs_compat_view_reports_aged_receipt_claims() {
+    jobs_compat_view_reports_aged_claims(CompatClaimMode::Batch).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_jobs_compat_view_reports_aged_materialized_leases() {
+    jobs_compat_view_reports_aged_claims(CompatClaimMode::Materialized).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_jobs_compat_view_reports_aged_row_local_claims() {
+    jobs_compat_view_reports_aged_claims(CompatClaimMode::RowLocal).await;
+}
+
+enum CompatClaimMode {
+    Batch,
+    RowLocal,
+    Materialized,
+}
+
+async fn jobs_compat_view_reports_aged_claims(mode: CompatClaimMode) {
+    let (_db_guard, pool) = setup_pool(6).await;
+    let queue = "qs_compat_aged_running";
+    let schema = "awa_qs_compat_aged_running";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: !matches!(mode, CompatClaimMode::Materialized),
+            ..Default::default()
+        },
+    )
+    .await;
+    let args = serde_json::json!({ "id": 901 });
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 901 },
+        InsertOpts {
+            queue: queue.to_string(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    backdate_one_lane_ready_job_run_at(
+        &pool,
+        schema,
+        job_id,
+        Utc::now() - chrono::Duration::minutes(5),
+    )
+    .await;
+    // Reprioritization retains the old ready row, tombstoned, with the same
+    // job and attempt identity. It must not become another running result.
+    assert!(store.set_priority(&pool, job_id, 3).await.unwrap());
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("claim reprioritized job with aging");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert_eq!(claimed[0].job.priority, 1);
+    assert_eq!(claimed[0].claim.priority, 3);
+
+    if matches!(mode, CompatClaimMode::RowLocal) {
+        // Represent the real claim in the legacy row-local receipt format.
+        // Keep its identity, attempt, claim time and deadline unchanged.
+        let converted = sqlx::query(audited_sql(format!(
+            r#"
+            WITH batches AS (
+                DELETE FROM {schema}.lease_claim_batches
+                WHERE queue = $1
+                RETURNING *
+            )
+            INSERT INTO {schema}.lease_claims (
+                claim_slot, receipt_id, job_id, run_lease, ready_slot,
+                ready_generation, queue, priority, attempt, max_attempts,
+                lane_seq, enqueue_shard, claimed_at, deadline_at
+            )
+            SELECT batches.claim_slot, items.receipt_id, items.job_id,
+                   items.run_lease, batches.ready_slot, batches.ready_generation,
+                   batches.queue, batches.priority, items.attempt,
+                   items.max_attempts, items.lane_seq, batches.enqueue_shard,
+                   batches.claimed_at, batches.deadline_at
+            FROM batches
+            CROSS JOIN LATERAL unnest(
+                batches.job_ids, batches.run_leases, batches.receipt_ids,
+                batches.lane_seqs, batches.attempts, batches.max_attempts
+            ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
+            "#
+        )))
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("convert the claim to the row-local receipt format");
+        assert_eq!(converted.rows_affected(), 1);
+    }
+
+    type Projection = (i64, String, i64, i16, serde_json::Value, i16);
+    async fn read_projection(pool: &sqlx::PgPool, job_id: i64) -> Vec<Projection> {
+        sqlx::query_as(
+            "SELECT id, state::text, run_lease, attempt, args, priority \
+             FROM awa.jobs WHERE id = $1 ORDER BY run_lease",
+        )
+        .bind(job_id)
+        .fetch_all(pool)
+        .await
+        .expect("read aged job from SQL compatibility view")
+    }
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "running".to_string(),
+            claimed[0].job.run_lease,
+            claimed[0].job.attempt,
+            args.clone(),
+            claimed[0].job.priority,
+        )],
+        "aging must not hide a live claim or duplicate a tombstoned ready row"
+    );
+
+    let retried = store
+        .retry_after(
+            &pool,
+            job_id,
+            claimed[0].job.run_lease,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .expect("retry aged claim")
+        .expect("current attempt must be retryable");
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "retryable".to_string(),
+            claimed[0].job.run_lease,
+            claimed[0].job.attempt,
+            args.clone(),
+            retried.priority,
+        )],
+        "closed receipts must not remain visible as running"
+    );
+    assert_eq!(
+        store
+            .promote_due(&pool, JobState::Retryable, 1)
+            .await
+            .expect("promote retried job"),
+        1
+    );
+    let reclaimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("claim the next attempt");
+    assert_eq!(reclaimed.len(), 1);
+    assert!(reclaimed[0].job.run_lease > claimed[0].job.run_lease);
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "running".to_string(),
+            reclaimed[0].job.run_lease,
+            reclaimed[0].job.attempt,
+            args.clone(),
+            reclaimed[0].job.priority,
+        )],
+        "retained ready rows from older attempts must not duplicate the current one"
+    );
+    assert_eq!(
+        store
+            .complete_runtime_batch(&pool, &reclaimed)
+            .await
+            .expect("complete current attempt"),
+        vec![(job_id, reclaimed[0].job.run_lease)]
+    );
+    assert_eq!(
+        read_projection(&pool, job_id).await,
+        vec![(
+            job_id,
+            "completed".to_string(),
+            reclaimed[0].job.run_lease,
+            reclaimed[0].job.attempt,
+            args,
+            reclaimed[0].job.priority,
+        )],
+        "completed attempts must not also remain visible as running"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_cursor_advance_requires_claim_evidence() {
     cursor_advance_requires_claim_evidence(true).await;
 }
