@@ -104,6 +104,30 @@ If a change breaks something *not* listed here, it is not a breaking change — 
 surprises users repeatedly, the fix is to amend this document, not to argue.
 
 
+### Job filters (ADR-049)
+
+`JobFilter`'s JSON keeps ADR-030's keys. What holds across versions, and what
+checks it:
+
+- **0.6 readers fail closed on extended filters.** Several tags or states
+  travel as a list under `tag` or `state`, which 0.6's `BatchOperationFilter`
+  (`tag: Option<String>`, `state: Option<JobState>`) rejects. A unit test in
+  `awa-model/src/filter.rs` reads the new shape with a copy of that type.
+  DLQ bulk bodies nest the filter under `filter`; 0.6's body type reads only
+  flat `kind`, `queue` and `tag`, and its DLQ functions refuse an empty
+  filter. No rehearsal runs a released 0.6 server or runner against these
+  shapes.
+- **Extended batch filters wait for the fleet.** A batch operation with
+  several tags or states, or `dead_lettered`, is refused while any live
+  runtime reports a version older than 0.7.0-alpha.2
+  (`extended_filters_wait_for_the_fleet` in `awa/tests/job_filter_test.rs`,
+  using a recorded runtime row rather than a running 0.6 binary).
+- **Stored ADR-030 filters still load.** Rows a 0.6 `BatchOperationFilter`
+  wrote, including explicit nulls, deserialize as `JobFilter`.
+- **Tag indexes are invisible to older binaries.** They are partial GIN
+  indexes Postgres maintains on every write; no binary reads or writes them
+  directly, and no migration adds them.
+
 ### Periodic ownership (v045)
 
 The opt-in owner protocol leaves unowned additive registration unchanged. Its
