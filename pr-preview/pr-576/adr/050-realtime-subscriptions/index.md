@@ -1,347 +1,225 @@
 > For the complete AWA documentation index, see [`llms.txt`](../../llms.txt).
 
-# ADR-050: Real-time resource subscriptions
+# ADR-050: Admin views use invalidation and authoritative refetch
 
 ## Status
 
-Proposed. Documentation only; no subscription API is implemented by this record.
-Number reserved in [#576](https://github.com/hardbyte/awa/pull/576).
+Proposed. The SSE transport experiment is opt-in and disabled by default.
+[Draft PR #576](https://github.com/hardbyte/awa/pull/576) contains this decision
+and its supporting design contract; it implements no subscription feature.
 
-## Context
+## Problem and constraints
 
-The first consumer is Awa's admin UI. Its question is broader than whether a job
-changed state: is a queue falling behind, is a capable worker present, did rescue
-recover progress, has a schedule reconciled, or has an operator's batch finished?
-Applications may later want to refresh a view when their jobs complete.
+The admin UI needs current views of jobs, queues, workers, schedules, the DLQ
+and operator progress. Those views answer operational questions, not just whether
+a job changed status. Today ordinary HTTP reads and TTL caches serve them, with
+polling spread across pages. Adding push without a common refresh policy risks
+multiplying reads while leaving missed notifications and stale cache fills
+unresolved.
 
-The priority order is strict: job correctness, reliability and recovery first;
-performance second; UX third. A lost observation must never lose a job or become
-the only trigger for business work. Few production users are moving from 0.6 to
-0.7, so a simpler public interface is preferable to preserving an accidental one.
-That freedom does not remove the database rolling-upgrade contract.
+The priority order is job correctness, reliability and recovery first,
+performance second, UX third. Observation must not become a dependency of
+enqueue, claim, finalization or rescue. The initial consumer is the trusted admin
+UI; a future application API must not acquire stronger delivery or authorization
+promises by accident. The 0.6-to-0.7 transition permits interface simplification,
+while the rolling-upgrade and database safety contracts still apply.
 
-Today the UI polls ordinary HTTP reads. Aggregate endpoints have TTL caches with
-request coalescing; the server advertises a polling interval at least as large as
-the cache TTL. Job detail and batch progress have their own intervals. This
-proposal builds on those reads rather than creating another model of job state.
+## Decision and scope
 
-[ADR-049](../049-job-filter-and-indexed-tags/index.md) is accepted, although its index row
-still says Proposed. Its implementation is separately under review in
-[#572](https://github.com/hardbyte/awa/pull/572). The initial recommendation was
-formed independently of the separate filtering review. Subsequent document-specific review amendments are recorded below.
+**Admin views use disposable invalidation hints, authoritative API reads and
+independent bounded reconciliation.** This observation model is the enduring
+choice. Fetch-based SSE is the proposed experimental transport for v1, not the
+source of correctness and not a commitment to permanent transport infrastructure.
 
-## Decision
+A hint means that a resource may have changed. The owning read API decides its
+current contents, eligibility and accuracy. Filtered job views reuse
+[ADR-049's JobFilter](../049-job-filter-and-indexed-tags/index.md), including its bounds,
+strict parsing and separation of population from paging. Unsupported filters
+fail closed, including when successive requests reach servers of different
+versions. Routing hints does not create a second filter evaluator.
 
-Use **resource invalidation followed by authoritative refetch** over one
-multiplexed **fetch-based SSE connection per visible admin tab**. An invalidation
-means only "this resource may have changed". Reconnect resynchronizes current
-state; there is no durable cursor, transition replay or acknowledgement.
+The model has these invariants:
 
-The v1 implementation contract is
-[Real-time subscriptions v1](../../design/realtime-subscriptions-v1/index.md). It fixes
-`POST /api/subscriptions/v1`, strict versioned JSON reads, finite experimental
-limits, one refresh scheduler, cache-generation fences and the trusted-admin
-origin policy. These are requirements of this proposal, not optional follow-up
-choices. **Streaming is disabled by default** and requires explicit server
-opt-in until load and deployment validation supports default enablement.
+- **Recovery does not depend on hints.** Establish observation before acknowledging
+  readiness, then refetch. Reconnect and scope changes resynchronize. Independent
+  reconciliation repairs a missed final hint even while the transport looks
+  healthy. A hint received during a read remains pending rather than being
+  cleared by that response. Both entering and leaving a filtered population must
+  invalidate the view.
+- **Demand is bounded and shared.** Hints, polling, reconciliation, resume and
+  retries feed one paced refresh policy. Repeated demand coalesces without one
+  resource overwriting another. Read work, waiting work, fanout and slow clients
+  have finite budgets. Overload reduces freshness rather than creating more
+  polling or delaying job execution through an unbounded read backlog.
+- **Invalidation cannot be undone by a late cache fill.** Once local state is
+  invalidated, an older in-flight fill cannot reappear as current. Observation
+  timestamps retain the source sample's age. Transport activity is distinct from
+  source freshness; it cannot prove a worker alive or a replica caught up.
+- **Observation stays off the job write path.** V1 adds no worker hooks, database
+  triggers, mandatory listener, event log or subscription writes to job
+  transitions. Each admin process can refresh independently; peer-process and
+  worker changes converge through reads without a shared broker or leader.
+- **Domain guards and access boundaries remain authoritative.** Hints and
+  optimistic UI cannot enforce ownership, exclusivity or idempotency. Mutations
+  retain atomic server guards, and refresh preserves selections and operator
+  drafts. Read-only access remains sensitive admin access. Scopes cannot silently
+  widen, and a connection does not extend authorization indefinitely.
 
-Start with a process-local hub, periodic invalidation and hints after committed
-local admin mutations. Opening a stream performs zero database connections and
-zero state queries. Add no subscription writes, triggers, outbox, transactional
-directory, mandatory listener or worker changes on enqueue, claim, heartbeat,
-finalization or rescue. Neither delivery nor reconciliation depends on a worker
-or maintenance leader producing notifications.
+Authoritative reads retain their existing limitations. Composite loading can
+miss an in-flight claim or deferred-to-ready handoff; neither a stream nor
+Repeatable Read makes ring pruning an atomic snapshot. Convergence means retained
+state returned by ordinary APIs after changes settle and reads succeed, not
+observation of every job or transition. A completion pruned between reads may
+never be observed. Durable business reactions remain queue jobs through
+[ADR-029](../029-transactional-followup-jobs/index.md) and
+[ADR-046](../046-handler-staged-follow-ups/index.md) where applicable; existing best-effort
+rescue follow-ups are not strengthened.
 
-Worker-originated updates remain cadence-limited in v1. SSE alone makes them
-neither instantaneous nor cheaper than polling. Durable business reactions remain
-ordinary Awa jobs, using [ADR-029](../029-transactional-followup-jobs/index.md) and
-[ADR-046](../046-handler-staged-follow-ups/index.md) where applicable. Existing rescue
-follow-ups remain best effort after rescue; this proposal does not strengthen
-them.
+V1 remains within the existing trusted-admin boundary and existing read models.
+It adds no tenant authorization framework, presence ownership, new queue metrics
+or retained notification history. Protocol shapes, finite experimental limits,
+cache mechanisms, lifecycle handling and acceptance tests live in
+[the supporting v1 contract](../../design/realtime-subscriptions-v1/index.md).
 
-### Resources and shared filters
+### Why experiment with SSE
 
-V1 admits `jobs`, `job`, `dlq`, `queues`, `workers`, `schedules`, `operations`,
-`maintenance` and `stats`, with exact descriptors and existing read mappings in
-[the resource contract](../../design/realtime-subscriptions-v1/index.md#initial-resources).
-These cover current admin observations, not new metrics. Queue backlog, oldest
-waiting age, throughput and concurrency pressure may only use existing fields
-with documented accuracy. Presence is heartbeat evidence, and age can change
-without a write; stream traffic proves neither liveness nor source freshness.
+A one-way HTTP stream fits invalidation from an admin process to its connected
+views. Its immediate incremental opportunity is fanout after a committed local
+admin mutation, so other views connected to the same process can refetch sooner
+than their next poll. This does not accelerate worker-originated or peer-process
+changes beyond the sampling cadence, and timer-driven SSE does not inherently
+reduce database reads.
 
-Standalone recovery resources, retained notices/history, named queue/worker/
-schedule selectors and application consumers are excluded from v1. A DLQ view
-can observe current retained state, but an ephemeral notice is not an audit
-trail. `/storage?history=true` does not provide server-retained history. Catalog
-and kinds views keep their existing read behavior.
-
-`jobs` and `dlq` share ADR-049's `JobFilter` deserialization **and validation**.
-Fields intersect, states are any-of, tags are all-of, and creation bounds refer
-to original insertion. Paging stays separate. The hub routes coarse categories
-and retains keys/category mappings rather than evaluating a second filter.
-Thus a queue/state move invalidates both old and new populations; a replacement
-page removes departed jobs and refills vacancies. Routing solely on a new row
-would miss the leave. Filter changes abort/fence old streams and reads.
-
-Capabilities are advisory across mixed-server routing. New filtered reads use
-strict v1 JSON POST adapters; every response must agree on MIME, envelope and
-version. An old server may return SPA HTML with HTTP 200, which is an error.
-Legacy fallback permits unfiltered lists/details only; a nonempty filter remains
-unsupported, never rewritten by dropping predicates. Counts retain ADR-049's
-cap and are excluded from automatic refresh; invalidation only marks them stale.
-
-### Recovery uses one bounded scheduler
-
-Register and validate the complete resource set before `ready`, then refetch.
-Client dirty generations preserve a hint received during a read as one pending
-refresh, and superseded responses cannot overwrite the new view. Render a
-successful response even if newer demand remains; do not wait for quiet traffic.
-
-One tab-level scheduler handles hints, a jittered 30-second reconciliation
-watchdog, fallback polling, focus/resume, reconnect and mutations. Managed queries
-have no independent automatic intervals or focus/reconnect fetches. Hints and
-keepalives do not postpone the watchdog. Every demand, including resync, obeys
-the same concurrency, cooldown, admission and retry budgets. A transport failure
-must not add a second polling loop. Hidden tabs pause reads and streams; resume
-requests one paced resync. Selected jobs remain paused and stale until resumed,
-so refreshing cannot replace a selection underneath an operator.
-
-Transport deadlines run independently of the read iterator so a silent hung
-connection is detectable. Empty scope, cap rejection, cancellation and BFCache
-restore have explicit behavior in the contract. Preserve operator drafts too;
-optimistic UI and notifications never replace atomic server-side mutation guards
-or confer ownership through viewing/presence.
-
-The guarantee is convergence to retained state returned by ordinary APIs after
-changes settle and reads succeed. It is not observation of every job or
-transition, nor stronger cross-table consistency. Claims can be absent or stale
-while the lane cursor is outside MVCC; ordinary deferred-to-ready handoffs can
-also be missed by a composite read. Repeatable Read alone does not make ring
-`TRUNCATE` MVCC-safe. A local epoch is not a database position. A completion
-pruned before a read may never be observed; a reliable business reaction needs
-a durable job or application record at the source.
-
-The experimental defaults bound a stream to 16 descriptors and 64 KiB, a process
-to 64 streams and four expensive reads, and a tab to two concurrent reads. A
-whole read has a 15-second deadline covering admission, pool acquisition, every
-query/pass and serialization, with SQL and lock-wait limits inside it. Releasing
-a Rust future is not proof that PostgreSQL work stopped: cancellation and pool
-reuse must be tested. Full limits, overflow/slow-consumer behavior and the
-60-second maximum retry backoff are in the companion contract.
-
-### Server caches, observations and multiple instances
-
-A post-commit helper advances a bounded cache generation, retires its old cache
-entries, then signals the hub. A fill may publish/return as current only if its
-captured generation still matches. New requests cannot join an obsolete fill;
-retries stay within the remaining read budget. Moka `invalidate_all()` alone is
-not an established proof. Client dirty generations and server cache generations
-solve different races and both are required.
-
-Read responses preserve source observation time on cache hits and distinguish
-`observed_at`, `served_at` and `cache_age_ms`. Report replica freshness as unknown
-unless measured. A primary hint does not prove a replica has replayed the change.
-Cache hits may bypass expensive-read admission, but each fill acquires it once.
-Slow clients cannot hold a database connection or block shared fanout; dirty
-state collapses to resync, then close if it cannot be delivered within budget.
-
-Every admin process owns its hub, caches and timer. Peer mutations and worker
-activity converge through periodic reads; no broker, leader or sticky routing is
-needed. Reconnection to a different instance always resynchronizes. Combined
-read cost still grows with active views and process count and must be measured.
-Links to UIs for different databases remain navigation only.
-
-### Trusted-admin scope and transport
-
-V1 is the existing trusted admin surface, protected by ingress/private networking.
-It adds no tenant authorization framework. `--read-only` disables mutations,
-not access to sensitive job data. New stream/read adapters use same-origin JSON
-POSTs, explicit configured-origin checks and credential policy; an outer
-permissive CORS layer must not undo that boundary. An origin check neither
-authorizes a filter nor makes a public unauthenticated admin safe.
-
-Never place credentials, args, outputs or secrets in any URL. Do not place raw
-filter descriptors in subscription URLs or automatic subscription logs. Existing
-shareable search URLs may contain documented nonsecret opaque filter values.
-Descriptors travel in JSON request bodies and are not echoed in events/logs.
-
-Choose SSE because the contract is one-way hints with ordinary HTTP mutations
-and reads. V1 uses `fetch` plus AbortController; it has no native EventSource GET
-variant, registration service or server-side subscription session. Resource-set
-changes abort the old stream before opening its replacement, retaining displayed
-data as stale. The client implements bounded parsing and reconnect/backoff;
-the [SSE standard](https://html.spec.whatwg.org/multipage/server-sent-events.html)
-defines framing; EventSource's automatic reconnect does not apply to fetch.
-Epochs are connection identity, SSE `id` is absent, and `Last-Event-ID` never
-bypasses resync.
-
-Five-minute stream lifetimes permit ingress reauthentication but do not promise
-immediate per-user revocation in a server without identity. Deployment checks
-must cover the actual authentication proxy, buffering, compression and timeouts.
-Protocol/admission errors follow the contract's status/MIME and retry rules,
-including respecting `Retry-After` for both streams and refetches.
+Streaming therefore stays disabled by default. The experiment must compare it
+with improved polling, measuring local-mutation freshness alongside total read,
+connection and operational costs. PostgreSQL load tests must show job execution
+and recovery remain protected; actual ingress/pooler tests must establish that
+authentication, buffering and connection lifecycle behave as intended. A useful
+observation model does not by itself justify enabling a transport.
 
 ## Alternatives considered
 
+### Improved polling with the same observation model
+
+This is the strongest baseline and the default path while streaming is disabled.
+One scheduler,
+coalesced reads, bounded caches, clear stale state and reconciliation solve much
+of the problem without long-lived HTTP connections. It handles worker and
+peer-process changes at the same sampling cadence as timer-driven SSE.
+
+Polling lacks immediate server fanout of a local mutation to other connected
+views. SSE is worth retaining only if that incremental freshness, or another
+measured benefit, justifies its costs. If it does not, keep improved polling;
+none of the enduring invariants requires streaming.
+
+### Fetch-based SSE
+
+Selected for the opt-in v1 experiment because one-way hints fit the existing
+HTTP admin surface and ordinary requests still perform reads and mutations.
+It adds reconnect, parsing, proxy, authorization-lifetime and browser lifecycle
+work; using fetch does not provide EventSource's automatic recovery behavior.
+The supporting contract bounds that work and defines safe fallback, but those
+requirements are costs to validate, not evidence of an advantage already earned.
+
+### WebSocket
+
+WebSocket can change subscriptions bidirectionally without replacing a stream
+and would suit an actual interactive command protocol. V1 needs one-way hints,
+so that bidirectionality is unused and SSE fits the current HTTP request model.
+Both transports still need bounded state, parsing, reconnect, authorization and
+lifecycle handling. Choose between them on demonstrated requirements and deployed
+behavior, not on a claim that fetch-SSE avoids that complexity.
+
+### Pushed snapshots or row deltas
+
+Shared aggregate snapshots might save refetch round trips. Filtered snapshots
+and row deltas require server-side query or membership state, including page
+refill, population entry/exit and deletion semantics. Refetch keeps the existing
+read API authoritative and avoids maintaining that second view model. Consider
+pushed aggregates if measurements identify a material benefit without weakening
+recovery.
+
 ### Durable event log or transactional outbox
 
-A semantic append-only log could support replay after downtime and retained
-notices. An outbox written in the job transaction could couple a fact atomically
-to a transition, unlike a post-commit in-process hook. This is the right family
-of design if observing every retained event becomes an actual requirement.
+A log can retain transitions and support replay; a transactional outbox can couple
+publication to a committed state change. Those are appropriate capabilities when
+every transition is required. They also need complete writer coverage, commit-safe
+ordering, snapshot/replay boundaries, idempotence, retention and gap recovery. A
+sequence allocated before commit is not itself a safe replay watermark.
 
-It also requires complete coverage of Rust/Python/raw/bridge inserts, callbacks,
-rescue, compact completion batches, bulk actions, schedule reconciliation and
-pruning. It adds WAL, retention, schema/version contracts, publication lag and
-write-path failure modes for a UI that needs current state. A sequence allocated
-before commit is not a safe replay watermark: a later id may commit first and
-cause a consumer to skip the earlier transaction. Commit-safe ordering, an
-initial snapshot boundary, idempotence, gap detection, retention floors and
-expired-cursor resync all need a proven protocol.
+Current admin views need retained state, while durable reactions already use
+jobs. Paying WAL, publication and retention costs on job writes to obtain UI
+freshness would introduce an unnecessary dependency. No log, outbox or
+transactional directory is selected here.
 
-Not selected. It would duplicate durable reaction machinery already expressed by
-queue jobs. The proposed stream has no event table, consumer offset or replay
-retention to prune. Ordinary job/output/operation retention still applies, and
-pruning can make resources disappear; reads must not present absence as proof
-that a job never existed.
+### PostgreSQL LISTEN / NOTIFY
 
-### PostgreSQL LISTEN / NOTIFY as delivery or hints
-
-[PostgreSQL NOTIFY](https://www.postgresql.org/docs/17/sql-notify.html) delivers
-after commit to connected listeners, can fold duplicates, has a small payload
-limit, and exposes notifications to database users. A full notification queue
-can make notifying transactions fail at commit. It is not replayable history.
-Adding it to every transition would couple optional UI delivery to job commits.
-
-Not selected as delivery or as a new mandatory write-path mechanism. Existing
-queue wakeups are incomplete hints for this vocabulary: they do not mean that
-completion, worker expiry, schedules or prune changes were all observed. A later
-optimization may use one dedicated session listener per admin process, retaining
-timers and broad resync on listener reconnect. It must not create one PostgreSQL
-connection per browser, rely on transaction-mode poolers for session state, or
-send untrusted payloads straight to clients.
-
-The [LISTEN startup rule](https://www.postgresql.org/docs/17/sql-listen.html) is
-to commit registration before inspecting state. Even when followed, it does not
-repair an incomplete signal source or a missed notification. Any new emission
-path needs measured commit/WAL cost and review against
-[ADR-045](../045-hot-path-trigger-lock-contract/index.md); no trigger change is implied.
+Existing wakeups can be useful disposable hints but do not cover all admin
+resources or provide replay. New transactional emissions would add job-path cost;
+a full notification queue can make notifying transactions fail at commit.
+A mandatory listener would add session and deployment requirements without
+removing the need for reconciliation. A later optional hint optimization must
+preserve the observation model and earn its write/connection cost separately.
 
 ### Logical decoding / CDC
 
-[Logical decoding](https://www.postgresql.org/docs/17/logicaldecoding-explanation.html)
-can provide a database change stream with an exported snapshot boundary. It has
-replication-slot, privilege and failover requirements; consumers must tolerate
-duplicates after crashes. A stalled slot can retain WAL and catalog resources.
+CDC can provide a change stream with a snapshot boundary, but requires slot,
+privilege, failover and retention operations. Mapping Awa's leases, cursors,
+compact completions and partition pruning into public changes would also require
+a semantic adapter. It remains useful for external history and analytics, not a
+required dependency of current admin views.
 
-Awa's physical representation includes ready rows, cursors outside MVCC, leases,
-receipts, compact completions and partition truncation. Decoding those into
-public resource changes would expose storage evolution or require a semantic
-adapter with its own recovery proof. CDC remains useful for external history
-and analytics as documented in
-[managed Postgres](../../deploying-on-managed-postgres/index.md#logical-replication-and-cdc),
-but is not a required dependency for the admin UI.
+## Accepted consequences
 
-### Polling only, pushed snapshots, and WebSocket
+Consumers can converge after lost hints, reconnects and process changes
+without introducing a second event-processing engine. Job execution and durable
+reactions remain independent of browser availability.
 
-**Keep polling only.** This has the fewest moving parts and remains a valid
-deployment/fallback. The initial timer-driven SSE design does not claim fewer
-database reads. SSE buys a common resource vocabulary and immediate local
-invalidation, with room for safe hints later. If that benefit does not justify
-connection/proxy complexity in an implementation benchmark, retain polling
-behind the same vocabulary instead of shipping an idle streaming layer.
+The tradeoff is sampled freshness, potentially redundant reads and no guarantee
+of observing transient or already-pruned state. Coarse invalidation deliberately
+trades routing precision for simpler entry/exit correctness. Multiple admin
+processes have independent caches and read costs; their combined load still
+needs a budget. A successful stream does not imply a healthy queue or current
+source data.
 
-**Push snapshots or row deltas.** Shared sampled aggregate snapshots can save
-refetch round trips, but filtered job snapshots add per-subscriber query/state
-work. Row deltas need correct enter/leave, paging and deletion semantics plus
-the same recovery machinery. Start with refetch; consider pushed aggregate
-snapshots only when measurements show the read cost matters.
+The transport adds operational and client lifecycle costs while it remains an
+experiment. Production SLOs and default enablement need evidence; documentation
+checks establish neither implementation correctness nor capacity.
 
-**WebSocket.** It supports bidirectional subscription changes without reopening
-and would suit a later interactive command protocol. This design needs neither;
-it would add framing, reconnect and connection-state machinery without stronger
-delivery guarantees. Revisit if resource-set churn or actual bidirectional
-requirements justify it. The envelope and recovery semantics should survive a
-transport change.
+## Revisit conditions
 
-## Consequences
+Revisit the rationale when:
 
-- Job execution and durable reactions remain independent of browser health.
-  There is no new schema migration, per-job write tax or notification retention
-  job. Admin read load still competes for database resources and must be bounded.
-- Consumers get convergent views, not a replayable event API. Transient states,
-  completions before pruning and historical recovery notices may be missed.
-- Coarse invalidation simplifies correctness at the cost of extra reads and
-  cadence-limited remote updates. Finer routing must not weaken leave/resync
-  behavior. Low-latency coverage is explicitly incomplete in the first stage.
-- The initial public surface can change for 0.7, but must negotiate capabilities
-  and reject unsupported subscription shapes. An old server gets ordinary reads
-  and polling only for unfiltered legacy lists/details; nonempty filters are
-  unsupported. Never silently drop predicates to make fallback work.
+- A consumer requires replay, audit history or guaranteed completion observation;
+  current-state refetch cannot provide those guarantees.
+- Required worker or peer-process update latency cannot be met by sampled reads;
+  investigate a safe source of hints rather than treating SSE alone as a fix.
+- Measured read/connection cost or ingress behavior makes streaming less useful
+  than improved polling, or makes shared pushed aggregates worthwhile.
+- Application consumers require scoped authorization beyond trusted admin access,
+  or real bidirectional interaction changes the transport requirements.
 
-## Delivery and validation gates
+Revising a transport or sampling policy must preserve the enduring invariants
+unless a later decision explicitly replaces them.
 
-Implementation belongs in a separate draft PR, stacked on #572 or after its
-merge, reusing its actual filter/compiler rather than copying one into the UI
-crate. The [acceptance sequence](../../design/realtime-subscriptions-v1/index.md#implementation-and-acceptance)
-requires strict protocol adapters first, bounded hub/read work, deterministic
-cache/cancellation tests, one frontend scheduler and complete local-mutation
-coverage. It includes empty-install and read-only behavior without a worker,
-mixed-version routing, slow transports, peer-process convergence and paused
-selection/count exceptions.
+## Links and evidence
 
-Opt-in implementation may begin once these amendments are adopted in the draft;
-this documentation PR implements none of it. Keep the implementation PR draft
-until deterministic correctness and read-budget/cancellation tests pass. Default
-enablement additionally needs PostgreSQL 17/18 load evidence and actual
-ingress/pooler validation. Timer-driven SSE is not inherently cheaper than
-polling; measure local-mutation freshness and total read/connection costs.
-
-The earlier uniqueness-prune and DLQ downgrade findings remain separate release
-gates. Subscriptions neither cause nor repair them. This record does not assert
-those issues have been resolved.
-
-The contract now fixes endpoint/encoding, initial resource scope, experimental
-limits, scheduler, cache fencing, origin and fallback semantics. Production SLOs,
-measured default enablement, application authorization and historical notice
-retention remain unproven or outside v1. A requirement for replay or guaranteed
-completion observation changes the contract and needs a further decision.
-
-## Evidence and relationship to existing decisions
-
-Inspected at main `f644f321ad110c6436382b64bdc0d935dcdeba5a` and #572 head
-`512f477785d327ac092b94c6a399db4a8b5c4555` on 2026-10-30:
-
-- [Dashboard cache](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/cache.rs)
-  and [AppState](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/state.rs):
-  typed TTL caches, request coalescing, poll guidance and local invalidation.
-- [Frontend polling](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/frontend/src/hooks/use-poll-interval.ts)
-  and [router](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/lib.rs):
-  ordinary reads, existing resource families and current permissive CORS.
-- [Existing worker notification hub](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-worker/src/notify_hub.rs):
-  a shared listener, poll fallback and broad wakeup after reconnect; precedent
-  for hints with recovery, not evidence of full resource change coverage.
-- [#572 JobFilter](https://github.com/hardbyte/awa/blob/512f477785d327ac092b94c6a399db4a8b5c4555/awa-model/src/filter.rs)
-  and [job reads](https://github.com/hardbyte/awa/blob/512f477785d327ac092b94c6a399db4a8b5c4555/awa-ui/src/handlers/jobs.rs):
-  strict population semantics and shared bounded reads under implementation.
-- [ADR-049](../049-job-filter-and-indexed-tags/index.md): shared filter, advisory
-  in-flight reads, capped counts, tag retention and fleet compatibility.
-  [ADR-030](../030-batch-operations/index.md) owns durable operator actions;
-  subscriptions only observe their progress.
-- [ADR-029](../029-transactional-followup-jobs/index.md) and
-  [ADR-046](../046-handler-staged-follow-ups/index.md) own durable follow-up work.
-  This proposal neither replaces nor strengthens the guarantees of those paths.
+- [V1 implementation contract](../../design/realtime-subscriptions-v1/index.md): protocol,
+  budgets, cache fencing, browser lifecycle, security policy and validation gates.
+- [ADR-049](../049-job-filter-and-indexed-tags/index.md) and
+  [implementation PR #572](https://github.com/hardbyte/awa/pull/572): shared job
+  selection and advisory read behavior. The proposed adapter reuses that compiler.
+- [Existing dashboard cache](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/cache.rs),
+  [admin state](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/src/state.rs)
+  and [frontend polling](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-ui/frontend/src/hooks/use-poll-interval.ts):
+  the current read/cache baseline, not a measured comparison with SSE.
+- [Existing notification hub](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/awa-worker/src/notify_hub.rs):
+  hints with polling recovery, not complete admin change coverage.
+- [PostgreSQL NOTIFY](https://www.postgresql.org/docs/17/sql-notify.html),
+  [LISTEN startup](https://www.postgresql.org/docs/17/sql-listen.html),
+  [logical decoding](https://www.postgresql.org/docs/17/logicaldecoding-explanation.html)
+  and [SSE framing](https://html.spec.whatwg.org/multipage/server-sent-events.html):
+  substrate behavior, not proof of end-to-end freshness or delivery.
 - [ADR-041](../041-rolling-upgrade-policy/index.md) and
-  [ADR-045](../045-hot-path-trigger-lock-contract/index.md) remain binding for any future
-  schema or hot-path hint changes. The
-  [operations skill](https://github.com/hardbyte/awa/blob/f644f321ad110c6436382b64bdc0d935dcdeba5a/skills/awa-operations/SKILL.md)
-  documents the trusted admin boundary and read-only operation.
-
-The actual ADR draft at `3dd7ee3696e706d80c4a2777d7d0642f1e3480cc`
-(blob `154f328a7249229ad3e0a25db83827595ea95f21`) subsequently received a
-document-specific adversarial review. This amendment adopts its concrete v1
-contract in the companion design document. That review supports the direction
-subject to implementation tests; neither agreement nor docs CI establishes
-architectural correctness, load safety or a tested implementation. No executable
-review-model artifacts were supplied to this documentation session, so none are
-claimed as verified evidence here.
+  [ADR-045](../045-hot-path-trigger-lock-contract/index.md): existing rolling-upgrade and
+  hot-path constraints remain in force.
