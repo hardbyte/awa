@@ -2699,10 +2699,10 @@
 <li>a ring build never queues an exclusive lock that blocks a lane;</li>
 <li>pruning during a build reports <code>Blocked</code> and then succeeds.</li>
 <li><strong>A mixed fleet.</strong> A 0.6.9 producer's tagged jobs are found by tag once the build has run. A batch operation with several tags is refused while a 0.6.9 runtime is live, and the 0.6 filter type fails to read one.</li>
-<li><strong>Benchmark.</strong> <code>awa/tests/tag_filter_bench.rs</code>, on a realistic mix of tagged and untagged jobs, checks:</li>
-<li>a 100-row page loads in one batched read;</li>
-<li>a rare-tag lookup aims for under 100 ms at 50,000 retained jobs. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before. About half of a rare-tag lookup is loading the one job: <code>terminal_jobs</code> expands every compact completion batch before it can filter by id, which also slows <code>get_job</code>. An id-keyed read for it needs a migration and is a follow-up;</li>
-<li>with <code>fastupdate = off</code>, p99 enqueue latency for tagged jobs stays within 10% of today.</li>
+<li><strong>Benchmark.</strong> <code>awa/tests/tag_filter_bench.rs</code> loads a mix of tagged and untagged completed jobs (50,000 by default).</li>
+<li><strong>It asserts</strong> that a rare-tag lookup finds its one job, with a warm median under 250 ms. The aim is 100 ms; about half of today's time is loading the one job, because <code>terminal_jobs</code> expands every compact completion batch before it can filter by id, which also slows <code>get_job</code>. An id-keyed read for it needs a migration and is a follow-up.</li>
+<li><strong>It reports</strong> cold and warm times for unfiltered, available-only, kind, common-tag and rare-tag pages, a capped count, lifecycle WAL per job, and the tag indexes' size. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before.</li>
+<li><strong>Not measured by it:</strong> how many reads a page takes, and p99 enqueue latency for tagged jobs with <code>fastupdate = off</code>.</li>
 </ul>
 <h2 id="relationship-to-other-adrs">Relationship to other ADRs<a class="headerlink" href="#relationship-to-other-adrs" title="Permanent link">&para;</a></h2>
 <ul>
