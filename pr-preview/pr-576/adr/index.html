@@ -2533,9 +2533,14 @@
 <td>One <code>JobFilter</code> describes "which jobs" for listing, counting, batch preview, batch execution and the DLQ, compiled once per engine with only the predicates a filter sets; SQL narrows candidates and a batched loader settles each job's current state. Tags are the indexed handle for "jobs about X": a partial GIN index over non-empty payload tags on each queue-storage partition, maintained by Postgres for every binary, emptied by pruning, and built online by the migrator.</td>
 <td><span class="awa-status awa-status--proposed">Proposed</span></td>
 </tr>
+<tr>
+<td style="text-align: right;">050</td>
+<td><a href="050-realtime-subscriptions/">Real-time resource subscriptions</a></td>
+<td>Admin-first resource invalidation over SSE with bounded refetch, reconnect resync and periodic reconciliation; durable business triggers remain queue jobs.</td>
+<td><span class="awa-status awa-status--proposed">Proposed</span></td>
+</tr>
 </tbody>
 </table>
-<p>| 050 | <a href="050-realtime-subscriptions/">Real-time resource subscriptions</a> | Admin-first resource invalidation over SSE with bounded refetch, reconnect resync and periodic reconciliation; durable business triggers remain queue jobs. | <span class="awa-status awa-status--proposed">Proposed</span> |</p>
 <h2 id="correctness-evidence">Correctness evidence<a class="headerlink" href="#correctness-evidence" title="Permanent link">&para;</a></h2>
 <p>Executable TLA+ models live under <a href="https://github.com/hardbyte/awa/tree/main/correctness"><code>correctness/</code></a>. The storage models cover segmented storage, storage races, lock ordering, and trace refinement; the runtime models cover claim, rescue, callbacks, batching, cron, and view-trigger concurrency. Benchmark evidence belongs with the benchmark artifacts, not in this decision index.</p>
 <h2 id="conventions">Conventions<a class="headerlink" href="#conventions" title="Permanent link">&para;</a></h2>
