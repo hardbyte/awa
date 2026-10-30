@@ -104,6 +104,12 @@ must not add a second polling loop. Hidden tabs pause reads and streams; resume
 requests one paced resync. Selected jobs remain paused and stale until resumed,
 so refreshing cannot replace a selection underneath an operator.
 
+Transport deadlines run independently of the read iterator so a silent hung
+connection is detectable. Empty scope, cap rejection, cancellation and BFCache
+restore have explicit behavior in the contract. Preserve operator drafts too;
+optimistic UI and notifications never replace atomic server-side mutation guards
+or confer ownership through viewing/presence.
+
 The guarantee is convergence to retained state returned by ordinary APIs after
 changes settle and reads succeed. It is not observation of every job or
 transition, nor stronger cross-table consistency. Claims can be absent or stale
@@ -162,10 +168,10 @@ and reads. V1 uses `fetch` plus AbortController; it has no native EventSource GE
 variant, registration service or server-side subscription session. Resource-set
 changes abort the old stream before opening its replacement, retaining displayed
 data as stale. The client implements bounded parsing and reconnect/backoff;
-The [SSE standard](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+the [SSE standard](https://html.spec.whatwg.org/multipage/server-sent-events.html)
 defines framing; EventSource's automatic reconnect does not apply to fetch.
-Epochs are connection identity,
-SSE `id` is absent, and `Last-Event-ID` never bypasses resync.
+Epochs are connection identity, SSE `id` is absent, and `Last-Event-ID` never
+bypasses resync.
 
 Five-minute stream lifetimes permit ingress reauthentication but do not promise
 immediate per-user revocation in a server without identity. Deployment checks
