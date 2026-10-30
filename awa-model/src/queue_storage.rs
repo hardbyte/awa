@@ -44,7 +44,8 @@ const RECEIPT_DEADLINE_RESCUE_CURSOR_SCAN_LIMIT: i64 = 10_000;
 const DEFAULT_PRUNE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
 // Physical bytes above empty-index overhead on PostgreSQL 17/18. Installed
-// btree/GiST main forks retain one page; BRIN retains three main
+// btree/GiST main forks retain one page; GIN (the tag indexes) retains its
+// metapage and root; BRIN retains three main
 // and three FSM pages (four below 4 KiB block size) when empty. Unknown
 // access methods conservatively count any allocation as reclaimable. Include
 // heap/TOAST/index forks: VACUUM can leave an empty heap with expanded indexes.
@@ -80,7 +81,7 @@ SELECT EXISTS (
        OR pg_relation_size(oid, 'vm') > 0
        OR pg_relation_size(oid) > current_setting('block_size')::bigint *
           CASE amname WHEN 'btree' THEN 1 WHEN 'gist' THEN 1
-                      WHEN 'brin' THEN 3 ELSE 0 END
+                      WHEN 'gin' THEN 2 WHEN 'brin' THEN 3 ELSE 0 END
 )
 "#
 );

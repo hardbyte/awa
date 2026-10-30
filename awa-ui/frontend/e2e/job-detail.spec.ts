@@ -86,6 +86,10 @@ test.describe("Job detail page", () => {
       ),
       page.goto("/jobs?q=queue%3Alegacy_queue"),
     ]);
+    // The queue banner and match count load after the list and push the
+    // rows down; click once they have settled.
+    await expect(page.getByRole("heading", { name: "Queue: legacy_queue" })).toBeVisible();
+    await expect(page.getByTestId("match-count")).toBeVisible();
 
     const jobTable = page.getByRole("grid", { name: "Jobs" });
     await jobTable.getByRole("row").nth(1).click();
