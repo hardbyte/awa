@@ -2558,10 +2558,13 @@ checks it:</p>
   travel as a list under <code>tag</code> or <code>state</code>, which 0.6's <code>BatchOperationFilter</code>
   (<code>tag: Option&lt;String&gt;</code>, <code>state: Option&lt;JobState&gt;</code>) rejects. A unit test in
   <code>awa-model/src/filter.rs</code> reads the new shape with a copy of that type.
-  DLQ bulk bodies nest the filter under <code>filter</code>; 0.6's body type reads only
-  flat <code>kind</code>, <code>queue</code> and <code>tag</code>, and its DLQ functions refuse an empty
-  filter. No rehearsal runs a released 0.6 server or runner against these
-  shapes.</li>
+  DLQ retry and purge by the full filter use <code>/api/dlq/retry-matching</code> and
+  <code>/purge-matching</code>, which a 0.6 server answers with 405 (<code>/dlq/{id}</code> takes
+  only GET and DELETE there); a released v0.6.9 server was checked by hand,
+  not by CI. The 0.6 paths accept only the 0.6 body, so no body means more
+  on an older server than on this one (<code>admin_api_test</code>,
+  <code>test_dlq_bulk_bodies_never_mean_more_on_an_older_server</code>). No rehearsal
+  runs a released 0.6 runner against list-valued filters.</li>
 <li><strong>Extended batch filters wait for the fleet.</strong> A batch operation with
   several tags or states, or <code>dead_lettered</code>, is refused while any live
   runtime reports a version older than 0.7.0-alpha.2

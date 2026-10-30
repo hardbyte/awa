@@ -275,11 +275,12 @@ scan any partition that has no index yet. See [Finding jobs](../finding-jobs/ind
 A batch operation whose filter uses several tags, several states or
 `dead_lettered` is refused until every live runtime is 0.7.0-alpha.2 or
 later. Several tags or states travel as a list under `tag` or `state`,
-which a 0.6 server or runner refuses rather than ignoring, and the DLQ bulk
-endpoints take the filter nested under `filter`, which a 0.6 server treats
-as no filter and refuses. A browser holding the new admin UI during a
-rolling deploy therefore gets an error from an old replica, never a wider
-operation.
+which a 0.6 server or runner refuses rather than ignoring, and DLQ retry and
+purge by the full filter go to new endpoints (`/api/dlq/retry-matching`,
+`/api/dlq/purge-matching`) that a 0.6 server answers with 405. A browser
+holding the new admin UI during a rolling deploy therefore gets an error
+from an old replica, never a wider operation. Scripts that call the 0.6
+`/api/dlq/bulk-retry` and `/bulk-purge` bodies keep working unchanged.
 
 ## The one gate
 

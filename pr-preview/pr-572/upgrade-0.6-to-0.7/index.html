@@ -2965,11 +2965,12 @@ scan any partition that has no index yet. See <a href="../finding-jobs/">Finding
 <p>A batch operation whose filter uses several tags, several states or
 <code>dead_lettered</code> is refused until every live runtime is 0.7.0-alpha.2 or
 later. Several tags or states travel as a list under <code>tag</code> or <code>state</code>,
-which a 0.6 server or runner refuses rather than ignoring, and the DLQ bulk
-endpoints take the filter nested under <code>filter</code>, which a 0.6 server treats
-as no filter and refuses. A browser holding the new admin UI during a
-rolling deploy therefore gets an error from an old replica, never a wider
-operation.</p>
+which a 0.6 server or runner refuses rather than ignoring, and DLQ retry and
+purge by the full filter go to new endpoints (<code>/api/dlq/retry-matching</code>,
+<code>/api/dlq/purge-matching</code>) that a 0.6 server answers with 405. A browser
+holding the new admin UI during a rolling deploy therefore gets an error
+from an old replica, never a wider operation. Scripts that call the 0.6
+<code>/api/dlq/bulk-retry</code> and <code>/bulk-purge</code> bodies keep working unchanged.</p>
 <h2 id="the-one-gate">The one gate<a class="headerlink" href="#the-one-gate" title="Permanent link">&para;</a></h2>
 <p><code>awa migrate</code> on a 0.7 binary refuses to apply migrations unless one of these holds:</p>
 <ul>
