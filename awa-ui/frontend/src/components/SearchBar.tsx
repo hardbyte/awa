@@ -68,6 +68,37 @@ export function toRfc3339(value: string | undefined): string | undefined {
   return Number.isNaN(at.getTime()) ? undefined : at.toISOString();
 }
 
+/** Whether a created bound is set but doesn't parse. Requests leave such a
+ * bound out, so a page must not list or act on the wider result. */
+export function hasUnparsedDate(filters: SearchFilters): boolean {
+  return Boolean(
+    (filters.createdGte && !toRfc3339(filters.createdGte)) ||
+      (filters.createdLt && !toRfc3339(filters.createdLt))
+  );
+}
+
+/** Why a typed term can't be applied, or undefined when it can. `parseSearch`
+ * drops an `id:` or date it can't read, which would leave a wider filter
+ * than the one typed. */
+export function termError(token: string): string | undefined {
+  for (const part of token.trim().split(/\s+/)) {
+    if (part.startsWith("id:") && part.length > 3) {
+      if (part.slice(3).split(",").some((id) => !/^[1-9]\d*$/.test(id))) {
+        return "id: takes whole job ids, e.g. id:123 or id:123,456";
+      }
+    } else if (part.startsWith("created>=") && part.length > 9) {
+      if (!toRfc3339(part.slice(9))) {
+        return "created>= takes a date or time, e.g. created>=2026-10-30";
+      }
+    } else if (part.startsWith("created<") && part.length > 8) {
+      if (!toRfc3339(part.slice(8))) {
+        return "created< takes a date or time, e.g. created<2026-10-30";
+      }
+    }
+  }
+  return undefined;
+}
+
 /** One removable term: which filter it belongs to, and its value. */
 type Term =
   | { key: "kind" | "queue" | "createdGte" | "createdLt"; value: string }
@@ -144,6 +175,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [selectedIdx, setSelectedIdx] = useState(-1);
+  const [error, setError] = useState<string | undefined>();
   const containerRef = useRef<HTMLDivElement>(null);
 
   const activeFilters = parseSearch(value);
@@ -227,6 +259,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
 
   const handleInputChange = (text: string) => {
     setInputValue(text);
+    setError(undefined);
     const suggs = computeSuggestions(text);
     setSuggestions(suggs);
     setShowSuggestions(suggs.length > 0);
@@ -236,6 +269,12 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   /** Apply a filter token — merges into existing filters, clears input */
   const applyToken = useCallback(
     (token: string) => {
+      const problem = termError(token);
+      if (problem) {
+        setError(problem);
+        setShowSuggestions(false);
+        return;
+      }
       onChange(buildSearch(mergeFilters(activeFilters, parseSearch(token))));
       setInputValue("");
       setShowSuggestions(false);
@@ -353,8 +392,14 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
           placeholder={hasFilters ? "Add filter..." : "Filter by kind:, queue:, tag:, id:, created>= ...  (press /)"}
           className="min-w-[120px] flex-1 border-0 bg-transparent p-0 text-sm text-fg outline-none placeholder:text-muted-fg"
           aria-label="Search jobs"
+          aria-invalid={error ? true : undefined}
         />
       </div>
+      {error && (
+        <p className="mt-1 text-xs text-danger" role="alert">
+          {error}
+        </p>
+      )}
 
       {/* Suggestions dropdown */}
       {showSuggestions && suggestions.length > 0 && (

@@ -20,7 +20,7 @@ import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobCount, JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
-import { SearchBar, parseSearch, toRfc3339 } from "@/components/SearchBar";
+import { SearchBar, hasUnparsedDate, parseSearch, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -128,16 +128,20 @@ export function JobsPage() {
 
   const hasSel = selected.size > 0;
   const poll = usePollInterval();
+  const unparsedDate = hasUnparsedDate(searchFilters);
 
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
+    enabled: !unparsedDate,
     refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
   });
 
   // A batch operation acts on available and scheduled jobs, so the jobs
-  // page offers one only when its filter can reach them.
+  // page offers one only when its filter can reach them. The batch form
+  // reads tags as a comma list, so a tag with a comma can't be carried over.
   const batchEligible = ["all", "available", "scheduled"].includes(filters.state);
+  const tagWithComma = (searchFilters.tags ?? []).some((tag) => tag.includes(","));
   const batchSearch: Record<string, string> = Object.fromEntries(
     Object.entries({
       kind: searchFilters.kind,
@@ -155,7 +159,7 @@ export function JobsPage() {
   const countQuery = useQuery<JobCount>({
     queryKey: ["jobs-count", filterParams],
     queryFn: () => fetchJobCount(filterParams),
-    enabled: hasFilter,
+    enabled: hasFilter && !unparsedDate,
     staleTime: 30_000,
   });
 
@@ -401,7 +405,14 @@ export function JobsPage() {
       {/* Search bar with integrated filter chips */}
       <SearchBar value={filters.search} onChange={setSearch} />
 
-      {hasFilter && (
+      {unparsedDate && (
+        <p className="text-sm text-danger" role="alert">
+          A created date doesn't parse, so no jobs are listed. Use a date or
+          time such as 2026-10-30.
+        </p>
+      )}
+
+      {hasFilter && !unparsedDate && (
         <div className="flex flex-wrap items-center gap-3 text-sm text-muted-fg">
           {countQuery.data && (
             <span data-testid="match-count">
@@ -411,7 +422,10 @@ export function JobsPage() {
               matching
             </span>
           )}
-          {batchEligible && (
+          {batchEligible && tagWithComma && (
+            <span>A tag containing a comma can't be carried into a batch operation.</span>
+          )}
+          {batchEligible && !tagWithComma && (
             <Button
               size="sm"
               intent="outline"

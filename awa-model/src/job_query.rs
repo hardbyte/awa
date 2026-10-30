@@ -385,12 +385,21 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
     // Lateral probes with `OFFSET 0` keep each lookup a primary-key range or
     // probe. Joined plainly, the planner overestimates partial-index hits and
     // the cursor's reach, and hashes every retained row of the other table.
-    let mut branches = vec![Branch {
-        states: &[Available],
-        dead_lettered: false,
-        // Unclaimed rows sit above each lane's cursor, in whichever ring
-        // slot they were written to: one primary-key range per lane and slot.
-        from: format!(
+
+    // Unclaimed rows sit above each lane's cursor, in whichever ring slot
+    // they were written to. Untagged, that is one primary-key range per lane
+    // and slot. Tagged, the tag index finds the rows and the cursor only
+    // checks them, so the cost follows the matches rather than the backlog.
+    let available_from = if tagged {
+        format!(
+            "{schema}.ready_entries AS r \
+             JOIN claim_cursors AS cc \
+               ON cc.queue = r.queue AND cc.priority = r.priority \
+              AND cc.enqueue_shard = r.enqueue_shard \
+              AND r.lane_seq >= cc.claim_seq"
+        )
+    } else {
+        format!(
             "claim_cursors AS cc CROSS JOIN {schema}.queue_ring_slots AS rs \
              CROSS JOIN LATERAL ( \
                SELECT * FROM {schema}.ready_entries AS lane \
@@ -399,7 +408,12 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
                  AND lane.enqueue_shard = cc.enqueue_shard \
                  AND lane.lane_seq >= cc.claim_seq \
                OFFSET 0) AS r"
-        ),
+        )
+    };
+    let mut branches = vec![Branch {
+        states: &[Available],
+        dead_lettered: false,
+        from: available_from,
         conditions: vec![format!(
             "NOT EXISTS (SELECT 1 FROM {schema}.ready_tombstones AS tomb \
                  WHERE tomb.ready_slot = r.ready_slot \
@@ -997,6 +1011,22 @@ mod tests {
             sql.contains("(r.payload -> 'tags') <> '[]'::jsonb"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn tagged_available_rows_are_found_by_the_tag_index() {
+        let tagged = sql(
+            &JobFilter::new().tag("order:1").state(JobState::Available),
+            &ALL_STATES,
+        )
+        .unwrap();
+        assert!(
+            tagged.contains("ready_entries AS r JOIN claim_cursors"),
+            "{tagged}"
+        );
+        assert!(!tagged.contains("queue_ring_slots"), "{tagged}");
+        let untagged = sql(&JobFilter::new().state(JobState::Available), &ALL_STATES).unwrap();
+        assert!(untagged.contains("queue_ring_slots"), "{untagged}");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! ADR-049 cost check for finding jobs on queue storage.
 //!
 //! Inserts and completes a batch of jobs, two thirds of them tagged (one tag
-//! shared by one job in fifty, one unique per job), then times `find_jobs`
-//! and `count_jobs` for a rare tag, a common tag and a kind with no tag. It
-//! also reports the lifecycle WAL per job and the tag indexes' size.
+//! shared by one job in fifty, one unique per job), and leaves as many again
+//! unclaimed in a queue with no worker. It then times `find_jobs` and
+//! `count_jobs` for a rare tag in each population, a common tag and a kind
+//! with no tag. It also reports the lifecycle WAL per job and the tag
+//! indexes' size.
 //! Ignored by default; run with:
 //!
 //! ```sh
@@ -73,6 +75,7 @@ async fn tag_filter_cost() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
     let queue = "tag_bench";
+    let backlog_queue = "tag_bench_backlog";
 
     let returned = Arc::new(AtomicI64::new(0));
     let handler_returned = returned.clone();
@@ -134,10 +137,26 @@ async fn tag_filter_cost() {
     .fetch_one(&pool)
     .await
     .unwrap();
+    // An unclaimed backlog: available jobs are read per lane from its claim
+    // cursor, a different path from completed ones.
+    let backlog: Vec<awa::InsertParams> = (0..jobs)
+        .map(|n| awa::InsertParams {
+            kind: TagBench::kind().into(),
+            args: json!({ "n": n }),
+            opts: awa::InsertOpts {
+                queue: backlog_queue.into(),
+                tags: vec![format!("tenant:{}", n % TENANTS), format!("backlog:{n}")],
+                ..Default::default()
+            },
+        })
+        .collect();
+    for chunk in backlog.chunks(500) {
+        awa::insert_many(&pool, chunk).await.unwrap();
+    }
 
     println!(
         "\n{jobs} completed jobs, two thirds tagged; lifecycle WAL {lifecycle_wal:.0} B/job, \
-         tag indexes {:.0} B/job",
+         tag indexes {:.0} B/job; then {jobs} tagged jobs left available",
         index_bytes as f64 / jobs as f64
     );
     if std::env::var("TAG_BENCH_KEEP").is_ok() {
@@ -146,7 +165,7 @@ async fn tag_filter_cost() {
         return;
     }
     println!(
-        "{:<40} {:>10} {:>10} {:>8}",
+        "{:<44} {:>10} {:>10} {:>8}",
         "lookup", "cold", "warm", "rows"
     );
     let rare = format!("order:{}", jobs / 2 - (jobs / 2) % 3);
@@ -173,6 +192,11 @@ async fn tag_filter_cost() {
             JobFilter::new().tag(rare.clone()),
             20,
         ),
+        (
+            "find_jobs, rare tag in available backlog",
+            JobFilter::new().tag(format!("backlog:{}", jobs / 2)),
+            20,
+        ),
     ] {
         let (cold, elapsed, rows) = cold_and_warm(|| {
             let pool = pool.clone();
@@ -186,13 +210,13 @@ async fn tag_filter_cost() {
         })
         .await;
         println!(
-            "{label:<40} {:>8.1}ms {:>8.1}ms {rows:>8}",
+            "{label:<44} {:>8.1}ms {:>8.1}ms {rows:>8}",
             cold.as_secs_f64() * 1e3,
             elapsed.as_secs_f64() * 1e3
         );
         if label.contains("rare") {
-            assert_eq!(rows, 1);
-            rare_median = elapsed;
+            assert_eq!(rows, 1, "{label}");
+            rare_median = rare_median.max(elapsed);
         }
     }
     let (cold, elapsed, _) = cold_and_warm(|| {
@@ -206,13 +230,13 @@ async fn tag_filter_cost() {
     })
     .await;
     println!(
-        "{:<40} {:>8.1}ms {:>8.1}ms",
+        "{:<44} {:>8.1}ms {:>8.1}ms",
         "count_jobs, common tag",
         cold.as_secs_f64() * 1e3,
         elapsed.as_secs_f64() * 1e3
     );
     assert!(
         rare_median < RARE_TAG_TARGET,
-        "a warm rare-tag lookup took {rare_median:?}, over the {RARE_TAG_TARGET:?} target"
+        "the slower warm rare-tag lookup took {rare_median:?}, over the {RARE_TAG_TARGET:?} target"
     );
 }

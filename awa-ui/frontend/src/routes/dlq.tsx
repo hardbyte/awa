@@ -14,7 +14,7 @@ import {
 import type { DlqRow, ListDlqParams } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import { SearchBar, parseSearch, toRfc3339 } from "@/components/SearchBar";
+import { SearchBar, hasUnparsedDate, parseSearch, toRfc3339 } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,6 +62,9 @@ export function DlqPage() {
   const poll = usePollInterval();
 
   const searchFilters = parseSearch(filters.search);
+  // A date that doesn't parse is left out of a request, so it would widen
+  // what is listed and what a bulk action touches.
+  const unparsedDate = hasUnparsedDate(searchFilters);
 
   const params: ListDlqParams = {
     kind: searchFilters.kind,
@@ -78,6 +81,7 @@ export function DlqPage() {
   const dlqQuery = useQuery<DlqRow[]>({
     queryKey: ["dlq", params],
     queryFn: () => fetchDlq(params),
+    enabled: !unparsedDate,
     refetchInterval: poll.interval,
     staleTime: poll.staleTime,
   });
@@ -131,11 +135,6 @@ export function DlqPage() {
 
   const rows = dlqQuery.data ?? [];
   const hasActiveFilter = Object.keys(searchFilters).length > 0;
-  // A date that doesn't parse is left out of the request, so it would widen
-  // what a bulk action touches.
-  const unparsedDate =
-    (searchFilters.createdGte && !toRfc3339(searchFilters.createdGte)) ||
-    (searchFilters.createdLt && !toRfc3339(searchFilters.createdLt));
 
   const setUrlParams = useCallback(
     (updates: Record<string, string | undefined>) => {

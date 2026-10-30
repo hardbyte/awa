@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { timeAgo } from "@/lib/time";
-import { buildSearch, parseSearch, toRfc3339 } from "@/components/SearchBar";
+import {
+  buildSearch,
+  hasUnparsedDate,
+  parseSearch,
+  termError,
+  toRfc3339,
+} from "@/components/SearchBar";
 import { toWireFilter } from "@/lib/api";
 
 describe("timeAgo", () => {
@@ -94,6 +100,22 @@ describe("parseSearch", () => {
   it("converts typed dates to RFC 3339", () => {
     expect(toRfc3339("2026-10-01T00:00:00Z")).toBe("2026-10-01T00:00:00.000Z");
     expect(toRfc3339("not a date")).toBeUndefined();
+  });
+
+  it("refuses typed ids and dates it would otherwise drop", () => {
+    expect(termError("id:123,456")).toBeUndefined();
+    expect(termError("queue:billing id:abc")).toMatch(/whole job ids/);
+    expect(termError("id:0")).toMatch(/whole job ids/);
+    expect(termError("created>=2026-10-30")).toBeUndefined();
+    expect(termError("created>=not-a-date")).toMatch(/created>=/);
+    expect(termError("created<soon")).toMatch(/created</);
+    expect(termError("tag:a,b kind:k")).toBeUndefined();
+  });
+
+  it("flags a created bound that doesn't parse", () => {
+    expect(hasUnparsedDate(parseSearch("created>=2026-10-01"))).toBe(false);
+    expect(hasUnparsedDate(parseSearch("created>=nope"))).toBe(true);
+    expect(hasUnparsedDate(parseSearch("queue:q created<nope"))).toBe(true);
   });
 });
 
