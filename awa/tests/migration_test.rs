@@ -527,6 +527,12 @@ async fn test_every_migration_is_individually_re_runnable() {
                 panic!("second apply of migration v{version} failed — not re-runnable: {err}")
             });
     }
+    // `migrations::run` follows the SQL with the tag-index pass for empty
+    // partitions (ADR-049); apply it here too so the comparison below is
+    // between the same steps.
+    awa::model::tag_index::index_empty_partitions(&mut conn)
+        .await
+        .expect("index empty partitions");
     drop(conn);
 
     // A double-applied set must still land on the real current schema.
