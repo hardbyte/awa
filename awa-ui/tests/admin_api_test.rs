@@ -21,6 +21,29 @@ async fn setup_pool() -> sqlx::PgPool {
     pool
 }
 
+/// Finding jobs by filter needs queue storage (ADR-049), so tests of the job
+/// list and batch operations run on their own queue-storage database.
+async fn queue_storage_db() -> awa_testing::setup::TestDatabase {
+    awa_testing::setup::TestDatabase::queue_storage().await
+}
+
+async fn insert_job(pool: &sqlx::PgPool, kind: &str, queue: &str, priority: i16) {
+    awa_model::insert_many(
+        pool,
+        &[awa_model::InsertParams {
+            kind: kind.to_string(),
+            args: serde_json::json!({}),
+            opts: awa_model::InsertOpts {
+                queue: queue.to_string(),
+                priority,
+                ..Default::default()
+            },
+        }],
+    )
+    .await
+    .expect("fixture insert should succeed");
+}
+
 async fn setup_read_only_pool() -> sqlx::PgPool {
     PgPoolOptions::new()
         .max_connections(1)
@@ -644,12 +667,11 @@ async fn test_kinds_endpoint_surfaces_descriptors_for_declared_empty_kind() {
 
 #[tokio::test]
 async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
-    let _guard = test_lock().lock().await;
-    let pool = setup_pool().await;
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
     let suffix = Uuid::new_v4().simple().to_string();
     let queue = format!("api_job_desc_queue_{suffix}");
     let kind = format!("api_job_desc_kind_{suffix}");
-    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
 
     awa_model::admin::sync_queue_descriptors(
         &pool,
@@ -677,17 +699,7 @@ async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
     .await
     .expect("kind descriptor sync should succeed");
 
-    sqlx::query(
-        r#"
-        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
-        VALUES ($1, $2, '{}'::jsonb, 'available', now())
-        "#,
-    )
-    .bind(&kind)
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("fixture insert should succeed");
+    insert_job(&pool, &kind, &queue, 2).await;
 
     sqlx::query("SELECT awa.rebuild_admin_metadata()")
         .execute(&pool)
@@ -721,24 +733,13 @@ async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
 
 #[tokio::test]
 async fn test_jobs_endpoint_keeps_legacy_rows_without_descriptors() {
-    let _guard = test_lock().lock().await;
-    let pool = setup_pool().await;
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
     let suffix = Uuid::new_v4().simple().to_string();
     let queue = format!("api_legacy_queue_{suffix}");
     let kind = format!("api_legacy_kind_{suffix}");
-    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
 
-    sqlx::query(
-        r#"
-        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
-        VALUES ($1, $2, '{}'::jsonb, 'available', now())
-        "#,
-    )
-    .bind(&kind)
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("fixture insert should succeed");
+    insert_job(&pool, &kind, &queue, 2).await;
 
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
@@ -1079,24 +1080,10 @@ async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
 
 #[tokio::test]
 async fn test_batch_ops_api_preview_submit_and_cancel() {
-    let _guard = test_lock().lock().await;
-    let pool = setup_pool().await;
+    let db = queue_storage_db().await;
+    let pool = db.pool().clone();
     let queue = "api_batch_ops";
-    clean_jobs(&pool, &[queue], &["api_batch_job"]).await;
-    sqlx::query("DELETE FROM awa.batch_operations")
-        .execute(&pool)
-        .await
-        .expect("clean batch ops");
-    sqlx::query(
-        r#"
-        INSERT INTO awa.jobs_hot (kind, queue, args, state, priority)
-        VALUES ('api_batch_job', $1, '{}', 'available', 4)
-        "#,
-    )
-    .bind(queue)
-    .execute(&pool)
-    .await
-    .expect("seed job");
+    insert_job(&pool, "api_batch_job", queue, 4).await;
 
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
