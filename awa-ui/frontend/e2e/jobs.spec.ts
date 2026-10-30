@@ -161,7 +161,7 @@ test.describe("Search bar filters", () => {
     await expect(page.getByText("tag:e2e", { exact: true })).toBeVisible();
     await expect(page.getByText("tag:priority", { exact: true })).toBeVisible();
     await expect(page.getByTestId("match-count")).toHaveText("1 matching");
-    await expect(page.getByText("#800005").first()).toBeVisible();
+    await expect(page.getByText("#800005").filter({ visible: true }).first()).toBeVisible();
     await expect(page.getByText("#800006")).toHaveCount(0);
   });
 

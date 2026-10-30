@@ -53,15 +53,17 @@ def test_find_and_count_take_a_dict_keywords_or_both(client):
     queue = "pyfilter_find"
     jobs = _seed(client, queue)
 
-    by_dict = client.find_jobs({"queue": queue, "tags": ["batch:a"]})
+    by_dict = client.find_jobs({"queue": queue, "tag": ["batch:a"]})
     assert sorted(j.id for j in by_dict) == sorted(j.id for j in jobs[0::2])
     assert [j.id for j in by_dict] == sorted((j.id for j in by_dict), reverse=True)
 
-    by_keywords = client.find_jobs(queue=queue, tags=["batch:a", "order:2"])
+    by_keywords = client.find_jobs(queue=queue, tag=["batch:a", "order:2"])
     assert [j.id for j in by_keywords] == [jobs[2].id]
 
     merged = client.find_jobs({"queue": queue}, tag="order:5")
     assert [j.id for j in merged] == [jobs[5].id]
+    with pytest.raises(ValueError, match="conflicts"):
+        client.find_jobs({"queue": queue}, queue="elsewhere")
 
     assert client.count_jobs(queue=queue) == {"count": 6, "exact": True}
     assert client.count_jobs({"queue": queue, "state": "completed"}) == {
@@ -103,10 +105,23 @@ def test_dlq_helpers_take_the_filter(client):
         _move_ready_to_failed_done(client, job.id)
     assert client.bulk_move_failed_to_dlq(queue=queue, reason="py_filter") == 6
 
-    listed = client.list_dlq(filter={"queue": queue, "tags": ["batch:a"]})
+    listed = client.list_dlq(filter={"queue": queue, "tag": ["batch:a"]})
     assert sorted(row.job.id for row in listed) == sorted(j.id for j in jobs[0::2])
 
+    # Every DLQ row is a dead-lettered failed job, so these don't narrow it.
+    for unscoped in ({"dead_lettered": True}, {"state": "failed"}):
+        with pytest.raises(Exception, match="allow_all"):
+            client.purge_dlq(filter=unscoped)
     assert client.purge_dlq(filter={"queue": queue, "tag": "order:1"}) == 1
+    newest = client.list_dlq(filter={"queue": queue}, limit=1)[0]
+    assert (
+        client.purge_dlq(
+            filter={"queue": queue, "created_at_lt": "2000-01-01T00:00:00Z"},
+            before_id=newest.job.id,
+            before_dlq_at=newest.dlq_at,
+        )
+        == 0
+    ), "a cursor keeps the rest of the filter"
     assert client.bulk_retry_from_dlq(queue=queue, filter={"tag": "order:3"}) == 1
     assert client.dlq_depth(queue=queue) == 4
 
@@ -117,7 +132,7 @@ def test_batch_preview_uses_the_same_population(client):
     preview = client.preview_batch_operation(
         "set_priority",
         spec={"priority": 1},
-        filter={"queue": queue, "tags": ["batch:b"]},
+        filter={"queue": queue, "tag": ["batch:b"]},
     )
     assert preview["total_matched"] == 3
     assert {row["id"] for row in preview["sample"]} == {j.id for j in jobs[1::2]}

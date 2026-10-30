@@ -358,11 +358,38 @@ async fn dlq_paths_share_the_filter() {
             .unwrap()
             .is_empty()
     );
-    assert!(
-        dlq::purge_dlq_matching(&pool, &JobFilter::new(), false)
-            .await
-            .is_err(),
-        "an empty filter needs allow_all"
+    // Every DLQ row is a dead-lettered failed job, so none of these
+    // narrows it.
+    for unscoped in [
+        JobFilter::new(),
+        JobFilter::new().state(JobState::Failed),
+        JobFilter::new().dead_lettered(true),
+    ] {
+        assert!(
+            dlq::purge_dlq_matching(&pool, &unscoped, false)
+                .await
+                .is_err(),
+            "{unscoped:?} needs allow_all"
+        );
+        assert!(
+            dlq::bulk_retry_from_dlq_matching(&pool, &unscoped, false)
+                .await
+                .is_err(),
+            "{unscoped:?} needs allow_all"
+        );
+    }
+    assert_eq!(
+        dlq::purge_dlq_matching_before(
+            &pool,
+            &JobFilter::new().tag("order:8"),
+            None,
+            Some(ids[8]),
+            false
+        )
+        .await
+        .unwrap(),
+        0,
+        "the cursor narrows the filter rather than replacing it"
     );
     assert_eq!(
         dlq::bulk_retry_from_dlq_matching(&pool, &JobFilter::new().tag("order:8"), false)

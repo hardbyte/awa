@@ -17,6 +17,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub const MAX_FILTER_IDS: usize = 1000;
 /// Longest tag, in bytes, a filter may search for.
 pub const MAX_FILTER_TAG_BYTES: usize = 256;
+/// Most tags a filter may require; a job carries at most this many.
+pub const MAX_FILTER_TAGS: usize = 20;
 /// Largest page `find_jobs` returns.
 pub const MAX_PAGE_LIMIT: i64 = 1000;
 /// Page size when none is given.
@@ -120,8 +122,8 @@ impl JobFilter {
             && self.created_at_lt.is_none()
     }
 
-    /// True when the filter needs a field ADR-030 did not define, so a
-    /// batch-operation runner from before ADR-049 would ignore part of it.
+    /// True when the filter needs more than ADR-030's shape: a runner from
+    /// before ADR-049 cannot read it, or ignores `dead_lettered`.
     pub fn uses_extended_fields(&self) -> bool {
         self.tags.len() > 1 || self.states.len() > 1 || self.dead_lettered.is_some()
     }
@@ -137,6 +139,12 @@ impl JobFilter {
                     ids.len()
                 )));
             }
+        }
+        if self.tags.len() > MAX_FILTER_TAGS {
+            return Err(AwaError::Validation(format!(
+                "a job filter may require at most {MAX_FILTER_TAGS} tags, got {}",
+                self.tags.len()
+            )));
         }
         if let Some(tag) = self
             .tags
@@ -188,8 +196,27 @@ impl JobFilter {
     }
 }
 
-/// The ADR-030 JSON shape, plus the plural fields ADR-049 added. One tag or
-/// one state serializes under the singular key a pre-ADR-049 runner knows.
+/// One value, or a list of them.
+#[derive(Deserialize)]
+#[serde(untagged, expecting = "a single value or a list of values")]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn into_vec(self) -> Vec<T> {
+        match self {
+            OneOrMany::One(one) => vec![one],
+            OneOrMany::Many(many) => many,
+        }
+    }
+}
+
+/// The ADR-030 JSON shape. Several tags or states go under the same singular
+/// key as a list, never a new key: a server or runner from before ADR-049
+/// ignores an unknown key, which would widen the filter, but refuses a list
+/// where it expects one value.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireIn {
@@ -200,19 +227,30 @@ struct WireIn {
     #[serde(default)]
     ids: Option<Vec<i64>>,
     #[serde(default)]
-    tag: Option<String>,
+    tag: Option<OneOrMany<String>>,
     #[serde(default)]
-    tags: Option<Vec<String>>,
-    #[serde(default)]
-    state: Option<JobState>,
-    #[serde(default)]
-    states: Option<Vec<JobState>>,
+    state: Option<OneOrMany<JobState>>,
     #[serde(default)]
     dead_lettered: Option<bool>,
     #[serde(default)]
     created_at_gte: Option<DateTime<Utc>>,
     #[serde(default)]
     created_at_lt: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OneOrManyOut<'a, T> {
+    One(&'a T),
+    Many(&'a [T]),
+}
+
+fn one_or_many<T>(values: &[T]) -> Option<OneOrManyOut<'_, T>> {
+    match values {
+        [] => None,
+        [one] => Some(OneOrManyOut::One(one)),
+        many => Some(OneOrManyOut::Many(many)),
+    }
 }
 
 #[derive(Serialize)]
@@ -224,13 +262,9 @@ struct WireOut<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     ids: Option<&'a Vec<i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tag: Option<&'a String>,
+    tag: Option<OneOrManyOut<'a, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tags: Option<&'a Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<JobState>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    states: Option<&'a Vec<JobState>>,
+    state: Option<OneOrManyOut<'a, JobState>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dead_lettered: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,24 +275,12 @@ struct WireOut<'a> {
 
 impl Serialize for JobFilter {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let (tag, tags) = match self.tags.as_slice() {
-            [] => (None, None),
-            [one] => (Some(one), None),
-            _ => (None, Some(&self.tags)),
-        };
-        let (state, states) = match self.states.as_slice() {
-            [] => (None, None),
-            [one] => (Some(*one), None),
-            _ => (None, Some(&self.states)),
-        };
         WireOut {
             kind: self.kind.as_ref(),
             queue: self.queue.as_ref(),
             ids: self.ids.as_ref(),
-            tag,
-            tags,
-            state,
-            states,
+            tag: one_or_many(&self.tags),
+            state: one_or_many(&self.states),
             dead_lettered: self.dead_lettered,
             created_at_gte: self.created_at_gte,
             created_at_lt: self.created_at_lt,
@@ -270,7 +292,7 @@ impl Serialize for JobFilter {
 impl<'de> Deserialize<'de> for JobFilter {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = WireIn::deserialize(deserializer)?;
-        let mut filter = JobFilter {
+        let filter = JobFilter {
             kind: wire.kind,
             queue: wire.queue,
             ids: wire.ids,
@@ -279,18 +301,15 @@ impl<'de> Deserialize<'de> for JobFilter {
             created_at_lt: wire.created_at_lt,
             ..Default::default()
         };
-        filter = filter
-            .tags(wire.tag)
-            .tags(wire.tags.unwrap_or_default())
-            .states(wire.state)
-            .states(wire.states.unwrap_or_default());
-        Ok(filter)
+        Ok(filter
+            .tags(wire.tag.map(OneOrMany::into_vec).unwrap_or_default())
+            .states(wire.state.map(OneOrMany::into_vec).unwrap_or_default()))
     }
 }
 
 /// The first version whose batch-operation runner reads every
-/// [`JobFilter`] field. An older runner ignores the fields ADR-030 did not
-/// define and would act on a wider population.
+/// [`JobFilter`] field. An older runner fails to load a filter with several
+/// tags or states, and ignores `dead_lettered`.
 pub const EXTENDED_FILTER_MIN_RUNTIME: &str = "0.7.0-alpha.2";
 
 /// Refuse a filter that needs ADR-049's fields while a live runtime is older
@@ -302,8 +321,11 @@ pub(crate) async fn require_fleet_for_extended_filters(
     let minimum = semver::Version::parse(EXTENDED_FILTER_MIN_RUNTIME)
         .expect("the extended-filter runtime floor is valid semver");
     let live: Vec<(String, String)> = sqlx::query_as(
+        // The same liveness window cron reconciliation uses: three snapshot
+        // intervals, and never under 30 seconds.
         "SELECT instance_id::text, version FROM awa.runtime_instances \
-         WHERE last_seen_at + interval '90 seconds' >= now()",
+         WHERE last_seen_at \
+             + make_interval(secs => GREATEST(30.0, snapshot_interval_ms * 0.003)) >= now()",
     )
     .fetch_all(pool)
     .await
@@ -320,7 +342,7 @@ pub(crate) async fn require_fleet_for_extended_filters(
     }
     Err(AwaError::Validation(format!(
         "this filter uses several tags or states, or dead_lettered, which runtimes older \
-         than {EXTENDED_FILTER_MIN_RUNTIME} would ignore; {} live runtime(s) are older: {}",
+         than {EXTENDED_FILTER_MIN_RUNTIME} cannot run; {} live runtime(s) are older: {}",
         old.len(),
         old.join(", ")
     )))
@@ -434,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn one_tag_or_state_keeps_the_adr030_keys() {
+    fn several_tags_or_states_share_the_adr030_keys() {
         let one = serde_json::to_value(JobFilter::new().tag("a").state(JobState::Failed)).unwrap();
         assert_eq!(one, serde_json::json!({ "tag": "a", "state": "failed" }));
         let many = JobFilter::new()
@@ -443,18 +465,37 @@ mod tests {
         let json = serde_json::to_value(&many).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({ "tags": ["a", "b"], "states": ["failed", "cancelled"] })
+            serde_json::json!({ "tag": ["a", "b"], "state": ["failed", "cancelled"] })
         );
         assert_eq!(serde_json::from_value::<JobFilter>(json).unwrap(), many);
         assert!(many.uses_extended_fields());
         assert!(!JobFilter::new().tag("a").uses_extended_fields());
+        assert!(
+            serde_json::from_value::<JobFilter>(serde_json::json!({ "tags": ["a"] })).is_err(),
+            "only the singular keys exist on the wire"
+        );
     }
 
     #[test]
-    fn singular_and_plural_keys_merge() {
-        let filter: JobFilter =
-            serde_json::from_value(serde_json::json!({ "tag": "a", "tags": ["a", "b"] })).unwrap();
-        assert_eq!(filter.tags, vec!["a".to_string(), "b".to_string()]);
+    fn a_pre_adr049_reader_refuses_several_tags_rather_than_widening() {
+        // The 0.6 `BatchOperationFilter`: it ignores unknown keys.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Adr030Filter {
+            queue: Option<String>,
+            tag: Option<String>,
+            state: Option<JobState>,
+        }
+        let narrow = JobFilter::new().queue("q").tags(["a", "b"]);
+        assert!(
+            serde_json::from_value::<Adr030Filter>(serde_json::to_value(narrow).unwrap()).is_err()
+        );
+        let narrow = JobFilter::new()
+            .queue("q")
+            .states([JobState::Available, JobState::Scheduled]);
+        assert!(
+            serde_json::from_value::<Adr030Filter>(serde_json::to_value(narrow).unwrap()).is_err()
+        );
     }
 
     #[test]
@@ -462,6 +503,14 @@ mod tests {
         assert!(JobFilter::new().ids(0..1001).validate().is_err());
         assert!(JobFilter::new().ids(0..1000).validate().is_ok());
         assert!(JobFilter::new().tag("x".repeat(257)).validate().is_err());
+        assert!(JobFilter::new()
+            .tags((0..21).map(|n| format!("t{n}")))
+            .validate()
+            .is_err());
+        assert!(JobFilter::new()
+            .tags((0..20).map(|n| format!("t{n}")))
+            .validate()
+            .is_ok());
         let now = Utc::now();
         assert!(JobFilter::new()
             .created_at_gte(now)

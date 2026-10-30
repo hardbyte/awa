@@ -13106,6 +13106,13 @@ impl QueueStorage {
         let closed_evidence =
             receipt_closed_evidence_sql(schema, &closure_rel, &closure_batch_rel, "claims");
         let mut candidates = Vec::new();
+        // One read-only transaction, so these statements get the settings
+        // the filter reads use. They are fixed-shape probes by `job_id`, so a
+        // connection plans each once rather than once per call; a custom plan
+        // costs more than running it, because each probe expands to every
+        // partition.
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        crate::job_query::plan_reads(&mut tx, true).await?;
 
         let ready_rows: Vec<ReadyJobRow> = sqlx::query_as(audited_sql(format!(
             r#"
@@ -13124,13 +13131,24 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 COALESCE(payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.ready_entries
+            FROM {schema}.ready_entries AS r
             WHERE job_id = ANY($1)
+              -- A priority or queue move tombstones the old row and copies
+              -- its lease and times to the new one, so the two would tie.
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.ready_tombstones AS tomb
+                  WHERE tomb.ready_slot = r.ready_slot
+                    AND tomb.ready_generation = r.ready_generation
+                    AND tomb.queue = r.queue
+                    AND tomb.priority = r.priority
+                    AND tomb.enqueue_shard = r.enqueue_shard
+                    AND tomb.lane_seq = r.lane_seq
+              )
             ORDER BY run_lease DESC, attempted_at DESC NULLS LAST, run_at DESC
             "#,
         )))
         .bind(job_ids)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in ready_rows {
@@ -13161,7 +13179,7 @@ impl QueueStorage {
             "#,
         )))
         .bind(job_ids)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in deferred_rows {
@@ -13216,7 +13234,7 @@ impl QueueStorage {
             "#,
         )))
         .bind(job_ids)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_rows {
@@ -13282,7 +13300,7 @@ impl QueueStorage {
             "#,
         )))
         .bind(job_ids)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_rows {
@@ -13334,17 +13352,25 @@ impl QueueStorage {
                 claim_batches.attempts,
                 claim_batches.max_attempts
             ) AS items(job_id, run_lease, receipt_id, lane_seq, attempt, max_attempts)
-            JOIN {schema}.ready_entries AS ready
-              ON ready.ready_slot = claim_batches.ready_slot
-             AND ready.ready_generation = claim_batches.ready_generation
-             AND ready.queue = claim_batches.queue
-             AND ready.enqueue_shard = claim_batches.enqueue_shard
-             AND ready.lane_seq = items.lane_seq
-             AND ready.job_id = items.job_id
+            -- A `job_id` probe in the batch's ring slot. Joined plainly, the
+            -- planner can match every batch against every ready row in its
+            -- lane before unnesting.
+            CROSS JOIN LATERAL (
+                SELECT *
+                FROM {schema}.ready_entries AS ready_probe
+                WHERE ready_probe.job_id = items.job_id
+                  AND ready_probe.ready_slot = claim_batches.ready_slot
+                  AND ready_probe.ready_generation = claim_batches.ready_generation
+                  AND ready_probe.queue = claim_batches.queue
+                  AND ready_probe.enqueue_shard = claim_batches.enqueue_shard
+                  AND ready_probe.lane_seq = items.lane_seq
+                OFFSET 0
+            ) AS ready
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = items.job_id
              AND attempt.run_lease = items.run_lease
-            WHERE items.job_id = ANY($1)
+            WHERE claim_batches.job_ids && $1
+              AND items.job_id = ANY($1)
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures
@@ -13383,7 +13409,7 @@ impl QueueStorage {
             "#,
         )))
         .bind(job_ids)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_claim_batch_rows {
@@ -13419,7 +13445,7 @@ impl QueueStorage {
             "#,
         )))
         .bind(job_ids)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in done_rows {
@@ -13454,12 +13480,14 @@ impl QueueStorage {
             "#,
         )))
         .bind(job_ids)
-        .fetch_all(pool)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         for row in dlq_rows {
             candidates.push((row.into_job_row()?, true));
         }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
 
         let mut current: HashMap<i64, (JobRow, bool)> = HashMap::with_capacity(job_ids.len());
         for (job, dead_lettered) in candidates {

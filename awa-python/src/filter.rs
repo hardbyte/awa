@@ -6,14 +6,12 @@ use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 8] = [
     "kind",
     "queue",
     "ids",
     "tag",
-    "tags",
     "state",
-    "states",
     "dead_lettered",
     "created_at_gte",
     "created_at_lt",
@@ -27,6 +25,14 @@ fn parse_state(value: &str) -> PyResult<JobState> {
     value
         .parse::<JobState>()
         .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// A string or a list of strings, as the wire format's `tag` and `state` take.
+fn one_or_many(value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if let Ok(one) = value.extract::<String>() {
+        return Ok(vec![one]);
+    }
+    value.extract::<Vec<String>>()
 }
 
 /// A filter dict, or the empty filter for `None`. Unknown keys are an error,
@@ -67,16 +73,10 @@ pub(crate) fn parse_job_filter(py: Python<'_>, filter: Option<&Py<PyAny>>) -> Py
         ..Default::default()
     };
     if let Some(tag) = item(dict, "tag")? {
-        parsed = parsed.tag(tag.extract::<String>()?);
-    }
-    if let Some(tags) = item(dict, "tags")? {
-        parsed = parsed.tags(tags.extract::<Vec<String>>()?);
+        parsed = parsed.tags(one_or_many(&tag)?);
     }
     if let Some(state) = item(dict, "state")? {
-        parsed = parsed.state(parse_state(&state.extract::<String>()?)?);
-    }
-    if let Some(states) = item(dict, "states")? {
-        for state in states.extract::<Vec<String>>()? {
+        for state in one_or_many(&state)? {
             parsed = parsed.state(parse_state(&state)?);
         }
     }
@@ -94,19 +94,37 @@ pub(crate) fn extract_datetime(value: Bound<'_, PyAny>) -> PyResult<DateTime<Utc
         .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))
 }
 
-/// The old keyword arguments, layered onto a filter.
+/// The old keyword arguments, layered onto a filter. Every field narrows,
+/// so a keyword that names a different kind or queue than the filter is an
+/// error rather than a replacement.
 pub(crate) fn with_legacy_fields(
     filter: JobFilter,
     kind: Option<String>,
     queue: Option<String>,
     tag: Option<String>,
-) -> JobFilter {
-    JobFilter {
-        kind: kind.or(filter.kind.clone()),
-        queue: queue.or(filter.queue.clone()),
+) -> PyResult<JobFilter> {
+    fn merge(
+        name: &str,
+        keyword: Option<String>,
+        field: Option<String>,
+    ) -> PyResult<Option<String>> {
+        match (keyword, field) {
+            (Some(keyword), Some(field)) if keyword != field => {
+                Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{name}={keyword:?} conflicts with the filter's {name} {field:?}"
+                )))
+            }
+            (keyword, field) => Ok(keyword.or(field)),
+        }
+    }
+    let kind = merge("kind", kind, filter.kind.clone())?;
+    let queue = merge("queue", queue, filter.queue.clone())?;
+    Ok(JobFilter {
+        kind,
+        queue,
         ..filter
     }
-    .tags(tag)
+    .tags(tag))
 }
 
 /// `{"count": n, "exact": bool}`: `exact` is false when more than `n` jobs

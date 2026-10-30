@@ -131,6 +131,11 @@ export function DlqPage() {
 
   const rows = dlqQuery.data ?? [];
   const hasActiveFilter = Object.keys(searchFilters).length > 0;
+  // A date that doesn't parse is left out of the request, so it would widen
+  // what a bulk action touches.
+  const unparsedDate =
+    (searchFilters.createdGte && !toRfc3339(searchFilters.createdGte)) ||
+    (searchFilters.createdLt && !toRfc3339(searchFilters.createdLt));
 
   const setUrlParams = useCallback(
     (updates: Record<string, string | undefined>) => {
@@ -180,7 +185,7 @@ export function DlqPage() {
           <Button
             size="xs"
             onPress={() => setShowRetryConfirm(true)}
-            isDisabled={retryFilterMutation.isPending}
+            isDisabled={retryFilterMutation.isPending || !!unparsedDate}
           >
             Retry matching ({rows.length}+)
           </Button>
@@ -189,10 +194,15 @@ export function DlqPage() {
             size="xs"
             className="text-danger"
             onPress={() => setShowPurgeConfirm(true)}
-            isDisabled={purgeFilterMutation.isPending}
+            isDisabled={purgeFilterMutation.isPending || !!unparsedDate}
           >
             Purge matching
           </Button>
+          {unparsedDate && (
+            <span className="text-sm text-danger" role="alert">
+              A created date doesn't parse, so bulk actions are off.
+            </span>
+          )}
         </div>
       )}
 

@@ -3,7 +3,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use awa_model::dlq::{self, DlqRow, RetryFromDlqOpts};
-use awa_model::{DlqPage, JobFilter};
+use awa_model::{AwaError, DlqPage, JobFilter};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -94,22 +94,20 @@ pub async fn retry_dlq_job(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BulkFilterPayload {
+    /// The full job filter (ADR-049). It is nested rather than flat so a
+    /// server from before ADR-049, which reads only the flat fields below and
+    /// ignores unknown keys, sees no filter and refuses instead of acting on
+    /// more rows.
+    #[serde(default)]
+    pub filter: Option<JobFilter>,
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]
     pub queue: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
-    /// All of these tags, alongside `tag`.
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub ids: Option<Vec<i64>>,
-    #[serde(default)]
-    pub created_at_gte: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(default)]
-    pub created_at_lt: Option<chrono::DateTime<chrono::Utc>>,
     /// Explicit opt-in to act on every row in the DLQ when no filter is
     /// provided. The model layer rejects empty filters otherwise.
     #[serde(default)]
@@ -117,17 +115,21 @@ pub struct BulkFilterPayload {
 }
 
 impl BulkFilterPayload {
-    fn filter(&self) -> JobFilter {
-        JobFilter {
+    fn filter(&self) -> Result<JobFilter, ApiError> {
+        let flat = JobFilter {
             kind: self.kind.clone(),
             queue: self.queue.clone(),
-            ids: self.ids.clone(),
-            created_at_gte: self.created_at_gte,
-            created_at_lt: self.created_at_lt,
             ..Default::default()
         }
-        .tags(self.tag.clone())
-        .tags(self.tags.clone())
+        .tags(self.tag.clone());
+        match &self.filter {
+            None => Ok(flat),
+            Some(filter) if flat.is_empty() => Ok(filter.clone()),
+            Some(_) => Err(AwaError::Validation(
+                "pass either `filter` or the flat kind, queue and tag fields, not both".to_string(),
+            )
+            .into()),
+        }
     }
 }
 
@@ -141,13 +143,12 @@ pub async fn bulk_retry_dlq(
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
-    let queue_attr = payload.queue.clone();
-    let count =
-        dlq::bulk_retry_from_dlq_matching(&state.pool, &payload.filter(), payload.all).await?;
+    let filter = payload.filter()?;
+    let count = dlq::bulk_retry_from_dlq_matching(&state.pool, &filter, payload.all).await?;
     if count > 0 {
         state
             .metrics
-            .record_dlq_retried(queue_attr.as_deref(), count);
+            .record_dlq_retried(filter.queue.as_deref(), count);
     }
     Ok(Json(CountResponse { count }))
 }
@@ -175,12 +176,12 @@ pub async fn bulk_purge_dlq(
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
-    let queue_attr = payload.queue.clone();
-    let count = dlq::purge_dlq_matching(&state.pool, &payload.filter(), payload.all).await?;
+    let filter = payload.filter()?;
+    let count = dlq::purge_dlq_matching(&state.pool, &filter, payload.all).await?;
     if count > 0 {
         state
             .metrics
-            .record_dlq_purged(queue_attr.as_deref(), count);
+            .record_dlq_purged(filter.queue.as_deref(), count);
     }
     Ok(Json(CountResponse { count }))
 }
@@ -227,4 +228,36 @@ pub async fn bulk_move_failed(
         );
     }
     Ok(Json(CountResponse { count }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(json: serde_json::Value) -> Result<BulkFilterPayload, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    #[test]
+    fn bulk_bodies_take_the_nested_filter_or_the_flat_fields() {
+        let nested = payload(serde_json::json!({
+            "filter": { "queue": "q", "tag": ["a", "b"], "ids": [1, 2] }
+        }))
+        .unwrap();
+        assert_eq!(
+            nested.filter().unwrap(),
+            JobFilter::new().queue("q").tags(["a", "b"]).ids([1, 2])
+        );
+        let flat = payload(serde_json::json!({ "queue": "q", "tag": "a" })).unwrap();
+        assert_eq!(flat.filter().unwrap(), JobFilter::new().queue("q").tag("a"));
+        let both = payload(serde_json::json!({ "queue": "q", "filter": { "tag": "a" } })).unwrap();
+        assert!(both.filter().is_err());
+    }
+
+    #[test]
+    fn flat_fields_beyond_the_06_shape_are_refused() {
+        // A flat `ids` would be ignored by a 0.6 server; this one refuses it
+        // so a client learns to nest.
+        assert!(payload(serde_json::json!({ "queue": "q", "ids": [1] })).is_err());
+    }
 }

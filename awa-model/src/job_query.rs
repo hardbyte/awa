@@ -261,6 +261,15 @@ impl Branch {
             let p = statement.param(Bind::Time(lt));
             conditions.push(format!("{} < {p}", self.created_at));
         }
+        // With a tag, the order is computed rather than read from the
+        // `job_id` index: otherwise the planner walks that index backwards,
+        // expecting the tag to match soon, and tests every row for a rare
+        // one instead of asking the tag index.
+        let order = if filter.tags.is_empty() {
+            self.id.to_string()
+        } else {
+            format!("({} + 0)", self.id)
+        };
         let tail = match window {
             Window::NewestFirst { before_id, limit } => {
                 if let Some(before_id) = before_id {
@@ -268,7 +277,7 @@ impl Branch {
                     conditions.push(format!("{} < {p}", self.id));
                 }
                 let p = statement.param(Bind::Int(limit));
-                format!(" ORDER BY {} DESC LIMIT {p}", self.id)
+                format!(" ORDER BY {order} DESC LIMIT {p}")
             }
             Window::OldestFirst {
                 after_id,
@@ -279,41 +288,69 @@ impl Branch {
                 let max = statement.param(Bind::Int(max_id));
                 conditions.push(format!("{} > {after} AND {} <= {max}", self.id, self.id));
                 let p = statement.param(Bind::Int(limit));
-                format!(" ORDER BY {} ASC LIMIT {p}", self.id)
+                format!(" ORDER BY {order} ASC LIMIT {p}")
             }
-            Window::Unbounded { .. } => String::new(),
+            Window::Unbounded { cap } => capped_tail(statement, cap),
         };
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
             format!(" WHERE {}", conditions.join(" AND "))
         };
-        format!(
-            "(SELECT {} AS job_id FROM {}{where_clause}{tail})",
-            self.id, self.from
+        counted_branch(
+            format!(
+                "SELECT {} AS job_id FROM {}{where_clause}{tail}",
+                self.id, self.from
+            ),
+            window,
         )
     }
 }
 
-/// Ready rows joined to the claim, lease or completion that names them.
+/// A capped count reads at most one row past the cap from each branch, so
+/// the cost is bounded by the cap rather than by the population.
+fn capped_tail(statement: &mut Statement, cap: Option<i64>) -> String {
+    match cap {
+        Some(cap) => format!(" LIMIT {}", statement.param(Bind::Int(cap + 1))),
+        None => String::new(),
+    }
+}
+
+/// A branch's select, carrying for a capped count how many rows the branch
+/// returned: one that reached its limit means the count is past the cap.
+fn counted_branch(select: String, window: Window) -> String {
+    match window {
+        Window::Unbounded { cap: Some(_) } => {
+            format!("(SELECT job_id, count(*) OVER () AS branch_rows FROM ({select}) AS branch)")
+        }
+        _ => format!("({select})"),
+    }
+}
+
+/// The ready row a claim, lease or completion names, as a lateral probe of
+/// the `job_id` index in that ring slot's partition. The lane's priority is
+/// not compared: a lease records the priority it was claimed at, which aging
+/// can leave different from its ready row's.
 fn ready_join(schema: &str, alias: &str, id: &str, run_lease: &str, lane_seq: &str) -> String {
     format!(
-        "JOIN {schema}.ready_entries AS r \
-           ON r.ready_slot = {alias}.ready_slot \
-          AND r.ready_generation = {alias}.ready_generation \
-          AND r.queue = {alias}.queue \
-          AND r.run_lease + 1 = {run_lease} \
-          AND r.enqueue_shard = {alias}.enqueue_shard \
-          AND r.lane_seq = {lane_seq} \
-          AND r.job_id = {id} \
-          AND NOT EXISTS ( \
-              SELECT 1 FROM {schema}.ready_tombstones AS tomb \
-              WHERE tomb.ready_slot = r.ready_slot \
-                AND tomb.ready_generation = r.ready_generation \
-                AND tomb.queue = r.queue \
-                AND tomb.priority = r.priority \
-                AND tomb.enqueue_shard = r.enqueue_shard \
-                AND tomb.lane_seq = r.lane_seq)"
+        "CROSS JOIN LATERAL ( \
+           SELECT * FROM {schema}.ready_entries AS rp \
+           WHERE rp.job_id = {id} \
+             AND rp.ready_slot = {alias}.ready_slot \
+             AND rp.ready_generation = {alias}.ready_generation \
+             AND rp.queue = {alias}.queue \
+             AND rp.run_lease + 1 = {run_lease} \
+             AND rp.enqueue_shard = {alias}.enqueue_shard \
+             AND rp.lane_seq = {lane_seq} \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM {schema}.ready_tombstones AS tomb \
+                 WHERE tomb.ready_slot = rp.ready_slot \
+                   AND tomb.ready_generation = rp.ready_generation \
+                   AND tomb.queue = rp.queue \
+                   AND tomb.priority = rp.priority \
+                   AND tomb.enqueue_shard = rp.enqueue_shard \
+                   AND tomb.lane_seq = rp.lane_seq) \
+           OFFSET 0) AS r"
     )
 }
 
@@ -330,40 +367,54 @@ fn open_receipt_conditions(schema: &str, id: &str, run_lease: &str) -> Vec<Strin
         .collect()
 }
 
-fn done_ready_keys() -> &'static str {
-    "r.ready_slot = d.ready_slot \
-     AND r.ready_generation = d.ready_generation \
-     AND r.queue = d.queue \
-     AND r.priority = d.priority \
-     AND r.enqueue_shard = d.enqueue_shard \
-     AND r.lane_seq = d.lane_seq"
+/// `{probe}`'s row with the same ring position as `{outer}`'s, as a lateral
+/// primary-key probe.
+fn same_position(schema: &str, table: &str, probe: &str, outer: &str, extra: &str) -> String {
+    format!(
+        "(SELECT * FROM {schema}.{table} AS {probe} \
+          WHERE {probe}.ready_slot = {outer}.ready_slot \
+            AND {probe}.ready_generation = {outer}.ready_generation \
+            AND {probe}.queue = {outer}.queue \
+            AND {probe}.priority = {outer}.priority \
+            AND {probe}.enqueue_shard = {outer}.enqueue_shard \
+            AND {probe}.lane_seq = {outer}.lane_seq{extra} \
+          OFFSET 0)"
+    )
 }
 
 fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
     use JobState::*;
     let tagged = !filter.tags.is_empty();
+    // Lateral probes with `OFFSET 0` keep each lookup a primary-key range or
+    // probe. Joined plainly, the planner overestimates partial-index hits and
+    // the cursor's reach, and hashes every retained row of the other table.
     let mut branches = vec![Branch {
         states: &[Available],
         dead_lettered: false,
+        // Unclaimed rows sit above each lane's cursor, in whichever ring
+        // slot they were written to: one primary-key range per lane and slot.
         from: format!(
-            "{schema}.ready_entries AS r JOIN claim_cursors AS cc \
-               ON cc.queue = r.queue AND cc.priority = r.priority \
-              AND cc.enqueue_shard = r.enqueue_shard"
+            "claim_cursors AS cc CROSS JOIN {schema}.queue_ring_slots AS rs \
+             CROSS JOIN LATERAL ( \
+               SELECT * FROM {schema}.ready_entries AS lane \
+               WHERE lane.ready_slot = rs.slot AND lane.queue = cc.queue \
+                 AND lane.priority = cc.priority \
+                 AND lane.enqueue_shard = cc.enqueue_shard \
+                 AND lane.lane_seq >= cc.claim_seq \
+               OFFSET 0) AS r"
         ),
-        conditions: vec![
-            "r.lane_seq >= cc.claim_seq".to_string(),
-            format!(
-                "NOT EXISTS (SELECT 1 FROM {schema}.ready_tombstones AS tomb \
+        conditions: vec![format!(
+            "NOT EXISTS (SELECT 1 FROM {schema}.ready_tombstones AS tomb \
                  WHERE tomb.ready_slot = r.ready_slot \
                    AND tomb.ready_generation = r.ready_generation \
                    AND tomb.queue = r.queue AND tomb.priority = r.priority \
                    AND tomb.enqueue_shard = r.enqueue_shard \
                    AND tomb.lane_seq = r.lane_seq)"
-            ),
-        ],
+        )],
         id: "r.job_id",
         kind: "r.kind",
-        queue: "r.queue",
+        // On the cursor, so a queue filter narrows the lanes probed.
+        queue: "cc.queue",
         state: None,
         created_at: "r.created_at",
         payload: Some("r.payload"),
@@ -424,6 +475,16 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
         payload: Some("r.payload"),
     });
     let mut batch_conditions = vec![
+        // Skips, before unnesting, a batch whose receipts closure batches
+        // have all closed: most retained batches, once their jobs finish.
+        format!(
+            "NOT (b.receipt_ranges <@ COALESCE(( \
+               SELECT range_agg(closed) \
+               FROM {schema}.lease_claim_closure_batches AS cb \
+               CROSS JOIN LATERAL unnest(cb.receipt_ranges) AS closed \
+               WHERE cb.claim_slot = b.claim_slot \
+                 AND cb.receipt_ranges && b.receipt_ranges), '{{}}'::int8multirange))"
+        ),
         format!(
             "NOT EXISTS (SELECT 1 FROM {schema}.lease_claim_closures AS cx \
              WHERE cx.claim_slot = b.claim_slot AND cx.job_id = i.job_id \
@@ -461,8 +522,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
             states: &[Completed, Failed, Cancelled],
             dead_lettered: false,
             from: format!(
-                "{schema}.done_entries AS d LEFT JOIN {schema}.ready_entries AS r ON {}",
-                done_ready_keys()
+                "{schema}.done_entries AS d LEFT JOIN LATERAL {} AS r ON true",
+                same_position(schema, "ready_entries", "rp", "d", "")
             ),
             conditions: vec!["d.payload IS NOT NULL".to_string()],
             id: "d.job_id",
@@ -476,10 +537,10 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
             states: &[Completed, Failed, Cancelled],
             dead_lettered: false,
             from: format!(
-                "{schema}.ready_entries AS r JOIN {schema}.done_entries AS d ON {}",
-                done_ready_keys()
+                "{schema}.ready_entries AS r CROSS JOIN LATERAL {} AS d",
+                same_position(schema, "done_entries", "dp", "r", " AND dp.payload IS NULL")
             ),
-            conditions: vec!["d.payload IS NULL".to_string()],
+            conditions: vec![],
             id: "d.job_id",
             kind: "d.kind",
             queue: "d.queue",
@@ -492,8 +553,8 @@ fn queue_storage_branches(schema: &str, filter: &JobFilter) -> Vec<Branch> {
             states: &[Completed, Failed, Cancelled],
             dead_lettered: false,
             from: format!(
-                "{schema}.done_entries AS d LEFT JOIN {schema}.ready_entries AS r ON {}",
-                done_ready_keys()
+                "{schema}.done_entries AS d LEFT JOIN LATERAL {} AS r ON true",
+                same_position(schema, "ready_entries", "rp", "d", "")
             ),
             conditions: vec![],
             id: "d.job_id",
@@ -669,14 +730,17 @@ fn canonical_statement(
                     let p = statement.param(Bind::Int(limit));
                     format!(" ORDER BY j.id ASC LIMIT {p}")
                 }
-                Window::Unbounded { .. } => String::new(),
+                Window::Unbounded { cap } => capped_tail(&mut statement, cap),
             };
             let where_clause = if conditions.is_empty() {
                 String::new()
             } else {
                 format!(" WHERE {}", conditions.join(" AND "))
             };
-            format!("(SELECT j.id AS job_id FROM {table} AS j{where_clause}{tail})")
+            counted_branch(
+                format!("SELECT j.id AS job_id FROM {table} AS j{where_clause}{tail}"),
+                window,
+            )
         })
         .collect();
     statement.sql = finish(
@@ -707,10 +771,11 @@ fn finish(prefix: String, union: String, window: Window, statement: &mut Stateme
             )
         }
         Window::Unbounded { cap: Some(cap) } => {
-            let p = statement.param(Bind::Int(cap + 1));
+            let p = statement.param(Bind::Int(cap));
             format!(
-                "{prefix}SELECT count(*)::bigint FROM ( \
-                   SELECT DISTINCT job_id FROM ({union}) AS candidates LIMIT {p}) AS capped"
+                "{prefix}SELECT (CASE WHEN max(branch_rows) > {p} THEN {p} + 1 \
+                   ELSE count(DISTINCT job_id) END)::bigint \
+                 FROM ({union}) AS candidates"
             )
         }
         Window::Unbounded { cap: None } => {
@@ -736,17 +801,26 @@ async fn statement(
     }
 }
 
-/// Run a candidate or count statement under a statement timeout, so an
-/// expensive filter cannot hold a connection indefinitely.
-async fn fetch_scalars(pool: &PgPool, statement: Statement) -> Result<Vec<i64>, AwaError> {
+/// Run a candidate or count statement. Interactive reads run under
+/// [`READ_TIMEOUT`], so an expensive filter cannot hold a connection
+/// indefinitely; a batch operation's scan runs without one, as it did
+/// before ADR-049, because failing it fails the operation.
+async fn fetch_scalars(
+    pool: &PgPool,
+    statement: Statement,
+    timeout: Option<std::time::Duration>,
+) -> Result<Vec<i64>, AwaError> {
     let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-    sqlx::query(audited_sql(format!(
-        "SET LOCAL statement_timeout = '{}ms'",
-        READ_TIMEOUT.as_millis()
-    )))
-    .execute(tx.as_mut())
-    .await
-    .map_err(map_sqlx_error)?;
+    plan_reads(&mut tx, false).await?;
+    if let Some(timeout) = timeout {
+        sqlx::query(audited_sql(format!(
+            "SET LOCAL statement_timeout = '{}ms'",
+            timeout.as_millis()
+        )))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+    }
     let rows = statement
         .query_scalar()
         .fetch_all(tx.as_mut())
@@ -754,6 +828,32 @@ async fn fetch_scalars(pool: &PgPool, statement: Statement) -> Result<Vec<i64>, 
         .map_err(map_sqlx_error)?;
     tx.commit().await.map_err(map_sqlx_error)?;
     Ok(rows)
+}
+
+/// Settings for the filter and loader reads, for the rest of `tx`.
+///
+/// - No JIT. These plans are many cheap index probes whose estimated cost
+///   can still cross the JIT threshold; compiling them takes about a second
+///   and saves nothing.
+/// - With `generic`, a prepared statement's first plan is kept for every
+///   later call on the connection. Postgres otherwise keeps planning a
+///   statement over partitioned tables afresh, because the generic plan
+///   prices every partition that runtime pruning will skip.
+pub(crate) async fn plan_reads(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    generic: bool,
+) -> Result<(), AwaError> {
+    sqlx::query("SET LOCAL jit = off")
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+    if generic {
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+    }
+    Ok(())
 }
 
 /// How long one filtered read may run.
@@ -833,7 +933,7 @@ pub(crate) async fn find(
         let Some(statement) = statement else {
             return Ok(Vec::new());
         };
-        let ids = fetch_scalars(pool, statement).await?;
+        let ids = fetch_scalars(pool, statement, Some(READ_TIMEOUT)).await?;
         let exhausted = (ids.len() as i64) < fetch;
         for (job, dead_lettered) in load(pool, store.as_ref(), &ids).await? {
             if effective.contains(&job.state) && filter.matches(&job, dead_lettered) {
@@ -878,7 +978,7 @@ pub(crate) async fn count(
     let Some(statement) = statement else {
         return Ok(JobCount::Exact(0));
     };
-    let n = fetch_scalars(pool, statement)
+    let n = fetch_scalars(pool, statement, Some(READ_TIMEOUT))
         .await?
         .first()
         .copied()
@@ -904,7 +1004,7 @@ pub(crate) async fn max_id(
     let Some(statement) = statement else {
         return Ok(None);
     };
-    Ok(fetch_scalars(pool, statement).await?.first().copied())
+    Ok(fetch_scalars(pool, statement, None).await?.first().copied())
 }
 
 /// Candidate ids for a batch scan's next chunk, oldest first. The runner
@@ -927,7 +1027,7 @@ pub(crate) async fn scan_ids(
     let Some(statement) = statement else {
         return Ok(Vec::new());
     };
-    fetch_scalars(pool, statement).await
+    fetch_scalars(pool, statement, None).await
 }
 
 #[cfg(test)]
@@ -980,7 +1080,7 @@ mod tests {
     fn tag_filters_read_indexed_payloads_and_skip_compact_completions() {
         let sql = sql(&JobFilter::new().tag("order:1"), &ALL_STATES).unwrap();
         assert!(!sql.contains("receipt_completion_batches"), "{sql}");
-        assert!(sql.contains("d.payload IS NULL"), "{sql}");
+        assert!(sql.contains("dp.payload IS NULL"), "{sql}");
         assert!(sql.contains("d.payload IS NOT NULL"), "{sql}");
         assert!(
             sql.contains("(r.payload -> 'tags') <> '[]'::jsonb"),

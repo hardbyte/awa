@@ -1460,7 +1460,7 @@ impl PyClient {
             kind,
             queue,
             tag,
-        );
+        )?;
         let pool = self.pool.clone();
         crate::async_bridge::future_into_py(py, async move {
             let page = awa_model::DlqPage {
@@ -1702,7 +1702,7 @@ impl PyClient {
             kind,
             queue,
             tag,
-        );
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         crate::async_bridge::future_into_py(py, async move {
@@ -1822,34 +1822,19 @@ impl PyClient {
             kind,
             queue,
             tag,
-        );
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         crate::async_bridge::future_into_py(py, async move {
-            let count = if before_id.is_some() || before_dlq_at.is_some() {
-                // Positional purges keep the deprecated keyset form.
-                let legacy = awa_model::dlq::ListDlqFilter {
-                    kind: filter.kind.clone(),
-                    queue: filter.queue.clone(),
-                    tag: filter.tags.first().cloned(),
-                    before_id,
-                    before_dlq_at,
-                    limit: None,
-                };
-                if filter.tags.len() > 1 || filter.ids.is_some() || !filter.states.is_empty() {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "before_id/before_dlq_at combine only with kind, queue and one tag",
-                    ));
-                }
-                #[allow(deprecated)]
-                awa_model::dlq::purge_dlq(&pool, &legacy, allow_all)
-                    .await
-                    .map_err(map_awa_error)?
-            } else {
-                awa_model::dlq::purge_dlq_matching(&pool, &filter, allow_all)
-                    .await
-                    .map_err(map_awa_error)?
-            };
+            let count = awa_model::dlq::purge_dlq_matching_before(
+                &pool,
+                &filter,
+                before_dlq_at,
+                before_id,
+                allow_all,
+            )
+            .await
+            .map_err(map_awa_error)?;
             if count > 0 {
                 metrics.record_dlq_purged(filter.queue.as_deref(), count);
             }
@@ -3270,7 +3255,7 @@ impl PyClient {
             kind,
             queue,
             tag,
-        );
+        )?;
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -3370,7 +3355,7 @@ impl PyClient {
             kind,
             queue,
             tag,
-        );
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         py.detach(|| {
@@ -3482,35 +3467,20 @@ impl PyClient {
             kind,
             queue,
             tag,
-        );
+        )?;
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = if before_id.is_some() || before_dlq_at.is_some() {
-                    // Positional purges keep the deprecated keyset form.
-                    let legacy = awa_model::dlq::ListDlqFilter {
-                        kind: filter.kind.clone(),
-                        queue: filter.queue.clone(),
-                        tag: filter.tags.first().cloned(),
-                        before_id,
-                        before_dlq_at,
-                        limit: None,
-                    };
-                    if filter.tags.len() > 1 || filter.ids.is_some() || !filter.states.is_empty() {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "before_id/before_dlq_at combine only with kind, queue and one tag",
-                        ));
-                    }
-                    #[allow(deprecated)]
-                    awa_model::dlq::purge_dlq(&pool, &legacy, allow_all)
-                        .await
-                        .map_err(map_awa_error)?
-                } else {
-                    awa_model::dlq::purge_dlq_matching(&pool, &filter, allow_all)
-                        .await
-                        .map_err(map_awa_error)?
-                };
+                let count = awa_model::dlq::purge_dlq_matching_before(
+                    &pool,
+                    &filter,
+                    before_dlq_at,
+                    before_id,
+                    allow_all,
+                )
+                .await
+                .map_err(map_awa_error)?;
                 if count > 0 {
                     metrics.record_dlq_purged(filter.queue.as_deref(), count);
                 }

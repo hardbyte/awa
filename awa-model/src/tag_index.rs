@@ -75,6 +75,16 @@ pub async fn tag_index_status(pool: &PgPool) -> Result<Vec<TagIndexStatus>, AwaE
 }
 
 async fn tag_index_status_on(conn: &mut PgConnection) -> Result<Vec<TagIndexStatus>, AwaError> {
+    // A database not yet migrated to 0.7 has no schema discovery function,
+    // and no tag indexes either.
+    let discoverable: bool =
+        sqlx::query_scalar("SELECT to_regprocedure('awa.queue_storage_schemas()') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+    if !discoverable {
+        return Ok(Vec::new());
+    }
     let rows: Vec<(String, String, bool, Option<bool>)> = sqlx::query_as(
         r#"
         WITH schemas AS (
@@ -123,49 +133,74 @@ async fn tag_index_status_on(conn: &mut PgConnection) -> Result<Vec<TagIndexStat
         .collect())
 }
 
-/// Index `target` if the caller owns it, it is empty, and it can be locked
-/// without waiting: the build is then instant and blocks nothing. Returns
-/// whether it built the index.
+/// Largest heap, in bytes, the plain build will lock and scan. An empty
+/// table can still hold a burst's dead tuples until vacuum, and both the
+/// emptiness check and the build would read them under a lock that blocks
+/// writers.
+const EMPTY_HEAP_BYTES: i64 = 64 * 1024;
+
+/// Index `target` if the caller owns it, it is empty and small, and it can
+/// be locked without waiting: the build is then instant and blocks nothing.
+/// Returns whether it built the index.
 async fn index_if_empty(
     conn: &mut PgConnection,
     target: &TagIndexTarget,
 ) -> Result<bool, AwaError> {
-    let mut tx = conn.begin().await.map_err(map_sqlx_error)?;
     let relation = format!(
         "{}.{}",
         quote_ident(&target.schema),
         quote_ident(&target.table)
     );
-    let owned: bool = sqlx::query_scalar(
-        "SELECT pg_has_role(current_user, c.relowner, 'USAGE') \
+    let (owned, heap_bytes): (bool, i64) = sqlx::query_as(
+        "SELECT pg_has_role(current_user, c.relowner, 'USAGE'), pg_relation_size(c.oid) \
          FROM pg_class c WHERE c.oid = $1::regclass",
     )
     .bind(&relation)
-    .fetch_one(tx.as_mut())
+    .fetch_one(&mut *conn)
     .await
     .map_err(map_sqlx_error)?;
-    if !owned {
-        tx.rollback().await.map_err(map_sqlx_error)?;
+    if !owned || heap_bytes > EMPTY_HEAP_BYTES {
         return Ok(false);
     }
+    let mut tx = conn.begin().await.map_err(map_sqlx_error)?;
+    let built = build_if_empty(&mut tx, target, &relation).await;
+    // Roll back explicitly on every path that does not commit: a dropped
+    // transaction is only rolled back the next time its connection is used,
+    // and until then it would sit in the pool holding the lock and a
+    // snapshot that stalls concurrent index builds.
+    match built {
+        Ok(true) => {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            Ok(true)
+        }
+        Ok(false) => {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            Ok(false)
+        }
+        Err(err) => {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            if is_retryable(&err) {
+                Ok(false)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+async fn build_if_empty(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &TagIndexTarget,
+    relation: &str,
+) -> Result<bool, AwaError> {
     // SHARE blocks writers; NOWAIT means a busy partition is left for a
     // later pass rather than queueing a lock that would stall its lane.
-    let locked = sqlx::query(audited_sql(format!(
+    sqlx::query(audited_sql(format!(
         "LOCK TABLE {relation} IN SHARE MODE NOWAIT"
     )))
     .execute(tx.as_mut())
-    .await;
-    if let Err(err) = locked {
-        let err = map_sqlx_error(err);
-        // Roll back now: a dropped transaction is only rolled back the next
-        // time its connection is used, and until then it would sit in the
-        // pool holding a snapshot that stalls concurrent index builds.
-        tx.rollback().await.map_err(map_sqlx_error)?;
-        if is_lock_not_available(&err) {
-            return Ok(false);
-        }
-        return Err(err);
-    }
+    .await
+    .map_err(map_sqlx_error)?;
     let empty: bool = sqlx::query_scalar(audited_sql(format!(
         "SELECT NOT EXISTS (SELECT 1 FROM {relation})"
     )))
@@ -173,20 +208,22 @@ async fn index_if_empty(
     .await
     .map_err(map_sqlx_error)?;
     if !empty {
-        tx.rollback().await.map_err(map_sqlx_error)?;
         return Ok(false);
     }
     sqlx::query(audited_sql(index_ddl(&target.schema, &target.table, false)))
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-    tx.commit().await.map_err(map_sqlx_error)?;
     Ok(true)
 }
 
-fn is_lock_not_available(err: &AwaError) -> bool {
+/// A lock that wasn't available in time, or a lost deadlock: the target is
+/// left for a later pass.
+fn is_retryable(err: &AwaError) -> bool {
     match err {
-        AwaError::Database(sqlx::Error::Database(db)) => db.code().as_deref() == Some("55P03"),
+        AwaError::Database(sqlx::Error::Database(db)) => {
+            matches!(db.code().as_deref(), Some("55P03" | "40P01"))
+        }
         _ => false,
     }
 }
@@ -222,7 +259,8 @@ pub struct TagIndexBuild {
     pub built: usize,
     pub repaired: usize,
     pub already_valid: usize,
-    /// Populated ring partitions left for a later pass.
+    /// Left for a later pass: populated ring partitions, and tables that
+    /// were busy past the lock timeout or lost a deadlock.
     pub waiting: Vec<TagIndexTarget>,
 }
 
@@ -232,56 +270,124 @@ impl TagIndexBuild {
     }
 }
 
-/// Run `ddl` outside a transaction with a short lock timeout, on a
-/// connection of its own: `CONCURRENTLY` refuses to run in a transaction.
-async fn run_concurrently(pool: &PgPool, ddl: String) -> Result<(), AwaError> {
-    let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
+/// Run `ddl` outside a transaction with a short lock timeout:
+/// `CONCURRENTLY` refuses to run in a transaction.
+async fn run_concurrently(conn: &mut PgConnection, ddl: String) -> Result<(), AwaError> {
     sqlx::query("SET lock_timeout = '5s'")
-        .execute(conn.as_mut())
+        .execute(&mut *conn)
         .await
         .map_err(map_sqlx_error)?;
     let result = sqlx::query(audited_sql(ddl))
-        .execute(conn.as_mut())
+        .execute(&mut *conn)
         .await
         .map_err(map_sqlx_error);
-    let _ = sqlx::query("RESET lock_timeout")
-        .execute(conn.as_mut())
-        .await;
+    let _ = sqlx::query("RESET lock_timeout").execute(&mut *conn).await;
     result.map(|_| ())
 }
 
+/// Whether `target`'s index exists and is valid.
+async fn index_valid(conn: &mut PgConnection, target: &TagIndexTarget) -> Result<bool, AwaError> {
+    let valid: Option<bool> = sqlx::query_scalar(
+        "SELECT idx.indisvalid FROM pg_index idx \
+         JOIN pg_class ic ON ic.oid = idx.indexrelid \
+         JOIN pg_namespace n ON n.oid = ic.relnamespace \
+         WHERE n.nspname = $1 AND ic.relname = $2",
+    )
+    .bind(&target.schema)
+    .bind(index_name(&target.table))
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?;
+    Ok(valid == Some(true))
+}
+
+/// Drop the `_ccnew` copies a failed `REINDEX CONCURRENTLY` leaves behind:
+/// they are invalid, so no query uses them, but every write maintains them.
+async fn drop_abandoned_copies(conn: &mut PgConnection) -> Result<(), AwaError> {
+    let abandoned: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT n.nspname, ic.relname
+        FROM pg_index idx
+        JOIN pg_class ic ON ic.oid = idx.indexrelid
+        JOIN pg_namespace n ON n.oid = ic.relnamespace
+        WHERE NOT idx.indisvalid
+          AND ic.relname LIKE '%\_tags\_idx\_ccnew%'
+          AND n.nspname IN (SELECT s FROM awa.queue_storage_schemas() AS q(s))
+        "#,
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(map_sqlx_error)?;
+    for (schema, index) in abandoned {
+        let dropped = run_concurrently(
+            conn,
+            format!(
+                "DROP INDEX CONCURRENTLY IF EXISTS {}.{}",
+                quote_ident(&schema),
+                quote_ident(&index)
+            ),
+        )
+        .await;
+        match dropped {
+            Err(err) if !is_retryable(&err) => return Err(err),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// One pass of the migrator's online build. Builds one index at a time,
-/// repairs indexes an interrupted build left invalid, and reports the ring
-/// partitions still waiting for pruning to empty them. Safe to repeat.
+/// repairs indexes an interrupted build left invalid, and reports what is
+/// left for a later pass: ring partitions waiting for pruning to empty them,
+/// and tables that stayed busy past the lock timeout. Safe to repeat.
 pub async fn build_tag_indexes(pool: &PgPool, mode: BuildMode) -> Result<TagIndexBuild, AwaError> {
     let mut outcome = TagIndexBuild::default();
+    // One connection throughout, so a pool of one is enough.
     let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
-    for status in tag_index_status_on(&mut conn).await? {
+    let statuses = tag_index_status_on(&mut conn).await?;
+    if !statuses.is_empty() {
+        drop_abandoned_copies(&mut conn).await?;
+    }
+    for status in statuses {
         let target = status.target;
-        match status.state {
-            TagIndexState::Valid => outcome.already_valid += 1,
-            TagIndexState::Invalid => {
-                run_concurrently(
-                    pool,
-                    format!(
-                        "REINDEX INDEX CONCURRENTLY {}.{}",
-                        quote_ident(&target.schema),
-                        quote_ident(&index_name(&target.table))
-                    ),
-                )
-                .await?;
-                outcome.repaired += 1;
+        let ddl = match status.state {
+            TagIndexState::Valid => {
+                outcome.already_valid += 1;
+                continue;
             }
+            TagIndexState::Invalid => format!(
+                "REINDEX INDEX CONCURRENTLY {}.{}",
+                quote_ident(&target.schema),
+                quote_ident(&index_name(&target.table))
+            ),
             TagIndexState::Missing => {
                 if index_if_empty(&mut conn, &target).await? {
                     outcome.built += 1;
-                } else if !target.ring || mode == BuildMode::Now {
-                    run_concurrently(pool, index_ddl(&target.schema, &target.table, true)).await?;
-                    outcome.built += 1;
-                } else {
-                    outcome.waiting.push(target);
+                    continue;
                 }
+                if target.ring && mode == BuildMode::WhenEmpty {
+                    outcome.waiting.push(target);
+                    continue;
+                }
+                index_ddl(&target.schema, &target.table, true)
             }
+        };
+        match run_concurrently(&mut conn, ddl).await {
+            Err(err) if is_retryable(&err) => {
+                outcome.waiting.push(target);
+                continue;
+            }
+            result => result?,
+        }
+        // `IF NOT EXISTS` also succeeds on an index another session is still
+        // building, and a cancelled build leaves an invalid one: only a valid
+        // index counts as done.
+        if !index_valid(&mut conn, &target).await? {
+            outcome.waiting.push(target);
+        } else if status.state == TagIndexState::Invalid {
+            outcome.repaired += 1;
+        } else {
+            outcome.built += 1;
         }
     }
     Ok(outcome)

@@ -126,7 +126,7 @@ test.describe("Batch operations page", () => {
     });
 
     await page.goto("/batch-ops");
-    await page.locator("select").selectOption("move_queue");
+    await page.getByRole("combobox", { name: /^Operation/ }).selectOption("move_queue");
     await page.getByLabel("Queue filter").fill("e2e_test");
     await page.getByLabel("Kind filter").fill("e2e_job");
     await page.getByLabel("IDs filter").fill("800006");
@@ -144,7 +144,7 @@ test.describe("Batch operations page", () => {
       const body = route.request().postDataJSON();
       expect(body.filter).toEqual({
         queue: "e2e_test",
-        tags: ["e2e", "priority"],
+        tag: ["e2e", "priority"],
         state: "scheduled",
         created_at_gte: "2026-10-01T00:00:00.000Z",
       });
@@ -157,6 +157,15 @@ test.describe("Batch operations page", () => {
     await expect(page.getByTestId("batch-preview-count")).toHaveText(
       "4 eligible job(s) would change."
     );
+  });
+
+  test("a created date that doesn't parse blocks preview and submit", async ({ page }) => {
+    await stubSharedApi(page, []);
+    await page.goto("/batch-ops?queue=e2e_test");
+    await page.getByLabel("Created before").fill("2026-10-32");
+    await expect(page.getByRole("alert")).toHaveText("Created before is not a date");
+    await expect(page.getByRole("button", { name: "Preview" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Submit" })).toBeDisabled();
   });
 
   test("requests cancellation for an active operation", async ({ page }) => {

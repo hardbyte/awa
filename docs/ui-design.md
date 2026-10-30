@@ -86,8 +86,8 @@ GET  /api/dlq/:id
 GET  /api/dlq/depth
 POST   /api/dlq/:id/retry
 DELETE /api/dlq/:id
-POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, tags?, ids?, created_at_gte?, created_at_lt?, all? }
-POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, tags?, ids?, created_at_gte?, created_at_lt?, all? }
+POST   /api/dlq/bulk-retry              { filter?, all? }  or the 0.6 form { kind?, queue?, tag?, all? }
+POST   /api/dlq/bulk-purge              { filter?, all? }  or the 0.6 form { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
 
 POST /api/callbacks/:callback_id/complete   { payload?, output? }

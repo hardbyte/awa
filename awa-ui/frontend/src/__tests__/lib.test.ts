@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { timeAgo } from "@/lib/time";
 import { buildSearch, parseSearch, toRfc3339 } from "@/components/SearchBar";
+import { toWireFilter } from "@/lib/api";
 
 describe("timeAgo", () => {
   it("shows seconds for recent times", () => {
@@ -93,5 +94,19 @@ describe("parseSearch", () => {
   it("converts typed dates to RFC 3339", () => {
     expect(toRfc3339("2026-10-01T00:00:00Z")).toBe("2026-10-01T00:00:00.000Z");
     expect(toRfc3339("not a date")).toBeUndefined();
+  });
+});
+
+describe("toWireFilter", () => {
+  it("sends one value bare and several as a list under the singular key", () => {
+    expect(toWireFilter({ queue: "q", tags: ["a"], states: ["failed"] })).toEqual({
+      queue: "q",
+      tag: "a",
+      state: "failed",
+    });
+    expect(toWireFilter({ tags: ["a", "b"], states: ["failed", "cancelled"], ids: [] })).toEqual({
+      tag: ["a", "b"],
+      state: ["failed", "cancelled"],
+    });
   });
 });

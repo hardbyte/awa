@@ -409,11 +409,28 @@ pub async fn retry_from_dlq(
     store.retry_from_dlq(pool, job_id, opts).await
 }
 
+/// Refuse a bulk DLQ action whose filter would select the whole DLQ unless
+/// the caller opted in. `states` and `dead_lettered` don't count: every DLQ
+/// row is a dead-lettered failed job, so neither narrows it.
+fn require_dlq_scope(filter: &JobFilter, allow_all: bool, action: &str) -> Result<(), AwaError> {
+    let scoped = filter.kind.is_some()
+        || filter.queue.is_some()
+        || !filter.tags.is_empty()
+        || filter.ids.as_ref().is_some_and(|ids| !ids.is_empty())
+        || filter.created_at_gte.is_some()
+        || filter.created_at_lt.is_some();
+    if scoped || allow_all {
+        return Ok(());
+    }
+    Err(AwaError::Validation(format!(
+        "{action} needs a kind, queue, tag, ids or created_at bound (or allow_all=true)"
+    )))
+}
+
 /// Bulk-retry DLQ rows matching the filter.
 ///
-/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
-/// `true`. This guard prevents an empty payload from reviving the entire DLQ
-/// by accident.
+/// Requires a filter that narrows the DLQ unless `allow_all` is `true`. This
+/// guard prevents an empty payload from reviving the entire DLQ by accident.
 ///
 /// Like single-row retry, unique-claim conflicts abort the transaction and
 /// leave the affected DLQ rows untouched.
@@ -423,11 +440,7 @@ pub async fn bulk_retry_from_dlq_matching(
     allow_all: bool,
 ) -> Result<u64, AwaError> {
     filter.validate()?;
-    if !allow_all && filter.is_empty() {
-        return Err(AwaError::Validation(
-            "bulk retry from the DLQ requires a filter (or allow_all=true)".into(),
-        ));
-    }
+    require_dlq_scope(filter, allow_all, "bulk retry from the DLQ")?;
     let Some(predicate) = dlq_predicate(filter) else {
         return Ok(0);
     };
@@ -461,23 +474,32 @@ pub async fn bulk_retry_from_dlq(
 
 /// Purge DLQ rows matching the filter.
 ///
-/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
-/// `true`, which is the explicit "yes, purge the whole DLQ" escape hatch for
+/// Requires a filter that narrows the DLQ unless `allow_all` is `true`,
+/// which is the explicit "yes, purge the whole DLQ" escape hatch for
 /// operator tooling.
 pub async fn purge_dlq_matching(
     pool: &PgPool,
     filter: &JobFilter,
     allow_all: bool,
 ) -> Result<u64, AwaError> {
+    purge_dlq_matching_before(pool, filter, None, None, allow_all).await
+}
+
+/// [`purge_dlq_matching`], limited to rows before a `(dlq_at, id)` position
+/// in `find_dlq`'s order: a page's last row, to purge everything older.
+pub async fn purge_dlq_matching_before(
+    pool: &PgPool,
+    filter: &JobFilter,
+    before_dlq_at: Option<DateTime<Utc>>,
+    before_id: Option<i64>,
+    allow_all: bool,
+) -> Result<u64, AwaError> {
     filter.validate()?;
-    if !allow_all && filter.is_empty() {
-        return Err(AwaError::Validation(
-            "purging the DLQ requires a filter (or allow_all=true)".into(),
-        ));
-    }
-    let Some(predicate) = dlq_predicate(filter) else {
+    require_dlq_scope(filter, allow_all, "purging the DLQ")?;
+    let Some(mut predicate) = dlq_predicate(filter) else {
         return Ok(0);
     };
+    before_position(&mut predicate, before_dlq_at, before_id);
     purge_where(pool, &predicate).await
 }
 

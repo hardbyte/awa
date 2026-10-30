@@ -17,9 +17,18 @@ Notable changes between releases. Detailed migration notes for storage transitio
 - **Rust library users: `BatchOperationFilter` is now `JobFilter`.** Its
   `state` and `tag` fields become `states` and `tags` lists. Build a filter
   with `JobFilter::new().state(..).tag(..)` or `JobFilter { kind: ..,
-  ..Default::default() }`. Its JSON shape is unchanged, so stored batch
-  operations still load. Unknown JSON fields are now an error rather than
-  ignored.
+  ..Default::default() }`. Its JSON keeps ADR-030's keys, so stored batch
+  operations still load: several tags or states go under `tag` or `state` as
+  a list, which a 0.6 server or runner refuses rather than ignoring. Unknown
+  JSON fields are now an error rather than ignored.
+- **HTTP: the DLQ bulk-retry and bulk-purge bodies take the filter under
+  `filter`.** The flat `kind`, `queue` and `tag` still work. A 0.6 server
+  sees a nested filter as no filter and refuses it, so a newer client can't
+  purge more than it asked for.
+- **A DLQ purge or bulk retry needs a filter that narrows the DLQ** (kind,
+  queue, tag, ids or a created bound) unless `allow_all` is set; `state:
+  failed` and `dead_lettered: true` alone are refused, since every DLQ row
+  matches them.
 - **Deprecated:** `admin::list_jobs` and `ListJobsFilter` (use `find_jobs`
   with `JobFilter` and `JobPage`), and `dlq::list_dlq`, `purge_dlq`,
   `bulk_retry_from_dlq` and `ListDlqFilter` (use `find_dlq`,
@@ -27,7 +36,7 @@ Notable changes between releases. Detailed migration notes for storage transitio
   through 0.8.
 - **A batch operation whose filter uses several tags, several states or
   `dead_lettered` is refused** while a runtime older than 0.7.0-alpha.2 is
-  live, because an older runner would ignore those fields.
+  live, because an older runner can't read them.
 
 ### Added
 

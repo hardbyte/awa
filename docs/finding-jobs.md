@@ -12,14 +12,19 @@ the same jobs on every one of them.
 | --- | --- |
 | `kind` | The job's kind. |
 | `queue` | The job's queue. |
-| `states` | Any of these states. JSON also accepts a single `state`. |
-| `tags` | All of these tags. JSON also accepts a single `tag`. |
+| `state` | One state, or a list: any of them. |
+| `tag` | One tag, or a list: all of them (at most 20). |
 | `dead_lettered` | `true` for only dead-lettered jobs, `false` for none of them. |
 | `ids` | Only these job ids (at most 1,000). |
 | `created_at_gte`, `created_at_lt` | The original insert time, unchanged by retries and moves. |
 
 A field that is not set does not narrow the population. Unknown fields are an
-error, so a typo cannot widen what a purge or batch operation acts on.
+error, so a typo cannot widen what a purge or batch operation acts on. In
+Rust the lists are the `states` and `tags` fields.
+
+A DLQ purge or bulk retry needs a field that narrows the DLQ (kind, queue,
+tag, ids or a created bound), or `allow_all`. Over HTTP its filter goes
+under `filter`: `{"filter": {"queue": "billing", "tag": ["tenant:acme"]}}`.
 
 Each job appears once, in its current state. Listing is newest first; page by
 passing the last id you saw as `before_id`. A job whose claim is in flight
@@ -52,7 +57,7 @@ any state:
     client.insert(SendInvoice(order_id=123), tags=["order:123"])
 
     jobs = client.find_jobs(tag="order:123")
-    count = client.count_jobs({"tags": ["tenant:acme"], "state": "failed"})
+    count = client.count_jobs({"tag": ["tenant:acme", "region:eu"], "state": ["failed", "cancelled"]})
     ```
 
 === "HTTP"
@@ -101,7 +106,8 @@ jobs in the same filter are left alone.
 
 A batch operation whose filter uses several tags, several states or
 `dead_lettered` is refused while a runtime older than 0.7.0-alpha.2 is live:
-an older runner would ignore those fields and act on more jobs.
+an older runner can't read them. A 0.6 server or runner refuses a list under
+`tag` or `state` rather than acting on more jobs.
 
 ## Building the tag indexes
 

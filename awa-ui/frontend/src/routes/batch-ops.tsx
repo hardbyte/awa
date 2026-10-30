@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearch } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -6,6 +6,7 @@ import {
   fetchBatchOperations,
   previewBatchOperation,
   submitBatchOperation,
+  toWireFilter,
   type BatchOperation,
   type BatchOperationFilter,
   type BatchOperationKind,
@@ -80,22 +81,28 @@ function splitList(value: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Why the form's filter can't be sent: a field that doesn't parse would
+ * otherwise be left out, widening the jobs the operation changes.
+ */
+function filterError(form: Pick<BatchForm, "ids" | "createdGte" | "createdLt">): string | null {
+  if (splitList(form.ids).some((id) => !/^\d+$/.test(id))) return "IDs must be whole numbers";
+  if (form.createdGte.trim() && !toRfc3339(form.createdGte.trim())) return "Created from is not a date";
+  if (form.createdLt.trim() && !toRfc3339(form.createdLt.trim())) return "Created before is not a date";
+  return null;
+}
+
 /** The shared job filter (ADR-049) the form describes. */
 function buildFilter(form: BatchForm): BatchOperationFilter {
-  const ids = splitList(form.ids).map(Number).filter(Number.isFinite);
-  const tags = splitList(form.tags);
-  const createdGte = toRfc3339(form.createdGte.trim());
-  const createdLt = toRfc3339(form.createdLt.trim());
-  return {
-    ...(form.queue.trim() ? { queue: form.queue.trim() } : {}),
-    ...(form.kind.trim() ? { kind: form.kind.trim() } : {}),
-    ...(ids.length > 0 ? { ids } : {}),
-    // One tag keeps the ADR-030 key every runner reads.
-    ...(tags.length === 1 ? { tag: tags[0] } : tags.length > 1 ? { tags } : {}),
-    ...(form.state ? { state: form.state } : {}),
-    ...(createdGte ? { created_at_gte: createdGte } : {}),
-    ...(createdLt ? { created_at_lt: createdLt } : {}),
-  };
+  return toWireFilter({
+    queue: form.queue.trim() || undefined,
+    kind: form.kind.trim() || undefined,
+    ids: splitList(form.ids).map(Number),
+    tags: splitList(form.tags),
+    states: form.state ? [form.state] : [],
+    created_at_gte: toRfc3339(form.createdGte.trim()),
+    created_at_lt: toRfc3339(form.createdLt.trim()),
+  });
 }
 
 function buildPayload(form: BatchForm): BatchOperationPayload {
@@ -144,8 +151,14 @@ export function BatchOpsPage() {
   const search = useSearch({ strict: false }) as Record<string, string | undefined>;
   const [form, setForm] = useState<BatchForm>(() => initialForm(search));
   const [preview, setPreview] = useState<BatchOperationPreview | null>(null);
-  const isPayloadValid = useMemo(() => isPayloadFormValid(form), [form]);
+  const formFilterError = useMemo(() => filterError(form), [form]);
+  const isPayloadValid = useMemo(
+    () => isPayloadFormValid(form) && formFilterError === null,
+    [form, formFilterError]
+  );
   const payload = useMemo(() => buildPayload(form), [form]);
+  // A preview describes the form it was taken from.
+  useEffect(() => setPreview(null), [payload]);
 
   const operationsQuery = useQuery({
     queryKey: ["batch-ops"],
@@ -262,6 +275,11 @@ export function BatchOpsPage() {
           Batch operations act only on available and scheduled jobs; running,
           waiting and finished jobs in the same filter are left alone.
         </p>
+        {formFilterError && (
+          <p className="mt-2 text-sm text-danger" role="alert">
+            {formFilterError}
+          </p>
+        )}
         {preview && (
           <p className="mt-2 text-sm" data-testid="batch-preview-count">
             {preview.total_matched.toLocaleString()} eligible job(s) would change.

@@ -54,17 +54,16 @@ BatchOperationState = Literal[
 class JobFilter(TypedDict, total=False):
     """Which jobs (ADR-049): every key set narrows the population.
 
-    ``tags`` are all-of, ``states`` any-of; ``tag`` and ``state`` are the
-    single-value spellings. An unknown key is an error.
+    ``tag`` takes one tag or a list, all of which a job must carry;
+    ``state`` takes one state or a list, any of which matches. An unknown
+    key is an error.
     """
 
     kind: str
     queue: str
     ids: list[int]
-    tag: str
-    tags: list[str]
-    state: str
-    states: list[str]
+    tag: str | list[str]
+    state: str | list[str]
     dead_lettered: bool
     created_at_gte: dt.datetime | str
     created_at_lt: dt.datetime | str
@@ -82,11 +81,20 @@ class JobCount(TypedDict):
 
 
 def _merge_filter(filter: JobFilter | None, fields: dict[str, Any]) -> JobFilter | None:
-    """Layer keyword filter fields over a filter dict."""
+    """Layer keyword filter fields over a filter dict.
+
+    Every field narrows, so a keyword that disagrees with the dict is an
+    error rather than a replacement.
+    """
     if not fields:
         return filter
     merged: dict[str, Any] = dict(filter or {})
-    merged.update({key: value for key, value in fields.items() if value is not None})
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if merged.get(key) is not None and merged[key] != value:
+            raise ValueError(f"{key}={value!r} conflicts with the filter's {key} {merged[key]!r}")
+        merged[key] = value
     return merged  # type: ignore[return-value]
 
 
@@ -470,8 +478,8 @@ class AsyncClient:
     ) -> list[Job]:
         """Jobs matching a filter, newest first (ADR-049).
 
-        Filter fields may be passed as a dict, as keywords, or both;
-        keywords win. Pass the last job's id as ``before_id`` for the next
+        Filter fields may be passed as a dict, as keywords, or both, as
+        long as they agree. Pass the last job's id as ``before_id`` for the next
         page.
         """
         return await self._raw.find_jobs(
