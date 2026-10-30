@@ -263,7 +263,13 @@ pub async fn submit_batch_operation(
     if request.filter.uses_extended_fields() {
         crate::filter::require_fleet_for_extended_filters(pool).await?;
     }
-    if request.filter.is_empty() && !request.allow_all {
+    // `dead_lettered: false` excludes nothing a batch operation can reach, so
+    // it doesn't count as narrowing one.
+    let narrowing = BatchOperationFilter {
+        dead_lettered: None,
+        ..request.filter.clone()
+    };
+    if narrowing.is_empty() && !request.allow_all {
         return Err(AwaError::Validation(
             "batch operation requires a filter or allow_all=true".to_string(),
         ));

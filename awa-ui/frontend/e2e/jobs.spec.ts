@@ -188,7 +188,8 @@ test.describe("Search bar filters", () => {
     await expect(
       page.getByRole("button", { name: "Change priority or queue of matching jobs" })
     ).toHaveCount(0);
-    expect(jobRequests.filter((url) => !url.includes("/api/jobs/"))).toEqual([]);
+    // Job detail requests (/api/jobs/<id>) aside, nothing lists or counts.
+    expect(jobRequests.filter((url) => !/\/api\/jobs\/\d+/.test(url))).toEqual([]);
 
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs?") && r.ok()),

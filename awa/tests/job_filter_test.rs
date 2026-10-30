@@ -258,6 +258,31 @@ async fn the_canonical_engine_is_refused_rather_than_searched() {
 }
 
 #[tokio::test]
+async fn a_batch_needs_a_field_that_narrows_it() {
+    let db = TestDatabase::queue_storage().await;
+    let pool = db.pool().clone();
+    let submit = |filter: JobFilter| {
+        batch_operations::submit_batch_operation(
+            &pool,
+            SubmitBatchOperation {
+                spec: BatchOperationSpec::SetPriority { priority: 1 },
+                filter,
+                submitted_by: None,
+                allow_all: false,
+            },
+        )
+    };
+    // Every job a batch operation can reach is not dead-lettered.
+    let err = submit(JobFilter::new().dead_lettered(false))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("requires a filter"), "{err}");
+    submit(JobFilter::new().queue(QUEUE).dead_lettered(false))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn pages_cover_the_population_once_newest_first() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
