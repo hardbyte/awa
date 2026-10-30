@@ -4,7 +4,7 @@
 
 ## Status
 
-Proposed. Amends [ADR-030](../030-batch-operations/index.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. `awa migrate` and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by `awa storage build-tag-index`, which the migrator runs after upgrading.
+Accepted. Amends [ADR-030](../030-batch-operations/index.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. `awa migrate` and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by `awa storage build-tag-index`, which the migrator runs after upgrading.
 
 ## Context
 
@@ -140,7 +140,7 @@ Each engine has one function that turns `(filter, eligible states, window)` into
   - JIT is off for these reads. Their estimated cost can cross the JIT threshold, and compiling them takes about a second.
   - The batched loader's statements keep a connection's first plan. Postgres otherwise re-plans a statement over partitioned tables on every call, because a generic plan prices partitions that runtime pruning skips, and planning costs more than running these probes.
 - **Listing without a tag has no new index.** Ready and done partitions are already indexed by `job_id`, so an id-descending page with a kind, queue or state filter walks recent rows and stops at the page. A rare kind or queue walks further, bounded by the timeout. An index on `(kind, job_id)` or `(queue, job_id)` would tax every job, so it's left until measurements call for one.
-- **Canonical** compiles to one statement over `awa.jobs`, with the same rule about present predicates. The canonical engine is deprecated ([ADR-037](../037-canonical-engine-deprecation/index.md)) and isn't optimised further.
+- **Queue storage only.** The canonical engine is deprecated ([ADR-037](../037-canonical-engine-deprecation/index.md)), and in 0.7 a migrated cluster is finalized onto queue storage; only a fresh install that hasn't started a worker is still canonical. Finding, counting and batch operations therefore return the error the DLQ APIs already return when no queue-storage backend is active, rather than keep a second compiler alive until 0.8 removes canonical.
 
 ### Tags are the indexed handle for "jobs about X"
 
@@ -285,10 +285,10 @@ It's deferred because the index serves explicit tags today, and derivation can b
   - a ring build never queues an exclusive lock that blocks a lane;
   - pruning during a build reports `Blocked` and then succeeds.
 - **A mixed fleet.** A 0.6.9 producer's tagged jobs are found by tag once the build has run. A batch operation with several tags is refused while a 0.6.9 runtime is live, and the 0.6 filter type fails to read one.
-- **Benchmark.** `awa/tests/tag_filter_bench.rs`, on a realistic mix of tagged and untagged jobs, checks:
-  - a 100-row page loads in one batched read;
-  - a rare-tag lookup aims for under 100 ms at 50,000 retained jobs. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before. About half of a rare-tag lookup is loading the one job: `terminal_jobs` expands every compact completion batch before it can filter by id, which also slows `get_job`. An id-keyed read for it needs a migration and is a follow-up;
-  - with `fastupdate = off`, p99 enqueue latency for tagged jobs stays within 10% of today.
+- **Benchmark.** `awa/tests/tag_filter_bench.rs` loads a mix of tagged and untagged completed jobs (50,000 by default).
+  - **It asserts** that a rare-tag lookup finds its one job, with a warm median under 250 ms. The aim is 100 ms; about half of today's time is loading the one job, because `terminal_jobs` expands every compact completion batch before it can filter by id, which also slows `get_job`. An id-keyed read for it needs a migration and is a follow-up.
+  - **It reports** cold and warm times for unfiltered, available-only, kind, common-tag and rare-tag pages, a capped count, lifecycle WAL per job, and the tag indexes' size. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before.
+  - **Not measured by it:** how many reads a page takes, and p99 enqueue latency for tagged jobs with `fastupdate = off`.
 
 ## Relationship to other ADRs
 

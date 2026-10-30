@@ -2311,6 +2311,9 @@ admin UI's jobs page and DLQ page, <code>awa job list</code> and <code>awa dlq l
 <code>find_jobs</code>, and batch operations' preview and execution
 (<a href="../adr/049-job-filter-and-indexed-tags/">ADR-049</a>). The same filter selects
 the same jobs on every one of them.</p>
+<p>Finding jobs needs the queue-storage engine. On the deprecated canonical
+engine (<a href="../adr/037-canonical-engine-deprecation/">ADR-037</a>) these calls
+return an error naming the missing queue_storage backend.</p>
 <h2 id="the-filter">The filter<a class="headerlink" href="#the-filter" title="Permanent link">&para;</a></h2>
 <table>
 <thead>

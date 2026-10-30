@@ -2383,7 +2383,7 @@
 
 <h1 id="adr-049-one-job-filter-and-tags-as-the-indexed-handle">ADR-049: One job filter, and tags as the indexed handle<a class="headerlink" href="#adr-049-one-job-filter-and-tags-as-the-indexed-handle" title="Permanent link">&para;</a></h1>
 <h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>Proposed. Amends <a href="../030-batch-operations/">ADR-030</a>: its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. <code>awa migrate</code> and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by <code>awa storage build-tag-index</code>, which the migrator runs after upgrading.</p>
+<p>Accepted. Amends <a href="../030-batch-operations/">ADR-030</a>: its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. <code>awa migrate</code> and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by <code>awa storage build-tag-index</code>, which the migrator runs after upgrading.</p>
 <h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
 <p>Operators and applications ask Awa one question in several places: <em>which jobs?</em> The admin UI's jobs page, <code>awa job list</code>, Python's <code>list_jobs</code>, a batch operation's preview, the batch operation itself and the DLQ pages each answer it, and each answers it differently.</p>
 <ul>
@@ -2576,7 +2576,7 @@
   - JIT is off for these reads. Their estimated cost can cross the JIT threshold, and compiling them takes about a second.
   - The batched loader's statements keep a connection's first plan. Postgres otherwise re-plans a statement over partitioned tables on every call, because a generic plan prices partitions that runtime pruning skips, and planning costs more than running these probes.
 - <strong>Listing without a tag has no new index.</strong> Ready and done partitions are already indexed by <code>job_id</code>, so an id-descending page with a kind, queue or state filter walks recent rows and stops at the page. A rare kind or queue walks further, bounded by the timeout. An index on <code>(kind, job_id)</code> or <code>(queue, job_id)</code> would tax every job, so it's left until measurements call for one.
-- <strong>Canonical</strong> compiles to one statement over <code>awa.jobs</code>, with the same rule about present predicates. The canonical engine is deprecated (<a href="../037-canonical-engine-deprecation/">ADR-037</a>) and isn't optimised further.</p>
+- <strong>Queue storage only.</strong> The canonical engine is deprecated (<a href="../037-canonical-engine-deprecation/">ADR-037</a>), and in 0.7 a migrated cluster is finalized onto queue storage; only a fresh install that hasn't started a worker is still canonical. Finding, counting and batch operations therefore return the error the DLQ APIs already return when no queue-storage backend is active, rather than keep a second compiler alive until 0.8 removes canonical.</p>
 <h3 id="tags-are-the-indexed-handle-for-jobs-about-x">Tags are the indexed handle for "jobs about X"<a class="headerlink" href="#tags-are-the-indexed-handle-for-jobs-about-x" title="Permanent link">&para;</a></h3>
 <p>A tag is the supported way to find the jobs about something an application cares about: <code>order:123</code>, <code>tenant:acme</code>, <code>import:2026-10-29</code>.
 - <strong>Attach it at insert,</strong> with <code>InsertOpts::tags</code> or Python's <code>tags=</code>. Insert already allows at most 20 tags per job, and the canonical engine enforces the same limit.
@@ -2729,10 +2729,10 @@
 <li>a ring build never queues an exclusive lock that blocks a lane;</li>
 <li>pruning during a build reports <code>Blocked</code> and then succeeds.</li>
 <li><strong>A mixed fleet.</strong> A 0.6.9 producer's tagged jobs are found by tag once the build has run. A batch operation with several tags is refused while a 0.6.9 runtime is live, and the 0.6 filter type fails to read one.</li>
-<li><strong>Benchmark.</strong> <code>awa/tests/tag_filter_bench.rs</code>, on a realistic mix of tagged and untagged jobs, checks:</li>
-<li>a 100-row page loads in one batched read;</li>
-<li>a rare-tag lookup aims for under 100 ms at 50,000 retained jobs. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before. About half of a rare-tag lookup is loading the one job: <code>terminal_jobs</code> expands every compact completion batch before it can filter by id, which also slows <code>get_job</code>. An id-keyed read for it needs a migration and is a follow-up;</li>
-<li>with <code>fastupdate = off</code>, p99 enqueue latency for tagged jobs stays within 10% of today.</li>
+<li><strong>Benchmark.</strong> <code>awa/tests/tag_filter_bench.rs</code> loads a mix of tagged and untagged completed jobs (50,000 by default).</li>
+<li><strong>It asserts</strong> that a rare-tag lookup finds its one job, with a warm median under 250 ms. The aim is 100 ms; about half of today's time is loading the one job, because <code>terminal_jobs</code> expands every compact completion batch before it can filter by id, which also slows <code>get_job</code>. An id-keyed read for it needs a migration and is a follow-up.</li>
+<li><strong>It reports</strong> cold and warm times for unfiltered, available-only, kind, common-tag and rare-tag pages, a capped count, lifecycle WAL per job, and the tag indexes' size. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before.</li>
+<li><strong>Not measured by it:</strong> how many reads a page takes, and p99 enqueue latency for tagged jobs with <code>fastupdate = off</code>.</li>
 </ul>
 <h2 id="relationship-to-other-adrs">Relationship to other ADRs<a class="headerlink" href="#relationship-to-other-adrs" title="Permanent link">&para;</a></h2>
 <ul>
