@@ -1,0 +1,2785 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Postgres-native background jobs for Rust and Python">
+      
+      
+      
+        <link rel="canonical" href="https://hardbyte.github.io/awa/design/realtime-subscriptions-v1/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Real-time subscriptions v1: implementation contract - AWA</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CGeist+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"Geist Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/reference.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/language-switch.css">
+    
+      <link rel="stylesheet" href="../../stylesheets/agent-docs.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  
+  
+  
+  
+  <meta name="theme-color" content="#17633e">
+  <meta property="og:title" content="Real-time subscriptions v1: implementation contract — AWA">
+  <meta property="og:description" content="Postgres-native background jobs for Rust and Python">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://hardbyte.github.io/awa/design/realtime-subscriptions-v1/">
+  
+    <link rel="alternate" type="text/markdown" href="index.md">
+  
+  <link rel="help" type="text/plain" href="../../llms.txt" title="AWA documentation index for AI agents">
+
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#real-time-subscriptions-v1-implementation-contract" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <span class="awa-version-note">
+    These docs track <strong>main / 0.7 development</strong>.
+    Latest stable:
+    <a href="https://github.com/hardbyte/awa/releases/tag/v0.6.6">v0.6.6</a>.
+  </span>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AWA" class="md-header__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AWA
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Real-time subscriptions v1: implementation contract
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="awa-light" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../start/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Start
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../concepts/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Concepts
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../guides/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../operations/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Operations
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../security/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Security
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Contributing
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AWA" class="md-nav__button md-logo" aria-label="AWA" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    AWA
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/hardbyte/awa" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    hardbyte/awa
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../start/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Start
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Start
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started-python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../start/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../concepts/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concepts
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Concepts
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/job-lifecycle/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job lifecycle
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/transactional-enqueue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transactional enqueue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../concepts/failure-lab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive failure lab
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../queue-storage-substrate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Queue storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../guides/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bridge-adapters/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bridge adapters
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lifecycle-hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Lifecycle hooks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../job-output/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Job output
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../http-callbacks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTTP callbacks
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../callback-receivers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback receivers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../dead-letter-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dead-letter queue
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../operations/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operations
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Operations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deployment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../deploying-on-managed-postgres/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managed Postgres
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5_5" id="__nav_5_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrations
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_5_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Migrations
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../migrations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migration overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.5-to-0.6/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.5 to 0.6
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../upgrade-0.6-to-0.7/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Upgrade 0.6 to 0.7
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../grafana/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Security
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Security overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/database-roles/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Database roles
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/deployable-surfaces/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Deployable surfaces
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../security/callback-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Callback security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../reference/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI commands
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/rust/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Stability policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../adr/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture decisions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Contributing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../benchmarking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#streaming-request-and-validation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streaming request and validation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#initial-resources" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Initial resources
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#events-and-stream-parsing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Events and stream parsing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#capabilities-and-strict-versioned-reads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Capabilities and strict versioned reads
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Capabilities and strict versioned reads">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#errors-and-retry-policy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Errors and retry policy
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#finite-experimental-budgets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Finite experimental budgets
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+  <div class="awa-language-switch" data-awa-language-switch hidden>
+    <span class="awa-language-switch__label" id="awa-language-switch-label">Language</span>
+    <div class="awa-language-switch__options" role="group" aria-labelledby="awa-language-switch-label">
+      <button type="button" data-awa-language="rust" aria-pressed="false">Rust</button>
+      <button type="button" data-awa-language="python" aria-pressed="false">Python</button>
+    </div>
+  </div>
+  
+                  
+
+
+  
+  
+
+
+<h1 id="real-time-subscriptions-v1-implementation-contract">Real-time subscriptions v1: implementation contract<a class="headerlink" href="#real-time-subscriptions-v1-implementation-contract" title="Permanent link">&para;</a></h1>
+<p>Status: proposed companion contract to
+<a href="../../adr/050-realtime-subscriptions/">ADR-050</a>. Streaming is <strong>disabled by
+default</strong>, enabled only by explicit server opt-in. The settings below are finite
+experimental engineering limits, not measured production SLOs. This document
+specifies a future implementation; it does not describe a shipped API.</p>
+<p>V1 serves the existing trusted admin UI. It uses process-local coarse
+invalidation, ordinary read semantics and mandatory reconciliation. No
+transactional directory, outbox, CDC integration, tenant authorization framework
+or worker change is required. Durable business triggers remain queue jobs.</p>
+<h2 id="streaming-request-and-validation">Streaming request and validation<a class="headerlink" href="#streaming-request-and-validation" title="Permanent link">&para;</a></h2>
+<p>Use <strong><code>POST /api/subscriptions/v1</code></strong>, accepting strict JSON and returning
+<code>text/event-stream</code>. The tab uses <code>fetch</code> and an AbortController. This is one
+streaming request/response, not a registration/session service. There is no native
+EventSource GET variant in v1. Resource changes abort the old stream before
+opening its replacement. Retain displayed data, marked stale, until successful
+reconciliation.</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="nt">"resources"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="p">{</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">      </span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"r1"</span><span class="p">,</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"jobs"</span><span class="p">,</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">      </span><span class="nt">"filter"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">        </span><span class="nt">"queue"</span><span class="p">:</span><span class="w"> </span><span class="s2">"emails"</span><span class="p">,</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">        </span><span class="nt">"tag"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"tenant:opaque"</span><span class="p">,</span><span class="w"> </span><span class="s2">"order:opaque"</span><span class="p">]</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">      </span><span class="p">}</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="p">},</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span><span class="p">{</span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"r2"</span><span class="p">,</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"job"</span><span class="p">,</span><span class="w"> </span><span class="nt">"job_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"123"</span><span class="p">},</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="p">{</span><span class="nt">"key"</span><span class="p">:</span><span class="w"> </span><span class="s2">"r3"</span><span class="p">,</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"workers"</span><span class="p">}</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">  </span><span class="p">]</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>Validate the complete request before registration or HTTP 200:</p>
+<ul>
+<li>Exact protocol version; unknown fields rejected at envelope, resource and
+  filter levels; unique opaque keys and type-specific fields.</li>
+<li>Both <code>JobFilter</code> deserialization <strong>and <code>validate()</code></strong>, using the existing
+  implementation and bounds. Strict parsing alone does not enforce validation.</li>
+<li>Valid IDs/UUIDs and every byte/count bound. Subscription job IDs are decimal
+  strings to avoid another JavaScript integer-precision dependency.</li>
+</ul>
+<p>Body/descriptor limits apply while receiving and parsing, before allocation can
+grow without bound. Do not echo raw descriptors or filters in events or logs.
+After validation the hub may retain only keys and category mappings; it never
+evaluates filters. Opening a stream performs <strong>zero database connections and zero
+state queries</strong>.</p>
+<h2 id="initial-resources">Initial resources<a class="headerlink" href="#initial-resources" title="Permanent link">&para;</a></h2>
+<p>These types invalidate existing read results; they promise no new metrics or
+retained history. The UI owns explicit active-query mappings.</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Additional fields</th>
+<th>Existing reads invalidated</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>jobs</code></td>
+<td>Required <code>filter: JobFilter</code></td>
+<td>Jobs pages and dashboard job sample; count becomes stale only.</td>
+</tr>
+<tr>
+<td><code>job</code></td>
+<td>Required decimal-string <code>job_id</code></td>
+<td>One job's current detail, output, progress and source.</td>
+</tr>
+<tr>
+<td><code>dlq</code></td>
+<td>Required <code>filter: JobFilter</code></td>
+<td>DLQ page/detail and depth.</td>
+</tr>
+<tr>
+<td><code>queues</code></td>
+<td>None</td>
+<td>Queue list/detail and <code>/queues/runtime</code>.</td>
+</tr>
+<tr>
+<td><code>workers</code></td>
+<td>None</td>
+<td><code>/runtime</code>, derived runtime details, capabilities and coverage.</td>
+</tr>
+<tr>
+<td><code>schedules</code></td>
+<td>None</td>
+<td><code>/cron</code> and <code>/cron/reconciliation</code>.</td>
+</tr>
+<tr>
+<td><code>operations</code></td>
+<td>Optional <code>operation_id: UUID</code></td>
+<td>Batch-operation list or one operation.</td>
+</tr>
+<tr>
+<td><code>maintenance</code></td>
+<td>None</td>
+<td><code>/storage</code> and existing sampling behavior.</td>
+</tr>
+<tr>
+<td><code>stats</code></td>
+<td>None</td>
+<td><code>/stats</code> and current timeseries views.</td>
+</tr>
+</tbody>
+</table>
+<p>Exclude standalone <code>recovery</code>, retained notices/history, application consumers
+and named queue/worker/schedule selectors from v1. They need further read
+contracts or add little with coarse routing. <code>/storage?history=true</code> supplies no
+server-retained history; subscriptions must not imply otherwise. Catalog/kinds
+views keep existing read behavior. Queue health, throughput, age and recovery
+displays use only existing fields with documented accuracy.</p>
+<p><code>JobFilter</code> describes a population; pages remain separate. Invalidation refetches
+the active bounded page, removing jobs that left and filling vacancies from
+current matches. It does not promise stable multi-page snapshots, an infinite
+list or visibility of every transition. Unknown routing information invalidates
+the broader category rather than risking a missed leave.</p>
+<h2 id="events-and-stream-parsing">Events and stream parsing<a class="headerlink" href="#events-and-stream-parsing" title="Permanent link">&para;</a></h2>
+<p>The only data event types are <code>ready</code>, <code>invalidate</code> and <code>resync</code>:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>event: ready
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>data: {"version":1,"epoch":"opaque-connection-id","keys":["r1","r2","r3"],"refresh_ms":5000,"reconcile_ms":30000,"keepalive_ms":15000}
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>event: invalidate
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>data: {"version":1,"epoch":"opaque-connection-id","keys":["r1","r2"]}
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>event: resync
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>data: {"version":1,"epoch":"opaque-connection-id","reason":"overflow"}
+</span></code></pre></div>
+<p><code>ready.keys</code> equals the requested set: never partially accept. Registration
+precedes <code>ready</code>; a client displaying a preliminary read must refetch after
+<code>ready</code>. Epoch is connection identity, not a database position. No SSE <code>id</code>,
+offset, acknowledgement or transition payload is emitted. Keepalives are comments
+and do not increment dirty generations.</p>
+<p>Check version, envelope, accepted keys and epoch. Unknown versions or malformed
+events close the stream and enter safe fallback with a visible protocol error;
+invalid protocol does not cause an automatic stream retry loop. Enforce frame
+limits even when a peer never finishes a frame. Parse chunked SSE, comments,
+split UTF-8 and split line boundaries with finite buffers. A fetch client must
+implement reconnect itself; native EventSource reconnect behavior is not automatic.</p>
+<h2 id="capabilities-and-strict-versioned-reads">Capabilities and strict versioned reads<a class="headerlink" href="#capabilities-and-strict-versioned-reads" title="Permanent link">&para;</a></h2>
+<p>Add optional structured <code>subscriptions</code> and separate <code>job_filter_protocols</code>
+fields to <code>/api/capabilities</code>. Advertise enabled protocols, accepted types,
+limits, refresh policy and disabled status. Absence means unsupported; do not
+infer support from semver. Capabilities are advisory: the next request can reach
+an older server.</p>
+<p>Add thin strict JSON adapters:</p>
+<ul>
+<li><code>POST /api/v1/jobs/query</code></li>
+<li><code>POST /api/v1/dlq/query</code></li>
+<li><code>POST /api/v1/jobs/count</code></li>
+</ul>
+<p>Query bodies use the existing filter and page semantics:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span><span class="nt">"version"</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">"filter"</span><span class="p">:{},</span><span class="nt">"page"</span><span class="p">:{}}</span>
+</span></code></pre></div>
+<p>Count bodies omit <code>page</code>. Reject unknown fields, including page fields through
+strict wrappers where existing page deserializers are permissive. Reuse the
+model/compiler and existing response conversion, not a second evaluator or
+storage model. Responses wrap the existing payload without changing its meaning:</p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">{</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="nt">"data"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;existing response payload&gt;"</span><span class="p">,</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="nt">"observation"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span><span class="nt">"observed_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;source observation time&gt;"</span><span class="p">,</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="nt">"served_at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;response time&gt;"</span><span class="p">,</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">    </span><span class="nt">"cache_age_ms"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>The strings above mark payload/timestamp placeholders, not literal wire values.
+The new UI's filtered subscription/refetch path uses these adapters. Existing
+permissive GET endpoints may remain for compatibility. Unknown <code>/api/*</code> routes
+in the new router return API errors, not SPA HTML.</p>
+<p>Unsupported routes, wrong MIME, malformed envelopes and mismatched versions are
+errors. Check JSON/version agreement for every read and <code>text/event-stream</code> plus
+valid <code>ready</code> for streams. HTTP 200 alone proves nothing: an older server's SPA
+fallback may return login/HTML content. Never retry by dropping predicates.</p>
+<p>Without v1 reads, permit legacy polling of <strong>unfiltered</strong> lists/details only.
+Nonempty filters remain unsupported rather than rewritten; only a separately
+tested legacy subset may later relax this. Do not display an unsupported job-match count
+as zero. New-server read budgets apply to SSE-triggered reads and their legacy
+fallback paths alike; fallback does not establish new server-side guarantees on
+an old binary.</p>
+<p>Never place credentials, args, outputs or secrets in any URL. Do not place raw
+filter descriptors in subscription URLs or automatic subscription logs. Existing
+shareable search URLs may contain documented nonsecret opaque filter values.
+JSON adapters avoid filters in new API URLs without removing intentional search
+and bookmark URLs.</p>
+<h3 id="errors-and-retry-policy">Errors and retry policy<a class="headerlink" href="#errors-and-retry-policy" title="Permanent link">&para;</a></h3>
+<p>Before streaming headers, return structured JSON errors:</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Invalid/unsupported version, type or fields</td>
+<td>400</td>
+</tr>
+<tr>
+<td>Size limit</td>
+<td>413</td>
+</tr>
+<tr>
+<td>Authorization/origin failure</td>
+<td>401/403</td>
+</tr>
+<tr>
+<td>Admission limit</td>
+<td>429 with <code>Retry-After</code></td>
+</tr>
+<tr>
+<td>Temporary overload or disabled transport</td>
+<td>503</td>
+</tr>
+</tbody>
+</table>
+<p>404/405 or wrong MIME means unsupported transport. After streaming headers, use
+resync/close; do not pretend to change HTTP status.</p>
+<ul>
+<li>Network/transport failures retain stale data, use the <strong>same paced read
+  scheduler</strong>, and reconnect with exponential backoff/jitter capped at 60 seconds.</li>
+<li>429/503 honor <code>Retry-After</code> across stream attempts <strong>and refetches</strong>. Overload
+  must not create immediate additional polling.</li>
+<li>401/403 stop retries until credentials or user action change.</li>
+<li>Invalid protocol/request stops stream retries and shows the error. Safe read
+  fallback still requires supported filter semantics and the same scheduler.</li>
+<li>Reprobe absent transport capability no more than every 60 seconds, unless the
+  user explicitly requests it.</li>
+</ul>
+<h2 id="finite-experimental-budgets">Finite experimental budgets<a class="headerlink" href="#finite-experimental-budgets" title="Permanent link">&para;</a></h2>
+<p>All limits are configurable with sanity checks. Zero/unlimited must not defeat
+the contract. These values are the initial opt-in implementation contract, not
+production capacity or freshness promises.</p>
+<table>
+<thead>
+<tr>
+<th>Bound</th>
+<th>Initial setting</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Feature default</td>
+<td>Disabled; explicit server opt-in.</td>
+</tr>
+<tr>
+<td>Resources</td>
+<td>16 descriptors per stream.</td>
+</tr>
+<tr>
+<td>Resource keys</td>
+<td>Unique; 1–64 ASCII alphanumeric, <code>_</code> or <code>-</code> characters.</td>
+</tr>
+<tr>
+<td>Request size</td>
+<td>64 KiB total; 32 KiB per descriptor.</td>
+</tr>
+<tr>
+<td>Streams</td>
+<td>64 per process.</td>
+</tr>
+<tr>
+<td>Principal quotas</td>
+<td>No invented identities in no-auth mode; ingress may enforce quotas.</td>
+</tr>
+<tr>
+<td>Pending stream state</td>
+<td>One dirty bit per admitted key plus one resync flag.</td>
+</tr>
+<tr>
+<td>Event/frame budget</td>
+<td>4 KiB application pending/frame budget.</td>
+</tr>
+<tr>
+<td>Debounce</td>
+<td>100 ms target; 500 ms maximum from first dirty event.</td>
+</tr>
+<tr>
+<td>Keepalive</td>
+<td>Comment every 15 seconds.</td>
+</tr>
+<tr>
+<td>Client liveness</td>
+<td>Reconnect after 45 seconds without bytes.</td>
+</tr>
+<tr>
+<td>Connect/ready deadline</td>
+<td>10 seconds.</td>
+</tr>
+<tr>
+<td>Slow transport</td>
+<td>Abort after a frame is pending for 5 seconds without body-consumer progress.</td>
+</tr>
+<tr>
+<td>Stream lifetime</td>
+<td>5 minutes, then reconnect/resync.</td>
+</tr>
+<tr>
+<td>Periodic hints</td>
+<td>Existing <code>poll_interval_ms</code>, currently at least 5 seconds and cache TTL.</td>
+</tr>
+<tr>
+<td>Reconciliation</td>
+<td>Jittered 30-second watchdog per active resource.</td>
+</tr>
+<tr>
+<td>Client read concurrency</td>
+<td>2 per tab; one in flight and one pending marker per exact query key.</td>
+</tr>
+<tr>
+<td>Refresh floor</td>
+<td>Cached reads respect advertised TTL/poll interval; uncached detail/pages at least 2 seconds apart.</td>
+</tr>
+<tr>
+<td>Server expensive reads</td>
+<td>4 simultaneous operations per process.</td>
+</tr>
+<tr>
+<td>Read admission</td>
+<td>At most 16 waiters; 250 ms admission wait; excess gets 429.</td>
+</tr>
+<tr>
+<td>Whole-read deadline</td>
+<td>15 seconds, including admission, pool acquisition, all queries/passes and serialization.</td>
+</tr>
+<tr>
+<td>SQL statement limit</td>
+<td>At most 5 seconds, also bounded by remaining whole-read deadline.</td>
+</tr>
+<tr>
+<td>SQL lock-wait limit</td>
+<td>At most 1 second, also bounded by remaining deadline.</td>
+</tr>
+<tr>
+<td>Repeated failure</td>
+<td>Exponential backoff to 60 seconds; retain one pending demand.</td>
+</tr>
+</tbody>
+</table>
+<p>Bound request/descriptor parsing before large allocation. Coalesce repeated
+invalidation into dirty bits. Overflow collapses to one all-resources resync;
+close if that cannot make transport progress within budget. Slow consumers never
+block the shared hub, readers, workers or producers. Release stream permits on
+body drop, shutdown and failure. Idle time without a pending frame is not
+backpressure. Enqueueing into an application channel is not evidence of transport
+delivery; local body-consumer progress is not a remote receipt acknowledgement.</p>
+<p>The process-wide expensive-read budget covers SSE-triggered and fallback reads.
+Cache hits may bypass admission; each cache fill acquires it once. Do not create
+a database task or pool connection per subscription. Bound obsolete fills,
+filtered cache cardinality and total fanout as well as per-stream state. Share
+aggregate reads; any filtered coalescing key includes backend, authorization
+scope, full normalized filter and page.</p>
+<p>A Rust future timeout alone does not prove SQL cancellation. Apply server-side
+deadlines to <strong>all</strong> constituent queries through appropriately configured admin
+read connections or deadline-aware transaction helpers. Do not alter mutation
+session timeouts accidentally. Verify cancellation rolls back or closes
+outstanding work before a connection becomes reusable.</p>
+<p>Audit candidate queries, separate loader transactions, all listing passes,
+aggregates and DLQ reads. The document-specific review identified a gap in</p>
+<h1 id="572s-candidate-query-only-timing-its-loader-opens-a-separate-transaction-with">572's candidate-query-only timing: its loader opens a separate transaction with<a class="headerlink" href="#572s-candidate-query-only-timing-its-loader-opens-a-separate-transaction-with" title="Permanent link">&para;</a></h1>
+<p>planning settings, and listing may make 32 candidate passes. This contract
+requires the entire operation, not each pass independently, to fit the deadline.
+The implementation must verify coverage against its actual base revision.</p>
+<h2 id="one-frontend-refresh-scheduler">One frontend refresh scheduler<a class="headerlink" href="#one-frontend-refresh-scheduler" title="Permanent link">&para;</a></h2>
+<p>Use one tab-level scheduler for SSE hints, watchdogs, legacy polling,
+focus/resume, reconnect and mutation refreshes. Managed queries disable
+independent automatic intervals, focus fetching and reconnect fetching. Migrate
+the existing two-second detail/operation polling explicitly. Every cause marks
+the same bounded dirty state; no component opens its own stream.</p>
+<p>With healthy SSE, periodic hints and reconciliation drive reads. With unhealthy
+SSE, polling takes over <strong>through the same scheduler</strong>. Do not run both plus
+independent React Query timers. Hints and keepalives alone never postpone the
+reconciliation watchdog. Resync obeys admission, cooldown and backoff. A failed
+read does not count as successful reconciliation or clear pending demand.</p>
+<p>A request captures its query's dirty generation at start. Its response clears
+only that captured demand. A hint during the request leaves one pending refresh;
+the client may render the successful response while still showing stale/dirty
+state. Fence superseded filter/stream epochs and late responses. Continuous hints
+must neither starve visible results nor build an unbounded queue.</p>
+<p>Respect pauses and explicit actions:</p>
+<ul>
+<li>Jobs currently pause automatic refresh while IDs are selected. Hints mark the
+  view stale without replacing the selection. Resume/manual refresh re-enters
+  the scheduler; mutations still use explicit selected IDs and server guards.</li>
+<li>Filtered job-match counts are excluded from automatic SSE/watchdog/focus refresh. Mark them stale;
+  refresh only on filter change, explicit refresh or the specified debounced
+  operator action. Prefix invalidation must not accidentally poll counts.</li>
+<li>Hidden tabs pause streams and reads. Visible resume performs one paced resync.</li>
+</ul>
+<p>Convergence means retained state returned by ordinary APIs after changes settle
+and reads succeed. It does not strengthen cross-table consistency or guarantee
+observation of every transient transition. Composite loading may miss ordinary
+deferred-to-ready handoffs as well as claims; Repeatable Read alone does not make
+ring <code>TRUNCATE</code> MVCC-safe. Preserve reconciliation rather than asserting a perfect
+snapshot/stream boundary. Absence after retention is not proof of never existing.</p>
+<h2 id="cache-generations-and-truthful-observations">Cache generations and truthful observations<a class="headerlink" href="#cache-generations-and-truthful-observations" title="Permanent link">&para;</a></h2>
+<p>Use a bounded monotonic generation per aggregate cache group. After a successful
+local mutation commits, one post-commit helper:</p>
+<ol>
+<li>Advances the cache generation.</li>
+<li>Invalidates or retires the old generation.</li>
+<li>Signals the hub.</li>
+</ol>
+<p>A fill captures its generation before starting. It may publish/return as current
+only if that generation matches at completion. Requests after invalidation must
+not join an old-generation fill. Use generation-keyed caches with bounded obsolete
+work or an explicit synchronized check; never hold a cache lock over a database
+query. Discard/retry obsolete completions only within the remaining read budget.
+Do not relabel them fresh or loop indefinitely under continuous invalidations.
+Existing Moka <code>invalidate_all()</code> alone is not an established proof. Require a
+deterministic old-fill-after-invalidation test.</p>
+<p>Client and server generation fences are both required. The client cannot detect
+an obsolete cache fill served as fresh. Read metadata distinguishes:</p>
+<ul>
+<li><code>observed_at</code>: source-fetch start, or a conservative start/end observation
+  window for a composite read.</li>
+<li><code>served_at</code>: response time.</li>
+<li><code>cache_age_ms</code>: age of the cached observation.</li>
+</ul>
+<p>Preserve original observation time on cache hits. A fresh HTTP response does not
+make an old sample newly observed. Use a common wrapper or headers for existing
+payloads; the new v1 adapters use the envelope above. Worker liveness remains
+heartbeat evidence under its documented window. Replica freshness/lag is
+<strong>unknown</strong> unless actually measured; primary hints do not prove replica replay.</p>
+<p>V1 may conservatively invalidate all admitted categories and aggregate caches
+after any successful local mutation. Include every family, notably DLQ
+retry/purge/move and batch cancellation, whose current handlers do not uniformly
+invalidate caches. Rolled-back mutations emit no hints. Worker and peer-process
+activity is timer-covered, with no added hooks or triggers. Each admin process
+owns its hub/cache/timer and reads its backend; no broker or sticky routing is
+needed. Measure aggregate read costs across processes.</p>
+<h2 id="trusted-admin-origin-and-credentials">Trusted-admin origin and credentials<a class="headerlink" href="#trusted-admin-origin-and-credentials" title="Permanent link">&para;</a></h2>
+<p>V1 is the existing trusted admin surface, not an application tenant API.
+<code>--read-only</code> disables mutations, not access to sensitive data. Ingress/private
+network controls protect reads and streams; an origin check does not authorize a
+JobFilter or make a public unauthenticated admin safe.</p>
+<p>Default new adapters to same-origin browser access with existing ingress auth:</p>
+<ul>
+<li>Require JSON POST bodies. Reject a present Origin unless it matches the
+  configured public admin origin. Never derive an allowlist from arbitrary
+  forwarded-host headers.</li>
+<li>No wildcard credentialed CORS. Isolate new routes or deliberately replace
+  existing permissive CORS so an outer layer cannot undo this policy.</li>
+<li>Browser fetch uses <code>credentials: "same-origin"</code> and <code>cache: "no-store"</code>.
+  Reject cross-origin redirects/login HTML as protocol data.</li>
+<li>Non-browser requests without Origin retain the existing ingress/private-network
+  trust requirement.</li>
+</ul>
+<p>SSE response headers:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>Content-Type: text/event-stream
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>Cache-Control: private, no-store, no-transform
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>X-Accel-Buffering: no
+</span></code></pre></div>
+<p>Use the actual ingress's buffering controls, testing authentication proxy,
+compression, idle timeouts and streaming behavior. The five-minute stream
+lifetime allows ingress reauthentication; a server without identity cannot
+promise immediate per-user revocation. Application-scoped consumers remain
+outside v1. Do not put secrets, args or output in notifications or transport logs.</p>
+<h2 id="implementation-and-acceptance">Implementation and acceptance<a class="headerlink" href="#implementation-and-acceptance" title="Permanent link">&para;</a></h2>
+<p>Use a separate draft implementation PR, stacked on #572 or after its merge,
+reusing its actual <code>JobFilter</code> compiler. Do not copy a second compiler into the
+UI crate. Adopting this contract permits opt-in implementation, not default
+enablement, release or merge.</p>
+<ol>
+<li>Adopt ADR-050 and this protocol/resource/fallback/privacy/limit/scheduler/cache/
+   origin contract. Keep experimental defaults and disabled-by-default status.</li>
+<li>Add protocol types/capabilities, strict read adapters and status/MIME checks.
+   Verify read-only and empty-install behavior without starting a worker.</li>
+<li>Add the bounded process-local hub/timer and post-commit helper. Prove stream
+   opening does zero state queries/connections. Test descriptor/frame bounds,
+   permits, disconnect cleanup, shutdown and blocked response bodies.</li>
+<li>Add cache generations, observations and whole-read budgets. Use deterministic
+   barriers for stale-fill races. Prove timed-out SQL stops/rolls back and pool
+   connections return to baseline before reuse.</li>
+<li>Add one tab-level fetch-SSE manager/scheduler with explicit active-query
+   mappings, dirty generations, abort/fencing, count/selection exceptions and
+   fallback. Test finite parsing across chunks, comments, UTF-8 and line splits.</li>
+<li>Cover every local mutation family. Prove rollback emits no hint and peer
+   changes converge through periodic reads. Test filter entry/exit, page refill,
+   retained-not-found presentation, errors, resume and heartbeat expiry without
+   writes. Preserve "where applicable" for follow-ups: rescue follow-ups remain
+   best effort after rescue.</li>
+<li>Test old-server 200-HTML/404, mixed-version routing of capabilities/stream/read,
+   401/403, 429 <code>Retry-After</code>, 503, healthy SSE with failed database reads,
+   restarts, continuous hints, overflow/resync, slow consumers and fallback
+   without duplicate loops. Counts/paused selections remain unchanged until
+   explicitly resumed/refreshed under their rules.</li>
+<li>Benchmark PostgreSQL 17 and 18 with zero clients, current polling, opted-in SSE,
+   maximum admitted views and multiple admin processes. Measure p95/p99 enqueue,
+   claim and finalization latency, rescue progress, WAL, query QPS, permits,
+   database connections, cache fills and browser freshness. Validate through
+   supported ingress/pooler topology.</li>
+</ol>
+<p>Keep the implementation PR draft until deterministic correctness and
+read-budget/cancellation tests pass. Default enablement requires load/deployment
+evidence; missing evidence does not prevent writing an opt-in implementation.
+Timer-driven SSE is not inherently cheaper than polling: measure local-mutation
+freshness and total read/connection costs before default enablement.</p>
+<p>The earlier uniqueness-prune and DLQ downgrade findings remain separate release
+gates. This stream neither causes nor repairs them. No transactional-directory
+proposal is included. New metrics, retained notices/history and application
+authorization need separate work.</p>
+<h2 id="evidence-boundary">Evidence boundary<a class="headerlink" href="#evidence-boundary" title="Permanent link">&para;</a></h2>
+<p>This contract adopts the actual-document review of ADR-050 at
+<code>3dd7ee3696e706d80c4a2777d7d0642f1e3480cc</code>, verified blob
+<code>154f328a7249229ad3e0a25db83827595ea95f21</code>. The original repository and
+PostgreSQL/SSE source evidence remains linked in
+<a href="../../adr/050-realtime-subscriptions/#evidence-and-relationship-to-existing-decisions">ADR-050</a>.
+Review agreement and documentation CI do not establish a tested subscription
+implementation, SQL cancellation, load safety or deployment correctness. The
+transferred review evidence paragraph was incomplete and executable model
+artifacts were not supplied here; this document claims no verified model result.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; AWA contributors · MIT OR Apache-2.0
+    </div>
+  
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/hardbyte/awa" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.annotate", "content.code.copy", "content.tabs.link", "content.tooltips", "navigation.footer", "navigation.indexes", "navigation.instant", "navigation.instant.progress", "navigation.sections", "navigation.tabs", "navigation.top", "search.highlight", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../javascripts/language-switch.js"></script>
+      
+        <script src="../../javascripts/agent-docs.js"></script>
+      
+    
+  </body>
+</html>
