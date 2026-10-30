@@ -2527,6 +2527,12 @@
 <td>A handler may record a size-bounded JSON output for its attempt, sealed with the staging buffer and published only by the attempt's own lease-guarded transition: as the job's output on completion, or in the error entry of a failure, where only the latest entry to record one keeps it. It rides the compact completion batch, and neither the engine nor another job reads it. A kind may declare its output type, which types the API and is published in its descriptor.</td>
 <td><span class="awa-status awa-status--accepted">Accepted</span></td>
 </tr>
+<tr>
+<td style="text-align: right;">049</td>
+<td><a href="049-job-filter-and-indexed-tags/">One job filter, and tags as the indexed handle</a></td>
+<td>One <code>JobFilter</code> describes "which jobs" for listing, counting, batch preview, batch execution and the DLQ, compiled once per engine with only the predicates a filter sets; SQL narrows candidates and a batched loader settles each job's current state. Tags are the indexed handle for "jobs about X": a partial GIN index over non-empty payload tags on each queue-storage partition, maintained by Postgres for every binary, emptied by pruning, and built online by the migrator.</td>
+<td><span class="awa-status awa-status--proposed">Proposed</span></td>
+</tr>
 </tbody>
 </table>
 <h2 id="correctness-evidence">Correctness evidence<a class="headerlink" href="#correctness-evidence" title="Permanent link">&para;</a></h2>
