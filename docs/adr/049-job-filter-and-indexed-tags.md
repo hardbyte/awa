@@ -283,10 +283,10 @@ It's deferred because the index serves explicit tags today, and derivation can b
   - a ring build never queues an exclusive lock that blocks a lane;
   - pruning during a build reports `Blocked` and then succeeds.
 - **A mixed fleet.** A 0.6.9 producer's tagged jobs are found by tag once the build has run. A batch operation with several tags is refused while a 0.6.9 runtime is live, and the 0.6 filter type fails to read one.
-- **Benchmark.** `awa/tests/tag_filter_bench.rs`, on a realistic mix of tagged and untagged jobs, checks:
-  - a 100-row page loads in one batched read;
-  - a rare-tag lookup aims for under 100 ms at 50,000 retained jobs. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before. About half of a rare-tag lookup is loading the one job: `terminal_jobs` expands every compact completion batch before it can filter by id, which also slows `get_job`. An id-keyed read for it needs a migration and is a follow-up;
-  - with `fastupdate = off`, p99 enqueue latency for tagged jobs stays within 10% of today.
+- **Benchmark.** `awa/tests/tag_filter_bench.rs` loads a mix of tagged and untagged completed jobs (50,000 by default).
+  - **It asserts** that a rare-tag lookup finds its one job, with a warm median under 250 ms. The aim is 100 ms; about half of today's time is loading the one job, because `terminal_jobs` expands every compact completion batch before it can filter by id, which also slows `get_job`. An id-keyed read for it needs a migration and is a follow-up.
+  - **It reports** cold and warm times for unfiltered, available-only, kind, common-tag and rare-tag pages, a capped count, lifecycle WAL per job, and the tag indexes' size. Measured when this was implemented: a page of 100 in about 200 ms and a rare tag in 120–160 ms, against a 120-second listing before.
+  - **Not measured by it:** how many reads a page takes, and p99 enqueue latency for tagged jobs with `fastupdate = off`.
 
 ## Relationship to other ADRs
 
