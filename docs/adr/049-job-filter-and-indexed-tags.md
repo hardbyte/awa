@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. Amends [ADR-030](030-batch-operations.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. `awa migrate` and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by `awa storage build-tag-index`, which the migrator runs after upgrading.
+Accepted. Amends [ADR-030](030-batch-operations.md): its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. `awa migrate` and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by `awa storage build-tag-index`, which the migrator runs after upgrading.
 
 ## Context
 
