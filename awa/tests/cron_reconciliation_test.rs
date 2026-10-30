@@ -206,33 +206,60 @@ async fn transient_conflict_resets_grace_between_leader_passes() {
     let pool = db.pool().clone();
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    let c = config("billing", 150);
+    let c = config("billing", 60_000);
     publish(&pool, a, &c, &[job("invoice")]).await;
-    publish(&pool, b, &c, &[job("invoice")]).await;
-    tokio::time::sleep(Duration::from_millis(170)).await;
-    assert!(reconcile::plan(&pool, "billing")
-        .await
-        .unwrap()
-        .blockers
-        .is_empty());
-    // The leader never observes the mixed window; publication must reset it.
     publish(&pool, b, &c, &[]).await;
+    publish(&pool, a, &c, &[]).await;
+    // Mature the unanimous empty manifest without requiring database round
+    // trips to fit inside a 150 ms grace window on a shared CI runner.
+    let old_agreed_since: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE awa.cron_owners SET agreed_since=clock_timestamp()-interval '2 minutes' WHERE owner_id='billing' RETURNING agreed_since",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let before = reconcile::plan(&pool, "billing").await.unwrap();
+    assert!(before.blockers.is_empty());
+    assert_eq!(before.retirements, ["invoice"]);
+    assert!(get(&pool, "invoice").await.retired_at.is_none());
+
+    // No applying leader pass observes the mixed window. Publication itself
+    // must clear durable agreement, even if the fleet returns to the same hash.
+    publish(&pool, b, &c, &[job("invoice")]).await;
+    let agreement_cleared: bool = sqlx::query_scalar(
+        "SELECT agreed_hash IS NULL AND agreed_since IS NULL AND evidence_until IS NULL FROM awa.cron_owners WHERE owner_id='billing'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(agreement_cleared);
     assert!(reconcile::plan(&pool, "billing")
         .await
         .unwrap()
         .blockers
         .contains(&"mixed_desired_manifests".into()));
-    publish(&pool, a, &c, &[]).await;
+    publish(&pool, b, &c, &[]).await;
     let p = reconcile::reconcile(&pool, "billing").await.unwrap();
+    assert_eq!(p.desired_hash, before.desired_hash);
+    assert!(p.agreed_since.unwrap() > old_agreed_since);
     assert!(!p.applied);
     assert!(p.grace_remaining_ms > 0);
-    tokio::time::sleep(Duration::from_millis(170)).await;
-    assert!(
-        reconcile::reconcile(&pool, "billing")
-            .await
-            .unwrap()
-            .applied
-    );
+    assert_eq!(p.blockers, ["grace_period"]);
+    assert_eq!(p.retirements, ["invoice"]);
+    assert!(get(&pool, "invoice").await.retired_at.is_none());
+
+    // Advance only grace evidence; keep declarations and runtime freshness live.
+    sqlx::query(
+        "UPDATE awa.cron_owners SET agreed_since=clock_timestamp()-interval '2 minutes' WHERE owner_id='billing'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let applied = reconcile::reconcile(&pool, "billing").await.unwrap();
+    assert!(applied.applied);
+    assert!(applied.blockers.is_empty());
+    assert_eq!(applied.retirements, ["invoice"]);
+    assert!(get(&pool, "invoice").await.retired_at.is_some());
 }
 
 #[tokio::test]
