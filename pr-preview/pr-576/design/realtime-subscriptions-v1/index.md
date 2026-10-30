@@ -55,6 +55,12 @@ After validation the hub may retain only keys and category mappings; it never
 evaluates filters. Opening a stream performs **zero database connections and zero
 state queries**.
 
+An empty active resource set opens no stream and schedules no resource reads.
+The server rejects an empty `resources` array with 400. More than 16 descriptors
+rejects the complete request under the size-limit policy; never silently truncate,
+partially subscribe or open extra streams to bypass the cap. Display the error
+while retaining safe, paced reads of supported views.
+
 ## Initial resources
 
 These types invalidate existing read results; they promise no new metrics or
@@ -113,6 +119,11 @@ invalid protocol does not cause an automatic stream retry loop. Enforce frame
 limits even when a peer never finishes a frame. Parse chunked SSE, comments,
 split UTF-8 and split line boundaries with finite buffers. A fetch client must
 implement reconnect itself; native EventSource reconnect behavior is not automatic.
+
+Run connect/ready and byte-liveness deadlines on independent timers, not inside
+or after the stream reader's await/iterator. A pending read that never returns
+must still be aborted at its deadline. Bytes/keepalives establish transport
+activity only; they neither establish source freshness nor reset reconciliation.
 
 ## Capabilities and strict versioned reads
 
@@ -273,12 +284,16 @@ SSE, polling takes over **through the same scheduler**. Do not run both plus
 independent React Query timers. Hints and keepalives alone never postpone the
 reconciliation watchdog. Resync obeys admission, cooldown and backoff. A failed
 read does not count as successful reconciliation or clear pending demand.
+This includes a missed final invalidation: a retained completed job's detail
+must still refresh through reconciliation even when SSE continues sending bytes.
 
 A request captures its query's dirty generation at start. Its response clears
 only that captured demand. A hint during the request leaves one pending refresh;
 the client may render the successful response while still showing stale/dirty
 state. Fence superseded filter/stream epochs and late responses. Continuous hints
 must neither starve visible results nor build an unbounded queue.
+Keep demand by resource/query key, not one global latest-resource slot; hints
+for a second resource cannot overwrite the first resource's pending demand.
 
 Respect pauses and explicit actions:
 
@@ -289,6 +304,24 @@ Respect pauses and explicit actions:
   refresh only on filter change, explicit refresh or the specified debounced
   operator action. Prefix invalidation must not accidentally poll counts.
 - Hidden tabs pause streams and reads. Visible resume performs one paced resync.
+
+Resource-set changes cancel/fence old work before replacement. On `pagehide`,
+abort streams and managed reads and stop timers, including when entering the
+browser back-forward cache (BFCache). On persisted `pageshow`, discard the old
+transport epoch and resume exactly one scheduler, with one paced resync only if
+visible and nonempty. Cancelled reads do not clear demand or count as successful
+reconciliation. Test repeated scope churn and restore without leaked permits,
+read tasks or duplicate loops.
+
+Preserve unsaved operator form/dialog drafts as well as selected IDs during
+refetch; do not silently replace the values the operator is reviewing. Optimistic
+UI coordination is separate from atomic domain mutation guards. Destructive
+operations validate current eligibility and applicable version/lease/fencing
+conditions atomically on the server; notifications and disabled buttons cannot
+enforce exclusivity or idempotency. Retain the existing server guards rather
+than inventing a subscription ownership protocol. Viewing a job or observing
+worker presence grants no ownership; active attempt ownership remains a lease
+and domain-state question.
 
 Convergence means retained state returned by ordinary APIs after changes settle
 and reads succeed. It does not strengthen cross-table consistency or guarantee
@@ -399,12 +432,23 @@ enablement, release or merge.
    401/403, 429 `Retry-After`, 503, healthy SSE with failed database reads,
    restarts, continuous hints, overflow/resync, slow consumers and fallback
    without duplicate loops. Counts/paused selections remain unchanged until
-   explicitly resumed/refreshed under their rules.
+   explicitly resumed/refreshed under their rules. Include a silently hung reader,
+   a missed final event with continuing keepalives, interleaved resource hints,
+   empty/over-cap scope, scope churn, cancellation, BFCache restore and preserved
+   operator drafts. Independently verify the existing atomic mutation guards.
 8. Benchmark PostgreSQL 17 and 18 with zero clients, current polling, opted-in SSE,
    maximum admitted views and multiple admin processes. Measure p95/p99 enqueue,
    claim and finalization latency, rescue progress, WAL, query QPS, permits,
    database connections, cache fills and browser freshness. Validate through
    supported ingress/pooler topology.
+
+Distinguish source/pipeline observation lag where measurable, transport activity,
+API refetch latency and browser read/render freshness in diagnostic evidence.
+Missing source/pipeline lag remains unknown. A healthy stream can coexist with
+an unhealthy queue or stale source, and a consumer-stage metric cannot establish
+universal subsecond browser freshness. Report histogram resolution and censored
+top-bucket observations rather than claiming an exact delay from the last bucket.
+These are measurement requirements, not additional v1 resource/metric APIs.
 
 Keep the implementation PR draft until deterministic correctness and
 read-budget/cancellation tests pass. Default enablement requires load/deployment
