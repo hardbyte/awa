@@ -220,6 +220,7 @@ async fn transient_conflict_resets_grace_between_leader_passes() {
     .unwrap();
     let before = reconcile::plan(&pool, "billing").await.unwrap();
     assert!(before.blockers.is_empty());
+    assert_eq!(before.agreed_since, Some(old_agreed_since));
     assert_eq!(before.retirements, ["invoice"]);
     assert!(get(&pool, "invoice").await.retired_at.is_none());
 
@@ -258,6 +259,8 @@ async fn transient_conflict_resets_grace_between_leader_passes() {
     let applied = reconcile::reconcile(&pool, "billing").await.unwrap();
     assert!(applied.applied);
     assert!(applied.blockers.is_empty());
+    assert_eq!(applied.grace_remaining_ms, 0);
+    assert_eq!(applied.desired_hash, p.desired_hash);
     assert_eq!(applied.retirements, ["invoice"]);
     assert!(get(&pool, "invoice").await.retired_at.is_some());
 }
