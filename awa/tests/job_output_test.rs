@@ -448,7 +448,14 @@ async fn external_completion_stores_the_output_it_is_given() {
     let db = TestDatabase::queue_storage().await;
     let pool = db.pool().clone();
     let queue = "output_external";
+    // The completed jobs are read back after shutdown; with the default
+    // one-second ring rotation, prune can truncate them first.
     let client = Client::builder(pool.clone())
+        .queue_storage(
+            awa::QueueStorageConfig::default(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
         .queue(queue, queue_config())
         .register_worker(AwaitWorker)
         .build()
