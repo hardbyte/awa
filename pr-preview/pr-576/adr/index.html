@@ -2535,6 +2535,7 @@
 </tr>
 </tbody>
 </table>
+<p>| 050 | <a href="050-realtime-subscriptions/">Real-time resource subscriptions</a> | Admin-first resource invalidation over SSE with bounded refetch, reconnect resync and periodic reconciliation; durable business triggers remain queue jobs. | <span class="awa-status awa-status--proposed">Proposed</span> |</p>
 <h2 id="correctness-evidence">Correctness evidence<a class="headerlink" href="#correctness-evidence" title="Permanent link">&para;</a></h2>
 <p>Executable TLA+ models live under <a href="https://github.com/hardbyte/awa/tree/main/correctness"><code>correctness/</code></a>. The storage models cover segmented storage, storage races, lock ordering, and trace refinement; the runtime models cover claim, rescue, callbacks, batching, cron, and view-trigger concurrency. Benchmark evidence belongs with the benchmark artifacts, not in this decision index.</p>
 <h2 id="conventions">Conventions<a class="headerlink" href="#conventions" title="Permanent link">&para;</a></h2>
