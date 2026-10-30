@@ -2353,7 +2353,7 @@
 
 <h1 id="adr-049-one-job-filter-and-tags-as-the-indexed-handle">ADR-049: One job filter, and tags as the indexed handle<a class="headerlink" href="#adr-049-one-job-filter-and-tags-as-the-indexed-handle" title="Permanent link">&para;</a></h1>
 <h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>Proposed. Amends <a href="../030-batch-operations/">ADR-030</a>: its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. <code>awa migrate</code> and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by <code>awa storage build-tag-index</code>, which the migrator runs after upgrading.</p>
+<p>Accepted. Amends <a href="../030-batch-operations/">ADR-030</a>: its batch-operation filter becomes the filter for job listing, counting, batch preview, batch execution and the DLQ. No migration. <code>awa migrate</code> and schema preparation index the partitions that are empty, so new schemas come out fully indexed; populated partitions are indexed by <code>awa storage build-tag-index</code>, which the migrator runs after upgrading.</p>
 <h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
 <p>Operators and applications ask Awa one question in several places: <em>which jobs?</em> The admin UI's jobs page, <code>awa job list</code>, Python's <code>list_jobs</code>, a batch operation's preview, the batch operation itself and the DLQ pages each answer it, and each answers it differently.</p>
 <ul>
