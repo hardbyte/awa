@@ -465,7 +465,7 @@ This contract adopts the actual-document review of ADR-050 at
 `3dd7ee3696e706d80c4a2777d7d0642f1e3480cc`, verified blob
 `154f328a7249229ad3e0a25db83827595ea95f21`. The original repository and
 PostgreSQL/SSE source evidence remains linked in
-[ADR-050](../adr/050-realtime-subscriptions.md#evidence-and-relationship-to-existing-decisions).
+[ADR-050](../adr/050-realtime-subscriptions.md#links-and-evidence).
 Review agreement and documentation CI do not establish a tested subscription
 implementation, SQL cancellation, load safety or deployment correctness. The
 transferred review evidence paragraph was incomplete and executable model
