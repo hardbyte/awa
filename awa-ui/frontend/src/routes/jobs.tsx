@@ -236,9 +236,10 @@ export function JobsPage() {
     onError: () => toast.error("Failed to drain queue"),
   });
 
-  // Compute which selected jobs are retryable vs cancellable
+  // Compute which selected jobs are retryable vs cancellable. Dead-lettered
+  // jobs are retried through the DLQ page; the job endpoints skip them.
   const { retryableIds, cancellableIds } = useMemo(() => {
-    const selectedJobs = jobs.filter((j) => selected.has(j.id));
+    const selectedJobs = jobs.filter((j) => selected.has(j.id) && !j.dlq);
     return {
       retryableIds: selectedJobs
         .filter((j) => RETRYABLE_STATES.has(j.state))

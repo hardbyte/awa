@@ -358,6 +358,14 @@ async fn dlq_paths_share_the_filter() {
             .unwrap()
             .is_empty()
     );
+    // The jobs listing marks the dead-lettered job, so the admin UI routes
+    // actions on it through the DLQ.
+    let listed = admin::find_jobs_with_source(&pool, &JobFilter::new(), JobPage::default())
+        .await
+        .unwrap();
+    for (job, dlq) in &listed {
+        assert_eq!(dlq.is_some(), job.id == ids[8], "job {}", job.id);
+    }
     // Every DLQ row is a dead-lettered failed job, so none of these
     // narrows it.
     for unscoped in [

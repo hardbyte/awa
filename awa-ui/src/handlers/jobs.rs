@@ -30,14 +30,6 @@ pub struct JobResponse {
 }
 
 impl JobResponse {
-    fn from_row(
-        row: JobRow,
-        queue_descriptors: &HashMap<String, admin::QueueDescriptor>,
-        kind_descriptors: &HashMap<String, admin::JobKindDescriptor>,
-    ) -> Self {
-        Self::from_row_with_dlq(row, queue_descriptors, kind_descriptors, None)
-    }
-
     fn from_row_with_dlq(
         row: JobRow,
         queue_descriptors: &HashMap<String, admin::QueueDescriptor>,
@@ -63,15 +55,22 @@ impl JobResponse {
         pool: &sqlx::PgPool,
         rows: Vec<JobRow>,
     ) -> Result<Vec<Self>, awa_model::AwaError> {
+        Self::from_rows_with_dlq(pool, rows.into_iter().map(|row| (row, None)).collect()).await
+    }
+
+    async fn from_rows_with_dlq(
+        pool: &sqlx::PgPool,
+        rows: Vec<(JobRow, Option<DlqMetadata>)>,
+    ) -> Result<Vec<Self>, awa_model::AwaError> {
         let queue_names: Vec<String> = rows
             .iter()
-            .map(|row| row.queue.clone())
+            .map(|(row, _)| row.queue.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         let kind_names: Vec<String> = rows
             .iter()
-            .map(|row| row.kind.clone())
+            .map(|(row, _)| row.kind.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -81,7 +80,9 @@ impl JobResponse {
 
         Ok(rows
             .into_iter()
-            .map(|row| Self::from_row(row, &queue_descriptors, &kind_descriptors))
+            .map(|(row, dlq)| {
+                Self::from_row_with_dlq(row, &queue_descriptors, &kind_descriptors, dlq)
+            })
             .collect())
     }
 }
@@ -98,8 +99,12 @@ pub async fn list_jobs(
         before_id: query.before_id,
         limit: query.limit.unwrap_or(awa_model::filter::DEFAULT_PAGE_LIMIT),
     };
-    let jobs = admin::find_jobs(&state.pool, &query.filter, page).await?;
-    Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
+    // Dead-lettered jobs carry their DLQ metadata, so the UI routes actions
+    // on them through `/api/dlq/*`.
+    let jobs = admin::find_jobs_with_source(&state.pool, &query.filter, page).await?;
+    Ok(Json(
+        JobResponse::from_rows_with_dlq(&state.pool, jobs).await?,
+    ))
 }
 
 /// `GET /api/jobs/count`: how many jobs the same parameters select, exact up

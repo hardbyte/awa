@@ -363,6 +363,42 @@ pub async fn get_dlq_job(pool: &PgPool, job_id: i64) -> Result<Option<DlqRow>, A
     row.map(QueueStorageDlqRow::into_dlq_row).transpose()
 }
 
+/// DLQ metadata for whichever of `job_ids` are dead-lettered. Empty when
+/// queue storage is not active, since only it has a DLQ.
+pub async fn dlq_metadata_for(
+    pool: &PgPool,
+    job_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, DlqMetadata>, AwaError> {
+    if job_ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let Some(schema) = QueueStorage::active_schema(pool).await? else {
+        return Ok(Default::default());
+    };
+    let store = QueueStorage::from_existing_schema(schema)?;
+    let rows: Vec<(i64, String, DateTime<Utc>, i64)> = sqlx::query_as(audited_sql(format!(
+        "SELECT DISTINCT ON (job_id) job_id, dlq_reason, dlq_at, original_run_lease \
+         FROM {}.dlq_entries WHERE job_id = ANY($1) ORDER BY job_id, dlq_at DESC",
+        store.schema()
+    )))
+    .bind(job_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(job_id, reason, dlq_at, original_run_lease)| {
+            (
+                job_id,
+                DlqMetadata {
+                    reason,
+                    dlq_at,
+                    original_run_lease,
+                },
+            )
+        })
+        .collect())
+}
+
 pub async fn dlq_depth(pool: &PgPool, queue: Option<&str>) -> Result<i64, AwaError> {
     let store = active_queue_storage(pool).await?;
     sqlx::query_scalar::<_, i64>(audited_sql(format!(

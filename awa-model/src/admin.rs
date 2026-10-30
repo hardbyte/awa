@@ -2602,6 +2602,26 @@ pub async fn find_jobs(
     .await
 }
 
+/// [`find_jobs`], with DLQ metadata for each job that is dead-lettered, so
+/// a caller can send actions on it through the DLQ rather than the job
+/// endpoints.
+pub async fn find_jobs_with_source(
+    pool: &PgPool,
+    filter: &crate::filter::JobFilter,
+    page: crate::filter::JobPage,
+) -> Result<Vec<(JobRow, Option<DlqMetadata>)>, AwaError> {
+    let jobs = find_jobs(pool, filter, page).await?;
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    let mut dlq = crate::dlq::dlq_metadata_for(pool, &ids).await?;
+    Ok(jobs
+        .into_iter()
+        .map(|job| {
+            let metadata = dlq.remove(&job.id);
+            (job, metadata)
+        })
+        .collect())
+}
+
 /// How many jobs `filter` selects: exact up to
 /// [`COUNT_CAP`](crate::filter::COUNT_CAP), otherwise at least that many.
 pub async fn count_jobs(
