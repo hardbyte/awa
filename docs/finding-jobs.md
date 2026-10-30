@@ -8,7 +8,9 @@ the same jobs on every one of them.
 
 Finding jobs needs the queue-storage engine. On the deprecated canonical
 engine ([ADR-037](adr/037-canonical-engine-deprecation.md)) these calls
-return an error naming the missing queue_storage backend.
+return an error naming the missing queue_storage backend. The exception is a
+fresh install that holds no jobs yet: listing and counting there return
+nothing, and batch operations are still refused.
 
 ## The filter
 

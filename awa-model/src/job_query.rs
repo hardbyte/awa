@@ -689,18 +689,32 @@ fn finish(prefix: String, union: String, window: Window, statement: &mut Stateme
 }
 
 /// The active queue-storage engine. Finding jobs by filter is a
-/// queue-storage feature: the canonical engine is deprecated and holds work
-/// only on a fresh install that hasn't started a worker (ADR-037).
-pub(crate) async fn active_store(pool: &PgPool) -> Result<QueueStorage, AwaError> {
-    let schema = QueueStorage::active_schema(pool).await?.ok_or_else(|| {
-        AwaError::Validation(
-            "finding jobs by filter requires an active queue_storage backend; \
-             the canonical engine is deprecated (ADR-037)"
-                .to_string(),
-        )
-    })?;
-    QueueStorage::from_existing_schema(schema)
+/// queue-storage feature: the canonical engine is deprecated (ADR-037).
+///
+/// A canonical database that holds no jobs answers `None`, so every filter
+/// selects nothing. That is a fresh install whose first worker hasn't
+/// started yet, and an empty list is the true answer there. Once canonical
+/// holds jobs, a filter is refused rather than answered wrongly.
+pub(crate) async fn active_store(pool: &PgPool) -> Result<Option<QueueStorage>, AwaError> {
+    if let Some(schema) = QueueStorage::active_schema(pool).await? {
+        return QueueStorage::from_existing_schema(schema).map(Some);
+    }
+    let holds_jobs: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM awa.jobs_hot) \
+             OR EXISTS (SELECT 1 FROM awa.scheduled_jobs)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(map_sqlx_error)?;
+    if holds_jobs {
+        return Err(AwaError::Validation(CANONICAL_REFUSAL.to_string()));
+    }
+    Ok(None)
 }
+
+pub(crate) const CANONICAL_REFUSAL: &str =
+    "finding jobs by filter requires an active queue_storage backend; \
+     the canonical engine is deprecated (ADR-037)";
 
 /// The candidate statement, or `None` when no job can match.
 async fn statement(
@@ -708,10 +722,14 @@ async fn statement(
     filter: &JobFilter,
     eligible: &[JobState],
     window: Window,
-) -> Result<(QueueStorage, Option<Statement>), AwaError> {
-    let store = active_store(pool).await?;
-    let statement = queue_storage_statement(store.schema(), filter, eligible, window);
-    Ok((store, statement))
+) -> Result<Option<(QueueStorage, Statement)>, AwaError> {
+    let Some(store) = active_store(pool).await? else {
+        return Ok(None);
+    };
+    Ok(
+        queue_storage_statement(store.schema(), filter, eligible, window)
+            .map(|statement| (store, statement)),
+    )
 }
 
 /// Run a candidate or count statement. Interactive reads run under
@@ -824,8 +842,8 @@ pub(crate) async fn find(
             },
             Window::Unbounded { .. } => unreachable!("rejected above"),
         };
-        let (store, statement) = statement(pool, filter, eligible, cursor_window).await?;
-        let Some(statement) = statement else {
+        let Some((store, statement)) = statement(pool, filter, eligible, cursor_window).await?
+        else {
             return Ok(Vec::new());
         };
         let ids = fetch_scalars(pool, statement, Some(READ_TIMEOUT)).await?;
@@ -869,8 +887,8 @@ pub(crate) async fn count(
     eligible: &[JobState],
     cap: Option<i64>,
 ) -> Result<JobCount, AwaError> {
-    let (_, statement) = statement(pool, filter, eligible, Window::Unbounded { cap }).await?;
-    let Some(statement) = statement else {
+    let Some((_, statement)) = statement(pool, filter, eligible, Window::Unbounded { cap }).await?
+    else {
         return Ok(JobCount::Exact(0));
     };
     let n = fetch_scalars(pool, statement, Some(READ_TIMEOUT))
@@ -895,8 +913,7 @@ pub(crate) async fn max_id(
         before_id: None,
         limit: 1,
     };
-    let (_, statement) = statement(pool, filter, eligible, window).await?;
-    let Some(statement) = statement else {
+    let Some((_, statement)) = statement(pool, filter, eligible, window).await? else {
         return Ok(None);
     };
     Ok(fetch_scalars(pool, statement, None).await?.first().copied())
@@ -918,8 +935,7 @@ pub(crate) async fn scan_ids(
         max_id,
         limit,
     };
-    let (_, statement) = statement(pool, filter, eligible, window).await?;
-    let Some(statement) = statement else {
+    let Some((_, statement)) = statement(pool, filter, eligible, window).await? else {
         return Ok(Vec::new());
     };
     fetch_scalars(pool, statement, None).await

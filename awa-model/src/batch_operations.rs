@@ -253,7 +253,13 @@ pub async fn submit_batch_operation(
     request.spec.validate()?;
     request.filter.validate()?;
     validate_filter_for_spec(&request.spec, &request.filter)?;
-    crate::job_query::active_store(pool).await?;
+    // An empty canonical database lists no jobs, but nothing could run a
+    // batch operation there.
+    if crate::job_query::active_store(pool).await?.is_none() {
+        return Err(AwaError::Validation(
+            crate::job_query::CANONICAL_REFUSAL.to_string(),
+        ));
+    }
     if request.filter.uses_extended_fields() {
         crate::filter::require_fleet_for_extended_filters(pool).await?;
     }

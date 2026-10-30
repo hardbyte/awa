@@ -191,10 +191,50 @@ async fn filters_agree_with_each_jobs_current_row_on_queue_storage() {
 async fn the_canonical_engine_is_refused_rather_than_searched() {
     let db = TestDatabase::canonical().await;
     let pool = db.pool().clone();
+    let spec = BatchOperationSpec::SetPriority { priority: 1 };
+    let submit = || {
+        batch_operations::submit_batch_operation(
+            &pool,
+            SubmitBatchOperation {
+                spec: spec.clone(),
+                filter: JobFilter::new().queue(QUEUE),
+                submitted_by: None,
+                allow_all: false,
+            },
+        )
+    };
     let refused = |err: awa::AwaError| {
         let message = err.to_string();
         assert!(message.contains("queue_storage"), "{message}");
     };
+
+    // A fresh install before its first worker: nothing to find, and nothing
+    // could run a batch operation.
+    assert!(
+        admin::find_jobs(&pool, &JobFilter::new(), JobPage::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        admin::count_jobs(&pool, &JobFilter::new()).await.unwrap(),
+        JobCount::Exact(0)
+    );
+    refused(submit().await.unwrap_err());
+
+    awa::insert_many(
+        &pool,
+        &[InsertParams {
+            kind: "jf_canonical".into(),
+            args: json!({}),
+            opts: InsertOpts {
+                queue: QUEUE.into(),
+                ..Default::default()
+            },
+        }],
+    )
+    .await
+    .unwrap();
     refused(
         admin::find_jobs(&pool, &JobFilter::new(), JobPage::default())
             .await
@@ -205,7 +245,6 @@ async fn the_canonical_engine_is_refused_rather_than_searched() {
             .await
             .unwrap_err(),
     );
-    let spec = BatchOperationSpec::SetPriority { priority: 1 };
     refused(
         batch_operations::preview_batch_operation(
             &pool,
@@ -215,19 +254,7 @@ async fn the_canonical_engine_is_refused_rather_than_searched() {
         .await
         .unwrap_err(),
     );
-    refused(
-        batch_operations::submit_batch_operation(
-            &pool,
-            SubmitBatchOperation {
-                spec,
-                filter: JobFilter::new().queue(QUEUE),
-                submitted_by: None,
-                allow_all: false,
-            },
-        )
-        .await
-        .unwrap_err(),
-    );
+    refused(submit().await.unwrap_err());
 }
 
 #[tokio::test]

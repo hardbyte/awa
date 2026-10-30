@@ -34,7 +34,8 @@ Notable changes between releases. Detailed migration notes for storage transitio
   and batch-operation preview and submit return an error naming the
   missing queue_storage backend, as the DLQ APIs already did. In 0.7 a
   migrated cluster is finalized onto queue storage; only a fresh install that
-  hasn't started a worker is still canonical.
+  hasn't started a worker is still canonical. While it holds no jobs, listing
+  and counting there return nothing rather than an error.
 - **A DLQ purge or bulk retry needs a filter that narrows the DLQ** (kind,
   queue, tag, ids or a created bound) unless `allow_all` is set; `state:
   failed` and `dead_lettered: true` alone are refused, since every DLQ row
