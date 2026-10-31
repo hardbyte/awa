@@ -1,6 +1,7 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { useEffect, useMemo, useState } from "react";
 import { useSearch } from "@tanstack/react-router";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   cancelBatchOperation,
   fetchBatchOperations,
@@ -162,10 +163,9 @@ export function BatchOpsPage() {
   // A preview describes the form it was taken from.
   useEffect(() => setPreview(null), [payload]);
 
-  const operationsQuery = useQuery({
+  const operationsQuery = useManagedQuery({
     queryKey: ["batch-ops"],
     queryFn: () => fetchBatchOperations({ limit: 50 }),
-    refetchInterval: 2_000,
   });
 
   const previewMutation = useMutation({

@@ -1,7 +1,7 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import { fetchCronReconciliation, cronOwnerAction, type CronActionPlan, type CronOwnerAction } from "../lib/api";
 import { useMemo, useState } from "react";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -21,26 +21,20 @@ import { Button } from "@/components/ui/button";
 import { CronExpr } from "@/components/CronExpr";
 import { JsonView } from "@/components/JsonView";
 import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 
 export function CronPage() {
   const queryClient = useQueryClient();
   const [expandedName, setExpandedName] = useState<string | null>(null);
   const readOnly = useReadOnly();
-  const poll = usePollInterval();
 
-  const cronQuery = useQuery<CronJobRow[]>({
+  const cronQuery = useManagedQuery<CronJobRow[]>({
     queryKey: ["cron"],
     queryFn: fetchCronJobs,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
 
-  const queuesQuery = useQuery<QueueOverview[]>({
+  const queuesQuery = useManagedQuery<QueueOverview[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
 
   const pausedQueues = useMemo(() => {
@@ -91,7 +85,7 @@ export function CronPage() {
   const [adoptName, setAdoptName] = useState("");
   const [adoptOwner, setAdoptOwner] = useState("");
   const [expectedOwner, setExpectedOwner] = useState("");
-  const reconciliation = useQuery({ queryKey: ["cron-reconciliation"], queryFn: fetchCronReconciliation, refetchInterval: poll.interval });
+  const reconciliation = useManagedQuery({ queryKey: ["cron-reconciliation"], queryFn: fetchCronReconciliation });
   const ownerMutation = useMutation({
     mutationFn: ({ action, apply }: { action: CronOwnerAction; apply: boolean }) => cronOwnerAction(action, apply),
     onSuccess: (plan) => {

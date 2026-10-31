@@ -1,5 +1,5 @@
+import { useManagedQuery } from "@/hooks/use-managed-query";
 import {
-  useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
@@ -29,7 +29,6 @@ import {
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
-import { usePollInterval } from "@/hooks/use-poll-interval";
 
 /// Coerce a URL-param string to a positive integer, rejecting `NaN`,
 /// negatives, zero, and floats. Returns `undefined` on invalid input so
@@ -59,7 +58,6 @@ export function DlqPage() {
   const filters = useDlqFilters();
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
-  const poll = usePollInterval();
 
   const searchFilters = parseSearch(filters.search);
   // A term that doesn't parse is left out of a request, so it would widen
@@ -78,19 +76,15 @@ export function DlqPage() {
     limit: filters.limit,
   };
 
-  const dlqQuery = useQuery<DlqRow[]>({
+  const dlqQuery = useManagedQuery<DlqRow[]>({
     queryKey: ["dlq", params],
     queryFn: () => fetchDlq(params),
     enabled: !searchError,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
 
-  const depthQuery = useQuery({
+  const depthQuery = useManagedQuery({
     queryKey: ["dlq-depth"],
     queryFn: fetchDlqDepth,
-    refetchInterval: poll.interval,
-    staleTime: poll.staleTime,
   });
 
   const retryFilterMutation = useMutation({
@@ -162,6 +156,7 @@ export function DlqPage() {
 
   return (
     <div className="space-y-4 p-4">
+      {dlqQuery.isPlaceholderData && <p role="status">Previous filter results are shown while the new read finishes.</p>}
       <div className="flex items-center justify-between">
         <Heading>Dead Letter Queue</Heading>
         {depthQuery.data && (

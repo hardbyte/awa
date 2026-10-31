@@ -1,3 +1,4 @@
+import { checkedJson, currentReadSignal, ReadProtocolError } from "./observation/read-control.ts";
 /** Typed fetch wrapper for the AWA API. */
 
 export interface JobRow {
@@ -391,30 +392,33 @@ function jobFilterQuery(params: ListJobsParams): URLSearchParams {
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
     headers: { "Content-Type": "application/json" },
+    credentials: "same-origin", cache: "no-store", redirect: "error",
     ...init,
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((body as { error?: string }).error ?? res.statusText);
-  }
-  return res.json() as Promise<T>;
+  return checkedJson<T>(res);
+}
+
+/** Explicit observation-read intent, including future JSON POST read adapters.
+ * Mutations use apiFetch directly and never inherit the scheduler's signal. */
+export function apiRead<T>(path: string, init?: RequestInit): Promise<T> {
+  return apiFetch(path, { ...init, signal: currentReadSignal() ?? init?.signal });
 }
 
 // Jobs
 export function fetchJobs(params: ListJobsParams = {}): Promise<JobRow[]> {
   const query = jobFilterQuery(params).toString();
-  return apiFetch(`/jobs${query ? `?${query}` : ""}`);
+  return apiRead(`/jobs${query ? `?${query}` : ""}`);
 }
 
 /** How many jobs a filter selects; exact up to the server's cap. */
 export function fetchJobCount(params: ListJobsParams = {}): Promise<JobCount> {
   const { before_id: _before, limit: _limit, ...filter } = params;
   const query = jobFilterQuery(filter).toString();
-  return apiFetch(`/jobs/count${query ? `?${query}` : ""}`);
+  return apiRead(`/jobs/count${query ? `?${query}` : ""}`);
 }
 
 export function fetchJob(id: number): Promise<JobRow> {
-  return apiFetch(`/jobs/${id}`);
+  return apiRead(`/jobs/${id}`);
 }
 
 export function retryJob(id: number): Promise<JobRow> {
@@ -449,13 +453,13 @@ export function fetchBatchOperations(params: {
     if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
   }
   const query = qs.toString();
-  return apiFetch(`/batch-ops${query ? `?${query}` : ""}`);
+  return apiRead(`/batch-ops${query ? `?${query}` : ""}`);
 }
 
 export function previewBatchOperation(
   payload: BatchOperationPayload
 ): Promise<BatchOperationPreview> {
-  return apiFetch("/batch-ops/preview", {
+  return apiRead("/batch-ops/preview", {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -498,15 +502,15 @@ export interface DlqBulkResult {
 
 export function fetchDlq(params: ListDlqParams = {}): Promise<DlqRow[]> {
   const query = jobFilterQuery(params).toString();
-  return apiFetch(`/dlq${query ? `?${query}` : ""}`);
+  return apiRead(`/dlq${query ? `?${query}` : ""}`);
 }
 
 export function fetchDlqDepth(): Promise<DlqDepthResponse> {
-  return apiFetch("/dlq/depth");
+  return apiRead("/dlq/depth");
 }
 
 export function fetchDlqJob(id: number): Promise<DlqRow | null> {
-  return apiFetch(`/dlq/${id}`);
+  return apiRead(`/dlq/${id}`);
 }
 
 export function retryDlqJob(
@@ -566,19 +570,19 @@ export function bulkMoveFailedToDlq(body: {
 
 // Queues
 export function fetchQueues(): Promise<QueueOverview[]> {
-  return apiFetch("/queues");
+  return apiRead("/queues");
 }
 
 export function fetchQueue(queue: string): Promise<QueueOverview> {
-  return apiFetch(`/queues/${encodeURIComponent(queue)}`);
+  return apiRead(`/queues/${encodeURIComponent(queue)}`);
 }
 
 export function fetchKinds(): Promise<JobKindOverview[]> {
-  return apiFetch("/kinds");
+  return apiRead("/kinds");
 }
 
 export function fetchQueueRuntime(): Promise<QueueRuntimeSummary[]> {
-  return apiFetch("/queues/runtime");
+  return apiRead("/queues/runtime");
 }
 
 export function pauseQueue(
@@ -605,7 +609,7 @@ export function drainQueue(queue: string): Promise<{ drained: number }> {
 
 // Cron
 export function fetchCronJobs(): Promise<CronJobRow[]> {
-  return apiFetch("/cron");
+  return apiRead("/cron");
 }
 
 export function triggerCronJob(name: string): Promise<JobRow> {
@@ -632,46 +636,52 @@ export function resumeCronJob(name: string): Promise<{ ok: boolean }> {
 
 // Stats
 export function fetchStats(): Promise<StateCounts> {
-  return apiFetch("/stats");
+  return apiRead("/stats");
 }
 
 export function fetchRuntime(): Promise<RuntimeOverview> {
-  return apiFetch("/runtime");
+  return apiRead("/runtime");
 }
 
 // Returns null if the backend is older than 0.5.5-alpha and lacks /storage.
-export async function fetchStorage(
-  options: { history?: boolean } = {}
-): Promise<StorageStatusReport | null> {
-  const qs = options.history ? "?history=true" : "";
-  const res = await fetch(`/api/storage${qs}`, {
-    headers: { "Content-Type": "application/json" },
+export async function fetchStorage(options: { history?: boolean } = {}): Promise<StorageStatusReport | null> {
+  const res = await fetch(`/api/storage${options.history ? "?history=true" : ""}`, {
+    headers: { "Content-Type": "application/json" }, credentials: "same-origin", cache: "no-store",
+    redirect: "error", signal: currentReadSignal(),
   });
   if (res.status === 404) return null;
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error((body as { error?: string }).error ?? res.statusText);
-  }
-  return res.json() as Promise<StorageStatusReport>;
+  return checkedJson<StorageStatusReport>(res);
 }
 
+let capabilitiesAttempt: Promise<Capabilities> | null = null;
+let capabilitiesSignal: AbortSignal | undefined;
 export function fetchCapabilities(): Promise<Capabilities> {
-  return apiFetch("/capabilities");
+  if (capabilitiesAttempt && !capabilitiesSignal?.aborted) return capabilitiesAttempt;
+  capabilitiesSignal = currentReadSignal();
+  const pending = apiRead<Capabilities>("/capabilities").then(value => {
+    if (!value || typeof value.read_only !== "boolean" || (value.poll_interval_ms !== undefined
+      && (!Number.isSafeInteger(value.poll_interval_ms) || value.poll_interval_ms < 1))) {
+      throw new ReadProtocolError("Invalid capabilities response");
+    }
+    return value;
+  }).finally(() => { if (capabilitiesAttempt === pending) capabilitiesAttempt = null; });
+  capabilitiesAttempt = pending;
+  return pending;
 }
 
 export function fetchTimeseries(
   minutes?: number
 ): Promise<TimeseriesBucket[]> {
   const qs = minutes ? `?minutes=${minutes}` : "";
-  return apiFetch(`/stats/timeseries${qs}`);
+  return apiRead(`/stats/timeseries${qs}`);
 }
 
 export function fetchDistinctKinds(): Promise<string[]> {
-  return apiFetch("/stats/kinds");
+  return apiRead("/stats/kinds");
 }
 
 export function fetchDistinctQueues(): Promise<string[]> {
-  return apiFetch("/stats/queues");
+  return apiRead("/stats/queues");
 }
 
 
@@ -699,7 +709,7 @@ export interface CronActionPlan {
   applied: boolean;
 }
 export function fetchCronReconciliation(): Promise<CronReconciliationPlan[]> {
-  return apiFetch("/cron/reconciliation");
+  return apiRead("/cron/reconciliation");
 }
 export function cronOwnerAction(action: CronOwnerAction, apply = false): Promise<CronActionPlan> {
   return apiFetch("/cron/owner-action", {

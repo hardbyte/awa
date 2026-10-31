@@ -133,9 +133,12 @@ pub async fn patch_batch_operation(
 ) -> Result<Json<BatchOperation>, ApiError> {
     state.require_writable()?;
     match payload.state {
-        BatchOperationState::Cancelling => Ok(Json(
-            batch_operations::request_batch_operation_cancellation(&state.pool, id).await?,
-        )),
+        BatchOperationState::Cancelling => {
+            let operation =
+                batch_operations::request_batch_operation_cancellation(&state.pool, id).await?;
+            state.invalidate_dashboard_caches();
+            Ok(Json(operation))
+        }
         _ => Err(awa_model::AwaError::Validation(
             "only state=cancelling is supported for batch operation PATCH".to_string(),
         )

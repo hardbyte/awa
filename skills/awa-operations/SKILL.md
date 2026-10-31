@@ -372,6 +372,16 @@ connection. Set `--callback-hmac-secret` to verify callback signatures; for
 externally reachable callbacks with a private admin surface, run
 `awa callbacks serve` instead, whose router has no admin routes.
 
+Managed dashboard views share a per-tab polling scheduler: at most 16 exact
+queries and two reads at once. The UI shows retained data as stale on read
+failure; authentication failures stop retries until an explicit refresh. Hidden
+tabs pause reads and resume with one paced refresh. Selecting jobs pauses that
+list; filtered counts refresh on filter change or explicit refresh, not every
+poll. The displayed reconciliation bound is a scheduling policy, not a data-age
+SLO. Other processes and workers are observed through ordinary timed reads.
+See [admin observation](../../docs/admin-observation.md) for cache metadata and
+the remaining strict-read/server-deadline validation requirements.
+
 ## Before You Finish A Change
 
 1. Confirm the resolved target and that you are on the intended context.
